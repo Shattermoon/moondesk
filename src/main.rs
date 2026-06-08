@@ -27,7 +27,7 @@ use ratatui::{
 };
 use state::{
     AppState, FLOW_ANIM_CELLS, FLOW_BOOTSTRAP_PHASES, FlowAnimKind, FlowAnimSegment, FlowDirection,
-    FlowLane, Mode, ServerUiEvent, SharedState, ToolMode, UsageTotals, app_config_path,
+    FlowLane, Mode, ServerUiEvent, SharedState, ShowDetailMode, ToolMode, UsageTotals, app_config_path,
     flow_anim_lit_count, load_ngrok_authtoken, save_ngrok_authtoken,
 };
 use std::io::{Write, stdout};
@@ -455,20 +455,17 @@ fn flow_phase_lines(
         .collect()
 }
 
-fn flow_bootstrap_steps_total() -> usize {
-    FLOW_BOOTSTRAP_PHASES
-        .iter()
-        .map(|phase| phase.steps.len())
-        .sum()
+fn flow_bootstrap_steps_total(mode: state::ShowDetailMode) -> usize {
+    state::flow_bootstrap_steps_total(mode)
 }
 
-fn flow_bootstrap_complete(flow: &FlowLane) -> bool {
-    flow.bootstrap_completed_steps >= flow_bootstrap_steps_total()
+fn flow_bootstrap_complete(flow: &FlowLane, mode: state::ShowDetailMode) -> bool {
+    flow.bootstrap_completed_steps >= flow_bootstrap_steps_total(mode)
         && flow.bootstrap_pending_steps.is_empty()
 }
 
-fn flow_bootstrap_status_visible(flow: &FlowLane, now_millis: u128) -> bool {
-    if !flow_bootstrap_complete(flow) {
+fn flow_bootstrap_status_visible(flow: &FlowLane, now_millis: u128, mode: state::ShowDetailMode) -> bool {
+    if !flow_bootstrap_complete(flow, mode) {
         return true;
     }
     if current_anim_segment(flow, now_millis).is_some() {
@@ -491,7 +488,7 @@ fn active_bootstrap_status_flow<'a>(app: &'a AppState, now_millis: u128) -> Opti
         should_display_flow_row(flow, app.remote_connected)
             && flow.bootstrap_status_active
             && flow.closing_started_ms.is_none()
-            && flow_bootstrap_status_visible(flow, now_millis)
+            && flow_bootstrap_status_visible(flow, now_millis, app.show_detail_mode)
     })
 }
 
@@ -521,7 +518,7 @@ fn flow_bootstrap_status_lines(
     now_millis: u128,
 ) -> Vec<Line<'static>> {
     let action_label = latest_flow_action(flow);
-    let bootstrap_complete = flow_bootstrap_complete(flow);
+    let bootstrap_complete = flow_bootstrap_complete(flow, app.show_detail_mode);
     let header_title = if bootstrap_complete {
         "Initialize completed"
     } else {
@@ -1426,21 +1423,24 @@ async fn run_settings(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let themes = theme::all();
     let tool_modes = ToolMode::all();
+    let show_detail_modes = ShowDetailMode::all();
     let mut confirm_reset_token_billing = false;
     let mut selected_row = {
         let app = state.lock().await;
         themes.iter().position(|t| t.id == app.theme).unwrap_or(0)
     };
-    let total_rows = themes.len() + tool_modes.len() + 1;
+    let total_rows = themes.len() + tool_modes.len() + show_detail_modes.len() + 1 + 2;
 
     loop {
-        let (current_theme, current_tool_mode, usage_totals, set_catdesk_as_co_author) = {
+        let (current_theme, current_tool_mode, current_show_detail_mode, usage_totals, set_catdesk_as_co_author, mcp_slug) = {
             let app = state.lock().await;
             (
                 app.current_theme(),
                 app.tool_mode,
+                app.show_detail_mode,
                 app.usage_totals.clone(),
                 app.set_catdesk_as_co_author,
+                app.mcp_slug.clone(),
             )
         };
         terminal.draw(|f| {
@@ -1448,7 +1448,9 @@ async fn run_settings(
                 f,
                 current_theme,
                 current_tool_mode,
+                current_show_detail_mode,
                 set_catdesk_as_co_author,
+                &mcp_slug,
                 &usage_totals,
                 selected_row,
                 confirm_reset_token_billing,
@@ -1485,6 +1487,9 @@ async fn run_settings(
                         } else {
                             let tool_mode_start = themes.len();
                             let tool_mode_end = tool_mode_start + tool_modes.len();
+                            let detail_mode_start = tool_mode_end;
+                            let detail_mode_end = detail_mode_start + show_detail_modes.len();
+                            
                             if selected_row < tool_mode_end {
                                 let picked = tool_modes[selected_row - tool_mode_start];
                                 if app.tool_mode != picked {
@@ -1492,7 +1497,14 @@ async fn run_settings(
                                     app.log("INFO", format!("Tool mode: {}", picked.label()));
                                     app.persist_state_with_log();
                                 }
-                            } else {
+                            } else if selected_row < detail_mode_end {
+                                let picked = show_detail_modes[selected_row - detail_mode_start];
+                                if app.show_detail_mode != picked {
+                                    app.show_detail_mode = picked;
+                                    app.log("INFO", format!("Widget detail mode: {}", picked.label()));
+                                    app.persist_state_with_log();
+                                }
+                            } else if selected_row == detail_mode_end {
                                 app.set_catdesk_as_co_author = !app.set_catdesk_as_co_author;
                                 let enabled = app.set_catdesk_as_co_author;
                                 app.log(
@@ -1502,6 +1514,13 @@ async fn run_settings(
                                         if enabled { "enabled" } else { "disabled" }
                                     ),
                                 );
+                                app.persist_state_with_log();
+                            } else if selected_row == detail_mode_end + 1 {
+                                // Keep existing slug, do nothing
+                            } else if selected_row == detail_mode_end + 2 {
+                                app.regenerate_mcp_slug();
+                                let msg = format!("Generated new security slug: {}", app.mcp_slug);
+                                app.log("INFO", msg);
                                 app.persist_state_with_log();
                             }
                         }
@@ -1530,13 +1549,16 @@ fn draw_settings(
     f: &mut Frame,
     current_theme: &theme::ThemeDef,
     current_tool_mode: ToolMode,
+    current_show_detail_mode: ShowDetailMode,
     set_catdesk_as_co_author: bool,
+    mcp_slug: &str,
     usage_totals: &UsageTotals,
     selected_row: usize,
     confirm_reset_token_billing: bool,
 ) {
     let themes = theme::all();
     let tool_modes = ToolMode::all();
+    let show_detail_modes = ShowDetailMode::all();
     let palette = current_theme.palette;
     let area = f.area();
     let chunks = Layout::default()
@@ -1562,6 +1584,7 @@ fn draw_settings(
         );
     f.render_widget(header, chunks[0]);
 
+    let mut selected_line_idx = 0;
     let mut lines = vec![
         Line::from(""),
         Line::from(Span::styled(
@@ -1582,6 +1605,9 @@ fn draw_settings(
             Style::default().fg(palette.primary_fg)
         };
         lines.push(Line::from(""));
+        if selected {
+            selected_line_idx = lines.len();
+        }
         let mut spans = vec![Span::styled(
             format!(" {} [{}] {}", marker, idx + 1, theme.label),
             name_style,
@@ -1619,6 +1645,9 @@ fn draw_settings(
             Style::default().fg(palette.primary_fg)
         };
         lines.push(Line::from(""));
+        if selected {
+            selected_line_idx = lines.len();
+        }
         let mut spans = vec![Span::styled(
             format!(" {} [{}] {}", marker, row_idx + 1, tool_mode.label()),
             name_style,
@@ -1637,7 +1666,49 @@ fn draw_settings(
             Style::default().fg(palette.muted_fg),
         )]));
     }
-    let co_author_row = themes.len() + tool_modes.len();
+    
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![Span::styled(
+        "  Choose a widget detail mode:",
+        Style::default()
+            .fg(palette.title_fg)
+            .add_modifier(Modifier::BOLD),
+    )]));
+    for (idx, detail_mode) in show_detail_modes.iter().enumerate() {
+        let row_idx = themes.len() + tool_modes.len() + idx;
+        let selected = row_idx == selected_row;
+        let marker = if selected { ">" } else { " " };
+        let name_style = if selected {
+            Style::default()
+                .fg(palette.key_fg)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(palette.primary_fg)
+        };
+        lines.push(Line::from(""));
+        if selected {
+            selected_line_idx = lines.len();
+        }
+        let mut spans = vec![Span::styled(
+            format!(" {} [{}] {}", marker, row_idx + 1, detail_mode.label()),
+            name_style,
+        )];
+        if *detail_mode == current_show_detail_mode {
+            spans.push(Span::styled(
+                "  [current]",
+                Style::default()
+                    .fg(palette.secondary_fg)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        lines.push(Line::from(spans));
+        lines.push(Line::from(vec![Span::styled(
+            format!("     {}", detail_mode.description()),
+            Style::default().fg(palette.muted_fg),
+        )]));
+    }
+
+    let co_author_row = themes.len() + tool_modes.len() + show_detail_modes.len();
     let co_author_selected = co_author_row == selected_row;
     let co_author_marker = if co_author_selected { ">" } else { " " };
     let co_author_name_style = if co_author_selected {
@@ -1654,6 +1725,9 @@ fn draw_settings(
             .fg(palette.title_fg)
             .add_modifier(Modifier::BOLD),
     )]));
+    if co_author_selected {
+        selected_line_idx = lines.len();
+    }
     lines.push(Line::from(vec![Span::styled(
         format!(
             " {} [{}] Set CatDesk as co-author",
@@ -1677,9 +1751,69 @@ fn draw_settings(
             }),
         ),
     ]));
+
     lines.push(Line::from(vec![Span::styled(
         "     When enabled, CatDesk automatically appends \"Co-Authored-By: CatDesk\" to git commits and blocks manually written CatDesk co-author trailers.",
         Style::default().fg(palette.muted_fg),
+    )]));
+
+    let slug_keep_row = co_author_row + 1;
+    let slug_keep_selected = slug_keep_row == selected_row;
+    let slug_keep_marker = if slug_keep_selected { ">" } else { " " };
+    let slug_keep_name_style = if slug_keep_selected {
+        Style::default()
+            .fg(palette.key_fg)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(palette.primary_fg)
+    };
+
+    let slug_new_row = co_author_row + 2;
+    let slug_new_selected = slug_new_row == selected_row;
+    let slug_new_marker = if slug_new_selected { ">" } else { " " };
+    let slug_new_name_style = if slug_new_selected {
+        Style::default()
+            .fg(palette.key_fg)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(palette.primary_fg)
+    };
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![Span::styled(
+        "  Connection Security URL:",
+        Style::default()
+            .fg(palette.title_fg)
+            .add_modifier(Modifier::BOLD),
+    )]));
+    if slug_keep_selected {
+        selected_line_idx = lines.len();
+    }
+    lines.push(Line::from(vec![Span::styled(
+        format!(
+            " {} [{}] Keep current recorded slug",
+            slug_keep_marker,
+            slug_keep_row + 1
+        ),
+        slug_keep_name_style,
+    )]));
+    lines.push(Line::from(vec![
+        Span::styled("     ", Style::default()),
+        Span::styled(
+            format!("[{}]", mcp_slug),
+            Style::default().fg(palette.muted_fg),
+        ),
+    ]));
+    if slug_new_selected {
+        selected_line_idx = lines.len();
+    }
+    lines.push(Line::from(vec![Span::styled(
+        format!(
+            " {} [{}] Generate new random slug",
+            slug_new_marker,
+            slug_new_row + 1
+        ),
+        slug_new_name_style,
     )]));
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
@@ -1730,7 +1864,12 @@ fn draw_settings(
         ),
     ]));
 
-    let body = Paragraph::new(lines).block(
+    let visible_height = chunks[1].height.saturating_sub(2);
+    let max_scroll = (lines.len() as u16).saturating_sub(visible_height);
+    let target_scroll = (selected_line_idx as u16).saturating_sub(visible_height / 2);
+    let scroll_y = target_scroll.min(max_scroll);
+
+    let body = Paragraph::new(lines).scroll((scroll_y, 0)).block(
         Block::default()
             .title(" Theme, Tool Mode & Billing ")
             .borders(Borders::ALL)
@@ -3057,59 +3196,81 @@ fn draw_ui(
         .fg(palette.primary_fg)
         .add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
     let guide_lines = if show_guide {
-        vec![
-            Line::from(vec![
-                Span::styled("  1. ", guide_step_style),
-                Span::styled("Open connector settings: ", guide_text_style),
-                Span::styled("(click to copy)", guide_detail_style),
-            ]),
-            Line::from(vec![
-                Span::styled("     ", guide_text_style),
-                Span::styled(
-                    "https://chatgpt.com/apps#settings/Connectors",
-                    guide_copyable_style,
-                ),
-            ]),
-            Line::from(""),
-            Line::from(vec![
-                Span::styled("  2. ", guide_step_style),
-                Span::styled("Click ", guide_text_style),
-                Span::styled("Create app", guide_strong_style),
-            ]),
-            Line::from(""),
-            Line::from(vec![
-                Span::styled("  3. ", guide_step_style),
-                Span::styled("Fill in the form: ", guide_text_style),
-                Span::styled("(click to copy)", guide_detail_style),
-            ]),
-            Line::from(vec![
-                Span::styled("     Name          ", guide_detail_style),
-                Span::styled(" │ ", guide_separator_style),
-                Span::styled("CatDesk", guide_copyable_style),
-            ]),
-            Line::from(vec![
-                Span::styled("     MCP Server URL", guide_detail_style),
-                Span::styled(" │ ", guide_separator_style),
-                Span::styled(mcp_url.clone(), guide_copyable_style),
-            ]),
-            Line::from(vec![
-                Span::styled("     Authentication", guide_detail_style),
-                Span::styled(" │ ", guide_separator_style),
-                Span::styled("None", guide_copyable_style),
-            ]),
-            Line::from(""),
-            Line::from(vec![
-                Span::styled("  4. ", guide_step_style),
-                Span::styled("Click ", guide_text_style),
-                Span::styled("I understand and want to continue", guide_strong_style),
-            ]),
-            Line::from(""),
-            Line::from(vec![
-                Span::styled("  5. ", guide_step_style),
-                Span::styled("Click ", guide_text_style),
-                Span::styled("Create", guide_strong_style),
-            ]),
-        ]
+        if app.is_returning_user {
+            vec![
+                Line::from(vec![
+                    Span::styled("  ✅ ", guide_step_style),
+                    Span::styled("Connection URL is fixed and ready!", guide_strong_style),
+                ]),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("     You do ", guide_text_style),
+                    Span::styled("NOT", guide_strong_style),
+                    Span::styled(" need to recreate the app in ChatGPT.", guide_text_style),
+                ]),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("     Simply go to your ChatGPT conversation and send a message.", guide_text_style),
+                ]),
+                Line::from(vec![
+                    Span::styled("     CatDesk will instantly connect and this screen will disappear.", guide_detail_style),
+                ]),
+            ]
+        } else {
+            vec![
+                Line::from(vec![
+                    Span::styled("  1. ", guide_step_style),
+                    Span::styled("Open connector settings: ", guide_text_style),
+                    Span::styled("(click to copy)", guide_detail_style),
+                ]),
+                Line::from(vec![
+                    Span::styled("     ", guide_text_style),
+                    Span::styled(
+                        "https://chatgpt.com/apps#settings/Connectors",
+                        guide_copyable_style,
+                    ),
+                ]),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("  2. ", guide_step_style),
+                    Span::styled("Click ", guide_text_style),
+                    Span::styled("Create app", guide_strong_style),
+                ]),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("  3. ", guide_step_style),
+                    Span::styled("Fill in the form: ", guide_text_style),
+                    Span::styled("(click to copy)", guide_detail_style),
+                ]),
+                Line::from(vec![
+                    Span::styled("     Name          ", guide_detail_style),
+                    Span::styled(" │ ", guide_separator_style),
+                    Span::styled("CatDesk", guide_copyable_style),
+                ]),
+                Line::from(vec![
+                    Span::styled("     MCP Server URL", guide_detail_style),
+                    Span::styled(" │ ", guide_separator_style),
+                    Span::styled(mcp_url.clone(), guide_copyable_style),
+                ]),
+                Line::from(vec![
+                    Span::styled("     Authentication", guide_detail_style),
+                    Span::styled(" │ ", guide_separator_style),
+                    Span::styled("None", guide_copyable_style),
+                ]),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("  4. ", guide_step_style),
+                    Span::styled("Click ", guide_text_style),
+                    Span::styled("I understand and want to continue", guide_strong_style),
+                ]),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("  5. ", guide_step_style),
+                    Span::styled("Click ", guide_text_style),
+                    Span::styled("Create", guide_strong_style),
+                ]),
+            ]
+        }
     } else {
         Vec::new()
     };

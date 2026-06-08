@@ -108,6 +108,31 @@ pub enum ShowDetailMode {
 }
 
 impl ShowDetailMode {
+    pub fn all() -> &'static [ShowDetailMode] {
+        const MODES: [ShowDetailMode; 3] = [
+            ShowDetailMode::Disable,
+            ShowDetailMode::Expanded,
+            ShowDetailMode::Collapsed,
+        ];
+        &MODES
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Disable => "Disable",
+            Self::Expanded => "Expanded",
+            Self::Collapsed => "Collapsed",
+        }
+    }
+
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::Disable => "Completely disable the web widget. Fastest and uses least memory.",
+            Self::Expanded => "Show the full web widget with syntax-highlighted diffs.",
+            Self::Collapsed => "Show the web widget but keep code changes collapsed by default.",
+        }
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Disable => "disable",
@@ -121,6 +146,7 @@ impl ShowDetailMode {
 #[serde(rename_all = "camelCase")]
 pub struct AppConfig {
     pub ngrok_authtoken: Option<String>,
+    pub mcp_slug: Option<String>,
     #[serde(default)]
     pub agents_path_mode: AgentsPathMode,
     #[serde(default)]
@@ -142,6 +168,7 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             ngrok_authtoken: None,
+            mcp_slug: None,
             agents_path_mode: AgentsPathMode::Default,
             token_stats_layout: TokenStatsLayout::Right,
             show_detail_mode: ShowDetailMode::Expanded,
@@ -499,7 +526,9 @@ pub struct AppState {
     pub theme: String,
     pub mode: Mode,
     pub tool_mode: ToolMode,
+    pub show_detail_mode: ShowDetailMode,
     pub mcp_slug: String,
+    pub is_returning_user: bool,
     pub server_running: bool,
     pub ngrok_running: bool,
     pub ngrok_url: Option<String>,
@@ -770,9 +799,14 @@ fn enqueue_flow_segment(
     }
 }
 
-fn flow_bootstrap_step(index: usize) -> Option<&'static FlowBootstrapStep> {
+fn flow_bootstrap_step(index: usize, mode: ShowDetailMode) -> Option<&'static FlowBootstrapStep> {
     let mut offset = 0;
-    for phase in FLOW_BOOTSTRAP_PHASES {
+    let phases_to_check = if mode == ShowDetailMode::Disable {
+        2
+    } else {
+        FLOW_BOOTSTRAP_PHASES.len()
+    };
+    for phase in &FLOW_BOOTSTRAP_PHASES[..phases_to_check] {
         let end = offset + phase.steps.len();
         if index < end {
             return phase.steps.get(index - offset);
@@ -782,8 +816,13 @@ fn flow_bootstrap_step(index: usize) -> Option<&'static FlowBootstrapStep> {
     None
 }
 
-fn flow_bootstrap_steps_total() -> usize {
-    FLOW_BOOTSTRAP_PHASES
+pub fn flow_bootstrap_steps_total(mode: ShowDetailMode) -> usize {
+    let phases_to_check = if mode == ShowDetailMode::Disable {
+        2
+    } else {
+        FLOW_BOOTSTRAP_PHASES.len()
+    };
+    FLOW_BOOTSTRAP_PHASES[..phases_to_check]
         .iter()
         .map(|phase| phase.steps.len())
         .sum()
@@ -809,12 +848,13 @@ fn advance_bootstrap_progress(
     pending_steps: &mut VecDeque<usize>,
     events: &[String],
     direction: FlowDirection,
+    mode: ShowDetailMode,
 ) {
     match direction {
         FlowDirection::Forward => {
             for event in events {
                 let next_index = completed_steps.saturating_add(pending_steps.len());
-                let Some(step) = flow_bootstrap_step(next_index) else {
+                let Some(step) = flow_bootstrap_step(next_index, mode) else {
                     break;
                 };
                 if step.event != event {
@@ -832,7 +872,7 @@ fn advance_bootstrap_progress(
                 let Some(pending_index) = pending_steps.front().copied() else {
                     break;
                 };
-                let Some(step) = flow_bootstrap_step(pending_index) else {
+                let Some(step) = flow_bootstrap_step(pending_index, mode) else {
                     pending_steps.clear();
                     break;
                 };
@@ -877,11 +917,19 @@ impl AppState {
         if partner_binagotchy_seed.is_none() {
             mascot::archive_startup_mascot(mascot_seed)?;
         }
+        let is_returning_user = config.mcp_slug.is_some();
+        let mcp_slug = match config.mcp_slug {
+            Some(slug) if !slug.is_empty() => slug,
+            _ => generate_mcp_slug(),
+        };
+
         Ok(Self {
             theme: config.theme,
             mode: config.mode,
             tool_mode: config.tool_mode,
-            mcp_slug: generate_mcp_slug(),
+            show_detail_mode: config.show_detail_mode,
+            mcp_slug,
+            is_returning_user,
             server_running: false,
             ngrok_running: false,
             ngrok_url: None,
@@ -938,14 +986,20 @@ impl AppState {
 
     fn app_config(&self) -> std::io::Result<AppConfig> {
         let mut config = AppConfig::load_from_path(&self.config_path)?;
+        config.mcp_slug = Some(self.mcp_slug.clone());
         config.partner_binagotchy_seed = self.partner_binagotchy_seed.clone();
         config.set_catdesk_as_co_author = self.set_catdesk_as_co_author;
         config.theme = self.theme.clone();
         config.mode = self.mode;
         config.tool_mode = self.tool_mode;
+        config.show_detail_mode = self.show_detail_mode;
         config.usage_totals = self.usage_totals.clone().normalized();
         config.selected_browser = self.selected_browser.clone();
         Ok(config.normalized())
+    }
+
+    pub fn regenerate_mcp_slug(&mut self) {
+        self.mcp_slug = generate_mcp_slug();
     }
 
     pub fn persist_state(&self) -> std::io::Result<()> {
@@ -1031,6 +1085,7 @@ impl AppState {
                 &mut flow.bootstrap_pending_steps,
                 events,
                 direction,
+                self.show_detail_mode,
             );
             bootstrap.completed_steps = flow.bootstrap_completed_steps;
             bootstrap.pending_steps = flow.bootstrap_pending_steps.clone();
@@ -1071,6 +1126,7 @@ impl AppState {
                 &mut flow.bootstrap_pending_steps,
                 events,
                 direction,
+                self.show_detail_mode,
             );
             bootstrap.completed_steps = flow.bootstrap_completed_steps;
             bootstrap.pending_steps = flow.bootstrap_pending_steps.clone();
@@ -1100,7 +1156,7 @@ impl AppState {
 
     pub fn prune_closed_flows(&mut self) {
         let now_ms = now_unix_millis();
-        let bootstrap_steps_total = flow_bootstrap_steps_total();
+        let bootstrap_steps_total = flow_bootstrap_steps_total(self.show_detail_mode);
 
         for flow in &mut self.flows {
             prune_finished_segments(&mut flow.anim_queue, now_ms);
@@ -1604,8 +1660,8 @@ toolCallCount = 0
             .map(|phase| phase.steps.len())
             .collect();
         assert_eq!(phase_step_counts, vec![4, 4, 10, 11, 4]);
-        assert_eq!(flow_bootstrap_steps_total(), 33);
-        assert_eq!(flow.bootstrap_completed_steps, flow_bootstrap_steps_total());
+        assert_eq!(flow_bootstrap_steps_total(ShowDetailMode::Expanded), 33);
+        assert_eq!(flow.bootstrap_completed_steps, flow_bootstrap_steps_total(ShowDetailMode::Expanded));
         assert!(flow.bootstrap_pending_steps.is_empty());
 
         let _ = std::fs::remove_file(config_path);

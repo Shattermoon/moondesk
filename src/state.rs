@@ -147,6 +147,7 @@ impl ShowDetailMode {
 pub struct AppConfig {
     pub ngrok_authtoken: Option<String>,
     pub mcp_slug: Option<String>,
+    pub ngrok_domain: Option<String>,
     #[serde(default)]
     pub agents_path_mode: AgentsPathMode,
     #[serde(default)]
@@ -169,6 +170,7 @@ impl Default for AppConfig {
         Self {
             ngrok_authtoken: None,
             mcp_slug: None,
+            ngrok_domain: None,
             agents_path_mode: AgentsPathMode::Default,
             token_stats_layout: TokenStatsLayout::Right,
             show_detail_mode: ShowDetailMode::Expanded,
@@ -528,6 +530,7 @@ pub struct AppState {
     pub tool_mode: ToolMode,
     pub show_detail_mode: ShowDetailMode,
     pub mcp_slug: String,
+    pub ngrok_domain: Option<String>,
     pub is_returning_user: bool,
     pub server_running: bool,
     pub ngrok_running: bool,
@@ -917,7 +920,7 @@ impl AppState {
         if partner_binagotchy_seed.is_none() {
             mascot::archive_startup_mascot(mascot_seed)?;
         }
-        let is_returning_user = config.mcp_slug.is_some();
+        let is_returning_user = config.mcp_slug.is_some() && config.ngrok_domain.is_some();
         let mcp_slug = match config.mcp_slug {
             Some(slug) if !slug.is_empty() => slug,
             _ => generate_mcp_slug(),
@@ -929,6 +932,7 @@ impl AppState {
             tool_mode: config.tool_mode,
             show_detail_mode: config.show_detail_mode,
             mcp_slug,
+            ngrok_domain: config.ngrok_domain.clone(),
             is_returning_user,
             server_running: false,
             ngrok_running: false,
@@ -987,6 +991,7 @@ impl AppState {
     fn app_config(&self) -> std::io::Result<AppConfig> {
         let mut config = AppConfig::load_from_path(&self.config_path)?;
         config.mcp_slug = Some(self.mcp_slug.clone());
+        config.ngrok_domain = self.ngrok_domain.clone();
         config.partner_binagotchy_seed = self.partner_binagotchy_seed.clone();
         config.set_catdesk_as_co_author = self.set_catdesk_as_co_author;
         config.theme = self.theme.clone();

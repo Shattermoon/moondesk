@@ -1417,6 +1417,57 @@ fn centered_rect(percent_x: u16, height: u16, area: Rect) -> Rect {
     Rect::new(x, y, width, popup_height)
 }
 
+async fn run_prompt(
+    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    prompt_title: &str,
+    initial_value: &str,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let mut input = initial_value.to_string();
+    loop {
+        terminal.draw(|f| {
+            let area = centered_rect(60, 20, f.area());
+            let block = Block::default()
+                .title(prompt_title)
+                .borders(Borders::ALL)
+                .border_type(ratatui::widgets::BorderType::Rounded)
+                .style(Style::default().fg(Color::Yellow));
+            
+            let text = Paragraph::new(format!("> {}_", input))
+                .block(block)
+                .wrap(ratatui::widgets::Wrap { trim: true });
+            f.render_widget(ratatui::widgets::Clear, area);
+            f.render_widget(text, area);
+        })?;
+
+        if crossterm::event::poll(std::time::Duration::from_millis(100))? {
+            let event = crossterm::event::read()?;
+            match event {
+                crossterm::event::Event::Paste(text) => {
+                    input.push_str(&text);
+                }
+                crossterm::event::Event::Key(key) => {
+                    if key.kind != crossterm::event::KeyEventKind::Press {
+                        continue;
+                    }
+                    match key.code {
+                        crossterm::event::KeyCode::Enter => return Ok(Some(input)),
+                        crossterm::event::KeyCode::Esc => return Ok(None),
+                        crossterm::event::KeyCode::Backspace => {
+                            input.pop();
+                        }
+                        crossterm::event::KeyCode::Char(c) => {
+                            input.push(c);
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+
 async fn run_settings(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     state: SharedState,
@@ -1429,10 +1480,10 @@ async fn run_settings(
         let app = state.lock().await;
         themes.iter().position(|t| t.id == app.theme).unwrap_or(0)
     };
-    let total_rows = themes.len() + tool_modes.len() + show_detail_modes.len() + 1 + 2;
+    let total_rows = themes.len() + tool_modes.len() + show_detail_modes.len() + 1 + 3;
 
     loop {
-        let (current_theme, current_tool_mode, current_show_detail_mode, usage_totals, set_catdesk_as_co_author, mcp_slug) = {
+        let (current_theme, current_tool_mode, current_show_detail_mode, usage_totals, set_catdesk_as_co_author, mcp_slug, ngrok_domain) = {
             let app = state.lock().await;
             (
                 app.current_theme(),
@@ -1441,6 +1492,7 @@ async fn run_settings(
                 app.usage_totals.clone(),
                 app.set_catdesk_as_co_author,
                 app.mcp_slug.clone(),
+                app.ngrok_domain.clone(),
             )
         };
         terminal.draw(|f| {
@@ -1451,6 +1503,7 @@ async fn run_settings(
                 current_show_detail_mode,
                 set_catdesk_as_co_author,
                 &mcp_slug,
+                ngrok_domain.as_deref(),
                 &usage_totals,
                 selected_row,
                 confirm_reset_token_billing,
@@ -1519,9 +1572,24 @@ async fn run_settings(
                                 // Keep existing slug, do nothing
                             } else if selected_row == detail_mode_end + 2 {
                                 app.regenerate_mcp_slug();
-                                let msg = format!("Generated new security slug: {}", app.mcp_slug);
-                                app.log("INFO", msg);
+                                app.log("INFO", "Generated new random MCP slug".into());
                                 app.persist_state_with_log();
+                            } else if selected_row == detail_mode_end + 3 {
+                                let current_domain = app.ngrok_domain.clone().unwrap_or_default();
+                                drop(app);
+                                if let Some(new_domain) = run_prompt(terminal, "Enter ngrok static domain (with/without https://, empty to clear):", &current_domain).await? {
+                                    let mut cleaned = new_domain.trim();
+                                    if let Some(stripped) = cleaned.strip_prefix("https://") {
+                                        cleaned = stripped;
+                                    } else if let Some(stripped) = cleaned.strip_prefix("http://") {
+                                        cleaned = stripped;
+                                    }
+                                    cleaned = cleaned.trim_end_matches('/');
+                                    let mut app = state.lock().await;
+                                    app.ngrok_domain = if cleaned.is_empty() { None } else { Some(cleaned.to_string()) };
+                                    app.log("INFO", "Updated ngrok static domain".into());
+                                    app.persist_state_with_log();
+                                }
                             }
                         }
                     }
@@ -1552,6 +1620,7 @@ fn draw_settings(
     current_show_detail_mode: ShowDetailMode,
     set_catdesk_as_co_author: bool,
     mcp_slug: &str,
+    ngrok_domain: Option<&str>,
     usage_totals: &UsageTotals,
     selected_row: usize,
     confirm_reset_token_billing: bool,
@@ -1779,6 +1848,17 @@ fn draw_settings(
         Style::default().fg(palette.primary_fg)
     };
 
+    let domain_row = co_author_row + 3;
+    let domain_selected = domain_row == selected_row;
+    let domain_marker = if domain_selected { ">" } else { " " };
+    let domain_name_style = if domain_selected {
+        Style::default()
+            .fg(palette.key_fg)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(palette.primary_fg)
+    };
+
     lines.push(Line::from(""));
     lines.push(Line::from(vec![Span::styled(
         "  Connection Security URL:",
@@ -1814,6 +1894,32 @@ fn draw_settings(
             slug_new_row + 1
         ),
         slug_new_name_style,
+    )]));
+    if domain_selected {
+        selected_line_idx = lines.len();
+    }
+    lines.push(Line::from(vec![Span::styled(
+        format!(
+            " {} [{}] Set ngrok static domain",
+            domain_marker,
+            domain_row + 1
+        ),
+        domain_name_style,
+    )]));
+    lines.push(Line::from(vec![
+        Span::styled("     ", Style::default()),
+        Span::styled(
+            if let Some(domain) = ngrok_domain {
+                format!("[{}]", domain)
+            } else {
+                "[not set]".to_string()
+            },
+            Style::default().fg(palette.muted_fg),
+        ),
+    ]));
+    lines.push(Line::from(vec![Span::styled(
+        "     Pro tip: Your permanent ngrok-free.dev domain is auto-saved above.",
+        Style::default().fg(palette.muted_fg),
     )]));
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(

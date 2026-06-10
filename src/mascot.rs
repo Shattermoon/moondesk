@@ -368,28 +368,29 @@ pub(crate) fn catdesk_downloads_root() -> std::io::Result<PathBuf> {
 
 pub(crate) fn load_archived_binagotchy_cards() -> std::io::Result<Vec<ArchivedBinagotchyCard>> {
     let root = catdesk_binagotchy_root()?;
-    let mut entries: Vec<PathBuf> = fs::read_dir(&root)?
-        .map(|entry| entry.map(|value| value.path()))
-        .collect::<Result<Vec<_>, _>>()?
+    let mut entries: Vec<PathBuf> = match fs::read_dir(&root) {
+        Ok(dir) => dir
+            .map(|entry| entry.map(|value| value.path()))
+            .collect::<Result<Vec<_>, _>>()?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+        Err(e) => return Err(e),
+    }
         .into_iter()
         .filter(|path| path.is_dir())
         .collect();
     entries.sort_by(|left, right| right.file_name().cmp(&left.file_name()));
 
-    entries
+    Ok(entries
         .into_iter()
-        .map(|entry| {
+        .filter_map(|entry| {
             let folder = entry
                 .file_name()
-                .map(|value| value.to_string_lossy().to_string())
-                .ok_or_else(|| {
-                    std::io::Error::other("binagotchy archive is missing folder name")
-                })?;
-            let metadata_text = fs::read_to_string(entry.join(METADATA_FILE_NAME))?;
+                .map(|value| value.to_string_lossy().to_string())?;
+            let metadata_text = fs::read_to_string(entry.join(METADATA_FILE_NAME)).ok()?;
             let metadata: StoredMascotMetadata =
-                toml::from_str(&metadata_text).map_err(std::io::Error::other)?;
-            let bytes = fs::read(entry.join(CHARACTER_PNG_FILE_NAME))?;
-            Ok(ArchivedBinagotchyCard {
+                toml::from_str(&metadata_text).ok()?;
+            let bytes = fs::read(entry.join(CHARACTER_PNG_FILE_NAME)).ok()?;
+            Some(ArchivedBinagotchyCard {
                 folder,
                 seed: metadata.seed,
                 image: format!(
@@ -398,7 +399,7 @@ pub(crate) fn load_archived_binagotchy_cards() -> std::io::Result<Vec<ArchivedBi
                 ),
             })
         })
-        .collect()
+        .collect())
 }
 
 pub(crate) fn save_archived_binagotchy_folder(folder: &str) -> std::io::Result<PathBuf> {

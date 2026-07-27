@@ -1444,6 +1444,10 @@ fn tool_descriptor_should_attach_widget(name: &str) -> bool {
 }
 
 fn ensure_tool_descriptor_widget_template(tool: &mut Value) {
+    if current_show_detail_mode() == ShowDetailMode::Disable {
+        return;
+    }
+
     let Some(tool_obj) = tool.as_object_mut() else {
         return;
     };
@@ -1662,7 +1666,11 @@ fn current_token_stats_layout() -> TokenStatsLayout {
 }
 
 fn current_show_detail_mode() -> ShowDetailMode {
-    load_app_config()
+    #[cfg(test)]
+    {
+        return ShowDetailMode::Expanded;
+    }
+    crate::state::load_app_config()
         .map(|config| config.show_detail_mode)
         .unwrap_or_default()
 }
@@ -1980,6 +1988,10 @@ fn enrich_tool_result(
     mut result: Value,
     widget_context: Option<&AutoWidgetContext>,
 ) -> Value {
+    if current_show_detail_mode() == ShowDetailMode::Disable {
+        return result;
+    }
+
     if !result.is_object() {
         let value = result;
         result = json!({

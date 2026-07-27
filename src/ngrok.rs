@@ -18,12 +18,23 @@ pub async fn start(state: SharedState) -> Result<(), String> {
         .parse()
         .map_err(|e| format!("Invalid forward URL: {e}"))?;
 
-    let mut forwarder = ngrok::Session::builder()
+    let session = ngrok::Session::builder()
         .authtoken(authtoken)
         .connect()
         .await
-        .map_err(|e| format!("Failed to connect ngrok session: {e}"))?
-        .http_endpoint()
+        .map_err(|e| format!("Failed to connect ngrok session: {e}"))?;
+
+    let mut http_endpoint = session.http_endpoint();
+    if let Some(domain) = {
+        let app = state.lock().await;
+        app.ngrok_domain.clone()
+    } {
+        if !domain.is_empty() {
+            http_endpoint.domain(domain);
+        }
+    }
+
+    let mut forwarder = http_endpoint
         .listen_and_forward(forwards_to)
         .await
         .map_err(|e| format!("Failed to open ngrok tunnel: {e}"))?;
@@ -53,6 +64,16 @@ pub async fn start(state: SharedState) -> Result<(), String> {
         app.log("INFO", "ngrok SDK tunnel started".into());
         app.log("INFO", format!("ngrok URL: {url}"));
         app.log("INFO", format!("MCP Server URL: {url}{mcp_path}"));
+
+        if app.ngrok_domain.is_none() {
+            if let Ok(parsed_url) = reqwest::Url::parse(&url) {
+                if let Some(host) = parsed_url.host_str() {
+                    app.ngrok_domain = Some(host.to_string());
+                    app.log("INFO", format!("Auto-saved ngrok static domain: {host}"));
+                    app.persist_state_with_log();
+                }
+            }
+        }
     }
 
     Ok(())

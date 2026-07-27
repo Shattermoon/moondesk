@@ -192,6 +192,11 @@ impl AppConfig {
             .take()
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
+        self.ngrok_domain = self
+            .ngrok_domain
+            .take()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
         self.partner_binagotchy_seed = self
             .partner_binagotchy_seed
             .take()
@@ -621,6 +626,18 @@ pub fn save_ngrok_authtoken(token: &str) -> std::io::Result<PathBuf> {
     let path = app_config_path()?;
     let mut config = AppConfig::load_from_path(&path)?;
     config.ngrok_authtoken = Some(token.to_string());
+    config.save_to_path(&path)?;
+    Ok(path)
+}
+
+pub fn load_ngrok_domain() -> std::io::Result<Option<String>> {
+    Ok(load_app_config()?.ngrok_domain)
+}
+
+pub fn save_ngrok_domain(domain: &str) -> std::io::Result<PathBuf> {
+    let path = app_config_path()?;
+    let mut config = AppConfig::load_from_path(&path)?;
+    config.ngrok_domain = Some(domain.to_string());
     config.save_to_path(&path)?;
     Ok(path)
 }

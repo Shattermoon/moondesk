@@ -88,6 +88,8 @@ I tried this with GPT-5.2 before, and the results were poor. However, **GPT-5.4 
    catdesk
    ```
 
+   On first launch, CatDesk will ask you to enter your **ngrok authtoken** and **ngrok static domain** (e.g. `my-app.ngrok-free.dev`). You can get both from the [ngrok dashboard](https://dashboard.ngrok.com/get-started/setup). These are saved to `~/.catdesk/config.toml` and reused on subsequent launches.
+
    By default, CatDesk listens on port `3200`, as defined in [`main()`](/home/xeift/Desktop/CatDesk/src/main.rs#L325). You can override it with `PORT`. The workspace root defaults to the current working directory and can be overridden with `WORKSPACE_ROOT`, also in [`main()`](/home/xeift/Desktop/CatDesk/src/main.rs#L325).
 
    On macOS Terminal.app, CatDesk manages a dedicated `CatDesk` Terminal profile automatically. If the current Terminal tab is not already using that profile, CatDesk applies it, closes any temporary helper window, and asks you to run the same command again in that tab. It only starts immediately when the current tab is already using `CatDesk`. Set `CATDESK_SKIP_MACOS_TERMINAL_PROFILE=1` if you want to keep the current Terminal session untouched.
@@ -294,19 +296,19 @@ This is a bug on ChatGPT's side. There is nothing I can do about it, and changin
 
 The URL is made of these parts:
 
-| Part         | Example                       | What it means                          |
-| ------------ | ----------------------------- | -------------------------------------- |
-| Public URL   | `https://xxxx.ngrok-free.app` | The temporary ngrok address            |
-| Random path  | `/Ab3kL9xQ2pTm7VhC`           | A random per-run path added by CatDesk |
-| MCP endpoint | `/mcp`                        | The actual MCP endpoint                |
+| Part         | Example                       | What it means                                |
+| ------------ | ----------------------------- | -------------------------------------------- |
+| Public URL   | `https://xxxx.ngrok-free.dev` | Your ngrok static domain                     |
+| Random path  | `/Ab3kL9xQ2pTm7VhC`           | A random path generated on first launch      |
+| MCP endpoint | `/mcp`                        | The actual MCP endpoint                      |
 
 So the full URL looks like this:
 
 ```text
-https://xxxx.ngrok-free.app/Ab3kL9xQ2pTm7VhC/mcp
+https://xxxx.ngrok-free.dev/Ab3kL9xQ2pTm7VhC/mcp
 ```
 
-The URL changes every time you start CatDesk (both `Public URL` and `Random path`). ChatGPT Web does not provide an edit button for Custom Connectors, so you need to delete the old connector and create a new one with the new URL.
+Both the static domain and the random path are persisted in `~/.catdesk/config.toml`, so the full MCP URL stays the same across launches. You only need to set up the connector once.
 
 # About Binagotchy
 

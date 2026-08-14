@@ -395,7 +395,7 @@ fn flow_phase_lines(
     let title_width = FLOW_BOOTSTRAP_PHASES
         .iter()
         .enumerate()
-        .map(|(phase_index, phase)| format!("    Phase {}: {}", phase_index + 1, phase.title))
+        .map(|(phase_index, phase)| format!("    Phase {}  {}", phase_index + 1, phase.title))
         .map(|title| title.chars().count())
         .max()
         .unwrap_or(0);
@@ -421,7 +421,7 @@ fn flow_phase_lines(
         .iter()
         .enumerate()
         .map(|(phase_index, phase)| {
-            let title = format!("    Phase {}: {}", phase_index + 1, phase.title);
+            let title = format!("    Phase {}  {}", phase_index + 1, phase.title);
             let title_padding = title_width.saturating_sub(title.chars().count());
             let status_label = flow_phase_status_label(flow, phase_index);
             let status_text = status_label
@@ -959,7 +959,7 @@ fn draw_mode_select(f: &mut Frame, theme: &theme::ThemeDef, tool_mode: ToolMode)
     let lines = vec![
         Line::from(""),
         Line::from(Span::styled(
-            "  Select mode:",
+            "  Select mode",
             Style::default()
                 .fg(palette.title_fg)
                 .add_modifier(Modifier::BOLD),
@@ -1013,7 +1013,7 @@ fn draw_mode_select(f: &mut Frame, theme: &theme::ThemeDef, tool_mode: ToolMode)
             Span::styled("Settings", Style::default().fg(palette.primary_fg)),
             Span::styled(
                 format!(
-                    " (theme: {}, tool mode: {})",
+                    " (theme {}, tool mode {})",
                     theme.label,
                     tool_mode.label()
                 ),
@@ -1904,7 +1904,7 @@ fn draw_settings(
     let mut lines = vec![
         Line::from(""),
         Line::from(Span::styled(
-            "  Choose a theme:",
+            "  Choose a theme",
             Style::default()
                 .fg(palette.title_fg)
                 .add_modifier(Modifier::BOLD),
@@ -1944,7 +1944,7 @@ fn draw_settings(
     }
     lines.push(Line::from(""));
     lines.push(Line::from(vec![Span::styled(
-        "  Choose a tool mode:",
+        "  Choose a tool mode",
         Style::default()
             .fg(palette.title_fg)
             .add_modifier(Modifier::BOLD),
@@ -1985,7 +1985,7 @@ fn draw_settings(
     
     lines.push(Line::from(""));
     lines.push(Line::from(vec![Span::styled(
-        "  Choose a widget detail mode:",
+        "  Choose a widget detail mode",
         Style::default()
             .fg(palette.title_fg)
             .add_modifier(Modifier::BOLD),
@@ -2036,7 +2036,7 @@ fn draw_settings(
     };
     lines.push(Line::from(""));
     lines.push(Line::from(vec![Span::styled(
-        "  Commit attribution:",
+        "  Commit attribution",
         Style::default()
             .fg(palette.title_fg)
             .add_modifier(Modifier::BOLD),
@@ -2108,7 +2108,7 @@ fn draw_settings(
 
     lines.push(Line::from(""));
     lines.push(Line::from(vec![Span::styled(
-        "  Connection Security URL:",
+        "  Connection Security URL",
         Style::default()
             .fg(palette.title_fg)
             .add_modifier(Modifier::BOLD),
@@ -2170,32 +2170,32 @@ fn draw_settings(
     )]));
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "  Token billing:",
+        "  Token billing",
         Style::default()
             .fg(palette.title_fg)
             .add_modifier(Modifier::BOLD),
     )));
     lines.push(Line::from(vec![
-        Span::styled("  Input: ", Style::default().fg(palette.muted_fg)),
+        Span::styled("  Input ", Style::default().fg(palette.muted_fg)),
         Span::styled(
             usage_totals.input_tokens.to_string(),
             Style::default().fg(palette.primary_fg),
         ),
-        Span::styled("   Output: ", Style::default().fg(palette.muted_fg)),
+        Span::styled("   Output ", Style::default().fg(palette.muted_fg)),
         Span::styled(
             usage_totals.output_tokens.to_string(),
             Style::default().fg(palette.primary_fg),
         ),
     ]));
     lines.push(Line::from(vec![
-        Span::styled("  Total: ", Style::default().fg(palette.muted_fg)),
+        Span::styled("  Total ", Style::default().fg(palette.muted_fg)),
         Span::styled(
             usage_totals.total_tokens.to_string(),
             Style::default()
                 .fg(palette.secondary_fg)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled("   Tool calls: ", Style::default().fg(palette.muted_fg)),
+        Span::styled("   Tool calls ", Style::default().fg(palette.muted_fg)),
         Span::styled(
             usage_totals.tool_call_count.to_string(),
             Style::default().fg(palette.primary_fg),
@@ -2467,7 +2467,7 @@ fn draw_browser_select(
     let mut lines: Vec<Line> = vec![
         Line::from(vec![
             Span::styled(
-                "  Installed browsers: ",
+                "  Installed browsers ",
                 Style::default().fg(palette.muted_fg),
             ),
             Span::styled(
@@ -2479,14 +2479,14 @@ fn draw_browser_select(
         ]),
         Line::from(vec![
             Span::styled(
-                "  Remote debugging active: ",
+                "  Remote debugging active ",
                 Style::default().fg(palette.muted_fg),
             ),
             Span::styled(active_summary, Style::default().fg(palette.success_fg)),
         ]),
         Line::from(vec![
             Span::styled(
-                "  Selectable (Chromium): ",
+                "  Selectable (Chromium) ",
                 Style::default().fg(palette.muted_fg),
             ),
             Span::styled(
@@ -2516,7 +2516,7 @@ fn draw_browser_select(
                 Style::default().fg(palette.muted_fg),
             )]));
             lines.push(Line::from(vec![Span::styled(
-                format!("     status: {}", browser.support_note),
+                format!("     status {}", browser.support_note),
                 Style::default().fg(palette.warning_fg),
             )]));
             lines.push(Line::from(""));
@@ -2557,11 +2557,11 @@ fn draw_browser_select(
                 )]));
             }
             lines.push(Line::from(vec![Span::styled(
-                format!("     path: {}", browser.path),
+                format!("     path {}", browser.path),
                 Style::default().fg(palette.muted_fg),
             )]));
             lines.push(Line::from(vec![Span::styled(
-                format!("     status: {}", browser.support_note),
+                format!("     status {}", browser.support_note),
                 Style::default().fg(if browser.mcp_supported {
                     palette.success_fg
                 } else {
@@ -2570,7 +2570,7 @@ fn draw_browser_select(
             )]));
             if !browser.mcp_supported {
                 lines.push(Line::from(vec![Span::styled(
-                    "     remote debugging integration: not supported yet",
+                    "     remote debugging integration not supported yet",
                     Style::default().fg(palette.warning_fg),
                 )]));
             } else if browser.remote_debug_active {
@@ -2580,13 +2580,13 @@ fn draw_browser_select(
                     .map(|v| v.to_string())
                     .unwrap_or_else(|| "--".into());
                 lines.push(Line::from(vec![Span::styled(
-                    format!("     remote debugging: ACTIVE at {target} (pid {pid})"),
+                    format!("     remote debugging ACTIVE at {target} (pid {pid})"),
                     Style::default().fg(palette.success_fg),
                 )]));
             } else {
                 lines.push(Line::from(vec![Span::styled(
                     format!(
-                        "     remote debugging: not active (supported flag: {})",
+                        "     remote debugging not active (supported flag {})",
                         browser.remote_debug_hint
                     ),
                     Style::default().fg(palette.warning_fg),
@@ -3322,7 +3322,7 @@ fn draw_ui(
     };
     let request_stats_for = |app: &AppState| -> Vec<Span<'static>> {
         vec![
-            Span::styled("  Requests: ", Style::default().fg(palette.muted_fg)),
+            Span::styled("  Requests ", Style::default().fg(palette.muted_fg)),
             Span::styled(
                 app.request_count.to_string(),
                 Style::default().fg(palette.title_fg),
@@ -3343,7 +3343,7 @@ fn draw_ui(
 
     let mut status_lines: Vec<Line> = vec![
         Line::from(vec![
-            status_label("Mode:"),
+            status_label("Mode"),
             Span::styled(
                 mode_label,
                 Style::default()
@@ -3352,7 +3352,7 @@ fn draw_ui(
             ),
         ]),
         Line::from(vec![
-            status_label("Tool mode:"),
+            status_label("Tool mode"),
             Span::styled(
                 tool_mode_label,
                 Style::default()
@@ -3361,7 +3361,7 @@ fn draw_ui(
             ),
         ]),
         Line::from(vec![
-            status_label("Server:"),
+            status_label("Server"),
             Span::styled(
                 &server_status,
                 Style::default().fg(if app.server_running {
@@ -3372,7 +3372,7 @@ fn draw_ui(
             ),
         ]),
         Line::from(vec![
-            status_label("ngrok:"),
+            status_label("ngrok"),
             Span::styled(
                 ngrok_status,
                 Style::default().fg(if app.ngrok_running {
@@ -3383,7 +3383,7 @@ fn draw_ui(
             ),
         ]),
         Line::from(vec![
-            status_label("DevTools:"),
+            status_label("DevTools"),
             Span::styled(
                 devtools_status,
                 Style::default().fg(if app.devtools_running {
@@ -3394,7 +3394,7 @@ fn draw_ui(
             ),
         ]),
         Line::from(vec![
-            status_label("MCP Server URL:"),
+            status_label("MCP Server URL"),
             Span::styled(
                 &mcp_url,
                 Style::default().fg(if has_url {
@@ -3405,14 +3405,14 @@ fn draw_ui(
             ),
         ]),
         Line::from(vec![
-            status_label("Workspace:"),
+            status_label("Workspace"),
             Span::styled(
                 &*app.workspace_root,
                 Style::default().fg(palette.secondary_fg),
             ),
         ]),
         {
-            let mut spans = vec![status_label("Remote connected:")];
+            let mut spans = vec![status_label("Remote connected")];
             if app.remote_connected {
                 spans.push(Span::styled(
                     "V",
@@ -3432,36 +3432,36 @@ fn draw_ui(
         },
         session_usage_line(
             &app.session_usage_totals,
-            status_label("Session:"),
+            status_label("Session"),
             &palette,
         ),
     ];
 
     if !show_guide {
         status_lines.push(Line::from(vec![
-            status_label("Local browsers:"),
+            status_label("Local browsers"),
             Span::styled(browser_summary, Style::default().fg(palette.title_fg)),
         ]));
         status_lines.push(Line::from(vec![
-            status_label("Remote dbg support:"),
+            status_label("Remote dbg support"),
             Span::styled(remote_support_summary, Style::default().fg(palette.info_fg)),
         ]));
         status_lines.push(Line::from(vec![
-            status_label("Remote dbg active:"),
+            status_label("Remote dbg active"),
             Span::styled(
                 remote_active_summary,
                 Style::default().fg(palette.success_fg),
             ),
         ]));
         status_lines.push(Line::from(vec![
-            status_label("Selected browser:"),
+            status_label("Selected browser"),
             Span::styled(
                 selected_browser_summary,
                 Style::default().fg(palette.secondary_fg),
             ),
         ]));
         status_lines.push(Line::from(vec![
-            status_label("Selected target:"),
+            status_label("Selected target"),
             Span::styled(
                 selected_target_summary,
                 Style::default().fg(palette.info_fg),

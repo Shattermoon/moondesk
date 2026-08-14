@@ -250,10 +250,27 @@ fn format_usd_compact(usd: f64) -> String {
     }
 }
 
-fn session_usage_line(
+fn formatted_usage_values(usage: &UsageTotals) -> [String; 5] {
+    [
+        format_token_compact(usage.input_tokens),
+        format_token_compact(usage.output_tokens),
+        format_token_compact(usage.total_tokens),
+        format_token_compact(usage.tool_call_count),
+        format_usd_compact(estimate_gpt55_usage_cost_usd(usage)),
+    ]
+}
+
+fn usage_value_widths(first: &UsageTotals, second: &UsageTotals) -> [usize; 5] {
+    let first = formatted_usage_values(first);
+    let second = formatted_usage_values(second);
+    std::array::from_fn(|index| first[index].len().max(second[index].len()))
+}
+
+fn usage_line(
     usage: &UsageTotals,
     status_label: Span<'static>,
     palette: &theme::Palette,
+    value_widths: &[usize; 5],
 ) -> Line<'static> {
     let label_style = Style::default().fg(palette.muted_fg);
     let value_style = Style::default()
@@ -262,25 +279,38 @@ fn session_usage_line(
     let price_style = Style::default()
         .fg(palette.success_fg)
         .add_modifier(Modifier::BOLD);
+    let values = formatted_usage_values(usage);
 
     Line::from(vec![
         status_label,
         Span::styled("↓", label_style),
-        Span::styled(format_token_compact(usage.input_tokens), value_style),
+        Span::styled(
+            format!("{:<width$}", values[0], width = value_widths[0]),
+            value_style,
+        ),
         Span::styled(" (tool input, llm output)", label_style),
         Span::raw("  "),
         Span::styled("↑", label_style),
-        Span::styled(format_token_compact(usage.output_tokens), value_style),
+        Span::styled(
+            format!("{:<width$}", values[1], width = value_widths[1]),
+            value_style,
+        ),
         Span::raw("  "),
         Span::styled("Σ", label_style),
-        Span::styled(format_token_compact(usage.total_tokens), value_style),
+        Span::styled(
+            format!("{:<width$}", values[2], width = value_widths[2]),
+            value_style,
+        ),
         Span::raw("  "),
         Span::styled("ƒ", label_style),
-        Span::styled(format_token_compact(usage.tool_call_count), value_style),
+        Span::styled(
+            format!("{:<width$}", values[3], width = value_widths[3]),
+            value_style,
+        ),
         Span::raw("  "),
         Span::styled("$", label_style),
         Span::styled(
-            format_usd_compact(estimate_gpt55_usage_cost_usd(usage)),
+            format!("{:<width$}", values[4], width = value_widths[4]),
             price_style,
         ),
     ])
@@ -3341,6 +3371,7 @@ fn draw_ui(
     let status_content_height = status_height.saturating_sub(4) as usize;
     let flow_block_lines = 2;
 
+    let usage_widths = usage_value_widths(&app.session_usage_totals, &app.usage_totals);
     let mut status_lines: Vec<Line> = vec![
         Line::from(vec![
             status_label("Mode"),
@@ -3430,10 +3461,17 @@ fn draw_ui(
             }
             Line::from(spans)
         },
-        session_usage_line(
+        usage_line(
             &app.session_usage_totals,
             status_label("Session"),
             &palette,
+            &usage_widths,
+        ),
+        usage_line(
+            &app.usage_totals,
+            status_label("All-time"),
+            &palette,
+            &usage_widths,
         ),
     ];
 

@@ -267,6 +267,7 @@ fn session_usage_line(
         status_label,
         Span::styled("↓", label_style),
         Span::styled(format_token_compact(usage.input_tokens), value_style),
+        Span::styled(" (tool input, llm output)", label_style),
         Span::raw("  "),
         Span::styled("↑", label_style),
         Span::styled(format_token_compact(usage.output_tokens), value_style),

@@ -260,12 +260,15 @@ fn mcp_url_reveal_seconds(remaining: Duration) -> u64 {
         .min(MCP_URL_REVEAL_DURATION.as_secs() as u128) as u64
 }
 
-fn mcp_url_reveal_bar(remaining: Duration) -> String {
-    let lit = mcp_url_reveal_seconds(remaining) as usize;
-    format!(
-        "{}{}",
+fn mcp_url_reveal_bar_segments(remaining: Duration) -> (String, String) {
+    let total_millis = MCP_URL_REVEAL_DURATION.as_millis();
+    let remaining_millis = remaining.as_millis().min(total_millis);
+    let lit = remaining_millis
+        .saturating_mul(MCP_URL_REVEAL_BAR_CELLS as u128)
+        .div_ceil(total_millis) as usize;
+    (
         "━".repeat(lit.min(MCP_URL_REVEAL_BAR_CELLS)),
-        "·".repeat(MCP_URL_REVEAL_BAR_CELLS.saturating_sub(lit)),
+        "─".repeat(MCP_URL_REVEAL_BAR_CELLS.saturating_sub(lit)),
     )
 }
 
@@ -3363,13 +3366,8 @@ fn draw_ui(
         (Some(_), false) => MCP_URL_MASK.to_string(),
         (None, _) => "--".to_string(),
     };
-    let mcp_url_security_status = mcp_url_reveal_remaining.map(|remaining| {
-        format!(
-            "[ EXPOSED {:>2}s ] {}",
-            mcp_url_reveal_seconds(remaining),
-            mcp_url_reveal_bar(remaining),
-        )
-    });
+    let mcp_url_security_status = mcp_url_reveal_remaining
+        .map(|remaining| format!("[ EXPOSED {:>2}s ]", mcp_url_reveal_seconds(remaining)));
     let browser_summary = browser::format_browser_names(&app.detected_browsers);
     let remote_support_summary = browser::format_remote_debug_names(&app.detected_browsers);
     let remote_active_summary = browser::format_active_remote_debug_names(&app.detected_browsers);
@@ -3501,7 +3499,7 @@ fn draw_ui(
                 spans.push(Span::raw("  "));
                 let security_text = mcp_url_security_status
                     .as_deref()
-                    .unwrap_or("[ SEALED · click ]");
+                    .unwrap_or("Click to reveal");
                 let security_color = match mcp_url_reveal_remaining {
                     Some(remaining) if mcp_url_reveal_seconds(remaining) <= 3 => palette.danger_fg,
                     Some(_) => palette.warning_fg,
@@ -3513,6 +3511,20 @@ fn draw_ui(
                         .fg(security_color)
                         .add_modifier(Modifier::BOLD),
                 ));
+                if let Some(remaining) = mcp_url_reveal_remaining {
+                    let (remaining_bar, elapsed_bar) = mcp_url_reveal_bar_segments(remaining);
+                    spans.push(Span::raw("  "));
+                    spans.push(Span::styled(
+                        remaining_bar,
+                        Style::default()
+                            .fg(security_color)
+                            .add_modifier(Modifier::BOLD),
+                    ));
+                    spans.push(Span::styled(
+                        elapsed_bar,
+                        Style::default().fg(palette.muted_fg),
+                    ));
+                }
             }
             Line::from(spans)
         },
@@ -3736,7 +3748,7 @@ fn draw_ui(
                         spans.push(Span::raw("  "));
                         let security_text = mcp_url_security_status
                             .as_deref()
-                            .unwrap_or("[ SEALED · click ]");
+                            .unwrap_or("Click to reveal");
                         let security_color = match mcp_url_reveal_remaining {
                             Some(remaining) if mcp_url_reveal_seconds(remaining) <= 3 => {
                                 palette.danger_fg
@@ -3750,6 +3762,20 @@ fn draw_ui(
                                 .fg(security_color)
                                 .add_modifier(Modifier::BOLD),
                         ));
+                        if let Some(remaining) = mcp_url_reveal_remaining {
+                            let (remaining_bar, elapsed_bar) = mcp_url_reveal_bar_segments(remaining);
+                            spans.push(Span::raw("  "));
+                            spans.push(Span::styled(
+                                remaining_bar,
+                                Style::default()
+                                    .fg(security_color)
+                                    .add_modifier(Modifier::BOLD),
+                            ));
+                            spans.push(Span::styled(
+                                elapsed_bar,
+                                Style::default().fg(palette.muted_fg),
+                            ));
+                        }
                     }
                     Line::from(spans)
                 },

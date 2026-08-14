@@ -43,6 +43,9 @@ const FLOW_ROW_CELLS: usize = FLOW_ANIM_CELLS;
 const FLOW_LANE_LEFT_LABEL: &str = "Your computer ";
 const REMOTE_CONNECT_UI_GRACE_MS: u128 = 8_000;
 const UI_POLL_INTERVAL: Duration = Duration::from_nanos(1_000_000_000 / 60);
+const MCP_URL_REVEAL_DURATION: Duration = Duration::from_secs(10);
+const MCP_URL_MASK: &str = "https://▓▓▓▓▓▓▓▓/▓▓▓▓▓▓▓▓/mcp";
+const MCP_URL_REVEAL_BAR_CELLS: usize = 10;
 const STATUS_PANEL_HEIGHT: u16 = TUI_MASCOT_BLOCK_HEIGHT + 6;
 const STATUS_LABEL_WIDTH: usize = 19;
 const GPT55_INPUT_USD_PER_1M: f64 = 5.0;
@@ -248,6 +251,22 @@ fn format_usd_compact(usd: f64) -> String {
     } else {
         trimmed.to_string()
     }
+}
+
+fn mcp_url_reveal_seconds(remaining: Duration) -> u64 {
+    remaining
+        .as_millis()
+        .div_ceil(1_000)
+        .min(MCP_URL_REVEAL_DURATION.as_secs() as u128) as u64
+}
+
+fn mcp_url_reveal_bar(remaining: Duration) -> String {
+    let lit = mcp_url_reveal_seconds(remaining) as usize;
+    format!(
+        "{}{}",
+        "━".repeat(lit.min(MCP_URL_REVEAL_BAR_CELLS)),
+        "·".repeat(MCP_URL_REVEAL_BAR_CELLS.saturating_sub(lit)),
+    )
 }
 
 fn formatted_usage_values(usage: &UsageTotals) -> [String; 5] {
@@ -3004,6 +3023,7 @@ async fn run_tui(
     let mut last_animation_snapshot = String::new();
     #[allow(unused_assignments)]
     let mut last_mcp_url: Option<String> = None;
+    let mut mcp_url_revealed_until: Option<Instant> = None;
 
     loop {
         {
@@ -3012,6 +3032,11 @@ async fn run_tui(
             app.prune_closed_flows();
         }
         {
+            let reveal_remaining = mcp_url_revealed_until
+                .and_then(|deadline| deadline.checked_duration_since(Instant::now()));
+            if mcp_url_revealed_until.is_some() && reveal_remaining.is_none() {
+                mcp_url_revealed_until = None;
+            }
             let app = state.lock().await;
             last_mcp_url = app.public_mcp_url();
             let toast_ref = toast
@@ -3028,6 +3053,7 @@ async fn run_tui(
                     log_follow_tail,
                     &mut latest_log_view,
                     toast_ref,
+                    reveal_remaining,
                 );
 
                 if let Some(((c0, r0), (c1, r1))) = selection.range() {
@@ -3171,7 +3197,24 @@ async fn run_tui(
                                             if line.contains("MCP Server URL")
                                                 || line.contains(prefix)
                                             {
-                                                Some(url.clone())
+                                                let revealed = mcp_url_revealed_until
+                                                    .and_then(|deadline| {
+                                                        deadline.checked_duration_since(Instant::now())
+                                                    })
+                                                    .is_some();
+                                                if revealed {
+                                                    Some(url.clone())
+                                                } else {
+                                                    let now = Instant::now();
+                                                    mcp_url_revealed_until =
+                                                        Some(now + MCP_URL_REVEAL_DURATION);
+                                                    toast = Some((
+                                                        "URL revealed for 10s",
+                                                        (mouse.column, mouse.row),
+                                                        now,
+                                                    ));
+                                                    None
+                                                }
                                             } else {
                                                 None
                                             }
@@ -3243,6 +3286,7 @@ fn draw_ui(
     log_follow_tail: bool,
     log_view: &mut Option<(usize, usize)>,
     toast: Option<(&str, (u16, u16))>,
+    mcp_url_reveal_remaining: Option<Duration>,
 ) {
     let palette = app.current_theme().palette;
     let area = f.area();
@@ -3312,7 +3356,20 @@ fn draw_ui(
             "N/A"
         }
     };
-    let mcp_url: String = app.public_mcp_url().unwrap_or_else(|| "--".into());
+    let full_mcp_url = app.public_mcp_url();
+    let mcp_url_is_revealed = full_mcp_url.is_some() && mcp_url_reveal_remaining.is_some();
+    let mcp_url = match (&full_mcp_url, mcp_url_is_revealed) {
+        (Some(url), true) => url.clone(),
+        (Some(_), false) => MCP_URL_MASK.to_string(),
+        (None, _) => "--".to_string(),
+    };
+    let mcp_url_security_status = mcp_url_reveal_remaining.map(|remaining| {
+        format!(
+            "[ EXPOSED {:>2}s ] {}",
+            mcp_url_reveal_seconds(remaining),
+            mcp_url_reveal_bar(remaining),
+        )
+    });
     let browser_summary = browser::format_browser_names(&app.detected_browsers);
     let remote_support_summary = browser::format_remote_debug_names(&app.detected_browsers);
     let remote_active_summary = browser::format_active_remote_debug_names(&app.detected_browsers);
@@ -3424,17 +3481,41 @@ fn draw_ui(
                 }),
             ),
         ]),
-        Line::from(vec![
-            status_label("MCP Server URL"),
-            Span::styled(
-                &mcp_url,
-                Style::default().fg(if has_url {
-                    palette.info_fg
-                } else {
-                    palette.muted_fg
-                }),
-            ),
-        ]),
+        {
+            let mut spans = vec![
+                status_label("MCP Server URL"),
+                Span::styled(
+                    &mcp_url,
+                    Style::default().fg(if has_url {
+                        if mcp_url_is_revealed {
+                            palette.info_fg
+                        } else {
+                            palette.muted_fg
+                        }
+                    } else {
+                        palette.muted_fg
+                    }),
+                ),
+            ];
+            if has_url {
+                spans.push(Span::raw("  "));
+                let security_text = mcp_url_security_status
+                    .as_deref()
+                    .unwrap_or("[ SEALED · click ]");
+                let security_color = match mcp_url_reveal_remaining {
+                    Some(remaining) if mcp_url_reveal_seconds(remaining) <= 3 => palette.danger_fg,
+                    Some(_) => palette.warning_fg,
+                    None => palette.muted_fg,
+                };
+                spans.push(Span::styled(
+                    security_text.to_string(),
+                    Style::default()
+                        .fg(security_color)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            }
+            Line::from(spans)
+        },
         Line::from(vec![
             status_label("Workspace"),
             Span::styled(
@@ -3631,18 +3712,47 @@ fn draw_ui(
                 Line::from(vec![
                     Span::styled("  3. ", guide_step_style),
                     Span::styled("Fill in the form: ", guide_text_style),
-                    Span::styled("(click to copy)", guide_detail_style),
+                    Span::styled("(URL reveals before copy)", guide_detail_style),
                 ]),
                 Line::from(vec![
                     Span::styled("     Name          ", guide_detail_style),
                     Span::styled(" │ ", guide_separator_style),
                     Span::styled("CatDesk", guide_copyable_style),
                 ]),
-                Line::from(vec![
-                    Span::styled("     MCP Server URL", guide_detail_style),
-                    Span::styled(" │ ", guide_separator_style),
-                    Span::styled(mcp_url.clone(), guide_copyable_style),
-                ]),
+                {
+                    let mut spans = vec![
+                        Span::styled("     MCP Server URL", guide_detail_style),
+                        Span::styled(" │ ", guide_separator_style),
+                        Span::styled(
+                            mcp_url.clone(),
+                            if mcp_url_is_revealed {
+                                guide_copyable_style
+                            } else {
+                                guide_detail_style
+                            },
+                        ),
+                    ];
+                    if has_url {
+                        spans.push(Span::raw("  "));
+                        let security_text = mcp_url_security_status
+                            .as_deref()
+                            .unwrap_or("[ SEALED · click ]");
+                        let security_color = match mcp_url_reveal_remaining {
+                            Some(remaining) if mcp_url_reveal_seconds(remaining) <= 3 => {
+                                palette.danger_fg
+                            }
+                            Some(_) => palette.warning_fg,
+                            None => palette.muted_fg,
+                        };
+                        spans.push(Span::styled(
+                            security_text.to_string(),
+                            Style::default()
+                                .fg(security_color)
+                                .add_modifier(Modifier::BOLD),
+                        ));
+                    }
+                    Line::from(spans)
+                },
                 Line::from(vec![
                     Span::styled("     Authentication", guide_detail_style),
                     Span::styled(" │ ", guide_separator_style),

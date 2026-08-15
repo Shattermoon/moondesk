@@ -558,7 +558,8 @@ fn should_show_connect_guide(app: &AppState, now_millis: u128) -> bool {
         .last_remote_activity_ms
         .map(|t| now_millis.saturating_sub(t) < REMOTE_CONNECT_UI_GRACE_MS)
         .unwrap_or(false);
-    both_running
+    !app.is_returning_user
+        && both_running
         && has_url
         && !app.remote_connected
         && visible_flow_count == 0
@@ -3612,7 +3613,7 @@ fn draw_ui(
             let call_text = if app.remote_connected {
                 "awaiting request"
             } else {
-                "flow closed"
+                "awaiting connection"
             };
             let call_offset = flow_call_offset(call_text);
             status_lines.push(Line::from(vec![

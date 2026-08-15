@@ -677,15 +677,12 @@ fn search_text_grep(
     let mut truncated = false;
 
     for file in files.iter() {
-        if returned_matches >= options.max_matches {
-            truncated = true;
-            break;
-        }
-        let remaining_matches = options.max_matches - returned_matches;
+        let remaining_matches = options.max_matches.saturating_sub(returned_matches);
+        let probe_limit = remaining_matches.saturating_add(1);
         let file_match_limit = options
             .max_matches_per_file
-            .map(|value| value.min(remaining_matches))
-            .unwrap_or(remaining_matches);
+            .map(|value| value.min(probe_limit))
+            .unwrap_or(probe_limit);
         let mut command = ProcessCommand::new("grep");
         command
             .current_dir(root)
@@ -755,6 +752,9 @@ fn search_text_grep(
                 returned_matches += 1;
             }
             results.push(entry);
+        }
+        if truncated {
+            break;
         }
     }
 
@@ -1254,6 +1254,99 @@ mod tests {
             vec![("src/main.rs", 2, "alpha1")]
         );
         assert!(output.results.iter().any(|entry| entry.is_context));
+
+        let _ = fs::remove_dir_all(workspace_root);
+    }
+
+    #[test]
+    fn grep_search_backend_marks_truncated_when_an_extra_match_exists() {
+        if !command_available("grep") {
+            return;
+        }
+
+        let workspace_root = test_workspace("search-grep-truncated");
+        fs::create_dir_all(workspace_root.join("src")).expect("create workspace");
+        fs::write(
+            workspace_root.join("src").join("main.rs"),
+            "alpha1\nbeta\nalpha2\n",
+        )
+        .expect("write source");
+
+        let output = search_text_grep(
+            &workspace_root,
+            &workspace_root,
+            ResolvedSearchTextOptions {
+                pattern: "alpha[0-9]",
+                glob: Some("*.rs"),
+                fixed_strings: false,
+                case_insensitive: false,
+                before: 0,
+                after: 0,
+                max_matches: 1,
+                max_matches_per_file: None,
+                include_hidden: false,
+                no_ignore: false,
+            },
+        )
+        .unwrap_or_else(|_| panic!("search"));
+
+        assert_eq!(output.backend, "grep");
+        assert_eq!(output.match_count, 1);
+        assert!(output.truncated);
+        assert_eq!(
+            output
+                .results
+                .iter()
+                .filter(|entry| !entry.is_context)
+                .map(|entry| (entry.path.as_str(), entry.line, entry.text.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("src/main.rs", 1, "alpha1")]
+        );
+
+        let _ = fs::remove_dir_all(workspace_root);
+    }
+
+    #[test]
+    fn grep_search_backend_does_not_mark_exact_limit_as_truncated() {
+        if !command_available("grep") {
+            return;
+        }
+
+        let workspace_root = test_workspace("search-grep-exact-limit");
+        fs::create_dir_all(workspace_root.join("src")).expect("create workspace");
+        fs::write(workspace_root.join("src").join("a.rs"), "alpha1\n").expect("write match");
+        fs::write(workspace_root.join("src").join("b.rs"), "beta\n").expect("write non-match");
+
+        let output = search_text_grep(
+            &workspace_root,
+            &workspace_root,
+            ResolvedSearchTextOptions {
+                pattern: "alpha[0-9]",
+                glob: Some("*.rs"),
+                fixed_strings: false,
+                case_insensitive: false,
+                before: 0,
+                after: 0,
+                max_matches: 1,
+                max_matches_per_file: None,
+                include_hidden: false,
+                no_ignore: false,
+            },
+        )
+        .unwrap_or_else(|_| panic!("search"));
+
+        assert_eq!(output.backend, "grep");
+        assert_eq!(output.match_count, 1);
+        assert!(!output.truncated);
+        assert_eq!(
+            output
+                .results
+                .iter()
+                .filter(|entry| !entry.is_context)
+                .map(|entry| (entry.path.as_str(), entry.line, entry.text.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("src/a.rs", 1, "alpha1")]
+        );
 
         let _ = fs::remove_dir_all(workspace_root);
     }

@@ -536,7 +536,11 @@ fn flow_bootstrap_complete(flow: &FlowLane, mode: state::ShowDetailMode) -> bool
         && flow.bootstrap_pending_steps.is_empty()
 }
 
-fn flow_bootstrap_status_visible(flow: &FlowLane, now_millis: u128, mode: state::ShowDetailMode) -> bool {
+fn flow_bootstrap_status_visible(
+    flow: &FlowLane,
+    now_millis: u128,
+    mode: state::ShowDetailMode,
+) -> bool {
     if !flow_bootstrap_complete(flow, mode) {
         return true;
     }
@@ -1083,11 +1087,7 @@ fn draw_mode_select(f: &mut Frame, theme: &theme::ThemeDef, tool_mode: ToolMode)
             ),
             Span::styled("Settings", Style::default().fg(palette.primary_fg)),
             Span::styled(
-                format!(
-                    " (theme {}, tool mode {})",
-                    theme.label,
-                    tool_mode.label()
-                ),
+                format!(" (theme {}, tool mode {})", theme.label, tool_mode.label()),
                 Style::default().fg(palette.muted_fg),
             ),
         ]),
@@ -1749,7 +1749,7 @@ async fn run_prompt(
                 .borders(Borders::ALL)
                 .border_type(ratatui::widgets::BorderType::Rounded)
                 .style(Style::default().fg(Color::Yellow));
-            
+
             let text = Paragraph::new(format!("> {}_", input))
                 .block(block)
                 .wrap(ratatui::widgets::Wrap { trim: true });
@@ -1785,7 +1785,6 @@ async fn run_prompt(
     }
 }
 
-
 async fn run_settings(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     state: SharedState,
@@ -1801,7 +1800,15 @@ async fn run_settings(
     let total_rows = themes.len() + tool_modes.len() + show_detail_modes.len() + 1 + 3;
 
     loop {
-        let (current_theme, current_tool_mode, current_show_detail_mode, usage_totals, set_catdesk_as_co_author, mcp_slug, ngrok_domain) = {
+        let (
+            current_theme,
+            current_tool_mode,
+            current_show_detail_mode,
+            usage_totals,
+            set_catdesk_as_co_author,
+            mcp_slug,
+            ngrok_domain,
+        ) = {
             let app = state.lock().await;
             (
                 app.current_theme(),
@@ -1860,7 +1867,7 @@ async fn run_settings(
                             let tool_mode_end = tool_mode_start + tool_modes.len();
                             let detail_mode_start = tool_mode_end;
                             let detail_mode_end = detail_mode_start + show_detail_modes.len();
-                            
+
                             if selected_row < tool_mode_end {
                                 let picked = tool_modes[selected_row - tool_mode_start];
                                 if app.tool_mode != picked {
@@ -1872,7 +1879,10 @@ async fn run_settings(
                                 let picked = show_detail_modes[selected_row - detail_mode_start];
                                 if app.show_detail_mode != picked {
                                     app.show_detail_mode = picked;
-                                    app.log("INFO", format!("Widget detail mode: {}", picked.label()));
+                                    app.log(
+                                        "INFO",
+                                        format!("Widget detail mode: {}", picked.label()),
+                                    );
                                     app.persist_state_with_log();
                                 }
                             } else if selected_row == detail_mode_end {
@@ -2053,7 +2063,7 @@ fn draw_settings(
             Style::default().fg(palette.muted_fg),
         )]));
     }
-    
+
     lines.push(Line::from(""));
     lines.push(Line::from(vec![Span::styled(
         "  Choose a widget detail mode",
@@ -3247,7 +3257,8 @@ async fn run_tui(
                                             if let Some(ref domain) = last_ngrok_domain {
                                                 let revealed = log_ngrok_domain_revealed_until
                                                     .and_then(|deadline| {
-                                                        deadline.checked_duration_since(Instant::now())
+                                                        deadline
+                                                            .checked_duration_since(Instant::now())
                                                     })
                                                     .is_some();
                                                 if revealed {
@@ -3270,7 +3281,8 @@ async fn run_tui(
                                             if let Some(ref url) = last_ngrok_url {
                                                 let revealed = log_ngrok_url_revealed_until
                                                     .and_then(|deadline| {
-                                                        deadline.checked_duration_since(Instant::now())
+                                                        deadline
+                                                            .checked_duration_since(Instant::now())
                                                     })
                                                     .is_some();
                                                 if revealed {
@@ -3293,7 +3305,8 @@ async fn run_tui(
                                             if let Some(ref url) = last_mcp_url {
                                                 let revealed = log_mcp_url_revealed_until
                                                     .and_then(|deadline| {
-                                                        deadline.checked_duration_since(Instant::now())
+                                                        deadline
+                                                            .checked_duration_since(Instant::now())
                                                     })
                                                     .is_some();
                                                 if revealed {
@@ -3319,7 +3332,8 @@ async fn run_tui(
                                             {
                                                 let revealed = mcp_url_revealed_until
                                                     .and_then(|deadline| {
-                                                        deadline.checked_duration_since(Instant::now())
+                                                        deadline
+                                                            .checked_duration_since(Instant::now())
                                                     })
                                                     .is_some();
                                                 if revealed {
@@ -3842,12 +3856,14 @@ fn draw_ui(
                     Span::styled(" need to recreate the app in ChatGPT.", guide_text_style),
                 ]),
                 Line::from(""),
-                Line::from(vec![
-                    Span::styled("     Simply go to your ChatGPT conversation and send a message.", guide_text_style),
-                ]),
-                Line::from(vec![
-                    Span::styled("     CatDesk will instantly connect and this screen will disappear.", guide_detail_style),
-                ]),
+                Line::from(vec![Span::styled(
+                    "     Simply go to your ChatGPT conversation and send a message.",
+                    guide_text_style,
+                )]),
+                Line::from(vec![Span::styled(
+                    "     CatDesk will instantly connect and this screen will disappear.",
+                    guide_detail_style,
+                )]),
             ]
         } else {
             vec![
@@ -3912,7 +3928,8 @@ fn draw_ui(
                                 .add_modifier(Modifier::BOLD),
                         ));
                         if let Some(remaining) = mcp_url_reveal_remaining {
-                            let (remaining_bar, elapsed_bar) = mcp_url_reveal_bar_segments(remaining);
+                            let (remaining_bar, elapsed_bar) =
+                                mcp_url_reveal_bar_segments(remaining);
                             spans.push(Span::raw("  "));
                             spans.push(Span::styled(
                                 remaining_bar,

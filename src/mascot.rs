@@ -375,9 +375,9 @@ pub(crate) fn load_archived_binagotchy_cards() -> std::io::Result<Vec<ArchivedBi
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
         Err(e) => return Err(e),
     }
-        .into_iter()
-        .filter(|path| path.is_dir())
-        .collect();
+    .into_iter()
+    .filter(|path| path.is_dir())
+    .collect();
     entries.sort_by(|left, right| right.file_name().cmp(&left.file_name()));
 
     Ok(entries
@@ -387,8 +387,7 @@ pub(crate) fn load_archived_binagotchy_cards() -> std::io::Result<Vec<ArchivedBi
                 .file_name()
                 .map(|value| value.to_string_lossy().to_string())?;
             let metadata_text = fs::read_to_string(entry.join(METADATA_FILE_NAME)).ok()?;
-            let metadata: StoredMascotMetadata =
-                toml::from_str(&metadata_text).ok()?;
+            let metadata: StoredMascotMetadata = toml::from_str(&metadata_text).ok()?;
             let bytes = fs::read(entry.join(CHARACTER_PNG_FILE_NAME)).ok()?;
             Some(ArchivedBinagotchyCard {
                 folder,

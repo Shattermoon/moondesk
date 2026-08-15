@@ -646,10 +646,7 @@ fn short_flow_id(flow_id: &str) -> String {
 
 #[cfg(test)]
 pub fn user_home_dir() -> std::io::Result<PathBuf> {
-    Ok(std::env::temp_dir().join(format!(
-        "catdesk-test-home-{}",
-        std::process::id()
-    )))
+    Ok(std::env::temp_dir().join(format!("catdesk-test-home-{}", std::process::id())))
 }
 
 #[cfg(not(test))]
@@ -1362,7 +1359,10 @@ mod tests {
         assert!(matches!(app.tool_mode, ToolMode::MultiTools));
         assert!(matches!(app.show_detail_mode, ShowDetailMode::Collapsed));
         assert!(app.set_catdesk_as_co_author);
-        assert_eq!(app.partner_binagotchy_seed.as_deref(), Some("00000000000000ff"));
+        assert_eq!(
+            app.partner_binagotchy_seed.as_deref(),
+            Some("00000000000000ff")
+        );
         let all_time_usage = app.all_time_usage_totals();
         assert_eq!(all_time_usage.tool_input_tokens, 120);
         assert_eq!(all_time_usage.tool_output_tokens, 34);
@@ -1826,7 +1826,10 @@ toolCallCount = 0
             .collect();
         assert_eq!(phase_step_counts, vec![4, 4, 10, 11, 4]);
         assert_eq!(flow_bootstrap_steps_total(ShowDetailMode::Expanded), 33);
-        assert_eq!(flow.bootstrap_completed_steps, flow_bootstrap_steps_total(ShowDetailMode::Expanded));
+        assert_eq!(
+            flow.bootstrap_completed_steps,
+            flow_bootstrap_steps_total(ShowDetailMode::Expanded)
+        );
         assert!(flow.bootstrap_pending_steps.is_empty());
 
         let _ = std::fs::remove_file(config_path);

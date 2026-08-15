@@ -19,7 +19,8 @@ use crate::workspace_tools;
 
 const SERVER_NAME: &str = "catdesk";
 const SERVER_VERSION: &str = "4.0.0";
-const PROTOCOL_VERSION: &str = "2025-03-26";
+const MCP_PROTOCOL_VERSION: &str = "2025-11-25";
+const DEVTOOLS_PROTOCOL_VERSION: &str = "2025-03-26";
 const UI_TEMPLATE_URI: &str = "ui://widget/catdesk-dashboard.html";
 const UI_TEMPLATE_MIME_TYPE: &str = "text/html;profile=mcp-app";
 pub(crate) const WIDGET_PAYLOAD_META_KEY: &str = "catdesk/widgetPayload";
@@ -157,7 +158,7 @@ pub async fn handle_request(
                     "id": "dt-init",
                     "method": "initialize",
                     "params": {
-                        "protocolVersion": PROTOCOL_VERSION,
+                        "protocolVersion": DEVTOOLS_PROTOCOL_VERSION,
                         "capabilities": {},
                         "clientInfo": {"name": "catdesk-bridge", "version": SERVER_VERSION}
                     }
@@ -200,7 +201,7 @@ fn handle_initialize(req: &JsonRpcRequest) -> JsonRpcResponse {
     JsonRpcResponse::success(
         req.id.clone(),
         json!({
-            "protocolVersion": PROTOCOL_VERSION,
+            "protocolVersion": MCP_PROTOCOL_VERSION,
             "capabilities": {
                 "tools": { "listChanged": false },
                 "resources": { "listChanged": false }
@@ -318,6 +319,168 @@ fn handle_resources_read(req: &JsonRpcRequest, public_base_url: Option<&str>) ->
 }
 
 // ── tools/list ──────────────────────────────────────────────
+
+fn local_tool_output_schema(name: &str) -> Option<Value> {
+    let mut properties = Map::new();
+    properties.insert(
+        "toolName".to_string(),
+        json!({ "type": "string", "const": name }),
+    );
+    properties.insert("message".to_string(), json!({ "type": "string" }));
+    properties.insert("success".to_string(), json!({ "type": "boolean" }));
+
+    match name {
+        "catdesk_instruction" => {
+            properties.insert("instructionText".to_string(), json!({ "type": "string" }));
+        }
+        "read" => {
+            properties.insert("path".to_string(), json!({ "type": "string" }));
+            properties.insert(
+                "bytes".to_string(),
+                json!({ "type": "integer", "minimum": 0 }),
+            );
+            properties.insert(
+                "sizeBytes".to_string(),
+                json!({ "type": "integer", "minimum": 0 }),
+            );
+            properties.insert(
+                "lineCount".to_string(),
+                json!({ "type": "integer", "minimum": 0 }),
+            );
+            properties.insert("text".to_string(), json!({ "type": "string" }));
+            properties.insert("truncated".to_string(), json!({ "type": "boolean" }));
+        }
+        "search" => {
+            properties.insert("searchPattern".to_string(), json!({ "type": "string" }));
+            properties.insert("searchPath".to_string(), json!({ "type": "string" }));
+            properties.insert("searchBackend".to_string(), json!({ "type": "string" }));
+            properties.insert("searchBackendNote".to_string(), json!({ "type": "string" }));
+            properties.insert(
+                "matchCount".to_string(),
+                json!({ "type": "integer", "minimum": 0 }),
+            );
+            properties.insert("searchTruncated".to_string(), json!({ "type": "boolean" }));
+            properties.insert(
+                "searchLimit".to_string(),
+                json!({ "type": "integer", "minimum": 0 }),
+            );
+            properties.insert(
+                "searchResults".to_string(),
+                json!({
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "path": { "type": "string" },
+                            "line": { "type": "integer", "minimum": 0 },
+                            "text": { "type": "string" },
+                            "isContext": { "type": "boolean" }
+                        },
+                        "required": ["path", "line", "text", "isContext"]
+                    }
+                }),
+            );
+        }
+        "write" => {
+            properties.insert("path".to_string(), json!({ "type": "string" }));
+            properties.insert(
+                "bytesWritten".to_string(),
+                json!({ "type": "integer", "minimum": 0 }),
+            );
+            properties.insert("createDirs".to_string(), json!({ "type": "boolean" }));
+        }
+        "edit" => {
+            properties.insert("path".to_string(), json!({ "type": "string" }));
+            properties.insert("replaceAll".to_string(), json!({ "type": "boolean" }));
+        }
+        "delete" => {
+            properties.insert("path".to_string(), json!({ "type": "string" }));
+            properties.insert("recursive".to_string(), json!({ "type": "boolean" }));
+        }
+        "run_command" => {
+            for field in [
+                "command",
+                "cwd",
+                "stdout",
+                "stderr",
+                "interceptedToolName",
+                "interceptedCommandName",
+                "from",
+                "to",
+                "resolvedFrom",
+                "resolvedTo",
+                "destinationOperand",
+                "listPath",
+            ] {
+                properties.insert(field.to_string(), json!({ "type": "string" }));
+            }
+            for field in [
+                "elapsedMs",
+                "listItemCount",
+                "listDirectoryCount",
+                "listFileCount",
+                "listOtherCount",
+                "listLimit",
+            ] {
+                properties.insert(
+                    field.to_string(),
+                    json!({ "type": "integer", "minimum": 0 }),
+                );
+            }
+            for field in [
+                "destinationOperandWasDirectory",
+                "overwrite",
+                "skipped",
+                "listTruncated",
+            ] {
+                properties.insert(field.to_string(), json!({ "type": "boolean" }));
+            }
+            properties.insert(
+                "listEntries".to_string(),
+                json!({
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "path": { "type": "string" },
+                            "name": { "type": "string" },
+                            "kind": { "type": "string" },
+                            "depth": { "type": "integer", "minimum": 0 }
+                        },
+                        "required": ["path", "name", "kind", "depth"]
+                    }
+                }),
+            );
+        }
+        _ => return None,
+    }
+
+    Some(json!({
+        "type": "object",
+        "properties": properties,
+        "required": ["toolName"]
+    }))
+}
+
+fn ensure_local_tool_output_schema(tool: &mut Value) {
+    let Some(tool_obj) = tool.as_object_mut() else {
+        return;
+    };
+    if tool_obj.contains_key("outputSchema") {
+        return;
+    }
+    let Some(name) = tool_obj
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+    else {
+        return;
+    };
+    let Some(schema) = local_tool_output_schema(&name) else {
+        return;
+    };
+    tool_obj.insert("outputSchema".to_string(), schema);
+}
 
 async fn handle_tools_list(
     req: &JsonRpcRequest,
@@ -458,6 +621,7 @@ async fn handle_tools_list(
     }
 
     for tool in &mut tools {
+        ensure_local_tool_output_schema(tool);
         ensure_tool_descriptor_widget_template(tool);
     }
 
@@ -2882,6 +3046,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn initialize_negotiates_2025_11_25_without_changing_devtools_protocol() {
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0".into(),
+            id: Some(json!("req-initialize")),
+            method: "initialize".into(),
+            params: json!({
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": { "name": "test-client", "version": "1.0.0" }
+            }),
+        };
+
+        let response = handle_initialize(&req);
+        assert_eq!(
+            response
+                .result
+                .as_ref()
+                .and_then(|result| result.get("protocolVersion"))
+                .and_then(Value::as_str),
+            Some("2025-11-25")
+        );
+        assert_eq!(MCP_PROTOCOL_VERSION, "2025-11-25");
+        assert_eq!(DEVTOOLS_PROTOCOL_VERSION, "2025-03-26");
+    }
+
     #[tokio::test]
     async fn multi_tools_list_exposes_run_command_mv_without_move_path_tool() {
         let req = JsonRpcRequest {
@@ -2914,6 +3104,77 @@ mod tests {
                 "delete",
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn local_tools_list_exposes_output_schemas() {
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0".into(),
+            id: Some(json!("req-tools-list")),
+            method: "tools/list".into(),
+            params: json!({}),
+        };
+
+        let response = handle_tools_list(&req, Mode::Both, ToolMode::MultiTools, &None).await;
+        let tools = response
+            .result
+            .as_ref()
+            .and_then(|result| result.get("tools"))
+            .and_then(Value::as_array)
+            .expect("missing tools");
+
+        for tool in tools {
+            let name = tool
+                .get("name")
+                .and_then(Value::as_str)
+                .expect("missing tool name");
+            let schema = tool
+                .get("outputSchema")
+                .and_then(Value::as_object)
+                .unwrap_or_else(|| panic!("missing output schema for {name}"));
+            assert_eq!(schema.get("type").and_then(Value::as_str), Some("object"));
+            let properties = schema
+                .get("properties")
+                .and_then(Value::as_object)
+                .expect("missing output schema properties");
+            assert_eq!(
+                properties
+                    .get("toolName")
+                    .and_then(|property| property.get("const"))
+                    .and_then(Value::as_str),
+                Some(name)
+            );
+            assert!(properties.contains_key("message"));
+            assert!(properties.contains_key("success"));
+            assert!(
+                schema
+                    .get("required")
+                    .and_then(Value::as_array)
+                    .is_some_and(|required| required.iter().any(|field| field == "toolName"))
+            );
+        }
+
+        for (tool_name, field) in [
+            ("run_command", "stdout"),
+            ("catdesk_instruction", "instructionText"),
+            ("read", "text"),
+            ("search", "searchResults"),
+            ("write", "bytesWritten"),
+            ("edit", "replaceAll"),
+            ("delete", "recursive"),
+        ] {
+            let properties = tools
+                .iter()
+                .find(|tool| tool.get("name").and_then(Value::as_str) == Some(tool_name))
+                .and_then(|tool| tool.get("outputSchema"))
+                .and_then(|schema| schema.get("properties"))
+                .and_then(Value::as_object)
+                .unwrap_or_else(|| panic!("missing output properties for {tool_name}"));
+            assert!(
+                properties.contains_key(field),
+                "missing {field} in output schema for {tool_name}"
+            );
+        }
     }
 
     #[tokio::test]

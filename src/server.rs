@@ -187,7 +187,10 @@ fn summarize_response(resp: &Value) -> String {
             .unwrap_or("Unknown error");
         return format!("id={id}:error({code} {msg})");
     }
-    if resp.get("result").is_some() {
+    if let Some(result) = resp.get("result") {
+        if let Some(protocol_version) = result.get("protocolVersion").and_then(Value::as_str) {
+            return format!("id={id}:result protocolVersion={protocol_version}");
+        }
         return format!("id={id}:result");
     }
     format!("id={id}:unknown")
@@ -741,6 +744,23 @@ mod tests {
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
     use tokio::sync::{Mutex, mpsc::unbounded_channel};
+
+    #[test]
+    fn summarize_initialize_response_includes_protocol_version() {
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {}
+            }
+        });
+
+        assert_eq!(
+            summarize_response(&response),
+            "id=1:result protocolVersion=2025-11-25"
+        );
+    }
 
     fn unique_temp_path(prefix: &str) -> PathBuf {
         let unique = SystemTime::now()

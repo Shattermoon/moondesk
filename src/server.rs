@@ -200,9 +200,9 @@ fn extract_turn_token_usage(result: Option<&Value>) -> Option<(u64, u64)> {
         .and_then(|meta| meta.get(WIDGET_PAYLOAD_META_KEY))
         .and_then(Value::as_object)
         .and_then(|payload| payload.get("turnTokenUsage"))?;
-    let input_tokens = usage.get("inputTokens").and_then(Value::as_u64)?;
-    let output_tokens = usage.get("outputTokens").and_then(Value::as_u64)?;
-    Some((input_tokens, output_tokens))
+    let tool_input_tokens = usage.get("inputTokens").and_then(Value::as_u64)?;
+    let tool_output_tokens = usage.get("outputTokens").and_then(Value::as_u64)?;
+    Some((tool_input_tokens, tool_output_tokens))
 }
 
 fn attach_history_usage(result: &mut Option<Value>, usage_totals: &UsageTotals) {
@@ -210,8 +210,8 @@ fn attach_history_usage(result: &mut Option<Value>, usage_totals: &UsageTotals) 
         return;
     };
     let history_usage = json!({
-        "inputTokens": usage_totals.input_tokens,
-        "outputTokens": usage_totals.output_tokens,
+        "inputTokens": usage_totals.tool_input_tokens,
+        "outputTokens": usage_totals.tool_output_tokens,
         "totalTokens": usage_totals.total_tokens,
     });
     let history_tool_call_count = json!(usage_totals.tool_call_count);
@@ -805,8 +805,8 @@ mod tests {
             }
         }));
         let usage_totals = UsageTotals {
-            input_tokens: 120,
-            output_tokens: 34,
+            tool_input_tokens: 120,
+            tool_output_tokens: 34,
             total_tokens: 154,
             tool_call_count: 7,
         };
@@ -991,9 +991,10 @@ mod tests {
         );
 
         let app = app_state.lock().await;
-        assert!(app.usage_totals.total_tokens > 0);
-        assert_eq!(app.usage_totals.tool_call_count, 1);
-        assert_eq!(app.session_usage_totals, app.usage_totals);
+        let all_time_usage = app.all_time_usage_totals();
+        assert!(all_time_usage.total_tokens > 0);
+        assert_eq!(all_time_usage.tool_call_count, 1);
+        assert_eq!(app.session_usage_totals, all_time_usage);
         assert!(matches!(app.mode, Mode::Both));
         assert!(matches!(app.tool_mode, ToolMode::MultiTools));
         drop(app);
@@ -1106,11 +1107,11 @@ async fn post_mcp(State(s): State<ServerState>, body_bytes: Bytes) -> Response<B
             let turn_token_usage = extract_turn_token_usage(resp.result.as_ref());
             let usage_totals = {
                 let mut app = s.app.lock().await;
-                if let Some((input_tokens, output_tokens)) = turn_token_usage {
-                    app.record_turn_usage(input_tokens, output_tokens);
+                if let Some((tool_input_tokens, tool_output_tokens)) = turn_token_usage {
+                    app.record_turn_usage(tool_input_tokens, tool_output_tokens);
                     app.persist_state_with_log();
                 }
-                app.usage_totals.clone()
+                app.all_time_usage_totals()
             };
             attach_history_usage(&mut resp.result, &usage_totals);
             attach_catdesk_instruction_actions(

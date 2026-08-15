@@ -85,17 +85,17 @@ impl JsonRpcResponse {
 
 #[derive(Clone, Default)]
 struct TokenUsage {
-    input_tokens: u64,
-    output_tokens: u64,
+    tool_input_tokens: u64,
+    tool_output_tokens: u64,
     total_tokens: u64,
 }
 
 impl TokenUsage {
-    fn from_counts(input_tokens: u64, output_tokens: u64) -> Self {
+    fn from_counts(tool_input_tokens: u64, tool_output_tokens: u64) -> Self {
         Self {
-            input_tokens,
-            output_tokens,
-            total_tokens: input_tokens.saturating_add(output_tokens),
+            tool_input_tokens,
+            tool_output_tokens,
+            total_tokens: tool_input_tokens.saturating_add(tool_output_tokens),
         }
     }
 }
@@ -1341,11 +1341,11 @@ fn estimate_value_tokens_o200k(value: &Value) -> u64 {
 }
 
 fn estimate_turn_token_usage(req: &JsonRpcRequest, tool_name: &str, result: &Value) -> TokenUsage {
-    let input_payload = build_turn_token_payload(req, tool_name);
-    let input_tokens = estimate_value_tokens_o200k(&input_payload);
-    let output_payload = sanitize_result_for_turn_token_count(result);
-    let output_tokens = estimate_value_tokens_o200k(&output_payload);
-    TokenUsage::from_counts(input_tokens, output_tokens)
+    let tool_input_payload = build_turn_token_payload(req, tool_name);
+    let tool_input_tokens = estimate_value_tokens_o200k(&tool_input_payload);
+    let tool_output_payload = sanitize_result_for_turn_token_count(result);
+    let tool_output_tokens = estimate_value_tokens_o200k(&tool_output_payload);
+    TokenUsage::from_counts(tool_input_tokens, tool_output_tokens)
 }
 
 fn sanitize_result_for_turn_token_count(result: &Value) -> Value {
@@ -1422,8 +1422,8 @@ fn attach_turn_token_usage(result: &mut Value, usage: &TokenUsage) {
         widget_payload.insert(
             "turnTokenUsage".to_string(),
             json!({
-                "inputTokens": usage.input_tokens,
-                "outputTokens": usage.output_tokens,
+                "inputTokens": usage.tool_input_tokens,
+                "outputTokens": usage.tool_output_tokens,
                 "totalTokens": usage.total_tokens,
             }),
         );

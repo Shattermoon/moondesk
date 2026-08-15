@@ -27,9 +27,9 @@ use ratatui::{
 };
 use state::{
     AppState, FLOW_ANIM_CELLS, FLOW_BOOTSTRAP_PHASES, FlowAnimKind, FlowAnimSegment, FlowDirection,
-    FlowLane, Mode, ServerUiEvent, SharedState, ShowDetailMode, ToolMode, UsageTotals, app_config_path,
-    flow_anim_lit_count, load_ngrok_authtoken, load_ngrok_domain, save_ngrok_authtoken,
-    save_ngrok_domain,
+    FlowLane, GPT_5_6_AND_EARLIER_USAGE_BUCKET, Mode, ServerUiEvent, SharedState, ShowDetailMode,
+    ToolMode, UsageTotals, app_config_path, flow_anim_lit_count, load_ngrok_authtoken,
+    load_ngrok_domain, save_ngrok_authtoken, save_ngrok_domain,
 };
 use std::io::{Write, stdout};
 use std::sync::Arc;
@@ -50,8 +50,8 @@ const NGROK_DOMAIN_MASK: &str = "▓▓▓▓▓▓▓▓";
 const MCP_URL_REVEAL_BAR_CELLS: usize = 10;
 const STATUS_PANEL_HEIGHT: u16 = TUI_MASCOT_BLOCK_HEIGHT + 6;
 const STATUS_LABEL_WIDTH: usize = 19;
-const GPT55_INPUT_USD_PER_1M: f64 = 5.0;
-const GPT55_OUTPUT_USD_PER_1M: f64 = 30.0;
+const GPT_5_6_AND_EARLIER_INPUT_USD_PER_1M: f64 = 5.0;
+const GPT_5_6_AND_EARLIER_OUTPUT_USD_PER_1M: f64 = 30.0;
 const PRICE_DISPLAY_DECIMALS: usize = 6;
 const NGROK_SETUP_URL: &str = "https://dashboard.ngrok.com/get-started/setup";
 
@@ -239,10 +239,20 @@ fn format_token_compact(value: u64) -> String {
     format!("{}{}", formatted.trim_end_matches(".0"), suffix)
 }
 
-fn estimate_gpt55_usage_cost_usd(usage: &UsageTotals) -> f64 {
-    (usage.input_tokens as f64 * GPT55_OUTPUT_USD_PER_1M
-        + usage.output_tokens as f64 * GPT55_INPUT_USD_PER_1M)
+fn estimate_gpt_5_6_and_earlier_usage_cost_usd(usage: &UsageTotals) -> f64 {
+    (usage.tool_input_tokens as f64 * GPT_5_6_AND_EARLIER_OUTPUT_USD_PER_1M
+        + usage.tool_output_tokens as f64 * GPT_5_6_AND_EARLIER_INPUT_USD_PER_1M)
         / 1_000_000.0
+}
+
+fn estimate_all_time_usage_cost_usd(app: &AppState) -> f64 {
+    app.usage_by_model
+        .iter()
+        .map(|(bucket, usage)| match bucket.as_str() {
+            GPT_5_6_AND_EARLIER_USAGE_BUCKET => estimate_gpt_5_6_and_earlier_usage_cost_usd(usage),
+            _ => panic!("missing pricing for usage bucket `{bucket}`"),
+        })
+        .sum()
 }
 
 fn format_usd_compact(usd: f64) -> String {
@@ -274,24 +284,30 @@ fn mcp_url_reveal_bar_segments(remaining: Duration) -> (String, String) {
     )
 }
 
-fn formatted_usage_values(usage: &UsageTotals) -> [String; 5] {
+fn formatted_usage_values(usage: &UsageTotals, cost_usd: f64) -> [String; 5] {
     [
-        format_token_compact(usage.input_tokens),
-        format_token_compact(usage.output_tokens),
+        format_token_compact(usage.tool_input_tokens),
+        format_token_compact(usage.tool_output_tokens),
         format_token_compact(usage.total_tokens),
         format_token_compact(usage.tool_call_count),
-        format_usd_compact(estimate_gpt55_usage_cost_usd(usage)),
+        format_usd_compact(cost_usd),
     ]
 }
 
-fn usage_value_widths(first: &UsageTotals, second: &UsageTotals) -> [usize; 5] {
-    let first = formatted_usage_values(first);
-    let second = formatted_usage_values(second);
+fn usage_value_widths(
+    first: &UsageTotals,
+    first_cost_usd: f64,
+    second: &UsageTotals,
+    second_cost_usd: f64,
+) -> [usize; 5] {
+    let first = formatted_usage_values(first, first_cost_usd);
+    let second = formatted_usage_values(second, second_cost_usd);
     std::array::from_fn(|index| first[index].len().max(second[index].len()))
 }
 
 fn usage_line(
     usage: &UsageTotals,
+    cost_usd: f64,
     status_label: Span<'static>,
     palette: &theme::Palette,
     value_widths: &[usize; 5],
@@ -303,7 +319,7 @@ fn usage_line(
     let price_style = Style::default()
         .fg(palette.success_fg)
         .add_modifier(Modifier::BOLD);
-    let values = formatted_usage_values(usage);
+    let values = formatted_usage_values(usage, cost_usd);
 
     Line::from(vec![
         status_label,
@@ -1791,7 +1807,7 @@ async fn run_settings(
                 app.current_theme(),
                 app.tool_mode,
                 app.show_detail_mode,
-                app.usage_totals.clone(),
+                app.all_time_usage_totals(),
                 app.set_catdesk_as_co_author,
                 app.mcp_slug.clone(),
                 app.ngrok_domain.clone(),
@@ -1901,7 +1917,7 @@ async fn run_settings(
                             continue;
                         }
                         let mut app = state.lock().await;
-                        app.usage_totals = UsageTotals::default();
+                        app.usage_by_model.clear();
                         app.log("INFO", "Token billing totals reset".into());
                         app.persist_state_with_log();
                         confirm_reset_token_billing = false;
@@ -2233,12 +2249,12 @@ fn draw_settings(
     lines.push(Line::from(vec![
         Span::styled("  Input ", Style::default().fg(palette.muted_fg)),
         Span::styled(
-            usage_totals.input_tokens.to_string(),
+            usage_totals.tool_input_tokens.to_string(),
             Style::default().fg(palette.primary_fg),
         ),
         Span::styled("   Output ", Style::default().fg(palette.muted_fg)),
         Span::styled(
-            usage_totals.output_tokens.to_string(),
+            usage_totals.tool_output_tokens.to_string(),
             Style::default().fg(palette.primary_fg),
         ),
     ]));
@@ -3548,7 +3564,16 @@ fn draw_ui(
     let status_content_height = status_height.saturating_sub(4) as usize;
     let flow_block_lines = 2;
 
-    let usage_widths = usage_value_widths(&app.session_usage_totals, &app.usage_totals);
+    let all_time_usage_totals = app.all_time_usage_totals();
+    let session_usage_cost_usd =
+        estimate_gpt_5_6_and_earlier_usage_cost_usd(&app.session_usage_totals);
+    let all_time_usage_cost_usd = estimate_all_time_usage_cost_usd(app);
+    let usage_widths = usage_value_widths(
+        &app.session_usage_totals,
+        session_usage_cost_usd,
+        &all_time_usage_totals,
+        all_time_usage_cost_usd,
+    );
     let mut status_lines: Vec<Line> = vec![
         Line::from(vec![
             status_label("Mode"),
@@ -3678,12 +3703,14 @@ fn draw_ui(
         },
         usage_line(
             &app.session_usage_totals,
+            session_usage_cost_usd,
             status_label("Session"),
             &palette,
             &usage_widths,
         ),
         usage_line(
-            &app.usage_totals,
+            &all_time_usage_totals,
+            all_time_usage_cost_usd,
             status_label("All-time"),
             &palette,
             &usage_widths,

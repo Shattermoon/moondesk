@@ -5920,19 +5920,19 @@
           }
         }
 
-        var GPT55_INPUT_USD_PER_1M = 5.0;
-        var GPT55_OUTPUT_USD_PER_1M = 30.0;
+        var GPT_5_6_AND_EARLIER_INPUT_USD_PER_1M = 5.0;
+        var GPT_5_6_AND_EARLIER_OUTPUT_USD_PER_1M = 30.0;
         var PRICE_ANIMATION_DECIMALS = 6;
 
-        function estimateGpt55TurnCostUsd(usage) {
+        function estimateGpt56AndEarlierUsageCostUsd(usage) {
           if (!usage) return 0;
           var input = Number(usage.inputTokens);
           var output = Number(usage.outputTokens);
           if (!Number.isFinite(input) || input < 0) input = 0;
           if (!Number.isFinite(output) || output < 0) output = 0;
           return (
-            (input * GPT55_OUTPUT_USD_PER_1M +
-              output * GPT55_INPUT_USD_PER_1M) /
+            (input * GPT_5_6_AND_EARLIER_OUTPUT_USD_PER_1M +
+              output * GPT_5_6_AND_EARLIER_INPUT_USD_PER_1M) /
             1000000
           );
         }
@@ -6051,7 +6051,7 @@
           options = options || {};
           var faceClass = options.faceClass ? " " + options.faceClass : "";
           var animate = !!options.animate;
-          var estimatedUsd = estimateGpt55TurnCostUsd(usage);
+          var estimatedUsd = estimateGpt56AndEarlierUsageCostUsd(usage);
           var callsHtml =
             callCount > 0
               ? '<div class="token-line"><span class="token-key">' +
@@ -6303,13 +6303,13 @@
             input: formatTokenCompact(usage.inputTokens),
             output: formatTokenCompact(usage.outputTokens),
             total: formatTokenCompact(usage.totalTokens),
-            price: formatUsdCompact(estimateGpt55TurnCostUsd(usage)),
+            price: formatUsdCompact(estimateGpt56AndEarlierUsageCostUsd(usage)),
           };
           var animatedText = {
             input: finalText.input,
             output: finalText.output,
             total: finalText.total,
-            price: formatUsdAnimated(estimateGpt55TurnCostUsd(usage)),
+            price: formatUsdAnimated(estimateGpt56AndEarlierUsageCostUsd(usage)),
           };
           var locked = {
             input: false,
@@ -6485,7 +6485,7 @@
               output: formatTokenCompact(usage.output),
               total: formatTokenCompact(usage.total),
               price: formatUsdAnimated(
-                estimateGpt55TurnCostUsd({
+                estimateGpt56AndEarlierUsageCostUsd({
                   inputTokens: usage.input,
                   outputTokens: usage.output,
                 }),
@@ -6496,7 +6496,7 @@
               output: formatTokenCompact(ghostUsage.output),
               total: formatTokenCompact(ghostUsage.total),
               price: formatUsdAnimated(
-                estimateGpt55TurnCostUsd({
+                estimateGpt56AndEarlierUsageCostUsd({
                   inputTokens: ghostUsage.input,
                   outputTokens: ghostUsage.output,
                 }),

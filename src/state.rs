@@ -1,6 +1,6 @@
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -44,28 +44,63 @@ pub struct FlowBootstrapProgress {
 
 const APP_CONFIG_DIR_NAME: &str = ".catdesk";
 const APP_CONFIG_FILE_NAME: &str = "config.toml";
+pub const GPT_5_6_AND_EARLIER_USAGE_BUCKET: &str = "through-gpt-5.6";
+pub const CURRENT_USAGE_BUCKET: &str = GPT_5_6_AND_EARLIER_USAGE_BUCKET;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageTotals {
-    pub input_tokens: u64,
-    pub output_tokens: u64,
+    pub tool_input_tokens: u64,
+    pub tool_output_tokens: u64,
     pub total_tokens: u64,
     pub tool_call_count: u64,
 }
 
 impl UsageTotals {
-    pub fn accumulate(&mut self, input_tokens: u64, output_tokens: u64, tool_call_count: u64) {
-        self.input_tokens = self.input_tokens.saturating_add(input_tokens);
-        self.output_tokens = self.output_tokens.saturating_add(output_tokens);
-        self.total_tokens = self.input_tokens.saturating_add(self.output_tokens);
+    pub fn accumulate(
+        &mut self,
+        tool_input_tokens: u64,
+        tool_output_tokens: u64,
+        tool_call_count: u64,
+    ) {
+        self.tool_input_tokens = self.tool_input_tokens.saturating_add(tool_input_tokens);
+        self.tool_output_tokens = self.tool_output_tokens.saturating_add(tool_output_tokens);
+        self.total_tokens = self
+            .tool_input_tokens
+            .saturating_add(self.tool_output_tokens);
         self.tool_call_count = self.tool_call_count.saturating_add(tool_call_count);
     }
 
+    pub fn merge(&mut self, other: &Self) {
+        self.accumulate(
+            other.tool_input_tokens,
+            other.tool_output_tokens,
+            other.tool_call_count,
+        );
+    }
+
     fn normalized(mut self) -> Self {
-        self.total_tokens = self.input_tokens.saturating_add(self.output_tokens);
+        self.total_tokens = self
+            .tool_input_tokens
+            .saturating_add(self.tool_output_tokens);
         self
     }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LegacyUsageTotals {
+    input_tokens: u64,
+    output_tokens: u64,
+    total_tokens: u64,
+    tool_call_count: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UsageConfigMigration {
+    usage_totals: Option<LegacyUsageTotals>,
+    usage_by_model: Option<BTreeMap<String, UsageTotals>>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -161,7 +196,8 @@ pub struct AppConfig {
     pub theme: String,
     pub mode: Mode,
     pub tool_mode: ToolMode,
-    pub usage_totals: UsageTotals,
+    #[serde(default)]
+    pub usage_by_model: BTreeMap<String, UsageTotals>,
     pub selected_browser: Option<DetectedBrowser>,
 }
 
@@ -179,7 +215,7 @@ impl Default for AppConfig {
             theme: theme::DEFAULT_THEME_ID.to_string(),
             mode: Mode::Both,
             tool_mode: ToolMode::MultiTools,
-            usage_totals: UsageTotals::default(),
+            usage_by_model: BTreeMap::new(),
             selected_browser: None,
         }
     }
@@ -202,7 +238,11 @@ impl AppConfig {
             .take()
             .map(|value| value.trim().to_ascii_lowercase())
             .filter(|value| !value.is_empty());
-        self.usage_totals = self.usage_totals.normalized();
+        self.usage_by_model = self
+            .usage_by_model
+            .into_iter()
+            .map(|(bucket, usage)| (bucket, usage.normalized()))
+            .collect();
         self
     }
 
@@ -212,8 +252,31 @@ impl AppConfig {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
             Err(e) => return Err(e),
         };
-        let config = toml::from_str::<Self>(&text).map_err(std::io::Error::other)?;
-        Ok(config.normalized())
+        let mut config = toml::from_str::<Self>(&text).map_err(std::io::Error::other)?;
+        let migration =
+            toml::from_str::<UsageConfigMigration>(&text).map_err(std::io::Error::other)?;
+
+        match (migration.usage_totals, migration.usage_by_model) {
+            (Some(_), Some(_)) => Err(std::io::Error::other(
+                "config contains both legacy usageTotals and usageByModel",
+            )),
+            (Some(legacy), None) => {
+                let _legacy_total_tokens = legacy.total_tokens;
+                config.usage_by_model.insert(
+                    GPT_5_6_AND_EARLIER_USAGE_BUCKET.to_string(),
+                    UsageTotals {
+                        tool_input_tokens: legacy.input_tokens,
+                        tool_output_tokens: legacy.output_tokens,
+                        total_tokens: legacy.input_tokens.saturating_add(legacy.output_tokens),
+                        tool_call_count: legacy.tool_call_count,
+                    },
+                );
+                let config = config.normalized();
+                config.save_to_path(path)?;
+                Ok(config)
+            }
+            (None, _) => Ok(config.normalized()),
+        }
     }
 
     fn save_to_path(&self, path: &Path) -> std::io::Result<()> {
@@ -555,7 +618,7 @@ pub struct AppState {
     pub flows: Vec<FlowLane>,
     pub flow_bootstrap_progress: HashMap<String, FlowBootstrapProgress>,
     pub request_count: u64,
-    pub usage_totals: UsageTotals,
+    pub usage_by_model: BTreeMap<String, UsageTotals>,
     pub session_usage_totals: UsageTotals,
     config_path: PathBuf,
     pub server_handle: Option<tokio::task::JoinHandle<()>>,
@@ -581,6 +644,15 @@ fn short_flow_id(flow_id: &str) -> String {
     flow_id[..flow_id.len().min(8)].to_string()
 }
 
+#[cfg(test)]
+pub fn user_home_dir() -> std::io::Result<PathBuf> {
+    Ok(std::env::temp_dir().join(format!(
+        "catdesk-test-home-{}",
+        std::process::id()
+    )))
+}
+
+#[cfg(not(test))]
 pub fn user_home_dir() -> std::io::Result<PathBuf> {
     if let Some(home) = std::env::var_os("HOME").filter(|value| !value.is_empty()) {
         return Ok(PathBuf::from(home));
@@ -969,7 +1041,7 @@ impl AppState {
             flows: Vec::new(),
             flow_bootstrap_progress: HashMap::new(),
             request_count: 0,
-            usage_totals: config.usage_totals,
+            usage_by_model: config.usage_by_model,
             session_usage_totals: UsageTotals::default(),
             config_path,
             server_handle: None,
@@ -1015,7 +1087,7 @@ impl AppState {
         config.mode = self.mode;
         config.tool_mode = self.tool_mode;
         config.show_detail_mode = self.show_detail_mode;
-        config.usage_totals = self.usage_totals.clone().normalized();
+        config.usage_by_model = self.usage_by_model.clone();
         config.selected_browser = self.selected_browser.clone();
         Ok(config.normalized())
     }
@@ -1034,10 +1106,21 @@ impl AppState {
         }
     }
 
-    pub fn record_turn_usage(&mut self, input_tokens: u64, output_tokens: u64) {
-        self.usage_totals.accumulate(input_tokens, output_tokens, 1);
+    pub fn all_time_usage_totals(&self) -> UsageTotals {
+        let mut totals = UsageTotals::default();
+        for usage in self.usage_by_model.values() {
+            totals.merge(usage);
+        }
+        totals
+    }
+
+    pub fn record_turn_usage(&mut self, tool_input_tokens: u64, tool_output_tokens: u64) {
+        self.usage_by_model
+            .entry(CURRENT_USAGE_BUCKET.to_string())
+            .or_default()
+            .accumulate(tool_input_tokens, tool_output_tokens, 1);
         self.session_usage_totals
-            .accumulate(input_tokens, output_tokens, 1);
+            .accumulate(tool_input_tokens, tool_output_tokens, 1);
     }
 
     pub fn apply_server_ui_event(&mut self, event: ServerUiEvent) {
@@ -1228,6 +1311,8 @@ fn generate_mcp_slug() -> String {
 mod tests {
     use super::*;
 
+    const LEGACY_CONFIG_FIXTURE: &str = include_str!("../tests/fixtures/legacy_config.toml");
+
     fn test_app(name: &str) -> (AppState, PathBuf, PathBuf) {
         let unique = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -1246,6 +1331,15 @@ mod tests {
     }
 
     #[test]
+    fn tests_use_isolated_home_directory() {
+        let test_home = user_home_dir().expect("resolve test home");
+        let process_home = std::env::var_os("HOME").map(PathBuf::from);
+
+        assert!(test_home.starts_with(std::env::temp_dir()));
+        assert_ne!(Some(test_home), process_home);
+    }
+
+    #[test]
     fn app_state_loads_persisted_config_file() {
         let unique = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -1254,20 +1348,7 @@ mod tests {
         let workspace = std::env::temp_dir().join(format!("catdesk-config-load-{unique}"));
         std::fs::create_dir_all(&workspace).expect("create temp workspace");
         let config_path = workspace.join(APP_CONFIG_FILE_NAME);
-        std::fs::write(
-            &config_path,
-            r#"theme = "neon"
-mode = "browser"
-toolMode = "multiTools"
-
-[usageTotals]
-inputTokens = 120
-outputTokens = 34
-totalTokens = 154
-toolCallCount = 7
-"#,
-        )
-        .expect("write config file");
+        std::fs::write(&config_path, LEGACY_CONFIG_FIXTURE).expect("write legacy config fixture");
 
         let app = AppState::from_config_path(
             8787,
@@ -1279,11 +1360,66 @@ toolCallCount = 7
         assert_eq!(app.theme, "neon");
         assert!(matches!(app.mode, Mode::Browser));
         assert!(matches!(app.tool_mode, ToolMode::MultiTools));
-        assert_eq!(app.usage_totals.input_tokens, 120);
-        assert_eq!(app.usage_totals.output_tokens, 34);
-        assert_eq!(app.usage_totals.total_tokens, 154);
-        assert_eq!(app.usage_totals.tool_call_count, 7);
+        assert!(matches!(app.show_detail_mode, ShowDetailMode::Collapsed));
+        assert!(app.set_catdesk_as_co_author);
+        assert_eq!(app.partner_binagotchy_seed.as_deref(), Some("00000000000000ff"));
+        let all_time_usage = app.all_time_usage_totals();
+        assert_eq!(all_time_usage.tool_input_tokens, 120);
+        assert_eq!(all_time_usage.tool_output_tokens, 34);
+        assert_eq!(all_time_usage.total_tokens, 154);
+        assert_eq!(all_time_usage.tool_call_count, 7);
         assert_eq!(app.session_usage_totals, UsageTotals::default());
+
+        let migrated = std::fs::read_to_string(&config_path).expect("read migrated config");
+        assert!(!migrated.contains("[usageTotals]"));
+        assert!(migrated.contains("[usageByModel.\"through-gpt-5.6\"]"));
+        assert!(migrated.contains("toolInputTokens = 120"));
+        assert!(migrated.contains("toolOutputTokens = 34"));
+
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_dir(workspace);
+    }
+
+    #[test]
+    fn app_config_rejects_legacy_and_new_usage_formats_together() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let workspace =
+            std::env::temp_dir().join(format!("catdesk-config-usage-conflict-{unique}"));
+        std::fs::create_dir_all(&workspace).expect("create temp workspace");
+        let config_path = workspace.join(APP_CONFIG_FILE_NAME);
+        std::fs::write(
+            &config_path,
+            r#"theme = "neon"
+mode = "both"
+toolMode = "multiTools"
+
+[usageTotals]
+inputTokens = 1
+outputTokens = 2
+totalTokens = 3
+toolCallCount = 1
+
+[usageByModel."through-gpt-5.6"]
+toolInputTokens = 1
+toolOutputTokens = 2
+totalTokens = 3
+toolCallCount = 1
+"#,
+        )
+        .expect("write conflicting config");
+
+        let error = match AppConfig::load_from_path(&config_path) {
+            Ok(_) => panic!("expected usage migration conflict"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("both legacy usageTotals and usageByModel")
+        );
 
         let _ = std::fs::remove_file(config_path);
         let _ = std::fs::remove_dir(workspace);
@@ -1308,7 +1444,10 @@ toolCallCount = 7
         app.theme = "neon".into();
         app.mode = Mode::Computer;
         app.tool_mode = ToolMode::ReadOnly;
-        app.usage_totals.accumulate(12, 8, 3);
+        app.usage_by_model
+            .entry(CURRENT_USAGE_BUCKET.to_string())
+            .or_default()
+            .accumulate(12, 8, 3);
         app.session_usage_totals.accumulate(100, 200, 1);
         app.persist_state().expect("persist state");
 
@@ -1316,10 +1455,14 @@ toolCallCount = 7
         assert_eq!(saved.theme, "neon");
         assert!(matches!(saved.mode, Mode::Computer));
         assert!(matches!(saved.tool_mode, ToolMode::ReadOnly));
-        assert_eq!(saved.usage_totals.input_tokens, 12);
-        assert_eq!(saved.usage_totals.output_tokens, 8);
-        assert_eq!(saved.usage_totals.total_tokens, 20);
-        assert_eq!(saved.usage_totals.tool_call_count, 3);
+        let saved_usage = saved
+            .usage_by_model
+            .get(CURRENT_USAGE_BUCKET)
+            .expect("saved current usage bucket");
+        assert_eq!(saved_usage.tool_input_tokens, 12);
+        assert_eq!(saved_usage.tool_output_tokens, 8);
+        assert_eq!(saved_usage.total_tokens, 20);
+        assert_eq!(saved_usage.tool_call_count, 3);
 
         let reloaded = AppState::from_config_path(
             8787,
@@ -1327,7 +1470,7 @@ toolCallCount = 7
             config_path.clone(),
         )
         .expect("reload app state");
-        assert_eq!(reloaded.usage_totals.total_tokens, 20);
+        assert_eq!(reloaded.all_time_usage_totals().total_tokens, 20);
         assert_eq!(reloaded.session_usage_totals, UsageTotals::default());
 
         let _ = std::fs::remove_file(config_path);

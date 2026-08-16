@@ -1,7 +1,7 @@
 {
   "name": "catdesk",
   "version": "0.1.8",
-  "description": "Turn ChatGPT Web into a coding agent.",
+  "description": "Use ChatGPT Chat as a local coding agent.",
   "license": "MIT",
   "repository": {
     "type": "git",

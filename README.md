@@ -1,6 +1,6 @@
 # CatDesk
 
-An open-source tool that turns ChatGPT Web into a coding agent. No reverse engineering, no API, no Codex. A ChatGPT Plus subscription is enough.
+An open-source tool that lets you use ChatGPT Chat as a local coding agent. No reverse engineering, no API, no Codex, no Work mode. A ChatGPT Plus subscription is enough.
 
 <p align="center">
   <img src="docs/images/catdesk_preview.gif" alt="CatDesk in ChatGPT Web"><br>
@@ -13,7 +13,7 @@ This is an independent open-source project and is not affiliated with or endorse
 
 # Why CatDesk?
 
-Codex has a very generous weekly quota (2x usage + reset usage frequently) compared to Antigravity and Claude Code (3 Opus prompts then 5h quota is gone lol), that's why I love OpenAI so much.
+Codex has a very generous weekly quota (reset usage frequently) compared to Antigravity (good at good morning) and Claude Code (RIP 5h quota 💀), that's why I love OpenAI so much.
 
 <p align="center">
   <img src="docs/images/codex_2x_usage.png" alt="Codex reset usage frequently🙏" width="700"><br>
@@ -35,6 +35,11 @@ Here's the solution: most people with a Plus subscription do not use even 10% of
 
 That's the idea behind CatDesk! It gives ChatGPT Web tools like `write` and `run_command` to edit files on your computer.
 
+<p align="center">
+  <img src="docs/images/thinking_usage_limits.png" alt="ChatGPT reasoning usage limits for GPT-5.5 and GPT-5.6" width="900"><br>
+  <em>GPT-5.5: <a href="https://web.archive.org/web/20260519111010/https://help.openai.com/en/articles/11909943-gpt-55-in-chatgpt">3,000 messages/week</a>, GPT-5.6: <a href="https://help.openai.com/en/articles/20001354-gpt-56-in-chatgpt">unknown</a> but I have never hit the limit</em>
+</p>
+
 # How does this work?
 
 1. A ChatGPT Plus or above subscription is required.
@@ -50,11 +55,11 @@ ChatGPT Web + CatDesk
 = OpenClaw without cron and other active utilities
 ```
 
-I tried this with GPT-5.2 before, and the results were poor. However, **GPT-5.4 Thinking is now really good at tool calling and computer use.** The first time I tried it with GPT-5.4, I was honestly surprised by how well it worked.
+I tried this with GPT-5.2 before, and the results were poor. However, **GPT-5.4 Thinking is now really good at tool calling and computer use.** The first time I tried it with GPT-5.4, I was honestly surprised by how well it worked. GPT-5.5 and GPT-5.6 are even smoother, and GPT-5.6 is extremely good at using CatDesk. It's also very fast.
 
-# Differences between ChatGPT + CatDesk, Codex, and the API (let's say Plus plan)
+# Differences between ChatGPT Chat + CatDesk, Codex, and the API (let's say Plus plan)
 
-|       | ChatGPT + CatDesk                                  | Codex                   | OpenAI API           |
+|       | ChatGPT Chat + CatDesk                             | Codex                   | OpenAI API           |
 | ----- | -------------------------------------------------- | ----------------------- | -------------------- |
 | Usage | 3,000 messages/week                                | Generous weekly quota   | Pay as you go        |
 | Pros  | Stable, no extra fee, and nearly unlimited\* quota | Stable and no extra fee | Stable               |
@@ -80,45 +85,42 @@ I tried this with GPT-5.2 before, and the results were poor. However, **GPT-5.4 
    npm install -g catdesk
    ```
 
-   The npm package downloads a prebuilt CatDesk binary for your platform. You do not need a Rust toolchain.
-
 2. Run CatDesk from any terminal directory.
 
    ```bash
    catdesk
    ```
 
+   When CatDesk starts, choose `Control Computer`, `Control Browser`, or `Both`. If browser control is enabled, select a supported Chromium browser.
+
    On first launch, CatDesk will ask you to enter your **ngrok authtoken** and **ngrok static domain** (e.g. `my-app.ngrok-free.dev`). You can get both from the [ngrok dashboard](https://dashboard.ngrok.com/get-started/setup). These are saved to `~/.catdesk/config.toml` and reused on subsequent launches.
 
-   By default, CatDesk listens on port `3200`, as defined in [`main()`](/home/xeift/Desktop/CatDesk/src/main.rs#L325). You can override it with `PORT`. The workspace root defaults to the current working directory and can be overridden with `WORKSPACE_ROOT`, also in [`main()`](/home/xeift/Desktop/CatDesk/src/main.rs#L325).
+   By default, CatDesk listens on port `3200`. You can override it with `PORT`. The workspace root defaults to the current working directory and can be overridden with `WORKSPACE_ROOT`.
 
    On macOS Terminal.app, CatDesk manages a dedicated `CatDesk` Terminal profile automatically. If the current Terminal tab is not already using that profile, CatDesk applies it, closes any temporary helper window, and asks you to run the same command again in that tab. It only starts immediately when the current tab is already using `CatDesk`. Set `CATDESK_SKIP_MACOS_TERMINAL_PROFILE=1` if you want to keep the current Terminal session untouched.
 
 3. Wait for the TUI to show the MCP Server URL.
 
-4. Open [ChatGPT connector settings](https://chatgpt.com/apps#settings/Connectors).
+4. Open [ChatGPT connector settings](https://chatgpt.com/plugins#settings/Connectors?create-connector=true&redirectAfter=%2Fplugins).
 
-5. Click `Create app`.
-
-6. Fill in the connector form.
-   Use:
+5. In the pop-up window, fill in the connector form:
    - Name: `CatDesk` or any name you like
-   - MCP Server URL: the full URL shown by CatDesk
+   - MCP Server URL: the full URL shown in CatDesk TUI
    - Authentication: `None`
 
-   These values come directly from the in-app guide in [`guide_lines`](/home/xeift/Desktop/CatDesk/src/main.rs#L2150).
+6. Click `I understand and want to continue`.
 
-7. Click `I understand and want to continue`.
+7. Click `Create`, then click `Connect`.
 
-8. Click `Create`.
+   - Permission defaults to **Allow read actions**. For the smoothest experience, I recommend **Allow all actions** (equivalent to Codex's `--yolo`; use with caution).
 
-9. Add this to your ChatGPT `Custom instructions`:
+8. Add this to your ChatGPT `Custom instructions`:
 
 ```text
 CatDesk is a coding tool and a custom connector. Always use CatDesk if the user wants to do anything related to file operations. Always call `catdesk_instruction` after `list_resources`, and follow the instructions it contains.
 ```
 
-10. Start using the connector from ChatGPT Web. Some important tips:
+9. Start using the connector from ChatGPT Web. Some important tips:
 
 - I recommend let ChatGPT to decide which connector automatically. You can manually selecting the connector using `/` or `@`. This way, ChatGPT can only access the connector you selected, which may improve stability. However, the downside is, `web.search` and `web.open` will be disabled. Which means it can't search latest info. The `web` tool and a custom connector cannot be used at the same time.
 
@@ -141,7 +143,6 @@ CatDesk is a coding tool and a custom connector. Always use CatDesk if the user 
   <em>3.9 GB Memory usage🥹</em>
 </p>
 
-- Use 5.5 with `Standard` thinking effort for CatDesk. It‘s smoother and faster, and produces better code quality than `Extended`(at least in my experience).
 
 # Tools
 
@@ -191,26 +192,6 @@ According to [the blog](<https://help.openai.com/en/articles/11909943-gpt-53-and
 
 Yes. Open [Advanced connector settings](https://chatgpt.com/#settings/Connectors/Advanced) and turn on `Enforce CSP in developer mode`. That setting removes the red button. CatDesk automatically adds the current ngrok domain to the widget CSP, so the widget should keep working with CSP enforcement enabled.
 
-### Can I skip approval, like with `--yolo` or `--dangerously-skip-permissions`?
-
-<p align="center">
-  <img src="docs/images/approval.png" alt="Approval required for sensitive operations" width="500"><br>
-  <em>Approval required for sensitive operations</em>
-</p>
-
-No. This restriction comes from the ChatGPT Web side. There is not much CatDesk can do about it. ChatGPT Web probably uses an LLM or some internal policy layer to detect high-risk operations and require manual approval. Sensitive filenames and sensitive content can both trigger manual approval. It is not only about which tool is being used. For example:
-
-> write("api_key.txt", content: "")<br>
-> ⚠️ Approval required
-
-> write("Xeift.txt", content: "api_key")<br>
-> ⚠️ Approval required
-
-> write("i_luv_catgirl.txt", content: "")<br>
-> ✅ No approval required
-
-Sometimes this is annoying, but there is no good workaround right now. This is one of the reasons I say CatDesk is _not as smooth as native Codex_.
-
 ### I've already connected. Why do I need to connect again and again?
 
 There doesn't seem to be any obvious pattern for when the connector triggers `Connect`. I'm sure it's not triggered by the tool call count, but I don't know the exact reason.
@@ -232,9 +213,9 @@ I know it’s annoying. I’m trying to find a solution now.
 
 ### Can CatDesk be used in other apps?
 
-No. CatDesk is built around ChatGPT Web and its Custom Connector (They call it _Apps_ now, but to prevent confusion with _Application_, I still prefer call it _Connector_) flow. In practice, that means this project is not just a plain standalone MCP server. Also, there still are not many AI apps that support custom remote MCP servers well. Even if they support, they probably does not provide such generous (3000 messages) weekly quota.
+Yes, in theory. CatDesk may also work with other apps that support custom remote MCP servers, including Claude. (I don't think anyone will use CatDesk with Claude though, since Claude Chat mode and Claude Code share the same usage limits.)
 
-For Claude, web and Claude Code share same quota, so just simply use Claude Code, no need to use CatDesk.
+However, CatDesk is built specifically for ChatGPT Chat and its Custom Connector (They renamed it to _Apps_, and now they renamed it again and call it _Plugins_, but to prevent confusion with _Application_, I still prefer call it _Connector_) flow. ChatGPT Chat is the environment CatDesk is designed and tested for, so other apps may not work as smoothly.
 
 ### How does the input/output token be calculated?
 

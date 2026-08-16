@@ -144,6 +144,20 @@ CatDesk is a coding tool and a custom connector. Always use CatDesk if the user 
 </p>
 
 
+# Stack
+
+| Part | Stack |
+| --- | --- |
+| Core | Rust |
+| MCP server | Custom implementation (no SDK) |
+| MCP protocolVersion | `2025-11-25` |
+| Server | Axum + Tokio |
+| TUI | Ratatui |
+| Tunnel | ngrok |
+| Browser control | chrome-devtools-mcp |
+| Widget | HTML + JavaScript |
+| Distribution | npm |
+
 # Tools
 
 CatDesk has two local tool modes: `multi-tools` exposes 7 tools, and `read-only` exposes 3 tools.

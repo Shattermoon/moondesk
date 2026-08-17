@@ -594,6 +594,12 @@ where
 }
 
 async fn run_job(job: Arc<CommandJob>, mut cancel_rx: watch::Receiver<bool>) {
+    let cancelled_before_spawn = *cancel_rx.borrow();
+    if cancelled_before_spawn {
+        job.finish(CommandJobState::Cancelled, None).await;
+        return;
+    }
+
     let mut process = match process_runner::spawn_shell_command(&job.command, &job.cwd).await {
         Ok(process) => process,
         Err(error) => {
@@ -824,6 +830,30 @@ mod tests {
         assert!(
             !sentinel.exists(),
             "cancelled process survived and wrote sentinel"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn pre_cancelled_job_does_not_spawn_command() {
+        let root = workspace("pre-cancel");
+        let sentinel = root.join("sentinel.txt");
+        let command = if cfg!(windows) {
+            "Set-Content sentinel.txt spawned; Start-Sleep -Seconds 2"
+        } else {
+            "printf spawned > sentinel.txt; sleep 2"
+        };
+        let (job, cancel_rx) = CommandJob::new(command.to_string(), root.clone(), 10_000);
+
+        let _ = job.cancel_tx.send(true);
+        run_job(job.clone(), cancel_rx).await;
+
+        let snapshot = job.snapshot(0).await;
+        assert_eq!(snapshot.state, CommandJobState::Cancelled);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !sentinel.exists(),
+            "a job cancelled before the runner started still spawned its shell"
         );
         let _ = std::fs::remove_dir_all(root);
     }

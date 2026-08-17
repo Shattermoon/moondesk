@@ -1,4 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -22,6 +24,7 @@ const IDEMPOTENCY_WINDOW: StdDuration = StdDuration::from_secs(30);
 const MAX_OUTPUT_BYTES_PER_JOB: usize = 4 * 1024 * 1024;
 const MAX_TERMINAL_OUTPUT_BYTES: usize = 32 * 1024 * 1024;
 const MAX_POLL_OUTPUT_BYTES: usize = 128 * 1024;
+pub const MAX_COMMAND_OUTPUT_READ_BYTES: usize = 128 * 1024;
 const READ_CHUNK_BYTES: usize = 8 * 1024;
 const CLEANUP_INTERVAL: StdDuration = StdDuration::from_secs(1);
 
@@ -71,13 +74,32 @@ pub struct CommandJobSnapshot {
     pub next_cursor: u64,
     pub has_more_output: bool,
     pub output_truncated: bool,
+    pub output_archive_error: Option<String>,
     pub timeout_ms: u64,
 }
 
 #[derive(Clone, Debug)]
 pub struct StartCommandResult {
     pub snapshot: CommandJobSnapshot,
-    pub deduplicated: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct CommandOutputChunk {
+    pub start_byte: u64,
+    pub end_byte: u64,
+    pub text: String,
+    pub next_start_byte: Option<u64>,
+}
+
+#[derive(Debug)]
+struct OutputRootGuard {
+    path: PathBuf,
+}
+
+impl Drop for OutputRootGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
 }
 
 #[derive(Debug)]
@@ -88,7 +110,7 @@ struct JobRuntime {
     events: VecDeque<CommandOutputEvent>,
     retained_output_bytes: usize,
     next_seq: u64,
-    output_truncated: bool,
+    output_archive_error: Option<String>,
 }
 
 impl Default for JobRuntime {
@@ -100,7 +122,7 @@ impl Default for JobRuntime {
             events: VecDeque::new(),
             retained_output_bytes: 0,
             next_seq: 1,
-            output_truncated: false,
+            output_archive_error: None,
         }
     }
 }
@@ -113,35 +135,83 @@ struct CommandJob {
     started_at: Instant,
     timeout_ms: u64,
     runtime: Mutex<JobRuntime>,
+    stdout_archive: Mutex<File>,
+    stderr_archive: Mutex<File>,
     changed: Notify,
     cancel_tx: watch::Sender<bool>,
 }
 
 impl CommandJob {
-    fn new(command: String, cwd: PathBuf, timeout_ms: u64) -> (Arc<Self>, watch::Receiver<bool>) {
+    fn new_with_output(
+        id: String,
+        command: String,
+        cwd: PathBuf,
+        timeout_ms: u64,
+        output_paths: &process_runner::CommandOutputPaths,
+    ) -> Result<(Arc<Self>, watch::Receiver<bool>), String> {
+        let stdout_archive = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&output_paths.stdout)
+            .map_err(|error| format!("failed to open stdout archive: {error}"))?;
+        let stderr_archive = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&output_paths.stderr)
+            .map_err(|error| format!("failed to open stderr archive: {error}"))?;
         let (cancel_tx, cancel_rx) = watch::channel(false);
-        (
+        Ok((
             Arc::new(Self {
-                id: Uuid::new_v4().to_string(),
+                id,
                 command,
                 cwd,
                 started_at: Instant::now(),
                 timeout_ms,
                 runtime: Mutex::new(JobRuntime::default()),
+                stdout_archive: Mutex::new(stdout_archive),
+                stderr_archive: Mutex::new(stderr_archive),
                 changed: Notify::new(),
                 cancel_tx,
             }),
             cancel_rx,
-        )
+        ))
+    }
+
+    #[cfg(test)]
+    fn new(command: String, cwd: PathBuf, timeout_ms: u64) -> (Arc<Self>, watch::Receiver<bool>) {
+        let id = Uuid::new_v4().to_string();
+        let output_dir = cwd.join(format!(".catdesk-command-output-{id}"));
+        fs::create_dir_all(&output_dir).expect("create test command output dir");
+        let output_paths = process_runner::CommandOutputPaths {
+            stdout: output_dir.join("stdout.log"),
+            stderr: output_dir.join("stderr.log"),
+        };
+        Self::new_with_output(id, command, cwd, timeout_ms, &output_paths)
+            .expect("create test command output archive")
     }
 
     async fn append_output(&self, stream: &'static str, bytes: &[u8]) {
         if bytes.is_empty() {
             return;
         }
+        let archive_error = {
+            let archive = if stream == "stderr" {
+                &self.stderr_archive
+            } else {
+                &self.stdout_archive
+            };
+            let mut file = archive.lock().await;
+            file.write_all(bytes)
+                .err()
+                .map(|error| format!("failed to preserve complete {stream} output: {error}"))
+        };
+
         let text = String::from_utf8_lossy(bytes).into_owned();
         let event_bytes = text.len();
         let mut runtime = self.runtime.lock().await;
+        if runtime.output_archive_error.is_none() {
+            runtime.output_archive_error = archive_error;
+        }
         let seq = runtime.next_seq;
         runtime.next_seq = runtime.next_seq.saturating_add(1);
         runtime
@@ -149,14 +219,15 @@ impl CommandJob {
             .push_back(CommandOutputEvent { seq, stream, text });
         runtime.retained_output_bytes = runtime.retained_output_bytes.saturating_add(event_bytes);
 
-        while runtime.retained_output_bytes > MAX_OUTPUT_BYTES_PER_JOB {
+        while runtime.output_archive_error.is_none()
+            && runtime.retained_output_bytes > MAX_OUTPUT_BYTES_PER_JOB
+        {
             let Some(removed) = runtime.events.pop_front() else {
                 break;
             };
             runtime.retained_output_bytes = runtime
                 .retained_output_bytes
                 .saturating_sub(removed.text.len());
-            runtime.output_truncated = true;
         }
         drop(runtime);
         self.changed.notify_waiters();
@@ -210,7 +281,8 @@ impl CommandJob {
             events,
             next_cursor,
             has_more_output,
-            output_truncated: runtime.output_truncated || cursor_fell_behind,
+            output_truncated: cursor_fell_behind,
+            output_archive_error: runtime.output_archive_error.clone(),
             timeout_ms: self.timeout_ms,
         }
     }
@@ -225,9 +297,10 @@ struct ManagerState {
     last_cleanup: Option<Instant>,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct CommandJobManager {
     inner: Arc<RwLock<ManagerState>>,
+    output_root: Arc<OutputRootGuard>,
     // Starting a job performs a dedupe lookup, active-job capacity check, and
     // registry insertion. Serialize that short critical section so concurrent
     // MCP requests cannot both pass the checks and create duplicate/overflow jobs.
@@ -237,9 +310,122 @@ pub struct CommandJobManager {
     shutting_down: Arc<AtomicBool>,
 }
 
+impl Default for CommandJobManager {
+    fn default() -> Self {
+        let output_root = std::env::temp_dir().join(format!(
+            "catdesk-command-output-{}-{}",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        Self {
+            inner: Arc::new(RwLock::new(ManagerState::default())),
+            output_root: Arc::new(OutputRootGuard { path: output_root }),
+            start_lock: Arc::new(Mutex::new(())),
+            shutting_down: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
 impl CommandJobManager {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    fn output_paths(&self, output_id: &str) -> Result<process_runner::CommandOutputPaths, String> {
+        Uuid::parse_str(output_id).map_err(|_| "invalid command output id".to_string())?;
+        let dir = self.output_root.path.join(output_id);
+        Ok(process_runner::CommandOutputPaths {
+            stdout: dir.join("stdout.log"),
+            stderr: dir.join("stderr.log"),
+        })
+    }
+
+    fn prepare_output(
+        &self,
+        output_id: &str,
+    ) -> Result<process_runner::CommandOutputPaths, String> {
+        let paths = self.output_paths(output_id)?;
+        let dir = paths
+            .stdout
+            .parent()
+            .ok_or_else(|| "invalid command output path".to_string())?;
+        fs::create_dir_all(dir)
+            .map_err(|error| format!("failed to create command output archive: {error}"))?;
+        File::create(&paths.stdout)
+            .map_err(|error| format!("failed to create stdout archive: {error}"))?;
+        File::create(&paths.stderr)
+            .map_err(|error| format!("failed to create stderr archive: {error}"))?;
+        Ok(paths)
+    }
+
+    pub fn create_run_output(
+        &self,
+    ) -> Result<(String, process_runner::CommandOutputPaths), String> {
+        let output_id = Uuid::new_v4().to_string();
+        let paths = self.prepare_output(&output_id)?;
+        Ok((output_id, paths))
+    }
+
+    pub fn discard_output(&self, output_id: &str) {
+        if let Ok(paths) = self.output_paths(output_id)
+            && let Some(dir) = paths.stdout.parent()
+        {
+            let _ = fs::remove_dir_all(dir);
+        }
+    }
+
+    pub fn read_output(
+        &self,
+        output_id: &str,
+        stream: &str,
+        start_byte: u64,
+        max_bytes: usize,
+    ) -> Result<CommandOutputChunk, String> {
+        if !(4..=MAX_COMMAND_OUTPUT_READ_BYTES).contains(&max_bytes) {
+            return Err(format!(
+                "max_bytes must be between 4 and {MAX_COMMAND_OUTPUT_READ_BYTES}"
+            ));
+        }
+        let paths = self.output_paths(output_id)?;
+        let path = match stream {
+            "stdout" => paths.stdout,
+            "stderr" => paths.stderr,
+            _ => return Err("stream must be stdout or stderr".to_string()),
+        };
+        if !path.exists() {
+            return Err("command output archive not found".to_string());
+        }
+        let size = path.metadata().map_err(|error| error.to_string())?.len();
+        if start_byte > size {
+            return Err(format!(
+                "start_byte {start_byte} is past the end of the {stream} log ({size} bytes)"
+            ));
+        }
+
+        let mut file = File::open(&path).map_err(|error| error.to_string())?;
+        file.seek(SeekFrom::Start(start_byte))
+            .map_err(|error| error.to_string())?;
+        let to_read = max_bytes.min(size.saturating_sub(start_byte) as usize);
+        let mut data = vec![0_u8; to_read];
+        let read = file.read(&mut data).map_err(|error| error.to_string())?;
+        data.truncate(read);
+
+        let consumed = match std::str::from_utf8(&data) {
+            Ok(_) => data.len(),
+            Err(error) if error.error_len().is_none() && error.valid_up_to() > 0 => {
+                error.valid_up_to()
+            }
+            Err(_) => data.len(),
+        };
+        let text = String::from_utf8_lossy(&data[..consumed]).into_owned();
+        let end_byte = start_byte.saturating_add(consumed as u64);
+        let next_start_byte = (end_byte < size).then_some(end_byte);
+        Ok(CommandOutputChunk {
+            start_byte,
+            end_byte,
+            text,
+            next_start_byte,
+        })
     }
 
     pub fn normalize_timeout(timeout_ms: Option<u64>) -> Result<u64, String> {
@@ -291,7 +477,6 @@ impl CommandJobManager {
                 }
                 return Ok(StartCommandResult {
                     snapshot: job.snapshot(0).await,
-                    deduplicated: true,
                 });
             }
         }
@@ -315,8 +500,10 @@ impl CommandJobManager {
             ));
         }
 
-        let (job, cancel_rx) = CommandJob::new(command, cwd, timeout_ms);
-        let job_id = job.id.clone();
+        let job_id = Uuid::new_v4().to_string();
+        let output_paths = self.prepare_output(&job_id)?;
+        let (job, cancel_rx) =
+            CommandJob::new_with_output(job_id.clone(), command, cwd, timeout_ms, &output_paths)?;
         {
             let mut manager = self.inner.write().await;
             manager.jobs.insert(job_id.clone(), job.clone());
@@ -330,7 +517,6 @@ impl CommandJobManager {
         tokio::spawn(run_job(job.clone(), cancel_rx));
         Ok(StartCommandResult {
             snapshot: job.snapshot(0).await,
-            deduplicated: false,
         })
     }
 
@@ -1122,8 +1308,6 @@ mod tests {
             )
             .await
             .expect("deduplicate job");
-        assert!(!first.deduplicated);
-        assert!(second.deduplicated);
         assert_eq!(first.snapshot.job_id, second.snapshot.job_id);
         let _ = manager.cancel(&first.snapshot.job_id).await;
         let _ = std::fs::remove_dir_all(root);
@@ -1208,6 +1392,51 @@ mod tests {
         );
         assert!(snapshot.has_more_output);
         assert!(snapshot.next_cursor < chunks as u64);
+
+        let caught_up = job.snapshot(chunks as u64).await;
+        assert!(!caught_up.output_truncated);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn overflowed_background_output_remains_fully_recoverable_from_archive() {
+        let root = workspace("output-archive-recovery");
+        let manager = CommandJobManager::new();
+        let job_id = Uuid::new_v4().to_string();
+        let paths = manager
+            .prepare_output(&job_id)
+            .expect("prepare output archive");
+        let (job, _cancel_rx) = CommandJob::new_with_output(
+            job_id.clone(),
+            "synthetic".into(),
+            root.clone(),
+            5_000,
+            &paths,
+        )
+        .expect("create archived job");
+        let chunk = vec![b'x'; READ_CHUNK_BYTES];
+        let chunks = (MAX_OUTPUT_BYTES_PER_JOB / READ_CHUNK_BYTES) + 8;
+        for _ in 0..chunks {
+            job.append_output("stdout", &chunk).await;
+        }
+
+        let snapshot = job.snapshot(0).await;
+        assert!(snapshot.output_truncated);
+        assert!(snapshot.output_archive_error.is_none());
+
+        let mut start_byte = 0u64;
+        let mut recovered_bytes = 0usize;
+        loop {
+            let output = manager
+                .read_output(&job_id, "stdout", start_byte, MAX_COMMAND_OUTPUT_READ_BYTES)
+                .expect("read archived output");
+            recovered_bytes += output.text.len();
+            match output.next_start_byte {
+                Some(next) => start_byte = next,
+                None => break,
+            }
+        }
+        assert_eq!(recovered_bytes, chunks * READ_CHUNK_BYTES);
         let _ = std::fs::remove_dir_all(root);
     }
 

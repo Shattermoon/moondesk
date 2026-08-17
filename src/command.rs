@@ -2,6 +2,9 @@ use std::path::{Path, PathBuf};
 use tree_sitter::{Node, Parser};
 use tree_sitter_bash::LANGUAGE as BASH_LANGUAGE;
 
+// `run_command` is one-shot, so keep the legacy capture budget rather than
+// discarding output that cannot be recovered. Chatty commands should use the
+// incremental start_command/poll_command path instead.
 const MAX_BUFFER_BYTES: usize = 1024 * 1024;
 pub const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 pub const MAX_TIMEOUT_MS: u64 = 120_000;
@@ -13,10 +16,10 @@ pub struct CommandResult {
     pub stderr: String,
     pub success: bool,
     pub exit_code: Option<i32>,
-    pub elapsed_ms: u64,
     pub timed_out: bool,
     pub stdout_truncated: bool,
     pub stderr_truncated: bool,
+    pub output_archive_error: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -32,17 +35,6 @@ pub enum ListFilesInterceptSource {
     Tree,
     Ls,
     Rg,
-}
-
-impl ListFilesInterceptSource {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Find => "find",
-            Self::Tree => "tree",
-            Self::Ls => "ls",
-            Self::Rg => "rg",
-        }
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -176,40 +168,36 @@ pub fn detect_move_path_intercept(command: &str) -> Option<InterceptedMovePathRe
 /// The process runner owns the complete process tree. If this future is timed
 /// out or dropped because the MCP request disappears, the child tree is
 /// terminated instead of being left behind as an orphaned build.
+#[cfg(test)]
 pub async fn run_command(command: &str, cwd: &Path, timeout_ms: u64) -> CommandResult {
-    let result =
-        crate::process_runner::run_shell_command(command, cwd, timeout_ms, MAX_BUFFER_BYTES).await;
+    run_command_archived(command, cwd, timeout_ms, None).await
+}
+
+pub async fn run_command_archived(
+    command: &str,
+    cwd: &Path,
+    timeout_ms: u64,
+    output_paths: Option<&crate::process_runner::CommandOutputPaths>,
+) -> CommandResult {
+    let result = crate::process_runner::run_shell_command(
+        command,
+        cwd,
+        timeout_ms,
+        MAX_BUFFER_BYTES,
+        output_paths,
+    )
+    .await;
 
     CommandResult {
         stdout: result.stdout,
         stderr: result.stderr,
         success: result.success,
         exit_code: result.exit_code,
-        elapsed_ms: result.elapsed_ms,
         timed_out: result.timed_out,
         stdout_truncated: result.stdout_truncated,
         stderr_truncated: result.stderr_truncated,
+        output_archive_error: result.output_archive_error,
     }
-}
-
-/// Format stdout+stderr into a single string.
-pub fn format_result(r: &CommandResult) -> String {
-    let mut out = String::new();
-    if !r.stdout.is_empty() {
-        out.push_str(&r.stdout);
-    }
-    if !r.stderr.is_empty() {
-        if !out.is_empty() {
-            out.push_str("\n\nSTDERR:\n");
-        } else {
-            out.push_str("STDERR:\n");
-        }
-        out.push_str(&r.stderr);
-    }
-    if out.is_empty() {
-        out.push_str("(no output)");
-    }
-    out
 }
 
 pub fn contains_catdesk_co_author_marker(command: &str) -> bool {
@@ -1022,11 +1010,11 @@ mod tests {
     #[test]
     fn inject_catdesk_co_author_trailer_rewrites_nested_shell_commit_commands() {
         let rewritten = inject_catdesk_co_author_trailer(
-            "bash -lc 'git add src/widget/catdesk_dashboard.html && git commit -m \"Update catdesk widget meta handling\"'",
+            "bash -lc 'git add src/mcp.rs && git commit -m \"Update MCP metadata handling\"'",
         );
         assert_eq!(
             rewritten,
-            "bash -lc 'git add src/widget/catdesk_dashboard.html && git commit --trailer '\"'\"'Co-Authored-By: CatDesk'\"'\"' -m \"Update catdesk widget meta handling\"'"
+            "bash -lc 'git add src/mcp.rs && git commit --trailer '\"'\"'Co-Authored-By: CatDesk'\"'\"' -m \"Update MCP metadata handling\"'"
         );
     }
 

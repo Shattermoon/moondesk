@@ -6,17 +6,21 @@ use serde::Serialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, VecDeque};
 use std::fs;
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 
-const MAX_READ_BYTES: usize = 512 * 1024;
+pub const DEFAULT_READ_LINES: usize = 200;
+pub const MAX_READ_LINES: usize = 1000;
+pub const MAX_READ_BYTES: usize = 128 * 1024;
 const MAX_WRITE_BYTES: usize = 512 * 1024;
 const DEFAULT_LIST_LIMIT: usize = 200;
 const HARD_LIST_LIMIT: usize = 1000;
-const DEFAULT_SEARCH_LIMIT: usize = 100;
+const DEFAULT_SEARCH_LIMIT: usize = 50;
 const HARD_SEARCH_LIMIT: usize = 500;
 const HARD_SEARCH_CONTEXT_LINES: usize = 20;
+const MAX_SEARCH_RESPONSE_BYTES: usize = 128 * 1024;
+const MAX_SEARCH_LINE_BYTES: usize = 4 * 1024;
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -67,25 +71,13 @@ impl ListFilesOutput {
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReadFileOutput {
-    pub path: String,
-    pub bytes: usize,
-    pub size_bytes: u64,
-    pub line_count: usize,
+    pub start_line: Option<usize>,
+    pub end_line: Option<usize>,
+    pub start_byte: Option<u64>,
+    pub end_byte: Option<u64>,
     pub text: String,
-    pub truncated: bool,
-}
-
-impl ReadFileOutput {
-    pub fn render_text(&self) -> String {
-        let mut out = String::new();
-        out.push_str(&format!("path: {}\n", self.path));
-        out.push_str(&format!("bytes: {}\n\n", self.bytes));
-        out.push_str(&self.text);
-        if self.truncated {
-            out.push_str(&format!("\n\n[truncated at {} bytes]", MAX_READ_BYTES));
-        }
-        out
-    }
+    pub next_start_line: Option<usize>,
+    pub next_start_byte: Option<u64>,
 }
 
 #[derive(Clone, Serialize)]
@@ -111,34 +103,61 @@ pub struct SearchTextOutput {
 }
 
 impl SearchTextOutput {
-    pub fn render_text(&self) -> String {
+    pub fn render_text(&self) -> (String, bool) {
+        if self.results.is_empty() {
+            return ("(no matches)".to_string(), self.truncated);
+        }
+
         let mut out = String::new();
-        out.push_str(&format!("pattern: {}\n", self.pattern));
-        out.push_str(&format!("path: {}\n", self.path));
-        out.push_str(&format!("backend: {}\n", self.backend));
-        if !self.backend_note.is_empty() {
-            out.push_str(&format!("backend_note: {}\n", self.backend_note));
+        let mut current_path: Option<&str> = None;
+        let mut truncated = self.truncated;
+
+        for entry in &self.results {
+            let mut chunk = String::new();
+            let path_changed = current_path != Some(entry.path.as_str());
+            if path_changed {
+                if !out.is_empty() {
+                    chunk.push('\n');
+                }
+                chunk.push_str(&entry.path);
+                chunk.push('\n');
+            }
+
+            let (entry_text, line_truncated) =
+                truncate_utf8_bytes(&entry.text, MAX_SEARCH_LINE_BYTES);
+            truncated |= line_truncated;
+            let separator = if entry.is_context { '-' } else { ':' };
+            chunk.push_str(&format!("{}{} {}\n", entry.line, separator, entry_text));
+
+            if out.len().saturating_add(chunk.len()) > MAX_SEARCH_RESPONSE_BYTES {
+                truncated = true;
+                break;
+            }
+            out.push_str(&chunk);
+            if path_changed {
+                current_path = Some(entry.path.as_str());
+            }
         }
-        out.push_str(&format!("matches: {}\n\n", self.match_count));
-        out.push_str(
-            &self
-                .results
-                .iter()
-                .map(|entry| {
-                    let separator = if entry.is_context { "-" } else { ":" };
-                    format!(
-                        "{}{}{}{} {}",
-                        entry.path, separator, entry.line, separator, entry.text
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("\n"),
-        );
-        if self.truncated {
-            out.push_str(&format!("\n\n[truncated at {} matches]", self.limit));
+
+        if truncated {
+            let marker = "[truncated; narrow the search or request more specific results]\n";
+            if out.len().saturating_add(marker.len()) <= MAX_SEARCH_RESPONSE_BYTES {
+                out.push_str(marker);
+            }
         }
-        out
+        (out.trim_end().to_string(), truncated)
     }
+}
+
+fn truncate_utf8_bytes(value: &str, max_bytes: usize) -> (&str, bool) {
+    if value.len() <= max_bytes {
+        return (value, false);
+    }
+    let mut end = max_bytes;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    (&value[..end], true)
 }
 
 pub struct SearchTextOptions<'a> {
@@ -256,8 +275,19 @@ fn resolve_target_path(workspace_root: &str, path: &str) -> Result<PathBuf, Stri
     command::resolve_workspace_path(workspace_root, Some(path))
 }
 
-pub fn read_file(workspace_root: &str, path: &str) -> Result<ReadFileOutput, String> {
-    let root = workspace_root_path(workspace_root)?;
+pub fn read_file(
+    workspace_root: &str,
+    path: &str,
+    start_line: usize,
+    max_lines: usize,
+) -> Result<ReadFileOutput, String> {
+    if start_line == 0 {
+        return Err("start_line must be at least 1".into());
+    }
+    if !(1..=MAX_READ_LINES).contains(&max_lines) {
+        return Err(format!("max_lines must be between 1 and {MAX_READ_LINES}"));
+    }
+
     let target = resolve_target_path(workspace_root, path)?;
     if !target.exists() {
         return Err(format!("File not found: {}", target.display()));
@@ -266,45 +296,130 @@ pub fn read_file(workspace_root: &str, path: &str) -> Result<ReadFileOutput, Str
         return Err(format!("Not a file: {}", target.display()));
     }
 
-    let size_bytes = target.metadata().map_err(|e| e.to_string())?.len();
-    let line_count = count_file_lines(&target)?;
-    let mut file = fs::File::open(&target).map_err(|e| e.to_string())?;
-    let mut buf = vec![0_u8; MAX_READ_BYTES + 1];
-    let read_n = file.read(&mut buf).map_err(|e| e.to_string())?;
-    let truncated = read_n > MAX_READ_BYTES;
-    let data = &buf[..read_n.min(MAX_READ_BYTES)];
-    let text = String::from_utf8_lossy(data).into_owned();
-
-    Ok(ReadFileOutput {
-        path: to_workspace_relative(&root, &target),
-        bytes: data.len(),
-        size_bytes,
-        line_count,
-        text,
-        truncated,
-    })
-}
-
-fn count_file_lines(path: &Path) -> Result<usize, String> {
-    let mut file = fs::File::open(path).map_err(|e| e.to_string())?;
-    let mut buf = [0_u8; 8192];
-    let mut line_count = 0_usize;
-    let mut last_byte = None;
+    let file = fs::File::open(&target).map_err(|e| e.to_string())?;
+    let mut reader = BufReader::new(file);
+    let mut current_line = 1_usize;
+    let mut returned_lines = 0_usize;
+    let mut end_line = start_line.saturating_sub(1);
+    let mut next_start_line = None;
+    let mut text = String::new();
+    let mut line = String::new();
+    let mut byte_offset = 0_u64;
 
     loop {
-        let read_n = file.read(&mut buf).map_err(|e| e.to_string())?;
+        line.clear();
+        let line_start_byte = byte_offset;
+        let read_n = reader.read_line(&mut line).map_err(|e| e.to_string())?;
         if read_n == 0 {
             break;
         }
-        line_count += buf[..read_n].iter().filter(|byte| **byte == b'\n').count();
-        last_byte = Some(buf[read_n - 1]);
+        byte_offset = byte_offset.saturating_add(read_n as u64);
+        if current_line < start_line {
+            current_line += 1;
+            continue;
+        }
+        if returned_lines >= max_lines {
+            next_start_line = Some(current_line);
+            break;
+        }
+        if line.len() > MAX_READ_BYTES && returned_lines == 0 {
+            let mut output =
+                read_file_byte_chunk_from_target(&target, line_start_byte, MAX_READ_BYTES)?;
+            output.start_line = Some(current_line);
+            output.end_line = Some(current_line);
+            return Ok(output);
+        }
+        if text.len().saturating_add(line.len()) > MAX_READ_BYTES {
+            next_start_line = Some(current_line);
+            break;
+        }
+
+        text.push_str(&line);
+        returned_lines += 1;
+        end_line = current_line;
+        current_line += 1;
     }
 
-    if matches!(last_byte, Some(byte) if byte != b'\n') {
-        line_count += 1;
+    if returned_lines == 0 && next_start_line.is_none() && start_line > 1 {
+        return Err(format!(
+            "start_line {start_line} is past the end of the file"
+        ));
     }
 
-    Ok(line_count)
+    Ok(ReadFileOutput {
+        start_line: Some(start_line),
+        end_line: Some(end_line),
+        start_byte: None,
+        end_byte: None,
+        text,
+        next_start_line,
+        next_start_byte: None,
+    })
+}
+
+pub fn read_file_bytes(
+    workspace_root: &str,
+    path: &str,
+    start_byte: u64,
+    max_bytes: usize,
+) -> Result<ReadFileOutput, String> {
+    if !(4..=MAX_READ_BYTES).contains(&max_bytes) {
+        return Err(format!("max_bytes must be between 4 and {MAX_READ_BYTES}"));
+    }
+
+    let target = resolve_target_path(workspace_root, path)?;
+    if !target.exists() {
+        return Err(format!("File not found: {}", target.display()));
+    }
+    if !target.is_file() {
+        return Err(format!("Not a file: {}", target.display()));
+    }
+
+    read_file_byte_chunk_from_target(&target, start_byte, max_bytes)
+}
+
+fn read_file_byte_chunk_from_target(
+    target: &Path,
+    start_byte: u64,
+    max_bytes: usize,
+) -> Result<ReadFileOutput, String> {
+    let size_bytes = target.metadata().map_err(|e| e.to_string())?.len();
+    if start_byte > size_bytes {
+        return Err(format!(
+            "start_byte {start_byte} is past the end of the file ({size_bytes} bytes)"
+        ));
+    }
+
+    let mut file = fs::File::open(target).map_err(|e| e.to_string())?;
+    file.seek(SeekFrom::Start(start_byte))
+        .map_err(|e| e.to_string())?;
+    let mut data = Vec::with_capacity(max_bytes);
+    file.take(max_bytes as u64)
+        .read_to_end(&mut data)
+        .map_err(|e| e.to_string())?;
+
+    let consumed = readable_utf8_prefix_len(&data);
+    let text = String::from_utf8_lossy(&data[..consumed]).into_owned();
+    let end_byte = start_byte.saturating_add(consumed as u64);
+    let next_start_byte = (end_byte < size_bytes).then_some(end_byte);
+
+    Ok(ReadFileOutput {
+        start_line: None,
+        end_line: None,
+        start_byte: Some(start_byte),
+        end_byte: Some(end_byte),
+        text,
+        next_start_line: None,
+        next_start_byte,
+    })
+}
+
+fn readable_utf8_prefix_len(data: &[u8]) -> usize {
+    match std::str::from_utf8(data) {
+        Ok(_) => data.len(),
+        Err(error) if error.error_len().is_none() && error.valid_up_to() > 0 => error.valid_up_to(),
+        Err(_) => data.len(),
+    }
 }
 
 pub fn write_file(
@@ -1154,7 +1269,7 @@ pub fn edit_file(
     old_string: &str,
     new_string: &str,
     replace_all: bool,
-) -> Result<String, String> {
+) -> Result<usize, String> {
     if old_string.is_empty() {
         return Err("old_string must not be empty".into());
     }
@@ -1195,11 +1310,7 @@ pub fn edit_file(
     };
 
     fs::write(&target, replaced_content).map_err(|e| e.to_string())?;
-    Ok(format!(
-        "edited {} occurrence(s) in {}",
-        replaced_count,
-        to_workspace_relative(&root, &target)
-    ))
+    Ok(replaced_count)
 }
 
 #[cfg(test)]
@@ -1209,6 +1320,68 @@ mod tests {
 
     fn test_workspace(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("catdesk-workspace-tools-{name}-{}", Uuid::new_v4()))
+    }
+
+    #[test]
+    fn byte_chunk_read_preserves_utf8_boundaries() {
+        let workspace_root = test_workspace("read-byte-utf8");
+        fs::create_dir_all(&workspace_root).expect("create workspace");
+        let text = "ééééé";
+        fs::write(workspace_root.join("utf8.txt"), text).expect("write file");
+        let workspace_root_str = workspace_root.to_string_lossy().into_owned();
+
+        let first = read_file_bytes(&workspace_root_str, "utf8.txt", 0, 5).expect("first chunk");
+        assert_eq!(first.text, "éé");
+        assert_eq!(first.start_byte, Some(0));
+        assert_eq!(first.end_byte, Some(4));
+        assert_eq!(first.next_start_byte, Some(4));
+
+        let second = read_file_bytes(
+            &workspace_root_str,
+            "utf8.txt",
+            first.next_start_byte.expect("continuation"),
+            MAX_READ_BYTES,
+        )
+        .expect("second chunk");
+        assert_eq!(format!("{}{}", first.text, second.text), text);
+        assert!(second.next_start_byte.is_none());
+
+        let _ = fs::remove_dir_all(workspace_root);
+    }
+
+    #[test]
+    fn compact_search_render_groups_paths_and_caps_large_lines() {
+        let oversized = "x".repeat(MAX_SEARCH_LINE_BYTES + 100);
+        let output = SearchTextOutput {
+            pattern: "x".into(),
+            path: ".".into(),
+            backend: "test".into(),
+            backend_note: String::new(),
+            match_count: 2,
+            truncated: false,
+            limit: 50,
+            results: vec![
+                SearchTextEntry {
+                    path: "src/main.rs".into(),
+                    line: 10,
+                    text: oversized,
+                    is_context: false,
+                },
+                SearchTextEntry {
+                    path: "src/main.rs".into(),
+                    line: 11,
+                    text: "second".into(),
+                    is_context: false,
+                },
+            ],
+        };
+
+        let (text, truncated) = output.render_text();
+        assert!(truncated);
+        assert!(text.len() <= MAX_SEARCH_RESPONSE_BYTES);
+        assert_eq!(text.matches("src/main.rs").count(), 1);
+        assert!(text.contains("10: "));
+        assert!(text.contains("11: second"));
     }
 
     #[test]

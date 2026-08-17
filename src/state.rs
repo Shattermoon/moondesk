@@ -115,69 +115,6 @@ pub enum AgentsPathMode {
     Disabled,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TokenStatsLayout {
-    Disable,
-    #[default]
-    Right,
-    Bottom,
-}
-
-impl TokenStatsLayout {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Disable => "disable",
-            Self::Right => "right",
-            Self::Bottom => "bottom",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ShowDetailMode {
-    Disable,
-    #[default]
-    Expanded,
-    Collapsed,
-}
-
-impl ShowDetailMode {
-    pub fn all() -> &'static [ShowDetailMode] {
-        const MODES: [ShowDetailMode; 3] = [
-            ShowDetailMode::Disable,
-            ShowDetailMode::Expanded,
-            ShowDetailMode::Collapsed,
-        ];
-        &MODES
-    }
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Disable => "Disable",
-            Self::Expanded => "Expanded",
-            Self::Collapsed => "Collapsed",
-        }
-    }
-
-    pub fn description(self) -> &'static str {
-        match self {
-            Self::Disable => "Completely disable the web widget. Fastest and uses least memory.",
-            Self::Expanded => "Show the full web widget with syntax-highlighted diffs.",
-            Self::Collapsed => "Show the web widget but keep code changes collapsed by default.",
-        }
-    }
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Disable => "disable",
-            Self::Expanded => "expanded",
-            Self::Collapsed => "collapsed",
-        }
-    }
-}
-
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppConfig {
@@ -186,10 +123,6 @@ pub struct AppConfig {
     pub ngrok_domain: Option<String>,
     #[serde(default)]
     pub agents_path_mode: AgentsPathMode,
-    #[serde(default)]
-    pub token_stats_layout: TokenStatsLayout,
-    #[serde(default)]
-    pub show_detail_mode: ShowDetailMode,
     #[serde(default)]
     pub partner_binagotchy_seed: Option<String>,
     #[serde(default)]
@@ -209,8 +142,6 @@ impl Default for AppConfig {
             mcp_slug: None,
             ngrok_domain: None,
             agents_path_mode: AgentsPathMode::Default,
-            token_stats_layout: TokenStatsLayout::Right,
-            show_detail_mode: ShowDetailMode::Expanded,
             partner_binagotchy_seed: None,
             set_catdesk_as_co_author: false,
             theme: theme::DEFAULT_THEME_ID.to_string(),
@@ -386,49 +317,10 @@ const FLOW_BOOTSTRAP_PHASE_1_STEPS: &[FlowBootstrapStep] = &[
     },
 ];
 
-const FLOW_BOOTSTRAP_WIDGET_READ_STEPS: &[FlowBootstrapStep] = &[
-    FlowBootstrapStep {
-        event: "resources/read:run_command",
-        label: "run_command",
-    },
-    FlowBootstrapStep {
-        event: "resources/read:catdesk_instruction",
-        label: "instruction",
-    },
-    FlowBootstrapStep {
-        event: "resources/read:read",
-        label: "read",
-    },
-    FlowBootstrapStep {
-        event: "resources/read:search",
-        label: "search",
-    },
-    FlowBootstrapStep {
-        event: "resources/read:write",
-        label: "write",
-    },
-    FlowBootstrapStep {
-        event: "resources/read:edit",
-        label: "edit",
-    },
-    FlowBootstrapStep {
-        event: "resources/read:delete",
-        label: "delete",
-    },
-];
-
-const FLOW_BOOTSTRAP_PHASE_2_STEPS: &[FlowBootstrapStep] = FLOW_BOOTSTRAP_WIDGET_READ_STEPS;
-
-pub const FLOW_BOOTSTRAP_PHASES: &[FlowBootstrapPhase] = &[
-    FlowBootstrapPhase {
-        title: "Checking tools",
-        steps: FLOW_BOOTSTRAP_PHASE_1_STEPS,
-    },
-    FlowBootstrapPhase {
-        title: "Loading widgets",
-        steps: FLOW_BOOTSTRAP_PHASE_2_STEPS,
-    },
-];
+pub const FLOW_BOOTSTRAP_PHASES: &[FlowBootstrapPhase] = &[FlowBootstrapPhase {
+    title: "Checking tools",
+    steps: FLOW_BOOTSTRAP_PHASE_1_STEPS,
+}];
 
 /// Which MCP backends to enable.
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -501,7 +393,6 @@ pub struct AppState {
     pub theme: String,
     pub mode: Mode,
     pub tool_mode: ToolMode,
-    pub show_detail_mode: ShowDetailMode,
     pub mcp_slug: String,
     pub ngrok_domain: Option<String>,
     pub is_returning_user: bool,
@@ -513,7 +404,6 @@ pub struct AppState {
     pub devtools_running: bool,
     pub port: u16,
     pub workspace_root: String,
-    pub mascot_seed: u64,
     pub partner_binagotchy_seed: Option<String>,
     pub set_catdesk_as_co_author: bool,
     pub mascot: MascotPack,
@@ -613,30 +503,6 @@ pub fn save_ngrok_domain(domain: &str) -> std::io::Result<PathBuf> {
     let path = app_config_path()?;
     let mut config = AppConfig::load_from_path(&path)?;
     config.ngrok_domain = Some(domain.to_string());
-    config.save_to_path(&path)?;
-    Ok(path)
-}
-
-pub fn save_agents_path_mode(mode: AgentsPathMode) -> std::io::Result<PathBuf> {
-    let path = app_config_path()?;
-    let mut config = AppConfig::load_from_path(&path)?;
-    config.agents_path_mode = mode;
-    config.save_to_path(&path)?;
-    Ok(path)
-}
-
-pub fn save_token_stats_layout(layout: TokenStatsLayout) -> std::io::Result<PathBuf> {
-    let path = app_config_path()?;
-    let mut config = AppConfig::load_from_path(&path)?;
-    config.token_stats_layout = layout;
-    config.save_to_path(&path)?;
-    Ok(path)
-}
-
-pub fn save_show_detail_mode(mode: ShowDetailMode) -> std::io::Result<PathBuf> {
-    let path = app_config_path()?;
-    let mut config = AppConfig::load_from_path(&path)?;
-    config.show_detail_mode = mode;
     config.save_to_path(&path)?;
     Ok(path)
 }
@@ -794,14 +660,9 @@ fn enqueue_flow_segment(
     }
 }
 
-fn flow_bootstrap_step(index: usize, mode: ShowDetailMode) -> Option<&'static FlowBootstrapStep> {
+fn flow_bootstrap_step(index: usize) -> Option<&'static FlowBootstrapStep> {
     let mut offset = 0;
-    let phases_to_check = if mode == ShowDetailMode::Disable {
-        1
-    } else {
-        FLOW_BOOTSTRAP_PHASES.len()
-    };
-    for phase in &FLOW_BOOTSTRAP_PHASES[..phases_to_check] {
+    for phase in FLOW_BOOTSTRAP_PHASES {
         let end = offset + phase.steps.len();
         if index < end {
             return phase.steps.get(index - offset);
@@ -811,13 +672,8 @@ fn flow_bootstrap_step(index: usize, mode: ShowDetailMode) -> Option<&'static Fl
     None
 }
 
-pub fn flow_bootstrap_steps_total(mode: ShowDetailMode) -> usize {
-    let phases_to_check = if mode == ShowDetailMode::Disable {
-        1
-    } else {
-        FLOW_BOOTSTRAP_PHASES.len()
-    };
-    FLOW_BOOTSTRAP_PHASES[..phases_to_check]
+pub fn flow_bootstrap_steps_total() -> usize {
+    FLOW_BOOTSTRAP_PHASES
         .iter()
         .map(|phase| phase.steps.len())
         .sum()
@@ -843,13 +699,12 @@ fn advance_bootstrap_progress(
     pending_steps: &mut VecDeque<usize>,
     events: &[String],
     direction: FlowDirection,
-    mode: ShowDetailMode,
 ) {
     match direction {
         FlowDirection::Forward => {
             for event in events {
                 let next_index = completed_steps.saturating_add(pending_steps.len());
-                let Some(step) = flow_bootstrap_step(next_index, mode) else {
+                let Some(step) = flow_bootstrap_step(next_index) else {
                     break;
                 };
                 if step.event != event {
@@ -867,7 +722,7 @@ fn advance_bootstrap_progress(
                 let Some(pending_index) = pending_steps.front().copied() else {
                     break;
                 };
-                let Some(step) = flow_bootstrap_step(pending_index, mode) else {
+                let Some(step) = flow_bootstrap_step(pending_index) else {
                     pending_steps.clear();
                     break;
                 };
@@ -922,7 +777,6 @@ impl AppState {
             theme: config.theme,
             mode: config.mode,
             tool_mode: config.tool_mode,
-            show_detail_mode: config.show_detail_mode,
             mcp_slug,
             ngrok_domain: config.ngrok_domain.clone(),
             is_returning_user,
@@ -933,7 +787,6 @@ impl AppState {
             last_remote_activity_ms: None,
             devtools_running: false,
             port,
-            mascot_seed,
             partner_binagotchy_seed,
             set_catdesk_as_co_author: config.set_catdesk_as_co_author,
             mascot,
@@ -990,7 +843,6 @@ impl AppState {
         config.theme = self.theme.clone();
         config.mode = self.mode;
         config.tool_mode = self.tool_mode;
-        config.show_detail_mode = self.show_detail_mode;
         config.usage_by_model = self.usage_by_model.clone();
         config.selected_browser = self.selected_browser.clone();
         Ok(config.normalized())
@@ -1094,7 +946,6 @@ impl AppState {
                 &mut flow.bootstrap_pending_steps,
                 events,
                 direction,
-                self.show_detail_mode,
             );
             bootstrap.completed_steps = flow.bootstrap_completed_steps;
             bootstrap.pending_steps = flow.bootstrap_pending_steps.clone();
@@ -1135,7 +986,6 @@ impl AppState {
                 &mut flow.bootstrap_pending_steps,
                 events,
                 direction,
-                self.show_detail_mode,
             );
             bootstrap.completed_steps = flow.bootstrap_completed_steps;
             bootstrap.pending_steps = flow.bootstrap_pending_steps.clone();
@@ -1165,7 +1015,7 @@ impl AppState {
 
     pub fn prune_closed_flows(&mut self) {
         let now_ms = now_unix_millis();
-        let bootstrap_steps_total = flow_bootstrap_steps_total(self.show_detail_mode);
+        let bootstrap_steps_total = flow_bootstrap_steps_total();
 
         for flow in &mut self.flows {
             prune_finished_segments(&mut flow.anim_queue, now_ms);
@@ -1264,7 +1114,6 @@ mod tests {
         assert_eq!(app.theme, "neon");
         assert!(matches!(app.mode, Mode::Browser));
         assert!(matches!(app.tool_mode, ToolMode::MultiTools));
-        assert!(matches!(app.show_detail_mode, ShowDetailMode::Collapsed));
         assert!(app.set_catdesk_as_co_author);
         assert_eq!(
             app.partner_binagotchy_seed.as_deref(),
@@ -1431,52 +1280,6 @@ toolCallCount = 1
     }
 
     #[test]
-    fn app_config_round_trips_token_stats_layout() {
-        let unique = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let workspace = std::env::temp_dir().join(format!("catdesk-config-token-layout-{unique}"));
-        std::fs::create_dir_all(&workspace).expect("create temp config dir");
-        let config_path = workspace.join(APP_CONFIG_FILE_NAME);
-
-        let config = AppConfig {
-            token_stats_layout: TokenStatsLayout::Bottom,
-            ..AppConfig::default()
-        };
-        config.save_to_path(&config_path).expect("save config");
-
-        let saved = AppConfig::load_from_path(&config_path).expect("load config");
-        assert!(matches!(saved.token_stats_layout, TokenStatsLayout::Bottom));
-
-        let _ = std::fs::remove_file(config_path);
-        let _ = std::fs::remove_dir(workspace);
-    }
-
-    #[test]
-    fn app_config_round_trips_show_detail_mode() {
-        let unique = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let workspace = std::env::temp_dir().join(format!("catdesk-config-show-detail-{unique}"));
-        std::fs::create_dir_all(&workspace).expect("create temp config dir");
-        let config_path = workspace.join(APP_CONFIG_FILE_NAME);
-
-        let config = AppConfig {
-            show_detail_mode: ShowDetailMode::Collapsed,
-            ..AppConfig::default()
-        };
-        config.save_to_path(&config_path).expect("save config");
-
-        let saved = AppConfig::load_from_path(&config_path).expect("load config");
-        assert!(matches!(saved.show_detail_mode, ShowDetailMode::Collapsed));
-
-        let _ = std::fs::remove_file(config_path);
-        let _ = std::fs::remove_dir(workspace);
-    }
-
-    #[test]
     fn app_state_loads_partner_binagotchy_seed() {
         let unique = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -1514,7 +1317,6 @@ toolCallCount = 0
             app.partner_binagotchy_seed.as_deref(),
             Some("00000000000000ff")
         );
-        assert_eq!(app.mascot_seed, 0xff);
 
         let _ = std::fs::remove_file(config_path);
         let _ = std::fs::remove_dir(workspace);
@@ -1643,8 +1445,8 @@ toolCallCount = 0
     }
 
     #[test]
-    fn record_flow_bootstrap_tracks_current_tool_and_widget_loading_sequence() {
-        let (mut app, workspace, config_path) = test_app("catdesk-flow-bootstrap-widgets");
+    fn record_flow_bootstrap_tracks_tool_discovery_sequence() {
+        let (mut app, workspace, config_path) = test_app("catdesk-flow-bootstrap-tools");
 
         let sequence = [
             // Phase 1: Checking tools
@@ -1655,24 +1457,6 @@ toolCallCount = 0
             ("notifications/initialized", FlowDirection::Forward),
             ("tools/list", FlowDirection::Forward),
             ("tools/list", FlowDirection::Backward),
-            // Phase 2: Loading widgets
-            ("resources/read:run_command", FlowDirection::Forward),
-            ("resources/read:run_command", FlowDirection::Backward),
-            ("resources/read:catdesk_instruction", FlowDirection::Forward),
-            (
-                "resources/read:catdesk_instruction",
-                FlowDirection::Backward,
-            ),
-            ("resources/read:read", FlowDirection::Forward),
-            ("resources/read:read", FlowDirection::Backward),
-            ("resources/read:search", FlowDirection::Forward),
-            ("resources/read:search", FlowDirection::Backward),
-            ("resources/read:write", FlowDirection::Forward),
-            ("resources/read:write", FlowDirection::Backward),
-            ("resources/read:edit", FlowDirection::Forward),
-            ("resources/read:edit", FlowDirection::Backward),
-            ("resources/read:delete", FlowDirection::Forward),
-            ("resources/read:delete", FlowDirection::Backward),
         ];
 
         for (event, direction) in sequence {
@@ -1685,13 +1469,9 @@ toolCallCount = 0
             .iter()
             .map(|phase| phase.steps.len())
             .collect();
-        assert_eq!(phase_step_counts, vec![4, 7]);
-        assert_eq!(flow_bootstrap_steps_total(ShowDetailMode::Expanded), 11);
-        assert_eq!(flow_bootstrap_steps_total(ShowDetailMode::Disable), 4);
-        assert_eq!(
-            flow.bootstrap_completed_steps,
-            flow_bootstrap_steps_total(ShowDetailMode::Expanded)
-        );
+        assert_eq!(phase_step_counts, vec![4]);
+        assert_eq!(flow_bootstrap_steps_total(), 4);
+        assert_eq!(flow.bootstrap_completed_steps, flow_bootstrap_steps_total());
         assert!(flow.bootstrap_pending_steps.is_empty());
 
         let _ = std::fs::remove_file(config_path);
@@ -1699,7 +1479,7 @@ toolCallCount = 0
     }
 
     #[test]
-    fn record_flow_bootstrap_ignores_optional_reinitialize_before_widget_reads() {
+    fn record_flow_bootstrap_ignores_optional_reinitialize_after_tool_discovery() {
         let (mut app, workspace, config_path) = test_app("catdesk-flow-bootstrap-reinitialize");
 
         let sequence = [
@@ -1717,23 +1497,6 @@ toolCallCount = 0
             ("initialize", FlowDirection::Forward),
             ("initialize", FlowDirection::Backward),
             ("notifications/initialized", FlowDirection::Forward),
-            ("resources/read:run_command", FlowDirection::Forward),
-            ("resources/read:run_command", FlowDirection::Backward),
-            ("resources/read:catdesk_instruction", FlowDirection::Forward),
-            (
-                "resources/read:catdesk_instruction",
-                FlowDirection::Backward,
-            ),
-            ("resources/read:read", FlowDirection::Forward),
-            ("resources/read:read", FlowDirection::Backward),
-            ("resources/read:search", FlowDirection::Forward),
-            ("resources/read:search", FlowDirection::Backward),
-            ("resources/read:write", FlowDirection::Forward),
-            ("resources/read:write", FlowDirection::Backward),
-            ("resources/read:edit", FlowDirection::Forward),
-            ("resources/read:edit", FlowDirection::Backward),
-            ("resources/read:delete", FlowDirection::Forward),
-            ("resources/read:delete", FlowDirection::Backward),
         ];
 
         for (event, direction) in sequence {
@@ -1742,7 +1505,7 @@ toolCallCount = 0
 
         let flow = app.flows.first().expect("missing flow");
         assert!(flow.bootstrap_status_active);
-        assert_eq!(flow.bootstrap_completed_steps, 11);
+        assert_eq!(flow.bootstrap_completed_steps, 4);
         assert!(flow.bootstrap_pending_steps.is_empty());
 
         let _ = std::fs::remove_file(config_path);

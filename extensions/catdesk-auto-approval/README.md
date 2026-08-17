@@ -8,7 +8,7 @@ A small Chrome extension that auto click ChatGPT tool approval UI.
 - Enabled mode:
   - Watches `https://chatgpt.com/*` pages.
   - Detects ChatGPT tool approval cards.
-  - Highlights only the primary approval button using the CatDesk widget grayscale palette.
+  - Highlights only the primary approval button using the CatDesk grayscale palette.
   - Click the approval button.
 - Disabled mode:
   - Stops watching the page.

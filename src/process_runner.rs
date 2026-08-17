@@ -1,9 +1,8 @@
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::Instant;
 
-use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, ChildStderr, ChildStdout, Command};
 use tokio::time::{Duration, timeout};
 
@@ -15,10 +14,16 @@ pub struct ProcessRunResult {
     pub stderr: String,
     pub success: bool,
     pub exit_code: Option<i32>,
-    pub elapsed_ms: u64,
     pub timed_out: bool,
     pub stdout_truncated: bool,
     pub stderr_truncated: bool,
+    pub output_archive_error: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct CommandOutputPaths {
+    pub stdout: PathBuf,
+    pub stderr: PathBuf,
 }
 
 /// A spawned shell process owned by CatDesk.
@@ -460,30 +465,73 @@ struct CapturedOutput {
     text: String,
     truncated: bool,
     read_error: Option<String>,
+    archive_error: Option<String>,
 }
 
-async fn capture_reader<R>(mut reader: R, max_bytes: usize) -> CapturedOutput
+async fn capture_reader<R>(
+    mut reader: R,
+    max_bytes: usize,
+    archive_path: Option<PathBuf>,
+) -> CapturedOutput
 where
     R: AsyncRead + Unpin,
 {
+    let (mut archive, mut archive_error) = if let Some(path) = archive_path {
+        match tokio::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&path)
+            .await
+        {
+            Ok(file) => (Some(file), None),
+            Err(error) => (
+                None,
+                Some(format!(
+                    "failed to open command output archive {}: {error}",
+                    path.display()
+                )),
+            ),
+        }
+    } else {
+        (None, None)
+    };
+
     let mut output = BoundedBytes::new(max_bytes);
     let mut buffer = vec![0_u8; READ_CHUNK_BYTES];
     let mut read_error = None;
     loop {
         match reader.read(&mut buffer).await {
             Ok(0) => break,
-            Ok(read) => output.push(&buffer[..read]),
+            Ok(read) => {
+                let chunk = &buffer[..read];
+                if let Some(file) = archive.as_mut()
+                    && let Err(error) = file.write_all(chunk).await
+                {
+                    archive_error = Some(format!(
+                        "failed to preserve complete command output: {error}"
+                    ));
+                    archive = None;
+                }
+                output.push(chunk);
+            }
             Err(error) => {
                 read_error = Some(error.to_string());
                 break;
             }
         }
     }
+    if let Some(file) = archive.as_mut()
+        && let Err(error) = file.flush().await
+    {
+        archive_error = Some(format!("failed to flush complete command output: {error}"));
+    }
     let (text, truncated) = output.into_text();
     CapturedOutput {
         text,
         truncated,
         read_error,
+        archive_error,
     }
 }
 
@@ -515,8 +563,8 @@ pub async fn run_shell_command(
     cwd: &Path,
     timeout_ms: u64,
     max_capture_bytes: usize,
+    output_paths: Option<&CommandOutputPaths>,
 ) -> ProcessRunResult {
-    let started = Instant::now();
     let mut process = match spawn_shell_command(command, cwd).await {
         Ok(process) => process,
         Err(error) => {
@@ -525,20 +573,22 @@ pub async fn run_shell_command(
                 stderr: format!("Failed to execute: {error}"),
                 success: false,
                 exit_code: None,
-                elapsed_ms: started.elapsed().as_millis() as u64,
                 timed_out: false,
                 stdout_truncated: false,
                 stderr_truncated: false,
+                output_archive_error: None,
             };
         }
     };
 
+    let stdout_archive = output_paths.map(|paths| paths.stdout.clone());
+    let stderr_archive = output_paths.map(|paths| paths.stderr.clone());
     let stdout_task = process
         .take_stdout()
-        .map(|stdout| tokio::spawn(capture_reader(stdout, max_capture_bytes)));
+        .map(|stdout| tokio::spawn(capture_reader(stdout, max_capture_bytes, stdout_archive)));
     let stderr_task = process
         .take_stderr()
-        .map(|stderr| tokio::spawn(capture_reader(stderr, max_capture_bytes)));
+        .map(|stderr| tokio::spawn(capture_reader(stderr, max_capture_bytes, stderr_archive)));
 
     let mut timed_out = false;
     let mut wait_error = None;
@@ -559,6 +609,14 @@ pub async fn run_shell_command(
 
     let stdout_capture = finish_capture(stdout_task, "stdout").await;
     let stderr_capture = finish_capture(stderr_task, "stderr").await;
+    let archive_errors = [
+        stdout_capture.archive_error.as_deref(),
+        stderr_capture.archive_error.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    let output_archive_error = (!archive_errors.is_empty()).then(|| archive_errors.join("; "));
     let stdout = stdout_capture.text;
     let mut stderr = stderr_capture.text;
 
@@ -599,10 +657,10 @@ pub async fn run_shell_command(
         stderr,
         success,
         exit_code,
-        elapsed_ms: started.elapsed().as_millis() as u64,
         timed_out,
         stdout_truncated: stdout_capture.truncated,
         stderr_truncated: stderr_capture.truncated,
+        output_archive_error,
     }
 }
 
@@ -643,13 +701,36 @@ mod tests {
 
     #[tokio::test]
     async fn capture_reader_preserves_partial_output_on_read_error() {
-        let captured = capture_reader(PartialThenError { emitted: false }, 1024).await;
+        let captured = capture_reader(PartialThenError { emitted: false }, 1024, None).await;
         assert_eq!(captured.text, "partial-output");
         assert!(!captured.truncated);
         assert_eq!(
             captured.read_error.as_deref(),
             Some("synthetic read failure")
         );
+    }
+
+    #[tokio::test]
+    async fn capture_reader_archives_bytes_beyond_inline_limit() {
+        let root = workspace("archive-overflow");
+        let archive = root.join("stdout.log");
+        let payload = vec![b'x'; 16 * 1024];
+        let expected_len = payload.len();
+        let (mut writer, reader) = tokio::io::duplex(32 * 1024);
+        let writer_task = tokio::spawn(async move {
+            writer.write_all(&payload).await.expect("write payload");
+        });
+
+        let captured = capture_reader(reader, 1024, Some(archive.clone())).await;
+        writer_task.await.expect("writer task");
+        assert_eq!(captured.text.len(), 1024);
+        assert!(captured.truncated);
+        assert!(captured.archive_error.is_none());
+        assert_eq!(
+            std::fs::metadata(&archive).expect("archive metadata").len(),
+            expected_len as u64
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]
@@ -660,7 +741,7 @@ mod tests {
         } else {
             "printf 'hello\\n'"
         };
-        let result = run_shell_command(command, &root, 5_000, 1024).await;
+        let result = run_shell_command(command, &root, 5_000, 1024, None).await;
         assert!(result.success, "stderr: {}", result.stderr);
         assert_eq!(result.exit_code, Some(0));
         assert_eq!(result.stdout.trim(), "hello");
@@ -676,7 +757,7 @@ mod tests {
         } else {
             "printf '%*s' 200000 ''; printf '%*s' 200000 '' >&2"
         };
-        let result = run_shell_command(command, &root, 5_000, 4_096).await;
+        let result = run_shell_command(command, &root, 5_000, 4_096, None).await;
         assert!(
             result.success,
             "large-output command failed: {}",
@@ -698,7 +779,7 @@ mod tests {
         } else {
             "sleep 0.7; printf survived > sentinel.txt"
         };
-        let result = run_shell_command(command, &root, 100, 1024).await;
+        let result = run_shell_command(command, &root, 100, 1024, None).await;
         assert!(result.timed_out);
         tokio::time::sleep(Duration::from_millis(900)).await;
         assert!(
@@ -717,7 +798,7 @@ mod tests {
         } else {
             "(sleep 0.8; printf survived > descendant.txt) & sleep 5"
         };
-        let result = run_shell_command(command, &root, 150, 1024).await;
+        let result = run_shell_command(command, &root, 150, 1024, None).await;
         assert!(result.timed_out);
         tokio::time::sleep(Duration::from_millis(1_000)).await;
         assert!(
@@ -736,7 +817,7 @@ mod tests {
         } else {
             "(sleep 0.8; printf survived > detached.txt) & printf 'root-done\\n'"
         };
-        let result = run_shell_command(command, &root, 5_000, 1024).await;
+        let result = run_shell_command(command, &root, 5_000, 1024, None).await;
         assert!(result.success, "root command failed: {}", result.stderr);
         assert!(result.stdout.contains("root-done"));
         tokio::time::sleep(Duration::from_millis(1_000)).await;
@@ -757,10 +838,9 @@ mod tests {
             "sleep 0.7; printf survived > sentinel.txt"
         };
         let root_for_task = root.clone();
-        let task =
-            tokio::spawn(
-                async move { run_shell_command(command, &root_for_task, 5_000, 1024).await },
-            );
+        let task = tokio::spawn(async move {
+            run_shell_command(command, &root_for_task, 5_000, 1024, None).await
+        });
         tokio::time::sleep(Duration::from_millis(100)).await;
         task.abort();
         let _ = task.await;

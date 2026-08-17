@@ -29,9 +29,9 @@ use ratatui::{
 };
 use state::{
     AppState, FLOW_ANIM_CELLS, FLOW_BOOTSTRAP_PHASES, FlowAnimKind, FlowAnimSegment, FlowDirection,
-    FlowLane, GPT_5_6_AND_EARLIER_USAGE_BUCKET, Mode, ServerUiEvent, SharedState, ShowDetailMode,
-    ToolMode, UsageTotals, app_config_path, flow_anim_lit_count, load_ngrok_authtoken,
-    load_ngrok_domain, save_ngrok_authtoken, save_ngrok_domain,
+    FlowLane, GPT_5_6_AND_EARLIER_USAGE_BUCKET, Mode, ServerUiEvent, SharedState, ToolMode,
+    UsageTotals, app_config_path, flow_anim_lit_count, load_ngrok_authtoken, load_ngrok_domain,
+    save_ngrok_authtoken, save_ngrok_domain,
 };
 use std::io::{Write, stdout};
 use std::sync::Arc;
@@ -529,21 +529,17 @@ fn flow_phase_lines(
         .collect()
 }
 
-fn flow_bootstrap_steps_total(mode: state::ShowDetailMode) -> usize {
-    state::flow_bootstrap_steps_total(mode)
+fn flow_bootstrap_steps_total() -> usize {
+    state::flow_bootstrap_steps_total()
 }
 
-fn flow_bootstrap_complete(flow: &FlowLane, mode: state::ShowDetailMode) -> bool {
-    flow.bootstrap_completed_steps >= flow_bootstrap_steps_total(mode)
+fn flow_bootstrap_complete(flow: &FlowLane) -> bool {
+    flow.bootstrap_completed_steps >= flow_bootstrap_steps_total()
         && flow.bootstrap_pending_steps.is_empty()
 }
 
-fn flow_bootstrap_status_visible(
-    flow: &FlowLane,
-    now_millis: u128,
-    mode: state::ShowDetailMode,
-) -> bool {
-    if !flow_bootstrap_complete(flow, mode) {
+fn flow_bootstrap_status_visible(flow: &FlowLane, now_millis: u128) -> bool {
+    if !flow_bootstrap_complete(flow) {
         return true;
     }
     if current_anim_segment(flow, now_millis).is_some() {
@@ -566,7 +562,7 @@ fn active_bootstrap_status_flow<'a>(app: &'a AppState, now_millis: u128) -> Opti
         should_display_flow_row(flow, app.remote_connected)
             && flow.bootstrap_status_active
             && flow.closing_started_ms.is_none()
-            && flow_bootstrap_status_visible(flow, now_millis, app.show_detail_mode)
+            && flow_bootstrap_status_visible(flow, now_millis)
     })
 }
 
@@ -597,7 +593,7 @@ fn flow_bootstrap_status_lines(
     now_millis: u128,
 ) -> Vec<Line<'static>> {
     let action_label = latest_flow_action(flow);
-    let bootstrap_complete = flow_bootstrap_complete(flow, app.show_detail_mode);
+    let bootstrap_complete = flow_bootstrap_complete(flow);
     let header_title = if bootstrap_complete {
         "Initialize completed"
     } else {
@@ -1795,19 +1791,17 @@ async fn run_settings(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let themes = theme::all();
     let tool_modes = ToolMode::all();
-    let show_detail_modes = ShowDetailMode::all();
     let mut confirm_reset_token_billing = false;
     let mut selected_row = {
         let app = state.lock().await;
         themes.iter().position(|t| t.id == app.theme).unwrap_or(0)
     };
-    let total_rows = themes.len() + tool_modes.len() + show_detail_modes.len() + 1 + 3;
+    let total_rows = themes.len() + tool_modes.len() + 1 + 3;
 
     loop {
         let (
             current_theme,
             current_tool_mode,
-            current_show_detail_mode,
             usage_totals,
             set_catdesk_as_co_author,
             mcp_slug,
@@ -1817,7 +1811,6 @@ async fn run_settings(
             (
                 app.current_theme(),
                 app.tool_mode,
-                app.show_detail_mode,
                 app.all_time_usage_totals(),
                 app.set_catdesk_as_co_author,
                 app.mcp_slug.clone(),
@@ -1829,7 +1822,6 @@ async fn run_settings(
                 f,
                 current_theme,
                 current_tool_mode,
-                current_show_detail_mode,
                 set_catdesk_as_co_author,
                 &mcp_slug,
                 ngrok_domain.as_deref(),
@@ -1869,8 +1861,7 @@ async fn run_settings(
                         } else {
                             let tool_mode_start = themes.len();
                             let tool_mode_end = tool_mode_start + tool_modes.len();
-                            let detail_mode_start = tool_mode_end;
-                            let detail_mode_end = detail_mode_start + show_detail_modes.len();
+                            let settings_action_start = tool_mode_end;
 
                             if selected_row < tool_mode_end {
                                 let picked = tool_modes[selected_row - tool_mode_start];
@@ -1879,17 +1870,7 @@ async fn run_settings(
                                     app.log("INFO", format!("Tool mode: {}", picked.label()));
                                     app.persist_state_with_log();
                                 }
-                            } else if selected_row < detail_mode_end {
-                                let picked = show_detail_modes[selected_row - detail_mode_start];
-                                if app.show_detail_mode != picked {
-                                    app.show_detail_mode = picked;
-                                    app.log(
-                                        "INFO",
-                                        format!("Widget detail mode: {}", picked.label()),
-                                    );
-                                    app.persist_state_with_log();
-                                }
-                            } else if selected_row == detail_mode_end {
+                            } else if selected_row == settings_action_start {
                                 app.set_catdesk_as_co_author = !app.set_catdesk_as_co_author;
                                 let enabled = app.set_catdesk_as_co_author;
                                 app.log(
@@ -1900,13 +1881,13 @@ async fn run_settings(
                                     ),
                                 );
                                 app.persist_state_with_log();
-                            } else if selected_row == detail_mode_end + 1 {
+                            } else if selected_row == settings_action_start + 1 {
                                 // Keep existing slug, do nothing
-                            } else if selected_row == detail_mode_end + 2 {
+                            } else if selected_row == settings_action_start + 2 {
                                 app.regenerate_mcp_slug();
                                 app.log("INFO", "Generated new random MCP slug".into());
                                 app.persist_state_with_log();
-                            } else if selected_row == detail_mode_end + 3 {
+                            } else if selected_row == settings_action_start + 3 {
                                 let current_domain = app.ngrok_domain.clone().unwrap_or_default();
                                 drop(app);
                                 if let Some(new_domain) = run_prompt(terminal, "Enter ngrok static domain (with/without https://, empty to clear):", &current_domain).await? {
@@ -1949,7 +1930,6 @@ fn draw_settings(
     f: &mut Frame,
     current_theme: &theme::ThemeDef,
     current_tool_mode: ToolMode,
-    current_show_detail_mode: ShowDetailMode,
     set_catdesk_as_co_author: bool,
     mcp_slug: &str,
     ngrok_domain: Option<&str>,
@@ -1959,7 +1939,6 @@ fn draw_settings(
 ) {
     let themes = theme::all();
     let tool_modes = ToolMode::all();
-    let show_detail_modes = ShowDetailMode::all();
     let palette = current_theme.palette;
     let area = f.area();
     let chunks = Layout::default()
@@ -2068,48 +2047,7 @@ fn draw_settings(
         )]));
     }
 
-    lines.push(Line::from(""));
-    lines.push(Line::from(vec![Span::styled(
-        "  Choose a widget detail mode",
-        Style::default()
-            .fg(palette.title_fg)
-            .add_modifier(Modifier::BOLD),
-    )]));
-    for (idx, detail_mode) in show_detail_modes.iter().enumerate() {
-        let row_idx = themes.len() + tool_modes.len() + idx;
-        let selected = row_idx == selected_row;
-        let marker = if selected { ">" } else { " " };
-        let name_style = if selected {
-            Style::default()
-                .fg(palette.key_fg)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(palette.primary_fg)
-        };
-        lines.push(Line::from(""));
-        if selected {
-            selected_line_idx = lines.len();
-        }
-        let mut spans = vec![Span::styled(
-            format!(" {} [{}] {}", marker, row_idx + 1, detail_mode.label()),
-            name_style,
-        )];
-        if *detail_mode == current_show_detail_mode {
-            spans.push(Span::styled(
-                "  [current]",
-                Style::default()
-                    .fg(palette.secondary_fg)
-                    .add_modifier(Modifier::BOLD),
-            ));
-        }
-        lines.push(Line::from(spans));
-        lines.push(Line::from(vec![Span::styled(
-            format!("     {}", detail_mode.description()),
-            Style::default().fg(palette.muted_fg),
-        )]));
-    }
-
-    let co_author_row = themes.len() + tool_modes.len() + show_detail_modes.len();
+    let co_author_row = themes.len() + tool_modes.len();
     let co_author_selected = co_author_row == selected_row;
     let co_author_marker = if co_author_selected { ">" } else { " " };
     let co_author_name_style = if co_author_selected {

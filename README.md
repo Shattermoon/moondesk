@@ -155,29 +155,31 @@ CatDesk is a coding tool and a custom connector. Always use CatDesk if the user 
 | TUI | Ratatui |
 | Tunnel | ngrok |
 | Browser control | chrome-devtools-mcp |
-| Widget | HTML + JavaScript |
 | Distribution | npm |
 
 # Tools
 
-CatDesk has two local tool modes: `multi-tools` exposes 10 tools, and `read-only` exposes 3 tools.
+CatDesk has two local tool modes: `multi-tools` exposes 11 tools, and `read-only` exposes 3 tools.
 
 CatDesk's local tools in `multi-tools` mode are:
 
 | Tool                  | Type  | What it does                                                               |
 | --------------------- | ----- | -------------------------------------------------------------------------- |
-| `catdesk_instruction` | Guide | Returns CatDesk usage instructions and render Binagotchy                   |
-| `read`                | Read  | Reads a text file from the workspace                                       |
-| `search`              | Read  | Searches workspace text with `rg`, `grep`, or built-in search              |
+| `catdesk_instruction` | Guide | Returns CatDesk usage instructions                                        |
+| `read`                | Read  | Reads bounded line ranges or byte chunks from a workspace text file        |
+| `search`              | Read  | Searches workspace text and returns compact bounded results                |
 | `write`               | Write | Creates or overwrites a file                                               |
 | `edit`                | Write | Replaces exact text inside a file                                          |
 | `delete`              | Write | Deletes a file or directory                                                |
 | `run_command`         | Shell | Runs a short shell command and waits for completion                        |
 | `start_command`       | Job   | Starts a long-running shell command and immediately returns a job ID       |
 | `poll_command`        | Job   | Reads incremental output and status from a background command              |
+| `read_command_output` | Read  | Reads bounded chunks from complete preserved command stdout/stderr         |
 | `cancel_command`      | Job   | Stops a background command and its child process tree                      |
 
-Long-running commands are deliberately decoupled from the lifetime of an MCP HTTP request. Builds, compilation, dependency installation, long test suites, and development servers should use `start_command`, then `poll_command` with the returned cursor. Poll responses are bounded; if `hasMoreOutput` is true, keep polling with `nextCursor` even after the command reaches a terminal state to drain the remaining buffered output. `run_command` remains the simpler path for short commands and has a 120-second maximum timeout.
+Long-running commands are deliberately decoupled from the lifetime of an MCP HTTP request. Builds, compilation, dependency installation, long test suites, development servers, and commands expected to produce large output should use `start_command`, then `poll_command`. The first poll uses `after: 0`; every later poll must pass the previous `nextCursor`, so each response contains only new output. Poll responses stay bounded. Complete stdout/stderr is also preserved locally for the CatDesk session, so if a poll reports `outputTruncated`, `read_command_output` can recover either full stream in bounded byte chunks using the same job ID. `run_command` remains the simpler path for short commands; if its inline 1 MiB-per-stream capture is exceeded, it returns an `outputId` that `read_command_output` can use instead of permanently discarding the overflow.
+
+`read` defaults to 200 lines and exposes `nextStartLine` for normal pagination. If one line is too large for a single response, CatDesk returns a bounded byte chunk and `nextStartByte`; continue with `start_byte`/`max_bytes` so minified files, source maps, and other long-line text remain fully inspectable without one huge tool result.
 
 If browser mode is enabled, CatDesk can also expose extra browser/devtools tools. Those are provided by the browser bridge, so the exact list depends on your environment.
 
@@ -193,23 +195,6 @@ According to [the blog](<https://help.openai.com/en/articles/11909943-gpt-53-and
 | Pro  | 272K + 128K = 400K                     | 258K (1M experimental) |
 
 # FAQ
-
-### Can I turn off the red CSP button?
-
-<table align="center">
-  <tr>
-    <td align="center">
-      <img src="docs/images/csp_button.png" alt="The red CSP button shown in tool calls" height="96"><br>
-      <em>The red CSP button</em>
-    </td>
-    <td align="center">
-      <img src="docs/images/enforce_csp.png" alt="Advanced connector settings with Enforce CSP in developer mode" height="96"><br>
-      <em><code>Enforce CSP in developer mode</code> in Advanced connector settings</em>
-    </td>
-  </tr>
-</table>
-
-Yes. Open [Advanced connector settings](https://chatgpt.com/#settings/Connectors/Advanced) and turn on `Enforce CSP in developer mode`. That setting removes the red button. CatDesk automatically adds the current ngrok domain to the widget CSP, so the widget should keep working with CSP enforcement enabled.
 
 ### I've already connected. Why do I need to connect again and again?
 
@@ -252,7 +237,7 @@ CatDesk does not count:
 - hidden prompts or reasoning tokens
 - other internal tokens on OpenAI's side
 
-The loading animation is only a visual effect. ChatGPT Web does not stream partial MCP tool input/output into CatDesk, so the widget animates locally first and then locks to the estimated values when the real tool result arrives.
+These estimates stay local to CatDesk for its own counters and are not attached to MCP tool responses sent back to ChatGPT.
 
 ### What is workspace?
 
@@ -276,18 +261,6 @@ CatDesk checks these locations for `AGENTS.md` in this order. This happens every
   <img src="docs/images/set_agents_md.png" alt="Set AGENTS.md manually" width="500"><br>
   <em>Set AGENTS.md manually</em>
 </p>
-
-### What to do if the widget is blank?
-
-<p align="center">
-  <img src="docs/images/blank_widget.png" alt="Empty widget/function call" width="500"><br>
-  <em>Empty widget/function call</em>
-</p>
-
-1. Simply refresh the page and reconnect the connector.
-2. Stop the response and send the message again.
-
-This is a bug on ChatGPT's side. There is nothing I can do about it, and changing the code will not solve the issue. This bug was probably introduced on Apr 15th.
 
 # Safety
 
@@ -319,4 +292,4 @@ Both the static domain and the random path are persisted in `~/.catdesk/config.t
 
 The character is a cute shark-cat! I actually made this before CatDesk and decided to put it in the project.
 
-By default, CatDesk will generate a random Binagotchy every time you start it. If you see a cute one, you can set it as your partner on the launch screen. The system will also automatically save every Binagotchy in `~/.catdesk/binagotchy`. You can download it too (or, to be accurate, export it)! Both `.png` and `.gif` are supported. Feel free to use it anywhere. This project and Binagotchy are both under the MIT License. By the way, Binagotchy is generated using pure scripts and does not use any text-to-image or diffusion model.
+By default, CatDesk will generate a random Binagotchy every time you start it. If you see a cute one, you can set it as your partner on the launch screen. The system will also automatically save every Binagotchy in `~/.catdesk/binagotchy`; each archive contains `.png` and `.gif` files that you can copy or export directly. Feel free to use them anywhere. This project and Binagotchy are both under the MIT License. By the way, Binagotchy is generated using pure scripts and does not use any text-to-image or diffusion model.

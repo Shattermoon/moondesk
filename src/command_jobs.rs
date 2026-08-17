@@ -20,8 +20,10 @@ const MAX_RETAINED_JOBS: usize = 64;
 const TERMINAL_JOB_TTL: StdDuration = StdDuration::from_secs(60 * 60);
 const IDEMPOTENCY_WINDOW: StdDuration = StdDuration::from_secs(30);
 const MAX_OUTPUT_BYTES_PER_JOB: usize = 4 * 1024 * 1024;
+const MAX_TERMINAL_OUTPUT_BYTES: usize = 32 * 1024 * 1024;
 const MAX_POLL_OUTPUT_BYTES: usize = 128 * 1024;
 const READ_CHUNK_BYTES: usize = 8 * 1024;
+const CLEANUP_INTERVAL: StdDuration = StdDuration::from_secs(1);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -212,14 +214,6 @@ impl CommandJob {
             timeout_ms: self.timeout_ms,
         }
     }
-
-    async fn terminal_age(&self) -> Option<StdDuration> {
-        self.runtime
-            .lock()
-            .await
-            .finished_at
-            .map(|finished| finished.elapsed())
-    }
 }
 
 #[derive(Default)]
@@ -228,6 +222,7 @@ struct ManagerState {
     // Retry dedupe is intentionally short-lived. JSON-RPC request IDs are only
     // correlation IDs and may be reused later by a stateless client.
     request_jobs: HashMap<String, (String, Instant)>,
+    last_cleanup: Option<Instant>,
 }
 
 #[derive(Clone, Default)]
@@ -349,15 +344,18 @@ impl CommandJobManager {
         let job = self.get_job(job_id).await?;
         let wait_ms = wait_ms.min(MAX_POLL_WAIT_MS);
 
-        // Register the notification future before the first snapshot so output
-        // arriving between the check and wait cannot be missed.
+        // `Notify::notified()` does not register with `notify_waiters()` until
+        // the future is polled or explicitly enabled. Pin and enable it before
+        // taking the snapshot so a change in the check/wait gap is retained.
         let notified = job.changed.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
         let snapshot = job.snapshot(after).await;
         if snapshot.state.is_terminal() || !snapshot.events.is_empty() || wait_ms == 0 {
             return Ok(snapshot);
         }
 
-        let _ = timeout(Duration::from_millis(wait_ms), notified).await;
+        let _ = timeout(Duration::from_millis(wait_ms), &mut notified).await;
         Ok(job.snapshot(after).await)
     }
 
@@ -376,9 +374,11 @@ impl CommandJobManager {
         // misleading Running state. Wait until terminal or the bounded deadline.
         let deadline = Instant::now() + StdDuration::from_secs(5);
         loop {
-            // Register before the snapshot so a terminal transition cannot land
-            // in the check/wait gap.
+            // Pin and explicitly enable the waiter before checking state so a
+            // terminal transition cannot be lost in the check/wait gap.
             let notified = job.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             let snapshot = job.snapshot(0).await;
             if snapshot.state.is_terminal() {
                 return Ok(snapshot);
@@ -387,7 +387,7 @@ impl CommandJobManager {
             if remaining.is_zero() {
                 return Ok(snapshot);
             }
-            if timeout(remaining, notified).await.is_err() {
+            if timeout(remaining, &mut notified).await.is_err() {
                 return Ok(job.snapshot(0).await);
             }
         }
@@ -439,6 +439,17 @@ impl CommandJobManager {
     }
 
     pub async fn cleanup(&self) {
+        {
+            let mut manager = self.inner.write().await;
+            if manager
+                .last_cleanup
+                .is_some_and(|last| last.elapsed() < CLEANUP_INTERVAL)
+            {
+                return;
+            }
+            manager.last_cleanup = Some(Instant::now());
+        }
+
         let jobs = {
             let manager = self.inner.read().await;
             manager
@@ -451,24 +462,49 @@ impl CommandJobManager {
         let mut expired = Vec::new();
         let mut terminal = Vec::new();
         for (id, job) in jobs {
-            if let Some(age) = job.terminal_age().await {
-                if age >= TERMINAL_JOB_TTL {
-                    expired.push(id);
-                } else {
-                    terminal.push((id, age));
-                }
+            let runtime = job.runtime.lock().await;
+            let Some(finished_at) = runtime.finished_at else {
+                continue;
+            };
+            let age = finished_at.elapsed();
+            if age >= TERMINAL_JOB_TTL {
+                expired.push(id);
+            } else {
+                terminal.push((id, age, runtime.retained_output_bytes));
             }
         }
 
-        terminal.sort_by_key(|(_, age)| std::cmp::Reverse(*age));
+        // Oldest terminal jobs are the first eviction candidates both for the
+        // retained-job count and for the global decoded-output memory budget.
+        terminal.sort_by_key(|(_, age, _)| std::cmp::Reverse(*age));
         let retained_count = {
             let manager = self.inner.read().await;
             manager.jobs.len().saturating_sub(expired.len())
         };
         if retained_count > MAX_RETAINED_JOBS {
             let overflow = retained_count - MAX_RETAINED_JOBS;
-            expired.extend(terminal.into_iter().take(overflow).map(|(id, _)| id));
+            expired.extend(terminal.iter().take(overflow).map(|(id, _, _)| id.clone()));
         }
+
+        let already_expired = expired.iter().cloned().collect::<HashSet<_>>();
+        let mut terminal_output_bytes = terminal
+            .iter()
+            .filter(|(id, _, _)| !already_expired.contains(id))
+            .map(|(_, _, bytes)| *bytes)
+            .sum::<usize>();
+        if terminal_output_bytes > MAX_TERMINAL_OUTPUT_BYTES {
+            for (id, _, bytes) in &terminal {
+                if terminal_output_bytes <= MAX_TERMINAL_OUTPUT_BYTES {
+                    break;
+                }
+                if already_expired.contains(id) || expired.contains(id) {
+                    continue;
+                }
+                expired.push(id.clone());
+                terminal_output_bytes = terminal_output_bytes.saturating_sub(*bytes);
+            }
+        }
+
         let mut manager = self.inner.write().await;
         for id in &expired {
             manager.jobs.remove(id);
@@ -558,7 +594,7 @@ where
 }
 
 async fn run_job(job: Arc<CommandJob>, mut cancel_rx: watch::Receiver<bool>) {
-    let mut process = match process_runner::spawn_shell_command(&job.command, &job.cwd) {
+    let mut process = match process_runner::spawn_shell_command(&job.command, &job.cwd).await {
         Ok(process) => process,
         Err(error) => {
             job.append_output("stderr", format!("Failed to execute: {error}\n").as_bytes())
@@ -589,7 +625,7 @@ async fn run_job(job: Arc<CommandJob>, mut cancel_rx: watch::Receiver<bool>) {
 
     let (state, exit_code) = match completion {
         Completion::Exited(Ok(status)) => {
-            process.disarm();
+            process.disarm().await;
             if status.success() {
                 (CommandJobState::Succeeded, status.code())
             } else {
@@ -597,7 +633,7 @@ async fn run_job(job: Arc<CommandJob>, mut cancel_rx: watch::Receiver<bool>) {
             }
         }
         Completion::Exited(Err(error)) => {
-            process.terminate_tree();
+            process.terminate_tree().await;
             let _ = process.wait().await;
             job.append_output(
                 "stderr",
@@ -607,7 +643,7 @@ async fn run_job(job: Arc<CommandJob>, mut cancel_rx: watch::Receiver<bool>) {
             (CommandJobState::Failed, None)
         }
         Completion::Cancelled => {
-            process.terminate_tree();
+            process.terminate_tree().await;
             let status = process.wait().await.ok();
             (
                 CommandJobState::Cancelled,
@@ -615,7 +651,7 @@ async fn run_job(job: Arc<CommandJob>, mut cancel_rx: watch::Receiver<bool>) {
             )
         }
         Completion::TimedOut => {
-            process.terminate_tree();
+            process.terminate_tree().await;
             let status = process.wait().await.ok();
             job.append_output(
                 "stderr",
@@ -1011,6 +1047,7 @@ mod tests {
                 .get_mut("expired-request-key")
                 .expect("request key exists before cleanup");
             entry.1 = Instant::now() - IDEMPOTENCY_WINDOW - StdDuration::from_secs(1);
+            state.last_cleanup = None;
             assert!(state.jobs.contains_key(&started.snapshot.job_id));
         }
 
@@ -1263,6 +1300,38 @@ mod tests {
             "poll waited too long: {elapsed:?}"
         );
         manager.cancel_all().await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn cleanup_enforces_global_terminal_output_budget() {
+        let root = workspace("global-output-budget");
+        let manager = CommandJobManager::new();
+
+        for index in 0..9u64 {
+            let (job, _cancel_rx) = CommandJob::new("synthetic".into(), root.clone(), 5_000);
+            {
+                let mut runtime = job.runtime.lock().await;
+                runtime.state = CommandJobState::Succeeded;
+                runtime.finished_at = Some(Instant::now() - StdDuration::from_millis(index));
+                runtime.retained_output_bytes = MAX_OUTPUT_BYTES_PER_JOB;
+            }
+            manager.inner.write().await.jobs.insert(job.id.clone(), job);
+        }
+
+        manager.inner.write().await.last_cleanup = None;
+        manager.cleanup().await;
+
+        let jobs = {
+            let state = manager.inner.read().await;
+            state.jobs.values().cloned().collect::<Vec<_>>()
+        };
+        let mut retained_bytes = 0usize;
+        for job in jobs {
+            retained_bytes =
+                retained_bytes.saturating_add(job.runtime.lock().await.retained_output_bytes);
+        }
+        assert!(retained_bytes <= MAX_TERMINAL_OUTPUT_BYTES);
         let _ = std::fs::remove_dir_all(root);
     }
 }

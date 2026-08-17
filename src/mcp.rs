@@ -10,7 +10,8 @@ use tokio::sync::Mutex;
 
 use crate::command;
 use crate::command_jobs::{
-    CommandJobManager, CommandJobSnapshot, CommandJobState, MAX_JOB_TIMEOUT_MS, MAX_POLL_WAIT_MS,
+    CommandJobManager, CommandJobSnapshot, CommandJobState, DEFAULT_JOB_TIMEOUT_MS,
+    MAX_JOB_TIMEOUT_MS, MAX_POLL_WAIT_MS,
 };
 use crate::devtools::DevtoolsBridge;
 use crate::mascot;
@@ -551,7 +552,15 @@ async fn handle_tools_list(
                     "properties": {
                         "command": { "type": "string", "description": "The shell command to execute" },
                         "cwd": { "type": "string", "description": "Working directory relative to workspace root or absolute path within it" },
-                        "timeout": { "type": "integer", "minimum": 1, "maximum": 120000, "description": "Timeout in milliseconds for short commands. Maximum 120000; use start_command for long-running work." }
+                        "timeout": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": command::MAX_TIMEOUT_MS,
+                            "description": format!(
+                                "Timeout in milliseconds for short commands. Maximum {}; use start_command for long-running work.",
+                                command::MAX_TIMEOUT_MS
+                            )
+                        }
                     },
                     "required": ["command"]
                 },
@@ -566,7 +575,16 @@ async fn handle_tools_list(
                     "properties": {
                         "command": { "type": "string", "description": "The shell command to start" },
                         "cwd": { "type": "string", "description": "Working directory relative to workspace root or absolute path within it" },
-                        "timeout": { "type": "integer", "minimum": 1, "maximum": MAX_JOB_TIMEOUT_MS, "description": "Maximum command runtime in milliseconds. Defaults to 30 minutes; maximum is 24 hours." }
+                        "timeout": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": MAX_JOB_TIMEOUT_MS,
+                            "description": format!(
+                                "Maximum command runtime in milliseconds. Defaults to {} ms; maximum is {} ms.",
+                                DEFAULT_JOB_TIMEOUT_MS,
+                                MAX_JOB_TIMEOUT_MS
+                            )
+                        }
                     },
                     "required": ["command"]
                 },
@@ -906,6 +924,23 @@ async fn forward_to_devtools(
     }
 }
 
+fn format_command_output_events<'a, I>(events: I) -> String
+where
+    I: IntoIterator<Item = (&'a str, &'a str)>,
+{
+    let mut output = String::new();
+    for (stream, text) in events {
+        if stream == "stderr" {
+            output.push_str("[stderr] ");
+        }
+        output.push_str(text);
+        if !text.ends_with('\n') {
+            output.push('\n');
+        }
+    }
+    output
+}
+
 fn command_job_output_text(snapshot: &CommandJobSnapshot) -> String {
     if snapshot.events.is_empty() {
         return match snapshot.state {
@@ -913,16 +948,12 @@ fn command_job_output_text(snapshot: &CommandJobSnapshot) -> String {
             _ => "(no new output)".to_string(),
         };
     }
-    let mut output = String::new();
-    for event in &snapshot.events {
-        if event.stream == "stderr" {
-            output.push_str("[stderr] ");
-        }
-        output.push_str(&event.text);
-        if !event.text.ends_with('\n') {
-            output.push('\n');
-        }
-    }
+    let mut output = format_command_output_events(
+        snapshot
+            .events
+            .iter()
+            .map(|event| (event.stream, event.text.as_str())),
+    );
     if snapshot.has_more_output {
         output.push_str("[more buffered output available; poll again with nextCursor]\n");
     }
@@ -2149,15 +2180,15 @@ fn widget_changed_files(widget_context: Option<&AutoWidgetContext>) -> (Vec<Valu
     (changed_files, has_changes)
 }
 
-fn base_widget_payload(
+fn base_widget_payload_with_show_detail_mode(
     panel_mode: &str,
     title: &str,
     state: &str,
     tool_name: Option<&str>,
+    show_detail_mode: ShowDetailMode,
 ) -> Map<String, Value> {
     let mut payload = Map::new();
     let token_stats_layout = current_token_stats_layout();
-    let show_detail_mode = current_show_detail_mode();
     payload.insert("schema".to_string(), json!("catdesk.review.v1"));
     payload.insert("panelMode".to_string(), json!(panel_mode));
     payload.insert("title".to_string(), json!(title));
@@ -2174,6 +2205,21 @@ fn base_widget_payload(
         payload.insert("toolName".to_string(), json!(tool_name));
     }
     payload
+}
+
+fn base_widget_payload(
+    panel_mode: &str,
+    title: &str,
+    state: &str,
+    tool_name: Option<&str>,
+) -> Map<String, Value> {
+    base_widget_payload_with_show_detail_mode(
+        panel_mode,
+        title,
+        state,
+        tool_name,
+        current_show_detail_mode(),
+    )
 }
 
 fn current_token_stats_layout() -> TokenStatsLayout {
@@ -2385,26 +2431,24 @@ fn build_command_job_widget_payload(result: &Value, tool_name: &str) -> Option<V
         "timed_out" => ("Command Timed Out", "failed"),
         _ => ("Command Job", "waiting"),
     };
-    let mut output = String::new();
-    if let Some(events) = structured.get("events").and_then(Value::as_array) {
-        for event in events {
-            let stream = event
-                .get("stream")
-                .and_then(Value::as_str)
-                .unwrap_or("stdout");
-            let text = event
-                .get("text")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            if stream == "stderr" {
-                output.push_str("[stderr] ");
-            }
-            output.push_str(text);
-            if !text.ends_with('\n') {
-                output.push('\n');
-            }
-        }
-    }
+    let mut output = structured
+        .get("events")
+        .and_then(Value::as_array)
+        .map(|events| {
+            format_command_output_events(events.iter().map(|event| {
+                (
+                    event
+                        .get("stream")
+                        .and_then(Value::as_str)
+                        .unwrap_or("stdout"),
+                    event
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default(),
+                )
+            }))
+        })
+        .unwrap_or_default();
     if output.is_empty() {
         output = format!(
             "job {} · {}",
@@ -2584,12 +2628,13 @@ fn build_auto_widget_payload(
     }
 }
 
-fn enrich_tool_result(
+fn enrich_tool_result_with_show_detail_mode(
     req: &JsonRpcRequest,
     mut result: Value,
     widget_context: Option<&AutoWidgetContext>,
+    show_detail_mode: ShowDetailMode,
 ) -> Value {
-    if current_show_detail_mode() == ShowDetailMode::Disable {
+    if show_detail_mode == ShowDetailMode::Disable {
         return result;
     }
 
@@ -2611,7 +2656,14 @@ fn enrich_tool_result(
     let widget_payload = if has_widget_payload {
         None
     } else {
-        Some(build_auto_widget_payload(req, &result, widget_context))
+        let mut payload = build_auto_widget_payload(req, &result, widget_context);
+        if let Some(payload_obj) = payload.as_object_mut() {
+            payload_obj.insert(
+                "showDetailMode".to_string(),
+                json!(show_detail_mode.as_str()),
+            );
+        }
+        Some(payload)
     };
     if let Some(result_obj) = result.as_object_mut() {
         let meta_value = result_obj
@@ -2624,6 +2676,19 @@ fn enrich_tool_result(
     }
     remove_text_content_from_tool_result(req, &mut result);
     result
+}
+
+fn enrich_tool_result(
+    req: &JsonRpcRequest,
+    result: Value,
+    widget_context: Option<&AutoWidgetContext>,
+) -> Value {
+    enrich_tool_result_with_show_detail_mode(
+        req,
+        result,
+        widget_context,
+        current_show_detail_mode(),
+    )
 }
 
 fn collect_watch_targets(req: &JsonRpcRequest, workspace_root: &str) -> Vec<WatchTarget> {
@@ -5394,5 +5459,61 @@ hello world"
             Some("deadbeef")
         );
         assert!(widget_payload.get("widgetMascot").is_some());
+    }
+
+    #[test]
+    fn show_detail_modes_are_injectable_for_widget_enrichment() {
+        let req = tool_call_request("unknown_tool", json!({}));
+        let raw = json!({
+            "content": [{ "type": "text", "text": "hello" }],
+            "structuredContent": { "toolName": "unknown_tool" }
+        });
+
+        let disabled = enrich_tool_result_with_show_detail_mode(
+            &req,
+            raw.clone(),
+            None,
+            ShowDetailMode::Disable,
+        );
+        assert_eq!(
+            disabled, raw,
+            "Disable must leave the tool result untouched"
+        );
+
+        for (mode, expected) in [
+            (ShowDetailMode::Expanded, "expanded"),
+            (ShowDetailMode::Collapsed, "collapsed"),
+        ] {
+            let result = enrich_tool_result_with_show_detail_mode(&req, raw.clone(), None, mode);
+            let payload = result
+                .get("_meta")
+                .and_then(|meta| meta.get(WIDGET_PAYLOAD_META_KEY))
+                .expect("missing injected widget payload");
+            assert_eq!(
+                payload.get("showDetailMode").and_then(Value::as_str),
+                Some(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn base_widget_payload_serializes_all_show_detail_modes() {
+        for (mode, expected) in [
+            (ShowDetailMode::Expanded, "expanded"),
+            (ShowDetailMode::Collapsed, "collapsed"),
+            (ShowDetailMode::Disable, "disable"),
+        ] {
+            let payload = base_widget_payload_with_show_detail_mode(
+                "tool_call",
+                "Test",
+                "done",
+                Some("read"),
+                mode,
+            );
+            assert_eq!(
+                payload.get("showDetailMode").and_then(Value::as_str),
+                Some(expected)
+            );
+        }
     }
 }

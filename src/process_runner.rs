@@ -47,9 +47,9 @@ impl SpawnedProcess {
     }
 
     /// Terminate the root process and all descendants owned by this command.
-    pub fn terminate_tree(&mut self) {
-        self.tree.terminate();
-        // `taskkill /T` / process-group termination should already include the
+    pub async fn terminate_tree(&mut self) {
+        self.tree.terminate().await;
+        // Job-object / process-group termination should already include the
         // root, but keep Tokio's direct kill as a best-effort fallback.
         let _ = self.child.start_kill();
     }
@@ -57,15 +57,15 @@ impl SpawnedProcess {
     /// Finalize ownership after the root process exits. Any descendants still
     /// alive at that point are terminated so a command cannot silently detach
     /// work that outlives its CatDesk job.
-    pub fn disarm(&mut self) {
-        self.tree.disarm();
+    pub async fn disarm(&mut self) {
+        self.tree.disarm().await;
     }
 }
 
 impl Drop for SpawnedProcess {
     fn drop(&mut self) {
         if self.tree.is_armed() {
-            self.tree.terminate();
+            self.tree.terminate_blocking();
             let _ = self.child.start_kill();
         }
     }
@@ -80,12 +80,17 @@ struct ProcessTreeGuard {
 }
 
 impl ProcessTreeGuard {
+    #[cfg(not(windows))]
     fn new(pid: u32) -> Self {
+        Self { pid, armed: true }
+    }
+
+    #[cfg(windows)]
+    fn with_windows_job(pid: u32, job_handle: usize) -> Self {
         Self {
             pid,
             armed: true,
-            #[cfg(windows)]
-            job_handle: create_windows_job_for_process(pid),
+            job_handle: Some(job_handle),
         }
     }
 
@@ -93,7 +98,7 @@ impl ProcessTreeGuard {
         self.armed
     }
 
-    fn disarm(&mut self) {
+    async fn disarm(&mut self) {
         if !self.armed {
             return;
         }
@@ -102,8 +107,7 @@ impl ProcessTreeGuard {
             if self.job_handle.is_some() {
                 close_windows_job(&mut self.job_handle);
             } else {
-                // Best effort when Job Object assignment was unavailable.
-                terminate_process_tree(self.pid);
+                terminate_process_tree_async(self.pid).await;
             }
         }
         #[cfg(not(windows))]
@@ -111,14 +115,29 @@ impl ProcessTreeGuard {
         self.armed = false;
     }
 
-    fn terminate(&mut self) {
+    async fn terminate(&mut self) {
         if !self.armed {
             return;
         }
         #[cfg(windows)]
         {
             if !terminate_windows_job(&mut self.job_handle) {
-                terminate_process_tree(self.pid);
+                terminate_process_tree_async(self.pid).await;
+            }
+        }
+        #[cfg(not(windows))]
+        terminate_process_tree(self.pid);
+        self.armed = false;
+    }
+
+    fn terminate_blocking(&mut self) {
+        if !self.armed {
+            return;
+        }
+        #[cfg(windows)]
+        {
+            if !terminate_windows_job(&mut self.job_handle) {
+                terminate_process_tree_blocking(self.pid);
             }
         }
         #[cfg(not(windows))]
@@ -129,12 +148,12 @@ impl ProcessTreeGuard {
 
 impl Drop for ProcessTreeGuard {
     fn drop(&mut self) {
-        self.terminate();
+        self.terminate_blocking();
     }
 }
 
 #[cfg(windows)]
-fn create_windows_job_for_process(pid: u32) -> Option<usize> {
+fn create_windows_job_for_process(pid: u32) -> io::Result<usize> {
     use std::ffi::c_void;
     use std::mem::{size_of, zeroed};
     use windows_sys::Win32::Foundation::CloseHandle;
@@ -150,7 +169,7 @@ fn create_windows_job_for_process(pid: u32) -> Option<usize> {
     unsafe {
         let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
         if job.is_null() {
-            return None;
+            return Err(io::Error::last_os_error());
         }
 
         let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = zeroed();
@@ -162,23 +181,80 @@ fn create_windows_job_for_process(pid: u32) -> Option<usize> {
             size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
         ) == 0
         {
+            let error = io::Error::last_os_error();
             CloseHandle(job);
-            return None;
+            return Err(error);
         }
 
         let process = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, pid);
         if process.is_null() {
+            let error = io::Error::last_os_error();
             CloseHandle(job);
-            return None;
+            return Err(error);
         }
         let assigned = AssignProcessToJobObject(job, process) != 0;
+        let assign_error = if assigned {
+            None
+        } else {
+            Some(io::Error::last_os_error())
+        };
         CloseHandle(process);
-        if !assigned {
+        if let Some(error) = assign_error {
             CloseHandle(job);
-            return None;
+            return Err(error);
         }
 
-        Some(job as usize)
+        Ok(job as usize)
+    }
+}
+
+#[cfg(windows)]
+fn resume_windows_process(pid: u32) -> io::Result<()> {
+    use std::mem::{size_of, zeroed};
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
+    };
+    use windows_sys::Win32::System::Threading::{OpenThread, ResumeThread, THREAD_SUSPEND_RESUME};
+
+    unsafe {
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        if snapshot == INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error());
+        }
+
+        let mut entry: THREADENTRY32 = zeroed();
+        entry.dwSize = size_of::<THREADENTRY32>() as u32;
+        let mut found = Thread32First(snapshot, &mut entry) != 0;
+        while found {
+            if entry.th32OwnerProcessID == pid {
+                let thread = OpenThread(THREAD_SUSPEND_RESUME, 0, entry.th32ThreadID);
+                if thread.is_null() {
+                    let error = io::Error::last_os_error();
+                    CloseHandle(snapshot);
+                    return Err(error);
+                }
+                let previous_suspend_count = ResumeThread(thread);
+                let resume_error = if previous_suspend_count == u32::MAX {
+                    Some(io::Error::last_os_error())
+                } else {
+                    None
+                };
+                CloseHandle(thread);
+                CloseHandle(snapshot);
+                return match resume_error {
+                    Some(error) => Err(error),
+                    None => Ok(()),
+                };
+            }
+            found = Thread32Next(snapshot, &mut entry) != 0;
+        }
+
+        CloseHandle(snapshot);
+        Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "suspended process did not expose a resumable thread",
+        ))
     }
 }
 
@@ -208,16 +284,22 @@ fn terminate_windows_job(job_handle: &mut Option<usize>) -> bool {
 }
 
 #[cfg(windows)]
-fn terminate_process_tree(pid: u32) {
+fn terminate_process_tree_blocking(pid: u32) {
     // `/T` includes descendants and `/F` makes cancellation deterministic.
     // Use the executable directly rather than a shell command so the PID never
-    // passes through shell parsing.
+    // passes through shell parsing. This synchronous path is reserved for Drop,
+    // where Rust cannot await cleanup.
     let _ = std::process::Command::new("taskkill")
         .args(["/PID", &pid.to_string(), "/T", "/F"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
+}
+
+#[cfg(windows)]
+async fn terminate_process_tree_async(pid: u32) {
+    let _ = tokio::task::spawn_blocking(move || terminate_process_tree_blocking(pid)).await;
 }
 
 #[cfg(unix)]
@@ -259,7 +341,7 @@ fn shell_command(command: &str) -> Command {
     }
 }
 
-pub fn spawn_shell_command(command: &str, cwd: &Path) -> io::Result<SpawnedProcess> {
+fn spawn_shell_command_blocking(command: &str, cwd: &Path) -> io::Result<SpawnedProcess> {
     let mut shell = shell_command(command);
     shell
         .current_dir(cwd)
@@ -274,6 +356,13 @@ pub fn spawn_shell_command(command: &str, cwd: &Path) -> io::Result<SpawnedProce
         shell.as_std_mut().process_group(0);
     }
 
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        use windows_sys::Win32::System::Threading::CREATE_SUSPENDED;
+        shell.as_std_mut().creation_flags(CREATE_SUSPENDED);
+    }
+
     let mut child = shell.spawn()?;
     let Some(pid) = child.id() else {
         let _ = child.start_kill();
@@ -281,6 +370,34 @@ pub fn spawn_shell_command(command: &str, cwd: &Path) -> io::Result<SpawnedProce
             "spawned command did not expose a process id",
         ));
     };
+
+    #[cfg(windows)]
+    let tree = {
+        let job_handle = match create_windows_job_for_process(pid) {
+            Ok(handle) => handle,
+            Err(error) => {
+                let _ = child.start_kill();
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!("failed to assign suspended command to Windows Job Object: {error}"),
+                ));
+            }
+        };
+        if let Err(error) = resume_windows_process(pid) {
+            let mut job_handle = Some(job_handle);
+            close_windows_job(&mut job_handle);
+            let _ = child.start_kill();
+            return Err(io::Error::new(
+                error.kind(),
+                format!("failed to resume suspended command process: {error}"),
+            ));
+        }
+        ProcessTreeGuard::with_windows_job(pid, job_handle)
+    };
+
+    #[cfg(not(windows))]
+    let tree = ProcessTreeGuard::new(pid);
+
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
 
@@ -288,8 +405,16 @@ pub fn spawn_shell_command(command: &str, cwd: &Path) -> io::Result<SpawnedProce
         child,
         stdout,
         stderr,
-        tree: ProcessTreeGuard::new(pid),
+        tree,
     })
+}
+
+pub async fn spawn_shell_command(command: &str, cwd: &Path) -> io::Result<SpawnedProcess> {
+    let command = command.to_owned();
+    let cwd = cwd.to_path_buf();
+    tokio::task::spawn_blocking(move || spawn_shell_command_blocking(&command, &cwd))
+        .await
+        .map_err(|error| io::Error::other(format!("command spawn task failed: {error}")))?
 }
 
 #[derive(Debug)]
@@ -330,20 +455,59 @@ impl BoundedBytes {
     }
 }
 
-async fn capture_reader<R>(mut reader: R, max_bytes: usize) -> io::Result<(String, bool)>
+#[derive(Debug, Default)]
+struct CapturedOutput {
+    text: String,
+    truncated: bool,
+    read_error: Option<String>,
+}
+
+async fn capture_reader<R>(mut reader: R, max_bytes: usize) -> CapturedOutput
 where
     R: AsyncRead + Unpin,
 {
     let mut output = BoundedBytes::new(max_bytes);
     let mut buffer = vec![0_u8; READ_CHUNK_BYTES];
+    let mut read_error = None;
     loop {
-        let read = reader.read(&mut buffer).await?;
-        if read == 0 {
-            break;
+        match reader.read(&mut buffer).await {
+            Ok(0) => break,
+            Ok(read) => output.push(&buffer[..read]),
+            Err(error) => {
+                read_error = Some(error.to_string());
+                break;
+            }
         }
-        output.push(&buffer[..read]);
     }
-    Ok(output.into_text())
+    let (text, truncated) = output.into_text();
+    CapturedOutput {
+        text,
+        truncated,
+        read_error,
+    }
+}
+
+async fn finish_capture(
+    task: Option<tokio::task::JoinHandle<CapturedOutput>>,
+    stream: &str,
+) -> CapturedOutput {
+    let Some(task) = task else {
+        return CapturedOutput::default();
+    };
+    match task.await {
+        Ok(captured) => captured,
+        Err(error) => CapturedOutput {
+            read_error: Some(format!("{stream} capture task failed: {error}")),
+            ..CapturedOutput::default()
+        },
+    }
+}
+
+fn append_stderr_diagnostic(stderr: &mut String, message: &str) {
+    if !stderr.is_empty() && !stderr.ends_with('\n') {
+        stderr.push('\n');
+    }
+    stderr.push_str(message);
 }
 
 pub async fn run_shell_command(
@@ -353,7 +517,7 @@ pub async fn run_shell_command(
     max_capture_bytes: usize,
 ) -> ProcessRunResult {
     let started = Instant::now();
-    let mut process = match spawn_shell_command(command, cwd) {
+    let mut process = match spawn_shell_command(command, cwd).await {
         Ok(process) => process,
         Err(error) => {
             return ProcessRunResult {
@@ -377,73 +541,55 @@ pub async fn run_shell_command(
         .map(|stderr| tokio::spawn(capture_reader(stderr, max_capture_bytes)));
 
     let mut timed_out = false;
+    let mut wait_error = None;
     let status = match timeout(Duration::from_millis(timeout_ms), process.wait()).await {
         Ok(Ok(status)) => Some(status),
         Ok(Err(error)) => {
-            process.terminate_tree();
-            let _ = process.wait().await;
-            let mut stderr = format!("Failed while waiting for command: {error}");
-            if let Some(task) = stderr_task
-                && let Ok(Ok((captured, _))) = task.await
-                && !captured.is_empty()
-            {
-                stderr.push('\n');
-                stderr.push_str(&captured);
-            }
-            let stdout = if let Some(task) = stdout_task {
-                task.await
-                    .ok()
-                    .and_then(Result::ok)
-                    .map(|entry| entry.0)
-                    .unwrap_or_default()
-            } else {
-                String::new()
-            };
-            return ProcessRunResult {
-                stdout,
-                stderr,
-                success: false,
-                exit_code: None,
-                elapsed_ms: started.elapsed().as_millis() as u64,
-                timed_out: false,
-                stdout_truncated: false,
-                stderr_truncated: false,
-            };
+            wait_error = Some(error.to_string());
+            process.terminate_tree().await;
+            process.wait().await.ok()
         }
         Err(_) => {
             timed_out = true;
-            process.terminate_tree();
+            process.terminate_tree().await;
             process.wait().await.ok()
         }
     };
-    process.disarm();
+    process.disarm().await;
 
-    let (stdout, stdout_truncated) = match stdout_task {
-        Some(task) => task
-            .await
-            .ok()
-            .and_then(Result::ok)
-            .unwrap_or_else(|| (String::new(), false)),
-        None => (String::new(), false),
-    };
-    let (mut stderr, stderr_truncated) = match stderr_task {
-        Some(task) => task
-            .await
-            .ok()
-            .and_then(Result::ok)
-            .unwrap_or_else(|| (String::new(), false)),
-        None => (String::new(), false),
-    };
+    let stdout_capture = finish_capture(stdout_task, "stdout").await;
+    let stderr_capture = finish_capture(stderr_task, "stderr").await;
+    let stdout = stdout_capture.text;
+    let mut stderr = stderr_capture.text;
 
+    if let Some(error) = wait_error.as_deref() {
+        append_stderr_diagnostic(
+            &mut stderr,
+            &format!("Failed while waiting for command: {error}"),
+        );
+    }
+    if let Some(error) = stdout_capture.read_error.as_deref() {
+        append_stderr_diagnostic(
+            &mut stderr,
+            &format!("CatDesk failed to read stdout: {error}"),
+        );
+    }
+    if let Some(error) = stderr_capture.read_error.as_deref() {
+        append_stderr_diagnostic(
+            &mut stderr,
+            &format!("CatDesk failed to read stderr: {error}"),
+        );
+    }
     if timed_out {
-        if !stderr.is_empty() && !stderr.ends_with('\n') {
-            stderr.push('\n');
-        }
-        stderr.push_str(&format!("Command timed out after {timeout_ms} ms"));
+        append_stderr_diagnostic(
+            &mut stderr,
+            &format!("Command timed out after {timeout_ms} ms"),
+        );
     }
 
     let exit_code = status.as_ref().and_then(std::process::ExitStatus::code);
-    let success = !timed_out
+    let success = wait_error.is_none()
+        && !timed_out
         && status
             .as_ref()
             .is_some_and(std::process::ExitStatus::success);
@@ -455,8 +601,8 @@ pub async fn run_shell_command(
         exit_code,
         elapsed_ms: started.elapsed().as_millis() as u64,
         timed_out,
-        stdout_truncated,
-        stderr_truncated,
+        stdout_truncated: stdout_capture.truncated,
+        stderr_truncated: stderr_capture.truncated,
     }
 }
 
@@ -464,12 +610,46 @@ pub async fn run_shell_command(
 mod tests {
     use super::*;
     use std::path::PathBuf;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use tokio::io::ReadBuf;
     use uuid::Uuid;
+
+    struct PartialThenError {
+        emitted: bool,
+    }
+
+    impl AsyncRead for PartialThenError {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            if !self.emitted {
+                self.emitted = true;
+                buf.put_slice(b"partial-output");
+                Poll::Ready(Ok(()))
+            } else {
+                Poll::Ready(Err(io::Error::other("synthetic read failure")))
+            }
+        }
+    }
 
     fn workspace(name: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!("catdesk-process-{name}-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&path).expect("create test workspace");
         path
+    }
+
+    #[tokio::test]
+    async fn capture_reader_preserves_partial_output_on_read_error() {
+        let captured = capture_reader(PartialThenError { emitted: false }, 1024).await;
+        assert_eq!(captured.text, "partial-output");
+        assert!(!captured.truncated);
+        assert_eq!(
+            captured.read_error.as_deref(),
+            Some("synthetic read failure")
+        );
     }
 
     #[tokio::test]
@@ -494,7 +674,7 @@ mod tests {
         let command = if cfg!(windows) {
             "[Console]::Out.Write(('x' * 200000)); [Console]::Error.Write(('y' * 200000))"
         } else {
-            "python3 -c \"import sys; sys.stdout.write('x'*200000); sys.stderr.write('y'*200000)\""
+            "printf '%*s' 200000 ''; printf '%*s' 200000 '' >&2"
         };
         let result = run_shell_command(command, &root, 5_000, 4_096).await;
         assert!(

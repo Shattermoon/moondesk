@@ -3139,9 +3139,12 @@
             var command = readString(data.command);
             var commandElapsedMs = readNonNegativeInteger(data.elapsedMs);
             var commandOutput = readString(data.output);
+            if (command === null && next.call && next.detail) {
+              return validPayload(next);
+            }
             if (command === null) {
               return invalidPayload(
-                "run_command widget payload is missing required fields.",
+                "command widget payload is missing required fields.",
               );
             }
             next.command = command;

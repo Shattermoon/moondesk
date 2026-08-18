@@ -13,7 +13,8 @@ use tokio::sync::{Mutex, mpsc::UnboundedSender};
 use crate::command_jobs::CommandJobManager;
 use crate::devtools::DevtoolsBridge;
 use crate::mcp::{self, JsonRpcRequest};
-use crate::state::{FlowDirection, ServerUiEvent, SharedState};
+use crate::state::{CommandActivityState, FlowDirection, ServerUiEvent, SharedState};
+use uuid::Uuid;
 
 const STATELESS_FLOW_ID: &str = "stateless";
 const STATELESS_FLOW_LABEL: &str = "stateless";
@@ -122,6 +123,196 @@ fn summarize_response(resp: &Value) -> String {
     format!("id={id}:unknown")
 }
 
+#[derive(Clone, Debug)]
+enum CommandUiRequest {
+    Run { activity_id: String },
+    Start { activity_id: String },
+    Poll { job_id: String },
+    Cancel { job_id: String },
+}
+
+fn tool_arguments(req: &Value) -> Option<&Value> {
+    req.get("params")?.get("arguments")
+}
+
+fn begin_command_ui_request(
+    req: &Value,
+    ui_events: &UnboundedSender<ServerUiEvent>,
+) -> Option<CommandUiRequest> {
+    if req.get("method").and_then(Value::as_str) != Some("tools/call") {
+        return None;
+    }
+    let tool = request_tool_name(req)?;
+    let arguments = tool_arguments(req)?;
+    match tool.as_str() {
+        "run_command" | "start_command" => {
+            let command = arguments.get("command")?.as_str()?.to_string();
+            let activity_id = Uuid::new_v4().to_string();
+            let background = tool == "start_command";
+            let _ = ui_events.send(ServerUiEvent::CommandStarted {
+                activity_id: activity_id.clone(),
+                command,
+                background,
+            });
+            if background {
+                Some(CommandUiRequest::Start { activity_id })
+            } else {
+                Some(CommandUiRequest::Run { activity_id })
+            }
+        }
+        "poll_command" => arguments
+            .get("job_id")
+            .and_then(Value::as_str)
+            .map(|job_id| CommandUiRequest::Poll {
+                job_id: job_id.to_string(),
+            }),
+        "cancel_command" => arguments
+            .get("job_id")
+            .and_then(Value::as_str)
+            .map(|job_id| CommandUiRequest::Cancel {
+                job_id: job_id.to_string(),
+            }),
+        _ => None,
+    }
+}
+
+fn tool_structured_content(response: &Value) -> Option<&Value> {
+    response.get("result")?.get("structuredContent")
+}
+
+fn compact_command_preview(text: &str) -> Option<String> {
+    const MAX_PREVIEW_CHARS: usize = 240;
+    let mut tail = text
+        .chars()
+        .rev()
+        .take(MAX_PREVIEW_CHARS + 1)
+        .collect::<Vec<_>>();
+    let was_trimmed = tail.len() > MAX_PREVIEW_CHARS;
+    if was_trimmed {
+        tail.truncate(MAX_PREVIEW_CHARS);
+    }
+    tail.reverse();
+    let compact = tail
+        .into_iter()
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if compact.is_empty() {
+        None
+    } else if was_trimmed {
+        Some(format!("…{compact}"))
+    } else {
+        Some(compact)
+    }
+}
+
+fn command_response_preview(response: &Value) -> Option<String> {
+    if let Some(structured) = tool_structured_content(response) {
+        for field in ["stderr", "output", "stdout", "message"] {
+            if let Some(text) = structured.get(field).and_then(Value::as_str) {
+                if let Some(preview) = compact_command_preview(text) {
+                    return Some(preview);
+                }
+            }
+        }
+    }
+    response
+        .get("error")
+        .and_then(|error| error.get("message"))
+        .and_then(Value::as_str)
+        .and_then(compact_command_preview)
+}
+
+fn command_response_state(response: &Value) -> CommandActivityState {
+    let structured = tool_structured_content(response);
+    if structured
+        .and_then(|value| value.get("timedOut"))
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        return CommandActivityState::TimedOut;
+    }
+    if let Some(state) = structured
+        .and_then(|value| value.get("state"))
+        .and_then(Value::as_str)
+    {
+        return match state {
+            "succeeded" => CommandActivityState::Succeeded,
+            "failed" => CommandActivityState::Failed,
+            "cancelled" => CommandActivityState::Cancelled,
+            "timed_out" => CommandActivityState::TimedOut,
+            _ => CommandActivityState::Running,
+        };
+    }
+    let is_error = response.get("error").is_some()
+        || response
+            .get("result")
+            .and_then(|result| result.get("isError"))
+            .and_then(Value::as_bool)
+            == Some(true);
+    if is_error {
+        CommandActivityState::Failed
+    } else {
+        CommandActivityState::Succeeded
+    }
+}
+
+fn command_response_exit_code(response: &Value) -> Option<i32> {
+    tool_structured_content(response)
+        .and_then(|value| value.get("exitCode"))
+        .and_then(Value::as_i64)
+        .and_then(|code| i32::try_from(code).ok())
+}
+
+fn finish_command_ui_request(
+    request: &CommandUiRequest,
+    response: &Value,
+    ui_events: &UnboundedSender<ServerUiEvent>,
+) {
+    let state = command_response_state(response);
+    let exit_code = command_response_exit_code(response);
+    let preview = command_response_preview(response);
+    match request {
+        CommandUiRequest::Run { activity_id } => {
+            let _ = ui_events.send(ServerUiEvent::CommandUpdated {
+                activity_id: Some(activity_id.clone()),
+                job_id: None,
+                state,
+                exit_code,
+                preview,
+            });
+        }
+        CommandUiRequest::Start { activity_id } => {
+            if let Some(job_id) = tool_structured_content(response)
+                .and_then(|value| value.get("jobId"))
+                .and_then(Value::as_str)
+            {
+                let _ = ui_events.send(ServerUiEvent::CommandBoundToJob {
+                    activity_id: activity_id.clone(),
+                    job_id: job_id.to_string(),
+                });
+            }
+            let _ = ui_events.send(ServerUiEvent::CommandUpdated {
+                activity_id: Some(activity_id.clone()),
+                job_id: None,
+                state,
+                exit_code,
+                preview,
+            });
+        }
+        CommandUiRequest::Poll { job_id } | CommandUiRequest::Cancel { job_id } => {
+            let _ = ui_events.send(ServerUiEvent::CommandUpdated {
+                activity_id: None,
+                job_id: Some(job_id.clone()),
+                state,
+                exit_code,
+                preview,
+            });
+        }
+    }
+}
+
 // ── GET / — health ──────────────────────────────────────────
 
 async fn health(State(s): State<ServerState>) -> Json<Value> {
@@ -161,6 +352,107 @@ mod tests {
             summarize_response(&response),
             "id=1:result protocolVersion=2025-11-25"
         );
+    }
+
+    #[test]
+    fn command_ui_events_track_background_lifecycle_without_mutating_mcp_response() {
+        let (ui_tx, mut ui_rx) = unbounded_channel();
+        let start_request = json!({
+            "jsonrpc": "2.0",
+            "id": "req-start",
+            "method": "tools/call",
+            "params": {
+                "name": "start_command",
+                "arguments": { "command": "cargo test" }
+            }
+        });
+        let observation =
+            begin_command_ui_request(&start_request, &ui_tx).expect("observe start command");
+        let activity_id = match ui_rx.try_recv().expect("immediate command-start event") {
+            ServerUiEvent::CommandStarted {
+                activity_id,
+                command,
+                background,
+            } => {
+                assert_eq!(command, "cargo test");
+                assert!(background);
+                activity_id
+            }
+            _ => panic!("expected command-start event"),
+        };
+
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": "req-start",
+            "result": {
+                "content": [],
+                "structuredContent": { "jobId": "job-1", "state": "running" },
+                "isError": false
+            }
+        });
+        let response_before = response.clone();
+        finish_command_ui_request(&observation, &response, &ui_tx);
+        assert_eq!(response, response_before);
+
+        match ui_rx.try_recv().expect("job binding event") {
+            ServerUiEvent::CommandBoundToJob {
+                activity_id: bound_activity_id,
+                job_id,
+            } => {
+                assert_eq!(bound_activity_id, activity_id);
+                assert_eq!(job_id, "job-1");
+            }
+            _ => panic!("expected command-job binding"),
+        }
+        match ui_rx.try_recv().expect("running update") {
+            ServerUiEvent::CommandUpdated { state, .. } => {
+                assert_eq!(state, CommandActivityState::Running);
+            }
+            _ => panic!("expected command update"),
+        }
+
+        let poll_request = json!({
+            "jsonrpc": "2.0",
+            "id": "req-poll",
+            "method": "tools/call",
+            "params": {
+                "name": "poll_command",
+                "arguments": { "job_id": "job-1", "after": 0 }
+            }
+        });
+        let poll_observation =
+            begin_command_ui_request(&poll_request, &ui_tx).expect("observe poll command");
+        assert!(ui_rx.try_recv().is_err(), "poll must not add a command row");
+        let poll_response = json!({
+            "jsonrpc": "2.0",
+            "id": "req-poll",
+            "result": {
+                "content": [],
+                "structuredContent": {
+                    "state": "succeeded",
+                    "output": "test result: ok. 109 passed; 0 failed",
+                    "nextCursor": 7
+                },
+                "isError": false
+            }
+        });
+        finish_command_ui_request(&poll_observation, &poll_response, &ui_tx);
+        match ui_rx.try_recv().expect("terminal update") {
+            ServerUiEvent::CommandUpdated {
+                job_id,
+                state,
+                preview,
+                ..
+            } => {
+                assert_eq!(job_id.as_deref(), Some("job-1"));
+                assert_eq!(state, CommandActivityState::Succeeded);
+                assert_eq!(
+                    preview.as_deref(),
+                    Some("test result: ok. 109 passed; 0 failed")
+                );
+            }
+            _ => panic!("expected terminal command update"),
+        }
     }
 
     fn unique_temp_path(prefix: &str) -> PathBuf {
@@ -416,6 +708,10 @@ async fn post_mcp(State(s): State<ServerState>, body_bytes: Bytes) -> Response<B
             );
         }
     };
+    // TUI-only observability: publish the shell command as soon as the MCP call
+    // has been parsed. This channel is independent of the MCP response and does
+    // not add command text or result data to ChatGPT's conversation state.
+    let command_ui_request = begin_command_ui_request(&body, &s.ui_events);
 
     let (workspace_root, mode, tool_mode, set_catdesk_as_co_author) = {
         let app = s.app.lock().await;
@@ -448,7 +744,11 @@ async fn post_mcp(State(s): State<ServerState>, body_bytes: Bytes) -> Response<B
                 app.persist_state_with_log();
             }
         }
-        response_json = Some(serde_json::to_value(resp).unwrap());
+        let response_value = serde_json::to_value(resp).unwrap();
+        if let Some(command_ui_request) = command_ui_request.as_ref() {
+            finish_command_ui_request(command_ui_request, &response_value, &s.ui_events);
+        }
+        response_json = Some(response_value);
     }
 
     {

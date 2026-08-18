@@ -28,10 +28,10 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
 };
 use state::{
-    AppState, FLOW_ANIM_CELLS, FLOW_BOOTSTRAP_PHASES, FlowAnimKind, FlowAnimSegment, FlowDirection,
-    FlowLane, GPT_5_6_AND_EARLIER_USAGE_BUCKET, Mode, ServerUiEvent, SharedState, ToolMode,
-    UsageTotals, app_config_path, flow_anim_lit_count, load_ngrok_authtoken, load_ngrok_domain,
-    save_ngrok_authtoken, save_ngrok_domain,
+    AppState, CommandActivityState, FLOW_ANIM_CELLS, FLOW_BOOTSTRAP_PHASES, FlowAnimKind,
+    FlowAnimSegment, FlowDirection, FlowLane, GPT_5_6_AND_EARLIER_USAGE_BUCKET, Mode,
+    ServerUiEvent, SharedState, ToolMode, UsageTotals, app_config_path, flow_anim_lit_count,
+    load_ngrok_authtoken, load_ngrok_domain, save_ngrok_authtoken, save_ngrok_domain,
 };
 use std::io::{Write, stdout};
 use std::sync::Arc;
@@ -50,7 +50,7 @@ const MCP_URL_MASK: &str = "https://▓▓▓▓▓▓▓▓/▓▓▓▓▓▓�
 const NGROK_URL_MASK: &str = "https://▓▓▓▓▓▓▓▓";
 const NGROK_DOMAIN_MASK: &str = "▓▓▓▓▓▓▓▓";
 const MCP_URL_REVEAL_BAR_CELLS: usize = 10;
-const STATUS_PANEL_HEIGHT: u16 = TUI_MASCOT_BLOCK_HEIGHT + 6;
+const STATUS_PANEL_HEIGHT: u16 = TUI_MASCOT_BLOCK_HEIGHT + 4;
 const STATUS_LABEL_WIDTH: usize = 19;
 const GPT_5_6_AND_EARLIER_INPUT_USD_PER_1M: f64 = 5.0;
 const GPT_5_6_AND_EARLIER_OUTPUT_USD_PER_1M: f64 = 30.0;
@@ -91,6 +91,201 @@ impl Selection {
             _ => None,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BottomPanelFocus {
+    Logs,
+    ShellCommands,
+}
+
+impl BottomPanelFocus {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Logs => "Logs",
+            Self::ShellCommands => "Shell Commands",
+        }
+    }
+
+    fn toggled(self) -> Self {
+        match self {
+            Self::Logs => Self::ShellCommands,
+            Self::ShellCommands => Self::Logs,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct PanelScrollView {
+    max_scroll: usize,
+    effective_scroll: usize,
+}
+
+#[derive(Clone, Copy, Default)]
+struct BottomPanelAreas {
+    logs: Rect,
+    shell_commands: Option<Rect>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PanelItemHit {
+    top: u16,
+    bottom: u16,
+    index: usize,
+}
+
+#[derive(Default)]
+struct BottomPanelHitMaps {
+    logs: Vec<PanelItemHit>,
+    shell_commands: Vec<PanelItemHit>,
+}
+
+fn item_under_cursor(hits: &[PanelItemHit], row: u16) -> Option<usize> {
+    hits.iter()
+        .find(|hit| row >= hit.top && row <= hit.bottom)
+        .map(|hit| hit.index)
+}
+
+fn sync_panel_selection(selected: &mut Option<usize>, item_count: usize, follow_tail: bool) {
+    if item_count == 0 {
+        *selected = None;
+    } else if follow_tail {
+        *selected = Some(item_count - 1);
+    } else {
+        *selected = Some(selected.unwrap_or(item_count - 1).min(item_count - 1));
+    }
+}
+
+fn move_panel_selection(selected: &mut Option<usize>, item_count: usize, delta: isize) {
+    if item_count == 0 {
+        *selected = None;
+        return;
+    }
+    let current = selected.unwrap_or(item_count - 1).min(item_count - 1);
+    let next = if delta < 0 {
+        current.saturating_sub(delta.unsigned_abs())
+    } else {
+        current.saturating_add(delta as usize).min(item_count - 1)
+    };
+    *selected = Some(next);
+}
+
+fn tail_start_index(item_heights: &[usize], visible_lines: usize) -> usize {
+    if item_heights.is_empty() {
+        return 0;
+    }
+    let visible_lines = visible_lines.max(1);
+    let mut used = 0usize;
+    let mut start = item_heights.len() - 1;
+    for index in (0..item_heights.len()).rev() {
+        let height = item_heights[index].max(1);
+        if used > 0 && used.saturating_add(height) > visible_lines {
+            break;
+        }
+        start = index;
+        used = used.saturating_add(height);
+        if used >= visible_lines {
+            break;
+        }
+    }
+    start
+}
+
+fn truncate_with_ellipsis(text: &str, width: usize, expand_hint: bool) -> (String, bool) {
+    let char_count = text.chars().count();
+    if char_count <= width {
+        return (text.to_string(), false);
+    }
+    if width == 0 {
+        return (String::new(), true);
+    }
+    let preferred_suffix = if expand_hint { "… [Enter]" } else { "…" };
+    let suffix = if preferred_suffix.chars().count() <= width {
+        preferred_suffix
+    } else {
+        "…"
+    };
+    let keep = width.saturating_sub(suffix.chars().count());
+    let mut output: String = text.chars().take(keep).collect();
+    output.push_str(suffix);
+    (output, true)
+}
+
+fn wrap_preserving_chars(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut output = Vec::new();
+    for logical_line in text.split('\n') {
+        let logical_line = logical_line.strip_suffix('\r').unwrap_or(logical_line);
+        if logical_line.is_empty() {
+            output.push(String::new());
+            continue;
+        }
+        let mut chunk = String::new();
+        let mut count = 0usize;
+        for ch in logical_line.chars() {
+            if count == width {
+                output.push(std::mem::take(&mut chunk));
+                count = 0;
+            }
+            chunk.push(ch);
+            count += 1;
+        }
+        if !chunk.is_empty() {
+            output.push(chunk);
+        }
+    }
+    if output.is_empty() {
+        output.push(String::new());
+    }
+    output
+}
+
+fn scroll_panel_up(
+    scroll: &mut usize,
+    follow_tail: &mut bool,
+    view: PanelScrollView,
+    amount: usize,
+) {
+    let amount = amount.max(1);
+    if *follow_tail {
+        *follow_tail = false;
+        *scroll = view.effective_scroll.saturating_sub(amount);
+    } else {
+        *scroll = scroll.saturating_sub(amount);
+    }
+}
+
+fn scroll_panel_down(
+    scroll: &mut usize,
+    follow_tail: &mut bool,
+    view: PanelScrollView,
+    amount: usize,
+) {
+    if *follow_tail {
+        return;
+    }
+    *scroll = scroll.saturating_add(amount.max(1)).min(view.max_scroll);
+    if *scroll >= view.max_scroll {
+        *follow_tail = true;
+    }
+}
+
+fn follow_panel_latest(scroll: &mut usize, follow_tail: &mut bool, view: PanelScrollView) {
+    *follow_tail = true;
+    *scroll = view.max_scroll;
+}
+
+fn panel_under_cursor(areas: BottomPanelAreas, column: u16, row: u16) -> Option<BottomPanelFocus> {
+    if areas
+        .shell_commands
+        .is_some_and(|area| rect_contains(area, column, row))
+    {
+        return Some(BottomPanelFocus::ShellCommands);
+    }
+    if rect_contains(areas.logs, column, row) {
+        return Some(BottomPanelFocus::Logs);
+    }
+    None
 }
 
 fn extract_from_screen(lines: &[String], start: (u16, u16), end: (u16, u16)) -> String {
@@ -1686,8 +1881,14 @@ fn render_toast(f: &mut Frame, palette: theme::Palette, msg: &str, pos: (u16, u1
 
 #[cfg(test)]
 mod tests {
-    use super::{key_is_clipboard_paste, normalize_ngrok_authtoken_input};
+    use super::{
+        BottomPanelAreas, BottomPanelFocus, PanelItemHit, PanelScrollView, item_under_cursor,
+        key_is_clipboard_paste, move_panel_selection, normalize_ngrok_authtoken_input,
+        panel_under_cursor, scroll_panel_down, scroll_panel_up, tail_start_index,
+        truncate_with_ellipsis, wrap_preserving_chars,
+    };
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use ratatui::layout::Rect;
 
     #[test]
     fn normalizes_plain_ngrok_token() {
@@ -1719,6 +1920,103 @@ mod tests {
             KeyCode::Insert,
             KeyModifiers::SHIFT
         )));
+    }
+
+    #[test]
+    fn bottom_panels_keep_independent_scroll_state() {
+        let view = PanelScrollView {
+            max_scroll: 20,
+            effective_scroll: 20,
+        };
+        let log_scroll = 20;
+        let log_follow = true;
+        let mut command_scroll = 20;
+        let mut command_follow = true;
+
+        scroll_panel_up(&mut command_scroll, &mut command_follow, view, 1);
+        assert_eq!(command_scroll, 19);
+        assert!(!command_follow);
+        assert_eq!(log_scroll, 20);
+        assert!(log_follow);
+
+        scroll_panel_down(&mut command_scroll, &mut command_follow, view, 1);
+        assert_eq!(command_scroll, 20);
+        assert!(command_follow);
+    }
+
+    #[test]
+    fn mouse_targeting_selects_panel_under_cursor() {
+        let areas = BottomPanelAreas {
+            logs: Rect::new(0, 20, 40, 10),
+            shell_commands: Some(Rect::new(40, 20, 60, 10)),
+        };
+        assert_eq!(
+            panel_under_cursor(areas, 10, 24),
+            Some(BottomPanelFocus::Logs)
+        );
+        assert_eq!(
+            panel_under_cursor(areas, 70, 24),
+            Some(BottomPanelFocus::ShellCommands)
+        );
+        assert_eq!(panel_under_cursor(areas, 10, 5), None);
+    }
+
+    #[test]
+    fn variable_height_item_hit_testing_selects_the_rendered_entry() {
+        let hits = vec![
+            PanelItemHit {
+                top: 10,
+                bottom: 12,
+                index: 4,
+            },
+            PanelItemHit {
+                top: 13,
+                bottom: 18,
+                index: 5,
+            },
+        ];
+        assert_eq!(item_under_cursor(&hits, 11), Some(4));
+        assert_eq!(item_under_cursor(&hits, 17), Some(5));
+        assert_eq!(item_under_cursor(&hits, 19), None);
+    }
+
+    #[test]
+    fn compact_text_uses_explicit_ellipsis_and_expand_hint() {
+        let (plain, plain_clipped) = truncate_with_ellipsis("abcdefghijklmnop", 8, false);
+        assert!(plain_clipped);
+        assert_eq!(plain, "abcdefg…");
+
+        let (hinted, hinted_clipped) = truncate_with_ellipsis("abcdefghijklmnop", 12, true);
+        assert!(hinted_clipped);
+        assert_eq!(hinted, "abc… [Enter]");
+    }
+
+    #[test]
+    fn expanded_wrapping_preserves_full_command_characters() {
+        let command = "Write-Output 'one two'; Start-Sleep -Milliseconds 700";
+        let wrapped = wrap_preserving_chars(command, 9);
+        assert!(wrapped.len() > 1);
+        assert_eq!(wrapped.concat(), command);
+        assert!(wrapped.iter().all(|line| line.chars().count() <= 9));
+    }
+
+    #[test]
+    fn tail_start_respects_variable_entry_heights() {
+        // Three compact commands at three lines each fit in nine lines.
+        assert_eq!(tail_start_index(&[3, 3, 3, 3], 9), 1);
+        // Expanding the newest command to seven lines leaves room for only it.
+        assert_eq!(tail_start_index(&[3, 3, 3, 7], 9), 3);
+    }
+
+    #[test]
+    fn selection_navigation_clamps_to_available_items() {
+        let mut selected = Some(4);
+        move_panel_selection(&mut selected, 5, -2);
+        assert_eq!(selected, Some(2));
+        move_panel_selection(&mut selected, 5, 20);
+        assert_eq!(selected, Some(4));
+        move_panel_selection(&mut selected, 0, -1);
+        assert_eq!(selected, None);
     }
 }
 
@@ -2993,8 +3291,19 @@ async fn run_tui(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut log_scroll: usize = 0;
     let mut log_follow_tail = true;
-    let mut last_log_max_scroll: usize = 0;
-    let mut last_log_effective_scroll: usize = 0;
+    let mut command_scroll: usize = 0;
+    let mut command_follow_tail = true;
+    let mut last_log_view = PanelScrollView::default();
+    let mut last_command_view = PanelScrollView::default();
+    let mut bottom_panel_areas = BottomPanelAreas::default();
+    let mut bottom_panel_hits = BottomPanelHitMaps::default();
+    let mut focused_bottom_panel = BottomPanelFocus::ShellCommands;
+    let mut selected_log: Option<usize> = None;
+    let mut selected_command: Option<usize> = None;
+    let mut expanded_log: Option<usize> = None;
+    let mut expanded_command: Option<usize> = None;
+    let mut last_log_count: usize;
+    let mut last_command_count: usize;
     let mut selection = Selection::new();
     // (message, position (col, row), created_at)
     let mut toast: Option<(&str, (u16, u16), Instant)> = None;
@@ -3042,6 +3351,20 @@ async fn run_tui(
                 log_ngrok_domain_revealed_until = None;
             }
             let app = state.lock().await;
+            last_log_count = app.logs.len();
+            last_command_count = app.command_activities.len();
+            sync_panel_selection(&mut selected_log, last_log_count, log_follow_tail);
+            sync_panel_selection(
+                &mut selected_command,
+                last_command_count,
+                command_follow_tail,
+            );
+            if expanded_log.is_some_and(|index| index >= last_log_count) {
+                expanded_log = None;
+            }
+            if expanded_command.is_some_and(|index| index >= last_command_count) {
+                expanded_command = None;
+            }
             last_mcp_url = app.public_mcp_url();
             last_ngrok_url = app.ngrok_url.clone();
             last_ngrok_domain = app.ngrok_domain.clone();
@@ -3050,14 +3373,23 @@ async fn run_tui(
                 .filter(|(_, _, t)| t.elapsed().as_secs() < 2)
                 .map(|(m, pos, _)| (*m, *pos));
             let mut new_lines: Vec<String> = Vec::new();
-            let mut latest_log_view: Option<(usize, usize)> = None;
             terminal.draw(|f| {
                 draw_ui(
                     f,
                     &app,
                     log_scroll,
                     log_follow_tail,
-                    &mut latest_log_view,
+                    command_scroll,
+                    command_follow_tail,
+                    focused_bottom_panel,
+                    selected_log,
+                    selected_command,
+                    expanded_log,
+                    expanded_command,
+                    &mut last_log_view,
+                    &mut last_command_view,
+                    &mut bottom_panel_areas,
+                    &mut bottom_panel_hits,
                     toast_ref,
                     reveal_remaining,
                     log_mcp_reveal_remaining,
@@ -3103,12 +3435,14 @@ async fn run_tui(
                     new_lines.push(line);
                 }
             })?;
-            if let Some((max_scroll, effective_scroll)) = latest_log_view {
-                last_log_max_scroll = max_scroll;
-                last_log_effective_scroll = effective_scroll;
-                if !log_follow_tail && log_scroll > last_log_max_scroll {
-                    log_scroll = last_log_max_scroll;
-                }
+            if !log_follow_tail && log_scroll > last_log_view.max_scroll {
+                log_scroll = last_log_view.max_scroll;
+            }
+            if !command_follow_tail && command_scroll > last_command_view.max_scroll {
+                command_scroll = last_command_view.max_scroll;
+            }
+            if bottom_panel_areas.shell_commands.is_none() {
+                focused_bottom_panel = BottomPanelFocus::Logs;
             }
             screen_lines = new_lines;
         }
@@ -3139,31 +3473,232 @@ async fn run_tui(
                     selection.clear();
                     match key.code {
                         KeyCode::Char('q') => break,
-                        KeyCode::Up => {
-                            if log_follow_tail {
-                                log_follow_tail = false;
-                                log_scroll = last_log_effective_scroll.saturating_sub(1);
+                        KeyCode::Tab | KeyCode::BackTab => {
+                            if bottom_panel_areas.shell_commands.is_some() {
+                                focused_bottom_panel = focused_bottom_panel.toggled();
                             } else {
-                                log_scroll = log_scroll.saturating_sub(1);
+                                focused_bottom_panel = BottomPanelFocus::Logs;
                             }
                         }
-                        KeyCode::Down => {
-                            if !log_follow_tail {
-                                log_scroll = (log_scroll + 1).min(last_log_max_scroll);
-                                if log_scroll >= last_log_max_scroll {
-                                    log_follow_tail = true;
+                        KeyCode::Enter | KeyCode::Char(' ') => match focused_bottom_panel {
+                            BottomPanelFocus::Logs => {
+                                if let Some(index) = selected_log {
+                                    expanded_log = if expanded_log == Some(index) {
+                                        None
+                                    } else {
+                                        expanded_command = None;
+                                        log_follow_tail = false;
+                                        log_scroll = index.saturating_sub(1);
+                                        Some(index)
+                                    };
                                 }
                             }
-                        }
-                        KeyCode::End => {
-                            log_follow_tail = true;
-                            log_scroll = last_log_max_scroll;
-                        }
+                            BottomPanelFocus::ShellCommands => {
+                                if let Some(index) = selected_command {
+                                    expanded_command = if expanded_command == Some(index) {
+                                        None
+                                    } else {
+                                        expanded_log = None;
+                                        command_follow_tail = false;
+                                        command_scroll = index.saturating_sub(1);
+                                        Some(index)
+                                    };
+                                }
+                            }
+                        },
+                        KeyCode::Esc => match focused_bottom_panel {
+                            BottomPanelFocus::Logs => expanded_log = None,
+                            BottomPanelFocus::ShellCommands => expanded_command = None,
+                        },
+                        KeyCode::Up => match focused_bottom_panel {
+                            BottomPanelFocus::Logs => {
+                                expanded_log = None;
+                                move_panel_selection(&mut selected_log, last_log_count, -1);
+                                scroll_panel_up(
+                                    &mut log_scroll,
+                                    &mut log_follow_tail,
+                                    last_log_view,
+                                    1,
+                                );
+                            }
+                            BottomPanelFocus::ShellCommands => {
+                                expanded_command = None;
+                                move_panel_selection(&mut selected_command, last_command_count, -1);
+                                scroll_panel_up(
+                                    &mut command_scroll,
+                                    &mut command_follow_tail,
+                                    last_command_view,
+                                    1,
+                                );
+                            }
+                        },
+                        KeyCode::Down => match focused_bottom_panel {
+                            BottomPanelFocus::Logs => {
+                                expanded_log = None;
+                                move_panel_selection(&mut selected_log, last_log_count, 1);
+                                if selected_log == last_log_count.checked_sub(1) {
+                                    follow_panel_latest(
+                                        &mut log_scroll,
+                                        &mut log_follow_tail,
+                                        last_log_view,
+                                    );
+                                } else {
+                                    scroll_panel_down(
+                                        &mut log_scroll,
+                                        &mut log_follow_tail,
+                                        last_log_view,
+                                        1,
+                                    );
+                                }
+                            }
+                            BottomPanelFocus::ShellCommands => {
+                                expanded_command = None;
+                                move_panel_selection(&mut selected_command, last_command_count, 1);
+                                if selected_command == last_command_count.checked_sub(1) {
+                                    follow_panel_latest(
+                                        &mut command_scroll,
+                                        &mut command_follow_tail,
+                                        last_command_view,
+                                    );
+                                } else {
+                                    scroll_panel_down(
+                                        &mut command_scroll,
+                                        &mut command_follow_tail,
+                                        last_command_view,
+                                        1,
+                                    );
+                                }
+                            }
+                        },
+                        KeyCode::PageUp => match focused_bottom_panel {
+                            BottomPanelFocus::Logs => {
+                                expanded_log = None;
+                                move_panel_selection(&mut selected_log, last_log_count, -5);
+                                scroll_panel_up(
+                                    &mut log_scroll,
+                                    &mut log_follow_tail,
+                                    last_log_view,
+                                    5,
+                                );
+                            }
+                            BottomPanelFocus::ShellCommands => {
+                                expanded_command = None;
+                                move_panel_selection(&mut selected_command, last_command_count, -5);
+                                scroll_panel_up(
+                                    &mut command_scroll,
+                                    &mut command_follow_tail,
+                                    last_command_view,
+                                    5,
+                                );
+                            }
+                        },
+                        KeyCode::PageDown => match focused_bottom_panel {
+                            BottomPanelFocus::Logs => {
+                                expanded_log = None;
+                                move_panel_selection(&mut selected_log, last_log_count, 5);
+                                if selected_log == last_log_count.checked_sub(1) {
+                                    follow_panel_latest(
+                                        &mut log_scroll,
+                                        &mut log_follow_tail,
+                                        last_log_view,
+                                    );
+                                } else {
+                                    scroll_panel_down(
+                                        &mut log_scroll,
+                                        &mut log_follow_tail,
+                                        last_log_view,
+                                        5,
+                                    );
+                                }
+                            }
+                            BottomPanelFocus::ShellCommands => {
+                                expanded_command = None;
+                                move_panel_selection(&mut selected_command, last_command_count, 5);
+                                if selected_command == last_command_count.checked_sub(1) {
+                                    follow_panel_latest(
+                                        &mut command_scroll,
+                                        &mut command_follow_tail,
+                                        last_command_view,
+                                    );
+                                } else {
+                                    scroll_panel_down(
+                                        &mut command_scroll,
+                                        &mut command_follow_tail,
+                                        last_command_view,
+                                        5,
+                                    );
+                                }
+                            }
+                        },
+                        KeyCode::Home => match focused_bottom_panel {
+                            BottomPanelFocus::Logs => {
+                                expanded_log = None;
+                                selected_log = (last_log_count > 0).then_some(0);
+                                log_follow_tail = false;
+                                log_scroll = 0;
+                            }
+                            BottomPanelFocus::ShellCommands => {
+                                expanded_command = None;
+                                selected_command = (last_command_count > 0).then_some(0);
+                                command_follow_tail = false;
+                                command_scroll = 0;
+                            }
+                        },
+                        KeyCode::End => match focused_bottom_panel {
+                            BottomPanelFocus::Logs => {
+                                expanded_log = None;
+                                selected_log = last_log_count.checked_sub(1);
+                                follow_panel_latest(
+                                    &mut log_scroll,
+                                    &mut log_follow_tail,
+                                    last_log_view,
+                                );
+                            }
+                            BottomPanelFocus::ShellCommands => {
+                                expanded_command = None;
+                                selected_command = last_command_count.checked_sub(1);
+                                follow_panel_latest(
+                                    &mut command_scroll,
+                                    &mut command_follow_tail,
+                                    last_command_view,
+                                );
+                            }
+                        },
                         _ => {}
                     }
                 }
                 Event::Mouse(mouse) => match mouse.kind {
                     MouseEventKind::Down(MouseButton::Left) => {
+                        if let Some(panel) =
+                            panel_under_cursor(bottom_panel_areas, mouse.column, mouse.row)
+                        {
+                            focused_bottom_panel = panel;
+                            match panel {
+                                BottomPanelFocus::Logs => {
+                                    if let Some(index) =
+                                        item_under_cursor(&bottom_panel_hits.logs, mouse.row)
+                                    {
+                                        if selected_log != Some(index) {
+                                            expanded_log = None;
+                                        }
+                                        selected_log = Some(index);
+                                        log_follow_tail = index + 1 == last_log_count;
+                                    }
+                                }
+                                BottomPanelFocus::ShellCommands => {
+                                    if let Some(index) = item_under_cursor(
+                                        &bottom_panel_hits.shell_commands,
+                                        mouse.row,
+                                    ) {
+                                        if selected_command != Some(index) {
+                                            expanded_command = None;
+                                        }
+                                        selected_command = Some(index);
+                                        command_follow_tail = index + 1 == last_command_count;
+                                    }
+                                }
+                            }
+                        }
                         selection.start = Some((mouse.column, mouse.row));
                         selection.end = Some((mouse.column, mouse.row));
                         selection.dragging = true;
@@ -3334,18 +3869,74 @@ async fn run_tui(
                         }
                     }
                     MouseEventKind::ScrollUp => {
-                        if log_follow_tail {
-                            log_follow_tail = false;
-                            log_scroll = last_log_effective_scroll.saturating_sub(1);
-                        } else {
-                            log_scroll = log_scroll.saturating_sub(1);
+                        let target =
+                            panel_under_cursor(bottom_panel_areas, mouse.column, mouse.row)
+                                .unwrap_or(focused_bottom_panel);
+                        focused_bottom_panel = target;
+                        match target {
+                            BottomPanelFocus::Logs => {
+                                expanded_log = None;
+                                move_panel_selection(&mut selected_log, last_log_count, -1);
+                                scroll_panel_up(
+                                    &mut log_scroll,
+                                    &mut log_follow_tail,
+                                    last_log_view,
+                                    1,
+                                );
+                            }
+                            BottomPanelFocus::ShellCommands => {
+                                expanded_command = None;
+                                move_panel_selection(&mut selected_command, last_command_count, -1);
+                                scroll_panel_up(
+                                    &mut command_scroll,
+                                    &mut command_follow_tail,
+                                    last_command_view,
+                                    1,
+                                );
+                            }
                         }
                     }
                     MouseEventKind::ScrollDown => {
-                        if !log_follow_tail {
-                            log_scroll = (log_scroll + 1).min(last_log_max_scroll);
-                            if log_scroll >= last_log_max_scroll {
-                                log_follow_tail = true;
+                        let target =
+                            panel_under_cursor(bottom_panel_areas, mouse.column, mouse.row)
+                                .unwrap_or(focused_bottom_panel);
+                        focused_bottom_panel = target;
+                        match target {
+                            BottomPanelFocus::Logs => {
+                                expanded_log = None;
+                                move_panel_selection(&mut selected_log, last_log_count, 1);
+                                if selected_log == last_log_count.checked_sub(1) {
+                                    follow_panel_latest(
+                                        &mut log_scroll,
+                                        &mut log_follow_tail,
+                                        last_log_view,
+                                    );
+                                } else {
+                                    scroll_panel_down(
+                                        &mut log_scroll,
+                                        &mut log_follow_tail,
+                                        last_log_view,
+                                        1,
+                                    );
+                                }
+                            }
+                            BottomPanelFocus::ShellCommands => {
+                                expanded_command = None;
+                                move_panel_selection(&mut selected_command, last_command_count, 1);
+                                if selected_command == last_command_count.checked_sub(1) {
+                                    follow_panel_latest(
+                                        &mut command_scroll,
+                                        &mut command_follow_tail,
+                                        last_command_view,
+                                    );
+                                } else {
+                                    scroll_panel_down(
+                                        &mut command_scroll,
+                                        &mut command_follow_tail,
+                                        last_command_view,
+                                        1,
+                                    );
+                                }
                             }
                         }
                     }
@@ -3366,7 +3957,17 @@ fn draw_ui(
     app: &AppState,
     log_scroll: usize,
     log_follow_tail: bool,
-    log_view: &mut Option<(usize, usize)>,
+    command_scroll: usize,
+    command_follow_tail: bool,
+    focused_bottom_panel: BottomPanelFocus,
+    selected_log: Option<usize>,
+    selected_command: Option<usize>,
+    expanded_log: Option<usize>,
+    expanded_command: Option<usize>,
+    log_view: &mut PanelScrollView,
+    command_view: &mut PanelScrollView,
+    bottom_panel_areas: &mut BottomPanelAreas,
+    bottom_panel_hits: &mut BottomPanelHitMaps,
     toast: Option<(&str, (u16, u16))>,
     mcp_url_reveal_remaining: Option<Duration>,
     log_mcp_url_reveal_remaining: Option<Duration>,
@@ -3971,32 +4572,80 @@ fn draw_ui(
     let status = Paragraph::new(status_lines).wrap(Wrap { trim: false });
     f.render_widget(status, status_content);
 
-    // ── Keys ──
+    let show_command_panel = chunks[3].width >= 100 && chunks[3].height >= 5;
+    let effective_bottom_focus = if show_command_panel {
+        focused_bottom_panel
+    } else {
+        BottomPanelFocus::Logs
+    };
+
+    // ── Keys / bottom-pane focus ──
     let key_spans = vec![
         Span::styled("  [q]", Style::default().fg(palette.danger_fg)),
         Span::raw(" Quit  "),
-        Span::styled("[Up/Down]", Style::default().fg(palette.key_fg)),
-        Span::raw(" Scroll logs  "),
-        Span::styled("[Wheel]", Style::default().fg(palette.key_fg)),
-        Span::raw(" Scroll logs  "),
-        Span::styled("[End]", Style::default().fg(palette.key_fg)),
-        Span::raw(" Follow latest"),
+        Span::styled("[Tab]", Style::default().fg(palette.key_fg)),
+        Span::raw(" Switch  "),
+        Span::styled("[↑/↓/Wheel]", Style::default().fg(palette.key_fg)),
+        Span::raw(" Select/Scroll  "),
+        Span::styled("[PgUp/PgDn]", Style::default().fg(palette.key_fg)),
+        Span::raw(" Page  "),
+        Span::styled("[Enter/Space]", Style::default().fg(palette.key_fg)),
+        Span::raw(" Expand  "),
+        Span::styled("[Esc]", Style::default().fg(palette.key_fg)),
+        Span::raw(" Collapse  "),
+        Span::styled("[Home/End]", Style::default().fg(palette.key_fg)),
+        Span::raw(" First/Latest"),
     ];
     let keys = Paragraph::new(Line::from(key_spans)).block(
         Block::default()
-            .title(" Keys ")
+            .title(Line::from(vec![
+                Span::raw(" Keys · Focus: "),
+                Span::styled(
+                    effective_bottom_focus.label(),
+                    Style::default()
+                        .fg(palette.info_fg)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(" "),
+            ]))
             .borders(Borders::ALL)
             .border_type(palette.border_type)
             .border_style(Style::default().fg(palette.border_fg)),
     );
     f.render_widget(keys, chunks[2]);
 
+    let bottom_columns = if show_command_panel {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(38), Constraint::Percentage(62)])
+            .split(chunks[3])
+    } else {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(100)])
+            .split(chunks[3])
+    };
+    let logs_area = bottom_columns[0];
+    *bottom_panel_areas = BottomPanelAreas {
+        logs: logs_area,
+        shell_commands: if show_command_panel {
+            Some(bottom_columns[1])
+        } else {
+            None
+        },
+    };
+
+    bottom_panel_hits.logs.clear();
+    bottom_panel_hits.shell_commands.clear();
+
     // ── Logs ──
-    let log_items: Vec<ListItem> = app
+    let log_inner_width = logs_area.width.saturating_sub(2) as usize;
+    let log_rows: Vec<Vec<Line<'static>>> = app
         .logs
         .iter()
-        .map(|entry| {
-            let color = match entry.level {
+        .enumerate()
+        .map(|(index, entry)| {
+            let level_color = match entry.level {
                 "ERROR" => palette.danger_fg,
                 "WARN" => palette.warning_fg,
                 _ => palette.muted_fg,
@@ -4013,39 +4662,285 @@ fn draw_ui(
             } else {
                 entry.message.to_string()
             };
-            ListItem::new(Line::from(vec![
-                Span::styled(
-                    format!(" {} ", entry.time),
-                    Style::default().fg(palette.muted_fg),
-                ),
-                Span::styled(format!("{:5} ", entry.level), Style::default().fg(color)),
-                Span::styled(message, Style::default().fg(palette.primary_fg)),
-            ]))
+            let selected = selected_log == Some(index);
+            let expanded = selected && expanded_log == Some(index);
+            let selection_marker = if selected { ">" } else { " " };
+            let prefix = format!("{selection_marker} {} {:5} ", entry.time, entry.level);
+            let prefix_width = prefix.chars().count();
+            let content_width = log_inner_width.saturating_sub(prefix_width).max(1);
+            let message_style = if selected {
+                Style::default()
+                    .fg(palette.primary_fg)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(palette.primary_fg)
+            };
+
+            if expanded {
+                let wrapped = wrap_preserving_chars(&message, content_width);
+                let mut lines = Vec::with_capacity(wrapped.len());
+                for (line_index, chunk) in wrapped.into_iter().enumerate() {
+                    if line_index == 0 {
+                        lines.push(Line::from(vec![
+                            Span::styled(
+                                format!("{selection_marker} {} ", entry.time),
+                                Style::default().fg(palette.muted_fg),
+                            ),
+                            Span::styled(
+                                format!("{:5} ", entry.level),
+                                Style::default().fg(level_color),
+                            ),
+                            Span::styled(chunk, message_style),
+                        ]));
+                    } else {
+                        lines.push(Line::from(vec![
+                            Span::raw(" ".repeat(prefix_width)),
+                            Span::styled(chunk, message_style),
+                        ]));
+                    }
+                }
+                lines
+            } else {
+                let (compact, _) = truncate_with_ellipsis(&message, content_width, selected);
+                vec![Line::from(vec![
+                    Span::styled(
+                        format!("{selection_marker} {} ", entry.time),
+                        Style::default().fg(palette.muted_fg),
+                    ),
+                    Span::styled(
+                        format!("{:5} ", entry.level),
+                        Style::default().fg(level_color),
+                    ),
+                    Span::styled(compact, message_style),
+                ])]
+            }
         })
         .collect();
-
-    let visible_height = chunks[3].height.saturating_sub(2) as usize;
-    let total = log_items.len();
-    let max_scroll = total.saturating_sub(visible_height);
-    let effective_scroll = if log_follow_tail {
-        max_scroll
+    let log_heights: Vec<usize> = log_rows.iter().map(Vec::len).collect();
+    let log_visible_height = logs_area.height.saturating_sub(2) as usize;
+    let log_tail_start = tail_start_index(&log_heights, log_visible_height);
+    let log_max_scroll = if log_rows.is_empty() {
+        0
     } else {
-        log_scroll.min(max_scroll)
+        log_tail_start
     };
-    *log_view = Some((max_scroll, effective_scroll));
-    let visible_items: Vec<ListItem> = log_items
-        .into_iter()
-        .skip(effective_scroll)
-        .take(visible_height)
-        .collect();
-    let logs = List::new(visible_items).block(
+    let log_effective_scroll = if log_follow_tail {
+        log_max_scroll
+    } else {
+        log_scroll.min(log_max_scroll)
+    };
+    *log_view = PanelScrollView {
+        max_scroll: log_max_scroll,
+        effective_scroll: log_effective_scroll,
+    };
+
+    let mut visible_log_items = Vec::new();
+    let mut used_log_lines = 0usize;
+    let log_content_last_row = logs_area
+        .y
+        .saturating_add(logs_area.height.saturating_sub(2));
+    for (index, lines) in log_rows.into_iter().enumerate().skip(log_effective_scroll) {
+        if used_log_lines >= log_visible_height {
+            break;
+        }
+        let height = lines.len().max(1);
+        let top = logs_area
+            .y
+            .saturating_add(1)
+            .saturating_add(used_log_lines as u16);
+        let bottom = top
+            .saturating_add(height.saturating_sub(1) as u16)
+            .min(log_content_last_row);
+        bottom_panel_hits
+            .logs
+            .push(PanelItemHit { top, bottom, index });
+        visible_log_items.push(ListItem::new(lines));
+        used_log_lines = used_log_lines.saturating_add(height);
+    }
+
+    let log_focused = effective_bottom_focus == BottomPanelFocus::Logs;
+    let logs = List::new(visible_log_items).block(
         Block::default()
-            .title(" Logs ")
+            .title(if log_focused {
+                " Logs [focused] "
+            } else {
+                " Logs "
+            })
             .borders(Borders::ALL)
             .border_type(palette.border_type)
-            .border_style(Style::default().fg(palette.border_fg)),
+            .border_style(Style::default().fg(if log_focused {
+                palette.key_fg
+            } else {
+                palette.border_fg
+            })),
     );
-    f.render_widget(logs, chunks[3]);
+    f.render_widget(logs, logs_area);
+
+    if show_command_panel {
+        let command_area = bottom_columns[1];
+        let command_inner_width = command_area.width.saturating_sub(2) as usize;
+        let command_rows: Vec<Vec<Line<'static>>> = app
+            .command_activities
+            .iter()
+            .enumerate()
+            .map(|(index, activity)| {
+                let (marker, state_label, state_color) = match activity.state {
+                    CommandActivityState::Running => ("▶", "running", palette.info_fg),
+                    CommandActivityState::Succeeded => ("✓", "succeeded", palette.primary_fg),
+                    CommandActivityState::Failed => ("✗", "failed", palette.danger_fg),
+                    CommandActivityState::Cancelled => ("■", "cancelled", palette.warning_fg),
+                    CommandActivityState::TimedOut => ("⌛", "timed out", palette.danger_fg),
+                };
+                let selected = selected_command == Some(index);
+                let expanded = selected && expanded_command == Some(index);
+                let selection_marker = if selected { ">" } else { " " };
+                let prefix = format!("{selection_marker} {} {marker} ", activity.time);
+                let prefix_width = prefix.chars().count();
+                let content_width = command_inner_width.saturating_sub(prefix_width).max(1);
+                let command_style = if selected {
+                    Style::default()
+                        .fg(palette.primary_fg)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(palette.primary_fg)
+                };
+                let mut detail = state_label.to_string();
+                if activity.background {
+                    detail.push_str(" [bg]");
+                }
+                if let Some(exit_code) = activity.exit_code {
+                    detail.push_str(&format!(" exit {exit_code}"));
+                }
+                if let Some(preview) = activity.preview.as_deref() {
+                    detail.push_str(" · ");
+                    detail.push_str(preview);
+                }
+
+                let mut lines = Vec::new();
+                if expanded {
+                    for (line_index, chunk) in
+                        wrap_preserving_chars(&activity.command, content_width)
+                            .into_iter()
+                            .enumerate()
+                    {
+                        if line_index == 0 {
+                            lines.push(Line::from(vec![
+                                Span::styled(
+                                    format!("{selection_marker} {} ", activity.time),
+                                    Style::default().fg(palette.muted_fg),
+                                ),
+                                Span::styled(
+                                    format!("{marker} "),
+                                    Style::default().fg(state_color),
+                                ),
+                                Span::styled(chunk, command_style),
+                            ]));
+                        } else {
+                            lines.push(Line::from(vec![
+                                Span::raw(" ".repeat(prefix_width)),
+                                Span::styled(chunk, command_style),
+                            ]));
+                        }
+                    }
+                    for chunk in wrap_preserving_chars(&detail, content_width) {
+                        lines.push(Line::from(vec![
+                            Span::raw(" ".repeat(prefix_width)),
+                            Span::styled(chunk, Style::default().fg(palette.muted_fg)),
+                        ]));
+                    }
+                } else {
+                    let command_clipped = activity.command.chars().count() > content_width;
+                    let detail_clipped = detail.chars().count() > content_width;
+                    let expand_hint = selected && (command_clipped || detail_clipped);
+                    let (compact_command, _) =
+                        truncate_with_ellipsis(&activity.command, content_width, expand_hint);
+                    let (compact_detail, _) =
+                        truncate_with_ellipsis(&detail, content_width, selected && detail_clipped);
+                    lines.push(Line::from(vec![
+                        Span::styled(
+                            format!("{selection_marker} {} ", activity.time),
+                            Style::default().fg(palette.muted_fg),
+                        ),
+                        Span::styled(format!("{marker} "), Style::default().fg(state_color)),
+                        Span::styled(compact_command, command_style),
+                    ]));
+                    lines.push(Line::from(vec![
+                        Span::raw(" ".repeat(prefix_width)),
+                        Span::styled(compact_detail, Style::default().fg(palette.muted_fg)),
+                    ]));
+                }
+                // Deliberate breathing room: every command entry owns one blank
+                // line so adjacent executions never visually run together.
+                lines.push(Line::from(""));
+                lines
+            })
+            .collect();
+        let command_heights: Vec<usize> = command_rows.iter().map(Vec::len).collect();
+        let command_visible_height = command_area.height.saturating_sub(2) as usize;
+        let command_tail_start = tail_start_index(&command_heights, command_visible_height);
+        let command_max_scroll = if command_rows.is_empty() {
+            0
+        } else {
+            command_tail_start
+        };
+        let command_effective_scroll = if command_follow_tail {
+            command_max_scroll
+        } else {
+            command_scroll.min(command_max_scroll)
+        };
+        *command_view = PanelScrollView {
+            max_scroll: command_max_scroll,
+            effective_scroll: command_effective_scroll,
+        };
+
+        let mut visible_command_items = Vec::new();
+        let mut used_command_lines = 0usize;
+        let command_content_last_row = command_area
+            .y
+            .saturating_add(command_area.height.saturating_sub(2));
+        for (index, lines) in command_rows
+            .into_iter()
+            .enumerate()
+            .skip(command_effective_scroll)
+        {
+            if used_command_lines >= command_visible_height {
+                break;
+            }
+            let height = lines.len().max(1);
+            let top = command_area
+                .y
+                .saturating_add(1)
+                .saturating_add(used_command_lines as u16);
+            let bottom = top
+                .saturating_add(height.saturating_sub(1) as u16)
+                .min(command_content_last_row);
+            bottom_panel_hits
+                .shell_commands
+                .push(PanelItemHit { top, bottom, index });
+            visible_command_items.push(ListItem::new(lines));
+            used_command_lines = used_command_lines.saturating_add(height);
+        }
+
+        let command_focused = effective_bottom_focus == BottomPanelFocus::ShellCommands;
+        let commands = List::new(visible_command_items).block(
+            Block::default()
+                .title(if command_focused {
+                    " Shell Commands [focused] "
+                } else {
+                    " Shell Commands "
+                })
+                .borders(Borders::ALL)
+                .border_type(palette.border_type)
+                .border_style(Style::default().fg(if command_focused {
+                    palette.key_fg
+                } else {
+                    palette.border_fg
+                })),
+        );
+        f.render_widget(commands, command_area);
+    } else {
+        *command_view = PanelScrollView::default();
+    }
 
     // ── Floating toast (top-most layer) ──
     if let Some((msg, pos)) = toast {

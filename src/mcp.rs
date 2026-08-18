@@ -1357,12 +1357,56 @@ fn build_turn_token_payload(req: &JsonRpcRequest, tool_name: &str) -> Value {
     })
 }
 
-fn estimate_tokens_o200k(text: &str) -> u64 {
+const MAX_EXACT_TOKEN_ESTIMATE_BYTES: usize = 4 * 1024;
+
+fn exact_tokens_o200k(text: &str) -> u64 {
     o200k_base_singleton()
         .encode_with_special_tokens(text)
         .len()
         .try_into()
         .unwrap_or(u64::MAX)
+}
+
+fn utf8_prefix_at_most(text: &str, max_bytes: usize) -> &str {
+    let mut end = text.len().min(max_bytes);
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
+fn utf8_suffix_at_most(text: &str, max_bytes: usize) -> &str {
+    let mut start = text.len().saturating_sub(max_bytes);
+    while start < text.len() && !text.is_char_boundary(start) {
+        start += 1;
+    }
+    &text[start..]
+}
+
+fn estimate_tokens_o200k(text: &str) -> u64 {
+    if text.len() <= MAX_EXACT_TOKEN_ESTIMATE_BYTES {
+        return exact_tokens_o200k(text);
+    }
+
+    // Token accounting is a local UI estimate and must never become a response-path
+    // bottleneck. Sample both ends of unusually large payloads, then scale the
+    // observed token density instead of tokenizing megabytes before replying.
+    let sample_bytes_per_side = MAX_EXACT_TOKEN_ESTIMATE_BYTES / 2;
+    let head = utf8_prefix_at_most(text, sample_bytes_per_side);
+    let tail = utf8_suffix_at_most(text, sample_bytes_per_side);
+    let mut sample = String::with_capacity(head.len().saturating_add(tail.len()));
+    sample.push_str(head);
+    sample.push_str(tail);
+    let sample_bytes = sample.len();
+    if sample_bytes == 0 {
+        return 0;
+    }
+
+    let sample_tokens = exact_tokens_o200k(&sample);
+    let scaled = (sample_tokens as u128)
+        .saturating_mul(text.len() as u128)
+        .div_ceil(sample_bytes as u128);
+    scaled.min(u64::MAX as u128) as u64
 }
 
 fn estimate_value_tokens_o200k(value: &Value) -> u64 {
@@ -3367,5 +3411,20 @@ mod tests {
         assert!(input_tokens > 0);
         assert!(output_tokens > 0);
         assert!(result.get("_meta").is_none());
+    }
+
+    #[test]
+    fn large_token_estimates_use_bounded_sampling() {
+        let text = "Z".repeat(1_100_000);
+        let estimate = estimate_tokens_o200k(&text);
+        let sample = "Z".repeat(MAX_EXACT_TOKEN_ESTIMATE_BYTES);
+        let sample_tokens = exact_tokens_o200k(&sample);
+        let expected = (sample_tokens as u128)
+            .saturating_mul(text.len() as u128)
+            .div_ceil(MAX_EXACT_TOKEN_ESTIMATE_BYTES as u128)
+            .min(u64::MAX as u128) as u64;
+
+        assert_eq!(estimate, expected);
+        assert!(estimate > 0);
     }
 }

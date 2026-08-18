@@ -21,6 +21,30 @@ pub struct LogEntry {
     pub message: String,
 }
 
+/// Local shell-command activity shown only in the CatDesk TUI.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CommandActivityState {
+    Running,
+    Succeeded,
+    Failed,
+    Cancelled,
+    TimedOut,
+}
+
+#[derive(Clone, Debug)]
+pub struct CommandActivity {
+    pub id: String,
+    pub time: String,
+    pub command: String,
+    pub background: bool,
+    pub job_id: Option<String>,
+    pub state: CommandActivityState,
+    pub exit_code: Option<i32>,
+    pub preview: Option<String>,
+}
+
+const MAX_COMMAND_ACTIVITIES: usize = 300;
+
 /// MCP request flow rendered as a single timeline line.
 #[derive(Clone)]
 pub struct FlowLane {
@@ -262,6 +286,22 @@ pub enum ServerUiEvent {
     BeginFlowClose {
         flow_id: String,
     },
+    CommandStarted {
+        activity_id: String,
+        command: String,
+        background: bool,
+    },
+    CommandBoundToJob {
+        activity_id: String,
+        job_id: String,
+    },
+    CommandUpdated {
+        activity_id: Option<String>,
+        job_id: Option<String>,
+        state: CommandActivityState,
+        exit_code: Option<i32>,
+        preview: Option<String>,
+    },
     Log {
         level: &'static str,
         message: String,
@@ -410,6 +450,7 @@ pub struct AppState {
     pub detected_browsers: Vec<DetectedBrowser>,
     pub selected_browser: Option<DetectedBrowser>,
     pub logs: Vec<LogEntry>,
+    pub command_activities: VecDeque<CommandActivity>,
     pub flows: Vec<FlowLane>,
     pub flow_bootstrap_progress: HashMap<String, FlowBootstrapProgress>,
     pub request_count: u64,
@@ -794,6 +835,7 @@ impl AppState {
             detected_browsers: Vec::new(),
             selected_browser: config.selected_browser,
             logs: Vec::new(),
+            command_activities: VecDeque::new(),
             flows: Vec::new(),
             flow_bootstrap_progress: HashMap::new(),
             request_count: 0,
@@ -831,6 +873,74 @@ impl AppState {
         });
         if self.logs.len() > 500 {
             self.logs.remove(0);
+        }
+    }
+
+    fn command_started(&mut self, activity_id: String, command: String, background: bool) {
+        self.command_activities.push_back(CommandActivity {
+            id: activity_id,
+            time: now_hms(),
+            command,
+            background,
+            job_id: None,
+            state: CommandActivityState::Running,
+            exit_code: None,
+            preview: None,
+        });
+        while self.command_activities.len() > MAX_COMMAND_ACTIVITIES {
+            self.command_activities.pop_front();
+        }
+    }
+
+    fn command_bind_job(&mut self, activity_id: &str, job_id: String) {
+        let target_index = self
+            .command_activities
+            .iter()
+            .position(|activity| activity.id == activity_id);
+        let existing_index = self
+            .command_activities
+            .iter()
+            .position(|activity| activity.job_id.as_deref() == Some(job_id.as_str()));
+
+        if let (Some(target_index), Some(existing_index)) = (target_index, existing_index) {
+            if target_index != existing_index {
+                // start_command is retry-deduplicated by the command manager. If
+                // the same job is returned to a retried MCP request, keep one
+                // visual command entry instead of showing a duplicate execution.
+                self.command_activities.remove(target_index);
+                return;
+            }
+        }
+
+        if let Some(activity) = self
+            .command_activities
+            .iter_mut()
+            .rev()
+            .find(|activity| activity.id == activity_id)
+        {
+            activity.job_id = Some(job_id);
+        }
+    }
+
+    fn command_update(
+        &mut self,
+        activity_id: Option<&str>,
+        job_id: Option<&str>,
+        state: CommandActivityState,
+        exit_code: Option<i32>,
+        preview: Option<String>,
+    ) {
+        let activity = self.command_activities.iter_mut().rev().find(|activity| {
+            activity_id.is_some_and(|id| activity.id == id)
+                || job_id.is_some_and(|id| activity.job_id.as_deref() == Some(id))
+        });
+        let Some(activity) = activity else {
+            return;
+        };
+        activity.state = state;
+        activity.exit_code = exit_code;
+        if preview.as_deref().is_some_and(|text| !text.is_empty()) {
+            activity.preview = preview;
         }
     }
 
@@ -901,6 +1011,34 @@ impl AppState {
             }
             ServerUiEvent::BeginFlowClose { flow_id } => {
                 self.begin_flow_close(&flow_id);
+            }
+            ServerUiEvent::CommandStarted {
+                activity_id,
+                command,
+                background,
+            } => {
+                self.command_started(activity_id, command, background);
+            }
+            ServerUiEvent::CommandBoundToJob {
+                activity_id,
+                job_id,
+            } => {
+                self.command_bind_job(&activity_id, job_id);
+            }
+            ServerUiEvent::CommandUpdated {
+                activity_id,
+                job_id,
+                state,
+                exit_code,
+                preview,
+            } => {
+                self.command_update(
+                    activity_id.as_deref(),
+                    job_id.as_deref(),
+                    state,
+                    exit_code,
+                    preview,
+                );
             }
             ServerUiEvent::Log { level, message } => {
                 self.log(level, message);
@@ -1530,6 +1668,89 @@ toolCallCount = 0
         let flow = app.flows.first().expect("missing flow");
         assert!(!flow.bootstrap_status_active);
         assert!(flow.bootstrap_status_close_deadline_ms.is_none());
+
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn command_activity_tracks_background_job_without_poll_duplicates() {
+        let (mut app, workspace, config_path) = test_app("catdesk-command-activity");
+
+        app.apply_server_ui_event(ServerUiEvent::CommandStarted {
+            activity_id: "activity-a".into(),
+            command: "cargo test".into(),
+            background: true,
+        });
+        app.apply_server_ui_event(ServerUiEvent::CommandBoundToJob {
+            activity_id: "activity-a".into(),
+            job_id: "job-1".into(),
+        });
+        app.apply_server_ui_event(ServerUiEvent::CommandUpdated {
+            activity_id: None,
+            job_id: Some("job-1".into()),
+            state: CommandActivityState::Running,
+            exit_code: None,
+            preview: Some("Compiling catdesk".into()),
+        });
+        app.apply_server_ui_event(ServerUiEvent::CommandUpdated {
+            activity_id: None,
+            job_id: Some("job-1".into()),
+            state: CommandActivityState::Succeeded,
+            exit_code: Some(0),
+            preview: Some("109 passed; 0 failed".into()),
+        });
+
+        assert_eq!(app.command_activities.len(), 1);
+        let activity = app.command_activities.front().expect("command activity");
+        assert_eq!(activity.command, "cargo test");
+        assert_eq!(activity.job_id.as_deref(), Some("job-1"));
+        assert_eq!(activity.state, CommandActivityState::Succeeded);
+        assert_eq!(activity.exit_code, Some(0));
+        assert_eq!(activity.preview.as_deref(), Some("109 passed; 0 failed"));
+
+        // A retried start_command can return the same deduplicated job. The TUI
+        // should still show one actual execution, not a duplicate command row.
+        app.apply_server_ui_event(ServerUiEvent::CommandStarted {
+            activity_id: "activity-b".into(),
+            command: "cargo test".into(),
+            background: true,
+        });
+        app.apply_server_ui_event(ServerUiEvent::CommandBoundToJob {
+            activity_id: "activity-b".into(),
+            job_id: "job-1".into(),
+        });
+        assert_eq!(app.command_activities.len(), 1);
+
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn command_activity_history_is_bounded() {
+        let (mut app, workspace, config_path) = test_app("catdesk-command-history");
+
+        for index in 0..(MAX_COMMAND_ACTIVITIES + 20) {
+            app.command_started(
+                format!("activity-{index}"),
+                format!("command-{index}"),
+                false,
+            );
+        }
+
+        assert_eq!(app.command_activities.len(), MAX_COMMAND_ACTIVITIES);
+        assert_eq!(
+            app.command_activities
+                .front()
+                .map(|activity| activity.command.as_str()),
+            Some("command-20")
+        );
+        assert_eq!(
+            app.command_activities
+                .back()
+                .map(|activity| activity.command.clone()),
+            Some(format!("command-{}", MAX_COMMAND_ACTIVITIES + 19))
+        );
 
         let _ = std::fs::remove_file(config_path);
         let _ = std::fs::remove_dir_all(workspace);

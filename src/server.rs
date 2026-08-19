@@ -8,6 +8,7 @@ use axum::{
 };
 use serde_json::{Value, json};
 use std::sync::Arc;
+use subtle::ConstantTimeEq;
 use tokio::sync::{Mutex, mpsc::UnboundedSender};
 
 use crate::command_jobs::CommandJobManager;
@@ -71,7 +72,8 @@ fn jsonrpc_error_response(status: StatusCode, code: i64, msg: &str) -> Response<
 }
 
 async fn slug_is_authorized(state: &ServerState, slug: &str) -> bool {
-    state.app.lock().await.mcp_slug == slug
+    let configured_slug = state.app.lock().await.mcp_slug.clone();
+    bool::from(configured_slug.as_bytes().ct_eq(slug.as_bytes()))
 }
 
 fn not_found_response() -> Response<Body> {
@@ -878,9 +880,14 @@ mod tests {
             payload.get("name").and_then(Value::as_str),
             Some("MoonDesk")
         );
-        for private_field in ["workspace", "mode", "tool_mode", "mcp_slug", "ngrok_domain"] {
-            assert!(payload.get(private_field).is_none());
-        }
+        let mut keys = payload
+            .as_object()
+            .expect("health payload must be an object")
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        keys.sort_unstable();
+        assert_eq!(keys, vec!["name", "status"]);
     }
 
     #[tokio::test]

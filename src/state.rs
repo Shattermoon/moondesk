@@ -566,30 +566,6 @@ pub fn load_app_config() -> std::io::Result<AppConfig> {
     AppConfig::load_from_path(&app_config_path()?)
 }
 
-pub fn load_ngrok_authtoken() -> std::io::Result<Option<String>> {
-    Ok(load_app_config()?.ngrok_authtoken)
-}
-
-pub fn save_ngrok_authtoken(token: &str) -> std::io::Result<PathBuf> {
-    let path = app_config_path()?;
-    let mut config = AppConfig::load_from_path(&path)?;
-    config.ngrok_authtoken = Some(token.to_string());
-    config.save_to_path(&path)?;
-    Ok(path)
-}
-
-pub fn load_ngrok_domain() -> std::io::Result<Option<String>> {
-    Ok(load_app_config()?.ngrok_domain)
-}
-
-pub fn save_ngrok_domain(domain: &str) -> std::io::Result<PathBuf> {
-    let path = app_config_path()?;
-    let mut config = AppConfig::load_from_path(&path)?;
-    config.ngrok_domain = Some(domain.to_string());
-    config.save_to_path(&path)?;
-    Ok(path)
-}
-
 pub fn normalize_ngrok_domain(value: &str) -> Result<Option<String>, String> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -602,7 +578,19 @@ pub fn normalize_ngrok_domain(value: &str) -> Result<Option<String>, String> {
         if !matches!(url.scheme(), "http" | "https") {
             return Err("ngrok domain URL must use http:// or https://".into());
         }
-        if !url.username().is_empty() || url.password().is_some() || url.port().is_some() {
+        let authority = trimmed
+            .split_once("://")
+            .map(|(_, remainder)| remainder)
+            .unwrap_or_default()
+            .split(['/', '?', '#'])
+            .next()
+            .unwrap_or_default();
+        let host_port = authority.rsplit('@').next().unwrap_or(authority);
+        if !url.username().is_empty()
+            || url.password().is_some()
+            || url.port().is_some()
+            || host_port.contains(':')
+        {
             return Err("ngrok domain must not include credentials or a port".into());
         }
         if !matches!(url.path(), "" | "/") || url.query().is_some() || url.fragment().is_some() {
@@ -1056,6 +1044,11 @@ impl AppState {
         self.config_dirty = true;
     }
 
+    pub fn set_ngrok_domain(&mut self, domain: Option<String>) {
+        self.ngrok_domain = domain;
+        self.config_dirty = true;
+    }
+
     pub fn mark_config_dirty(&mut self) {
         self.config_dirty = true;
     }
@@ -1308,14 +1301,17 @@ pub async fn flush_config(state: &SharedState, force: bool) -> std::io::Result<b
         return Ok(false);
     };
 
-    let write_result = tokio::task::spawn_blocking(move || config.save_to_path(&path))
-        .await
-        .map_err(|error| {
-            std::io::Error::other(format!("config persistence task failed: {error}"))
-        })?;
+    let write_result = match tokio::task::spawn_blocking(move || config.save_to_path(&path)).await {
+        Ok(result) => result,
+        Err(error) => {
+            state.lock().await.config_dirty = true;
+            return Err(std::io::Error::other(format!(
+                "config persistence task failed: {error}"
+            )));
+        }
+    };
     if let Err(error) = write_result {
-        let mut app = state.lock().await;
-        app.config_dirty = true;
+        state.lock().await.config_dirty = true;
         return Err(error);
     }
     Ok(true)

@@ -658,6 +658,10 @@ fn search_text_rg(
     start: &Path,
     options: ResolvedSearchTextOptions<'_>,
 ) -> Result<SearchTextOutput, SearchBackendError> {
+    // Keep the fast ripgrep backend under the same candidate-file ceiling as
+    // the grep and Rust fallbacks so a broad search cannot bypass the bound.
+    collect_search_files(root, start, options).map_err(SearchBackendError::Failed)?;
+
     let mut command = ProcessCommand::new("rg");
     command
         .current_dir(root)
@@ -719,15 +723,16 @@ fn search_text_rg(
     let mut results: Vec<SearchTextEntry> = Vec::new();
     let mut returned_matches = 0_usize;
     let mut truncated = false;
-    let mut line = String::new();
+    let mut killed_early = false;
+    let mut oversized_record_seen = false;
 
-    loop {
-        line.clear();
-        let bytes_read = reader
-            .read_line(&mut line)
-            .map_err(|e| SearchBackendError::Failed(e.to_string()))?;
-        if bytes_read == 0 {
-            break;
+    while let Some((line, _, scan_truncated)) =
+        read_bounded_search_line(&mut reader).map_err(SearchBackendError::Failed)?
+    {
+        if scan_truncated {
+            oversized_record_seen = true;
+            truncated = true;
+            continue;
         }
         let event: Value = serde_json::from_str(line.trim_end()).map_err(|e| {
             SearchBackendError::Failed(format!("Failed to parse ripgrep JSON output: {e}"))
@@ -737,6 +742,7 @@ fn search_text_rg(
             Some("match") => {
                 if returned_matches >= options.max_matches {
                     truncated = true;
+                    killed_early = true;
                     let _ = child.kill();
                     break;
                 }
@@ -760,7 +766,7 @@ fn search_text_rg(
         .wait_with_output()
         .map_err(|e| SearchBackendError::Failed(e.to_string()))?;
     let status_code = output.status.code().unwrap_or(2);
-    if !truncated && status_code != 0 && status_code != 1 {
+    if !killed_early && status_code != 0 && status_code != 1 {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let message = stderr.trim();
         return Err(SearchBackendError::Failed(if message.is_empty() {
@@ -770,11 +776,16 @@ fn search_text_rg(
         }));
     }
 
+    let backend_note = if oversized_record_seen {
+        "oversized ripgrep JSON records were skipped after a bounded 1 MiB prefix".into()
+    } else {
+        String::new()
+    };
     Ok(SearchTextOutput {
         pattern: options.pattern.to_string(),
         path: to_workspace_relative(root, start),
         backend: "rg".into(),
-        backend_note: String::new(),
+        backend_note,
         match_count: returned_matches,
         truncated,
         limit: options.max_matches,
@@ -809,6 +820,7 @@ fn search_text_grep(
     let mut results = Vec::new();
     let mut returned_matches = 0_usize;
     let mut truncated = false;
+    let mut bounded_long_line_seen = false;
 
     for file in files.iter() {
         let remaining_matches = options.max_matches.saturating_sub(returned_matches);
@@ -865,9 +877,10 @@ fn search_text_grep(
 
         let mut file_matches = 0_usize;
         let mut reader = BufReader::new(stdout);
-        while let Some((line, _, _)) =
+        while let Some((line, _, scan_truncated)) =
             read_bounded_search_line(&mut reader).map_err(SearchBackendError::Failed)?
         {
+            bounded_long_line_seen |= scan_truncated;
             if line == "--" {
                 continue;
             }
@@ -914,13 +927,17 @@ fn search_text_grep(
         }
     }
 
+    let mut backend_note = "rg not found; used grep".to_string();
+    if bounded_long_line_seen {
+        backend_note.push_str("; very long lines are scanned through a bounded 1 MiB prefix");
+    }
     Ok(SearchTextOutput {
         pattern: options.pattern.to_string(),
         path: to_workspace_relative(root, start),
         backend: "grep".into(),
-        backend_note: "rg not found; used grep".into(),
+        backend_note,
         match_count: returned_matches,
-        truncated,
+        truncated: truncated || bounded_long_line_seen,
         limit: options.max_matches,
         results,
     })
@@ -1075,7 +1092,7 @@ fn search_text_rust(
         backend: "rust".into(),
         backend_note,
         match_count: returned_matches,
-        truncated,
+        truncated: truncated || bounded_long_line_seen,
         limit: options.max_matches,
         results,
     })
@@ -1629,6 +1646,46 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![("src/main.rs", 1, "alpha1")]
         );
+
+        let _ = fs::remove_dir_all(workspace_root);
+    }
+
+    #[test]
+    fn grep_search_backend_marks_bounded_long_lines_as_truncated() {
+        if !command_available("grep") {
+            return;
+        }
+
+        let workspace_root = test_workspace("search-grep-long-line");
+        fs::create_dir_all(workspace_root.join("src")).expect("create workspace");
+        let long_line = format!(
+            "needle{}tail\n",
+            "x".repeat(MAX_SEARCH_SCAN_LINE_BYTES + 256)
+        );
+        fs::write(workspace_root.join("src").join("main.rs"), long_line)
+            .expect("write long source line");
+
+        let output = search_text_grep(
+            &workspace_root,
+            &workspace_root,
+            ResolvedSearchTextOptions {
+                pattern: "needle",
+                glob: Some("*.rs"),
+                fixed_strings: true,
+                case_insensitive: false,
+                before: 0,
+                after: 0,
+                max_matches: 10,
+                max_matches_per_file: None,
+                include_hidden: false,
+                no_ignore: false,
+            },
+        )
+        .unwrap_or_else(|_| panic!("search"));
+
+        assert_eq!(output.match_count, 1);
+        assert!(output.truncated);
+        assert!(output.backend_note.contains("bounded 1 MiB prefix"));
 
         let _ = fs::remove_dir_all(workspace_root);
     }

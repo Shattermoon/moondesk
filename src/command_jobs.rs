@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Once};
 use std::time::{Duration as StdDuration, Instant};
@@ -22,13 +22,13 @@ const MAX_RETAINED_JOBS: usize = 64;
 const TERMINAL_JOB_TTL: StdDuration = StdDuration::from_secs(60 * 60);
 const IDEMPOTENCY_WINDOW: StdDuration = StdDuration::from_secs(30);
 const MAX_OUTPUT_BYTES_PER_JOB: usize = 4 * 1024 * 1024;
-const MAX_ARCHIVE_BYTES_PER_JOB: u64 = 64 * 1024 * 1024;
 const MAX_TERMINAL_OUTPUT_BYTES: usize = 32 * 1024 * 1024;
 const STALE_OUTPUT_ROOT_TTL: StdDuration = StdDuration::from_secs(24 * 60 * 60);
 const MAX_POLL_OUTPUT_BYTES: usize = 128 * 1024;
 pub const MAX_COMMAND_OUTPUT_READ_BYTES: usize = 128 * 1024;
 const READ_CHUNK_BYTES: usize = 8 * 1024;
 const CLEANUP_INTERVAL: StdDuration = StdDuration::from_secs(1);
+const OUTPUT_ROOT_PREFIX: &str = "moondesk-command-output-";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -204,11 +204,11 @@ impl CommandJob {
     fn reserve_archive_bytes(&self, requested: usize) -> usize {
         loop {
             let current = self.archive_bytes.load(Ordering::Acquire);
-            if current >= MAX_ARCHIVE_BYTES_PER_JOB {
+            if current >= process_runner::MAX_COMMAND_ARCHIVE_BYTES {
                 self.archive_truncated.store(true, Ordering::Release);
                 return 0;
             }
-            let remaining = MAX_ARCHIVE_BYTES_PER_JOB - current;
+            let remaining = process_runner::MAX_COMMAND_ARCHIVE_BYTES - current;
             let allowed = remaining.min(requested as u64) as usize;
             match self.archive_bytes.compare_exchange(
                 current,
@@ -373,32 +373,86 @@ pub struct CommandJobManager {
     shutting_down: Arc<AtomicBool>,
 }
 
+fn output_root_owner_pid(path: &Path) -> Option<u32> {
+    let name = path.file_name()?.to_str()?;
+    let suffix = name.strip_prefix(OUTPUT_ROOT_PREFIX)?;
+    let (pid, instance_id) = suffix.split_once('-')?;
+    Uuid::parse_str(instance_id).ok()?;
+    let pid = pid.parse::<u32>().ok()?;
+    (pid != 0).then_some(pid)
+}
+
+#[cfg(unix)]
+fn process_is_live(pid: u32) -> bool {
+    if pid == std::process::id() {
+        return true;
+    }
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    let result = unsafe { libc::kill(pid, 0) };
+    if result == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(windows)]
+fn process_is_live(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    const STILL_ACTIVE_EXIT_CODE: u32 = 259;
+
+    if pid == std::process::id() {
+        return true;
+    }
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if process.is_null() {
+        return std::io::Error::last_os_error().kind() == std::io::ErrorKind::PermissionDenied;
+    }
+    let mut exit_code = 0_u32;
+    let query_succeeded = unsafe { GetExitCodeProcess(process, &mut exit_code) } != 0;
+    unsafe {
+        CloseHandle(process);
+    }
+    query_succeeded && exit_code == STILL_ACTIVE_EXIT_CODE
+}
+
+fn cleanup_stale_output_roots() {
+    let temp_dir = std::env::temp_dir();
+    let Ok(entries) = fs::read_dir(&temp_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(owner_pid) = output_root_owner_pid(&path) else {
+            continue;
+        };
+        let is_directory = entry.file_type().is_ok_and(|file_type| file_type.is_dir());
+        if !is_directory || owner_pid == std::process::id() || process_is_live(owner_pid) {
+            continue;
+        }
+        let old_enough = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age >= STALE_OUTPUT_ROOT_TTL);
+        if old_enough {
+            let _ = fs::remove_dir_all(path);
+        }
+    }
+}
+
 fn cleanup_stale_output_roots_once() {
     static CLEANUP: Once = Once::new();
     CLEANUP.call_once(|| {
-        let temp_dir = std::env::temp_dir();
-        let Ok(entries) = fs::read_dir(&temp_dir) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let is_moondesk_output_root = path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("moondesk-command-output-"));
-            if !is_moondesk_output_root || !path.is_dir() {
-                continue;
-            }
-            let old_enough = entry
-                .metadata()
-                .and_then(|metadata| metadata.modified())
-                .ok()
-                .and_then(|modified| modified.elapsed().ok())
-                .is_some_and(|age| age >= STALE_OUTPUT_ROOT_TTL);
-            if old_enough {
-                let _ = fs::remove_dir_all(path);
-            }
-        }
+        let _ = std::thread::Builder::new()
+            .name("moondesk-output-cleanup".into())
+            .spawn(cleanup_stale_output_roots);
     });
 }
 
@@ -406,7 +460,7 @@ impl Default for CommandJobManager {
     fn default() -> Self {
         cleanup_stale_output_roots_once();
         let output_root = std::env::temp_dir().join(format!(
-            "moondesk-command-output-{}-{}",
+            "{OUTPUT_ROOT_PREFIX}{}-{}",
             std::process::id(),
             Uuid::new_v4()
         ));
@@ -994,6 +1048,21 @@ mod tests {
         path
     }
 
+    #[test]
+    fn output_root_names_track_a_live_owner_pid() {
+        let instance_id = Uuid::new_v4();
+        let path = std::env::temp_dir().join(format!(
+            "{OUTPUT_ROOT_PREFIX}{}-{instance_id}",
+            std::process::id()
+        ));
+        assert_eq!(output_root_owner_pid(&path), Some(std::process::id()));
+        assert!(process_is_live(std::process::id()));
+        assert_eq!(
+            output_root_owner_pid(&std::env::temp_dir().join("moondesk-command-output-invalid")),
+            None
+        );
+    }
+
     async fn wait_terminal(manager: &CommandJobManager, job_id: &str) -> CommandJobSnapshot {
         let mut cursor = 0;
         for _ in 0..30 {
@@ -1570,12 +1639,14 @@ mod tests {
             CommandJob::new_with_output(job_id, "synthetic".into(), root.clone(), 5_000, &paths)
                 .expect("create archived job");
 
-        job.archive_bytes
-            .store(MAX_ARCHIVE_BYTES_PER_JOB - 4, Ordering::Release);
+        job.archive_bytes.store(
+            process_runner::MAX_COMMAND_ARCHIVE_BYTES - 4,
+            Ordering::Release,
+        );
         assert_eq!(job.reserve_archive_bytes(8), 4);
         assert_eq!(
             job.archive_bytes.load(Ordering::Acquire),
-            MAX_ARCHIVE_BYTES_PER_JOB
+            process_runner::MAX_COMMAND_ARCHIVE_BYTES
         );
         assert!(job.archive_truncated.load(Ordering::Acquire));
         assert_eq!(job.reserve_archive_bytes(1), 0);

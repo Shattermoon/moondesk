@@ -21,6 +21,8 @@ const HARD_SEARCH_LIMIT: usize = 500;
 const HARD_SEARCH_CONTEXT_LINES: usize = 20;
 const MAX_SEARCH_RESPONSE_BYTES: usize = 128 * 1024;
 const MAX_SEARCH_LINE_BYTES: usize = 4 * 1024;
+const MAX_SEARCH_SCAN_LINE_BYTES: usize = 1024 * 1024;
+const MAX_SEARCH_CANDIDATE_FILES: usize = 100_000;
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -438,16 +440,16 @@ pub fn write_file(
 
     let root = workspace_root_path(workspace_root)?;
     let target = resolve_target_path(workspace_root, path)?;
-    if let Some(parent) = target.parent() {
-        if !parent.exists() {
-            if create_dirs {
-                fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-            } else {
-                return Err(format!(
-                    "Parent directory does not exist: {} (set create_dirs=true)",
-                    parent.display()
-                ));
-            }
+    if let Some(parent) = target.parent()
+        && !parent.exists()
+    {
+        if create_dirs {
+            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        } else {
+            return Err(format!(
+                "Parent directory does not exist: {} (set create_dirs=true)",
+                parent.display()
+            ));
         }
     }
 
@@ -658,7 +660,7 @@ fn search_text_rg(
 ) -> Result<SearchTextOutput, SearchBackendError> {
     let mut command = ProcessCommand::new("rg");
     command
-        .current_dir(&root)
+        .current_dir(root)
         .arg("--json")
         .arg("--line-number")
         .arg("--with-filename")
@@ -699,7 +701,7 @@ fn search_text_rg(
         }
     }
     let include_context = options.before > 0 || options.after > 0;
-    command.arg("--regexp").arg(options.pattern).arg(&start);
+    command.arg("--regexp").arg(options.pattern).arg(start);
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
 
     let mut child = command.spawn().map_err(|e| {
@@ -780,6 +782,23 @@ fn search_text_rg(
     })
 }
 
+fn drain_reader_bounded<R: Read>(mut reader: R, max_bytes: usize) -> Result<Vec<u8>, String> {
+    let mut retained = Vec::with_capacity(max_bytes.min(8 * 1024));
+    let mut buffer = [0_u8; 8 * 1024];
+    loop {
+        let read = reader
+            .read(&mut buffer)
+            .map_err(|error| error.to_string())?;
+        if read == 0 {
+            break;
+        }
+        let remaining = max_bytes.saturating_sub(retained.len());
+        let keep = remaining.min(read);
+        retained.extend_from_slice(&buffer[..keep]);
+    }
+    Ok(retained)
+}
+
 fn search_text_grep(
     root: &Path,
     start: &Path,
@@ -826,47 +845,69 @@ fn search_text_grep(
         command.arg("--").arg(options.pattern).arg(file);
         command.stdout(Stdio::piped()).stderr(Stdio::piped());
 
-        let output = command.output().map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
+        let mut child = command.spawn().map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
                 SearchBackendError::Unavailable
             } else {
-                SearchBackendError::Failed(e.to_string())
+                SearchBackendError::Failed(error.to_string())
             }
         })?;
-        let status_code = output.status.code().unwrap_or(2);
-        if status_code != 0 && status_code != 1 {
-            let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| SearchBackendError::Failed("Failed to capture grep stdout".into()))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| SearchBackendError::Failed("Failed to capture grep stderr".into()))?;
+        let stderr_task =
+            std::thread::spawn(move || drain_reader_bounded(stderr, MAX_SEARCH_RESPONSE_BYTES));
+
+        let mut file_matches = 0_usize;
+        let mut reader = BufReader::new(stdout);
+        while let Some((line, _, _)) =
+            read_bounded_search_line(&mut reader).map_err(SearchBackendError::Failed)?
+        {
+            if line == "--" {
+                continue;
+            }
+            let Some(entry) = parse_grep_search_entry(root, file, &line) else {
+                continue;
+            };
+            if !entry.is_context {
+                if returned_matches >= options.max_matches {
+                    truncated = true;
+                    let _ = child.kill();
+                    break;
+                }
+                if options
+                    .max_matches_per_file
+                    .is_some_and(|max_per_file| file_matches >= max_per_file)
+                {
+                    continue;
+                }
+                file_matches = file_matches.saturating_add(1);
+                returned_matches = returned_matches.saturating_add(1);
+            }
+            results.push(entry);
+        }
+
+        let status = child
+            .wait()
+            .map_err(|error| SearchBackendError::Failed(error.to_string()))?;
+        let stderr = stderr_task
+            .join()
+            .map_err(|_| SearchBackendError::Failed("grep stderr reader panicked".into()))?
+            .map_err(SearchBackendError::Failed)?;
+        let status_code = status.code().unwrap_or(2);
+        if !truncated && status_code != 0 && status_code != 1 {
+            let stderr = String::from_utf8_lossy(&stderr);
             let message = stderr.trim();
             return Err(SearchBackendError::Failed(if message.is_empty() {
                 format!("grep exited with status {status_code}")
             } else {
                 message.to_string()
             }));
-        }
-
-        let mut file_matches = 0_usize;
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        for line in stdout.lines() {
-            if line == "--" {
-                continue;
-            }
-            let Some(entry) = parse_grep_search_entry(root, file, line) else {
-                continue;
-            };
-            if !entry.is_context {
-                if returned_matches >= options.max_matches {
-                    truncated = true;
-                    break;
-                }
-                if let Some(max_per_file) = options.max_matches_per_file {
-                    if file_matches >= max_per_file {
-                        continue;
-                    }
-                }
-                file_matches += 1;
-                returned_matches += 1;
-            }
-            results.push(entry);
         }
         if truncated {
             break;
@@ -885,55 +926,147 @@ fn search_text_grep(
     })
 }
 
+fn read_bounded_search_line<R: BufRead>(
+    reader: &mut R,
+) -> Result<Option<(String, bool, bool)>, String> {
+    let mut kept = Vec::with_capacity(MAX_SEARCH_LINE_BYTES);
+    let mut saw_any = false;
+    let mut binary = false;
+    let mut scan_truncated = false;
+
+    loop {
+        let available = reader.fill_buf().map_err(|error| error.to_string())?;
+        if available.is_empty() {
+            break;
+        }
+        saw_any = true;
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let consume_len = newline.map_or(available.len(), |index| index + 1);
+        let chunk = &available[..consume_len];
+        binary |= chunk.contains(&0);
+        let content = if newline.is_some() {
+            &chunk[..chunk.len().saturating_sub(1)]
+        } else {
+            chunk
+        };
+        let remaining = MAX_SEARCH_SCAN_LINE_BYTES.saturating_sub(kept.len());
+        let copy_len = remaining.min(content.len());
+        kept.extend_from_slice(&content[..copy_len]);
+        scan_truncated |= copy_len < content.len();
+        reader.consume(consume_len);
+        if newline.is_some() {
+            break;
+        }
+    }
+
+    if !saw_any {
+        return Ok(None);
+    }
+    if kept.last() == Some(&b'\r') {
+        kept.pop();
+    }
+    Ok(Some((
+        String::from_utf8_lossy(&kept).into_owned(),
+        binary,
+        scan_truncated,
+    )))
+}
+
 fn search_text_rust(
     root: &Path,
     start: &Path,
     options: ResolvedSearchTextOptions<'_>,
-    backend_note: String,
+    mut backend_note: String,
 ) -> Result<SearchTextOutput, String> {
     let matcher = SearchMatcher::new(options)?;
     let files = collect_search_files(root, start, options)?;
     let mut results = Vec::new();
     let mut returned_matches = 0_usize;
     let mut truncated = false;
+    let mut bounded_long_line_seen = false;
 
-    for file in files.iter() {
-        if returned_matches >= options.max_matches {
-            truncated = true;
-            break;
-        }
-        let data = fs::read(file).map_err(|e| e.to_string())?;
-        if data.iter().any(|b| *b == 0) {
-            continue;
-        }
-        let text = String::from_utf8_lossy(&data);
-        let lines: Vec<&str> = text.lines().collect();
-        let mut match_indexes = Vec::new();
-        for (idx, line) in lines.iter().enumerate() {
-            if !matcher.is_match(line) {
-                continue;
-            }
-            if let Some(max_per_file) = options.max_matches_per_file {
-                if match_indexes.len() >= max_per_file {
-                    break;
-                }
-            }
-            if returned_matches + match_indexes.len() >= options.max_matches {
-                truncated = true;
+    'files: for file in &files {
+        let mut reader = BufReader::new(fs::File::open(file).map_err(|error| error.to_string())?);
+        let rel = to_workspace_relative(root, file);
+        let mut before_lines: VecDeque<(usize, String)> = VecDeque::new();
+        let mut selected: BTreeMap<usize, (String, bool)> = BTreeMap::new();
+        let mut file_matches = 0usize;
+        let mut after_remaining = 0usize;
+        let mut line_number = 0usize;
+        let mut binary_file = false;
+
+        while let Some((line, binary, scan_truncated)) = read_bounded_search_line(&mut reader)? {
+            line_number = line_number.saturating_add(1);
+            bounded_long_line_seen |= scan_truncated;
+            if binary {
+                binary_file = true;
                 break;
             }
-            match_indexes.push(idx);
+
+            let per_file_available = options
+                .max_matches_per_file
+                .is_none_or(|limit| file_matches < limit);
+            let matched = per_file_available && matcher.is_match(&line);
+            if matched {
+                if returned_matches >= options.max_matches {
+                    truncated = true;
+                    break;
+                }
+                for (context_line, context_text) in &before_lines {
+                    selected
+                        .entry(*context_line)
+                        .or_insert_with(|| (context_text.clone(), true));
+                }
+                selected.insert(line_number, (line.clone(), false));
+                file_matches = file_matches.saturating_add(1);
+                returned_matches = returned_matches.saturating_add(1);
+                after_remaining = options.after;
+            } else if after_remaining > 0 {
+                selected
+                    .entry(line_number)
+                    .or_insert_with(|| (line.clone(), true));
+                after_remaining -= 1;
+            }
+
+            if options.before > 0 {
+                before_lines.push_back((line_number, line));
+                while before_lines.len() > options.before {
+                    before_lines.pop_front();
+                }
+            }
+
+            if options
+                .max_matches_per_file
+                .is_some_and(|limit| file_matches >= limit)
+                && after_remaining == 0
+            {
+                break;
+            }
         }
-        append_rust_search_entries(
-            root,
-            file,
-            &lines,
-            &match_indexes,
-            options.before,
-            options.after,
-            &mut results,
+
+        if binary_file {
+            continue;
+        }
+        results.extend(
+            selected
+                .into_iter()
+                .map(|(line, (text, is_context))| SearchTextEntry {
+                    path: rel.clone(),
+                    line,
+                    text,
+                    is_context,
+                }),
         );
-        returned_matches += match_indexes.len();
+        if truncated {
+            break 'files;
+        }
+    }
+
+    if bounded_long_line_seen {
+        if !backend_note.is_empty() {
+            backend_note.push_str("; ");
+        }
+        backend_note.push_str("very long lines are scanned through a bounded 1 MiB prefix");
     }
 
     Ok(SearchTextOutput {
@@ -976,12 +1109,12 @@ fn validate_optional_search_limit(
 }
 
 fn validate_search_context(value: Option<usize>, name: &str) -> Result<(), String> {
-    if let Some(value) = value {
-        if value > HARD_SEARCH_CONTEXT_LINES {
-            return Err(format!(
-                "{name} must be between 0 and {HARD_SEARCH_CONTEXT_LINES}"
-            ));
-        }
+    if let Some(value) = value
+        && value > HARD_SEARCH_CONTEXT_LINES
+    {
+        return Err(format!(
+            "{name} must be between 0 and {HARD_SEARCH_CONTEXT_LINES}"
+        ));
     }
     Ok(())
 }
@@ -1081,9 +1214,15 @@ fn collect_search_files(
         }
         if let Some(glob) = glob.as_ref() {
             let rel = path.strip_prefix(root).unwrap_or(path);
-            if !glob.is_match(rel) {
+            let rel_for_glob = rel.to_string_lossy().replace('\\', "/");
+            if !glob.is_match(&rel_for_glob) {
                 continue;
             }
+        }
+        if files.len() >= MAX_SEARCH_CANDIDATE_FILES {
+            return Err(format!(
+                "search matched more than {MAX_SEARCH_CANDIDATE_FILES} candidate files; narrow path or glob"
+            ));
         }
         files.push(path.to_path_buf());
     }
@@ -1101,36 +1240,6 @@ fn compile_search_glob(glob: Option<&str>) -> Result<Option<GlobSet>, String> {
         builder.add(Glob::new(&format!("**/{glob}")).map_err(|e| e.to_string())?);
     }
     builder.build().map(Some).map_err(|e| e.to_string())
-}
-
-fn append_rust_search_entries(
-    root: &Path,
-    file: &Path,
-    lines: &[&str],
-    match_indexes: &[usize],
-    before: usize,
-    after: usize,
-    results: &mut Vec<SearchTextEntry>,
-) {
-    let mut selected: BTreeMap<usize, bool> = BTreeMap::new();
-    for match_idx in match_indexes {
-        let start_idx = match_idx.saturating_sub(before);
-        let end_idx = (*match_idx + after).min(lines.len().saturating_sub(1));
-        for idx in start_idx..=end_idx {
-            selected.entry(idx).or_insert(true);
-        }
-        selected.insert(*match_idx, false);
-    }
-
-    let rel = to_workspace_relative(root, file);
-    for (idx, is_context) in selected {
-        results.push(SearchTextEntry {
-            path: rel.clone(),
-            line: idx + 1,
-            text: lines[idx].to_string(),
-            is_context,
-        });
-    }
 }
 
 pub fn delete_path(workspace_root: &str, path: &str, recursive: bool) -> Result<String, String> {
@@ -1209,16 +1318,16 @@ pub fn move_path(
         return Ok("source and destination are the same path".into());
     }
 
-    if let Some(parent) = dst.parent() {
-        if !parent.exists() {
-            if create_dirs {
-                fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-            } else {
-                return Err(format!(
-                    "Destination parent does not exist: {} (set create_dirs=true)",
-                    parent.display()
-                ));
-            }
+    if let Some(parent) = dst.parent()
+        && !parent.exists()
+    {
+        if create_dirs {
+            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        } else {
+            return Err(format!(
+                "Destination parent does not exist: {} (set create_dirs=true)",
+                parent.display()
+            ));
         }
     }
 
@@ -1430,6 +1539,48 @@ mod tests {
             vec![("src/main.rs", 2, "alpha1")]
         );
         assert!(output.results.iter().any(|entry| entry.is_context));
+
+        let _ = fs::remove_dir_all(workspace_root);
+    }
+
+    #[test]
+    fn rust_search_backend_does_not_mark_exact_limit_as_truncated() {
+        let workspace_root = test_workspace("search-rust-exact-limit");
+        fs::create_dir_all(workspace_root.join("src")).expect("create workspace");
+        fs::write(workspace_root.join("src").join("a.rs"), "alpha1\n").expect("write match");
+        fs::write(workspace_root.join("src").join("b.rs"), "beta\n").expect("write non-match");
+
+        let output = search_text_rust(
+            &workspace_root,
+            &workspace_root,
+            ResolvedSearchTextOptions {
+                pattern: "alpha[0-9]",
+                glob: Some("*.rs"),
+                fixed_strings: false,
+                case_insensitive: false,
+                before: 0,
+                after: 0,
+                max_matches: 1,
+                max_matches_per_file: None,
+                include_hidden: false,
+                no_ignore: false,
+            },
+            "test rust backend".into(),
+        )
+        .expect("search");
+
+        assert_eq!(output.backend, "rust");
+        assert_eq!(output.match_count, 1);
+        assert!(!output.truncated);
+        assert_eq!(
+            output
+                .results
+                .iter()
+                .filter(|entry| !entry.is_context)
+                .map(|entry| (entry.path.as_str(), entry.line, entry.text.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("src/a.rs", 1, "alpha1")]
+        );
 
         let _ = fs::remove_dir_all(workspace_root);
     }

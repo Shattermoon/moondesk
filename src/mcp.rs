@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::io::Write as IoWrite;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tiktoken_rs::o200k_base_singleton;
@@ -17,7 +18,7 @@ use crate::state::{AgentsPathMode, Mode, ToolMode, load_app_config, user_home_di
 use crate::workspace_tools;
 
 const SERVER_NAME: &str = "moondesk";
-const SERVER_VERSION: &str = "4.0.0";
+const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 const MCP_PROTOCOL_VERSION: &str = "2025-11-25";
 const DEVTOOLS_PROTOCOL_VERSION: &str = "2025-03-26";
 
@@ -189,6 +190,10 @@ fn local_tool_output_schema(name: &str) -> Option<Value> {
             properties.insert("hasMoreOutput".to_string(), json!({ "type": "boolean" }));
             properties.insert("outputTruncated".to_string(), json!({ "type": "boolean" }));
             properties.insert(
+                "outputArchiveTruncated".to_string(),
+                json!({ "type": "boolean" }),
+            );
+            properties.insert(
                 "outputArchiveError".to_string(),
                 json!({ "type": "string" }),
             );
@@ -214,6 +219,10 @@ fn local_tool_output_schema(name: &str) -> Option<Value> {
             properties.insert("timedOut".to_string(), json!({ "type": "boolean" }));
             properties.insert("stdoutTruncated".to_string(), json!({ "type": "boolean" }));
             properties.insert("stderrTruncated".to_string(), json!({ "type": "boolean" }));
+            properties.insert(
+                "outputArchiveTruncated".to_string(),
+                json!({ "type": "boolean" }),
+            );
             properties.insert("outputId".to_string(), json!({ "type": "string" }));
             properties.insert(
                 "outputArchiveError".to_string(),
@@ -311,7 +320,7 @@ async fn handle_tools_list(
             tools.push(json!({
                 "name": "poll_command",
                 "title": "Poll command",
-                "description": "Read incremental output and current status from a command previously started with start_command. Pass the returned nextCursor as after on the next poll so output is not repeated. If hasMoreOutput is true, poll again even if the job is already terminal. If outputTruncated is true, the complete stdout/stderr is still preserved locally; use read_command_output with output_id equal to this job_id to recover it.",
+                "description": "Read incremental output and current status from a command previously started with start_command. Pass the returned nextCursor as after on the next poll so output is not repeated. If hasMoreOutput is true, poll again even if the job is already terminal. If outputTruncated is true, bounded stdout/stderr archives are preserved locally; use read_command_output with output_id equal to this job_id. If outputArchiveTruncated is true, the local archive reached its safety limit and recovery is partial.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -326,7 +335,7 @@ async fn handle_tools_list(
             tools.push(json!({
                 "name": "read_command_output",
                 "title": "Read command output",
-                "description": "Read a bounded chunk from a complete locally preserved command stdout/stderr archive. Use the outputId returned by a truncated run_command, or use a start_command jobId as output_id when poll_command reports outputTruncated. Continue with nextStartByte until it is absent.",
+                "description": "Read a bounded chunk from a locally preserved command stdout/stderr archive. Use the outputId returned by a truncated run_command, or use a start_command jobId as output_id when poll_command reports outputTruncated. Archives are disk-bounded; outputArchiveTruncated means the oldest preserved prefix ends at the archive safety limit. Continue with nextStartByte until it is absent.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -456,15 +465,14 @@ async fn handle_tools_list(
     }
 
     // Browser tools — get from devtools bridge
-    if mode.browser_enabled() {
-        if let Some(bridge) = devtools {
-            if let Some(dt_tools) = fetch_devtools_tools(bridge).await {
-                if tool_mode.read_only() {
-                    tools.extend(dt_tools.into_iter().filter(tool_is_read_only));
-                } else {
-                    tools.extend(dt_tools);
-                }
-            }
+    if mode.browser_enabled()
+        && let Some(bridge) = devtools
+        && let Some(dt_tools) = fetch_devtools_tools(bridge).await
+    {
+        if tool_mode.read_only() {
+            tools.extend(dt_tools.into_iter().filter(tool_is_read_only));
+        } else {
+            tools.extend(dt_tools);
         }
     }
 
@@ -493,7 +501,7 @@ async fn handle_tools_call(
         .unwrap_or("")
         .to_string();
 
-    let response = {
+    {
         // Local computer tools
         if mode.computer_enabled() {
             if matches!(
@@ -527,7 +535,7 @@ async fn handle_tools_call(
                         "poll_command" => handle_poll_command(req, command_jobs).await,
                         "read_command_output" => handle_read_command_output(req, command_jobs),
                         "cancel_command" => handle_cancel_command(req, command_jobs).await,
-                        _ => unreachable!(),
+                        _ => tool_error_response(req, format!("Unknown tool: {tool_name}")),
                     }
                 } else if tool_mode.read_only() {
                     read_only_blocked_response(req, &tool_name)
@@ -574,9 +582,7 @@ async fn handle_tools_call(
         } else {
             tool_error_response(req, format!("Unknown tool: {tool_name}"))
         }
-    };
-
-    response
+    }
 }
 
 async fn forward_to_devtools(
@@ -686,9 +692,12 @@ fn command_poll_structured(snapshot: &CommandJobSnapshot) -> Value {
     }
     if snapshot.output_truncated {
         object.insert("outputTruncated".to_string(), json!(true));
-        if let Some(error) = snapshot.output_archive_error.as_deref() {
-            object.insert("outputArchiveError".to_string(), json!(error));
-        }
+    }
+    if snapshot.output_archive_truncated {
+        object.insert("outputArchiveTruncated".to_string(), json!(true));
+    }
+    if let Some(error) = snapshot.output_archive_error.as_deref() {
+        object.insert("outputArchiveError".to_string(), json!(error));
     }
     insert_exit_code(&mut object, snapshot);
     Value::Object(object)
@@ -864,18 +873,14 @@ fn handle_read_command_output(
 
     match command_jobs.read_output(output_id, stream, start_byte, max_bytes) {
         Ok(output) => {
-            let mut structured = json!({
-                "startByte": output.start_byte,
-                "endByte": output.end_byte,
-                "text": output.text,
-            });
+            let mut structured = Map::new();
+            structured.insert("startByte".to_string(), json!(output.start_byte));
+            structured.insert("endByte".to_string(), json!(output.end_byte));
+            structured.insert("text".to_string(), json!(output.text));
             if let Some(next_start_byte) = output.next_start_byte {
-                structured
-                    .as_object_mut()
-                    .expect("command output result must be an object")
-                    .insert("nextStartByte".to_string(), json!(next_start_byte));
+                structured.insert("nextStartByte".to_string(), json!(next_start_byte));
             }
-            tool_success_response_with_structured(req, String::new(), structured)
+            tool_success_response_with_structured(req, String::new(), Value::Object(structured))
         }
         Err(error) => tool_error_response(req, error),
     }
@@ -900,16 +905,30 @@ async fn handle_cancel_command(
     }
 }
 
-fn run_command_structured(
-    stdout: &str,
-    stderr: &str,
+struct RunCommandStructured<'a> {
+    stdout: &'a str,
+    stderr: &'a str,
     exit_code: Option<i32>,
     timed_out: bool,
     stdout_truncated: bool,
     stderr_truncated: bool,
-    output_id: Option<&str>,
-    output_archive_error: Option<&str>,
-) -> Value {
+    output_archive_truncated: bool,
+    output_id: Option<&'a str>,
+    output_archive_error: Option<&'a str>,
+}
+
+fn run_command_structured(input: RunCommandStructured<'_>) -> Value {
+    let RunCommandStructured {
+        stdout,
+        stderr,
+        exit_code,
+        timed_out,
+        stdout_truncated,
+        stderr_truncated,
+        output_archive_truncated,
+        output_id,
+        output_archive_error,
+    } = input;
     let mut object = Map::new();
     if !stdout.is_empty() {
         object.insert("stdout".to_string(), json!(stdout));
@@ -928,6 +947,9 @@ fn run_command_structured(
     }
     if stderr_truncated {
         object.insert("stderrTruncated".to_string(), json!(true));
+    }
+    if output_archive_truncated {
+        object.insert("outputArchiveTruncated".to_string(), json!(true));
     }
     if let Some(output_id) = output_id {
         object.insert("outputId".to_string(), json!(output_id));
@@ -1015,16 +1037,17 @@ async fn handle_run_command(
         ) {
             Ok(listing) => {
                 let output = listing.render_text();
-                let structured = run_command_structured(
-                    &output,
-                    "",
-                    Some(0),
-                    false,
-                    listing.truncated,
-                    false,
-                    None,
-                    None,
-                );
+                let structured = run_command_structured(RunCommandStructured {
+                    stdout: &output,
+                    stderr: "",
+                    exit_code: Some(0),
+                    timed_out: false,
+                    stdout_truncated: listing.truncated,
+                    stderr_truncated: false,
+                    output_archive_truncated: false,
+                    output_id: None,
+                    output_archive_error: None,
+                });
                 return tool_success_response_with_structured(req, String::new(), structured);
             }
             Err(e) => return tool_error_response(req, e),
@@ -1035,7 +1058,7 @@ async fn handle_run_command(
         return handle_run_command_move_path_intercept(req, workspace_root, &cwd, &intercept);
     }
 
-    let (output_id, output_paths) = match command_jobs.create_run_output() {
+    let (output_id, output_paths) = match command_jobs.create_run_output().await {
         Ok(value) => value,
         Err(error) => return tool_error_response(req, error),
     };
@@ -1048,23 +1071,24 @@ async fn handle_run_command(
     .await;
     let needs_recovery = result.stdout_truncated || result.stderr_truncated;
     let archive_error = needs_recovery
-        .then(|| result.output_archive_error.as_deref())
+        .then_some(result.output_archive_error.as_deref())
         .flatten();
     let recoverable_output_id =
         (needs_recovery && archive_error.is_none()).then_some(output_id.as_str());
     if !needs_recovery {
-        command_jobs.discard_output(&output_id);
+        command_jobs.discard_output(&output_id).await;
     }
-    let structured = run_command_structured(
-        &result.stdout,
-        &result.stderr,
-        result.exit_code,
-        result.timed_out,
-        result.stdout_truncated,
-        result.stderr_truncated,
-        recoverable_output_id,
-        archive_error,
-    );
+    let structured = run_command_structured(RunCommandStructured {
+        stdout: &result.stdout,
+        stderr: &result.stderr,
+        exit_code: result.exit_code,
+        timed_out: result.timed_out,
+        stdout_truncated: result.stdout_truncated,
+        stderr_truncated: result.stderr_truncated,
+        output_archive_truncated: result.output_archive_truncated,
+        output_id: recoverable_output_id,
+        output_archive_error: archive_error,
+    });
 
     if result.success && archive_error.is_none() {
         tool_success_response_with_structured(req, String::new(), structured)
@@ -1103,15 +1127,15 @@ fn resolve_intercepted_move_path(
         destination_operand.clone()
     };
 
-    if intercept.overwrite && from != to {
-        if let Ok(destination_meta) = std::fs::symlink_metadata(&to) {
-            if source_meta.file_type().is_dir() || destination_meta.file_type().is_dir() {
-                return Err(format!(
-                    "mv intercept refuses to overwrite existing directories: {}",
-                    to.display()
-                ));
-            }
-        }
+    if intercept.overwrite
+        && from != to
+        && let Ok(destination_meta) = std::fs::symlink_metadata(&to)
+        && (source_meta.file_type().is_dir() || destination_meta.file_type().is_dir())
+    {
+        return Err(format!(
+            "mv intercept refuses to overwrite existing directories: {}",
+            to.display()
+        ));
     }
 
     Ok(ResolvedMovePathIntercept { from, to })
@@ -1141,8 +1165,17 @@ fn handle_run_command_move_path_intercept(
     match workspace_tools::move_path(workspace_root, &from, &to, intercept.overwrite, false) {
         Ok(_) => tool_success_response_with_structured(req, String::new(), json!({})),
         Err(error) => {
-            let structured =
-                run_command_structured("", &error, None, false, false, false, None, None);
+            let structured = run_command_structured(RunCommandStructured {
+                stdout: "",
+                stderr: &error,
+                exit_code: None,
+                timed_out: false,
+                stdout_truncated: false,
+                stderr_truncated: false,
+                output_archive_truncated: false,
+                output_id: None,
+                output_archive_error: None,
+            });
             tool_error_response_with_structured(req, String::new(), structured)
         }
     }
@@ -1314,7 +1347,7 @@ Always specify the branch explicitly when using `git push`."#
                 .to_string(),
         );
         lines.push(
-            "Use poll_command to read incremental output from a background command. Pass the returned nextCursor as after on the next poll so output is not repeated, and use wait_ms when waiting briefly for new progress. If hasMoreOutput is true, keep polling even after the command reaches a terminal state. If poll_command reports outputTruncated, use read_command_output with output_id equal to the job ID to recover the complete preserved stdout/stderr without rerunning the command."
+            "Use poll_command to read incremental output from a background command. Pass the returned nextCursor as after on the next poll so output is not repeated, and use wait_ms when waiting briefly for new progress. If hasMoreOutput is true, keep polling even after the command reaches a terminal state. If poll_command reports outputTruncated, use read_command_output with output_id equal to the job ID to recover the bounded preserved stdout/stderr without rerunning the command. outputArchiveTruncated means the local archive reached its disk safety limit."
                 .to_string(),
         );
         lines.push(
@@ -1350,13 +1383,6 @@ fn handle_moondesk_instruction(
     tool_success_response_with_structured(req, instruction_text, structured)
 }
 
-fn build_turn_token_payload(req: &JsonRpcRequest, tool_name: &str) -> Value {
-    json!({
-        "name": tool_name,
-        "arguments": tool_arguments(req),
-    })
-}
-
 const MAX_EXACT_TOKEN_ESTIMATE_BYTES: usize = 4 * 1024;
 
 fn exact_tokens_o200k(text: &str) -> u64 {
@@ -1367,6 +1393,7 @@ fn exact_tokens_o200k(text: &str) -> u64 {
         .unwrap_or(u64::MAX)
 }
 
+#[cfg(test)]
 fn utf8_prefix_at_most(text: &str, max_bytes: usize) -> &str {
     let mut end = text.len().min(max_bytes);
     while end > 0 && !text.is_char_boundary(end) {
@@ -1375,6 +1402,7 @@ fn utf8_prefix_at_most(text: &str, max_bytes: usize) -> &str {
     &text[..end]
 }
 
+#[cfg(test)]
 fn utf8_suffix_at_most(text: &str, max_bytes: usize) -> &str {
     let mut start = text.len().saturating_sub(max_bytes);
     while start < text.len() && !text.is_char_boundary(start) {
@@ -1383,6 +1411,7 @@ fn utf8_suffix_at_most(text: &str, max_bytes: usize) -> &str {
     &text[start..]
 }
 
+#[cfg(test)]
 fn estimate_tokens_o200k(text: &str) -> u64 {
     if text.len() <= MAX_EXACT_TOKEN_ESTIMATE_BYTES {
         return exact_tokens_o200k(text);
@@ -1409,17 +1438,102 @@ fn estimate_tokens_o200k(text: &str) -> u64 {
     scaled.min(u64::MAX as u128) as u64
 }
 
+#[derive(Default)]
+struct TokenEstimateWriter {
+    total_bytes: u64,
+    prefix: Vec<u8>,
+    suffix: Vec<u8>,
+}
+
+impl IoWrite for TokenEstimateWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.total_bytes = self.total_bytes.saturating_add(bytes.len() as u64);
+
+        if self.prefix.len() < MAX_EXACT_TOKEN_ESTIMATE_BYTES {
+            let remaining = MAX_EXACT_TOKEN_ESTIMATE_BYTES - self.prefix.len();
+            let keep = remaining.min(bytes.len());
+            self.prefix.extend_from_slice(&bytes[..keep]);
+        }
+
+        let suffix_capacity = MAX_EXACT_TOKEN_ESTIMATE_BYTES / 2;
+        if suffix_capacity > 0 {
+            if bytes.len() >= suffix_capacity {
+                self.suffix.clear();
+                self.suffix
+                    .extend_from_slice(&bytes[bytes.len() - suffix_capacity..]);
+            } else {
+                let overflow = self
+                    .suffix
+                    .len()
+                    .saturating_add(bytes.len())
+                    .saturating_sub(suffix_capacity);
+                if overflow > 0 {
+                    self.suffix.drain(..overflow);
+                }
+                self.suffix.extend_from_slice(bytes);
+            }
+        }
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl TokenEstimateWriter {
+    fn estimate_tokens(&self) -> u64 {
+        if self.total_bytes == 0 {
+            return 0;
+        }
+        if self.total_bytes <= MAX_EXACT_TOKEN_ESTIMATE_BYTES as u64 {
+            return exact_tokens_o200k(&String::from_utf8_lossy(&self.prefix));
+        }
+
+        let half = MAX_EXACT_TOKEN_ESTIMATE_BYTES / 2;
+        let head_len = half.min(self.prefix.len());
+        let mut sample = Vec::with_capacity(head_len.saturating_add(self.suffix.len()));
+        sample.extend_from_slice(&self.prefix[..head_len]);
+        sample.extend_from_slice(&self.suffix);
+        let sample_text = String::from_utf8_lossy(&sample);
+        let sample_tokens = exact_tokens_o200k(&sample_text);
+        let sample_bytes = sample.len().max(1) as u128;
+        let scaled = (sample_tokens as u128)
+            .saturating_mul(self.total_bytes as u128)
+            .div_ceil(sample_bytes);
+        scaled.min(u64::MAX as u128) as u64
+    }
+}
+
 fn estimate_value_tokens_o200k(value: &Value) -> u64 {
-    match serde_json::to_string(value) {
-        Ok(serialized) => estimate_tokens_o200k(&serialized),
+    let mut writer = TokenEstimateWriter::default();
+    match serde_json::to_writer(&mut writer, value) {
+        Ok(()) => writer.estimate_tokens(),
         Err(_) => 0,
     }
 }
 
+fn estimate_tool_input_tokens_o200k(req: &JsonRpcRequest, tool_name: &str) -> u64 {
+    let mut writer = TokenEstimateWriter::default();
+    let arguments = req.params.get("arguments").unwrap_or(&Value::Null);
+    let serialized = (|| -> Result<(), serde_json::Error> {
+        writer
+            .write_all(b"{\"name\":")
+            .map_err(serde_json::Error::io)?;
+        serde_json::to_writer(&mut writer, tool_name)?;
+        writer
+            .write_all(b",\"arguments\":")
+            .map_err(serde_json::Error::io)?;
+        serde_json::to_writer(&mut writer, arguments)?;
+        writer.write_all(b"}").map_err(serde_json::Error::io)?;
+        Ok(())
+    })();
+    serialized.map_or(0, |_| writer.estimate_tokens())
+}
+
 pub(crate) fn estimate_turn_token_usage(req: &JsonRpcRequest, result: &Value) -> (u64, u64) {
     let tool_name = tool_name_from_request(req);
-    let tool_input_payload = build_turn_token_payload(req, &tool_name);
-    let tool_input_tokens = estimate_value_tokens_o200k(&tool_input_payload);
+    let tool_input_tokens = estimate_tool_input_tokens_o200k(req, &tool_name);
     let tool_output_tokens = estimate_value_tokens_o200k(result);
     (tool_input_tokens, tool_output_tokens)
 }
@@ -1660,14 +1774,12 @@ fn handle_search_text(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcResp
     ) {
         Ok(output) => {
             let (text, truncated) = output.render_text();
-            let mut structured = json!({ "text": text });
+            let mut structured = Map::new();
+            structured.insert("text".to_string(), json!(text));
             if truncated {
-                structured
-                    .as_object_mut()
-                    .expect("search result must be an object")
-                    .insert("truncated".to_string(), json!(true));
+                structured.insert("truncated".to_string(), json!(true));
             }
-            tool_success_response_with_structured(req, String::new(), structured)
+            tool_success_response_with_structured(req, String::new(), Value::Object(structured))
         }
         Err(e) => tool_error_response(req, e),
     }
@@ -1816,6 +1928,20 @@ mod tests {
             1,
             "initialize should advertise tools only"
         );
+        let server_info = response
+            .result
+            .as_ref()
+            .and_then(|result| result.get("serverInfo"))
+            .expect("missing serverInfo");
+        assert_eq!(
+            server_info.get("name").and_then(Value::as_str),
+            Some("moondesk")
+        );
+        assert_eq!(
+            server_info.get("version").and_then(Value::as_str),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
+        assert_eq!(SERVER_VERSION, env!("CARGO_PKG_VERSION"));
         assert_eq!(MCP_PROTOCOL_VERSION, "2025-11-25");
         assert_eq!(DEVTOOLS_PROTOCOL_VERSION, "2025-03-26");
     }
@@ -1848,6 +1974,7 @@ mod tests {
             next_cursor: 7,
             has_more_output: false,
             output_truncated: false,
+            output_archive_truncated: false,
             output_archive_error: None,
             timeout_ms: 30_000,
         };
@@ -3302,10 +3429,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(workspace_root);
     }
 
-    #[test]
-    fn read_command_output_pages_preserved_stream_without_repeating_bytes() {
+    #[tokio::test]
+    async fn read_command_output_pages_preserved_stream_without_repeating_bytes() {
         let manager = CommandJobManager::new();
-        let (output_id, paths) = manager.create_run_output().expect("create output archive");
+        let (output_id, paths) = manager
+            .create_run_output()
+            .await
+            .expect("create output archive");
         std::fs::write(&paths.stdout, "abcdefghijklmnopqrstuvwxyz").expect("write stdout archive");
 
         let first = handle_read_command_output(

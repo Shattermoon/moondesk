@@ -1,13 +1,13 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Once};
 use std::time::{Duration as StdDuration, Instant};
 
 use serde::Serialize;
-use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{Mutex, Notify, RwLock, watch};
 use tokio::time::{Duration, timeout};
 use uuid::Uuid;
@@ -22,7 +22,9 @@ const MAX_RETAINED_JOBS: usize = 64;
 const TERMINAL_JOB_TTL: StdDuration = StdDuration::from_secs(60 * 60);
 const IDEMPOTENCY_WINDOW: StdDuration = StdDuration::from_secs(30);
 const MAX_OUTPUT_BYTES_PER_JOB: usize = 4 * 1024 * 1024;
+const MAX_ARCHIVE_BYTES_PER_JOB: u64 = 64 * 1024 * 1024;
 const MAX_TERMINAL_OUTPUT_BYTES: usize = 32 * 1024 * 1024;
+const STALE_OUTPUT_ROOT_TTL: StdDuration = StdDuration::from_secs(24 * 60 * 60);
 const MAX_POLL_OUTPUT_BYTES: usize = 128 * 1024;
 pub const MAX_COMMAND_OUTPUT_READ_BYTES: usize = 128 * 1024;
 const READ_CHUNK_BYTES: usize = 8 * 1024;
@@ -74,6 +76,7 @@ pub struct CommandJobSnapshot {
     pub next_cursor: u64,
     pub has_more_output: bool,
     pub output_truncated: bool,
+    pub output_archive_truncated: bool,
     pub output_archive_error: Option<String>,
     pub timeout_ms: u64,
 }
@@ -135,8 +138,10 @@ struct CommandJob {
     started_at: Instant,
     timeout_ms: u64,
     runtime: Mutex<JobRuntime>,
-    stdout_archive: Mutex<File>,
-    stderr_archive: Mutex<File>,
+    stdout_archive: Mutex<tokio::fs::File>,
+    stderr_archive: Mutex<tokio::fs::File>,
+    archive_bytes: AtomicU64,
+    archive_truncated: AtomicBool,
     changed: Notify,
     cancel_tx: watch::Sender<bool>,
 }
@@ -149,16 +154,20 @@ impl CommandJob {
         timeout_ms: u64,
         output_paths: &process_runner::CommandOutputPaths,
     ) -> Result<(Arc<Self>, watch::Receiver<bool>), String> {
-        let stdout_archive = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&output_paths.stdout)
-            .map_err(|error| format!("failed to open stdout archive: {error}"))?;
-        let stderr_archive = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&output_paths.stderr)
-            .map_err(|error| format!("failed to open stderr archive: {error}"))?;
+        let stdout_archive = tokio::fs::File::from_std(
+            OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&output_paths.stdout)
+                .map_err(|error| format!("failed to open stdout archive: {error}"))?,
+        );
+        let stderr_archive = tokio::fs::File::from_std(
+            OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&output_paths.stderr)
+                .map_err(|error| format!("failed to open stderr archive: {error}"))?,
+        );
         let (cancel_tx, cancel_rx) = watch::channel(false);
         Ok((
             Arc::new(Self {
@@ -170,6 +179,8 @@ impl CommandJob {
                 runtime: Mutex::new(JobRuntime::default()),
                 stdout_archive: Mutex::new(stdout_archive),
                 stderr_archive: Mutex::new(stderr_archive),
+                archive_bytes: AtomicU64::new(0),
+                archive_truncated: AtomicBool::new(false),
                 changed: Notify::new(),
                 cancel_tx,
             }),
@@ -190,20 +201,50 @@ impl CommandJob {
             .expect("create test command output archive")
     }
 
+    fn reserve_archive_bytes(&self, requested: usize) -> usize {
+        loop {
+            let current = self.archive_bytes.load(Ordering::Acquire);
+            if current >= MAX_ARCHIVE_BYTES_PER_JOB {
+                self.archive_truncated.store(true, Ordering::Release);
+                return 0;
+            }
+            let remaining = MAX_ARCHIVE_BYTES_PER_JOB - current;
+            let allowed = remaining.min(requested as u64) as usize;
+            match self.archive_bytes.compare_exchange(
+                current,
+                current.saturating_add(allowed as u64),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    if allowed < requested {
+                        self.archive_truncated.store(true, Ordering::Release);
+                    }
+                    return allowed;
+                }
+                Err(_) => continue,
+            }
+        }
+    }
+
     async fn append_output(&self, stream: &'static str, bytes: &[u8]) {
         if bytes.is_empty() {
             return;
         }
-        let archive_error = {
+        let archive_write_len = self.reserve_archive_bytes(bytes.len());
+        let archive_error = if archive_write_len == 0 {
+            None
+        } else {
             let archive = if stream == "stderr" {
                 &self.stderr_archive
             } else {
                 &self.stdout_archive
             };
             let mut file = archive.lock().await;
-            file.write_all(bytes)
+            file.write_all(&bytes[..archive_write_len])
+                .await
                 .err()
-                .map(|error| format!("failed to preserve complete {stream} output: {error}"))
+                .map(|error| format!("failed to preserve {stream} output: {error}"))
         };
 
         let text = String::from_utf8_lossy(bytes).into_owned();
@@ -219,9 +260,10 @@ impl CommandJob {
             .push_back(CommandOutputEvent { seq, stream, text });
         runtime.retained_output_bytes = runtime.retained_output_bytes.saturating_add(event_bytes);
 
-        while runtime.output_archive_error.is_none()
-            && runtime.retained_output_bytes > MAX_OUTPUT_BYTES_PER_JOB
-        {
+        // Keep the in-memory event buffer bounded even if the on-disk archive fails.
+        // Archive failure means old output may no longer be recoverable, not that a
+        // noisy command is allowed to grow MoonDesk's memory without limit.
+        while runtime.retained_output_bytes > MAX_OUTPUT_BYTES_PER_JOB {
             let Some(removed) = runtime.events.pop_front() else {
                 break;
             };
@@ -233,10 +275,29 @@ impl CommandJob {
         self.changed.notify_waiters();
     }
 
+    async fn flush_archives(&self) -> Option<String> {
+        for (stream, archive) in [
+            ("stdout", &self.stdout_archive),
+            ("stderr", &self.stderr_archive),
+        ] {
+            let mut file = archive.lock().await;
+            if let Err(error) = file.flush().await {
+                return Some(format!(
+                    "failed to flush preserved {stream} output: {error}"
+                ));
+            }
+        }
+        None
+    }
+
     async fn finish(&self, state: CommandJobState, exit_code: Option<i32>) {
+        let flush_error = self.flush_archives().await;
         let mut runtime = self.runtime.lock().await;
         if runtime.state.is_terminal() {
             return;
+        }
+        if runtime.output_archive_error.is_none() {
+            runtime.output_archive_error = flush_error;
         }
         runtime.state = state;
         runtime.exit_code = exit_code;
@@ -282,6 +343,7 @@ impl CommandJob {
             next_cursor,
             has_more_output,
             output_truncated: cursor_fell_behind,
+            output_archive_truncated: self.archive_truncated.load(Ordering::Acquire),
             output_archive_error: runtime.output_archive_error.clone(),
             timeout_ms: self.timeout_ms,
         }
@@ -291,6 +353,7 @@ impl CommandJob {
 #[derive(Default)]
 struct ManagerState {
     jobs: HashMap<String, Arc<CommandJob>>,
+    run_outputs: HashMap<String, Instant>,
     // Retry dedupe is intentionally short-lived. JSON-RPC request IDs are only
     // correlation IDs and may be reused later by a stateless client.
     request_jobs: HashMap<String, (String, Instant)>,
@@ -310,8 +373,38 @@ pub struct CommandJobManager {
     shutting_down: Arc<AtomicBool>,
 }
 
+fn cleanup_stale_output_roots_once() {
+    static CLEANUP: Once = Once::new();
+    CLEANUP.call_once(|| {
+        let temp_dir = std::env::temp_dir();
+        let Ok(entries) = fs::read_dir(&temp_dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let is_moondesk_output_root = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("moondesk-command-output-"));
+            if !is_moondesk_output_root || !path.is_dir() {
+                continue;
+            }
+            let old_enough = entry
+                .metadata()
+                .and_then(|metadata| metadata.modified())
+                .ok()
+                .and_then(|modified| modified.elapsed().ok())
+                .is_some_and(|age| age >= STALE_OUTPUT_ROOT_TTL);
+            if old_enough {
+                let _ = fs::remove_dir_all(path);
+            }
+        }
+    });
+}
+
 impl Default for CommandJobManager {
     fn default() -> Self {
+        cleanup_stale_output_roots_once();
         let output_root = std::env::temp_dir().join(format!(
             "moondesk-command-output-{}-{}",
             std::process::id(),
@@ -358,20 +451,30 @@ impl CommandJobManager {
         Ok(paths)
     }
 
-    pub fn create_run_output(
+    pub async fn create_run_output(
         &self,
     ) -> Result<(String, process_runner::CommandOutputPaths), String> {
         let output_id = Uuid::new_v4().to_string();
         let paths = self.prepare_output(&output_id)?;
+        self.inner
+            .write()
+            .await
+            .run_outputs
+            .insert(output_id.clone(), Instant::now());
         Ok((output_id, paths))
     }
 
-    pub fn discard_output(&self, output_id: &str) {
+    fn discard_output_dir(&self, output_id: &str) {
         if let Ok(paths) = self.output_paths(output_id)
             && let Some(dir) = paths.stdout.parent()
         {
             let _ = fs::remove_dir_all(dir);
         }
+    }
+
+    pub async fn discard_output(&self, output_id: &str) {
+        self.inner.write().await.run_outputs.remove(output_id);
+        self.discard_output_dir(output_id);
     }
 
     pub fn read_output(
@@ -691,14 +794,29 @@ impl CommandJobManager {
             }
         }
 
-        let mut manager = self.inner.write().await;
-        for id in &expired {
-            manager.jobs.remove(id);
+        let expired_run_outputs = {
+            let mut manager = self.inner.write().await;
+            for id in &expired {
+                manager.jobs.remove(id);
+            }
+            let live_job_ids = manager.jobs.keys().cloned().collect::<HashSet<_>>();
+            manager.request_jobs.retain(|_, (job_id, created_at)| {
+                created_at.elapsed() <= IDEMPOTENCY_WINDOW && live_job_ids.contains(job_id)
+            });
+            let expired_outputs = manager
+                .run_outputs
+                .iter()
+                .filter(|(_, created_at)| created_at.elapsed() >= TERMINAL_JOB_TTL)
+                .map(|(id, _)| id.clone())
+                .collect::<Vec<_>>();
+            for id in &expired_outputs {
+                manager.run_outputs.remove(id);
+            }
+            expired_outputs
+        };
+        for id in expired.into_iter().chain(expired_run_outputs) {
+            self.discard_output_dir(&id);
         }
-        let live_job_ids = manager.jobs.keys().cloned().collect::<HashSet<_>>();
-        manager.request_jobs.retain(|_, (job_id, created_at)| {
-            created_at.elapsed() <= IDEMPOTENCY_WINDOW && live_job_ids.contains(job_id)
-        });
     }
 }
 
@@ -1437,6 +1555,62 @@ mod tests {
             }
         }
         assert_eq!(recovered_bytes, chunks * READ_CHUNK_BYTES);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn archive_budget_caps_preserved_output_and_marks_truncation() {
+        let root = workspace("archive-budget");
+        let manager = CommandJobManager::new();
+        let job_id = Uuid::new_v4().to_string();
+        let paths = manager
+            .prepare_output(&job_id)
+            .expect("prepare output archive");
+        let (job, _cancel_rx) =
+            CommandJob::new_with_output(job_id, "synthetic".into(), root.clone(), 5_000, &paths)
+                .expect("create archived job");
+
+        job.archive_bytes
+            .store(MAX_ARCHIVE_BYTES_PER_JOB - 4, Ordering::Release);
+        assert_eq!(job.reserve_archive_bytes(8), 4);
+        assert_eq!(
+            job.archive_bytes.load(Ordering::Acquire),
+            MAX_ARCHIVE_BYTES_PER_JOB
+        );
+        assert!(job.archive_truncated.load(Ordering::Acquire));
+        assert_eq!(job.reserve_archive_bytes(1), 0);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn archive_failure_still_keeps_background_output_memory_bounded() {
+        let root = workspace("output-archive-failure-bounded");
+        let (job, _cancel_rx) = CommandJob::new("synthetic".into(), root.clone(), 5_000);
+        {
+            let mut runtime = job.runtime.lock().await;
+            runtime.output_archive_error = Some("simulated archive failure".into());
+        }
+
+        let chunk = vec![b'x'; READ_CHUNK_BYTES];
+        let chunks = (MAX_OUTPUT_BYTES_PER_JOB / READ_CHUNK_BYTES) + 8;
+        for _ in 0..chunks {
+            job.append_output("stdout", &chunk).await;
+        }
+
+        let snapshot = job.snapshot(0).await;
+        let retained = snapshot
+            .events
+            .iter()
+            .map(|event| event.text.len())
+            .sum::<usize>();
+        assert!(retained <= MAX_OUTPUT_BYTES_PER_JOB);
+        assert!(snapshot.output_truncated);
+        assert_eq!(
+            snapshot.output_archive_error.as_deref(),
+            Some("simulated archive failure")
+        );
+
         let _ = std::fs::remove_dir_all(root);
     }
 

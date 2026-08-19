@@ -18,7 +18,7 @@ const MASCOT_FRAME_HEIGHT: u32 = 32;
 const MASCOT_FRAME_MS: u64 = 80;
 const CLIPPYMOON_EXPORT_SIZE: u32 = 512;
 pub const TUI_MASCOT_BLOCK_WIDTH: u16 = MASCOT_FRAME_WIDTH as u16 + 2;
-pub const TUI_MASCOT_BLOCK_HEIGHT: u16 = ((MASCOT_FRAME_HEIGHT as u16) + 1) / 2 + 2;
+pub const TUI_MASCOT_BLOCK_HEIGHT: u16 = (MASCOT_FRAME_HEIGHT as u16).div_ceil(2) + 2;
 
 // eye openness, vertical bob, twinkle phase, repeat count
 const MASCOT_SEQUENCE: &[(u8, i32, u8, u8)] = &[
@@ -115,11 +115,16 @@ pub fn export_clippymoon(
     encoder
         .set_repeat(Repeat::Infinite)
         .map_err(std::io::Error::other)?;
-    let gif_frames = animation.into_iter().map(|(frame, delay_ms)| {
-        let scaled = scale_for_export(&frame)
-            .expect("ClippyMoon animation frame dimensions are fixed and exportable");
-        Frame::from_parts(scaled, 0, 0, Delay::from_numer_denom_ms(delay_ms as u32, 1))
-    });
+    let mut gif_frames = Vec::with_capacity(animation.len());
+    for (frame, delay_ms) in animation {
+        let scaled = scale_for_export(&frame)?;
+        gif_frames.push(Frame::from_parts(
+            scaled,
+            0,
+            0,
+            Delay::from_numer_denom_ms(delay_ms as u32, 1),
+        ));
+    }
     encoder
         .encode_frames(gif_frames)
         .map_err(std::io::Error::other)?;
@@ -295,6 +300,10 @@ fn build_tui_cell(top: image::Rgba<u8>, bottom: image::Rgba<u8>) -> TuiMascotCel
     }
 }
 
+fn openness_value(value: u8) -> f32 {
+    f32::from(value.min(10)) / 10.0
+}
+
 #[cfg(test)]
 mod tests {
     use super::{CLIPPYMOON_EXPORT_SIZE, MASCOT_SEQUENCE, export_clippymoon};
@@ -340,14 +349,5 @@ mod tests {
         assert_eq!(gif_frames.len(), MASCOT_SEQUENCE.len());
 
         let _ = std::fs::remove_dir_all(output_dir);
-    }
-}
-
-fn openness_value(value: u8) -> f32 {
-    match value {
-        10 => 1.0,
-        5 => 0.5,
-        0 => 0.0,
-        _ => panic!("unsupported mascot eye openness"),
     }
 }

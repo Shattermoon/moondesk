@@ -4,6 +4,13 @@ use rand::Rng;
 use rand_mt::Mt19937GenRand32;
 
 #[derive(Clone, Copy)]
+struct Circle {
+    x: i32,
+    y: i32,
+    radius: i32,
+}
+
+#[derive(Clone, Copy)]
 struct Crater {
     x: i32,
     y: i32,
@@ -59,9 +66,11 @@ pub fn render_clippymoon(
     draw_craters(&mut image, cx, cy, radius, traits.phase, palette, &craters);
     draw_face(
         &mut image,
-        cx,
-        cy,
-        radius,
+        Circle {
+            x: cx,
+            y: cy,
+            radius,
+        },
         traits.phase,
         traits.expression,
         traits.blush,
@@ -227,12 +236,16 @@ fn draw_craters(
         };
         fill_disc_clipped_to_moon(
             image,
-            center_x,
-            center_y,
-            crater.radius,
-            cx,
-            cy,
-            moon_radius,
+            Circle {
+                x: center_x,
+                y: center_y,
+                radius: crater.radius,
+            },
+            Circle {
+                x: cx,
+                y: cy,
+                radius: moon_radius,
+            },
             base,
         );
         put_if_inside_moon(
@@ -249,15 +262,18 @@ fn draw_craters(
 
 fn draw_face(
     image: &mut RgbaImage,
-    cx: i32,
-    cy: i32,
-    radius: i32,
+    moon: Circle,
     phase: MoonPhase,
     expression: MoonExpression,
     blush: bool,
     palette: MoonPalette,
     eye_openness: f32,
 ) {
+    let Circle {
+        x: cx,
+        y: cy,
+        radius,
+    } = moon;
     let face_dark = if matches!(phase, MoonPhase::New) {
         palette.star
     } else {
@@ -272,9 +288,7 @@ fn draw_face(
         image,
         left_eye_x,
         eye_y,
-        cx,
-        cy,
-        radius,
+        moon,
         eye_openness,
         face_dark,
         eye_glint,
@@ -283,9 +297,7 @@ fn draw_face(
         image,
         right_eye_x,
         eye_y,
-        cx,
-        cy,
-        radius,
+        moon,
         eye_openness,
         face_dark,
         eye_glint,
@@ -329,13 +341,16 @@ fn draw_eye(
     image: &mut RgbaImage,
     eye_cx: i32,
     eye_cy: i32,
-    moon_cx: i32,
-    moon_cy: i32,
-    moon_radius: i32,
+    moon: Circle,
     openness: f32,
     dark: Color,
     glint: Color,
 ) {
+    let Circle {
+        x: moon_cx,
+        y: moon_cy,
+        radius: moon_radius,
+    } = moon;
     let mut put_eye_pixel = |x: i32, y: i32, color: Color| {
         put_if_inside_moon(image, x, y, moon_cx, moon_cy, moon_radius, color);
     };
@@ -422,16 +437,17 @@ fn draw_stars(image: &mut RgbaImage, stars: &[Star], palette: MoonPalette, twink
     }
 }
 
-fn fill_disc_clipped_to_moon(
-    image: &mut RgbaImage,
-    cx: i32,
-    cy: i32,
-    radius: i32,
-    moon_cx: i32,
-    moon_cy: i32,
-    moon_radius: i32,
-    color: Color,
-) {
+fn fill_disc_clipped_to_moon(image: &mut RgbaImage, disc: Circle, moon: Circle, color: Color) {
+    let Circle {
+        x: cx,
+        y: cy,
+        radius,
+    } = disc;
+    let Circle {
+        x: moon_cx,
+        y: moon_cy,
+        radius: moon_radius,
+    } = moon;
     for dy in -radius..=radius {
         for dx in -radius..=radius {
             if dx * dx + dy * dy <= radius * radius {
@@ -503,7 +519,7 @@ fn mt_key(seed: u64) -> Vec<u32> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Star, draw_face, draw_stars, phase_is_lit};
+    use super::{Circle, Star, draw_face, draw_stars, phase_is_lit};
     use crate::clippymoon_gen::types::{MoonColor, MoonExpression, MoonPhase};
     use image::RgbaImage;
 
@@ -542,9 +558,11 @@ mod tests {
         let radius = 5;
         draw_face(
             &mut image,
-            cx,
-            cy,
-            radius,
+            Circle {
+                x: cx,
+                y: cy,
+                radius,
+            },
             MoonPhase::Full,
             MoonExpression::Cheeky,
             true,

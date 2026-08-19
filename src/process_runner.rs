@@ -1,12 +1,15 @@
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, ChildStderr, ChildStdout, Command};
 use tokio::time::{Duration, timeout};
 
 const READ_CHUNK_BYTES: usize = 8 * 1024;
+pub const MAX_COMMAND_ARCHIVE_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Debug)]
 pub struct ProcessRunResult {
@@ -17,6 +20,7 @@ pub struct ProcessRunResult {
     pub timed_out: bool,
     pub stdout_truncated: bool,
     pub stderr_truncated: bool,
+    pub output_archive_truncated: bool,
     pub output_archive_error: Option<String>,
 }
 
@@ -460,6 +464,49 @@ impl BoundedBytes {
     }
 }
 
+#[derive(Debug)]
+struct ArchiveBudget {
+    used: AtomicU64,
+    truncated: AtomicBool,
+    max_bytes: u64,
+}
+
+impl ArchiveBudget {
+    fn new(max_bytes: u64) -> Self {
+        Self {
+            used: AtomicU64::new(0),
+            truncated: AtomicBool::new(false),
+            max_bytes,
+        }
+    }
+
+    fn reserve(&self, requested: usize) -> usize {
+        loop {
+            let current = self.used.load(Ordering::Acquire);
+            if current >= self.max_bytes {
+                self.truncated.store(true, Ordering::Release);
+                return 0;
+            }
+            let remaining = self.max_bytes - current;
+            let allowed = remaining.min(requested as u64) as usize;
+            match self.used.compare_exchange(
+                current,
+                current.saturating_add(allowed as u64),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    if allowed < requested {
+                        self.truncated.store(true, Ordering::Release);
+                    }
+                    return allowed;
+                }
+                Err(_) => continue,
+            }
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct CapturedOutput {
     text: String,
@@ -472,6 +519,7 @@ async fn capture_reader<R>(
     mut reader: R,
     max_bytes: usize,
     archive_path: Option<PathBuf>,
+    archive_budget: Option<Arc<ArchiveBudget>>,
 ) -> CapturedOutput
 where
     R: AsyncRead + Unpin,
@@ -505,13 +553,16 @@ where
             Ok(0) => break,
             Ok(read) => {
                 let chunk = &buffer[..read];
-                if let Some(file) = archive.as_mut()
-                    && let Err(error) = file.write_all(chunk).await
-                {
-                    archive_error = Some(format!(
-                        "failed to preserve complete command output: {error}"
-                    ));
-                    archive = None;
+                if let Some(file) = archive.as_mut() {
+                    let archive_len = archive_budget
+                        .as_ref()
+                        .map_or(chunk.len(), |budget| budget.reserve(chunk.len()));
+                    if archive_len > 0
+                        && let Err(error) = file.write_all(&chunk[..archive_len]).await
+                    {
+                        archive_error = Some(format!("failed to preserve command output: {error}"));
+                        archive = None;
+                    }
                 }
                 output.push(chunk);
             }
@@ -576,6 +627,7 @@ pub async fn run_shell_command(
                 timed_out: false,
                 stdout_truncated: false,
                 stderr_truncated: false,
+                output_archive_truncated: false,
                 output_archive_error: None,
             };
         }
@@ -583,12 +635,27 @@ pub async fn run_shell_command(
 
     let stdout_archive = output_paths.map(|paths| paths.stdout.clone());
     let stderr_archive = output_paths.map(|paths| paths.stderr.clone());
-    let stdout_task = process
-        .take_stdout()
-        .map(|stdout| tokio::spawn(capture_reader(stdout, max_capture_bytes, stdout_archive)));
-    let stderr_task = process
-        .take_stderr()
-        .map(|stderr| tokio::spawn(capture_reader(stderr, max_capture_bytes, stderr_archive)));
+    let archive_budget = output_paths
+        .is_some()
+        .then(|| Arc::new(ArchiveBudget::new(MAX_COMMAND_ARCHIVE_BYTES)));
+    let stdout_budget = archive_budget.clone();
+    let stderr_budget = archive_budget.clone();
+    let stdout_task = process.take_stdout().map(|stdout| {
+        tokio::spawn(capture_reader(
+            stdout,
+            max_capture_bytes,
+            stdout_archive,
+            stdout_budget,
+        ))
+    });
+    let stderr_task = process.take_stderr().map(|stderr| {
+        tokio::spawn(capture_reader(
+            stderr,
+            max_capture_bytes,
+            stderr_archive,
+            stderr_budget,
+        ))
+    });
 
     let mut timed_out = false;
     let mut wait_error = None;
@@ -660,6 +727,9 @@ pub async fn run_shell_command(
         timed_out,
         stdout_truncated: stdout_capture.truncated,
         stderr_truncated: stderr_capture.truncated,
+        output_archive_truncated: archive_budget
+            .as_ref()
+            .is_some_and(|budget| budget.truncated.load(Ordering::Acquire)),
         output_archive_error,
     }
 }
@@ -701,7 +771,7 @@ mod tests {
 
     #[tokio::test]
     async fn capture_reader_preserves_partial_output_on_read_error() {
-        let captured = capture_reader(PartialThenError { emitted: false }, 1024, None).await;
+        let captured = capture_reader(PartialThenError { emitted: false }, 1024, None, None).await;
         assert_eq!(captured.text, "partial-output");
         assert!(!captured.truncated);
         assert_eq!(
@@ -721,7 +791,7 @@ mod tests {
             writer.write_all(&payload).await.expect("write payload");
         });
 
-        let captured = capture_reader(reader, 1024, Some(archive.clone())).await;
+        let captured = capture_reader(reader, 1024, Some(archive.clone()), None).await;
         writer_task.await.expect("writer task");
         assert_eq!(captured.text.len(), 1024);
         assert!(captured.truncated);

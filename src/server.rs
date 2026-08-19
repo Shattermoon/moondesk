@@ -1,8 +1,8 @@
 use axum::{
     Router,
     body::{Body, Bytes},
-    extract::State,
-    http::{Response, StatusCode, header},
+    extract::{Path as AxumPath, State},
+    http::{HeaderValue, Response, StatusCode, header},
     response::Json,
     routing::{delete, get, post},
 };
@@ -32,7 +32,6 @@ pub fn router(
     app_state: SharedState,
     devtools: Option<Arc<Mutex<DevtoolsBridge>>>,
     command_jobs: CommandJobManager,
-    mcp_path: String,
     ui_events: UnboundedSender<ServerUiEvent>,
 ) -> Router {
     let state = ServerState {
@@ -43,23 +42,44 @@ pub fn router(
     };
     Router::new()
         .route("/", get(health))
-        .route(&mcp_path, post(post_mcp))
-        .route(&mcp_path, get(get_mcp))
-        .route(&mcp_path, delete(delete_mcp))
+        .route("/{slug}/mcp", post(post_mcp))
+        .route("/{slug}/mcp", get(get_mcp))
+        .route("/{slug}/mcp", delete(delete_mcp))
         .with_state(state)
 }
 
+fn response_with_body(
+    status: StatusCode,
+    content_type: &'static str,
+    body: Body,
+) -> Response<Body> {
+    let mut response = Response::new(body);
+    *response.status_mut() = status;
+    response
+        .headers_mut()
+        .insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+    response
+}
+
 fn jsonrpc_error_response(status: StatusCode, code: i64, msg: &str) -> Response<Body> {
-    let body = serde_json::to_string(&json!({
+    let body = json!({
         "jsonrpc": "2.0",
         "error": {"code": code, "message": msg}
-    }))
-    .unwrap();
-    Response::builder()
-        .status(status)
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(body))
-        .unwrap()
+    })
+    .to_string();
+    response_with_body(status, "application/json", Body::from(body))
+}
+
+async fn slug_is_authorized(state: &ServerState, slug: &str) -> bool {
+    state.app.lock().await.mcp_slug == slug
+}
+
+fn not_found_response() -> Response<Body> {
+    response_with_body(
+        StatusCode::NOT_FOUND,
+        "application/json",
+        Body::from(r#"{"error":"not found"}"#),
+    )
 }
 
 fn request_id(req: &Value) -> String {
@@ -210,10 +230,10 @@ fn compact_command_preview(text: &str) -> Option<String> {
 fn command_response_preview(response: &Value) -> Option<String> {
     if let Some(structured) = tool_structured_content(response) {
         for field in ["stderr", "output", "stdout", "message"] {
-            if let Some(text) = structured.get(field).and_then(Value::as_str) {
-                if let Some(preview) = compact_command_preview(text) {
-                    return Some(preview);
-                }
+            if let Some(text) = structured.get(field).and_then(Value::as_str)
+                && let Some(preview) = compact_command_preview(text)
+            {
+                return Some(preview);
             }
         }
     }
@@ -315,16 +335,215 @@ fn finish_command_ui_request(
 
 // ── GET / — health ──────────────────────────────────────────
 
-async fn health(State(s): State<ServerState>) -> Json<Value> {
-    let app = s.app.lock().await;
+async fn health() -> Json<Value> {
     Json(json!({
         "status": "ok",
-        "name": "MoonDesk",
-        "description": "MCP Tools for ChatGPT to control your computer and browser",
-        "mode": app.mode.label(),
-        "tool_mode": app.tool_mode.label(),
-        "workspace": app.workspace_root,
+        "name": "MoonDesk"
     }))
+}
+
+// ── POST /<slug>/mcp ────────────────────────────────────────
+
+async fn post_mcp(
+    AxumPath(slug): AxumPath<String>,
+    State(s): State<ServerState>,
+    body_bytes: Bytes,
+) -> Response<Body> {
+    if !slug_is_authorized(&s, &slug).await {
+        return not_found_response();
+    }
+
+    let body: Value = match serde_json::from_slice(&body_bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            return jsonrpc_error_response(
+                StatusCode::BAD_REQUEST,
+                -32700,
+                &format!("Parse error: {e}"),
+            );
+        }
+    };
+    if !body.is_object() {
+        return jsonrpc_error_response(
+            StatusCode::BAD_REQUEST,
+            -32600,
+            "Invalid request: expected a single JSON-RPC message object",
+        );
+    }
+
+    let _ = s.ui_events.send(ServerUiEvent::IncrementRequestCount);
+    let _ = s.ui_events.send(ServerUiEvent::SetRemoteConnected(true));
+
+    let has_method = body.get("method").and_then(Value::as_str).is_some();
+    if !has_method {
+        let mcp_path = {
+            let app = s.app.lock().await;
+            app.mcp_path()
+        };
+        let _ = s.ui_events.send(ServerUiEvent::Log {
+            level: "INFO",
+            message: format!(
+                "POST {mcp_path} flow={STATELESS_FLOW_LABEL} accepted non-request JSON-RPC message"
+            ),
+        });
+        return response_with_body(StatusCode::ACCEPTED, "application/json", Body::empty());
+    }
+
+    let request_summary = summarize_request(&body);
+    let request_flow_event = request_flow_label(&body);
+
+    let _ = s.ui_events.send(ServerUiEvent::RecordFlow {
+        flow_id: STATELESS_FLOW_ID.to_string(),
+        events: vec![request_flow_event.clone()],
+        direction: FlowDirection::Forward,
+    });
+
+    let req: JsonRpcRequest = match serde_json::from_value(body.clone()) {
+        Ok(r) => r,
+        Err(e) => {
+            return jsonrpc_error_response(
+                StatusCode::BAD_REQUEST,
+                -32600,
+                &format!("Invalid request: {e}"),
+            );
+        }
+    };
+    // TUI-only observability: publish the shell command as soon as the MCP call
+    // has been parsed. This channel is independent of the MCP response and does
+    // not add command text or result data to ChatGPT's conversation state.
+    let command_ui_request = begin_command_ui_request(&body, &s.ui_events);
+
+    let (workspace_root, mode, tool_mode, set_moondesk_as_co_author) = {
+        let app = s.app.lock().await;
+        (
+            app.workspace_root.clone(),
+            app.mode,
+            app.tool_mode,
+            app.set_moondesk_as_co_author,
+        )
+    };
+
+    let mut response_json: Option<Value> = None;
+    if let Some(resp) = mcp::handle_request(
+        &req,
+        &workspace_root,
+        mode,
+        tool_mode,
+        set_moondesk_as_co_author,
+        &s.command_jobs,
+        &s.devtools,
+    )
+    .await
+    {
+        if req.method == "tools/call"
+            && let Some(result) = resp.result.as_ref()
+        {
+            let (tool_input_tokens, tool_output_tokens) =
+                mcp::estimate_turn_token_usage(&req, result);
+            let mut app = s.app.lock().await;
+            app.record_turn_usage(tool_input_tokens, tool_output_tokens);
+        }
+        let response_value = match serde_json::to_value(resp) {
+            Ok(value) => value,
+            Err(error) => {
+                return jsonrpc_error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    -32603,
+                    &format!("Internal error: failed to serialize JSON-RPC response: {error}"),
+                );
+            }
+        };
+        if let Some(command_ui_request) = command_ui_request.as_ref() {
+            finish_command_ui_request(command_ui_request, &response_value, &s.ui_events);
+        }
+        response_json = Some(response_value);
+    }
+
+    {
+        let app = s.app.lock().await;
+        let mcp_path = app.mcp_path();
+        drop(app);
+        if req.id.is_some() {
+            let _ = s.ui_events.send(ServerUiEvent::RecordFlow {
+                flow_id: STATELESS_FLOW_ID.to_string(),
+                events: vec![request_flow_event.clone()],
+                direction: FlowDirection::Backward,
+            });
+        }
+        let _ = s.ui_events.send(ServerUiEvent::Log {
+            level: "INFO",
+            message: format!(
+                "POST {mcp_path} flow={STATELESS_FLOW_LABEL} [{}]",
+                request_summary,
+            ),
+        });
+        if let Some(ref resp_json) = response_json {
+            let response_summary = summarize_response(resp_json);
+            let _ = s.ui_events.send(ServerUiEvent::Log {
+                level: "INFO",
+                message: format!(
+                    "POST {mcp_path} flow={STATELESS_FLOW_LABEL} response [{response_summary}]"
+                ),
+            });
+        }
+    }
+
+    if req.id.is_none() {
+        return response_with_body(StatusCode::ACCEPTED, "application/json", Body::empty());
+    }
+
+    let Some(response_json) = response_json else {
+        return jsonrpc_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            -32603,
+            "Internal error: request did not produce a JSON-RPC response",
+        );
+    };
+    let response_body = response_json.to_string();
+    response_with_body(
+        StatusCode::OK,
+        "application/json",
+        Body::from(response_body),
+    )
+}
+
+// ── GET /<slug>/mcp — pure HTTP mode (no SSE) ───────────────
+
+async fn get_mcp(AxumPath(slug): AxumPath<String>, State(s): State<ServerState>) -> Response<Body> {
+    if !slug_is_authorized(&s, &slug).await {
+        return not_found_response();
+    }
+    response_with_body(
+        StatusCode::METHOD_NOT_ALLOWED,
+        "application/json",
+        Body::from(
+            r#"{"jsonrpc":"2.0","error":{"code":-32601,"message":"GET SSE stream is disabled in pure HTTP mode"}}"#,
+        ),
+    )
+}
+
+// ── DELETE /<slug>/mcp ──────────────────────────────────────
+
+async fn delete_mcp(
+    AxumPath(slug): AxumPath<String>,
+    State(s): State<ServerState>,
+) -> Response<Body> {
+    if !slug_is_authorized(&s, &slug).await {
+        return not_found_response();
+    }
+    let _ = s.ui_events.send(ServerUiEvent::SetRemoteConnected(false));
+    let _ = s.ui_events.send(ServerUiEvent::BeginFlowClose {
+        flow_id: STATELESS_FLOW_ID.to_string(),
+    });
+    let _ = s.ui_events.send(ServerUiEvent::Log {
+        level: "INFO",
+        message: "DELETE mcp endpoint: stateless reset".to_string(),
+    });
+    response_with_body(
+        StatusCode::OK,
+        "application/json",
+        Body::from(r#"{"status":"ok"}"#),
+    )
 }
 
 #[cfg(test)]
@@ -492,6 +711,7 @@ mod tests {
             config_path.clone(),
         )
         .expect("create app state");
+        let mcp_slug = app.mcp_slug.clone();
         let app_state = Arc::new(Mutex::new(app));
         let (ui_tx, _ui_rx) = unbounded_channel();
         let command_jobs = CommandJobManager::new();
@@ -508,6 +728,7 @@ mod tests {
         };
 
         let start_response = post_mcp(
+            AxumPath(mcp_slug.clone()),
             State(server_state.clone()),
             tool_call_body(
                 "start_command",
@@ -534,6 +755,7 @@ mod tests {
         let mut terminal = None;
         for _ in 0..20 {
             let poll_response = post_mcp(
+                AxumPath(mcp_slug.clone()),
                 State(server_state.clone()),
                 tool_call_body(
                     "poll_command",
@@ -603,6 +825,7 @@ mod tests {
             config_path.clone(),
         )
         .expect("create app state");
+        let mcp_slug = app.mcp_slug.clone();
         let app_state = Arc::new(Mutex::new(app));
         let (ui_tx, _ui_rx) = unbounded_channel();
         let server_state = ServerState {
@@ -613,6 +836,7 @@ mod tests {
         };
 
         let response = post_mcp(
+            AxumPath(mcp_slug),
             State(server_state),
             tool_call_body("run_command", json!({ "command": "find ." })),
         )
@@ -645,190 +869,75 @@ mod tests {
         let _ = std::fs::remove_dir_all(workspace_root);
         let _ = std::fs::remove_dir_all(config_root);
     }
-}
 
-// ── POST /<slug>/mcp ────────────────────────────────────────
-
-async fn post_mcp(State(s): State<ServerState>, body_bytes: Bytes) -> Response<Body> {
-    let body: Value = match serde_json::from_slice(&body_bytes) {
-        Ok(v) => v,
-        Err(e) => {
-            return jsonrpc_error_response(
-                StatusCode::BAD_REQUEST,
-                -32700,
-                &format!("Parse error: {e}"),
-            );
-        }
-    };
-    if !body.is_object() {
-        return jsonrpc_error_response(
-            StatusCode::BAD_REQUEST,
-            -32600,
-            "Invalid request: expected a single JSON-RPC message object",
+    #[tokio::test]
+    async fn health_response_does_not_expose_workspace_or_runtime_configuration() {
+        let Json(payload) = health().await;
+        assert_eq!(payload.get("status").and_then(Value::as_str), Some("ok"));
+        assert_eq!(
+            payload.get("name").and_then(Value::as_str),
+            Some("MoonDesk")
         );
-    }
-
-    let _ = s.ui_events.send(ServerUiEvent::IncrementRequestCount);
-    let _ = s.ui_events.send(ServerUiEvent::SetRemoteConnected(true));
-
-    let has_method = body.get("method").and_then(Value::as_str).is_some();
-    if !has_method {
-        let mcp_path = {
-            let app = s.app.lock().await;
-            app.mcp_path()
-        };
-        let _ = s.ui_events.send(ServerUiEvent::Log {
-            level: "INFO",
-            message: format!(
-                "POST {mcp_path} flow={STATELESS_FLOW_LABEL} accepted non-request JSON-RPC message"
-            ),
-        });
-        return Response::builder()
-            .status(StatusCode::ACCEPTED)
-            .body(Body::empty())
-            .unwrap();
-    }
-
-    let request_summary = summarize_request(&body);
-    let request_flow_event = request_flow_label(&body);
-
-    let _ = s.ui_events.send(ServerUiEvent::RecordFlow {
-        flow_id: STATELESS_FLOW_ID.to_string(),
-        events: vec![request_flow_event.clone()],
-        direction: FlowDirection::Forward,
-    });
-
-    let req: JsonRpcRequest = match serde_json::from_value(body.clone()) {
-        Ok(r) => r,
-        Err(e) => {
-            return jsonrpc_error_response(
-                StatusCode::BAD_REQUEST,
-                -32600,
-                &format!("Invalid request: {e}"),
-            );
+        for private_field in ["workspace", "mode", "tool_mode", "mcp_slug", "ngrok_domain"] {
+            assert!(payload.get(private_field).is_none());
         }
-    };
-    // TUI-only observability: publish the shell command as soon as the MCP call
-    // has been parsed. This channel is independent of the MCP response and does
-    // not add command text or result data to ChatGPT's conversation state.
-    let command_ui_request = begin_command_ui_request(&body, &s.ui_events);
+    }
 
-    let (workspace_root, mode, tool_mode, set_moondesk_as_co_author) = {
-        let app = s.app.lock().await;
-        (
-            app.workspace_root.clone(),
-            app.mode,
-            app.tool_mode,
-            app.set_moondesk_as_co_author,
+    #[tokio::test]
+    async fn rotating_mcp_slug_immediately_rejects_old_slug_and_accepts_new_slug() {
+        let workspace_root = unique_temp_path("moondesk-slug-rotation-workspace");
+        let config_root = unique_temp_path("moondesk-slug-rotation-config");
+        let config_path = config_root.join("config.toml");
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        std::fs::create_dir_all(&config_root).expect("create config dir");
+
+        let app = AppState::new_for_test(
+            8787,
+            workspace_root.to_string_lossy().into_owned(),
+            config_path.clone(),
         )
-    };
-
-    let mut response_json: Option<Value> = None;
-    if let Some(resp) = mcp::handle_request(
-        &req,
-        &workspace_root,
-        mode,
-        tool_mode,
-        set_moondesk_as_co_author,
-        &s.command_jobs,
-        &s.devtools,
-    )
-    .await
-    {
-        if req.method == "tools/call" {
-            if let Some(result) = resp.result.as_ref() {
-                let (tool_input_tokens, tool_output_tokens) =
-                    mcp::estimate_turn_token_usage(&req, result);
-                let mut app = s.app.lock().await;
-                app.record_turn_usage(tool_input_tokens, tool_output_tokens);
-                app.persist_state_with_log();
-            }
-        }
-        let response_value = serde_json::to_value(resp).unwrap();
-        if let Some(command_ui_request) = command_ui_request.as_ref() {
-            finish_command_ui_request(command_ui_request, &response_value, &s.ui_events);
-        }
-        response_json = Some(response_value);
-    }
-
-    {
-        let app = s.app.lock().await;
-        let mcp_path = app.mcp_path();
-        drop(app);
-        if req.id.is_some() {
-            let _ = s.ui_events.send(ServerUiEvent::RecordFlow {
-                flow_id: STATELESS_FLOW_ID.to_string(),
-                events: vec![request_flow_event.clone()],
-                direction: FlowDirection::Backward,
-            });
-        }
-        let _ = s.ui_events.send(ServerUiEvent::Log {
-            level: "INFO",
-            message: format!(
-                "POST {mcp_path} flow={STATELESS_FLOW_LABEL} [{}]",
-                request_summary,
-            ),
-        });
-        if let Some(ref resp_json) = response_json {
-            let response_summary = summarize_response(resp_json);
-            let _ = s.ui_events.send(ServerUiEvent::Log {
-                level: "INFO",
-                message: format!(
-                    "POST {mcp_path} flow={STATELESS_FLOW_LABEL} response [{response_summary}]"
-                ),
-            });
-        }
-    }
-
-    if req.id.is_none() {
-        return Response::builder()
-            .status(StatusCode::ACCEPTED)
-            .body(Body::empty())
-            .unwrap();
-    }
-
-    let Some(response_json) = response_json else {
-        return jsonrpc_error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            -32603,
-            "Internal error: request did not produce a JSON-RPC response",
+        .expect("create app state");
+        let old_slug = app.mcp_slug.clone();
+        let app_state = Arc::new(Mutex::new(app));
+        let (ui_tx, _ui_rx) = unbounded_channel();
+        let server_state = ServerState {
+            app: app_state.clone(),
+            devtools: None,
+            command_jobs: CommandJobManager::new(),
+            ui_events: ui_tx,
+        };
+        let ping = Bytes::from_static(
+            br#"{"jsonrpc":"2.0","id":"slug-check","method":"ping","params":{}}"#,
         );
-    };
-    let response_body = serde_json::to_string(&response_json).unwrap();
 
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(response_body))
-        .unwrap()
-}
+        let before_rotation = post_mcp(
+            AxumPath(old_slug.clone()),
+            State(server_state.clone()),
+            ping.clone(),
+        )
+        .await;
+        assert_eq!(before_rotation.status(), StatusCode::OK);
 
-// ── GET /<slug>/mcp — pure HTTP mode (no SSE) ───────────────
+        let new_slug = {
+            let mut app = app_state.lock().await;
+            app.regenerate_mcp_slug();
+            app.mcp_slug.clone()
+        };
+        assert_ne!(old_slug, new_slug);
 
-async fn get_mcp() -> Response<Body> {
-    Response::builder()
-        .status(StatusCode::METHOD_NOT_ALLOWED)
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(
-            r#"{"jsonrpc":"2.0","error":{"code":-32601,"message":"GET SSE stream is disabled in pure HTTP mode"}}"#,
-        ))
-        .unwrap()
-}
+        let old_response = post_mcp(
+            AxumPath(old_slug),
+            State(server_state.clone()),
+            ping.clone(),
+        )
+        .await;
+        assert_eq!(old_response.status(), StatusCode::NOT_FOUND);
 
-// ── DELETE /<slug>/mcp ──────────────────────────────────────
+        let new_response = post_mcp(AxumPath(new_slug), State(server_state), ping).await;
+        assert_eq!(new_response.status(), StatusCode::OK);
 
-async fn delete_mcp(State(s): State<ServerState>) -> Response<Body> {
-    let _ = s.ui_events.send(ServerUiEvent::SetRemoteConnected(false));
-    let _ = s.ui_events.send(ServerUiEvent::BeginFlowClose {
-        flow_id: STATELESS_FLOW_ID.to_string(),
-    });
-    let _ = s.ui_events.send(ServerUiEvent::Log {
-        level: "INFO",
-        message: "DELETE mcp endpoint: stateless reset".to_string(),
-    });
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(r#"{"status":"ok"}"#))
-        .unwrap()
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_dir_all(workspace_root);
+        let _ = std::fs::remove_dir_all(config_root);
+    }
 }

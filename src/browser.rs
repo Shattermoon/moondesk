@@ -266,36 +266,33 @@ fn extract_remote_debug_target(args: &[String]) -> Option<String> {
             if !v.is_empty() {
                 address = v.to_string();
             }
-        } else if arg == "--remote-debugging-address" {
-            if let Some(v) = args.get(idx + 1) {
-                if !v.is_empty() {
-                    address = v.clone();
-                }
-            }
+        } else if arg == "--remote-debugging-address"
+            && let Some(v) = args.get(idx + 1)
+            && !v.is_empty()
+        {
+            address = v.clone();
         }
 
         if let Some(v) = arg.strip_prefix("--remote-debugging-port=") {
             if !v.is_empty() {
                 port = Some(v.to_string());
             }
-        } else if arg == "--remote-debugging-port" {
-            if let Some(v) = args.get(idx + 1) {
-                if !v.is_empty() {
-                    port = Some(v.clone());
-                }
-            }
+        } else if arg == "--remote-debugging-port"
+            && let Some(v) = args.get(idx + 1)
+            && !v.is_empty()
+        {
+            port = Some(v.clone());
         }
 
         if let Some(v) = arg.strip_prefix("--start-debugger-server=") {
             if !v.is_empty() {
                 port = Some(v.to_string());
             }
-        } else if arg == "--start-debugger-server" {
-            if let Some(v) = args.get(idx + 1) {
-                if !v.is_empty() {
-                    port = Some(v.clone());
-                }
-            }
+        } else if arg == "--start-debugger-server"
+            && let Some(v) = args.get(idx + 1)
+            && !v.is_empty()
+        {
+            port = Some(v.clone());
         }
     }
 

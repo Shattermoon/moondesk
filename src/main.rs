@@ -31,7 +31,8 @@ use state::{
     AppState, CommandActivityState, FLOW_ANIM_CELLS, FLOW_BOOTSTRAP_PHASES, FlowAnimKind,
     FlowAnimSegment, FlowDirection, FlowLane, GPT_5_6_AND_EARLIER_USAGE_BUCKET, Mode,
     ServerUiEvent, SharedState, ToolMode, UsageTotals, app_config_path, flow_anim_lit_count,
-    load_ngrok_authtoken, load_ngrok_domain, save_ngrok_authtoken, save_ngrok_domain,
+    flush_config, load_ngrok_authtoken, load_ngrok_domain, normalize_ngrok_domain,
+    save_ngrok_authtoken, save_ngrok_domain,
 };
 use std::io::{Write, stdout};
 use std::sync::Arc;
@@ -45,6 +46,7 @@ const FLOW_ROW_CELLS: usize = FLOW_ANIM_CELLS;
 const FLOW_LANE_LEFT_LABEL: &str = "Your computer ";
 const REMOTE_CONNECT_UI_GRACE_MS: u128 = 8_000;
 const UI_POLL_INTERVAL: Duration = Duration::from_nanos(1_000_000_000 / 60);
+const CONFIG_FLUSH_INTERVAL: Duration = Duration::from_millis(500);
 const MCP_URL_REVEAL_DURATION: Duration = Duration::from_secs(10);
 const MCP_URL_MASK: &str = "https://▓▓▓▓▓▓▓▓/▓▓▓▓▓▓▓▓/mcp";
 const NGROK_URL_MASK: &str = "https://▓▓▓▓▓▓▓▓";
@@ -58,6 +60,79 @@ const PRICE_DISPLAY_DECIMALS: usize = 6;
 const NGROK_SETUP_URL: &str = "https://dashboard.ngrok.com/get-started/setup";
 
 // ── Selection ───────────────────────────────────────────────
+
+#[derive(Clone)]
+struct UiSnapshot {
+    theme: String,
+    mode: Mode,
+    tool_mode: ToolMode,
+    public_mcp_url: Option<String>,
+    ngrok_domain: Option<String>,
+    ngrok_url: Option<String>,
+    is_returning_user: bool,
+    server_running: bool,
+    ngrok_running: bool,
+    remote_connected: bool,
+    last_remote_activity_ms: Option<u128>,
+    devtools_running: bool,
+    port: u16,
+    workspace_root: String,
+    mascot: mascot::MascotPack,
+    detected_browsers: Vec<browser::DetectedBrowser>,
+    selected_browser: Option<browser::DetectedBrowser>,
+    logs: Vec<state::LogEntry>,
+    command_activities: std::collections::VecDeque<state::CommandActivity>,
+    flows: Vec<FlowLane>,
+    request_count: u64,
+    usage_by_model: std::collections::BTreeMap<String, UsageTotals>,
+    session_usage_totals: UsageTotals,
+}
+
+impl UiSnapshot {
+    fn from_app(app: &AppState) -> Self {
+        Self {
+            theme: app.theme.clone(),
+            mode: app.mode,
+            tool_mode: app.tool_mode,
+            public_mcp_url: app.public_mcp_url(),
+            ngrok_domain: app.ngrok_domain.clone(),
+            ngrok_url: app.ngrok_url.clone(),
+            is_returning_user: app.is_returning_user,
+            server_running: app.server_running,
+            ngrok_running: app.ngrok_running,
+            remote_connected: app.remote_connected,
+            last_remote_activity_ms: app.last_remote_activity_ms,
+            devtools_running: app.devtools_running,
+            port: app.port,
+            workspace_root: app.workspace_root.clone(),
+            mascot: app.mascot.clone(),
+            detected_browsers: app.detected_browsers.clone(),
+            selected_browser: app.selected_browser.clone(),
+            logs: app.logs.clone(),
+            command_activities: app.command_activities.clone(),
+            flows: app.flows.clone(),
+            request_count: app.request_count,
+            usage_by_model: app.usage_by_model.clone(),
+            session_usage_totals: app.session_usage_totals.clone(),
+        }
+    }
+
+    fn current_theme(&self) -> &'static theme::ThemeDef {
+        theme::resolve(&self.theme)
+    }
+
+    fn public_mcp_url(&self) -> Option<String> {
+        self.public_mcp_url.clone()
+    }
+
+    fn all_time_usage_totals(&self) -> UsageTotals {
+        let mut totals = UsageTotals::default();
+        for usage in self.usage_by_model.values() {
+            totals.merge(usage);
+        }
+        totals
+    }
+}
 
 struct Selection {
     start: Option<(u16, u16)>,
@@ -442,12 +517,12 @@ fn estimate_gpt_5_6_and_earlier_usage_cost_usd(usage: &UsageTotals) -> f64 {
         / 1_000_000.0
 }
 
-fn estimate_all_time_usage_cost_usd(app: &AppState) -> f64 {
+fn estimate_all_time_usage_cost_usd(app: &UiSnapshot) -> f64 {
     app.usage_by_model
         .iter()
         .map(|(bucket, usage)| match bucket.as_str() {
             GPT_5_6_AND_EARLIER_USAGE_BUCKET => estimate_gpt_5_6_and_earlier_usage_cost_usd(usage),
-            _ => panic!("missing pricing for usage bucket `{bucket}`"),
+            _ => 0.0,
         })
         .sum()
 }
@@ -626,9 +701,7 @@ fn flow_phase_step_state(flow: Option<&FlowLane>, step_index: usize) -> FlowPhas
 }
 
 fn flow_phase_status_label(flow: Option<&FlowLane>, phase_index: usize) -> Option<String> {
-    let Some(flow) = flow else {
-        return None;
-    };
+    let flow = flow?;
     let (start, end) = flow_phase_bounds(phase_index);
     if flow.bootstrap_completed_steps >= end {
         return Some("✓".to_string());
@@ -749,10 +822,10 @@ fn flow_bootstrap_countdown_remaining_seconds(flow: &FlowLane, now_millis: u128)
     if now_millis >= deadline {
         return Some(0);
     }
-    Some((deadline.saturating_sub(now_millis) + 999) / 1000)
+    Some(deadline.saturating_sub(now_millis).div_ceil(1000))
 }
 
-fn active_bootstrap_status_flow<'a>(app: &'a AppState, now_millis: u128) -> Option<&'a FlowLane> {
+fn active_bootstrap_status_flow(app: &UiSnapshot, now_millis: u128) -> Option<&FlowLane> {
     app.flows.iter().find(|flow| {
         should_display_flow_row(flow, app.remote_connected)
             && flow.bootstrap_status_active
@@ -761,7 +834,7 @@ fn active_bootstrap_status_flow<'a>(app: &'a AppState, now_millis: u128) -> Opti
     })
 }
 
-fn should_show_connect_guide(app: &AppState, now_millis: u128) -> bool {
+fn should_show_connect_guide(app: &UiSnapshot, now_millis: u128) -> bool {
     let both_running = app.server_running && app.ngrok_running;
     let has_url = app.ngrok_url.is_some();
     let visible_flow_count = app
@@ -782,7 +855,7 @@ fn should_show_connect_guide(app: &AppState, now_millis: u128) -> bool {
 }
 
 fn flow_bootstrap_status_lines(
-    app: &AppState,
+    app: &UiSnapshot,
     flow: &FlowLane,
     palette: &theme::Palette,
     now_millis: u128,
@@ -865,7 +938,7 @@ fn flow_bootstrap_status_lines(
     lines
 }
 
-fn build_animation_snapshot(app: &AppState) -> Vec<String> {
+fn build_animation_snapshot(app: &UiSnapshot) -> Vec<String> {
     if app.flows.is_empty() {
         return Vec::new();
     }
@@ -1045,19 +1118,25 @@ fn normalize_ngrok_authtoken_input(text: &str) -> String {
     }
 
     let parts: Vec<&str> = trimmed.split_whitespace().collect();
-    if let Some(idx) = parts.iter().position(|part| *part == "add-authtoken") {
-        if let Some(token) = parts.get(idx + 1) {
-            return token.trim_matches(['"', '\'']).to_string();
-        }
+    if let Some(idx) = parts.iter().position(|part| *part == "add-authtoken")
+        && let Some(token) = parts.get(idx + 1)
+    {
+        return token.trim_matches(['"', '\'']).to_string();
     }
 
     trimmed.to_string()
 }
 
-fn drain_server_ui_events(app: &mut AppState, ui_events: &mut UnboundedReceiver<ServerUiEvent>) {
+fn drain_server_ui_events(
+    app: &mut AppState,
+    ui_events: &mut UnboundedReceiver<ServerUiEvent>,
+) -> bool {
+    let mut changed = false;
     while let Ok(event) = ui_events.try_recv() {
         app.apply_server_ui_event(event);
+        changed = true;
     }
+    changed
 }
 
 // ── Main ────────────────────────────────────────────────────
@@ -1126,6 +1205,19 @@ fn print_clippymoon_export(export: &mascot::ClippyMoonExport) {
     println!("gif: {}", export.gif_path.display());
 }
 
+fn parse_port_value(value: Option<&str>) -> Result<u16, String> {
+    let Some(value) = value else {
+        return Ok(3200);
+    };
+    let port = value
+        .parse::<u16>()
+        .map_err(|_| "PORT must be an integer from 1 to 65535".to_string())?;
+    if port == 0 {
+        return Err("PORT must be an integer from 1 to 65535".to_string());
+    }
+    Ok(port)
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli_args = std::env::args().skip(1).collect::<Vec<_>>();
@@ -1160,10 +1252,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let port: u16 = std::env::var("PORT")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(3200);
+    let port_value = std::env::var("PORT").ok();
+    let port = parse_port_value(port_value.as_deref()).map_err(std::io::Error::other)?;
     let workspace_root = match std::env::var("WORKSPACE_ROOT") {
         Ok(path) => path,
         Err(_) => std::env::current_dir()?.to_string_lossy().into_owned(),
@@ -1226,30 +1316,30 @@ async fn run_app(
         };
         terminal.draw(|f| draw_mode_select(f, current_theme, current_tool_mode))?;
 
-        if event::poll(UI_POLL_INTERVAL)? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind != KeyEventKind::Press {
+        if event::poll(UI_POLL_INTERVAL)?
+            && let Event::Key(key) = event::read()?
+        {
+            if key.kind != KeyEventKind::Press {
+                continue;
+            }
+            let mode = match key.code {
+                KeyCode::Char('1') => Mode::Computer,
+                KeyCode::Char('2') => Mode::Browser,
+                KeyCode::Char('3') => Mode::Both,
+                KeyCode::Char('q') => return Ok(()),
+                KeyCode::Char('s') => {
+                    run_settings(terminal, state.clone()).await?;
                     continue;
                 }
-                let mode = match key.code {
-                    KeyCode::Char('1') => Mode::Computer,
-                    KeyCode::Char('2') => Mode::Browser,
-                    KeyCode::Char('3') => Mode::Both,
-                    KeyCode::Char('q') => return Ok(()),
-                    KeyCode::Char('s') => {
-                        run_settings(terminal, state.clone()).await?;
-                        continue;
-                    }
-                    _ => continue,
-                };
-                {
-                    let mut app = state.lock().await;
-                    app.mode = mode;
-                    app.log("INFO", format!("Mode: {}", mode.label()));
-                    app.persist_state_with_log();
-                }
-                break;
+                _ => continue,
+            };
+            {
+                let mut app = state.lock().await;
+                app.mode = mode;
+                app.log("INFO", format!("Mode: {}", mode.label()));
+                app.mark_config_dirty();
             }
+            break;
         }
     }
 
@@ -1268,6 +1358,13 @@ async fn run_app(
     let continue_run = run_ngrok_domain_setup(terminal, state.clone()).await?;
     if !continue_run {
         return Ok(());
+    }
+
+    if let Err(error) = flush_config(&state, true).await {
+        state.lock().await.log(
+            "WARN",
+            format!("Failed to persist config before startup: {error}"),
+        );
     }
 
     // Start services
@@ -1397,10 +1494,10 @@ async fn run_ngrok_auth_setup(
     let mut toast: Option<(&str, (u16, u16), Instant)> = None;
 
     loop {
-        if let Some((_, _, t)) = &toast {
-            if t.elapsed().as_secs() >= 2 {
-                toast = None;
-            }
+        if let Some((_, _, t)) = &toast
+            && t.elapsed().as_secs() >= 2
+        {
+            toast = None;
         }
 
         let (current_theme, current_tool_mode, current_mode, browsers, selected_browser) = {
@@ -1490,6 +1587,7 @@ async fn run_ngrok_auth_setup(
                         match save_ngrok_authtoken(&token) {
                             Ok(saved_path) => {
                                 let mut app = state.lock().await;
+                                app.set_ngrok_authtoken(Some(token.clone()));
                                 app.log(
                                     "INFO",
                                     format!(
@@ -1533,17 +1631,16 @@ async fn run_ngrok_auth_setup(
                 input.push_str(&normalize_ngrok_authtoken_input(&text));
                 error_message = None;
             }
-            Event::Mouse(mouse) => {
+            Event::Mouse(mouse)
                 if matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left))
-                    && rect_contains(ngrok_setup_copy_area, mouse.column, mouse.row)
-                {
-                    let message = if clipboard_copy(NGROK_SETUP_URL) {
-                        "Copied!"
-                    } else {
-                        "Copy failed"
-                    };
-                    toast = Some((message, (mouse.column, mouse.row), Instant::now()));
-                }
+                    && rect_contains(ngrok_setup_copy_area, mouse.column, mouse.row) =>
+            {
+                let message = if clipboard_copy(NGROK_SETUP_URL) {
+                    "Copied!"
+                } else {
+                    "Copy failed"
+                };
+                toast = Some((message, (mouse.column, mouse.row), Instant::now()));
             }
             _ => {}
         }
@@ -1631,15 +1728,22 @@ async fn run_ngrok_domain_setup(
                 match key.code {
                     KeyCode::Esc | KeyCode::Char('q') => return Ok(false),
                     KeyCode::Enter => {
-                        let domain = normalize_ngrok_domain_input(&input);
-                        if domain.is_empty() {
-                            error_message = Some("ngrok domain cannot be empty".into());
-                            continue;
-                        }
+                        let domain = match normalize_ngrok_domain(&input) {
+                            Ok(Some(domain)) => domain,
+                            Ok(None) => {
+                                error_message = Some("ngrok domain cannot be empty".into());
+                                continue;
+                            }
+                            Err(error) => {
+                                error_message = Some(error);
+                                continue;
+                            }
+                        };
                         match save_ngrok_domain(&domain) {
                             Ok(saved_path) => {
                                 let mut app = state.lock().await;
                                 app.ngrok_domain = Some(domain.clone());
+                                app.mark_config_dirty();
                                 app.log(
                                     "INFO",
                                     format!(
@@ -1693,10 +1797,10 @@ fn normalize_ngrok_domain_input(text: &str) -> String {
     if trimmed.is_empty() {
         return String::new();
     }
-    if let Ok(url) = reqwest::Url::parse(trimmed) {
-        if let Some(host) = url.host_str() {
-            return host.to_string();
-        }
+    if let Ok(url) = reqwest::Url::parse(trimmed)
+        && let Some(host) = url.host_str()
+    {
+        return host.to_string();
     }
     trimmed.to_string()
 }
@@ -1958,171 +2062,6 @@ fn render_toast(f: &mut Frame, palette: theme::Palette, msg: &str, pos: (u16, u1
     f.render_widget(toast_widget, toast_area);
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{
-        BottomPanelAreas, BottomPanelFocus, PanelItemHit, PanelScrollView, item_under_cursor,
-        key_is_clipboard_paste, move_panel_selection, normalize_ngrok_authtoken_input,
-        panel_under_cursor, parse_clippymoon_export_args, scroll_panel_down, scroll_panel_up,
-        tail_start_index, truncate_with_ellipsis, wrap_preserving_chars,
-    };
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-    use ratatui::layout::Rect;
-
-    #[test]
-    fn clippymoon_without_export_subcommand_returns_usage() {
-        let args = vec!["clippymoon".to_string()];
-        let error = parse_clippymoon_export_args(&args).expect_err("missing subcommand must fail");
-        assert!(error.starts_with("usage: moondesk clippymoon export"));
-    }
-
-    #[test]
-    fn clippymoon_help_returns_usage_instead_of_starting_tui() {
-        let args = vec!["clippymoon".to_string(), "--help".to_string()];
-        let error = parse_clippymoon_export_args(&args).expect_err("help should return usage text");
-        assert!(error.starts_with("usage: moondesk clippymoon export"));
-    }
-
-    #[test]
-    fn non_clippymoon_args_do_not_intercept_normal_startup() {
-        let args = vec!["something-else".to_string()];
-        assert!(
-            parse_clippymoon_export_args(&args)
-                .expect("non-ClippyMoon arguments should parse")
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn normalizes_plain_ngrok_token() {
-        assert_eq!(
-            normalize_ngrok_authtoken_input("  test-token-123  "),
-            "test-token-123"
-        );
-    }
-
-    #[test]
-    fn extracts_token_from_ngrok_command() {
-        assert_eq!(
-            normalize_ngrok_authtoken_input("ngrok config add-authtoken test-token-123"),
-            "test-token-123"
-        );
-    }
-
-    #[test]
-    fn detects_ctrl_v_as_clipboard_paste() {
-        assert!(key_is_clipboard_paste(&KeyEvent::new(
-            KeyCode::Char('v'),
-            KeyModifiers::CONTROL
-        )));
-    }
-
-    #[test]
-    fn detects_shift_insert_as_clipboard_paste() {
-        assert!(key_is_clipboard_paste(&KeyEvent::new(
-            KeyCode::Insert,
-            KeyModifiers::SHIFT
-        )));
-    }
-
-    #[test]
-    fn bottom_panels_keep_independent_scroll_state() {
-        let view = PanelScrollView {
-            max_scroll: 20,
-            effective_scroll: 20,
-        };
-        let log_scroll = 20;
-        let log_follow = true;
-        let mut command_scroll = 20;
-        let mut command_follow = true;
-
-        scroll_panel_up(&mut command_scroll, &mut command_follow, view, 1);
-        assert_eq!(command_scroll, 19);
-        assert!(!command_follow);
-        assert_eq!(log_scroll, 20);
-        assert!(log_follow);
-
-        scroll_panel_down(&mut command_scroll, &mut command_follow, view, 1);
-        assert_eq!(command_scroll, 20);
-        assert!(command_follow);
-    }
-
-    #[test]
-    fn mouse_targeting_selects_panel_under_cursor() {
-        let areas = BottomPanelAreas {
-            logs: Rect::new(0, 20, 40, 10),
-            shell_commands: Some(Rect::new(40, 20, 60, 10)),
-        };
-        assert_eq!(
-            panel_under_cursor(areas, 10, 24),
-            Some(BottomPanelFocus::Logs)
-        );
-        assert_eq!(
-            panel_under_cursor(areas, 70, 24),
-            Some(BottomPanelFocus::ShellCommands)
-        );
-        assert_eq!(panel_under_cursor(areas, 10, 5), None);
-    }
-
-    #[test]
-    fn variable_height_item_hit_testing_selects_the_rendered_entry() {
-        let hits = vec![
-            PanelItemHit {
-                top: 10,
-                bottom: 12,
-                index: 4,
-            },
-            PanelItemHit {
-                top: 13,
-                bottom: 18,
-                index: 5,
-            },
-        ];
-        assert_eq!(item_under_cursor(&hits, 11), Some(4));
-        assert_eq!(item_under_cursor(&hits, 17), Some(5));
-        assert_eq!(item_under_cursor(&hits, 19), None);
-    }
-
-    #[test]
-    fn compact_text_uses_explicit_ellipsis_and_expand_hint() {
-        let (plain, plain_clipped) = truncate_with_ellipsis("abcdefghijklmnop", 8, false);
-        assert!(plain_clipped);
-        assert_eq!(plain, "abcdefg…");
-
-        let (hinted, hinted_clipped) = truncate_with_ellipsis("abcdefghijklmnop", 12, true);
-        assert!(hinted_clipped);
-        assert_eq!(hinted, "abc… [Enter]");
-    }
-
-    #[test]
-    fn expanded_wrapping_preserves_full_command_characters() {
-        let command = "Write-Output 'one two'; Start-Sleep -Milliseconds 700";
-        let wrapped = wrap_preserving_chars(command, 9);
-        assert!(wrapped.len() > 1);
-        assert_eq!(wrapped.concat(), command);
-        assert!(wrapped.iter().all(|line| line.chars().count() <= 9));
-    }
-
-    #[test]
-    fn tail_start_respects_variable_entry_heights() {
-        // Three compact commands at three lines each fit in nine lines.
-        assert_eq!(tail_start_index(&[3, 3, 3, 3], 9), 1);
-        // Expanding the newest command to seven lines leaves room for only it.
-        assert_eq!(tail_start_index(&[3, 3, 3, 7], 9), 3);
-    }
-
-    #[test]
-    fn selection_navigation_clamps_to_available_items() {
-        let mut selected = Some(4);
-        move_panel_selection(&mut selected, 5, -2);
-        assert_eq!(selected, Some(2));
-        move_panel_selection(&mut selected, 5, 20);
-        assert_eq!(selected, Some(4));
-        move_panel_selection(&mut selected, 0, -1);
-        assert_eq!(selected, None);
-    }
-}
-
 fn centered_rect(percent_x: u16, height: u16, area: Rect) -> Rect {
     let width = area
         .width
@@ -2221,123 +2160,150 @@ async fn run_settings(
         terminal.draw(|f| {
             draw_settings(
                 f,
-                current_theme,
-                current_tool_mode,
-                set_moondesk_as_co_author,
-                &mcp_slug,
-                ngrok_domain.as_deref(),
-                &usage_totals,
-                selected_row,
-                confirm_reset_token_billing,
+                SettingsView {
+                    current_theme,
+                    current_tool_mode,
+                    set_moondesk_as_co_author,
+                    mcp_slug: &mcp_slug,
+                    ngrok_domain: ngrok_domain.as_deref(),
+                    usage_totals: &usage_totals,
+                    selected_row,
+                    confirm_reset_token_billing,
+                },
             )
         })?;
 
-        if event::poll(UI_POLL_INTERVAL)? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind != KeyEventKind::Press {
-                    continue;
+        if event::poll(UI_POLL_INTERVAL)?
+            && let Event::Key(key) = event::read()?
+        {
+            if key.kind != KeyEventKind::Press {
+                continue;
+            }
+            match key.code {
+                KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
+                KeyCode::Up => {
+                    confirm_reset_token_billing = false;
+                    selected_row = selected_row.saturating_sub(1);
                 }
-                match key.code {
-                    KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
-                    KeyCode::Up => {
-                        confirm_reset_token_billing = false;
-                        selected_row = selected_row.saturating_sub(1);
+                KeyCode::Down => {
+                    confirm_reset_token_billing = false;
+                    if selected_row + 1 < total_rows {
+                        selected_row += 1;
                     }
-                    KeyCode::Down => {
-                        confirm_reset_token_billing = false;
-                        if selected_row + 1 < total_rows {
-                            selected_row += 1;
+                }
+                KeyCode::Enter => {
+                    confirm_reset_token_billing = false;
+                    let mut app = state.lock().await;
+                    if selected_row < themes.len() {
+                        let picked = themes[selected_row];
+                        if app.theme != picked.id {
+                            app.theme = picked.id.to_string();
+                            app.log("INFO", format!("Theme changed to {}", picked.label));
+                            app.mark_config_dirty();
                         }
-                    }
-                    KeyCode::Enter => {
-                        confirm_reset_token_billing = false;
-                        let mut app = state.lock().await;
-                        if selected_row < themes.len() {
-                            let picked = themes[selected_row];
-                            if app.theme != picked.id {
-                                app.theme = picked.id.to_string();
-                                app.log("INFO", format!("Theme changed to {}", picked.label));
-                                app.persist_state_with_log();
-                            }
-                        } else {
-                            let tool_mode_start = themes.len();
-                            let tool_mode_end = tool_mode_start + tool_modes.len();
-                            let settings_action_start = tool_mode_end;
+                    } else {
+                        let tool_mode_start = themes.len();
+                        let tool_mode_end = tool_mode_start + tool_modes.len();
+                        let settings_action_start = tool_mode_end;
 
-                            if selected_row < tool_mode_end {
-                                let picked = tool_modes[selected_row - tool_mode_start];
-                                if app.tool_mode != picked {
-                                    app.tool_mode = picked;
-                                    app.log("INFO", format!("Tool mode: {}", picked.label()));
-                                    app.persist_state_with_log();
-                                }
-                            } else if selected_row == settings_action_start {
-                                app.set_moondesk_as_co_author = !app.set_moondesk_as_co_author;
-                                let enabled = app.set_moondesk_as_co_author;
-                                app.log(
-                                    "INFO",
-                                    format!(
-                                        "Set MoonDesk as co-author: {}",
-                                        if enabled { "enabled" } else { "disabled" }
-                                    ),
-                                );
-                                app.persist_state_with_log();
-                            } else if selected_row == settings_action_start + 1 {
-                                // Keep existing slug, do nothing
-                            } else if selected_row == settings_action_start + 2 {
-                                app.regenerate_mcp_slug();
-                                app.log("INFO", "Generated new random MCP slug".into());
-                                app.persist_state_with_log();
-                            } else if selected_row == settings_action_start + 3 {
-                                let current_domain = app.ngrok_domain.clone().unwrap_or_default();
-                                drop(app);
-                                if let Some(new_domain) = run_prompt(terminal, "Enter ngrok static domain (with/without https://, empty to clear):", &current_domain).await? {
-                                    let mut cleaned = new_domain.trim();
-                                    if let Some(stripped) = cleaned.strip_prefix("https://") {
-                                        cleaned = stripped;
-                                    } else if let Some(stripped) = cleaned.strip_prefix("http://") {
-                                        cleaned = stripped;
-                                    }
-                                    cleaned = cleaned.trim_end_matches('/');
-                                    let mut app = state.lock().await;
-                                    app.ngrok_domain = if cleaned.is_empty() { None } else { Some(cleaned.to_string()) };
-                                    app.log("INFO", "Updated ngrok static domain".into());
-                                    app.persist_state_with_log();
-                                }
+                        if selected_row < tool_mode_end {
+                            let picked = tool_modes[selected_row - tool_mode_start];
+                            if app.tool_mode != picked {
+                                app.tool_mode = picked;
+                                app.log("INFO", format!("Tool mode: {}", picked.label()));
+                                app.mark_config_dirty();
                             }
+                        } else if selected_row == settings_action_start {
+                            app.set_moondesk_as_co_author = !app.set_moondesk_as_co_author;
+                            let enabled = app.set_moondesk_as_co_author;
+                            app.log(
+                                "INFO",
+                                format!(
+                                    "Set MoonDesk as co-author: {}",
+                                    if enabled { "enabled" } else { "disabled" }
+                                ),
+                            );
+                            app.mark_config_dirty();
+                        } else if selected_row == settings_action_start + 1 {
+                            // Keep existing slug, do nothing
+                        } else if selected_row == settings_action_start + 2 {
+                            app.regenerate_mcp_slug();
+                            app.log("INFO", "Generated new random MCP slug".into());
+                            app.mark_config_dirty();
+                        } else if selected_row == settings_action_start + 3 {
+                            let current_domain = app.ngrok_domain.clone().unwrap_or_default();
+                            drop(app);
+                            if let Some(new_domain) = run_prompt(terminal, "Enter ngrok static domain (with/without https://, empty to clear):", &current_domain).await? {
+                                    let normalized = match normalize_ngrok_domain(&new_domain) {
+                                        Ok(domain) => domain,
+                                        Err(error) => {
+                                            state.lock().await.log(
+                                                "WARN",
+                                                format!("Invalid ngrok domain: {error}"),
+                                            );
+                                            continue;
+                                        }
+                                    };
+                                    let was_running = {
+                                        let mut app = state.lock().await;
+                                        app.ngrok_domain = normalized;
+                                        app.log("INFO", "Updated ngrok static domain".into());
+                                        app.mark_config_dirty();
+                                        app.ngrok_running
+                                    };
+                                    if was_running
+                                        && let Err(error) = ngrok::restart(state.clone()).await
+                                    {
+                                        state.lock().await.log(
+                                            "ERROR",
+                                            format!("Failed to restart ngrok after domain change: {error}"),
+                                        );
+                                    }
+                                }
                         }
                     }
-                    KeyCode::Char('r') => {
-                        if !confirm_reset_token_billing {
-                            confirm_reset_token_billing = true;
-                            continue;
-                        }
-                        let mut app = state.lock().await;
-                        app.usage_by_model.clear();
-                        app.log("INFO", "Token billing totals reset".into());
-                        app.persist_state_with_log();
-                        confirm_reset_token_billing = false;
+                }
+                KeyCode::Char('r') => {
+                    if !confirm_reset_token_billing {
+                        confirm_reset_token_billing = true;
+                        continue;
                     }
-                    _ => {
-                        confirm_reset_token_billing = false;
-                    }
+                    let mut app = state.lock().await;
+                    app.usage_by_model.clear();
+                    app.log("INFO", "Token billing totals reset".into());
+                    app.mark_config_dirty();
+                    confirm_reset_token_billing = false;
+                }
+                _ => {
+                    confirm_reset_token_billing = false;
                 }
             }
         }
     }
 }
 
-fn draw_settings(
-    f: &mut Frame,
-    current_theme: &theme::ThemeDef,
+struct SettingsView<'a> {
+    current_theme: &'a theme::ThemeDef,
     current_tool_mode: ToolMode,
     set_moondesk_as_co_author: bool,
-    mcp_slug: &str,
-    ngrok_domain: Option<&str>,
-    usage_totals: &UsageTotals,
+    mcp_slug: &'a str,
+    ngrok_domain: Option<&'a str>,
+    usage_totals: &'a UsageTotals,
     selected_row: usize,
     confirm_reset_token_billing: bool,
-) {
+}
+
+fn draw_settings(f: &mut Frame, view: SettingsView<'_>) {
+    let SettingsView {
+        current_theme,
+        current_tool_mode,
+        set_moondesk_as_co_author,
+        mcp_slug,
+        ngrok_domain,
+        usage_totals,
+        selected_row,
+        confirm_reset_token_billing,
+    } = view;
     let themes = theme::all();
     let tool_modes = ToolMode::all();
     let palette = current_theme.palette;
@@ -2740,7 +2706,7 @@ async fn run_browser_select(
         });
         if selected_missing {
             app.selected_browser = None;
-            app.persist_state_with_log();
+            app.mark_config_dirty();
         }
         selected_supported_browser_idx(&browsers, app.selected_browser.as_ref())
     };
@@ -2772,63 +2738,56 @@ async fn run_browser_select(
             )
         })?;
 
-        if event::poll(UI_POLL_INTERVAL)? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind != KeyEventKind::Press {
-                    continue;
+        if event::poll(UI_POLL_INTERVAL)?
+            && let Event::Key(key) = event::read()?
+        {
+            if key.kind != KeyEventKind::Press {
+                continue;
+            }
+            match key.code {
+                KeyCode::Char('q') => return Ok(false),
+                KeyCode::Char('r') => {
+                    browsers = browser::detect_browsers();
+                    let mut app = state.lock().await;
+                    app.detected_browsers = browsers.clone();
+                    let selected_missing = app.selected_browser.as_ref().is_some_and(|selected| {
+                        !browsers
+                            .iter()
+                            .any(|browser| browser_identity_matches(browser, selected))
+                    });
+                    if selected_missing {
+                        app.selected_browser = None;
+                        app.mark_config_dirty();
+                    }
+                    selected_supported_idx =
+                        selected_supported_browser_idx(&browsers, app.selected_browser.as_ref());
                 }
-                match key.code {
-                    KeyCode::Char('q') => return Ok(false),
-                    KeyCode::Char('r') => {
-                        browsers = browser::detect_browsers();
-                        let mut app = state.lock().await;
-                        app.detected_browsers = browsers.clone();
-                        let selected_missing =
-                            app.selected_browser.as_ref().is_some_and(|selected| {
-                                !browsers
-                                    .iter()
-                                    .any(|browser| browser_identity_matches(browser, selected))
-                            });
-                        if selected_missing {
-                            app.selected_browser = None;
-                            app.persist_state_with_log();
-                        }
-                        selected_supported_idx = selected_supported_browser_idx(
-                            &browsers,
-                            app.selected_browser.as_ref(),
-                        );
-                    }
-                    KeyCode::Up => {
-                        selected_supported_idx = selected_supported_idx.saturating_sub(1)
-                    }
-                    KeyCode::Down => {
-                        if selected_supported_idx + 1 < supported_indices.len() {
-                            selected_supported_idx += 1;
-                        }
-                    }
-                    KeyCode::Enter => {
-                        if let Some(selected_idx) = supported_indices.get(selected_supported_idx) {
-                            if let Some(selected) = browsers.get(*selected_idx).cloned() {
-                                persist_selected_browser(state.clone(), selected).await;
-                                return Ok(true);
-                            }
-                        }
-                    }
-                    KeyCode::Char(c) if c.is_ascii_digit() => {
-                        let index = c.to_digit(10).unwrap_or(0) as usize;
-                        if index == 0 {
-                            continue;
-                        }
-                        let target_idx = index - 1;
-                        if let Some(browser_idx) = supported_indices.get(target_idx) {
-                            if let Some(selected) = browsers.get(*browser_idx).cloned() {
-                                persist_selected_browser(state.clone(), selected).await;
-                                return Ok(true);
-                            }
-                        }
-                    }
-                    _ => {}
+                KeyCode::Up => selected_supported_idx = selected_supported_idx.saturating_sub(1),
+                KeyCode::Down if selected_supported_idx + 1 < supported_indices.len() => {
+                    selected_supported_idx += 1;
                 }
+                KeyCode::Enter => {
+                    if let Some(selected_idx) = supported_indices.get(selected_supported_idx)
+                        && let Some(selected) = browsers.get(*selected_idx).cloned()
+                    {
+                        persist_selected_browser(state.clone(), selected).await;
+                        return Ok(true);
+                    }
+                }
+                KeyCode::Char(c) if c.is_ascii_digit() => {
+                    let index = c.to_digit(10).unwrap_or(0) as usize;
+                    if index == 0 {
+                        continue;
+                    }
+                    let target_idx = index - 1;
+                    if let Some(browser_idx) = supported_indices.get(target_idx)
+                        && let Some(selected) = browsers.get(*browser_idx).cloned()
+                    {
+                        persist_selected_browser(state.clone(), selected).await;
+                        return Ok(true);
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -2852,7 +2811,7 @@ async fn persist_selected_browser(state: SharedState, selected: browser::Detecte
         "INFO",
         format!("Selected browser remote debugging: {remote_info}"),
     );
-    app.persist_state_with_log();
+    app.mark_config_dirty();
 }
 
 fn draw_browser_select(
@@ -3077,10 +3036,10 @@ async fn wait_remote_debug_ready(port: u16, timeout: Duration) -> bool {
             .timeout(Duration::from_millis(600))
             .send()
             .await;
-        if let Ok(response) = result {
-            if response.status().is_success() {
-                return true;
-            }
+        if let Ok(response) = result
+            && response.status().is_success()
+        {
+            return true;
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
@@ -3091,9 +3050,7 @@ async fn ensure_selected_browser_remote_debugging(
     state: SharedState,
     selected_browser: Option<browser::DetectedBrowser>,
 ) -> Option<browser::DetectedBrowser> {
-    let Some(mut selected) = selected_browser else {
-        return None;
-    };
+    let mut selected = selected_browser?;
     if !selected.mcp_supported {
         state.lock().await.log(
             "ERROR",
@@ -3187,7 +3144,7 @@ async fn ensure_selected_browser_remote_debugging(
                     selected.name, port
                 ),
             );
-            app.persist_state_with_log();
+            app.mark_config_dirty();
         }
         Some(selected)
     } else {
@@ -3225,19 +3182,18 @@ async fn start_services(
         selected_browser =
             ensure_selected_browser_remote_debugging(state.clone(), selected_browser).await;
         detected_browsers = browser::detect_browsers();
-        if let Some(selected) = &selected_browser {
-            if let Some(refreshed) = detected_browsers
+        if let Some(selected) = &selected_browser
+            && let Some(refreshed) = detected_browsers
                 .iter()
                 .find(|b| b.path == selected.path && b.binary == selected.binary)
                 .cloned()
-            {
-                selected_browser = Some(refreshed);
-            }
+        {
+            selected_browser = Some(refreshed);
         }
         let mut app = state.lock().await;
         app.detected_browsers = detected_browsers.clone();
         app.selected_browser = selected_browser.clone();
-        app.persist_state_with_log();
+        app.mark_config_dirty();
     }
 
     let browser_summary = browser::format_browser_names(&detected_browsers);
@@ -3325,7 +3281,7 @@ async fn start_services(
                 .lock()
                 .await
                 .log("INFO", "Starting chrome-devtools-mcp...".into());
-            match DevtoolsBridge::start(selected_browser.as_ref()).await {
+            match DevtoolsBridge::start(selected_browser.as_ref(), ui_events.clone()).await {
                 Ok(bridge) => {
                     let mut app = state.lock().await;
                     app.devtools_running = true;
@@ -3343,18 +3299,14 @@ async fn start_services(
         None
     };
 
-    let (mcp_path, command_jobs) = {
-        let app = state.lock().await;
-        (app.mcp_path(), app.command_jobs.clone())
-    };
+    let command_jobs = { state.lock().await.command_jobs.clone() };
     let router = server::router(
         state.clone(),
         devtools_bridge.clone(),
         command_jobs,
-        mcp_path,
         ui_events,
     );
-    let listener = match tokio::net::TcpListener::bind(format!("0.0.0.0:{port}")).await {
+    let listener = match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
         Ok(l) => l,
         Err(e) => {
             state
@@ -3365,8 +3317,15 @@ async fn start_services(
         }
     };
 
+    let server_state = state.clone();
     let handle = tokio::spawn(async move {
-        let _ = axum::serve(listener, router).await;
+        let result = axum::serve(listener, router).await;
+        let mut app = server_state.lock().await;
+        app.server_running = false;
+        match result {
+            Ok(()) => app.log("WARN", "MCP server exited".into()),
+            Err(error) => app.log("ERROR", format!("MCP server failed: {error}")),
+        }
     });
 
     {
@@ -3423,12 +3382,23 @@ async fn run_tui(
     let mut log_mcp_url_revealed_until: Option<Instant> = None;
     let mut log_ngrok_url_revealed_until: Option<Instant> = None;
     let mut log_ngrok_domain_revealed_until: Option<Instant> = None;
+    let mut last_config_flush = Instant::now();
 
     loop {
-        {
-            let mut app = state.lock().await;
-            drain_server_ui_events(&mut app, &mut ui_events);
-            app.prune_closed_flows();
+        let app = {
+            let mut live = state.lock().await;
+            let _ = drain_server_ui_events(&mut live, &mut ui_events);
+            live.prune_closed_flows();
+            UiSnapshot::from_app(&live)
+        };
+        if last_config_flush.elapsed() >= CONFIG_FLUSH_INTERVAL {
+            if let Err(error) = flush_config(&state, false).await {
+                state
+                    .lock()
+                    .await
+                    .log("WARN", format!("Failed to persist config: {error}"));
+            }
+            last_config_flush = Instant::now();
         }
         {
             let reveal_remaining = mcp_url_revealed_until
@@ -3453,7 +3423,6 @@ async fn run_tui(
             {
                 log_ngrok_domain_revealed_until = None;
             }
-            let app = state.lock().await;
             last_log_count = app.logs.len();
             last_command_count = app.command_activities.len();
             sync_panel_selection(&mut selected_log, last_log_count, log_follow_tail);
@@ -3479,25 +3448,27 @@ async fn run_tui(
             terminal.draw(|f| {
                 draw_ui(
                     f,
-                    &app,
-                    log_scroll,
-                    log_follow_tail,
-                    command_scroll,
-                    command_follow_tail,
-                    focused_bottom_panel,
-                    selected_log,
-                    selected_command,
-                    expanded_log,
-                    expanded_command,
-                    &mut last_log_view,
-                    &mut last_command_view,
-                    &mut bottom_panel_areas,
-                    &mut bottom_panel_hits,
-                    toast_ref,
-                    reveal_remaining,
-                    log_mcp_reveal_remaining,
-                    log_ngrok_reveal_remaining,
-                    log_ngrok_domain_reveal_remaining,
+                    UiRenderContext {
+                        app: &app,
+                        log_scroll,
+                        log_follow_tail,
+                        command_scroll,
+                        command_follow_tail,
+                        focused_bottom_panel,
+                        selected_log,
+                        selected_command,
+                        expanded_log,
+                        expanded_command,
+                        log_view: &mut last_log_view,
+                        command_view: &mut last_command_view,
+                        bottom_panel_areas: &mut bottom_panel_areas,
+                        bottom_panel_hits: &mut bottom_panel_hits,
+                        toast: toast_ref,
+                        mcp_url_reveal_remaining: reveal_remaining,
+                        log_mcp_url_reveal_remaining: log_mcp_reveal_remaining,
+                        log_ngrok_url_reveal_remaining: log_ngrok_reveal_remaining,
+                        log_ngrok_domain_reveal_remaining,
+                    },
                 );
 
                 if let Some(((c0, r0), (c1, r1))) = selection.range() {
@@ -3528,14 +3499,16 @@ async fn run_tui(
                     }
                 }
 
-                let area = f.area();
-                let buf = f.buffer_mut();
-                for row in 0..area.height {
-                    let mut line = String::new();
-                    for col in 0..area.width {
-                        line.push_str(buf[(col, row)].symbol());
+                if selection.dragging {
+                    let area = f.area();
+                    let buf = f.buffer_mut();
+                    for row in 0..area.height {
+                        let mut line = String::new();
+                        for col in 0..area.width {
+                            line.push_str(buf[(col, row)].symbol());
+                        }
+                        new_lines.push(line);
                     }
-                    new_lines.push(line);
                 }
             })?;
             if !log_follow_tail && log_scroll > last_log_view.max_scroll {
@@ -3550,10 +3523,7 @@ async fn run_tui(
             screen_lines = new_lines;
         }
 
-        let snapshots = {
-            let app = state.lock().await;
-            build_animation_snapshot(&app)
-        };
+        let snapshots = build_animation_snapshot(&app);
         if !snapshots.is_empty() {
             let snapshot_joined = snapshots.join("\n");
             if snapshot_joined != last_animation_snapshot {
@@ -3561,13 +3531,25 @@ async fn run_tui(
             }
         }
 
-        if let Some((_, _, t)) = &toast {
-            if t.elapsed().as_secs() >= 2 {
-                toast = None;
-            }
+        if let Some((_, _, t)) = &toast
+            && t.elapsed().as_secs() >= 2
+        {
+            toast = None;
         }
 
-        if event::poll(UI_POLL_INTERVAL)? {
+        let reveal_active = mcp_url_revealed_until.is_some()
+            || log_mcp_url_revealed_until.is_some()
+            || log_ngrok_url_revealed_until.is_some()
+            || log_ngrok_domain_revealed_until.is_some();
+        let poll_interval = if !app.flows.is_empty() || reveal_active || selection.dragging {
+            UI_POLL_INTERVAL
+        } else if terminal.size()?.width >= 120 {
+            Duration::from_millis(app.mascot.frame_ms.max(16))
+        } else {
+            Duration::from_millis(250)
+        };
+
+        if event::poll(poll_interval)? {
             match event::read()? {
                 Event::Key(key) => {
                     if key.kind != KeyEventKind::Press {
@@ -3806,19 +3788,144 @@ async fn run_tui(
                         selection.end = Some((mouse.column, mouse.row));
                         selection.dragging = true;
                     }
-                    MouseEventKind::Drag(MouseButton::Left) => {
-                        if selection.dragging {
-                            selection.end = Some((mouse.column, mouse.row));
-                        }
+                    MouseEventKind::Drag(MouseButton::Left) if selection.dragging => {
+                        selection.end = Some((mouse.column, mouse.row));
                     }
-                    MouseEventKind::Up(MouseButton::Left) => {
-                        if selection.dragging {
-                            selection.end = Some((mouse.column, mouse.row));
-                            selection.dragging = false;
-                            if let Some((start, end)) = selection.range() {
-                                if start != end {
-                                    let text = extract_from_screen(&screen_lines, start, end);
-                                    if !text.is_empty() {
+                    MouseEventKind::Up(MouseButton::Left) if selection.dragging => {
+                        selection.end = Some((mouse.column, mouse.row));
+                        selection.dragging = false;
+                        if let Some((start, end)) = selection.range() {
+                            if start != end {
+                                let text = extract_from_screen(&screen_lines, start, end);
+                                if !text.is_empty() {
+                                    let message = if clipboard_copy(&text) {
+                                        "Copied!"
+                                    } else {
+                                        "Copy failed"
+                                    };
+                                    toast =
+                                        Some((message, (mouse.column, mouse.row), Instant::now()));
+                                }
+                            } else {
+                                let row = start.1 as usize;
+                                if row < screen_lines.len() {
+                                    let line = &screen_lines[row];
+                                    let copy_value = if line.contains("chatgpt.com/apps") {
+                                        Some(
+                                            "https://chatgpt.com/apps#settings/Connectors"
+                                                .to_string(),
+                                        )
+                                    } else if line.contains("Auto-saved ngrok static domain:") {
+                                        if let Some(ref domain) = last_ngrok_domain {
+                                            let revealed = log_ngrok_domain_revealed_until
+                                                .and_then(|deadline| {
+                                                    deadline.checked_duration_since(Instant::now())
+                                                })
+                                                .is_some();
+                                            if revealed {
+                                                Some(domain.clone())
+                                            } else {
+                                                let now = Instant::now();
+                                                log_ngrok_domain_revealed_until =
+                                                    Some(now + MCP_URL_REVEAL_DURATION);
+                                                toast = Some((
+                                                    "Domain revealed for 10s",
+                                                    (mouse.column, mouse.row),
+                                                    now,
+                                                ));
+                                                None
+                                            }
+                                        } else {
+                                            None
+                                        }
+                                    } else if line.contains("ngrok URL:") {
+                                        if let Some(ref url) = last_ngrok_url {
+                                            let revealed = log_ngrok_url_revealed_until
+                                                .and_then(|deadline| {
+                                                    deadline.checked_duration_since(Instant::now())
+                                                })
+                                                .is_some();
+                                            if revealed {
+                                                Some(url.clone())
+                                            } else {
+                                                let now = Instant::now();
+                                                log_ngrok_url_revealed_until =
+                                                    Some(now + MCP_URL_REVEAL_DURATION);
+                                                toast = Some((
+                                                    "URL revealed for 10s",
+                                                    (mouse.column, mouse.row),
+                                                    now,
+                                                ));
+                                                None
+                                            }
+                                        } else {
+                                            None
+                                        }
+                                    } else if line.contains("MCP Server URL:") {
+                                        if let Some(ref url) = last_mcp_url {
+                                            let revealed = log_mcp_url_revealed_until
+                                                .and_then(|deadline| {
+                                                    deadline.checked_duration_since(Instant::now())
+                                                })
+                                                .is_some();
+                                            if revealed {
+                                                Some(url.clone())
+                                            } else {
+                                                let now = Instant::now();
+                                                log_mcp_url_revealed_until =
+                                                    Some(now + MCP_URL_REVEAL_DURATION);
+                                                toast = Some((
+                                                    "URL revealed for 10s",
+                                                    (mouse.column, mouse.row),
+                                                    now,
+                                                ));
+                                                None
+                                            }
+                                        } else {
+                                            None
+                                        }
+                                    } else if let Some(ref url) = last_mcp_url {
+                                        let prefix = &url[..url.len().min(30)];
+                                        if line.contains("MCP Server URL") || line.contains(prefix)
+                                        {
+                                            let revealed = mcp_url_revealed_until
+                                                .and_then(|deadline| {
+                                                    deadline.checked_duration_since(Instant::now())
+                                                })
+                                                .is_some();
+                                            if revealed {
+                                                Some(url.clone())
+                                            } else {
+                                                let now = Instant::now();
+                                                mcp_url_revealed_until =
+                                                    Some(now + MCP_URL_REVEAL_DURATION);
+                                                toast = Some((
+                                                    "URL revealed for 10s",
+                                                    (mouse.column, mouse.row),
+                                                    now,
+                                                ));
+                                                None
+                                            }
+                                        } else {
+                                            None
+                                        }
+                                    } else {
+                                        None
+                                    }
+                                    .or_else(|| {
+                                        if line.contains("\u{2502}") {
+                                            if line.contains("Name") {
+                                                Some("MoonDesk".to_string())
+                                            } else if line.contains("Authentication") {
+                                                Some("None".to_string())
+                                            } else {
+                                                None
+                                            }
+                                        } else {
+                                            None
+                                        }
+                                    });
+                                    if let Some(text) = copy_value {
                                         let message = if clipboard_copy(&text) {
                                             "Copied!"
                                         } else {
@@ -3829,143 +3936,6 @@ async fn run_tui(
                                             (mouse.column, mouse.row),
                                             Instant::now(),
                                         ));
-                                    }
-                                } else {
-                                    let row = start.1 as usize;
-                                    if row < screen_lines.len() {
-                                        let line = &screen_lines[row];
-                                        let copy_value = if line.contains("chatgpt.com/apps") {
-                                            Some(
-                                                "https://chatgpt.com/apps#settings/Connectors"
-                                                    .to_string(),
-                                            )
-                                        } else if line.contains("Auto-saved ngrok static domain:") {
-                                            if let Some(ref domain) = last_ngrok_domain {
-                                                let revealed = log_ngrok_domain_revealed_until
-                                                    .and_then(|deadline| {
-                                                        deadline
-                                                            .checked_duration_since(Instant::now())
-                                                    })
-                                                    .is_some();
-                                                if revealed {
-                                                    Some(domain.clone())
-                                                } else {
-                                                    let now = Instant::now();
-                                                    log_ngrok_domain_revealed_until =
-                                                        Some(now + MCP_URL_REVEAL_DURATION);
-                                                    toast = Some((
-                                                        "Domain revealed for 10s",
-                                                        (mouse.column, mouse.row),
-                                                        now,
-                                                    ));
-                                                    None
-                                                }
-                                            } else {
-                                                None
-                                            }
-                                        } else if line.contains("ngrok URL:") {
-                                            if let Some(ref url) = last_ngrok_url {
-                                                let revealed = log_ngrok_url_revealed_until
-                                                    .and_then(|deadline| {
-                                                        deadline
-                                                            .checked_duration_since(Instant::now())
-                                                    })
-                                                    .is_some();
-                                                if revealed {
-                                                    Some(url.clone())
-                                                } else {
-                                                    let now = Instant::now();
-                                                    log_ngrok_url_revealed_until =
-                                                        Some(now + MCP_URL_REVEAL_DURATION);
-                                                    toast = Some((
-                                                        "URL revealed for 10s",
-                                                        (mouse.column, mouse.row),
-                                                        now,
-                                                    ));
-                                                    None
-                                                }
-                                            } else {
-                                                None
-                                            }
-                                        } else if line.contains("MCP Server URL:") {
-                                            if let Some(ref url) = last_mcp_url {
-                                                let revealed = log_mcp_url_revealed_until
-                                                    .and_then(|deadline| {
-                                                        deadline
-                                                            .checked_duration_since(Instant::now())
-                                                    })
-                                                    .is_some();
-                                                if revealed {
-                                                    Some(url.clone())
-                                                } else {
-                                                    let now = Instant::now();
-                                                    log_mcp_url_revealed_until =
-                                                        Some(now + MCP_URL_REVEAL_DURATION);
-                                                    toast = Some((
-                                                        "URL revealed for 10s",
-                                                        (mouse.column, mouse.row),
-                                                        now,
-                                                    ));
-                                                    None
-                                                }
-                                            } else {
-                                                None
-                                            }
-                                        } else if let Some(ref url) = last_mcp_url {
-                                            let prefix = &url[..url.len().min(30)];
-                                            if line.contains("MCP Server URL")
-                                                || line.contains(prefix)
-                                            {
-                                                let revealed = mcp_url_revealed_until
-                                                    .and_then(|deadline| {
-                                                        deadline
-                                                            .checked_duration_since(Instant::now())
-                                                    })
-                                                    .is_some();
-                                                if revealed {
-                                                    Some(url.clone())
-                                                } else {
-                                                    let now = Instant::now();
-                                                    mcp_url_revealed_until =
-                                                        Some(now + MCP_URL_REVEAL_DURATION);
-                                                    toast = Some((
-                                                        "URL revealed for 10s",
-                                                        (mouse.column, mouse.row),
-                                                        now,
-                                                    ));
-                                                    None
-                                                }
-                                            } else {
-                                                None
-                                            }
-                                        } else {
-                                            None
-                                        }
-                                        .or_else(|| {
-                                            if line.contains("\u{2502}") {
-                                                if line.contains("Name") {
-                                                    Some("MoonDesk".to_string())
-                                                } else if line.contains("Authentication") {
-                                                    Some("None".to_string())
-                                                } else {
-                                                    None
-                                                }
-                                            } else {
-                                                None
-                                            }
-                                        });
-                                        if let Some(text) = copy_value {
-                                            let message = if clipboard_copy(&text) {
-                                                "Copied!"
-                                            } else {
-                                                "Copy failed"
-                                            };
-                                            toast = Some((
-                                                message,
-                                                (mouse.column, mouse.row),
-                                                Instant::now(),
-                                            ));
-                                        }
                                     }
                                 }
                             }
@@ -4050,14 +4020,19 @@ async fn run_tui(
         }
     }
 
+    if let Err(error) = flush_config(&state, true).await {
+        state.lock().await.log(
+            "WARN",
+            format!("Failed to persist config on shutdown: {error}"),
+        );
+    }
     Ok(())
 }
 
 // ── Draw main UI ────────────────────────────────────────────
 
-fn draw_ui(
-    f: &mut Frame,
-    app: &AppState,
+struct UiRenderContext<'a> {
+    app: &'a UiSnapshot,
     log_scroll: usize,
     log_follow_tail: bool,
     command_scroll: usize,
@@ -4067,16 +4042,39 @@ fn draw_ui(
     selected_command: Option<usize>,
     expanded_log: Option<usize>,
     expanded_command: Option<usize>,
-    log_view: &mut PanelScrollView,
-    command_view: &mut PanelScrollView,
-    bottom_panel_areas: &mut BottomPanelAreas,
-    bottom_panel_hits: &mut BottomPanelHitMaps,
-    toast: Option<(&str, (u16, u16))>,
+    log_view: &'a mut PanelScrollView,
+    command_view: &'a mut PanelScrollView,
+    bottom_panel_areas: &'a mut BottomPanelAreas,
+    bottom_panel_hits: &'a mut BottomPanelHitMaps,
+    toast: Option<(&'a str, (u16, u16))>,
     mcp_url_reveal_remaining: Option<Duration>,
     log_mcp_url_reveal_remaining: Option<Duration>,
     log_ngrok_url_reveal_remaining: Option<Duration>,
     log_ngrok_domain_reveal_remaining: Option<Duration>,
-) {
+}
+
+fn draw_ui(f: &mut Frame, context: UiRenderContext<'_>) {
+    let UiRenderContext {
+        app,
+        log_scroll,
+        log_follow_tail,
+        command_scroll,
+        command_follow_tail,
+        focused_bottom_panel,
+        selected_log,
+        selected_command,
+        expanded_log,
+        expanded_command,
+        log_view,
+        command_view,
+        bottom_panel_areas,
+        bottom_panel_hits,
+        toast,
+        mcp_url_reveal_remaining,
+        log_mcp_url_reveal_remaining,
+        log_ngrok_url_reveal_remaining,
+        log_ngrok_domain_reveal_remaining,
+    } = context;
     let palette = app.current_theme().palette;
     let area = f.area();
     let now_millis = SystemTime::now()
@@ -4209,7 +4207,7 @@ fn draw_ui(
     let lane_for = |active: bool, flow: Option<&FlowLane>| -> Vec<Span<'static>> {
         flow_lane_spans(active, flow, &palette, now_millis)
     };
-    let request_stats_for = |app: &AppState| -> Vec<Span<'static>> {
+    let request_stats_for = |app: &UiSnapshot| -> Vec<Span<'static>> {
         vec![
             Span::styled("  Requests ", Style::default().fg(palette.muted_fg)),
             Span::styled(
@@ -4686,8 +4684,11 @@ fn draw_ui(
     let key_spans = vec![
         Span::styled("  [q]", Style::default().fg(palette.danger_fg)),
         Span::raw(" Quit  "),
-        Span::styled("[Tab]", Style::default().fg(palette.key_fg)),
-        Span::raw(" Switch  "),
+        Span::styled(
+            if show_command_panel { "[Tab]" } else { "" },
+            Style::default().fg(palette.key_fg),
+        ),
+        Span::raw(if show_command_panel { " Switch  " } else { "" }),
         Span::styled("[↑/↓/Wheel]", Style::default().fg(palette.key_fg)),
         Span::raw(" Select/Scroll  "),
         Span::styled("[PgUp/PgDn]", Style::default().fg(palette.key_fg)),
@@ -5048,5 +5049,179 @@ fn draw_ui(
     // ── Floating toast (top-most layer) ──
     if let Some((msg, pos)) = toast {
         render_toast(f, palette, msg, pos);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        BottomPanelAreas, BottomPanelFocus, PanelItemHit, PanelScrollView, item_under_cursor,
+        key_is_clipboard_paste, move_panel_selection, normalize_ngrok_authtoken_input,
+        panel_under_cursor, parse_clippymoon_export_args, parse_port_value, scroll_panel_down,
+        scroll_panel_up, tail_start_index, truncate_with_ellipsis, wrap_preserving_chars,
+    };
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use ratatui::layout::Rect;
+
+    #[test]
+    fn clippymoon_without_export_subcommand_returns_usage() {
+        let args = vec!["clippymoon".to_string()];
+        let error = parse_clippymoon_export_args(&args).expect_err("missing subcommand must fail");
+        assert!(error.starts_with("usage: moondesk clippymoon export"));
+    }
+
+    #[test]
+    fn clippymoon_help_returns_usage_instead_of_starting_tui() {
+        let args = vec!["clippymoon".to_string(), "--help".to_string()];
+        let error = parse_clippymoon_export_args(&args).expect_err("help should return usage text");
+        assert!(error.starts_with("usage: moondesk clippymoon export"));
+    }
+
+    #[test]
+    fn port_parser_rejects_invalid_explicit_values() {
+        assert_eq!(parse_port_value(None).expect("default port"), 3200);
+        assert_eq!(parse_port_value(Some("8787")).expect("valid port"), 8787);
+        assert!(parse_port_value(Some("0")).is_err());
+        assert!(parse_port_value(Some("not-a-port")).is_err());
+        assert!(parse_port_value(Some("70000")).is_err());
+    }
+
+    #[test]
+    fn non_clippymoon_args_do_not_intercept_normal_startup() {
+        let args = vec!["something-else".to_string()];
+        assert!(
+            parse_clippymoon_export_args(&args)
+                .expect("non-ClippyMoon arguments should parse")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn normalizes_plain_ngrok_token() {
+        assert_eq!(
+            normalize_ngrok_authtoken_input("  test-token-123  "),
+            "test-token-123"
+        );
+    }
+
+    #[test]
+    fn extracts_token_from_ngrok_command() {
+        assert_eq!(
+            normalize_ngrok_authtoken_input("ngrok config add-authtoken test-token-123"),
+            "test-token-123"
+        );
+    }
+
+    #[test]
+    fn detects_ctrl_v_as_clipboard_paste() {
+        assert!(key_is_clipboard_paste(&KeyEvent::new(
+            KeyCode::Char('v'),
+            KeyModifiers::CONTROL
+        )));
+    }
+
+    #[test]
+    fn detects_shift_insert_as_clipboard_paste() {
+        assert!(key_is_clipboard_paste(&KeyEvent::new(
+            KeyCode::Insert,
+            KeyModifiers::SHIFT
+        )));
+    }
+
+    #[test]
+    fn bottom_panels_keep_independent_scroll_state() {
+        let view = PanelScrollView {
+            max_scroll: 20,
+            effective_scroll: 20,
+        };
+        let log_scroll = 20;
+        let log_follow = true;
+        let mut command_scroll = 20;
+        let mut command_follow = true;
+
+        scroll_panel_up(&mut command_scroll, &mut command_follow, view, 1);
+        assert_eq!(command_scroll, 19);
+        assert!(!command_follow);
+        assert_eq!(log_scroll, 20);
+        assert!(log_follow);
+
+        scroll_panel_down(&mut command_scroll, &mut command_follow, view, 1);
+        assert_eq!(command_scroll, 20);
+        assert!(command_follow);
+    }
+
+    #[test]
+    fn mouse_targeting_selects_panel_under_cursor() {
+        let areas = BottomPanelAreas {
+            logs: Rect::new(0, 20, 40, 10),
+            shell_commands: Some(Rect::new(40, 20, 60, 10)),
+        };
+        assert_eq!(
+            panel_under_cursor(areas, 10, 24),
+            Some(BottomPanelFocus::Logs)
+        );
+        assert_eq!(
+            panel_under_cursor(areas, 70, 24),
+            Some(BottomPanelFocus::ShellCommands)
+        );
+        assert_eq!(panel_under_cursor(areas, 10, 5), None);
+    }
+
+    #[test]
+    fn variable_height_item_hit_testing_selects_the_rendered_entry() {
+        let hits = vec![
+            PanelItemHit {
+                top: 10,
+                bottom: 12,
+                index: 4,
+            },
+            PanelItemHit {
+                top: 13,
+                bottom: 18,
+                index: 5,
+            },
+        ];
+        assert_eq!(item_under_cursor(&hits, 11), Some(4));
+        assert_eq!(item_under_cursor(&hits, 17), Some(5));
+        assert_eq!(item_under_cursor(&hits, 19), None);
+    }
+
+    #[test]
+    fn compact_text_uses_explicit_ellipsis_and_expand_hint() {
+        let (plain, plain_clipped) = truncate_with_ellipsis("abcdefghijklmnop", 8, false);
+        assert!(plain_clipped);
+        assert_eq!(plain, "abcdefg…");
+
+        let (hinted, hinted_clipped) = truncate_with_ellipsis("abcdefghijklmnop", 12, true);
+        assert!(hinted_clipped);
+        assert_eq!(hinted, "abc… [Enter]");
+    }
+
+    #[test]
+    fn expanded_wrapping_preserves_full_command_characters() {
+        let command = "Write-Output 'one two'; Start-Sleep -Milliseconds 700";
+        let wrapped = wrap_preserving_chars(command, 9);
+        assert!(wrapped.len() > 1);
+        assert_eq!(wrapped.concat(), command);
+        assert!(wrapped.iter().all(|line| line.chars().count() <= 9));
+    }
+
+    #[test]
+    fn tail_start_respects_variable_entry_heights() {
+        // Three compact commands at three lines each fit in nine lines.
+        assert_eq!(tail_start_index(&[3, 3, 3, 3], 9), 1);
+        // Expanding the newest command to seven lines leaves room for only it.
+        assert_eq!(tail_start_index(&[3, 3, 3, 7], 9), 3);
+    }
+
+    #[test]
+    fn selection_navigation_clamps_to_available_items() {
+        let mut selected = Some(4);
+        move_panel_selection(&mut selected, 5, -2);
+        assert_eq!(selected, Some(2));
+        move_panel_selection(&mut selected, 5, 20);
+        assert_eq!(selected, Some(4));
+        move_panel_selection(&mut selected, 0, -1);
+        assert_eq!(selected, None);
     }
 }

@@ -240,22 +240,70 @@ impl AppConfig {
         }
 
         let text = toml::to_string_pretty(&config).map_err(std::io::Error::other)?;
+        let temp_path = parent.join(format!(".{APP_CONFIG_FILE_NAME}.{}.tmp", Uuid::new_v4()));
         let mut options = OpenOptions::new();
-        options.create(true).write(true).truncate(true);
+        options.create_new(true).write(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600);
         }
-        let mut file = options.open(path)?;
-        use std::io::Write as _;
-        file.write_all(text.as_bytes())?;
-        file.flush()?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+        let write_result = (|| -> std::io::Result<()> {
+            let mut file = options.open(&temp_path)?;
+            use std::io::Write as _;
+            file.write_all(text.as_bytes())?;
+            file.flush()?;
+            file.sync_all()?;
+            replace_config_file(&temp_path, path)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+                if let Ok(directory) = fs::File::open(parent) {
+                    let _ = directory.sync_all();
+                }
+            }
+            Ok(())
+        })();
+        if write_result.is_err() {
+            let _ = fs::remove_file(&temp_path);
         }
+        write_result
+    }
+}
+
+#[cfg(not(windows))]
+fn replace_config_file(temp_path: &Path, target_path: &Path) -> std::io::Result<()> {
+    fs::rename(temp_path, target_path)
+}
+
+#[cfg(windows)]
+fn replace_config_file(temp_path: &Path, target_path: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+
+    let temp_wide = temp_path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let target_wide = target_path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let result = unsafe {
+        MoveFileExW(
+            temp_wide.as_ptr(),
+            target_wide.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if result == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
         Ok(())
     }
 }
@@ -270,6 +318,7 @@ pub enum FlowDirection {
 pub enum ServerUiEvent {
     IncrementRequestCount,
     SetRemoteConnected(bool),
+    SetDevtoolsRunning(bool),
     RecordFlow {
         flow_id: String,
         events: Vec<String>,
@@ -427,6 +476,9 @@ pub struct AppState {
     pub tool_mode: ToolMode,
     pub mcp_slug: String,
     pub ngrok_domain: Option<String>,
+    ngrok_authtoken: Option<String>,
+    agents_path_mode: AgentsPathMode,
+    config_dirty: bool,
     pub is_returning_user: bool,
     pub server_running: bool,
     pub ngrok_running: bool,
@@ -462,8 +514,7 @@ const FLOW_LINK_CELLS: u64 = FLOW_ANIM_CELLS as u64;
 const FLOW_CHAIN_DELAY_CELLS: u64 = 0;
 const FLOW_FORWARD_ANIMATION_DURATION_MS: u64 = 125;
 const FLOW_BACKWARD_ANIMATION_DURATION_MS: u64 = 125;
-const FLOW_STEP_FIXED_MS: u64 =
-    (FLOW_FORWARD_ANIMATION_DURATION_MS + FLOW_LINK_CELLS - 1) / FLOW_LINK_CELLS;
+const FLOW_STEP_FIXED_MS: u64 = FLOW_FORWARD_ANIMATION_DURATION_MS.div_ceil(FLOW_LINK_CELLS);
 const FLOW_TURN_TRANSITION_MS: u64 = 24;
 const FLOW_CLOSE_PRUNE_MULTIPLIER: u64 = 3;
 const FLOW_BOOTSTRAP_STATUS_CLOSE_DELAY_MS: u128 = 3_000;
@@ -537,6 +588,53 @@ pub fn save_ngrok_domain(domain: &str) -> std::io::Result<PathBuf> {
     config.ngrok_domain = Some(domain.to_string());
     config.save_to_path(&path)?;
     Ok(path)
+}
+
+pub fn normalize_ngrok_domain(value: &str) -> Result<Option<String>, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+
+    let host = if trimmed.contains("://") {
+        let url = reqwest::Url::parse(trimmed)
+            .map_err(|error| format!("invalid ngrok domain URL: {error}"))?;
+        if !matches!(url.scheme(), "http" | "https") {
+            return Err("ngrok domain URL must use http:// or https://".into());
+        }
+        if !url.username().is_empty() || url.password().is_some() || url.port().is_some() {
+            return Err("ngrok domain must not include credentials or a port".into());
+        }
+        if !matches!(url.path(), "" | "/") || url.query().is_some() || url.fragment().is_some() {
+            return Err("ngrok domain must not include a path, query, or fragment".into());
+        }
+        url.host_str()
+            .ok_or_else(|| "ngrok domain URL is missing a host".to_string())?
+            .to_string()
+    } else {
+        if trimmed.contains(['/', '?', '#', '@', ':']) || trimmed.chars().any(char::is_whitespace) {
+            return Err("ngrok domain must be a bare hostname or an http(s) URL".into());
+        }
+        trimmed.trim_end_matches('.').to_string()
+    };
+
+    let host = host.to_ascii_lowercase();
+    if host.is_empty() || host.len() > 253 {
+        return Err("ngrok domain hostname is empty or too long".into());
+    }
+    for label in host.split('.') {
+        let valid = !label.is_empty()
+            && label.len() <= 63
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-');
+        if !valid {
+            return Err(format!("invalid hostname label in ngrok domain: {label}"));
+        }
+    }
+    Ok(Some(host))
 }
 
 fn now_hms() -> String {
@@ -782,6 +880,8 @@ impl AppState {
         config_path: PathBuf,
     ) -> std::io::Result<Self> {
         let config = AppConfig::load_from_path(&config_path)?;
+        let ngrok_authtoken = config.ngrok_authtoken.clone();
+        let agents_path_mode = config.agents_path_mode;
         let mascot_seed = rand::random::<u64>();
         let mascot = mascot::build_workspace_mascot(mascot_seed);
         let is_returning_user = config.mcp_slug.is_some() && config.ngrok_domain.is_some();
@@ -796,6 +896,9 @@ impl AppState {
             tool_mode: config.tool_mode,
             mcp_slug,
             ngrok_domain: config.ngrok_domain.clone(),
+            ngrok_authtoken,
+            agents_path_mode,
+            config_dirty: false,
             is_returning_user,
             server_running: false,
             ngrok_running: false,
@@ -879,14 +982,14 @@ impl AppState {
             .iter()
             .position(|activity| activity.job_id.as_deref() == Some(job_id.as_str()));
 
-        if let (Some(target_index), Some(existing_index)) = (target_index, existing_index) {
-            if target_index != existing_index {
-                // start_command is retry-deduplicated by the command manager. If
-                // the same job is returned to a retried MCP request, keep one
-                // visual command entry instead of showing a duplicate execution.
-                self.command_activities.remove(target_index);
-                return;
-            }
+        if let (Some(target_index), Some(existing_index)) = (target_index, existing_index)
+            && target_index != existing_index
+        {
+            // start_command is retry-deduplicated by the command manager. If
+            // the same job is returned to a retried MCP request, keep one
+            // visual command entry instead of showing a duplicate execution.
+            self.command_activities.remove(target_index);
+            return;
         }
 
         if let Some(activity) = self
@@ -921,31 +1024,53 @@ impl AppState {
         }
     }
 
-    fn app_config(&self) -> std::io::Result<AppConfig> {
-        let mut config = AppConfig::load_from_path(&self.config_path)?;
-        config.mcp_slug = Some(self.mcp_slug.clone());
-        config.ngrok_domain = self.ngrok_domain.clone();
-        config.set_moondesk_as_co_author = self.set_moondesk_as_co_author;
-        config.theme = self.theme.clone();
-        config.mode = self.mode;
-        config.tool_mode = self.tool_mode;
-        config.usage_by_model = self.usage_by_model.clone();
-        config.selected_browser = self.selected_browser.clone();
-        Ok(config.normalized())
+    fn app_config(&self) -> AppConfig {
+        AppConfig {
+            ngrok_authtoken: self.ngrok_authtoken.clone(),
+            mcp_slug: Some(self.mcp_slug.clone()),
+            ngrok_domain: self.ngrok_domain.clone(),
+            agents_path_mode: self.agents_path_mode,
+            set_moondesk_as_co_author: self.set_moondesk_as_co_author,
+            theme: self.theme.clone(),
+            mode: self.mode,
+            tool_mode: self.tool_mode,
+            usage_by_model: self.usage_by_model.clone(),
+            selected_browser: self.selected_browser.clone(),
+        }
+        .normalized()
     }
 
     pub fn regenerate_mcp_slug(&mut self) {
         self.mcp_slug = generate_mcp_slug();
+        self.config_dirty = true;
     }
 
+    pub fn ngrok_authtoken(&self) -> Option<&str> {
+        self.ngrok_authtoken.as_deref()
+    }
+
+    pub fn set_ngrok_authtoken(&mut self, token: Option<String>) {
+        self.ngrok_authtoken = token
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        self.config_dirty = true;
+    }
+
+    pub fn mark_config_dirty(&mut self) {
+        self.config_dirty = true;
+    }
+
+    #[cfg(test)]
     pub fn persist_state(&self) -> std::io::Result<()> {
-        self.app_config()?.save_to_path(&self.config_path)
+        self.app_config().save_to_path(&self.config_path)
     }
 
-    pub fn persist_state_with_log(&mut self) {
-        if let Err(e) = self.persist_state() {
-            self.log("WARN", format!("Failed to persist app state: {e}"));
+    fn take_config_snapshot(&mut self, force: bool) -> Option<(AppConfig, PathBuf)> {
+        if !force && !self.config_dirty {
+            return None;
         }
+        self.config_dirty = false;
+        Some((self.app_config(), self.config_path.clone()))
     }
 
     pub fn all_time_usage_totals(&self) -> UsageTotals {
@@ -963,6 +1088,7 @@ impl AppState {
             .accumulate(tool_input_tokens, tool_output_tokens, 1);
         self.session_usage_totals
             .accumulate(tool_input_tokens, tool_output_tokens, 1);
+        self.config_dirty = true;
     }
 
     pub fn apply_server_ui_event(&mut self, event: ServerUiEvent) {
@@ -977,6 +1103,9 @@ impl AppState {
                 } else {
                     self.last_remote_activity_ms = None;
                 }
+            }
+            ServerUiEvent::SetDevtoolsRunning(running) => {
+                self.devtools_running = running;
             }
             ServerUiEvent::RecordFlow {
                 flow_id,
@@ -1112,18 +1241,18 @@ impl AppState {
     pub fn begin_flow_close(&mut self, flow_id: &str) {
         let now_ms = now_unix_millis();
         self.flow_bootstrap_progress.remove(flow_id);
-        if let Some(flow) = self.flows.iter_mut().find(|flow| flow.flow_id == flow_id) {
-            if flow.closing_started_ms.is_none() {
-                flow.closing_started_ms = Some(now_ms);
-                flow.closing_step_ms = flow
-                    .anim_queue
-                    .back()
-                    .map(|seg| seg.step_ms.max(1))
-                    .unwrap_or_else(derive_flow_step_ms);
-                flow.anim_queue.clear();
-                flow.bootstrap_status_active = false;
-                flow.bootstrap_status_close_deadline_ms = None;
-            }
+        if let Some(flow) = self.flows.iter_mut().find(|flow| flow.flow_id == flow_id)
+            && flow.closing_started_ms.is_none()
+        {
+            flow.closing_started_ms = Some(now_ms);
+            flow.closing_step_ms = flow
+                .anim_queue
+                .back()
+                .map(|seg| seg.step_ms.max(1))
+                .unwrap_or_else(derive_flow_step_ms);
+            flow.anim_queue.clear();
+            flow.bootstrap_status_active = false;
+            flow.bootstrap_status_close_deadline_ms = None;
         }
     }
 
@@ -1168,6 +1297,28 @@ impl AppState {
             now_ms.saturating_sub(closing_started_ms) < ttl_ms
         });
     }
+}
+
+pub async fn flush_config(state: &SharedState, force: bool) -> std::io::Result<bool> {
+    let snapshot = {
+        let mut app = state.lock().await;
+        app.take_config_snapshot(force)
+    };
+    let Some((config, path)) = snapshot else {
+        return Ok(false);
+    };
+
+    let write_result = tokio::task::spawn_blocking(move || config.save_to_path(&path))
+        .await
+        .map_err(|error| {
+            std::io::Error::other(format!("config persistence task failed: {error}"))
+        })?;
+    if let Err(error) = write_result {
+        let mut app = state.lock().await;
+        app.config_dirty = true;
+        return Err(error);
+    }
+    Ok(true)
 }
 
 fn generate_mcp_slug() -> String {

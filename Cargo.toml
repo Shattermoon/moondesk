@@ -11,17 +11,17 @@ serde_json = "1"
 uuid = { version = "1", features = ["v4"] }
 ratatui = "0.29"
 crossterm = "0.28"
-reqwest = { version = "0.12", features = ["json"] }
-tokio-stream = "0.1"
+reqwest = { version = "0.12", default-features = false }
+
 base64 = "0.22"
 tiktoken-rs = "0.9.1"
-image = "0.25"
+image = { version = "0.25", default-features = false, features = ["png", "gif"] }
 rand = "0.8"
 rand_mt = "4"
 ngrok = "0.18.0"
 toml = "0.8"
 time = { version = "0.3", features = ["formatting", "macros"] }
-zip = { version = "2.2", default-features = false, features = ["deflate"] }
+
 tree-sitter = "0.25"
 tree-sitter-bash = "0.25.1"
 regex = "1"
@@ -32,7 +32,7 @@ ignore = "0.4"
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Diagnostics_ToolHelp", "Win32_System_JobObjects", "Win32_System_Threading"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Diagnostics_ToolHelp", "Win32_System_JobObjects", "Win32_System_Threading"] }
 
 [profile.release]
 lto = true

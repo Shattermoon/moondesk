@@ -1,4 +1,5 @@
-use std::path::{Path, PathBuf};
+use std::ffi::OsString;
+use std::path::{Component, Path, PathBuf};
 use tree_sitter::{Node, Parser};
 use tree_sitter_bash::LANGUAGE as BASH_LANGUAGE;
 
@@ -19,6 +20,7 @@ pub struct CommandResult {
     pub timed_out: bool,
     pub stdout_truncated: bool,
     pub stderr_truncated: bool,
+    pub output_archive_truncated: bool,
     pub output_archive_error: Option<String>,
 }
 
@@ -60,7 +62,85 @@ pub fn clamp_timeout(t: Option<u64>) -> u64 {
     }
 }
 
-/// Resolve `input` relative to `workspace_root`, rejecting path traversal.
+fn normalize_lexically(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                let _ = normalized.pop();
+            }
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::Normal(segment) => normalized.push(segment),
+        }
+    }
+    normalized
+}
+
+fn resolve_contained_path(
+    workspace_root: &str,
+    base: &Path,
+    input: &str,
+) -> Result<PathBuf, String> {
+    let root = Path::new(workspace_root)
+        .canonicalize()
+        .map(normalize_windows_verbatim_path)
+        .map_err(|e| e.to_string())?;
+    let candidate = if Path::new(input).is_absolute() {
+        PathBuf::from(input)
+    } else {
+        base.join(input)
+    };
+    let candidate = normalize_lexically(&candidate);
+
+    // Canonicalize the nearest existing ancestor rather than the whole candidate.
+    // New leaves cannot be canonicalized, and a lexical prefix check would accept
+    // paths such as `workspace/../outside/file`. Resolving the ancestor also catches
+    // symlink/junction escapes before any missing suffix components are appended.
+    let mut ancestor = candidate.clone();
+    let mut missing_suffix: Vec<OsString> = Vec::new();
+    while !ancestor.exists() {
+        let name = ancestor.file_name().map(OsString::from).ok_or_else(|| {
+            format!(
+                "Unable to resolve path inside workspace: {}",
+                candidate.display()
+            )
+        })?;
+        missing_suffix.push(name);
+        if !ancestor.pop() {
+            return Err(format!(
+                "Unable to resolve path inside workspace: {}",
+                candidate.display()
+            ));
+        }
+    }
+
+    let canonical_ancestor = ancestor
+        .canonicalize()
+        .map(normalize_windows_verbatim_path)
+        .map_err(|e| e.to_string())?;
+    if !canonical_ancestor.starts_with(&root) {
+        return Err(format!(
+            "Path escapes workspace root: {}",
+            candidate.display()
+        ));
+    }
+
+    let mut resolved = canonical_ancestor;
+    for component in missing_suffix.iter().rev() {
+        resolved.push(component);
+    }
+    if !resolved.starts_with(&root) {
+        return Err(format!(
+            "Path escapes workspace root: {}",
+            candidate.display()
+        ));
+    }
+    Ok(resolved)
+}
+
+/// Resolve `input` relative to `workspace_root`, rejecting traversal and symlink escapes.
 pub fn resolve_workspace_path(
     workspace_root: &str,
     input: Option<&str>,
@@ -69,50 +149,16 @@ pub fn resolve_workspace_path(
         .canonicalize()
         .map(normalize_windows_verbatim_path)
         .map_err(|e| e.to_string())?;
-    let input = input.unwrap_or(".");
-
-    let candidate = if Path::new(input).is_absolute() {
-        PathBuf::from(input)
-    } else {
-        root.join(input)
-    };
-
-    let candidate = normalize_windows_verbatim_path(candidate.canonicalize().unwrap_or(candidate));
-    if !candidate.starts_with(&root) {
-        return Err(format!(
-            "Path escapes workspace root: {}",
-            candidate.display()
-        ));
-    }
-    Ok(candidate)
+    resolve_contained_path(workspace_root, &root, input.unwrap_or("."))
 }
 
-/// Resolve `input` relative to `cwd`, rejecting path traversal outside the workspace root.
+/// Resolve `input` relative to `cwd`, rejecting traversal and symlink escapes.
 pub fn resolve_command_path(
     workspace_root: &str,
     cwd: &Path,
     input: Option<&str>,
 ) -> Result<PathBuf, String> {
-    let root = Path::new(workspace_root)
-        .canonicalize()
-        .map(normalize_windows_verbatim_path)
-        .map_err(|e| e.to_string())?;
-    let input = input.unwrap_or(".");
-
-    let candidate = if Path::new(input).is_absolute() {
-        PathBuf::from(input)
-    } else {
-        cwd.join(input)
-    };
-
-    let candidate = normalize_windows_verbatim_path(candidate.canonicalize().unwrap_or(candidate));
-    if !candidate.starts_with(&root) {
-        return Err(format!(
-            "Path escapes workspace root: {}",
-            candidate.display()
-        ));
-    }
-    Ok(candidate)
+    resolve_contained_path(workspace_root, cwd, input.unwrap_or("."))
 }
 
 pub fn normalize_windows_verbatim_path(path: PathBuf) -> PathBuf {
@@ -196,6 +242,7 @@ pub async fn run_command_archived(
         timed_out: result.timed_out,
         stdout_truncated: result.stdout_truncated,
         stderr_truncated: result.stderr_truncated,
+        output_archive_truncated: result.output_archive_truncated,
         output_archive_error: result.output_archive_error,
     }
 }
@@ -959,6 +1006,57 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
+    #[test]
+    fn resolve_workspace_path_rejects_nonexistent_parent_escape() {
+        let workspace_root = test_workspace("resolve-parent-escape");
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        let outside_name = format!(
+            "{}-outside",
+            workspace_root
+                .file_name()
+                .expect("workspace leaf")
+                .to_string_lossy()
+        );
+        let workspace_root_str = workspace_root.to_string_lossy().into_owned();
+        let escaped = format!("../{outside_name}/new-file.txt");
+
+        let error = resolve_workspace_path(&workspace_root_str, Some(&escaped))
+            .expect_err("nonexistent parent traversal must be rejected");
+        assert!(error.contains("escapes workspace root"));
+
+        let safe = resolve_workspace_path(&workspace_root_str, Some("new/subdirectory/file.txt"))
+            .expect("nonexistent path inside workspace should resolve");
+        assert!(
+            safe.starts_with(normalize_windows_verbatim_path(
+                workspace_root
+                    .canonicalize()
+                    .expect("canonicalize workspace")
+            ))
+        );
+
+        let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_workspace_path_rejects_symlink_ancestor_escape() {
+        use std::os::unix::fs::symlink;
+
+        let workspace_root = test_workspace("resolve-symlink-escape");
+        let outside_root = test_workspace("resolve-symlink-outside");
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        std::fs::create_dir_all(&outside_root).expect("create outside");
+        symlink(&outside_root, workspace_root.join("outside-link")).expect("create symlink");
+        let workspace_root_str = workspace_root.to_string_lossy().into_owned();
+
+        let error = resolve_workspace_path(&workspace_root_str, Some("outside-link/new-file.txt"))
+            .expect_err("symlink ancestor escape must be rejected");
+        assert!(error.contains("escapes workspace root"));
+
+        let _ = std::fs::remove_dir_all(workspace_root);
+        let _ = std::fs::remove_dir_all(outside_root);
     }
 
     #[tokio::test]

@@ -1,16 +1,48 @@
 name: Release
 
 on:
+  workflow_dispatch:
   push:
     tags:
       - "v*"
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 permissions:
-  contents: write
+  contents: read
 
 jobs:
+  validate:
+    name: Validate release source
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal --component rustfmt
+
+      - name: Verify release tag matches package version
+        if: github.ref_type == 'tag'
+        shell: bash
+        run: |
+          version="$(node -p "require('./package.json').version")"
+          test "${GITHUB_REF_NAME}" = "v${version}"
+
+      - name: Check formatting
+        run: cargo +stable fmt --check
+
+      - name: Run tests
+        run: cargo +stable test --locked
+
+      - name: Verify npm package contents
+        run: npm pack --dry-run --ignore-scripts
+
   build:
     name: Build ${{ matrix.asset }}
+    needs: validate
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -48,42 +80,54 @@ jobs:
           cp "${{ matrix.binary }}" "dist/${{ matrix.asset }}"
           chmod 755 "dist/${{ matrix.asset }}"
 
+      - name: Smoke-test binary and ClippyMoon export
+        shell: bash
+        run: |
+          "./dist/${{ matrix.asset }}" clippymoon --help
+          "./dist/${{ matrix.asset }}" clippymoon export \
+            --seed 0000000000000042 \
+            --out smoke-export
+          test -s smoke-export/clippymoon.png
+          test -s smoke-export/clippymoon.gif
+
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.asset }}
           path: dist/${{ matrix.asset }}
           if-no-files-found: error
+          retention-days: 7
 
   release:
     name: Create GitHub Release
+    if: github.ref_type == 'tag'
     needs: build
     runs-on: ubuntu-22.04
+    permissions:
+      contents: write
 
     steps:
       - uses: actions/checkout@v4
-
-      - name: Verify tag matches package version
-        run: |
-          version="$(node -p "require('./package.json').version")"
-          test "${GITHUB_REF_NAME}" = "v${version}"
 
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
 
-      - name: Create checksums
+      - name: Assemble release assets and checksums
+        shell: bash
         run: |
           mkdir -p release
           find artifacts -type f -name 'moondesk-*' -exec cp {} release/ \;
           cd release
           sha256sum moondesk-* > SHA256SUMS
+          test "$(find . -maxdepth 1 -type f -name 'moondesk-*' | wc -l)" -eq 5
           ls -la
 
-      - name: Create release
+      - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
+        shell: bash
         run: |
           gh release create "${GITHUB_REF_NAME}" release/* \
-            --title "${GITHUB_REF_NAME}" \
-            --notes "MoonDesk ${GITHUB_REF_NAME}" \
+            --title "MoonDesk ${GITHUB_REF_NAME}" \
+            --generate-notes \
             --verify-tag

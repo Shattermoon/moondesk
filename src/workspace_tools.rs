@@ -1319,7 +1319,10 @@ mod tests {
     use uuid::Uuid;
 
     fn test_workspace(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("catdesk-workspace-tools-{name}-{}", Uuid::new_v4()))
+        std::env::temp_dir().join(format!(
+            "moondesk-workspace-tools-{name}-{}",
+            Uuid::new_v4()
+        ))
     }
 
     #[test]

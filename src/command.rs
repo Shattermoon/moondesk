@@ -8,7 +8,7 @@ use tree_sitter_bash::LANGUAGE as BASH_LANGUAGE;
 const MAX_BUFFER_BYTES: usize = 1024 * 1024;
 pub const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 pub const MAX_TIMEOUT_MS: u64 = 120_000;
-pub const CATDESK_CO_AUTHOR_TRAILER: &str = "Co-Authored-By: CatDesk";
+pub const MOONDESK_CO_AUTHOR_TRAILER: &str = "Co-Authored-By: MoonDesk";
 
 #[derive(Debug)]
 pub struct CommandResult {
@@ -163,7 +163,7 @@ pub fn detect_move_path_intercept(command: &str) -> Option<InterceptedMovePathRe
     detect_move_path_intercept_from_words(&words)
 }
 
-/// Execute a short shell command via CatDesk's shared process runner.
+/// Execute a short shell command via MoonDesk's shared process runner.
 ///
 /// The process runner owns the complete process tree. If this future is timed
 /// out or dropped because the MCP request disappears, the child tree is
@@ -200,10 +200,10 @@ pub async fn run_command_archived(
     }
 }
 
-pub fn contains_catdesk_co_author_marker(command: &str) -> bool {
+pub fn contains_moondesk_co_author_marker(command: &str) -> bool {
     let haystack = command.to_ascii_lowercase();
     let mut cursor = 0usize;
-    for needle in ["co", "author", "by", "catdesk"] {
+    for needle in ["co", "author", "by", "moondesk"] {
         let Some(offset) = haystack[cursor..].find(needle) else {
             return false;
         };
@@ -218,7 +218,7 @@ pub fn command_contains_git_commit(command: &str) -> bool {
         .any(|segment| segment_contains_git_commit(segment))
 }
 
-pub fn inject_catdesk_co_author_trailer(command: &str) -> String {
+pub fn inject_moondesk_co_author_trailer(command: &str) -> String {
     let mut rewritten = String::with_capacity(command.len() + 64);
     for segment in shell_segments(command) {
         rewritten.push_str(&inject_trailer_into_segment(&segment));
@@ -240,7 +240,7 @@ fn inject_trailer_into_segment(segment: &str) -> String {
         let mut rewritten = String::with_capacity(segment.len() + 48);
         rewritten.push_str(&segment[..insert_pos]);
         rewritten.push_str(" --trailer '");
-        rewritten.push_str(CATDESK_CO_AUTHOR_TRAILER);
+        rewritten.push_str(MOONDESK_CO_AUTHOR_TRAILER);
         rewritten.push('\'');
         rewritten.push_str(&segment[insert_pos..]);
         return rewritten;
@@ -249,7 +249,7 @@ fn inject_trailer_into_segment(segment: &str) -> String {
     let Some(payload) = nested_shell_command(segment) else {
         return segment.to_string();
     };
-    let rewritten_command = inject_catdesk_co_author_trailer(&payload.command);
+    let rewritten_command = inject_moondesk_co_author_trailer(&payload.command);
     if rewritten_command == payload.command {
         return segment.to_string();
     }
@@ -935,7 +935,7 @@ mod tests {
     use uuid::Uuid;
 
     fn test_workspace(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("catdesk-command-{name}-{}", Uuid::new_v4()))
+        std::env::temp_dir().join(format!("moondesk-command-{name}-{}", Uuid::new_v4()))
     }
 
     #[test]
@@ -985,36 +985,36 @@ mod tests {
     }
 
     #[test]
-    fn contains_catdesk_co_author_marker_matches_spaced_and_punctuated_phrase() {
-        assert!(contains_catdesk_co_author_marker(
-            "git commit -m \"Fix bug\\n\\nCo-Authored-By: CatDesk\""
+    fn contains_moondesk_co_author_marker_matches_spaced_and_punctuated_phrase() {
+        assert!(contains_moondesk_co_author_marker(
+            "git commit -m \"Fix bug\\n\\nCo-Authored-By: MoonDesk\""
         ));
-        assert!(contains_catdesk_co_author_marker(
-            "git commit -m \"co***author___by:::catdesk\""
+        assert!(contains_moondesk_co_author_marker(
+            "git commit -m \"co***author___by:::moondesk\""
         ));
-        assert!(!contains_catdesk_co_author_marker(
+        assert!(!contains_moondesk_co_author_marker(
             "git commit -m \"fix bug\""
         ));
     }
 
     #[test]
-    fn inject_catdesk_co_author_trailer_rewrites_each_git_commit_segment() {
+    fn inject_moondesk_co_author_trailer_rewrites_each_git_commit_segment() {
         let rewritten =
-            inject_catdesk_co_author_trailer("git add . && git commit -m \"test\" && git status");
+            inject_moondesk_co_author_trailer("git add . && git commit -m \"test\" && git status");
         assert_eq!(
             rewritten,
-            "git add . && git commit --trailer 'Co-Authored-By: CatDesk' -m \"test\" && git status"
+            "git add . && git commit --trailer 'Co-Authored-By: MoonDesk' -m \"test\" && git status"
         );
     }
 
     #[test]
-    fn inject_catdesk_co_author_trailer_rewrites_nested_shell_commit_commands() {
-        let rewritten = inject_catdesk_co_author_trailer(
+    fn inject_moondesk_co_author_trailer_rewrites_nested_shell_commit_commands() {
+        let rewritten = inject_moondesk_co_author_trailer(
             "bash -lc 'git add src/mcp.rs && git commit -m \"Update MCP metadata handling\"'",
         );
         assert_eq!(
             rewritten,
-            "bash -lc 'git add src/mcp.rs && git commit --trailer '\"'\"'Co-Authored-By: CatDesk'\"'\"' -m \"Update MCP metadata handling\"'"
+            "bash -lc 'git add src/mcp.rs && git commit --trailer '\"'\"'Co-Authored-By: MoonDesk'\"'\"' -m \"Update MCP metadata handling\"'"
         );
     }
 

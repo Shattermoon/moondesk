@@ -21,17 +21,17 @@ const PLIST_BUDDY_PATH: &str = "/usr/libexec/PlistBuddy";
 #[cfg(target_os = "macos")]
 const TERMINAL_APP_PATH: &str = "/System/Applications/Utilities/Terminal.app";
 #[cfg(target_os = "macos")]
-const PROFILE_FILE_NAME: &str = "CatDesk.terminal";
+const PROFILE_FILE_NAME: &str = "MoonDesk.terminal";
 #[cfg(target_os = "macos")]
-const PROFILE_NAME: &str = "CatDesk";
+const PROFILE_NAME: &str = "MoonDesk";
 #[cfg(target_os = "macos")]
-const SKIP_ENV: &str = "CATDESK_SKIP_MACOS_TERMINAL_PROFILE";
+const SKIP_ENV: &str = "MOONDESK_SKIP_MACOS_TERMINAL_PROFILE";
 #[cfg(target_os = "macos")]
-const FONT_HEIGHT_SPACING_ENV: &str = "CATDESK_TERMINAL_FONT_HEIGHT_SPACING";
+const FONT_HEIGHT_SPACING_ENV: &str = "MOONDESK_TERMINAL_FONT_HEIGHT_SPACING";
 #[cfg(target_os = "macos")]
-const FONT_WIDTH_SPACING_ENV: &str = "CATDESK_TERMINAL_FONT_WIDTH_SPACING";
+const FONT_WIDTH_SPACING_ENV: &str = "MOONDESK_TERMINAL_FONT_WIDTH_SPACING";
 #[cfg(target_os = "macos")]
-const FONT_ANTIALIAS_ENV: &str = "CATDESK_TERMINAL_FONT_ANTIALIAS";
+const FONT_ANTIALIAS_ENV: &str = "MOONDESK_TERMINAL_FONT_ANTIALIAS";
 #[cfg(target_os = "macos")]
 const PROFILE_IMPORT_DELAY: Duration = Duration::from_millis(400);
 #[cfg(target_os = "macos")]
@@ -47,7 +47,7 @@ const PROFILE_FONT_NAME: &str = "Menlo-Regular";
 #[cfg(target_os = "macos")]
 const PROFILE_FONT_SIZE: i32 = 11;
 #[cfg(target_os = "macos")]
-const PROFILE_BYTES: &[u8] = include_bytes!("../assets/CatDesk.terminal");
+const PROFILE_BYTES: &[u8] = include_bytes!("../assets/MoonDesk.terminal");
 
 #[cfg(target_os = "macos")]
 enum PlistValueType {
@@ -225,7 +225,7 @@ end tell
 fn current_profile_name_for_tty(current_tty: &str) -> Result<Option<String>, String> {
     let script = r#"
 tell application "Terminal"
-  set targetTTY to system attribute "CATDESK_TERMINAL_TARGET_TTY"
+  set targetTTY to system attribute "MOONDESK_TERMINAL_TARGET_TTY"
   repeat with w in windows
     repeat with t in tabs of w
       try
@@ -240,7 +240,7 @@ end tell
 "#;
 
     let profile_name = run_osascript_with_env(
-        &[("CATDESK_TERMINAL_TARGET_TTY", current_tty)],
+        &[("MOONDESK_TERMINAL_TARGET_TTY", current_tty)],
         script,
         "failed to inspect the current Terminal.app tab profile",
     )?
@@ -259,7 +259,7 @@ fn apply_profile_to_tty(current_tty: &str) -> Result<bool, String> {
     let script = format!(
         r#"
 tell application "Terminal"
-  set targetTTY to system attribute "CATDESK_TERMINAL_TARGET_TTY"
+  set targetTTY to system attribute "MOONDESK_TERMINAL_TARGET_TTY"
   repeat with w in windows
     repeat with t in tabs of w
       try
@@ -279,7 +279,7 @@ end tell
     );
 
     run_osascript_with_env(
-        &[("CATDESK_TERMINAL_TARGET_TTY", current_tty)],
+        &[("MOONDESK_TERMINAL_TARGET_TTY", current_tty)],
         &script,
         "failed to apply Terminal.app profile in place",
     )
@@ -345,8 +345,8 @@ fn close_new_helper_windows(existing_window_ids: &[i64], original_tty: &str) -> 
     let script = format!(
         r#"
 tell application "Terminal"
-  set targetTTY to system attribute "CATDESK_TERMINAL_TARGET_TTY"
-  set existingWindowIDsText to system attribute "CATDESK_EXISTING_WINDOW_IDS"
+  set targetTTY to system attribute "MOONDESK_TERMINAL_TARGET_TTY"
+  set existingWindowIDsText to system attribute "MOONDESK_EXISTING_WINDOW_IDS"
   if existingWindowIDsText is "" then
     set existingWindowIDs to {{}}
   else
@@ -403,8 +403,8 @@ end tell
 
     let _ = run_osascript_with_env(
         &[
-            ("CATDESK_TERMINAL_TARGET_TTY", original_tty),
-            ("CATDESK_EXISTING_WINDOW_IDS", &window_ids),
+            ("MOONDESK_TERMINAL_TARGET_TTY", original_tty),
+            ("MOONDESK_EXISTING_WINDOW_IDS", &window_ids),
         ],
         &script,
         "failed to close the temporary Terminal.app helper window",

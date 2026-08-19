@@ -12,7 +12,7 @@ pub async fn start(state: SharedState) -> Result<(), String> {
         (app.port, app.mcp_path())
     };
     let authtoken = load_ngrok_authtoken()
-        .map_err(|e| format!("Failed to read ~/.catdesk/config.toml: {e}"))?
+        .map_err(|e| format!("Failed to read ~/.moondesk/config.toml: {e}"))?
         .ok_or_else(|| "ngrok authtoken is not configured".to_string())?;
     let forwards_to: Url = format!("http://127.0.0.1:{port}")
         .parse()

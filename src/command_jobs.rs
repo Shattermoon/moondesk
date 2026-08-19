@@ -180,7 +180,7 @@ impl CommandJob {
     #[cfg(test)]
     fn new(command: String, cwd: PathBuf, timeout_ms: u64) -> (Arc<Self>, watch::Receiver<bool>) {
         let id = Uuid::new_v4().to_string();
-        let output_dir = cwd.join(format!(".catdesk-command-output-{id}"));
+        let output_dir = cwd.join(format!(".moondesk-command-output-{id}"));
         fs::create_dir_all(&output_dir).expect("create test command output dir");
         let output_paths = process_runner::CommandOutputPaths {
             stdout: output_dir.join("stdout.log"),
@@ -313,7 +313,7 @@ pub struct CommandJobManager {
 impl Default for CommandJobManager {
     fn default() -> Self {
         let output_root = std::env::temp_dir().join(format!(
-            "catdesk-command-output-{}-{}",
+            "moondesk-command-output-{}-{}",
             std::process::id(),
             Uuid::new_v4()
         ));
@@ -589,7 +589,7 @@ impl CommandJobManager {
             .ok_or_else(|| format!("unknown or expired command job: {job_id}"))
     }
 
-    /// Cancel every command still owned by CatDesk and wait briefly for the
+    /// Cancel every command still owned by MoonDesk and wait briefly for the
     /// runners to terminate their process trees. Used during application exit;
     /// ordinary MCP request completion deliberately does not call this.
     pub async fn cancel_all(&self) {
@@ -770,7 +770,7 @@ where
                 }
                 job.append_output(
                     "stderr",
-                    format!("CatDesk failed to read {stream}: {error}\n").as_bytes(),
+                    format!("MoonDesk failed to read {stream}: {error}\n").as_bytes(),
                 )
                 .await;
                 break;
@@ -829,7 +829,7 @@ async fn run_job(job: Arc<CommandJob>, mut cancel_rx: watch::Receiver<bool>) {
             let _ = process.wait().await;
             job.append_output(
                 "stderr",
-                format!("CatDesk failed while waiting for command: {error}\n").as_bytes(),
+                format!("MoonDesk failed while waiting for command: {error}\n").as_bytes(),
             )
             .await;
             (CommandJobState::Failed, None)
@@ -871,7 +871,7 @@ mod tests {
     use super::*;
 
     fn workspace(name: &str) -> PathBuf {
-        let path = std::env::temp_dir().join(format!("catdesk-jobs-{name}-{}", Uuid::new_v4()));
+        let path = std::env::temp_dir().join(format!("moondesk-jobs-{name}-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&path).expect("create test workspace");
         path
     }

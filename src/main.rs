@@ -1069,13 +1069,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         #[cfg(target_os = "macos")]
         Ok(macos_terminal::LaunchAction::ExitAfterProfileBootstrap) => {
             eprintln!(
-                "CatDesk applied the Terminal.app profile. Run the same command again in this tab."
+                "MoonDesk applied the Terminal.app profile. Run the same command again in this tab."
             );
             return Ok(());
         }
         Err(error) => {
             return Err(std::io::Error::other(format!(
-                "CatDesk: macOS Terminal profile bootstrap failed: {error}"
+                "MoonDesk: macOS Terminal profile bootstrap failed: {error}"
             ))
             .into());
         }
@@ -1212,7 +1212,7 @@ fn draw_mode_select(f: &mut Frame, theme: &theme::ThemeDef, tool_mode: ToolMode)
         ])
         .split(area);
 
-    let header = Paragraph::new("  CatDesk - Turns ChatGPT Web into a coding agent =w=")
+    let header = Paragraph::new("  MoonDesk - Turns ChatGPT Web into a coding agent =w=")
         .style(
             Style::default()
                 .fg(palette.header_fg)
@@ -1422,7 +1422,7 @@ async fn run_ngrok_auth_setup(
                             }
                             Err(e) => {
                                 error_message =
-                                    Some(format!("Failed to save ~/.catdesk/config.toml: {e}"));
+                                    Some(format!("Failed to save ~/.moondesk/config.toml: {e}"));
                             }
                         }
                     }
@@ -1572,7 +1572,7 @@ async fn run_ngrok_domain_setup(
                             }
                             Err(e) => {
                                 error_message =
-                                    Some(format!("Failed to save ~/.catdesk/config.toml: {e}"));
+                                    Some(format!("Failed to save ~/.moondesk/config.toml: {e}"));
                             }
                         }
                     }
@@ -2101,7 +2101,7 @@ async fn run_settings(
             current_theme,
             current_tool_mode,
             usage_totals,
-            set_catdesk_as_co_author,
+            set_moondesk_as_co_author,
             mcp_slug,
             ngrok_domain,
         ) = {
@@ -2110,7 +2110,7 @@ async fn run_settings(
                 app.current_theme(),
                 app.tool_mode,
                 app.all_time_usage_totals(),
-                app.set_catdesk_as_co_author,
+                app.set_moondesk_as_co_author,
                 app.mcp_slug.clone(),
                 app.ngrok_domain.clone(),
             )
@@ -2120,7 +2120,7 @@ async fn run_settings(
                 f,
                 current_theme,
                 current_tool_mode,
-                set_catdesk_as_co_author,
+                set_moondesk_as_co_author,
                 &mcp_slug,
                 ngrok_domain.as_deref(),
                 &usage_totals,
@@ -2169,12 +2169,12 @@ async fn run_settings(
                                     app.persist_state_with_log();
                                 }
                             } else if selected_row == settings_action_start {
-                                app.set_catdesk_as_co_author = !app.set_catdesk_as_co_author;
-                                let enabled = app.set_catdesk_as_co_author;
+                                app.set_moondesk_as_co_author = !app.set_moondesk_as_co_author;
+                                let enabled = app.set_moondesk_as_co_author;
                                 app.log(
                                     "INFO",
                                     format!(
-                                        "Set CatDesk as co-author: {}",
+                                        "Set MoonDesk as co-author: {}",
                                         if enabled { "enabled" } else { "disabled" }
                                     ),
                                 );
@@ -2228,7 +2228,7 @@ fn draw_settings(
     f: &mut Frame,
     current_theme: &theme::ThemeDef,
     current_tool_mode: ToolMode,
-    set_catdesk_as_co_author: bool,
+    set_moondesk_as_co_author: bool,
     mcp_slug: &str,
     ngrok_domain: Option<&str>,
     usage_totals: &UsageTotals,
@@ -2367,7 +2367,7 @@ fn draw_settings(
     }
     lines.push(Line::from(vec![Span::styled(
         format!(
-            " {} [{}] Set CatDesk as co-author",
+            " {} [{}] Set MoonDesk as co-author",
             co_author_marker,
             co_author_row + 1
         ),
@@ -2376,12 +2376,12 @@ fn draw_settings(
     lines.push(Line::from(vec![
         Span::styled("     ", Style::default()),
         Span::styled(
-            if set_catdesk_as_co_author {
+            if set_moondesk_as_co_author {
                 "[enabled]"
             } else {
                 "[disabled]"
             },
-            Style::default().fg(if set_catdesk_as_co_author {
+            Style::default().fg(if set_moondesk_as_co_author {
                 palette.success_fg
             } else {
                 palette.muted_fg
@@ -2390,7 +2390,7 @@ fn draw_settings(
     ]));
 
     lines.push(Line::from(vec![Span::styled(
-        "     When enabled, CatDesk automatically appends \"Co-Authored-By: CatDesk\" to git commits and blocks manually written CatDesk co-author trailers.",
+        "     When enabled, MoonDesk automatically appends \"Co-Authored-By: MoonDesk\" to git commits and blocks manually written MoonDesk co-author trailers.",
         Style::default().fg(palette.muted_fg),
     )]));
 
@@ -3014,7 +3014,7 @@ async fn ensure_selected_browser_remote_debugging(
     };
 
     let user_data_dir = format!(
-        "/tmp/catdesk-remote-debug-{}",
+        "/tmp/moondesk-remote-debug-{}",
         sanitize_for_filename(&selected.binary)
     );
     if let Err(e) = std::fs::create_dir_all(&user_data_dir) {
@@ -3841,7 +3841,7 @@ async fn run_tui(
                                         .or_else(|| {
                                             if line.contains("\u{2502}") {
                                                 if line.contains("Name") {
-                                                    Some("CatDesk".to_string())
+                                                    Some("MoonDesk".to_string())
                                                 } else if line.contains("Authentication") {
                                                     Some("None".to_string())
                                                 } else {
@@ -4006,7 +4006,7 @@ fn draw_ui(
         .split(area);
 
     // ── Header ──
-    let header = Paragraph::new("  CatDesk - Turns ChatGPT Web into a coding agent =w=")
+    let header = Paragraph::new("  MoonDesk - Turns ChatGPT Web into a coding agent =w=")
         .style(
             Style::default()
                 .fg(palette.header_fg)
@@ -4410,7 +4410,7 @@ fn draw_ui(
                     guide_text_style,
                 )]),
                 Line::from(vec![Span::styled(
-                    "     CatDesk will instantly connect and this screen will disappear.",
+                    "     MoonDesk will instantly connect and this screen will disappear.",
                     guide_detail_style,
                 )]),
             ]
@@ -4443,7 +4443,7 @@ fn draw_ui(
                 Line::from(vec![
                     Span::styled("     Name          ", guide_detail_style),
                     Span::styled(" │ ", guide_separator_style),
-                    Span::styled("CatDesk", guide_copyable_style),
+                    Span::styled("MoonDesk", guide_copyable_style),
                 ]),
                 {
                     let mut spans = vec![

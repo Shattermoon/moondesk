@@ -2,7 +2,7 @@ theme = "neon"
 mode = "browser"
 toolMode = "multiTools"
 agentsPathMode = "codex"
-setCatdeskAsCoAuthor = true
+setMoondeskAsCoAuthor = true
 partnerBinagotchySeed = "00000000000000ff"
 
 [usageTotals]

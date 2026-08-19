@@ -1,4 +1,4 @@
-# CatDesk Auto Approval
+# MoonDesk Auto Approval
 
 A small Chrome extension that auto click ChatGPT tool approval UI.
 
@@ -8,7 +8,7 @@ A small Chrome extension that auto click ChatGPT tool approval UI.
 - Enabled mode:
   - Watches `https://chatgpt.com/*` pages.
   - Detects ChatGPT tool approval cards.
-  - Highlights only the primary approval button using the CatDesk grayscale palette.
+  - Highlights only the primary approval button using the MoonDesk grayscale palette.
   - Click the approval button.
 - Disabled mode:
   - Stops watching the page.
@@ -39,5 +39,5 @@ The candidate is only highlighted and clicked when the surrounding card contains
 5. Select this folder:
 
 ```text
-extensions/catdesk-auto-approval
+extensions/moondesk-auto-approval
 ```

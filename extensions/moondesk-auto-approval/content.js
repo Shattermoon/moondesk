@@ -5,8 +5,8 @@
   }
 
   const STORAGE_KEY = "enabled";
-  const OVERLAY_ATTR = "data-catdesk-auto-approval-overlay";
-  const OUTLINED_ATTR = "data-catdesk-auto-approval-outlined";
+  const OVERLAY_ATTR = "data-moondesk-auto-approval-overlay";
+  const OUTLINED_ATTR = "data-moondesk-auto-approval-outlined";
   const VERSION = "0.2.2";
   const HIGHLIGHT_COLOR = "rgba(255, 255, 255, 0.42)";
   const HIGHLIGHT_BACKGROUND = "rgba(255, 255, 255, 0.14)";

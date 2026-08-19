@@ -383,37 +383,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "catdesk"
-version = "0.1.8"
-dependencies = [
- "axum",
- "base64 0.22.1",
- "crossterm",
- "globset",
- "ignore",
- "image",
- "libc",
- "ngrok",
- "rand 0.8.5",
- "rand_mt",
- "ratatui",
- "regex",
- "reqwest",
- "serde",
- "serde_json",
- "tiktoken-rs",
- "time",
- "tokio",
- "tokio-stream",
- "toml",
- "tree-sitter",
- "tree-sitter-bash",
- "uuid",
- "windows-sys 0.61.2",
- "zip",
-]
-
-[[package]]
 name = "cc"
 version = "1.2.57"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1661,6 +1630,37 @@ dependencies = [
  "log",
  "wasi",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "moondesk"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "base64 0.22.1",
+ "crossterm",
+ "globset",
+ "ignore",
+ "image",
+ "libc",
+ "ngrok",
+ "rand 0.8.5",
+ "rand_mt",
+ "ratatui",
+ "regex",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tiktoken-rs",
+ "time",
+ "tokio",
+ "tokio-stream",
+ "toml",
+ "tree-sitter",
+ "tree-sitter-bash",
+ "uuid",
+ "windows-sys 0.61.2",
+ "zip",
 ]
 
 [[package]]

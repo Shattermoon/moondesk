@@ -24,7 +24,7 @@ const MASCOT_SPIRIT_FRAME_HEIGHT: u32 = 32;
 pub const TUI_MASCOT_BLOCK_WIDTH: u16 = MASCOT_SPIRIT_FRAME_WIDTH as u16 + 2;
 pub const TUI_MASCOT_BLOCK_HEIGHT: u16 = ((MASCOT_SPIRIT_FRAME_HEIGHT as u16) + 1) / 2 + 2;
 #[cfg_attr(test, allow(dead_code))]
-const CATDESK_DIR_NAME: &str = ".catdesk";
+const MOONDESK_DIR_NAME: &str = ".moondesk";
 #[cfg_attr(test, allow(dead_code))]
 const BINAGOTCHY_DIR_NAME: &str = "binagotchy";
 const METADATA_FILE_NAME: &str = "metadata.toml";
@@ -104,7 +104,7 @@ pub fn build_workspace_mascot(seed: u64) -> MascotPack {
 
 #[cfg_attr(test, allow(dead_code))]
 pub fn archive_startup_mascot(seed: u64) -> std::io::Result<()> {
-    archive_startup_mascot_to_root(seed, &catdesk_binagotchy_root()?)
+    archive_startup_mascot_to_root(seed, &moondesk_binagotchy_root()?)
 }
 
 fn archive_startup_mascot_to_root(seed: u64, root: &Path) -> std::io::Result<()> {
@@ -260,9 +260,9 @@ fn archive_sequence(seed: u64) -> (Vec<RgbaImage>, Vec<u64>, HashMap<String, Str
 }
 
 #[cfg_attr(test, allow(dead_code))]
-pub(crate) fn catdesk_binagotchy_root() -> std::io::Result<PathBuf> {
+pub(crate) fn moondesk_binagotchy_root() -> std::io::Result<PathBuf> {
     Ok(crate::state::user_home_dir()?
-        .join(CATDESK_DIR_NAME)
+        .join(MOONDESK_DIR_NAME)
         .join(BINAGOTCHY_DIR_NAME))
 }
 
@@ -521,7 +521,7 @@ mod tests {
             .duration_since(std::time::SystemTime::UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        let archive_root = std::env::temp_dir().join(format!("catdesk-binagotchy-{unique}"));
+        let archive_root = std::env::temp_dir().join(format!("moondesk-binagotchy-{unique}"));
         archive_startup_mascot_to_root(1, &archive_root).expect("archive mascot");
 
         let mut entries = std::fs::read_dir(&archive_root)

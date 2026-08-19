@@ -16,8 +16,8 @@ async function updateAction(enabled) {
   await chrome.action.setBadgeBackgroundColor({ color: enabled ? "#383838" : "#212121" });
   await chrome.action.setTitle({
     title: enabled
-      ? "CatDesk Auto Approval: enabled"
-      : "CatDesk Auto Approval: disabled",
+      ? "MoonDesk Auto Approval: enabled"
+      : "MoonDesk Auto Approval: disabled",
   });
 }
 

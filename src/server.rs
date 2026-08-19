@@ -319,7 +319,7 @@ async fn health(State(s): State<ServerState>) -> Json<Value> {
     let app = s.app.lock().await;
     Json(json!({
         "status": "ok",
-        "name": "CatDesk",
+        "name": "MoonDesk",
         "description": "MCP Tools for ChatGPT to control your computer and browser",
         "mode": app.mode.label(),
         "tool_mode": app.tool_mode.label(),
@@ -480,8 +480,8 @@ mod tests {
 
     #[tokio::test]
     async fn background_command_survives_separate_stateless_http_requests() {
-        let workspace_root = unique_temp_path("catdesk-post-mcp-command-job");
-        let config_root = unique_temp_path("catdesk-post-mcp-command-job-config");
+        let workspace_root = unique_temp_path("moondesk-post-mcp-command-job");
+        let config_root = unique_temp_path("moondesk-post-mcp-command-job-config");
         let config_path = config_root.join("config.toml");
         std::fs::create_dir_all(&workspace_root).expect("create workspace");
         std::fs::create_dir_all(&config_root).expect("create config dir");
@@ -590,8 +590,8 @@ mod tests {
 
     #[tokio::test]
     async fn post_mcp_accumulates_usage_without_returning_token_metadata() {
-        let workspace_root = unique_temp_path("catdesk-post-mcp-workspace");
-        let config_root = unique_temp_path("catdesk-post-mcp-config");
+        let workspace_root = unique_temp_path("moondesk-post-mcp-workspace");
+        let config_root = unique_temp_path("moondesk-post-mcp-config");
         let config_path = config_root.join("config.toml");
         std::fs::create_dir_all(&workspace_root).expect("create workspace");
         std::fs::create_dir_all(&config_root).expect("create config dir");
@@ -628,7 +628,7 @@ mod tests {
         let result = payload.get("result").expect("missing tool result");
         assert!(
             result.get("_meta").is_none(),
-            "tool result must not return CatDesk UI/token metadata"
+            "tool result must not return MoonDesk UI/token metadata"
         );
 
         let app = app_state.lock().await;
@@ -713,13 +713,13 @@ async fn post_mcp(State(s): State<ServerState>, body_bytes: Bytes) -> Response<B
     // not add command text or result data to ChatGPT's conversation state.
     let command_ui_request = begin_command_ui_request(&body, &s.ui_events);
 
-    let (workspace_root, mode, tool_mode, set_catdesk_as_co_author) = {
+    let (workspace_root, mode, tool_mode, set_moondesk_as_co_author) = {
         let app = s.app.lock().await;
         (
             app.workspace_root.clone(),
             app.mode,
             app.tool_mode,
-            app.set_catdesk_as_co_author,
+            app.set_moondesk_as_co_author,
         )
     };
 
@@ -729,7 +729,7 @@ async fn post_mcp(State(s): State<ServerState>, body_bytes: Bytes) -> Response<B
         &workspace_root,
         mode,
         tool_mode,
-        set_catdesk_as_co_author,
+        set_moondesk_as_co_author,
         &s.command_jobs,
         &s.devtools,
     )

@@ -21,7 +21,7 @@ pub struct LogEntry {
     pub message: String,
 }
 
-/// Local shell-command activity shown only in the CatDesk TUI.
+/// Local shell-command activity shown only in the MoonDesk TUI.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CommandActivityState {
     Running,
@@ -67,7 +67,7 @@ pub struct FlowBootstrapProgress {
     pub pending_steps: VecDeque<usize>,
 }
 
-const APP_CONFIG_DIR_NAME: &str = ".catdesk";
+const APP_CONFIG_DIR_NAME: &str = ".moondesk";
 const APP_CONFIG_FILE_NAME: &str = "config.toml";
 pub const GPT_5_6_AND_EARLIER_USAGE_BUCKET: &str = "through-gpt-5.6";
 pub const CURRENT_USAGE_BUCKET: &str = GPT_5_6_AND_EARLIER_USAGE_BUCKET;
@@ -134,7 +134,7 @@ pub enum AgentsPathMode {
     #[default]
     Default,
     Workspace,
-    Catdesk,
+    Moondesk,
     Codex,
     Disabled,
 }
@@ -150,7 +150,7 @@ pub struct AppConfig {
     #[serde(default)]
     pub partner_binagotchy_seed: Option<String>,
     #[serde(default)]
-    pub set_catdesk_as_co_author: bool,
+    pub set_moondesk_as_co_author: bool,
     pub theme: String,
     pub mode: Mode,
     pub tool_mode: ToolMode,
@@ -167,7 +167,7 @@ impl Default for AppConfig {
             ngrok_domain: None,
             agents_path_mode: AgentsPathMode::Default,
             partner_binagotchy_seed: None,
-            set_catdesk_as_co_author: false,
+            set_moondesk_as_co_author: false,
             theme: theme::DEFAULT_THEME_ID.to_string(),
             mode: Mode::Both,
             tool_mode: ToolMode::MultiTools,
@@ -445,7 +445,7 @@ pub struct AppState {
     pub port: u16,
     pub workspace_root: String,
     pub partner_binagotchy_seed: Option<String>,
-    pub set_catdesk_as_co_author: bool,
+    pub set_moondesk_as_co_author: bool,
     pub mascot: MascotPack,
     pub detected_browsers: Vec<DetectedBrowser>,
     pub selected_browser: Option<DetectedBrowser>,
@@ -483,7 +483,7 @@ fn short_flow_id(flow_id: &str) -> String {
 
 #[cfg(test)]
 pub fn user_home_dir() -> std::io::Result<PathBuf> {
-    Ok(std::env::temp_dir().join(format!("catdesk-test-home-{}", std::process::id())))
+    Ok(std::env::temp_dir().join(format!("moondesk-test-home-{}", std::process::id())))
 }
 
 #[cfg(not(test))]
@@ -829,7 +829,7 @@ impl AppState {
             devtools_running: false,
             port,
             partner_binagotchy_seed,
-            set_catdesk_as_co_author: config.set_catdesk_as_co_author,
+            set_moondesk_as_co_author: config.set_moondesk_as_co_author,
             mascot,
             workspace_root,
             detected_browsers: Vec::new(),
@@ -949,7 +949,7 @@ impl AppState {
         config.mcp_slug = Some(self.mcp_slug.clone());
         config.ngrok_domain = self.ngrok_domain.clone();
         config.partner_binagotchy_seed = self.partner_binagotchy_seed.clone();
-        config.set_catdesk_as_co_author = self.set_catdesk_as_co_author;
+        config.set_moondesk_as_co_author = self.set_moondesk_as_co_author;
         config.theme = self.theme.clone();
         config.mode = self.mode;
         config.tool_mode = self.tool_mode;
@@ -1237,7 +1237,7 @@ mod tests {
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        let workspace = std::env::temp_dir().join(format!("catdesk-config-load-{unique}"));
+        let workspace = std::env::temp_dir().join(format!("moondesk-config-load-{unique}"));
         std::fs::create_dir_all(&workspace).expect("create temp workspace");
         let config_path = workspace.join(APP_CONFIG_FILE_NAME);
         std::fs::write(&config_path, LEGACY_CONFIG_FIXTURE).expect("write legacy config fixture");
@@ -1252,7 +1252,7 @@ mod tests {
         assert_eq!(app.theme, "neon");
         assert!(matches!(app.mode, Mode::Browser));
         assert!(matches!(app.tool_mode, ToolMode::MultiTools));
-        assert!(app.set_catdesk_as_co_author);
+        assert!(app.set_moondesk_as_co_author);
         assert_eq!(
             app.partner_binagotchy_seed.as_deref(),
             Some("00000000000000ff")
@@ -1281,7 +1281,7 @@ mod tests {
             .unwrap_or_default()
             .as_nanos();
         let workspace =
-            std::env::temp_dir().join(format!("catdesk-config-usage-conflict-{unique}"));
+            std::env::temp_dir().join(format!("moondesk-config-usage-conflict-{unique}"));
         std::fs::create_dir_all(&workspace).expect("create temp workspace");
         let config_path = workspace.join(APP_CONFIG_FILE_NAME);
         std::fs::write(
@@ -1325,7 +1325,7 @@ toolCallCount = 1
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        let workspace = std::env::temp_dir().join(format!("catdesk-config-save-{unique}"));
+        let workspace = std::env::temp_dir().join(format!("moondesk-config-save-{unique}"));
         std::fs::create_dir_all(&workspace).expect("create temp workspace");
         let config_path = workspace.join(APP_CONFIG_FILE_NAME);
 
@@ -1377,7 +1377,7 @@ toolCallCount = 1
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        let workspace = std::env::temp_dir().join(format!("catdesk-config-token-{unique}"));
+        let workspace = std::env::temp_dir().join(format!("moondesk-config-token-{unique}"));
         std::fs::create_dir_all(&workspace).expect("create temp config dir");
         let config_path = workspace.join(APP_CONFIG_FILE_NAME);
 
@@ -1400,7 +1400,7 @@ toolCallCount = 1
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        let workspace = std::env::temp_dir().join(format!("catdesk-config-agents-mode-{unique}"));
+        let workspace = std::env::temp_dir().join(format!("moondesk-config-agents-mode-{unique}"));
         std::fs::create_dir_all(&workspace).expect("create temp config dir");
         let config_path = workspace.join(APP_CONFIG_FILE_NAME);
 
@@ -1423,7 +1423,7 @@ toolCallCount = 1
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        let workspace = std::env::temp_dir().join(format!("catdesk-config-partner-{unique}"));
+        let workspace = std::env::temp_dir().join(format!("moondesk-config-partner-{unique}"));
         std::fs::create_dir_all(&workspace).expect("create temp workspace");
         let config_path = workspace.join(APP_CONFIG_FILE_NAME);
 
@@ -1524,7 +1524,7 @@ toolCallCount = 0
 
     #[test]
     fn record_flow_tool_call_does_not_activate_bootstrap_status() {
-        let (mut app, workspace, config_path) = test_app("catdesk-flow-tool-call");
+        let (mut app, workspace, config_path) = test_app("moondesk-flow-tool-call");
 
         app.record_flow(
             "stateless",
@@ -1543,7 +1543,7 @@ toolCallCount = 0
 
     #[test]
     fn record_flow_initialize_activates_bootstrap_status() {
-        let (mut app, workspace, config_path) = test_app("catdesk-flow-initialize");
+        let (mut app, workspace, config_path) = test_app("moondesk-flow-initialize");
 
         app.record_flow(
             "stateless",
@@ -1562,7 +1562,7 @@ toolCallCount = 0
 
     #[test]
     fn record_flow_bootstrap_event_keeps_bootstrap_status_active() {
-        let (mut app, workspace, config_path) = test_app("catdesk-flow-bootstrap-event");
+        let (mut app, workspace, config_path) = test_app("moondesk-flow-bootstrap-event");
 
         app.record_flow(
             "stateless",
@@ -1584,7 +1584,7 @@ toolCallCount = 0
 
     #[test]
     fn record_flow_bootstrap_tracks_tool_discovery_sequence() {
-        let (mut app, workspace, config_path) = test_app("catdesk-flow-bootstrap-tools");
+        let (mut app, workspace, config_path) = test_app("moondesk-flow-bootstrap-tools");
 
         let sequence = [
             // Phase 1: Checking tools
@@ -1618,7 +1618,7 @@ toolCallCount = 0
 
     #[test]
     fn record_flow_bootstrap_ignores_optional_reinitialize_after_tool_discovery() {
-        let (mut app, workspace, config_path) = test_app("catdesk-flow-bootstrap-reinitialize");
+        let (mut app, workspace, config_path) = test_app("moondesk-flow-bootstrap-reinitialize");
 
         let sequence = [
             ("initialize", FlowDirection::Forward),
@@ -1652,7 +1652,7 @@ toolCallCount = 0
 
     #[test]
     fn record_flow_tool_call_after_initialize_deactivates_bootstrap_status() {
-        let (mut app, workspace, config_path) = test_app("catdesk-flow-tool-after-initialize");
+        let (mut app, workspace, config_path) = test_app("moondesk-flow-tool-after-initialize");
 
         app.record_flow(
             "stateless",
@@ -1661,7 +1661,7 @@ toolCallCount = 0
         );
         app.record_flow(
             "stateless",
-            &["tools/call:catdesk_instruction".to_string()],
+            &["tools/call:moondesk_instruction".to_string()],
             FlowDirection::Forward,
         );
 
@@ -1675,7 +1675,7 @@ toolCallCount = 0
 
     #[test]
     fn command_activity_tracks_background_job_without_poll_duplicates() {
-        let (mut app, workspace, config_path) = test_app("catdesk-command-activity");
+        let (mut app, workspace, config_path) = test_app("moondesk-command-activity");
 
         app.apply_server_ui_event(ServerUiEvent::CommandStarted {
             activity_id: "activity-a".into(),
@@ -1691,7 +1691,7 @@ toolCallCount = 0
             job_id: Some("job-1".into()),
             state: CommandActivityState::Running,
             exit_code: None,
-            preview: Some("Compiling catdesk".into()),
+            preview: Some("Compiling moondesk".into()),
         });
         app.apply_server_ui_event(ServerUiEvent::CommandUpdated {
             activity_id: None,
@@ -1728,7 +1728,7 @@ toolCallCount = 0
 
     #[test]
     fn command_activity_history_is_bounded() {
-        let (mut app, workspace, config_path) = test_app("catdesk-command-history");
+        let (mut app, workspace, config_path) = test_app("moondesk-command-history");
 
         for index in 0..(MAX_COMMAND_ACTIVITIES + 20) {
             app.command_started(
@@ -1758,7 +1758,7 @@ toolCallCount = 0
 
     #[test]
     fn record_flow_tool_call_after_close_does_not_reactivate_bootstrap_status() {
-        let (mut app, workspace, config_path) = test_app("catdesk-flow-after-close");
+        let (mut app, workspace, config_path) = test_app("moondesk-flow-after-close");
 
         app.record_flow(
             "stateless",

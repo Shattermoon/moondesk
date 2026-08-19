@@ -1,24 +1,24 @@
 {
-  "name": "catdesk",
-  "version": "0.1.8",
+  "name": "moondesk",
+  "version": "0.1.0",
   "description": "Use ChatGPT Chat as a local coding agent.",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Xeift/CatDesk.git"
+    "url": "git+https://github.com/Shattermoon/moondesk.git"
   },
-  "homepage": "https://github.com/Xeift/CatDesk#readme",
+  "homepage": "https://github.com/Shattermoon/moondesk#readme",
   "bugs": {
-    "url": "https://github.com/Xeift/CatDesk/issues"
+    "url": "https://github.com/Shattermoon/moondesk/issues"
   },
   "bin": {
-    "catdesk": "npm/catdesk.js"
+    "moondesk": "npm/moondesk.js"
   },
   "scripts": {
     "postinstall": "node npm/postinstall.js"
   },
   "files": [
-    "npm/catdesk.js",
+    "npm/moondesk.js",
     "npm/postinstall.js",
     "LICENSE",
     "README.md"

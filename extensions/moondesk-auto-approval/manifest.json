@@ -1,6 +1,6 @@
 {
   "manifest_version": 3,
-  "name": "CatDesk Auto Approval",
+  "name": "MoonDesk Auto Approval",
   "version": "0.2.2",
   "description": "Highlights ChatGPT tool approval primary buttons.",
   "permissions": [
@@ -11,7 +11,7 @@
     "https://chatgpt.com/*"
   ],
   "action": {
-    "default_title": "Toggle CatDesk Auto Approval",
+    "default_title": "Toggle MoonDesk Auto Approval",
     "default_icon": "icon.png"
   },
   "background": {

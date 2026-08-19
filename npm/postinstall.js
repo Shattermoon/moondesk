@@ -8,7 +8,7 @@ const packageRoot = path.resolve(__dirname, "..");
 const packageJson = require(path.join(packageRoot, "package.json"));
 const version = packageJson.version;
 const releaseTag = `v${version}`;
-const releaseBaseUrl = `https://github.com/Xeift/CatDesk/releases/download/${releaseTag}`;
+const releaseBaseUrl = `https://github.com/Shattermoon/moondesk/releases/download/${releaseTag}`;
 
 const supportedTargets = new Set([
   "linux-x64",
@@ -23,20 +23,20 @@ const arch = process.arch;
 const target = `${platform}-${arch}`;
 
 if (!supportedTargets.has(target)) {
-  console.error(`CatDesk does not provide a prebuilt binary for ${target}.`);
+  console.error(`MoonDesk does not provide a prebuilt binary for ${target}.`);
   console.error(`Supported targets: ${Array.from(supportedTargets).join(", ")}`);
   process.exit(1);
 }
 
-const assetName = platform === "win32" ? `catdesk-${target}.exe` : `catdesk-${target}`;
-const executableName = platform === "win32" ? "catdesk.exe" : "catdesk";
+const assetName = platform === "win32" ? `moondesk-${target}.exe` : `moondesk-${target}`;
+const executableName = platform === "win32" ? "moondesk.exe" : "moondesk";
 const binDir = path.join(__dirname, "bin");
 const installedBinary = path.join(binDir, executableName);
 
 async function fetchRequired(url) {
   const response = await fetch(url, {
     headers: {
-      "User-Agent": `catdesk-npm-install/${version}`,
+      "User-Agent": `moondesk-npm-install/${version}`,
     },
   });
 
@@ -91,6 +91,6 @@ async function main() {
 }
 
 main().catch((error) => {
-  console.error(`CatDesk install failed: ${error.message}`);
+  console.error(`MoonDesk install failed: ${error.message}`);
   process.exit(1);
 });

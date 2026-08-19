@@ -957,7 +957,7 @@ fn build_animation_snapshot(app: &UiSnapshot) -> Vec<String> {
         let lane_active = closing
             || !flow.anim_queue.is_empty()
             || (app.server_running && app.ngrok_running && app.remote_connected);
-        let direction = Some(flow_direction(Some(flow), now_millis)).filter(|_| lane_active);
+        let direction = lane_active.then_some(flow_direction(Some(flow), now_millis));
         let phase = flow_phase(flow, now_millis);
         let lit = flow_lit_count(Some(flow), now_millis, FLOW_ROW_CELLS);
         let lane = debug_lane(direction, lit, FLOW_ROW_CELLS);
@@ -1095,10 +1095,10 @@ fn clipboard_paste() -> Option<String> {
             _ => continue,
         };
 
-        if let Ok(text) = String::from_utf8(output.stdout) {
-            if !text.is_empty() {
-                return Some(text);
-            }
+        if let Ok(text) = String::from_utf8(output.stdout)
+            && !text.is_empty()
+        {
+            return Some(text);
         }
     }
 

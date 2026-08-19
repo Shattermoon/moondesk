@@ -3,7 +3,7 @@
 An open-source tool that lets you use ChatGPT Chat as a local coding agent. No reverse engineering, no API, no Codex, no Work mode. A ChatGPT Plus subscription is enough.
 
 > [!NOTE]
-> MoonDesk is maintained by **Shattermoon** and starts from the lightweight CatDesk experimental codebase. MoonDesk replaces the legacy mascot system with **ClippyMoon**, a deterministic procedural moon companion generated locally from a random seed.
+> MoonDesk is maintained by **Shattermoon** and is built around a lightweight local MCP architecture. Its procedural companion, **ClippyMoon**, is generated locally from a deterministic random seed.
 
 <p align="center">
   <img src="docs/images/moondesk_preview.gif" alt="MoonDesk in ChatGPT Web"><br>
@@ -291,6 +291,11 @@ https://xxxx.ngrok-free.dev/Ab3kL9xQ2pTm7VhC/mcp
 Both the static domain and the random path are persisted in `~/.moondesk/config.toml`, so the full MCP URL stays the same across launches. You only need to set up the connector once.
 
 # About ClippyMoon
+
+<p align="center">
+  <img src="docs/images/clippymoon.gif" alt="ClippyMoon!" width="500"><br>
+  <em>ClippyMoon!</em>
+</p>
 
 ClippyMoon is MoonDesk's procedural lunar companion. It is generated entirely in Rust from a random 64-bit seed when MoonDesk starts; no image-generation model or bundled sprite sheet is used.
 

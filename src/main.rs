@@ -1,5 +1,5 @@
-mod binagotchy_gen;
 mod browser;
+mod clippymoon_gen;
 mod command;
 mod command_jobs;
 mod devtools;
@@ -1062,8 +1062,87 @@ fn drain_server_ui_events(app: &mut AppState, ui_events: &mut UnboundedReceiver<
 
 // ── Main ────────────────────────────────────────────────────
 
+#[derive(Debug)]
+struct ClippyMoonExportArgs {
+    seed: Option<u64>,
+    output_dir: std::path::PathBuf,
+}
+
+fn parse_clippymoon_export_args(args: &[String]) -> Result<Option<ClippyMoonExportArgs>, String> {
+    if args.first().map(String::as_str) != Some("clippymoon") {
+        return Ok(None);
+    }
+    if args.get(1).map(String::as_str) != Some("export") {
+        return Err("usage: moondesk clippymoon export [--seed HEX] [--out DIRECTORY]".to_string());
+    }
+
+    let mut seed = None;
+    let mut output_dir = std::env::current_dir().map_err(|error| error.to_string())?;
+    let mut index = 2;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--seed" => {
+                index += 1;
+                let value = args
+                    .get(index)
+                    .ok_or_else(|| "--seed requires a hexadecimal seed".to_string())?;
+                let value = value.strip_prefix("0x").unwrap_or(value);
+                seed = Some(
+                    u64::from_str_radix(value, 16)
+                        .map_err(|error| format!("invalid ClippyMoon seed `{value}`: {error}"))?,
+                );
+            }
+            "--out" => {
+                index += 1;
+                let value = args
+                    .get(index)
+                    .ok_or_else(|| "--out requires a directory path".to_string())?;
+                output_dir = std::path::PathBuf::from(value);
+            }
+            "-h" | "--help" => {
+                return Err(
+                    "usage: moondesk clippymoon export [--seed HEX] [--out DIRECTORY]".to_string(),
+                );
+            }
+            unknown => {
+                return Err(format!(
+                    "unknown ClippyMoon export option `{unknown}`\nusage: moondesk clippymoon export [--seed HEX] [--out DIRECTORY]"
+                ));
+            }
+        }
+        index += 1;
+    }
+
+    Ok(Some(ClippyMoonExportArgs { seed, output_dir }))
+}
+
+fn print_clippymoon_export(export: &mascot::ClippyMoonExport) {
+    println!("ClippyMoon exported");
+    println!("seed: {:016x}", export.seed);
+    println!("phase: {}", export.traits.phase.name());
+    println!("color: {}", export.traits.color.name());
+    println!("expression: {}", export.traits.expression.name());
+    println!("png: {}", export.png_path.display());
+    println!("gif: {}", export.gif_path.display());
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let cli_args = std::env::args().skip(1).collect::<Vec<_>>();
+    match parse_clippymoon_export_args(&cli_args) {
+        Ok(Some(export_args)) => {
+            let export = mascot::export_clippymoon(export_args.seed, &export_args.output_dir)?;
+            print_clippymoon_export(&export);
+            return Ok(());
+        }
+        Ok(None) => {}
+        Err(message) if cli_args.iter().any(|arg| arg == "-h" || arg == "--help") => {
+            println!("{message}");
+            return Ok(());
+        }
+        Err(message) => return Err(std::io::Error::other(message).into()),
+    }
+
     match macos_terminal::maybe_relaunch_in_terminal_profile() {
         Ok(macos_terminal::LaunchAction::Continue) => {}
         #[cfg(target_os = "macos")]
@@ -1884,11 +1963,35 @@ mod tests {
     use super::{
         BottomPanelAreas, BottomPanelFocus, PanelItemHit, PanelScrollView, item_under_cursor,
         key_is_clipboard_paste, move_panel_selection, normalize_ngrok_authtoken_input,
-        panel_under_cursor, scroll_panel_down, scroll_panel_up, tail_start_index,
-        truncate_with_ellipsis, wrap_preserving_chars,
+        panel_under_cursor, parse_clippymoon_export_args, scroll_panel_down, scroll_panel_up,
+        tail_start_index, truncate_with_ellipsis, wrap_preserving_chars,
     };
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::layout::Rect;
+
+    #[test]
+    fn clippymoon_without_export_subcommand_returns_usage() {
+        let args = vec!["clippymoon".to_string()];
+        let error = parse_clippymoon_export_args(&args).expect_err("missing subcommand must fail");
+        assert!(error.starts_with("usage: moondesk clippymoon export"));
+    }
+
+    #[test]
+    fn clippymoon_help_returns_usage_instead_of_starting_tui() {
+        let args = vec!["clippymoon".to_string(), "--help".to_string()];
+        let error = parse_clippymoon_export_args(&args).expect_err("help should return usage text");
+        assert!(error.starts_with("usage: moondesk clippymoon export"));
+    }
+
+    #[test]
+    fn non_clippymoon_args_do_not_intercept_normal_startup() {
+        let args = vec!["something-else".to_string()];
+        assert!(
+            parse_clippymoon_export_args(&args)
+                .expect("non-ClippyMoon arguments should parse")
+                .is_none()
+        );
+    }
 
     #[test]
     fn normalizes_plain_ngrok_token() {
@@ -4551,7 +4654,7 @@ fn draw_ui(
     f.render_widget(status_block, status_columns[0]);
     if show_mascot {
         let mascot_block = Block::default()
-            .title(" Binagotchy ")
+            .title(" ClippyMoon ")
             .borders(Borders::ALL)
             .border_type(palette.border_type)
             .border_style(Style::default().fg(palette.border_fg));

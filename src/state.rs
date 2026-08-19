@@ -148,8 +148,6 @@ pub struct AppConfig {
     #[serde(default)]
     pub agents_path_mode: AgentsPathMode,
     #[serde(default)]
-    pub partner_binagotchy_seed: Option<String>,
-    #[serde(default)]
     pub set_moondesk_as_co_author: bool,
     pub theme: String,
     pub mode: Mode,
@@ -166,7 +164,6 @@ impl Default for AppConfig {
             mcp_slug: None,
             ngrok_domain: None,
             agents_path_mode: AgentsPathMode::Default,
-            partner_binagotchy_seed: None,
             set_moondesk_as_co_author: false,
             theme: theme::DEFAULT_THEME_ID.to_string(),
             mode: Mode::Both,
@@ -188,11 +185,6 @@ impl AppConfig {
             .ngrok_domain
             .take()
             .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty());
-        self.partner_binagotchy_seed = self
-            .partner_binagotchy_seed
-            .take()
-            .map(|value| value.trim().to_ascii_lowercase())
             .filter(|value| !value.is_empty());
         self.usage_by_model = self
             .usage_by_model
@@ -444,7 +436,6 @@ pub struct AppState {
     pub devtools_running: bool,
     pub port: u16,
     pub workspace_root: String,
-    pub partner_binagotchy_seed: Option<String>,
     pub set_moondesk_as_co_author: bool,
     pub mascot: MascotPack,
     pub detected_browsers: Vec<DetectedBrowser>,
@@ -546,12 +537,6 @@ pub fn save_ngrok_domain(domain: &str) -> std::io::Result<PathBuf> {
     config.ngrok_domain = Some(domain.to_string());
     config.save_to_path(&path)?;
     Ok(path)
-}
-
-pub(crate) fn parse_seed_hex(seed: &str) -> std::io::Result<u64> {
-    u64::from_str_radix(seed, 16).map_err(|error| {
-        std::io::Error::other(format!("invalid partner Binagotchy seed `{seed}`: {error}"))
-    })
 }
 
 fn now_hms() -> String {
@@ -797,24 +782,15 @@ impl AppState {
         config_path: PathBuf,
     ) -> std::io::Result<Self> {
         let config = AppConfig::load_from_path(&config_path)?;
-        let partner_binagotchy_seed = config.partner_binagotchy_seed.clone();
-        let mascot_seed = if let Some(seed) = partner_binagotchy_seed.as_deref() {
-            parse_seed_hex(seed)?
-        } else {
-            rand::random::<u64>()
-        };
+        let mascot_seed = rand::random::<u64>();
         let mascot = mascot::build_workspace_mascot(mascot_seed);
-        #[cfg(not(test))]
-        if partner_binagotchy_seed.is_none() {
-            mascot::archive_startup_mascot(mascot_seed)?;
-        }
         let is_returning_user = config.mcp_slug.is_some() && config.ngrok_domain.is_some();
         let mcp_slug = match config.mcp_slug {
             Some(slug) if !slug.is_empty() => slug,
             _ => generate_mcp_slug(),
         };
 
-        Ok(Self {
+        let mut app = Self {
             theme: config.theme,
             mode: config.mode,
             tool_mode: config.tool_mode,
@@ -828,7 +804,6 @@ impl AppState {
             last_remote_activity_ms: None,
             devtools_running: false,
             port,
-            partner_binagotchy_seed,
             set_moondesk_as_co_author: config.set_moondesk_as_co_author,
             mascot,
             workspace_root,
@@ -847,7 +822,9 @@ impl AppState {
             ngrok_task: None,
             remote_browser_child: None,
             devtools_child: None,
-        })
+        };
+        app.log("INFO", format!("ClippyMoon seed: {mascot_seed:016x}"));
+        Ok(app)
     }
 
     pub fn current_theme(&self) -> &'static theme::ThemeDef {
@@ -948,7 +925,6 @@ impl AppState {
         let mut config = AppConfig::load_from_path(&self.config_path)?;
         config.mcp_slug = Some(self.mcp_slug.clone());
         config.ngrok_domain = self.ngrok_domain.clone();
-        config.partner_binagotchy_seed = self.partner_binagotchy_seed.clone();
         config.set_moondesk_as_co_author = self.set_moondesk_as_co_author;
         config.theme = self.theme.clone();
         config.mode = self.mode;
@@ -1232,6 +1208,21 @@ mod tests {
     }
 
     #[test]
+    fn app_state_logs_clippymoon_seed_for_reproduction() {
+        let (app, workspace, config_path) = test_app("moondesk-clippymoon-seed-log");
+        let seed_text = app
+            .logs
+            .iter()
+            .find_map(|entry| entry.message.strip_prefix("ClippyMoon seed: "))
+            .expect("startup should log the ClippyMoon seed");
+        assert_eq!(seed_text.len(), 16);
+        assert!(seed_text.chars().all(|ch| ch.is_ascii_hexdigit()));
+
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
     fn app_state_loads_persisted_config_file() {
         let unique = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -1253,10 +1244,6 @@ mod tests {
         assert!(matches!(app.mode, Mode::Browser));
         assert!(matches!(app.tool_mode, ToolMode::MultiTools));
         assert!(app.set_moondesk_as_co_author);
-        assert_eq!(
-            app.partner_binagotchy_seed.as_deref(),
-            Some("00000000000000ff")
-        );
         let all_time_usage = app.all_time_usage_totals();
         assert_eq!(all_time_usage.tool_input_tokens, 120);
         assert_eq!(all_time_usage.tool_output_tokens, 34);
@@ -1412,49 +1399,6 @@ toolCallCount = 1
 
         let saved = AppConfig::load_from_path(&config_path).expect("load config");
         assert!(matches!(saved.agents_path_mode, AgentsPathMode::Codex));
-
-        let _ = std::fs::remove_file(config_path);
-        let _ = std::fs::remove_dir(workspace);
-    }
-
-    #[test]
-    fn app_state_loads_partner_binagotchy_seed() {
-        let unique = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let workspace = std::env::temp_dir().join(format!("moondesk-config-partner-{unique}"));
-        std::fs::create_dir_all(&workspace).expect("create temp workspace");
-        let config_path = workspace.join(APP_CONFIG_FILE_NAME);
-
-        std::fs::write(
-            &config_path,
-            r#"
-theme = "concise"
-mode = "both"
-toolMode = "multiTools"
-partnerBinagotchySeed = "00000000000000ff"
-
-[usageTotals]
-inputTokens = 0
-outputTokens = 0
-totalTokens = 0
-toolCallCount = 0
-"#,
-        )
-        .expect("write config file");
-
-        let app = AppState::from_config_path(
-            8787,
-            workspace.to_string_lossy().into_owned(),
-            config_path.clone(),
-        )
-        .expect("load app state");
-
-        assert_eq!(
-            app.partner_binagotchy_seed.as_deref(),
-            Some("00000000000000ff")
-        );
 
         let _ = std::fs::remove_file(config_path);
         let _ = std::fs::remove_dir(workspace);

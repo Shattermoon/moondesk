@@ -9,6 +9,7 @@ use ratatui::{
 };
 use std::{
     fs::{self, File},
+    io::BufWriter,
     path::{Path, PathBuf},
 };
 
@@ -33,6 +34,7 @@ const MASCOT_SEQUENCE: &[(u8, i32, u8, u8)] = &[
     (10, 0, 3, 6),
 ];
 
+/// One terminal half-block cell with optional foreground and background RGB colors.
 #[derive(Clone)]
 pub struct TuiMascotCell {
     pub glyph: char,
@@ -40,17 +42,20 @@ pub struct TuiMascotCell {
     pub bg: Option<(u8, u8, u8)>,
 }
 
+/// A complete terminal-renderable ClippyMoon frame.
 #[derive(Clone)]
 pub struct TuiMascotFrame {
     pub rows: Vec<Vec<TuiMascotCell>>,
 }
 
+/// Precomputed terminal animation frames for the current session's ClippyMoon.
 #[derive(Clone)]
 pub struct MascotPack {
     pub frame_ms: u64,
     pub tui_frames: Vec<TuiMascotFrame>,
 }
 
+/// Paths, seed, and identity traits produced by an explicit ClippyMoon export.
 pub struct ClippyMoonExport {
     pub seed: u64,
     pub png_path: PathBuf,
@@ -59,6 +64,7 @@ pub struct ClippyMoonExport {
 }
 
 impl MascotPack {
+    /// Select the animation frame corresponding to the supplied monotonic-ish millisecond clock.
     pub fn current_tui_frame(&self, now_millis: u128) -> &TuiMascotFrame {
         let idx = if self.tui_frames.is_empty() {
             0
@@ -105,7 +111,7 @@ pub fn export_clippymoon(
     write_png(&png_path, &character)?;
 
     let animation = mascot_animation_frames(seed);
-    let mut encoder = GifEncoder::new(File::create(&gif_path)?);
+    let mut encoder = GifEncoder::new(BufWriter::new(File::create(&gif_path)?));
     encoder
         .set_repeat(Repeat::Infinite)
         .map_err(std::io::Error::other)?;
@@ -126,6 +132,7 @@ pub fn export_clippymoon(
     })
 }
 
+/// Convert a terminal mascot frame into centered Ratatui lines for the mascot panel.
 pub fn render_tui_lines(frame: &TuiMascotFrame, area_height: u16) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     let target_height = area_height as usize;
@@ -155,24 +162,7 @@ pub fn render_tui_lines(frame: &TuiMascotFrame, area_height: u16) -> Vec<Line<'s
     lines
 }
 
-fn mascot_source_frames(seed: u64) -> Vec<RgbaImage> {
-    MASCOT_SEQUENCE
-        .iter()
-        .flat_map(|&(eye_openness, bob_offset, twinkle_frame, repeat)| {
-            let (frame, _) = clippymoon_gen::create_character(
-                Some(seed),
-                MASCOT_FRAME_WIDTH,
-                MASCOT_FRAME_HEIGHT,
-                openness_value(eye_openness),
-                bob_offset,
-                twinkle_frame,
-            );
-            std::iter::repeat_n(frame, repeat as usize)
-        })
-        .collect()
-}
-
-fn mascot_animation_frames(seed: u64) -> Vec<(RgbaImage, u64)> {
+fn mascot_sequence_frames(seed: u64) -> Vec<(RgbaImage, u8)> {
     MASCOT_SEQUENCE
         .iter()
         .map(|&(eye_openness, bob_offset, twinkle_frame, repeat)| {
@@ -184,8 +174,22 @@ fn mascot_animation_frames(seed: u64) -> Vec<(RgbaImage, u64)> {
                 bob_offset,
                 twinkle_frame,
             );
-            (frame, repeat as u64 * MASCOT_FRAME_MS)
+            (frame, repeat)
         })
+        .collect()
+}
+
+fn mascot_source_frames(seed: u64) -> Vec<RgbaImage> {
+    mascot_sequence_frames(seed)
+        .into_iter()
+        .flat_map(|(frame, repeat)| std::iter::repeat_n(frame, repeat as usize))
+        .collect()
+}
+
+fn mascot_animation_frames(seed: u64) -> Vec<(RgbaImage, u64)> {
+    mascot_sequence_frames(seed)
+        .into_iter()
+        .map(|(frame, repeat)| (frame, repeat as u64 * MASCOT_FRAME_MS))
         .collect()
 }
 
@@ -293,7 +297,9 @@ fn build_tui_cell(top: image::Rgba<u8>, bottom: image::Rgba<u8>) -> TuiMascotCel
 
 #[cfg(test)]
 mod tests {
-    use super::{CLIPPYMOON_EXPORT_SIZE, export_clippymoon};
+    use super::{CLIPPYMOON_EXPORT_SIZE, MASCOT_SEQUENCE, export_clippymoon};
+    use image::{AnimationDecoder, codecs::gif::GifDecoder};
+    use std::{fs::File, io::BufReader};
 
     #[test]
     fn explicit_export_writes_png_and_gif_without_startup_archiving() {
@@ -323,6 +329,15 @@ mod tests {
                 .len()
                 > 0
         );
+        let decoder = GifDecoder::new(BufReader::new(
+            File::open(&export.gif_path).expect("open exported gif"),
+        ))
+        .expect("decode exported gif");
+        let gif_frames = decoder
+            .into_frames()
+            .collect_frames()
+            .expect("collect exported gif frames");
+        assert_eq!(gif_frames.len(), MASCOT_SEQUENCE.len());
 
         let _ = std::fs::remove_dir_all(output_dir);
     }

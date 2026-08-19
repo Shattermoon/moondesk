@@ -17,6 +17,10 @@ struct Star {
     phase: u8,
 }
 
+/// Render a single transparent-background ClippyMoon animation frame.
+///
+/// Identity comes from `traits` and `seed`; animation-only inputs control the blink,
+/// one-pixel bob, and star-twinkle state without changing the moon's identity.
 pub fn render_clippymoon(
     seed: u64,
     width: u32,
@@ -264,11 +268,24 @@ fn draw_face(
     let right_eye_x = cx + 4;
     let eye_y = cy;
 
-    draw_eye(image, left_eye_x, eye_y, eye_openness, face_dark, eye_glint);
+    draw_eye(
+        image,
+        left_eye_x,
+        eye_y,
+        cx,
+        cy,
+        radius,
+        eye_openness,
+        face_dark,
+        eye_glint,
+    );
     draw_eye(
         image,
         right_eye_x,
         eye_y,
+        cx,
+        cy,
+        radius,
         eye_openness,
         face_dark,
         eye_glint,
@@ -281,53 +298,73 @@ fn draw_face(
         put_if_inside_moon(image, cx + 7, cy + 3, cx, cy, radius, palette.blush);
     }
 
+    let mut put_face_pixel = |x: i32, y: i32| {
+        put_if_inside_moon(image, x, y, cx, cy, radius, face_dark);
+    };
     match expression {
         MoonExpression::SoftSmile => {
-            put(image, cx - 2, cy + 3, face_dark);
-            put(image, cx - 1, cy + 4, face_dark);
-            put(image, cx, cy + 4, face_dark);
-            put(image, cx + 1, cy + 4, face_dark);
-            put(image, cx + 2, cy + 3, face_dark);
+            put_face_pixel(cx - 2, cy + 3);
+            put_face_pixel(cx - 1, cy + 4);
+            put_face_pixel(cx, cy + 4);
+            put_face_pixel(cx + 1, cy + 4);
+            put_face_pixel(cx + 2, cy + 3);
         }
         MoonExpression::TinySmile => {
-            put(image, cx - 1, cy + 4, face_dark);
-            put(image, cx, cy + 5, face_dark);
-            put(image, cx + 1, cy + 4, face_dark);
+            put_face_pixel(cx - 1, cy + 4);
+            put_face_pixel(cx, cy + 5);
+            put_face_pixel(cx + 1, cy + 4);
         }
         MoonExpression::Cheeky => {
-            put(image, cx - 2, cy + 4, face_dark);
-            put(image, cx - 1, cy + 5, face_dark);
-            put(image, cx, cy + 5, face_dark);
-            put(image, cx + 1, cy + 5, face_dark);
-            put(image, cx + 2, cy + 4, face_dark);
-            put(image, cx + 1, cy + 6, face_dark);
+            put_face_pixel(cx - 2, cy + 4);
+            put_face_pixel(cx - 1, cy + 5);
+            put_face_pixel(cx, cy + 5);
+            put_face_pixel(cx + 1, cy + 5);
+            put_face_pixel(cx + 2, cy + 4);
+            put_face_pixel(cx + 1, cy + 6);
         }
     }
 }
 
-fn draw_eye(image: &mut RgbaImage, cx: i32, cy: i32, openness: f32, dark: Color, glint: Color) {
+fn draw_eye(
+    image: &mut RgbaImage,
+    eye_cx: i32,
+    eye_cy: i32,
+    moon_cx: i32,
+    moon_cy: i32,
+    moon_radius: i32,
+    openness: f32,
+    dark: Color,
+    glint: Color,
+) {
+    let mut put_eye_pixel = |x: i32, y: i32, color: Color| {
+        put_if_inside_moon(image, x, y, moon_cx, moon_cy, moon_radius, color);
+    };
     let openness = openness.clamp(0.0, 1.0);
     if openness <= 0.15 {
-        put(image, cx - 1, cy + 1, dark);
-        put(image, cx, cy + 1, dark);
-        put(image, cx + 1, cy + 1, dark);
+        for x in -1..=1 {
+            put_eye_pixel(eye_cx + x, eye_cy + 1, dark);
+        }
         return;
     }
     if openness < 0.65 {
-        put(image, cx - 1, cy, dark);
-        put(image, cx, cy, dark);
-        put(image, cx + 1, cy, dark);
-        put(image, cx, cy + 1, dark);
+        for &(x, y) in &[
+            (eye_cx - 1, eye_cy),
+            (eye_cx, eye_cy),
+            (eye_cx + 1, eye_cy),
+            (eye_cx, eye_cy + 1),
+        ] {
+            put_eye_pixel(x, y, dark);
+        }
         return;
     }
 
     for y in -1..=2 {
         for x in -1..=1 {
-            put(image, cx + x, cy + y, dark);
+            put_eye_pixel(eye_cx + x, eye_cy + y, dark);
         }
     }
-    put(image, cx - 1, cy - 1, glint);
-    put(image, cx, cy - 1, glint);
+    put_eye_pixel(eye_cx - 1, eye_cy - 1, glint);
+    put_eye_pixel(eye_cx, eye_cy - 1, glint);
 }
 
 fn generate_stars(
@@ -369,7 +406,7 @@ fn generate_stars(
 fn draw_stars(image: &mut RgbaImage, stars: &[Star], palette: MoonPalette, twinkle_frame: u8) {
     let dim = blend(palette.star, rgba(40, 48, 67, 255), 0.62);
     for star in stars {
-        let age = (twinkle_frame + 6 - star.phase) % 6;
+        let age = (twinkle_frame % 6 + 6 - star.phase) % 6;
         match age {
             0 => {
                 put(image, star.x, star.y, palette.star);
@@ -466,8 +503,9 @@ fn mt_key(seed: u64) -> Vec<u32> {
 
 #[cfg(test)]
 mod tests {
-    use super::phase_is_lit;
-    use crate::clippymoon_gen::types::MoonPhase;
+    use super::{Star, draw_face, draw_stars, phase_is_lit};
+    use crate::clippymoon_gen::types::{MoonColor, MoonExpression, MoonPhase};
+    use image::RgbaImage;
 
     fn lit_pixels(phase: MoonPhase) -> usize {
         let radius = 10;
@@ -494,5 +532,47 @@ mod tests {
         assert!(crescent < quarter);
         assert!(quarter < gibbous);
         assert!(gibbous < full);
+    }
+
+    #[test]
+    fn face_pixels_stay_inside_minimum_moon_disc() {
+        let mut image = RgbaImage::new(16, 16);
+        let cx = 8;
+        let cy = 8;
+        let radius = 5;
+        draw_face(
+            &mut image,
+            cx,
+            cy,
+            radius,
+            MoonPhase::Full,
+            MoonExpression::Cheeky,
+            true,
+            MoonColor::PaleIvory.palette(),
+            1.0,
+        );
+
+        for (x, y, pixel) in image.enumerate_pixels() {
+            if pixel[3] == 0 {
+                continue;
+            }
+            let dx = x as i32 - cx;
+            let dy = y as i32 - cy;
+            assert!(
+                dx * dx + dy * dy <= radius * radius,
+                "face pixel ({x}, {y}) escaped the moon disc"
+            );
+        }
+    }
+
+    #[test]
+    fn twinkle_frame_accepts_entire_u8_range() {
+        let mut image = RgbaImage::new(8, 8);
+        let stars = [Star {
+            x: 4,
+            y: 4,
+            phase: 5,
+        }];
+        draw_stars(&mut image, &stars, MoonColor::PaleIvory.palette(), u8::MAX);
     }
 }

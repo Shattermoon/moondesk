@@ -790,7 +790,7 @@ impl AppState {
             _ => generate_mcp_slug(),
         };
 
-        Ok(Self {
+        let mut app = Self {
             theme: config.theme,
             mode: config.mode,
             tool_mode: config.tool_mode,
@@ -822,7 +822,9 @@ impl AppState {
             ngrok_task: None,
             remote_browser_child: None,
             devtools_child: None,
-        })
+        };
+        app.log("INFO", format!("ClippyMoon seed: {mascot_seed:016x}"));
+        Ok(app)
     }
 
     pub fn current_theme(&self) -> &'static theme::ThemeDef {
@@ -1203,6 +1205,21 @@ mod tests {
 
         assert!(test_home.starts_with(std::env::temp_dir()));
         assert_ne!(Some(test_home), process_home);
+    }
+
+    #[test]
+    fn app_state_logs_clippymoon_seed_for_reproduction() {
+        let (app, workspace, config_path) = test_app("moondesk-clippymoon-seed-log");
+        let seed_text = app
+            .logs
+            .iter()
+            .find_map(|entry| entry.message.strip_prefix("ClippyMoon seed: "))
+            .expect("startup should log the ClippyMoon seed");
+        assert_eq!(seed_text.len(), 16);
+        assert!(seed_text.chars().all(|ch| ch.is_ascii_hexdigit()));
+
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_dir_all(workspace);
     }
 
     #[test]

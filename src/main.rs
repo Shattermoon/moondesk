@@ -1062,14 +1062,18 @@ fn drain_server_ui_events(app: &mut AppState, ui_events: &mut UnboundedReceiver<
 
 // ── Main ────────────────────────────────────────────────────
 
+#[derive(Debug)]
 struct ClippyMoonExportArgs {
     seed: Option<u64>,
     output_dir: std::path::PathBuf,
 }
 
 fn parse_clippymoon_export_args(args: &[String]) -> Result<Option<ClippyMoonExportArgs>, String> {
-    if args.len() < 2 || args[0] != "clippymoon" || args[1] != "export" {
+    if args.first().map(String::as_str) != Some("clippymoon") {
         return Ok(None);
+    }
+    if args.get(1).map(String::as_str) != Some("export") {
+        return Err("usage: moondesk clippymoon export [--seed HEX] [--out DIRECTORY]".to_string());
     }
 
     let mut seed = None;
@@ -1959,11 +1963,35 @@ mod tests {
     use super::{
         BottomPanelAreas, BottomPanelFocus, PanelItemHit, PanelScrollView, item_under_cursor,
         key_is_clipboard_paste, move_panel_selection, normalize_ngrok_authtoken_input,
-        panel_under_cursor, scroll_panel_down, scroll_panel_up, tail_start_index,
-        truncate_with_ellipsis, wrap_preserving_chars,
+        panel_under_cursor, parse_clippymoon_export_args, scroll_panel_down, scroll_panel_up,
+        tail_start_index, truncate_with_ellipsis, wrap_preserving_chars,
     };
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::layout::Rect;
+
+    #[test]
+    fn clippymoon_without_export_subcommand_returns_usage() {
+        let args = vec!["clippymoon".to_string()];
+        let error = parse_clippymoon_export_args(&args).expect_err("missing subcommand must fail");
+        assert!(error.starts_with("usage: moondesk clippymoon export"));
+    }
+
+    #[test]
+    fn clippymoon_help_returns_usage_instead_of_starting_tui() {
+        let args = vec!["clippymoon".to_string(), "--help".to_string()];
+        let error = parse_clippymoon_export_args(&args).expect_err("help should return usage text");
+        assert!(error.starts_with("usage: moondesk clippymoon export"));
+    }
+
+    #[test]
+    fn non_clippymoon_args_do_not_intercept_normal_startup() {
+        let args = vec!["something-else".to_string()];
+        assert!(
+            parse_clippymoon_export_args(&args)
+                .expect("non-ClippyMoon arguments should parse")
+                .is_none()
+        );
+    }
 
     #[test]
     fn normalizes_plain_ngrok_token() {

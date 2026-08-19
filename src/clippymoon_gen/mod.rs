@@ -8,6 +8,10 @@ use std::collections::HashMap;
 
 pub use types::{ClippyMoonTraits, MoonColor, MoonExpression, MoonPhase};
 
+/// Render one ClippyMoon frame and return the deterministic traits selected for its seed.
+///
+/// Passing `None` creates a fresh random seed; callers that need reproducibility should
+/// provide an explicit seed.
 pub fn create_character(
     seed: Option<u64>,
     width: u32,
@@ -30,6 +34,7 @@ pub fn create_character(
     (image, traits.to_map())
 }
 
+/// Derive ClippyMoon's stable identity traits from a 64-bit seed.
 pub fn traits_from_seed(seed: u64) -> ClippyMoonTraits {
     let mut rng = Mt19937GenRand32::new_with_key(mt_key(seed ^ 0x6D6F_6F6E_6465_736B));
 

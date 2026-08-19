@@ -1,11 +1,14 @@
 use image::Rgba;
 
+/// RGBA pixel color used by the procedural renderer.
 pub type Color = Rgba<u8>;
 
+/// Construct an RGBA color for ClippyMoon palettes and drawing helpers.
 pub const fn rgba(r: u8, g: u8, b: u8, a: u8) -> Color {
     Rgba([r, g, b, a])
 }
 
+/// One of the eight major lunar phases used by the procedural phase mask.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MoonPhase {
     New,
@@ -19,6 +22,7 @@ pub enum MoonPhase {
 }
 
 impl MoonPhase {
+    /// Stable snake_case name used in CLI output and generated trait metadata.
     pub const fn name(self) -> &'static str {
         match self {
             Self::New => "new",
@@ -47,6 +51,7 @@ impl MoonPhase {
         }
     }
 
+    /// Return whether this phase belongs to the waxing half of the lunar cycle.
     pub const fn is_waxing(self) -> bool {
         matches!(
             self,
@@ -55,6 +60,7 @@ impl MoonPhase {
     }
 }
 
+/// Earth-visible color mood assigned to a generated ClippyMoon.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MoonColor {
     PaleIvory,
@@ -67,6 +73,7 @@ pub enum MoonColor {
 }
 
 impl MoonColor {
+    /// Stable snake_case name used in CLI output and generated trait metadata.
     pub const fn name(self) -> &'static str {
         match self {
             Self::PaleIvory => "pale_ivory",
@@ -79,6 +86,7 @@ impl MoonColor {
         }
     }
 
+    /// Color palette used to render this moon color across light, shadow, craters, and accents.
     pub const fn palette(self) -> MoonPalette {
         match self {
             Self::PaleIvory => MoonPalette {
@@ -169,6 +177,7 @@ impl MoonColor {
     }
 }
 
+/// Small facial-expression variants used by the ClippyMoon mascot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MoonExpression {
     SoftSmile,
@@ -177,6 +186,7 @@ pub enum MoonExpression {
 }
 
 impl MoonExpression {
+    /// Stable snake_case name used in CLI output and generated trait metadata.
     pub const fn name(self) -> &'static str {
         match self {
             Self::SoftSmile => "soft_smile",
@@ -186,6 +196,7 @@ impl MoonExpression {
     }
 }
 
+/// Seed-derived identity traits that remain stable across every animation frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ClippyMoonTraits {
     pub phase: MoonPhase,
@@ -197,6 +208,7 @@ pub struct ClippyMoonTraits {
 }
 
 impl ClippyMoonTraits {
+    /// Convert stable traits to printable string metadata without animation-only state.
     pub fn to_map(self) -> std::collections::HashMap<String, String> {
         let mut traits = std::collections::HashMap::new();
         traits.insert("phase".to_string(), self.phase.name().to_string());
@@ -209,6 +221,7 @@ impl ClippyMoonTraits {
     }
 }
 
+/// Complete renderer palette for one generated moon color mood.
 #[derive(Clone, Copy)]
 pub struct MoonPalette {
     pub lit: Color,

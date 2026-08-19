@@ -3,7 +3,7 @@
 An open-source tool that lets you use ChatGPT Chat as a local coding agent. No reverse engineering, no API, no Codex, no Work mode. A ChatGPT Plus subscription is enough.
 
 > [!NOTE]
-> MoonDesk is maintained by **Shattermoon** and starts from the lightweight CatDesk experimental codebase. The current bootstrap intentionally keeps some legacy CatDesk-era assets and features (including Binagotchy) so the working baseline stays intact; these will be replaced by MoonDesk's moon/star TUI identity in the next redesign phase.
+> MoonDesk is maintained by **Shattermoon** and starts from the lightweight CatDesk experimental codebase. MoonDesk replaces the legacy mascot system with **ClippyMoon**, a deterministic procedural moon companion generated locally from a random seed.
 
 <p align="center">
   <img src="docs/images/moondesk_preview.gif" alt="MoonDesk in ChatGPT Web"><br>
@@ -290,13 +290,10 @@ https://xxxx.ngrok-free.dev/Ab3kL9xQ2pTm7VhC/mcp
 
 Both the static domain and the random path are persisted in `~/.moondesk/config.toml`, so the full MCP URL stays the same across launches. You only need to set up the connector once.
 
-# About Binagotchy
+# About ClippyMoon
 
-<p align="center">
-  <img src="docs/images/binagotchy.gif" alt="Binagotchy!" width="500"><br>
-  <em>Binagotchy!</em>
-</p>
+ClippyMoon is MoonDesk's procedural lunar companion. It is generated entirely in Rust from a random 64-bit seed when MoonDesk starts; no image-generation model or bundled sprite sheet is used.
 
-The character is a cute shark-cat! I actually made this before MoonDesk and decided to put it in the project.
+A seed determines ClippyMoon's identity: one of the eight major moon phases, an Earth-visible color mood, crater layout, facial expression, blush, and surrounding stars. The current color families are pale ivory, silver, warm yellow, harvest orange, amber, copper, and blood red. Animation then changes only temporary frame state such as blinking, subtle one-pixel bobbing, and star twinkling, so the same seed always recreates the same character.
 
-By default, MoonDesk will generate a random Binagotchy every time you start it. If you see a cute one, you can set it as your partner on the launch screen. The system will also automatically save every Binagotchy in `~/.moondesk/binagotchy`; each archive contains `.png` and `.gif` files that you can copy or export directly. Feel free to use them anywhere. This project and Binagotchy are both under the MIT License. By the way, Binagotchy is generated using pure scripts and does not use any text-to-image or diffusion model.
+Normal MoonDesk startup keeps ClippyMoon entirely in memory: nothing is archived or persisted and each launch creates a fresh random moon. Export is explicit and opt-in. Run `moondesk clippymoon export` to create `clippymoon.png` and `clippymoon.gif` in the current directory, or use `--seed <hex>` to reproduce a specific moon and `--out <directory>` to choose the destination. The export uses the same deterministic generator and idle-animation sequence as the TUI; MoonDesk never writes these files unless the export command is invoked.

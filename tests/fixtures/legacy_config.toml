@@ -3,7 +3,6 @@ mode = "browser"
 toolMode = "multiTools"
 agentsPathMode = "codex"
 setMoondeskAsCoAuthor = true
-partnerBinagotchySeed = "00000000000000ff"
 
 [usageTotals]
 inputTokens = 120

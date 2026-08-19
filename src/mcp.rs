@@ -1481,23 +1481,47 @@ impl IoWrite for TokenEstimateWriter {
     }
 }
 
+fn utf8_prefix_from_bytes(bytes: &[u8]) -> &str {
+    match std::str::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(error) => std::str::from_utf8(&bytes[..error.valid_up_to()]).unwrap_or_default(),
+    }
+}
+
+fn utf8_suffix_from_bytes(bytes: &[u8]) -> &str {
+    let max_skip = bytes.len().min(3);
+    (0..=max_skip)
+        .find_map(|start| std::str::from_utf8(&bytes[start..]).ok())
+        .unwrap_or_default()
+}
+
 impl TokenEstimateWriter {
-    fn estimate_tokens(&self) -> u64 {
-        if self.total_bytes == 0 {
-            return 0;
-        }
+    fn sampled_text(&self) -> String {
         if self.total_bytes <= MAX_EXACT_TOKEN_ESTIMATE_BYTES as u64 {
-            return exact_tokens_o200k(&String::from_utf8_lossy(&self.prefix));
+            return utf8_prefix_from_bytes(&self.prefix).to_string();
         }
 
         let half = MAX_EXACT_TOKEN_ESTIMATE_BYTES / 2;
         let head_len = half.min(self.prefix.len());
-        let mut sample = Vec::with_capacity(head_len.saturating_add(self.suffix.len()));
-        sample.extend_from_slice(&self.prefix[..head_len]);
-        sample.extend_from_slice(&self.suffix);
-        let sample_text = String::from_utf8_lossy(&sample);
+        let head = utf8_prefix_from_bytes(&self.prefix[..head_len]);
+        let tail = utf8_suffix_from_bytes(&self.suffix);
+        let mut sample = String::with_capacity(head.len().saturating_add(tail.len()));
+        sample.push_str(head);
+        sample.push_str(tail);
+        sample
+    }
+
+    fn estimate_tokens(&self) -> u64 {
+        if self.total_bytes == 0 {
+            return 0;
+        }
+
+        let sample_text = self.sampled_text();
+        if self.total_bytes <= MAX_EXACT_TOKEN_ESTIMATE_BYTES as u64 {
+            return exact_tokens_o200k(&sample_text);
+        }
+        let sample_bytes = sample_text.len().max(1) as u128;
         let sample_tokens = exact_tokens_o200k(&sample_text);
-        let sample_bytes = sample.len().max(1) as u128;
         let scaled = (sample_tokens as u128)
             .saturating_mul(self.total_bytes as u128)
             .div_ceil(sample_bytes);
@@ -3556,5 +3580,18 @@ mod tests {
 
         assert_eq!(estimate, expected);
         assert!(estimate > 0);
+    }
+
+    #[test]
+    fn token_estimate_sampling_keeps_multibyte_utf8_boundaries() {
+        let text = "你🙂".repeat(2_000);
+        let mut writer = TokenEstimateWriter::default();
+        for chunk in text.as_bytes().chunks(7) {
+            std::io::Write::write_all(&mut writer, chunk).expect("write sample chunk");
+        }
+
+        let sample = writer.sampled_text();
+        assert!(!sample.contains('\u{FFFD}'));
+        assert!(writer.estimate_tokens() > 0);
     }
 }

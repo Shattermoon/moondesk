@@ -31,8 +31,7 @@ use state::{
     AppState, CommandActivityState, FLOW_ANIM_CELLS, FLOW_BOOTSTRAP_PHASES, FlowAnimKind,
     FlowAnimSegment, FlowDirection, FlowLane, GPT_5_6_AND_EARLIER_USAGE_BUCKET, Mode,
     ServerUiEvent, SharedState, ToolMode, UsageTotals, app_config_path, flow_anim_lit_count,
-    flush_config, load_ngrok_authtoken, load_ngrok_domain, normalize_ngrok_domain,
-    save_ngrok_authtoken, save_ngrok_domain,
+    flush_config, normalize_ngrok_domain,
 };
 use std::io::{Write, stdout};
 use std::sync::Arc;
@@ -1252,7 +1251,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let port_value = std::env::var("PORT").ok();
+    let port_value = std::env::var("PORT")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
     let port = parse_port_value(port_value.as_deref()).map_err(std::io::Error::other)?;
     let workspace_root = match std::env::var("WORKSPACE_ROOT") {
         Ok(path) => path,
@@ -1483,7 +1484,7 @@ async fn run_ngrok_auth_setup(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     state: SharedState,
 ) -> Result<bool, Box<dyn std::error::Error>> {
-    if load_ngrok_authtoken()?.is_some() {
+    if state.lock().await.ngrok_authtoken().is_some() {
         return Ok(true);
     }
 
@@ -1584,22 +1585,26 @@ async fn run_ngrok_auth_setup(
                             error_message = Some("NGROK_AUTHTOKEN cannot be empty".into());
                             continue;
                         }
-                        match save_ngrok_authtoken(&token) {
-                            Ok(saved_path) => {
-                                let mut app = state.lock().await;
-                                app.set_ngrok_authtoken(Some(token.clone()));
-                                app.log(
+                        {
+                            let mut app = state.lock().await;
+                            app.set_ngrok_authtoken(Some(token.clone()));
+                        }
+                        match flush_config(&state, true).await {
+                            Ok(_) => {
+                                state.lock().await.log(
                                     "INFO",
                                     format!(
                                         "Saved ngrok authtoken to {}",
-                                        saved_path.to_string_lossy()
+                                        config_path.to_string_lossy()
                                     ),
                                 );
                                 return Ok(true);
                             }
-                            Err(e) => {
-                                error_message =
-                                    Some(format!("Failed to save ~/.moondesk/config.toml: {e}"));
+                            Err(error) => {
+                                state.lock().await.set_ngrok_authtoken(None);
+                                error_message = Some(format!(
+                                    "Failed to save ~/.moondesk/config.toml: {error}"
+                                ));
                             }
                         }
                     }
@@ -1651,10 +1656,11 @@ async fn run_ngrok_domain_setup(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     state: SharedState,
 ) -> Result<bool, Box<dyn std::error::Error>> {
-    if load_ngrok_domain()?.is_some() {
+    if state.lock().await.ngrok_domain.is_some() {
         return Ok(true);
     }
 
+    let config_path = app_config_path()?;
     let mut input = String::new();
     let mut error_message: Option<String> = None;
 
@@ -1739,23 +1745,26 @@ async fn run_ngrok_domain_setup(
                                 continue;
                             }
                         };
-                        match save_ngrok_domain(&domain) {
-                            Ok(saved_path) => {
-                                let mut app = state.lock().await;
-                                app.ngrok_domain = Some(domain.clone());
-                                app.mark_config_dirty();
-                                app.log(
+                        {
+                            let mut app = state.lock().await;
+                            app.set_ngrok_domain(Some(domain.clone()));
+                        }
+                        match flush_config(&state, true).await {
+                            Ok(_) => {
+                                state.lock().await.log(
                                     "INFO",
                                     format!(
                                         "Saved ngrok domain to {}",
-                                        saved_path.to_string_lossy()
+                                        config_path.to_string_lossy()
                                     ),
                                 );
                                 return Ok(true);
                             }
-                            Err(e) => {
-                                error_message =
-                                    Some(format!("Failed to save ~/.moondesk/config.toml: {e}"));
+                            Err(error) => {
+                                state.lock().await.set_ngrok_domain(None);
+                                error_message = Some(format!(
+                                    "Failed to save ~/.moondesk/config.toml: {error}"
+                                ));
                             }
                         }
                     }
@@ -2231,35 +2240,59 @@ async fn run_settings(
                             app.log("INFO", "Generated new random MCP slug".into());
                             app.mark_config_dirty();
                         } else if selected_row == settings_action_start + 3 {
-                            let current_domain = app.ngrok_domain.clone().unwrap_or_default();
+                            let previous_domain = app.ngrok_domain.clone();
+                            let current_domain = previous_domain.clone().unwrap_or_default();
                             drop(app);
-                            if let Some(new_domain) = run_prompt(terminal, "Enter ngrok static domain (with/without https://, empty to clear):", &current_domain).await? {
-                                    let normalized = match normalize_ngrok_domain(&new_domain) {
-                                        Ok(domain) => domain,
-                                        Err(error) => {
-                                            state.lock().await.log(
-                                                "WARN",
-                                                format!("Invalid ngrok domain: {error}"),
-                                            );
-                                            continue;
-                                        }
-                                    };
-                                    let was_running = {
-                                        let mut app = state.lock().await;
-                                        app.ngrok_domain = normalized;
-                                        app.log("INFO", "Updated ngrok static domain".into());
-                                        app.mark_config_dirty();
-                                        app.ngrok_running
-                                    };
-                                    if was_running
-                                        && let Err(error) = ngrok::restart(state.clone()).await
+                            if let Some(new_domain) = run_prompt(
+                                terminal,
+                                "Enter ngrok static domain (with/without https://, empty to clear):",
+                                &current_domain,
+                            )
+                            .await?
+                            {
+                                let normalized = match normalize_ngrok_domain(&new_domain) {
+                                    Ok(domain) => domain,
+                                    Err(error) => {
+                                        state.lock().await.log(
+                                            "WARN",
+                                            format!("Invalid ngrok domain: {error}"),
+                                        );
+                                        continue;
+                                    }
+                                };
+                                let was_running = {
+                                    let mut app = state.lock().await;
+                                    app.set_ngrok_domain(normalized);
+                                    app.log("INFO", "Updated ngrok static domain".into());
+                                    app.ngrok_running
+                                };
+                                if was_running
+                                    && let Err(error) = ngrok::restart(state.clone()).await
+                                {
                                     {
+                                        let mut app = state.lock().await;
+                                        app.set_ngrok_domain(previous_domain.clone());
+                                        app.log(
+                                            "ERROR",
+                                            format!(
+                                                "Failed to restart ngrok after domain change: {error}"
+                                            ),
+                                        );
+                                        app.log(
+                                            "WARN",
+                                            "Restoring the previous ngrok domain".into(),
+                                        );
+                                    }
+                                    if let Err(restore_error) = ngrok::start(state.clone()).await {
                                         state.lock().await.log(
                                             "ERROR",
-                                            format!("Failed to restart ngrok after domain change: {error}"),
+                                            format!(
+                                                "Failed to restore the previous ngrok tunnel: {restore_error}"
+                                            ),
                                         );
                                     }
                                 }
+                            }
                         }
                     }
                 }
@@ -3885,8 +3918,8 @@ async fn run_tui(
                                             None
                                         }
                                     } else if let Some(ref url) = last_mcp_url {
-                                        let prefix = &url[..url.len().min(30)];
-                                        if line.contains("MCP Server URL") || line.contains(prefix)
+                                        let prefix = url.chars().take(30).collect::<String>();
+                                        if line.contains("MCP Server URL") || line.contains(&prefix)
                                         {
                                             let revealed = mcp_url_revealed_until
                                                 .and_then(|deadline| {
@@ -5057,8 +5090,9 @@ mod tests {
     use super::{
         BottomPanelAreas, BottomPanelFocus, PanelItemHit, PanelScrollView, item_under_cursor,
         key_is_clipboard_paste, move_panel_selection, normalize_ngrok_authtoken_input,
-        panel_under_cursor, parse_clippymoon_export_args, parse_port_value, scroll_panel_down,
-        scroll_panel_up, tail_start_index, truncate_with_ellipsis, wrap_preserving_chars,
+        normalize_ngrok_domain, panel_under_cursor, parse_clippymoon_export_args, parse_port_value,
+        scroll_panel_down, scroll_panel_up, tail_start_index, truncate_with_ellipsis,
+        wrap_preserving_chars,
     };
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::layout::Rect;
@@ -5084,6 +5118,41 @@ mod tests {
         assert!(parse_port_value(Some("0")).is_err());
         assert!(parse_port_value(Some("not-a-port")).is_err());
         assert!(parse_port_value(Some("70000")).is_err());
+    }
+
+    #[test]
+    fn normalizes_and_validates_ngrok_domains() {
+        let accepted = [
+            ("", None),
+            ("   ", None),
+            ("Example.Ngrok.App", Some("example.ngrok.app")),
+            ("https://EXAMPLE.NGROK.APP", Some("example.ngrok.app")),
+            ("http://Example.Ngrok.App/", Some("example.ngrok.app")),
+        ];
+        for (input, expected) in accepted {
+            assert_eq!(
+                normalize_ngrok_domain(input).expect("valid ngrok domain input"),
+                expected.map(str::to_string),
+                "input: {input:?}"
+            );
+        }
+
+        for input in [
+            "ftp://example.ngrok.app",
+            "https://user@example.ngrok.app",
+            "https://example.ngrok.app:443",
+            "https://example.ngrok.app/path",
+            "https://example.ngrok.app?query=1",
+            "example .ngrok.app",
+            "-bad.ngrok.app",
+            "bad-.ngrok.app",
+            "bad..ngrok.app",
+        ] {
+            assert!(
+                normalize_ngrok_domain(input).is_err(),
+                "input should be rejected: {input:?}"
+            );
+        }
     }
 
     #[test]

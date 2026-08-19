@@ -100,19 +100,30 @@ fn resolve_contained_path(
     // symlink/junction escapes before any missing suffix components are appended.
     let mut ancestor = candidate.clone();
     let mut missing_suffix: Vec<OsString> = Vec::new();
-    while !ancestor.exists() {
-        let name = ancestor.file_name().map(OsString::from).ok_or_else(|| {
-            format!(
-                "Unable to resolve path inside workspace: {}",
-                candidate.display()
-            )
-        })?;
-        missing_suffix.push(name);
-        if !ancestor.pop() {
-            return Err(format!(
-                "Unable to resolve path inside workspace: {}",
-                candidate.display()
-            ));
+    loop {
+        match std::fs::symlink_metadata(&ancestor) {
+            Ok(_) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let name = ancestor.file_name().map(OsString::from).ok_or_else(|| {
+                    format!(
+                        "Unable to resolve path inside workspace: {}",
+                        candidate.display()
+                    )
+                })?;
+                missing_suffix.push(name);
+                if !ancestor.pop() {
+                    return Err(format!(
+                        "Unable to resolve path inside workspace: {}",
+                        candidate.display()
+                    ));
+                }
+            }
+            Err(error) => {
+                return Err(format!(
+                    "Unable to inspect path while resolving inside workspace ({}): {error}",
+                    ancestor.display()
+                ));
+            }
         }
     }
 

@@ -73,20 +73,25 @@ impl JsonRpcResponse {
 
 // ── Handler ─────────────────────────────────────────────────
 
+#[derive(Clone, Copy)]
+pub struct McpRequestContext<'a> {
+    pub workspace_id: &'a WorkspaceId,
+    pub workspace_root: &'a str,
+    pub mode: Mode,
+    pub tool_mode: ToolMode,
+    pub set_moondesk_as_co_author: bool,
+    pub command_jobs: &'a CommandJobManager,
+    pub devtools: &'a Option<Arc<Mutex<DevtoolsBridge>>>,
+}
+
 pub async fn handle_request(
     req: &JsonRpcRequest,
-    workspace_id: &WorkspaceId,
-    workspace_root: &str,
-    mode: Mode,
-    tool_mode: ToolMode,
-    set_moondesk_as_co_author: bool,
-    command_jobs: &CommandJobManager,
-    devtools: &Option<Arc<Mutex<DevtoolsBridge>>>,
+    context: McpRequestContext<'_>,
 ) -> Option<JsonRpcResponse> {
     match req.method.as_str() {
         "initialize" => {
             // Also initialize devtools bridge if available
-            if let Some(bridge) = devtools {
+            if let Some(bridge) = context.devtools {
                 let init_req = json!({
                     "jsonrpc": "2.0",
                     "id": "dt-init",
@@ -107,20 +112,10 @@ pub async fn handle_request(
             Some(handle_initialize(req))
         }
         m if m.starts_with("notifications/") => None,
-        "tools/list" => Some(handle_tools_list(req, mode, tool_mode, devtools).await),
-        "tools/call" => Some(
-            handle_tools_call_for_workspace(
-                req,
-                workspace_id,
-                workspace_root,
-                mode,
-                tool_mode,
-                set_moondesk_as_co_author,
-                command_jobs,
-                devtools,
-            )
-            .await,
-        ),
+        "tools/list" => {
+            Some(handle_tools_list(req, context.mode, context.tool_mode, context.devtools).await)
+        }
+        "tools/call" => Some(handle_tools_call_for_workspace(req, context).await),
         "ping" => Some(JsonRpcResponse::success(req.id.clone(), json!({}))),
         _ => Some(JsonRpcResponse::error(
             req.id.clone(),
@@ -498,29 +493,35 @@ async fn handle_tools_call(
     command_jobs: &CommandJobManager,
     devtools: &Option<Arc<Mutex<DevtoolsBridge>>>,
 ) -> JsonRpcResponse {
+    let workspace_id = WorkspaceId::test_default();
     handle_tools_call_for_workspace(
         req,
-        &WorkspaceId::test_default(),
-        workspace_root,
-        mode,
-        tool_mode,
-        set_moondesk_as_co_author,
-        command_jobs,
-        devtools,
+        McpRequestContext {
+            workspace_id: &workspace_id,
+            workspace_root,
+            mode,
+            tool_mode,
+            set_moondesk_as_co_author,
+            command_jobs,
+            devtools,
+        },
     )
     .await
 }
 
 async fn handle_tools_call_for_workspace(
     req: &JsonRpcRequest,
-    workspace_id: &WorkspaceId,
-    workspace_root: &str,
-    mode: Mode,
-    tool_mode: ToolMode,
-    set_moondesk_as_co_author: bool,
-    command_jobs: &CommandJobManager,
-    devtools: &Option<Arc<Mutex<DevtoolsBridge>>>,
+    context: McpRequestContext<'_>,
 ) -> JsonRpcResponse {
+    let McpRequestContext {
+        workspace_id,
+        workspace_root,
+        mode,
+        tool_mode,
+        set_moondesk_as_co_author,
+        command_jobs,
+        devtools,
+    } = context;
     let params = &req.params;
     let tool_name = params
         .get("name")

@@ -12,8 +12,6 @@ mod server;
 mod state;
 mod theme;
 mod workspace_tools;
-// P0 stages the multi-workspace architecture types before config/routing wiring lands in P1/P2.
-#[allow(dead_code)]
 mod workspaces;
 
 use crossterm::{
@@ -33,13 +31,16 @@ use ratatui::{
 use state::{
     AppState, CommandActivityState, FLOW_ANIM_CELLS, FLOW_BOOTSTRAP_PHASES, FlowAnimKind,
     FlowAnimSegment, FlowDirection, FlowLane, GPT_5_6_AND_EARLIER_USAGE_BUCKET, Mode, SharedState,
-    ToolMode, UiEventReceiver, UiEventSender, UsageTotals, app_config_path, flow_anim_lit_count,
-    flush_config, normalize_ngrok_domain, ui_event_channel,
+    ToolMode, UiEventReceiver, UiEventSender, UsageTotals, add_workspace, app_config_path,
+    flow_anim_lit_count, flush_config, normalize_ngrok_domain, remove_workspace, rename_workspace,
+    rotate_workspace_secret, ui_event_channel,
 };
 use std::io::{Write, stdout};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::Mutex;
+use workspaces::{WorkspaceAvailability, WorkspaceConfig, WorkspaceId, workspace_availability};
 
 const FLOW_ROW_CELLS: usize = FLOW_ANIM_CELLS;
 const FLOW_LANE_LEFT_LABEL: &str = "Your computer ";
@@ -75,7 +76,9 @@ struct UiSnapshot {
     last_remote_activity_ms: Option<u128>,
     devtools_running: bool,
     port: u16,
-    workspace_root: String,
+    workspace_count: usize,
+    connected_workspace_count: usize,
+    workspace_names: std::collections::HashMap<WorkspaceId, String>,
     mascot: mascot::MascotPack,
     detected_browsers: Vec<browser::DetectedBrowser>,
     selected_browser: Option<browser::DetectedBrowser>,
@@ -103,7 +106,17 @@ impl UiSnapshot {
             last_remote_activity_ms: app.last_remote_activity_ms,
             devtools_running: app.devtools_running,
             port: app.port,
-            workspace_root: app.workspace_root.clone(),
+            workspace_count: app.workspaces.len(),
+            connected_workspace_count: app
+                .workspace_runtimes
+                .values()
+                .filter(|runtime| runtime.remote_connected())
+                .count(),
+            workspace_names: app
+                .workspaces
+                .iter()
+                .map(|workspace| (workspace.id.clone(), workspace.name.clone()))
+                .collect(),
             mascot: app.mascot.clone(),
             detected_browsers: app.detected_browsers.clone(),
             selected_browser: app.selected_browser.clone(),
@@ -1333,6 +1346,10 @@ async fn run_app(
                 KeyCode::Char('2') => Mode::Browser,
                 KeyCode::Char('3') => Mode::Both,
                 KeyCode::Char('q') => return Ok(()),
+                KeyCode::Char('w') => {
+                    run_workspaces(terminal, state.clone()).await?;
+                    continue;
+                }
                 KeyCode::Char('s') => {
                     run_settings(terminal, state.clone()).await?;
                     continue;
@@ -1454,6 +1471,15 @@ fn draw_mode_select(f: &mut Frame, theme: &theme::ThemeDef, tool_mode: ToolMode)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled("Both", Style::default().fg(palette.primary_fg)),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                "  [w] ",
+                Style::default()
+                    .fg(palette.key_fg)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("Workspaces", Style::default().fg(palette.primary_fg)),
         ]),
         Line::from(vec![
             Span::styled(
@@ -2139,6 +2165,455 @@ async fn run_prompt(
     }
 }
 
+#[derive(Clone)]
+struct WorkspaceUiRow {
+    config: WorkspaceConfig,
+    availability: WorkspaceAvailability,
+    connected: bool,
+    accepting_requests: bool,
+    in_flight_requests: usize,
+    request_count: u64,
+}
+
+async fn workspace_ui_snapshot(
+    state: &SharedState,
+) -> (
+    &'static theme::ThemeDef,
+    Option<String>,
+    Vec<WorkspaceUiRow>,
+) {
+    let app = state.lock().await;
+    let public_base = app.ngrok_url.clone().or_else(|| {
+        app.ngrok_domain
+            .as_ref()
+            .map(|domain| format!("https://{domain}"))
+    });
+    let rows = app
+        .workspaces
+        .iter()
+        .map(|workspace| {
+            let runtime = app.workspace_runtimes.get(&workspace.id);
+            WorkspaceUiRow {
+                config: workspace.clone(),
+                availability: workspace_availability(&workspace.root),
+                connected: runtime.is_some_and(|runtime| runtime.remote_connected()),
+                accepting_requests: runtime.is_some_and(|runtime| runtime.accepting_requests()),
+                in_flight_requests: runtime.map_or(0, |runtime| runtime.in_flight_requests()),
+                request_count: runtime.map_or(0, |runtime| runtime.request_count()),
+            }
+        })
+        .collect();
+    (app.current_theme(), public_base, rows)
+}
+
+fn workspace_public_mcp_url(base: Option<&str>, workspace: &WorkspaceConfig) -> Option<String> {
+    base.map(|base| format!("{}/{}/mcp", base.trim_end_matches('/'), workspace.mcp_slug))
+}
+
+fn normalize_workspace_path_input(value: &str) -> PathBuf {
+    PathBuf::from(value.trim().trim_matches(['\'', '"']))
+}
+
+async fn run_workspaces(
+    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    state: SharedState,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut selected = 0usize;
+    let mut revealed: Option<(WorkspaceId, Instant)> = None;
+    let mut confirm_rotate: Option<WorkspaceId> = None;
+    let mut confirm_remove: Option<WorkspaceId> = None;
+    let mut message: Option<String> = None;
+
+    loop {
+        let (current_theme, public_base, rows) = workspace_ui_snapshot(&state).await;
+        if rows.is_empty() {
+            return Ok(());
+        }
+        selected = selected.min(rows.len().saturating_sub(1));
+        let selected_row = rows[selected].clone();
+        let reveal_active = revealed.as_ref().is_some_and(|(workspace_id, deadline)| {
+            workspace_id == &selected_row.config.id && Instant::now() < *deadline
+        });
+        if revealed
+            .as_ref()
+            .is_some_and(|(_, deadline)| Instant::now() >= *deadline)
+        {
+            revealed = None;
+        }
+        let selected_url = workspace_public_mcp_url(public_base.as_deref(), &selected_row.config);
+
+        terminal.draw(|f| {
+            draw_workspaces(
+                f,
+                WorkspacesView {
+                    current_theme,
+                    rows: &rows,
+                    selected,
+                    selected_url: selected_url.as_deref(),
+                    reveal_url: reveal_active,
+                    message: message.as_deref(),
+                    confirm_rotate: confirm_rotate.as_ref() == Some(&selected_row.config.id),
+                    confirm_remove: confirm_remove.as_ref() == Some(&selected_row.config.id),
+                },
+            )
+        })?;
+
+        if !event::poll(UI_POLL_INTERVAL)? {
+            continue;
+        }
+        let Event::Key(key) = event::read()? else {
+            continue;
+        };
+        if key.kind != KeyEventKind::Press {
+            continue;
+        }
+
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => return Ok(()),
+            KeyCode::Up => {
+                selected = selected.saturating_sub(1);
+                confirm_rotate = None;
+                confirm_remove = None;
+                message = None;
+            }
+            KeyCode::Down => {
+                selected = (selected + 1).min(rows.len().saturating_sub(1));
+                confirm_rotate = None;
+                confirm_remove = None;
+                message = None;
+            }
+            KeyCode::Char('a') => {
+                confirm_rotate = None;
+                confirm_remove = None;
+                let Some(path_input) = run_prompt(terminal, "Workspace folder path:", "").await?
+                else {
+                    continue;
+                };
+                let root = normalize_workspace_path_input(&path_input);
+                let default_name = workspaces::derive_workspace_name(&root);
+                let Some(name) = run_prompt(terminal, "Workspace name:", &default_name).await?
+                else {
+                    continue;
+                };
+                match add_workspace(&state, name, root).await {
+                    Ok(workspace) => {
+                        let (_, _, refreshed) = workspace_ui_snapshot(&state).await;
+                        selected = refreshed
+                            .iter()
+                            .position(|row| row.config.id == workspace.id)
+                            .unwrap_or_else(|| refreshed.len().saturating_sub(1));
+                        message = Some(format!("Added workspace {}", workspace.name));
+                    }
+                    Err(error) => message = Some(format!("Add failed: {error}")),
+                }
+            }
+            KeyCode::Char('r') => {
+                confirm_rotate = None;
+                confirm_remove = None;
+                if let Some(name) =
+                    run_prompt(terminal, "Rename workspace:", &selected_row.config.name).await?
+                {
+                    match rename_workspace(&state, &selected_row.config.id, name).await {
+                        Ok(()) => message = Some("Workspace renamed".into()),
+                        Err(error) => message = Some(format!("Rename failed: {error}")),
+                    }
+                }
+            }
+            KeyCode::Char('x') => {
+                confirm_remove = None;
+                if confirm_rotate.as_ref() == Some(&selected_row.config.id) {
+                    match rotate_workspace_secret(&state, &selected_row.config.id).await {
+                        Ok(_) => {
+                            revealed = None;
+                            confirm_rotate = None;
+                            message = Some(
+                                "MCP URL rotated. Update the ChatGPT app using this workspace."
+                                    .into(),
+                            );
+                        }
+                        Err(error) => {
+                            confirm_rotate = None;
+                            message = Some(format!("Rotate failed: {error}"));
+                        }
+                    }
+                } else {
+                    confirm_rotate = Some(selected_row.config.id.clone());
+                    message = Some("Press x again to rotate this workspace URL".into());
+                }
+            }
+            KeyCode::Char('d') => {
+                confirm_rotate = None;
+                if confirm_remove.as_ref() == Some(&selected_row.config.id) {
+                    let removed_name = selected_row.config.name.clone();
+                    match remove_workspace(&state, &selected_row.config.id).await {
+                        Ok(()) => {
+                            selected = selected.saturating_sub(1);
+                            revealed = None;
+                            confirm_remove = None;
+                            message = Some(format!("Removed workspace {removed_name}"));
+                        }
+                        Err(error) => {
+                            confirm_remove = None;
+                            message = Some(format!("Remove failed: {error}"));
+                        }
+                    }
+                } else {
+                    confirm_remove = Some(selected_row.config.id.clone());
+                    message = Some("Press d again to remove this workspace".into());
+                }
+            }
+            KeyCode::Enter | KeyCode::Char('v') => {
+                confirm_rotate = None;
+                confirm_remove = None;
+                if selected_url.is_some() {
+                    revealed = Some((
+                        selected_row.config.id.clone(),
+                        Instant::now() + MCP_URL_REVEAL_DURATION,
+                    ));
+                    message = Some("MCP URL revealed for 10s".into());
+                } else {
+                    message = Some("Start/configure ngrok before copying a public MCP URL".into());
+                }
+            }
+            KeyCode::Char('c') => {
+                confirm_rotate = None;
+                confirm_remove = None;
+                match selected_url.as_deref() {
+                    Some(url) if reveal_active => {
+                        message = Some(if clipboard_copy(url) {
+                            "MCP URL copied".into()
+                        } else {
+                            "Copy failed".into()
+                        });
+                    }
+                    Some(_) => {
+                        revealed = Some((
+                            selected_row.config.id.clone(),
+                            Instant::now() + MCP_URL_REVEAL_DURATION,
+                        ));
+                        message = Some("URL revealed; press c again to copy".into());
+                    }
+                    None => {
+                        message = Some("No public MCP URL is available yet".into());
+                    }
+                }
+            }
+            _ => {
+                confirm_rotate = None;
+                confirm_remove = None;
+            }
+        }
+    }
+}
+
+struct WorkspacesView<'a> {
+    current_theme: &'static theme::ThemeDef,
+    rows: &'a [WorkspaceUiRow],
+    selected: usize,
+    selected_url: Option<&'a str>,
+    reveal_url: bool,
+    message: Option<&'a str>,
+    confirm_rotate: bool,
+    confirm_remove: bool,
+}
+
+fn draw_workspaces(f: &mut Frame, view: WorkspacesView<'_>) {
+    let WorkspacesView {
+        current_theme,
+        rows,
+        selected,
+        selected_url,
+        reveal_url,
+        message,
+        confirm_rotate,
+        confirm_remove,
+    } = view;
+    let palette = current_theme.palette;
+    let area = f.area();
+    let outer = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(10),
+            Constraint::Length(4),
+        ])
+        .split(area);
+
+    let connected = rows.iter().filter(|row| row.connected).count();
+    let header = Paragraph::new(format!(
+        "  Workspaces  {} registered · {} connected",
+        rows.len(),
+        connected
+    ))
+    .style(
+        Style::default()
+            .fg(palette.header_fg)
+            .add_modifier(Modifier::BOLD),
+    )
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(palette.border_type)
+            .border_style(Style::default().fg(palette.border_fg)),
+    );
+    f.render_widget(header, outer[0]);
+
+    let body = if outer[1].width >= 96 {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(44), Constraint::Percentage(56)])
+            .split(outer[1])
+    } else {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(48), Constraint::Percentage(52)])
+            .split(outer[1])
+    };
+
+    let items = rows
+        .iter()
+        .enumerate()
+        .map(|(index, row)| {
+            let status = match (row.availability, row.connected, row.accepting_requests) {
+                (WorkspaceAvailability::Unavailable, _, _) => "UNAVAILABLE",
+                (_, _, false) => "DRAINING",
+                (_, true, true) => "CONNECTED",
+                _ => "READY",
+            };
+            let marker = if index == selected { ">" } else { " " };
+            let style = if index == selected {
+                Style::default()
+                    .fg(palette.key_fg)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(palette.primary_fg)
+            };
+            ListItem::new(vec![
+                Line::from(Span::styled(
+                    format!(" {marker} {}  [{status}]", row.config.name),
+                    style,
+                )),
+                Line::from(Span::styled(
+                    format!("    {}", row.config.root.display()),
+                    Style::default().fg(palette.muted_fg),
+                )),
+            ])
+        })
+        .collect::<Vec<_>>();
+    let list = List::new(items).block(
+        Block::default()
+            .title(" Projects ")
+            .borders(Borders::ALL)
+            .border_type(palette.border_type)
+            .border_style(Style::default().fg(palette.border_fg)),
+    );
+    f.render_widget(list, body[0]);
+
+    let row = &rows[selected];
+    let availability = match row.availability {
+        WorkspaceAvailability::Available => "Available",
+        WorkspaceAvailability::Unavailable => "Unavailable",
+    };
+    let connection = if row.connected { "Connected" } else { "Ready" };
+    let url = match (selected_url, reveal_url) {
+        (Some(url), true) => url.to_string(),
+        (Some(_), false) => MCP_URL_MASK.to_string(),
+        (None, _) => "--".to_string(),
+    };
+    let url_style = if reveal_url {
+        Style::default().fg(palette.info_fg)
+    } else {
+        Style::default().fg(palette.muted_fg)
+    };
+    let details = Paragraph::new(vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  Name           ", Style::default().fg(palette.muted_fg)),
+            Span::styled(&row.config.name, Style::default().fg(palette.primary_fg)),
+        ]),
+        Line::from(vec![
+            Span::styled("  Root           ", Style::default().fg(palette.muted_fg)),
+            Span::styled(
+                row.config.root.to_string_lossy(),
+                Style::default().fg(palette.primary_fg),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("  Filesystem     ", Style::default().fg(palette.muted_fg)),
+            Span::styled(availability, Style::default().fg(palette.primary_fg)),
+        ]),
+        Line::from(vec![
+            Span::styled("  Connector      ", Style::default().fg(palette.muted_fg)),
+            Span::styled(connection, Style::default().fg(palette.primary_fg)),
+        ]),
+        Line::from(vec![
+            Span::styled("  Requests       ", Style::default().fg(palette.muted_fg)),
+            Span::styled(
+                row.request_count.to_string(),
+                Style::default().fg(palette.primary_fg),
+            ),
+            Span::styled(
+                format!("  · {} in flight", row.in_flight_requests),
+                Style::default().fg(palette.muted_fg),
+            ),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  ChatGPT app    ", Style::default().fg(palette.muted_fg)),
+            Span::styled(
+                format!("MoonDesk · {}", row.config.name),
+                Style::default().fg(palette.primary_fg),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("  MCP Server URL ", Style::default().fg(palette.muted_fg)),
+            Span::styled(url, url_style),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Browser/DevTools is shared by the MoonDesk host.",
+            Style::default().fg(palette.muted_fg),
+        )),
+    ])
+    .wrap(Wrap { trim: false })
+    .block(
+        Block::default()
+            .title(" Selected workspace ")
+            .borders(Borders::ALL)
+            .border_type(palette.border_type)
+            .border_style(Style::default().fg(palette.border_fg)),
+    );
+    f.render_widget(details, body[1]);
+
+    let mut footer_lines = vec![Line::from(vec![
+        Span::styled(" [a] Add  ", Style::default().fg(palette.key_fg)),
+        Span::styled("[r] Rename  ", Style::default().fg(palette.key_fg)),
+        Span::styled(
+            "[Enter/v] Reveal URL  ",
+            Style::default().fg(palette.key_fg),
+        ),
+        Span::styled("[c] Copy  ", Style::default().fg(palette.key_fg)),
+        Span::styled("[x] Rotate  ", Style::default().fg(palette.key_fg)),
+        Span::styled("[d] Remove  ", Style::default().fg(palette.danger_fg)),
+        Span::styled("[Esc] Back", Style::default().fg(palette.muted_fg)),
+    ])];
+    if let Some(message) = message {
+        let style = if confirm_rotate || confirm_remove {
+            Style::default().fg(palette.warning_fg)
+        } else {
+            Style::default().fg(palette.muted_fg)
+        };
+        footer_lines.push(Line::from(Span::styled(format!(" {message}"), style)));
+    }
+    let footer = Paragraph::new(footer_lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(palette.border_type)
+            .border_style(Style::default().fg(palette.border_fg)),
+    );
+    f.render_widget(footer, outer[2]);
+}
+
 async fn run_settings(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     state: SharedState,
@@ -2150,7 +2625,7 @@ async fn run_settings(
         let app = state.lock().await;
         themes.iter().position(|t| t.id == app.theme).unwrap_or(0)
     };
-    let total_rows = themes.len() + tool_modes.len() + 1 + 3;
+    let total_rows = themes.len() + tool_modes.len() + 2;
 
     loop {
         let (
@@ -2158,7 +2633,6 @@ async fn run_settings(
             current_tool_mode,
             usage_totals,
             set_moondesk_as_co_author,
-            mcp_slug,
             ngrok_domain,
         ) = {
             let app = state.lock().await;
@@ -2167,7 +2641,6 @@ async fn run_settings(
                 app.tool_mode,
                 app.all_time_usage_totals(),
                 app.set_moondesk_as_co_author,
-                app.mcp_slug.clone(),
                 app.ngrok_domain.clone(),
             )
         };
@@ -2178,7 +2651,6 @@ async fn run_settings(
                     current_theme,
                     current_tool_mode,
                     set_moondesk_as_co_author,
-                    mcp_slug: &mcp_slug,
                     ngrok_domain: ngrok_domain.as_deref(),
                     usage_totals: &usage_totals,
                     selected_row,
@@ -2239,12 +2711,6 @@ async fn run_settings(
                             );
                             app.mark_config_dirty();
                         } else if selected_row == settings_action_start + 1 {
-                            // Keep existing slug, do nothing
-                        } else if selected_row == settings_action_start + 2 {
-                            app.regenerate_mcp_slug();
-                            app.log("INFO", "Generated new random MCP slug".into());
-                            app.mark_config_dirty();
-                        } else if selected_row == settings_action_start + 3 {
                             let previous_domain = app.ngrok_domain.clone();
                             let current_domain = previous_domain.clone().unwrap_or_default();
                             drop(app);
@@ -2324,7 +2790,6 @@ struct SettingsView<'a> {
     current_theme: &'a theme::ThemeDef,
     current_tool_mode: ToolMode,
     set_moondesk_as_co_author: bool,
-    mcp_slug: &'a str,
     ngrok_domain: Option<&'a str>,
     usage_totals: &'a UsageTotals,
     selected_row: usize,
@@ -2336,7 +2801,6 @@ fn draw_settings(f: &mut Frame, view: SettingsView<'_>) {
         current_theme,
         current_tool_mode,
         set_moondesk_as_co_author,
-        mcp_slug,
         ngrok_domain,
         usage_totals,
         selected_row,
@@ -2501,29 +2965,7 @@ fn draw_settings(f: &mut Frame, view: SettingsView<'_>) {
         Style::default().fg(palette.muted_fg),
     )]));
 
-    let slug_keep_row = co_author_row + 1;
-    let slug_keep_selected = slug_keep_row == selected_row;
-    let slug_keep_marker = if slug_keep_selected { ">" } else { " " };
-    let slug_keep_name_style = if slug_keep_selected {
-        Style::default()
-            .fg(palette.key_fg)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(palette.primary_fg)
-    };
-
-    let slug_new_row = co_author_row + 2;
-    let slug_new_selected = slug_new_row == selected_row;
-    let slug_new_marker = if slug_new_selected { ">" } else { " " };
-    let slug_new_name_style = if slug_new_selected {
-        Style::default()
-            .fg(palette.key_fg)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(palette.primary_fg)
-    };
-
-    let domain_row = co_author_row + 3;
+    let domain_row = co_author_row + 1;
     let domain_selected = domain_row == selected_row;
     let domain_marker = if domain_selected { ">" } else { " " };
     let domain_name_style = if domain_selected {
@@ -2536,40 +2978,15 @@ fn draw_settings(f: &mut Frame, view: SettingsView<'_>) {
 
     lines.push(Line::from(""));
     lines.push(Line::from(vec![Span::styled(
-        "  Connection Security URL",
+        "  Connection",
         Style::default()
             .fg(palette.title_fg)
             .add_modifier(Modifier::BOLD),
     )]));
-    if slug_keep_selected {
-        selected_line_idx = lines.len();
-    }
-    lines.push(Line::from(vec![Span::styled(
-        format!(
-            " {} [{}] Keep current recorded slug",
-            slug_keep_marker,
-            slug_keep_row + 1
-        ),
-        slug_keep_name_style,
-    )]));
-    lines.push(Line::from(vec![
-        Span::styled("     ", Style::default()),
-        Span::styled(
-            format!("[{}]", mcp_slug),
-            Style::default().fg(palette.muted_fg),
-        ),
-    ]));
-    if slug_new_selected {
-        selected_line_idx = lines.len();
-    }
-    lines.push(Line::from(vec![Span::styled(
-        format!(
-            " {} [{}] Generate new random slug",
-            slug_new_marker,
-            slug_new_row + 1
-        ),
-        slug_new_name_style,
-    )]));
+    lines.push(Line::from(Span::styled(
+        "     Workspace-specific MCP URLs are managed from [w] Workspaces.",
+        Style::default().fg(palette.muted_fg),
+    )));
     if domain_selected {
         selected_line_idx = lines.len();
     }
@@ -3596,6 +4013,9 @@ async fn run_tui(
                     selection.clear();
                     match key.code {
                         KeyCode::Char('q') => break,
+                        KeyCode::Char('w') => {
+                            run_workspaces(terminal, state.clone()).await?;
+                        }
                         KeyCode::Tab | KeyCode::BackTab => {
                             if bottom_panel_areas.shell_commands.is_some() {
                                 focused_bottom_panel = focused_bottom_panel.toggled();
@@ -4378,9 +4798,12 @@ fn draw_ui(f: &mut Frame, context: UiRenderContext<'_>) {
             Line::from(spans)
         },
         Line::from(vec![
-            status_label("Workspace"),
+            status_label("Workspaces"),
             Span::styled(
-                &*app.workspace_root,
+                format!(
+                    "{} registered · {} connected · [w] manage",
+                    app.workspace_count, app.connected_workspace_count
+                ),
                 Style::default().fg(palette.secondary_fg),
             ),
         ]),
@@ -4722,6 +5145,8 @@ fn draw_ui(f: &mut Frame, context: UiRenderContext<'_>) {
     let key_spans = vec![
         Span::styled("  [q]", Style::default().fg(palette.danger_fg)),
         Span::raw(" Quit  "),
+        Span::styled("[w]", Style::default().fg(palette.key_fg)),
+        Span::raw(" Workspaces  "),
         Span::styled(
             if show_command_panel { "[Tab]" } else { "" },
             Style::default().fg(palette.key_fg),
@@ -4807,7 +5232,19 @@ fn draw_ui(f: &mut Frame, context: UiRenderContext<'_>) {
             let selected = selected_log == Some(index);
             let expanded = selected && expanded_log == Some(index);
             let selection_marker = if selected { ">" } else { " " };
-            let prefix = format!("{selection_marker} {} {:5} ", entry.time, entry.level);
+            let workspace_tag = entry
+                .workspace_id
+                .as_ref()
+                .and_then(|workspace_id| app.workspace_names.get(workspace_id))
+                .map(|name| {
+                    let (short, _) = truncate_with_ellipsis(name, 12, false);
+                    format!("[{short}] ")
+                })
+                .unwrap_or_default();
+            let prefix = format!(
+                "{selection_marker} {} {:5} {workspace_tag}",
+                entry.time, entry.level
+            );
             let prefix_width = prefix.chars().count();
             let content_width = log_inner_width.saturating_sub(prefix_width).max(1);
             let message_style = if selected {
@@ -4832,6 +5269,10 @@ fn draw_ui(f: &mut Frame, context: UiRenderContext<'_>) {
                                 format!("{:5} ", entry.level),
                                 Style::default().fg(level_color),
                             ),
+                            Span::styled(
+                                workspace_tag.clone(),
+                                Style::default().fg(palette.info_fg),
+                            ),
                             Span::styled(chunk, message_style),
                         ]));
                     } else {
@@ -4853,6 +5294,7 @@ fn draw_ui(f: &mut Frame, context: UiRenderContext<'_>) {
                         format!("{:5} ", entry.level),
                         Style::default().fg(level_color),
                     ),
+                    Span::styled(workspace_tag, Style::default().fg(palette.info_fg)),
                     Span::styled(compact, message_style),
                 ])]
             }
@@ -4936,7 +5378,18 @@ fn draw_ui(f: &mut Frame, context: UiRenderContext<'_>) {
                 let selected = selected_command == Some(index);
                 let expanded = selected && expanded_command == Some(index);
                 let selection_marker = if selected { ">" } else { " " };
-                let prefix = format!("{selection_marker} {} {marker} ", activity.time);
+                let workspace_tag = app
+                    .workspace_names
+                    .get(&activity.workspace_id)
+                    .map(|name| {
+                        let (short, _) = truncate_with_ellipsis(name, 12, false);
+                        format!("[{short}] ")
+                    })
+                    .unwrap_or_default();
+                let prefix = format!(
+                    "{selection_marker} {} {marker} {workspace_tag}",
+                    activity.time
+                );
                 let prefix_width = prefix.chars().count();
                 let content_width = command_inner_width.saturating_sub(prefix_width).max(1);
                 let command_style = if selected {
@@ -4975,6 +5428,10 @@ fn draw_ui(f: &mut Frame, context: UiRenderContext<'_>) {
                                     format!("{marker} "),
                                     Style::default().fg(state_color),
                                 ),
+                                Span::styled(
+                                    workspace_tag.clone(),
+                                    Style::default().fg(palette.info_fg),
+                                ),
                                 Span::styled(chunk, command_style),
                             ]));
                         } else {
@@ -5004,6 +5461,7 @@ fn draw_ui(f: &mut Frame, context: UiRenderContext<'_>) {
                             Style::default().fg(palette.muted_fg),
                         ),
                         Span::styled(format!("{marker} "), Style::default().fg(state_color)),
+                        Span::styled(workspace_tag.clone(), Style::default().fg(palette.info_fg)),
                         Span::styled(compact_command, command_style),
                     ]));
                     lines.push(Line::from(vec![

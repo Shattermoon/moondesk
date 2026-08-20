@@ -493,6 +493,34 @@ impl Default for CommandJobManager {
     }
 }
 
+async fn signal_running_jobs(jobs: &[Arc<CommandJob>]) {
+    for job in jobs {
+        if job.runtime.lock().await.state == CommandJobState::Running {
+            let _ = job.cancel_tx.send(true);
+        }
+    }
+}
+
+async fn wait_until_not_running(jobs: &[Arc<CommandJob>], timeout: StdDuration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let mut any_running = false;
+        for job in jobs {
+            if job.runtime.lock().await.state == CommandJobState::Running {
+                any_running = true;
+                break;
+            }
+        }
+        if !any_running {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 impl CommandJobManager {
     pub fn new() -> Self {
         Self::default()
@@ -853,38 +881,29 @@ impl CommandJobManager {
     }
 
     pub async fn cancel_workspace(&self, workspace_id: &WorkspaceId) -> Result<(), String> {
-        let _start_guard = self.start_lock.lock().await;
+        // Production callers revoke workspace request admission before reaching
+        // this method. Hold the global start lock only long enough to snapshot
+        // the workspace's jobs and signal cancellation; unrelated workspaces
+        // must not lose their start capacity while process trees wind down.
         let jobs = {
-            let manager = self.inner.read().await;
-            manager
-                .jobs
-                .values()
-                .filter(|job| &job.workspace_id == workspace_id)
-                .cloned()
-                .collect::<Vec<_>>()
+            let _start_guard = self.start_lock.lock().await;
+            let jobs = {
+                let manager = self.inner.read().await;
+                manager
+                    .jobs
+                    .values()
+                    .filter(|job| &job.workspace_id == workspace_id)
+                    .cloned()
+                    .collect::<Vec<_>>()
+            };
+            signal_running_jobs(&jobs).await;
+            jobs
         };
-        for job in &jobs {
-            if job.runtime.lock().await.state == CommandJobState::Running {
-                let _ = job.cancel_tx.send(true);
-            }
-        }
 
-        let deadline = Instant::now() + StdDuration::from_secs(5);
-        loop {
-            let mut any_running = false;
-            for job in &jobs {
-                if job.runtime.lock().await.state == CommandJobState::Running {
-                    any_running = true;
-                    break;
-                }
-            }
-            if !any_running {
-                return Ok(());
-            }
-            if Instant::now() >= deadline {
-                return Err("timed out waiting for workspace command jobs to stop".to_string());
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
+        if wait_until_not_running(&jobs, StdDuration::from_secs(5)).await {
+            Ok(())
+        } else {
+            Err("timed out waiting for workspace command jobs to stop".to_string())
         }
     }
 
@@ -984,26 +1003,8 @@ impl CommandJobManager {
             let manager = self.inner.read().await;
             manager.jobs.values().cloned().collect::<Vec<_>>()
         };
-        for job in &jobs {
-            if job.runtime.lock().await.state == CommandJobState::Running {
-                let _ = job.cancel_tx.send(true);
-            }
-        }
-
-        let deadline = Instant::now() + StdDuration::from_secs(5);
-        loop {
-            let mut any_running = false;
-            for job in &jobs {
-                if job.runtime.lock().await.state == CommandJobState::Running {
-                    any_running = true;
-                    break;
-                }
-            }
-            if !any_running || Instant::now() >= deadline {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        signal_running_jobs(&jobs).await;
+        let _ = wait_until_not_running(&jobs, StdDuration::from_secs(5)).await;
     }
 
     pub async fn cleanup(&self) {
@@ -2067,8 +2068,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cleanup_enforces_terminal_output_budget_per_workspace() {
-        let root = workspace("global-output-budget");
+    async fn cleanup_enforces_terminal_output_budget_for_single_workspace() {
+        let root = workspace("single-workspace-output-budget");
         let manager = CommandJobManager::new();
 
         for index in 0..9u64 {
@@ -2182,7 +2183,7 @@ mod tests {
                 .await
                 .expect("workspace A should receive its full active-job allowance");
         }
-        manager
+        let started_b = manager
             .start_for_workspace(
                 &workspace_b,
                 command.to_string(),
@@ -2210,6 +2211,18 @@ mod tests {
             .cancel_workspace(&workspace_a)
             .await
             .expect("cancel workspace A jobs");
+        let workspace_b_snapshot = manager
+            .poll_for_workspace(&workspace_b, &started_b.snapshot.job_id, 0, 0)
+            .await
+            .expect("poll workspace B after cancelling A");
+        assert_eq!(workspace_b_snapshot.state, CommandJobState::Running);
+        assert_eq!(
+            manager
+                .purge_workspace_state(&workspace_b)
+                .await
+                .expect_err("active workspace B job must block purge"),
+            "workspace still has active command jobs"
+        );
         manager
             .cancel_workspace(&workspace_b)
             .await
@@ -2371,7 +2384,7 @@ mod tests {
             "sleep 0.8; printf survived > b-survived.txt"
         };
 
-        manager
+        let started_a = manager
             .start_for_workspace(
                 &workspace_a,
                 command_a.to_string(),
@@ -2381,7 +2394,7 @@ mod tests {
             )
             .await
             .expect("start workspace A shutdown job");
-        manager
+        let started_b = manager
             .start_for_workspace(
                 &workspace_b,
                 command_b.to_string(),
@@ -2393,6 +2406,16 @@ mod tests {
             .expect("start workspace B shutdown job");
 
         manager.cancel_all().await;
+        let snapshot_a = manager
+            .poll_for_workspace(&workspace_a, &started_a.snapshot.job_id, 0, 0)
+            .await
+            .expect("poll workspace A after shutdown cancellation");
+        let snapshot_b = manager
+            .poll_for_workspace(&workspace_b, &started_b.snapshot.job_id, 0, 0)
+            .await
+            .expect("poll workspace B after shutdown cancellation");
+        assert_eq!(snapshot_a.state, CommandJobState::Cancelled);
+        assert_eq!(snapshot_b.state, CommandJobState::Cancelled);
         tokio::time::sleep(StdDuration::from_millis(1_000)).await;
         assert!(!sentinel_a.exists());
         assert!(!sentinel_b.exists());

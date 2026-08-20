@@ -6,7 +6,6 @@ use std::io::Write as IoWrite;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tiktoken_rs::o200k_base_singleton;
-use tokio::sync::Mutex;
 
 use crate::command;
 use crate::command_jobs::{
@@ -81,7 +80,7 @@ pub struct McpRequestContext<'a> {
     pub tool_mode: ToolMode,
     pub set_moondesk_as_co_author: bool,
     pub command_jobs: &'a CommandJobManager,
-    pub devtools: &'a Option<Arc<Mutex<DevtoolsBridge>>>,
+    pub devtools: &'a Option<Arc<DevtoolsBridge>>,
 }
 
 pub async fn handle_request(
@@ -102,8 +101,7 @@ pub async fn handle_request(
                         "clientInfo": {"name": "moondesk-bridge", "version": SERVER_VERSION}
                     }
                 });
-                let mut b = bridge.lock().await;
-                let _ = b.ensure_initialized(&init_req).await;
+                let _ = bridge.ensure_initialized(&init_req).await;
             }
             Some(handle_initialize(req))
         }
@@ -257,7 +255,7 @@ async fn handle_tools_list(
     req: &JsonRpcRequest,
     mode: Mode,
     tool_mode: ToolMode,
-    devtools: &Option<Arc<Mutex<DevtoolsBridge>>>,
+    devtools: &Option<Arc<DevtoolsBridge>>,
 ) -> JsonRpcResponse {
     let mut tools: Vec<Value> = Vec::new();
 
@@ -487,7 +485,7 @@ async fn handle_tools_call(
     tool_mode: ToolMode,
     set_moondesk_as_co_author: bool,
     command_jobs: &CommandJobManager,
-    devtools: &Option<Arc<Mutex<DevtoolsBridge>>>,
+    devtools: &Option<Arc<DevtoolsBridge>>,
 ) -> JsonRpcResponse {
     let workspace_id = WorkspaceId::test_default();
     handle_tools_call_for_workspace(
@@ -632,7 +630,7 @@ async fn forward_to_devtools(
     req: &JsonRpcRequest,
     tool_name: &str,
     tool_mode: ToolMode,
-    devtools: &Option<Arc<Mutex<DevtoolsBridge>>>,
+    devtools: &Option<Arc<DevtoolsBridge>>,
 ) -> JsonRpcResponse {
     let params = &req.params;
     let Some(bridge) = devtools else {
@@ -661,8 +659,7 @@ async fn forward_to_devtools(
         "params": params
     });
 
-    let mut b = bridge.lock().await;
-    match b.request(&forward_req).await {
+    match bridge.request(&forward_req).await {
         Ok(resp) => {
             if let Some(result) = resp.get("result") {
                 return JsonRpcResponse::success(req.id.clone(), result.clone());
@@ -1650,15 +1647,14 @@ fn tool_is_read_only(tool: &Value) -> bool {
         .unwrap_or(false)
 }
 
-async fn fetch_devtools_tools(bridge: &Arc<Mutex<DevtoolsBridge>>) -> Option<Vec<Value>> {
+async fn fetch_devtools_tools(bridge: &Arc<DevtoolsBridge>) -> Option<Vec<Value>> {
     let list_req = json!({
         "jsonrpc": "2.0",
         "id": "dt-tools-list",
         "method": "tools/list",
         "params": {}
     });
-    let mut b = bridge.lock().await;
-    let resp = b.request(&list_req).await.ok()?;
+    let resp = bridge.request(&list_req).await.ok()?;
     let dt_tools = resp
         .get("result")
         .and_then(|r| r.get("tools"))
@@ -1667,10 +1663,7 @@ async fn fetch_devtools_tools(bridge: &Arc<Mutex<DevtoolsBridge>>) -> Option<Vec
     Some(dt_tools)
 }
 
-async fn devtools_tool_is_read_only(
-    bridge: &Arc<Mutex<DevtoolsBridge>>,
-    tool_name: &str,
-) -> Option<bool> {
+async fn devtools_tool_is_read_only(bridge: &Arc<DevtoolsBridge>, tool_name: &str) -> Option<bool> {
     let dt_tools = fetch_devtools_tools(bridge).await?;
     dt_tools
         .iter()

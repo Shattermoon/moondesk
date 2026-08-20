@@ -1,41 +1,53 @@
 use serde_json::Value;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicU64, Ordering},
+};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 
 use crate::browser::DetectedBrowser;
-use crate::state::{ServerUiEvent, UiEventSender};
+use crate::state::{ServerUiEvent, SharedState, UiEventSender};
 
 const CHROME_DEVTOOLS_MCP_VERSION: &str = "1.7.0";
 const MAX_DEVTOOLS_DIAGNOSTIC_LINES: usize = 100;
 const MAX_DEVTOOLS_DIAGNOSTIC_CHARS: usize = 2_048;
 
 #[derive(Default)]
-struct InitializationGate {
-    initialized: bool,
+struct InitializationState {
+    initialized: AtomicBool,
 }
 
-impl InitializationGate {
+impl InitializationState {
     fn needs_initialization(&self) -> bool {
-        !self.initialized
+        !self.initialized.load(Ordering::Acquire)
     }
 
-    fn mark_initialized(&mut self) {
-        self.initialized = true;
+    fn mark_initialized(&self) {
+        self.initialized.store(true, Ordering::Release);
     }
 
-    fn reset(&mut self) {
-        self.initialized = false;
+    fn reset(&self) {
+        self.initialized.store(false, Ordering::Release);
     }
+}
+
+fn internal_request_id(sequence: u64) -> Value {
+    Value::String(format!(
+        "moondesk-devtools-{}-{sequence}",
+        std::process::id()
+    ))
 }
 
 /// A running chrome-devtools-mcp child process with stdin/stdout JSON-RPC bridge.
 pub struct DevtoolsBridge {
-    child: Child,
-    stdin: tokio::io::BufWriter<tokio::process::ChildStdin>,
+    child: Mutex<Child>,
+    stdin: Mutex<tokio::io::BufWriter<tokio::process::ChildStdin>>,
     pending: Arc<Mutex<std::collections::HashMap<Value, tokio::sync::oneshot::Sender<Value>>>>,
-    initialization: InitializationGate,
+    initialization: Arc<InitializationState>,
+    initialization_lock: Mutex<()>,
+    next_request_id: AtomicU64,
 }
 
 impl DevtoolsBridge {
@@ -43,7 +55,8 @@ impl DevtoolsBridge {
     pub async fn start(
         selected_browser: Option<&DetectedBrowser>,
         ui_events: UiEventSender,
-    ) -> Result<Arc<Mutex<Self>>, String> {
+        state: SharedState,
+    ) -> Result<Arc<Self>, String> {
         let mut command = Command::new("npx");
         let package = format!("chrome-devtools-mcp@{CHROME_DEVTOOLS_MCP_VERSION}");
         command.args(["-y", package.as_str()]);
@@ -80,17 +93,20 @@ impl DevtoolsBridge {
             Mutex<std::collections::HashMap<Value, tokio::sync::oneshot::Sender<Value>>>,
         > = Arc::new(Mutex::new(std::collections::HashMap::new()));
 
-        let bridge = Arc::new(Mutex::new(Self {
-            child,
-            stdin,
+        let initialization = Arc::new(InitializationState::default());
+        let bridge = Arc::new(Self {
+            child: Mutex::new(child),
+            stdin: Mutex::new(stdin),
             pending: pending.clone(),
-            initialization: InitializationGate::default(),
-        }));
+            initialization: initialization.clone(),
+            initialization_lock: Mutex::new(()),
+            next_request_id: AtomicU64::new(1),
+        });
 
         // Spawn stdout reader task. EOF means the child is no longer usable: clear
         // pending requests so their receivers fail immediately and update the TUI.
         let pending_clone = pending;
-        let stdout_ui_events = ui_events.clone();
+        let stdout_state = state;
         tokio::spawn(async move {
             let mut reader = BufReader::new(child_stdout);
             let mut line = String::new();
@@ -115,8 +131,9 @@ impl DevtoolsBridge {
                     Err(_) => break,
                 }
             }
+            initialization.reset();
             pending_clone.lock().await.clear();
-            let _ = stdout_ui_events.send(ServerUiEvent::SetDevtoolsRunning(false));
+            stdout_state.lock().await.devtools_running = false;
         });
 
         // Drain stderr so diagnostics cannot block the child. Surface a bounded
@@ -168,11 +185,14 @@ impl DevtoolsBridge {
         Ok(bridge)
     }
 
-    /// Initialize the shared chrome-devtools-mcp child at most once.
-    /// Multiple MoonDesk workspace connectors can initialize concurrently, but
-    /// the bridge itself is mutex-protected and only the first successful call
-    /// performs the underlying JSON-RPC handshake.
-    pub async fn ensure_initialized(&mut self, init_req: &Value) -> Result<(), String> {
+    /// Initialize the shared chrome-devtools-mcp child at most once while it is alive.
+    /// The initialization mutex only serializes the handshake itself; normal tool
+    /// requests do not hold it and can wait for independent responses concurrently.
+    pub async fn ensure_initialized(&self, init_req: &Value) -> Result<(), String> {
+        if !self.initialization.needs_initialization() {
+            return Ok(());
+        }
+        let _guard = self.initialization_lock.lock().await;
         if !self.initialization.needs_initialization() {
             return Ok(());
         }
@@ -186,35 +206,46 @@ impl DevtoolsBridge {
         Ok(())
     }
 
-    /// Send a JSON-RPC request and wait for the response.
-    pub async fn request(&mut self, req: &Value) -> Result<Value, String> {
-        // Register the response channel *before* writing the request. A fast child
-        // can answer immediately after flush; registering afterwards creates a race
-        // where the reader discards a valid response and the caller waits 120s.
-        let pending = if let Some(id) = req.get("id").cloned() {
+    fn next_internal_request_id(&self) -> Value {
+        let sequence = self.next_request_id.fetch_add(1, Ordering::Relaxed);
+        internal_request_id(sequence)
+    }
+
+    /// Send a JSON-RPC request and wait for the response. Client-provided IDs are
+    /// remapped so different ChatGPT workspace connectors can safely reuse the same
+    /// JSON-RPC correlation ID without colliding in the shared DevTools child.
+    pub async fn request(&self, req: &Value) -> Result<Value, String> {
+        let mut outbound = req.clone();
+        let original_id = req.get("id").cloned();
+        let pending = if original_id.is_some() {
+            let internal_id = self.next_internal_request_id();
+            let object = outbound
+                .as_object_mut()
+                .ok_or_else(|| "DevTools JSON-RPC request must be an object".to_string())?;
+            object.insert("id".to_string(), internal_id.clone());
             let (tx, rx) = tokio::sync::oneshot::channel();
-            self.pending.lock().await.insert(id.clone(), tx);
-            Some((id, rx))
+            self.pending.lock().await.insert(internal_id.clone(), tx);
+            Some((internal_id, rx))
         } else {
             None
         };
 
-        let line = serde_json::to_string(req).map_err(|e| e.to_string())?;
-        let write_result = async {
-            self.stdin
-                .write_all(line.as_bytes())
-                .await
-                .map_err(|e| format!("stdin write: {e}"))?;
-            self.stdin
-                .write_all(b"\n")
-                .await
-                .map_err(|e| format!("stdin write newline: {e}"))?;
-            self.stdin
-                .flush()
-                .await
-                .map_err(|e| format!("stdin flush: {e}"))
-        }
-        .await;
+        let line = serde_json::to_string(&outbound).map_err(|e| e.to_string())?;
+        let write_result = {
+            let mut stdin = self.stdin.lock().await;
+            async {
+                stdin
+                    .write_all(line.as_bytes())
+                    .await
+                    .map_err(|e| format!("stdin write: {e}"))?;
+                stdin
+                    .write_all(b"\n")
+                    .await
+                    .map_err(|e| format!("stdin write newline: {e}"))?;
+                stdin.flush().await.map_err(|e| format!("stdin flush: {e}"))
+            }
+            .await
+        };
 
         if let Err(error) = write_result {
             if let Some((id, _)) = &pending {
@@ -223,34 +254,42 @@ impl DevtoolsBridge {
             return Err(error);
         }
 
-        let Some((id, rx)) = pending else {
+        let Some((internal_id, rx)) = pending else {
             return Ok(Value::Null);
         };
-        match tokio::time::timeout(std::time::Duration::from_secs(120), rx).await {
-            Ok(Ok(resp)) => Ok(resp),
+        let mut response = match tokio::time::timeout(std::time::Duration::from_secs(120), rx).await
+        {
+            Ok(Ok(resp)) => resp,
             Ok(Err(_)) => {
-                self.pending.lock().await.remove(&id);
-                Err("Response channel closed".into())
+                self.pending.lock().await.remove(&internal_id);
+                return Err("Response channel closed".into());
             }
             Err(_) => {
-                self.pending.lock().await.remove(&id);
-                Err("Request timed out (120s)".into())
+                self.pending.lock().await.remove(&internal_id);
+                return Err("Request timed out (120s)".into());
             }
+        };
+        if let Some(original_id) = original_id
+            && let Some(object) = response.as_object_mut()
+        {
+            object.insert("id".to_string(), original_id);
         }
+        Ok(response)
     }
 
     /// Send a notification (no id, no response expected).
-    pub async fn notify(&mut self, req: &Value) -> Result<(), String> {
+    pub async fn notify(&self, req: &Value) -> Result<(), String> {
         let line = serde_json::to_string(req).map_err(|e| e.to_string())?;
-        self.stdin
+        let mut stdin = self.stdin.lock().await;
+        stdin
             .write_all(line.as_bytes())
             .await
             .map_err(|e| format!("stdin write: {e}"))?;
-        self.stdin
+        stdin
             .write_all(b"\n")
             .await
             .map_err(|e| format!("stdin write: {e}"))?;
-        self.stdin
+        stdin
             .flush()
             .await
             .map_err(|e| format!("stdin flush: {e}"))?;
@@ -259,32 +298,38 @@ impl DevtoolsBridge {
 
     /// Stop the shared bridge explicitly so MoonDesk never leaves the npx child
     /// alive after the host exits.
-    pub async fn stop(&mut self) {
+    pub async fn stop(&self) {
         self.initialization.reset();
         self.pending.lock().await.clear();
-        let _ = self.stdin.shutdown().await;
-        let _ = self.child.start_kill();
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), self.child.wait()).await;
+        let _ = self.stdin.lock().await.shutdown().await;
+        let mut child = self.child.lock().await;
+        let _ = child.start_kill();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), child.wait()).await;
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::InitializationGate;
+    use super::*;
 
     #[test]
-    fn initialization_gate_allows_one_handshake_until_reset() {
-        let mut gate = InitializationGate::default();
+    fn initialization_state_allows_one_handshake_until_reset() {
+        let state = InitializationState::default();
         let mut handshakes = 0;
         for _ in 0..3 {
-            if gate.needs_initialization() {
+            if state.needs_initialization() {
                 handshakes += 1;
-                gate.mark_initialized();
+                state.mark_initialized();
             }
         }
         assert_eq!(handshakes, 1);
+        state.reset();
+        assert!(state.needs_initialization());
+    }
 
-        gate.reset();
-        assert!(gate.needs_initialization());
+    #[test]
+    fn internal_devtools_request_ids_are_unique_and_do_not_reuse_client_ids() {
+        assert_ne!(internal_request_id(1), internal_request_id(2));
+        assert_ne!(internal_request_id(1), Value::String("1".into()));
     }
 }

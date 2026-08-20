@@ -395,6 +395,15 @@ fn validate_persisted_root(root: &Path) -> Result<(), String> {
             root.display()
         ));
     }
+    if root.is_dir() {
+        let canonical = canonicalize_existing_workspace_root(root)?;
+        if comparable_root(&canonical) != comparable_root(root) {
+            return Err(format!(
+                "workspace root must be stored in canonical form: {}",
+                root.display()
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -511,6 +520,25 @@ mod tests {
             config("Child", child, "SecretSlugBBBBBB"),
         ];
         assert!(validate_workspace_registry(&workspaces).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registry_rejects_existing_symlink_root_alias() {
+        use std::os::unix::fs::symlink;
+
+        let target = absolute_test_root("persisted-symlink-target");
+        let alias = absolute_test_root("persisted-symlink-alias");
+        std::fs::create_dir_all(&target).expect("create symlink target");
+        symlink(&target, &alias).expect("create workspace root symlink");
+        let workspace = config("Alias", alias.clone(), "SecretSlugAAAAAA");
+
+        let error = validate_workspace_registry(&[workspace])
+            .expect_err("persisted symlink aliases must fail canonical validation");
+        assert!(error.contains("canonical form"));
+
+        let _ = std::fs::remove_file(alias);
+        let _ = std::fs::remove_dir_all(target);
     }
 
     #[test]

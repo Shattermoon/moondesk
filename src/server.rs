@@ -8,7 +8,6 @@ use axum::{
 };
 use serde_json::{Value, json};
 use std::sync::Arc;
-use tokio::sync::Mutex;
 
 use crate::command_jobs::CommandJobManager;
 use crate::devtools::DevtoolsBridge;
@@ -25,7 +24,7 @@ const STATELESS_FLOW_LABEL: &str = "stateless";
 #[derive(Clone)]
 struct ServerState {
     app: SharedState,
-    devtools: Option<Arc<Mutex<DevtoolsBridge>>>,
+    devtools: Option<Arc<DevtoolsBridge>>,
     command_jobs: CommandJobManager,
     ui_events: UiEventSender,
 }
@@ -33,7 +32,7 @@ struct ServerState {
 /// Build the axum router.
 pub fn router(
     app_state: SharedState,
-    devtools: Option<Arc<Mutex<DevtoolsBridge>>>,
+    devtools: Option<Arc<DevtoolsBridge>>,
     command_jobs: CommandJobManager,
     ui_events: UiEventSender,
 ) -> Router {
@@ -168,43 +167,55 @@ fn tool_arguments(req: &Value) -> Option<&Value> {
 fn begin_command_ui_request(
     req: &Value,
     workspace_id: &WorkspaceId,
-    ui_events: &UiEventSender,
-) -> Option<CommandUiRequest> {
+) -> (Option<CommandUiRequest>, Option<ServerUiEvent>) {
     if req.get("method").and_then(Value::as_str) != Some("tools/call") {
-        return None;
+        return (None, None);
     }
-    let tool = request_tool_name(req)?;
-    let arguments = tool_arguments(req)?;
+    let Some(tool) = request_tool_name(req) else {
+        return (None, None);
+    };
+    let Some(arguments) = tool_arguments(req) else {
+        return (None, None);
+    };
     match tool.as_str() {
         "run_command" | "start_command" => {
-            let command = arguments.get("command")?.as_str()?.to_string();
+            let Some(command) = arguments.get("command").and_then(Value::as_str) else {
+                return (None, None);
+            };
             let activity_id = Uuid::new_v4().to_string();
             let background = tool == "start_command";
-            let _ = ui_events.send(ServerUiEvent::CommandStarted {
+            let event = ServerUiEvent::CommandStarted {
                 workspace_id: workspace_id.clone(),
                 activity_id: activity_id.clone(),
-                command,
+                command: command.to_string(),
                 background,
-            });
-            if background {
-                Some(CommandUiRequest::Start { activity_id })
+            };
+            let request = if background {
+                CommandUiRequest::Start { activity_id }
             } else {
-                Some(CommandUiRequest::Run { activity_id })
-            }
+                CommandUiRequest::Run { activity_id }
+            };
+            (Some(request), Some(event))
         }
-        "poll_command" => arguments
-            .get("job_id")
-            .and_then(Value::as_str)
-            .map(|job_id| CommandUiRequest::Poll {
-                job_id: job_id.to_string(),
-            }),
-        "cancel_command" => arguments
-            .get("job_id")
-            .and_then(Value::as_str)
-            .map(|job_id| CommandUiRequest::Cancel {
-                job_id: job_id.to_string(),
-            }),
-        _ => None,
+        "poll_command" => (
+            arguments
+                .get("job_id")
+                .and_then(Value::as_str)
+                .map(|job_id| CommandUiRequest::Poll {
+                    job_id: job_id.to_string(),
+                }),
+            None,
+        ),
+        "cancel_command" => (
+            arguments
+                .get("job_id")
+                .and_then(Value::as_str)
+                .map(|job_id| CommandUiRequest::Cancel {
+                    job_id: job_id.to_string(),
+                }),
+            None,
+        ),
+        _ => (None, None),
     }
 }
 
@@ -301,34 +312,32 @@ fn finish_command_ui_request(
     request: &CommandUiRequest,
     response: &Value,
     workspace_id: &WorkspaceId,
-    ui_events: &UiEventSender,
-) {
+) -> Vec<ServerUiEvent> {
     let state = command_response_state(response);
     let exit_code = command_response_exit_code(response);
     let preview = command_response_preview(response);
     match request {
-        CommandUiRequest::Run { activity_id } => {
-            let _ = ui_events.send(ServerUiEvent::CommandUpdated {
-                workspace_id: workspace_id.clone(),
-                activity_id: Some(activity_id.clone()),
-                job_id: None,
-                state,
-                exit_code,
-                preview,
-            });
-        }
+        CommandUiRequest::Run { activity_id } => vec![ServerUiEvent::CommandUpdated {
+            workspace_id: workspace_id.clone(),
+            activity_id: Some(activity_id.clone()),
+            job_id: None,
+            state,
+            exit_code,
+            preview,
+        }],
         CommandUiRequest::Start { activity_id } => {
+            let mut events = Vec::with_capacity(2);
             if let Some(job_id) = tool_structured_content(response)
                 .and_then(|value| value.get("jobId"))
                 .and_then(Value::as_str)
             {
-                let _ = ui_events.send(ServerUiEvent::CommandBoundToJob {
+                events.push(ServerUiEvent::CommandBoundToJob {
                     workspace_id: workspace_id.clone(),
                     activity_id: activity_id.clone(),
                     job_id: job_id.to_string(),
                 });
             }
-            let _ = ui_events.send(ServerUiEvent::CommandUpdated {
+            events.push(ServerUiEvent::CommandUpdated {
                 workspace_id: workspace_id.clone(),
                 activity_id: Some(activity_id.clone()),
                 job_id: None,
@@ -336,16 +345,17 @@ fn finish_command_ui_request(
                 exit_code,
                 preview,
             });
+            events
         }
         CommandUiRequest::Poll { job_id } | CommandUiRequest::Cancel { job_id } => {
-            let _ = ui_events.send(ServerUiEvent::CommandUpdated {
+            vec![ServerUiEvent::CommandUpdated {
                 workspace_id: workspace_id.clone(),
                 activity_id: None,
                 job_id: Some(job_id.clone()),
                 state,
                 exit_code,
                 preview,
-            });
+            }]
         }
     }
 }
@@ -388,13 +398,16 @@ async fn post_mcp(
         );
     }
 
-    let _ = s.ui_events.send(ServerUiEvent::IncrementRequestCount {
-        workspace_id: workspace.workspace_id.clone(),
-    });
-    let _ = s.ui_events.send(ServerUiEvent::SetRemoteConnected {
-        workspace_id: workspace.workspace_id.clone(),
-        connected: true,
-    });
+    {
+        let mut app = s.app.lock().await;
+        app.apply_server_ui_event(ServerUiEvent::IncrementRequestCount {
+            workspace_id: workspace.workspace_id.clone(),
+        });
+        app.apply_server_ui_event(ServerUiEvent::SetRemoteConnected {
+            workspace_id: workspace.workspace_id.clone(),
+            connected: true,
+        });
+    }
 
     let has_method = body.get("method").and_then(Value::as_str).is_some();
     if !has_method {
@@ -412,12 +425,15 @@ async fn post_mcp(
     let request_summary = summarize_request(&body);
     let request_flow_event = request_flow_label(&body);
 
-    let _ = s.ui_events.send(ServerUiEvent::RecordFlow {
-        workspace_id: workspace.workspace_id.clone(),
-        flow_id: STATELESS_FLOW_ID.to_string(),
-        events: vec![request_flow_event.clone()],
-        direction: FlowDirection::Forward,
-    });
+    s.app
+        .lock()
+        .await
+        .apply_server_ui_event(ServerUiEvent::RecordFlow {
+            workspace_id: workspace.workspace_id.clone(),
+            flow_id: STATELESS_FLOW_ID.to_string(),
+            events: vec![request_flow_event.clone()],
+            direction: FlowDirection::Forward,
+        });
 
     let req: JsonRpcRequest = match serde_json::from_value(body.clone()) {
         Ok(r) => r,
@@ -429,10 +445,13 @@ async fn post_mcp(
             );
         }
     };
-    // TUI-only observability: publish the shell command as soon as the MCP call
-    // has been parsed. This channel is independent of the MCP response and does
-    // not add command text or result data to ChatGPT's conversation state.
-    let command_ui_request = begin_command_ui_request(&body, &workspace.workspace_id, &s.ui_events);
+    // TUI-only observability stays local to MoonDesk. Apply state transitions
+    // directly so a full best-effort log queue cannot lose command lifecycle state.
+    let (command_ui_request, command_start_event) =
+        begin_command_ui_request(&body, &workspace.workspace_id);
+    if let Some(event) = command_start_event {
+        s.app.lock().await.apply_server_ui_event(event);
+    }
 
     let workspace_root = workspace.root.to_string_lossy().into_owned();
     let (mode, tool_mode, set_moondesk_as_co_author) = {
@@ -474,24 +493,30 @@ async fn post_mcp(
             }
         };
         if let Some(command_ui_request) = command_ui_request.as_ref() {
-            finish_command_ui_request(
+            let events = finish_command_ui_request(
                 command_ui_request,
                 &response_value,
                 &workspace.workspace_id,
-                &s.ui_events,
             );
+            let mut app = s.app.lock().await;
+            for event in events {
+                app.apply_server_ui_event(event);
+            }
         }
         response_json = Some(response_value);
     }
 
     {
         if req.id.is_some() {
-            let _ = s.ui_events.send(ServerUiEvent::RecordFlow {
-                workspace_id: workspace.workspace_id.clone(),
-                flow_id: STATELESS_FLOW_ID.to_string(),
-                events: vec![request_flow_event.clone()],
-                direction: FlowDirection::Backward,
-            });
+            s.app
+                .lock()
+                .await
+                .apply_server_ui_event(ServerUiEvent::RecordFlow {
+                    workspace_id: workspace.workspace_id.clone(),
+                    flow_id: STATELESS_FLOW_ID.to_string(),
+                    events: vec![request_flow_event.clone()],
+                    direction: FlowDirection::Backward,
+                });
         }
         let _ = s.ui_events.send(ServerUiEvent::Log {
             workspace_id: Some(workspace.workspace_id.clone()),
@@ -557,14 +582,17 @@ async fn delete_mcp(
     let Some((workspace, _request_lease)) = resolve_workspace(&s, &slug).await else {
         return not_found_response();
     };
-    let _ = s.ui_events.send(ServerUiEvent::SetRemoteConnected {
-        workspace_id: workspace.workspace_id.clone(),
-        connected: false,
-    });
-    let _ = s.ui_events.send(ServerUiEvent::BeginFlowClose {
-        workspace_id: workspace.workspace_id.clone(),
-        flow_id: STATELESS_FLOW_ID.to_string(),
-    });
+    {
+        let mut app = s.app.lock().await;
+        app.apply_server_ui_event(ServerUiEvent::SetRemoteConnected {
+            workspace_id: workspace.workspace_id.clone(),
+            connected: false,
+        });
+        app.apply_server_ui_event(ServerUiEvent::BeginFlowClose {
+            workspace_id: workspace.workspace_id.clone(),
+            flow_id: STATELESS_FLOW_ID.to_string(),
+        });
+    }
     let _ = s.ui_events.send(ServerUiEvent::Log {
         workspace_id: Some(workspace.workspace_id.clone()),
         level: "INFO",
@@ -607,7 +635,6 @@ mod tests {
 
     #[test]
     fn command_ui_events_track_background_lifecycle_without_mutating_mcp_response() {
-        let (ui_tx, mut ui_rx) = ui_event_channel();
         let workspace_id = WorkspaceId::test_default();
         let start_request = json!({
             "jsonrpc": "2.0",
@@ -618,9 +645,9 @@ mod tests {
                 "arguments": { "command": "cargo test" }
             }
         });
-        let observation = begin_command_ui_request(&start_request, &workspace_id, &ui_tx)
-            .expect("observe start command");
-        let activity_id = match ui_rx.try_recv().expect("immediate command-start event") {
+        let (observation, start_event) = begin_command_ui_request(&start_request, &workspace_id);
+        let observation = observation.expect("observe start command");
+        let activity_id = match start_event.expect("immediate command-start event") {
             ServerUiEvent::CommandStarted {
                 activity_id,
                 command,
@@ -644,23 +671,24 @@ mod tests {
             }
         });
         let response_before = response.clone();
-        finish_command_ui_request(&observation, &response, &workspace_id, &ui_tx);
+        let events = finish_command_ui_request(&observation, &response, &workspace_id);
         assert_eq!(response, response_before);
+        assert_eq!(events.len(), 2);
 
-        match ui_rx.try_recv().expect("job binding event") {
+        match &events[0] {
             ServerUiEvent::CommandBoundToJob {
                 activity_id: bound_activity_id,
                 job_id,
                 ..
             } => {
-                assert_eq!(bound_activity_id, activity_id);
+                assert_eq!(bound_activity_id, &activity_id);
                 assert_eq!(job_id, "job-1");
             }
             _ => panic!("expected command-job binding"),
         }
-        match ui_rx.try_recv().expect("running update") {
+        match &events[1] {
             ServerUiEvent::CommandUpdated { state, .. } => {
-                assert_eq!(state, CommandActivityState::Running);
+                assert_eq!(*state, CommandActivityState::Running);
             }
             _ => panic!("expected command update"),
         }
@@ -674,9 +702,13 @@ mod tests {
                 "arguments": { "job_id": "job-1", "after": 0 }
             }
         });
-        let poll_observation = begin_command_ui_request(&poll_request, &workspace_id, &ui_tx)
-            .expect("observe poll command");
-        assert!(ui_rx.try_recv().is_err(), "poll must not add a command row");
+        let (poll_observation, poll_start_event) =
+            begin_command_ui_request(&poll_request, &workspace_id);
+        let poll_observation = poll_observation.expect("observe poll command");
+        assert!(
+            poll_start_event.is_none(),
+            "poll must not add a command row"
+        );
         let poll_response = json!({
             "jsonrpc": "2.0",
             "id": "req-poll",
@@ -690,8 +722,10 @@ mod tests {
                 "isError": false
             }
         });
-        finish_command_ui_request(&poll_observation, &poll_response, &workspace_id, &ui_tx);
-        match ui_rx.try_recv().expect("terminal update") {
+        let poll_events =
+            finish_command_ui_request(&poll_observation, &poll_response, &workspace_id);
+        assert_eq!(poll_events.len(), 1);
+        match &poll_events[0] {
             ServerUiEvent::CommandUpdated {
                 job_id,
                 state,
@@ -699,7 +733,7 @@ mod tests {
                 ..
             } => {
                 assert_eq!(job_id.as_deref(), Some("job-1"));
-                assert_eq!(state, CommandActivityState::Succeeded);
+                assert_eq!(*state, CommandActivityState::Succeeded);
                 assert_eq!(
                     preview.as_deref(),
                     Some("test result: ok. 109 passed; 0 failed")
@@ -1167,7 +1201,7 @@ mod tests {
         });
 
         let app_state = Arc::new(Mutex::new(app));
-        let (ui_tx, mut ui_rx) = ui_event_channel();
+        let (ui_tx, _ui_rx) = ui_event_channel();
         let server_state = ServerState {
             app: app_state.clone(),
             devtools: None,
@@ -1177,10 +1211,6 @@ mod tests {
 
         let response = delete_mcp(AxumPath(slug_a), State(server_state)).await;
         assert_eq!(response.status(), StatusCode::OK);
-        while let Ok(event) = ui_rx.try_recv() {
-            app_state.lock().await.apply_server_ui_event(event);
-        }
-
         let app = app_state.lock().await;
         assert!(app.remote_connected);
         assert!(!app.workspace_runtimes[&workspace_a_id].remote_connected());
@@ -1191,6 +1221,130 @@ mod tests {
         let _ = std::fs::remove_dir_all(config_root);
         let _ = std::fs::remove_dir_all(workspace_b_root);
         let _ = std::fs::remove_dir_all(workspace_a_root);
+    }
+
+    #[tokio::test]
+    async fn command_state_survives_a_full_transient_log_queue() {
+        let workspace_root = unique_temp_path("moondesk-full-ui-queue-workspace");
+        let config_root = unique_temp_path("moondesk-full-ui-queue-config");
+        let config_path = config_root.join("config.toml");
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        std::fs::create_dir_all(&config_root).expect("create config root");
+
+        let app = AppState::new_for_test(
+            8787,
+            workspace_root.to_string_lossy().into_owned(),
+            config_path.clone(),
+        )
+        .expect("create app state");
+        let slug = app.workspaces[0].mcp_slug.clone();
+        let app_state = Arc::new(Mutex::new(app));
+        let (ui_tx, _ui_rx) = ui_event_channel();
+        for index in 0..crate::state::UI_EVENT_QUEUE_CAPACITY {
+            ui_tx
+                .send(ServerUiEvent::Log {
+                    workspace_id: None,
+                    level: "INFO",
+                    message: format!("queued-log-{index}"),
+                })
+                .expect("fill transient log queue");
+        }
+        assert!(
+            ui_tx
+                .send(ServerUiEvent::Log {
+                    workspace_id: None,
+                    level: "INFO",
+                    message: "overflow".into(),
+                })
+                .is_err(),
+            "test must actually saturate the transient queue"
+        );
+
+        let server_state = ServerState {
+            app: app_state.clone(),
+            devtools: None,
+            command_jobs: CommandJobManager::new(),
+            ui_events: ui_tx,
+        };
+        let command = if cfg!(windows) {
+            "Write-Output queue-ok"
+        } else {
+            "printf 'queue-ok\n'"
+        };
+        let response = post_mcp(
+            AxumPath(slug),
+            State(server_state),
+            tool_call_body("run_command", json!({ "command": command })),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let app = app_state.lock().await;
+        let activity = app
+            .command_activities
+            .back()
+            .expect("command state must bypass transient log queue");
+        assert_eq!(activity.command, command);
+        assert_eq!(activity.state, CommandActivityState::Succeeded);
+        drop(app);
+
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_dir_all(config_root);
+        let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn routine_request_logs_do_not_expose_workspace_secret_slug() {
+        let workspace_root = unique_temp_path("moondesk-secret-log-workspace");
+        let config_root = unique_temp_path("moondesk-secret-log-config");
+        let config_path = config_root.join("config.toml");
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        std::fs::create_dir_all(&config_root).expect("create config root");
+
+        let app = AppState::new_for_test(
+            8787,
+            workspace_root.to_string_lossy().into_owned(),
+            config_path.clone(),
+        )
+        .expect("create app state");
+        let slug = app.workspaces[0].mcp_slug.clone();
+        let app_state = Arc::new(Mutex::new(app));
+        let (ui_tx, mut ui_rx) = ui_event_channel();
+        let server_state = ServerState {
+            app: app_state,
+            devtools: None,
+            command_jobs: CommandJobManager::new(),
+            ui_events: ui_tx,
+        };
+
+        let response = post_mcp(
+            AxumPath(slug.clone()),
+            State(server_state),
+            Bytes::from_static(
+                br#"{"jsonrpc":"2.0","id":"secret-log-check","method":"ping","params":{}}"#,
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let mut observed_log = false;
+        while let Ok(event) = ui_rx.try_recv() {
+            if let ServerUiEvent::Log { message, .. } = event {
+                observed_log = true;
+                assert!(
+                    !message.contains(&slug),
+                    "routine request log leaked workspace MCP secret: {message}"
+                );
+            }
+        }
+        assert!(
+            observed_log,
+            "request should emit at least one local log entry"
+        );
+
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_dir_all(config_root);
+        let _ = std::fs::remove_dir_all(workspace_root);
     }
 
     #[tokio::test]

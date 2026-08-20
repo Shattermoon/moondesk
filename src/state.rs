@@ -1,4 +1,3 @@
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs::{self, OpenOptions};
@@ -12,6 +11,7 @@ use crate::browser::DetectedBrowser;
 use crate::command_jobs::CommandJobManager;
 use crate::mascot::{self, MascotPack};
 use crate::theme;
+use crate::workspaces::{self, WorkspaceConfig};
 
 /// Log entry displayed in the TUI.
 #[derive(Clone)]
@@ -69,6 +69,7 @@ pub struct FlowBootstrapProgress {
 
 const APP_CONFIG_DIR_NAME: &str = ".moondesk";
 const APP_CONFIG_FILE_NAME: &str = "config.toml";
+const CURRENT_CONFIG_VERSION: u32 = 2;
 pub const GPT_5_6_AND_EARLIER_USAGE_BUCKET: &str = "through-gpt-5.6";
 pub const CURRENT_USAGE_BUCKET: &str = GPT_5_6_AND_EARLIER_USAGE_BUCKET;
 
@@ -142,8 +143,13 @@ pub enum AgentsPathMode {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppConfig {
+    #[serde(default)]
+    pub config_version: u32,
     pub ngrok_authtoken: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp_slug: Option<String>,
+    #[serde(default)]
+    pub workspaces: Vec<WorkspaceConfig>,
     pub ngrok_domain: Option<String>,
     #[serde(default)]
     pub agents_path_mode: AgentsPathMode,
@@ -160,8 +166,10 @@ pub struct AppConfig {
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
+            config_version: 0,
             ngrok_authtoken: None,
             mcp_slug: None,
+            workspaces: Vec::new(),
             ngrok_domain: None,
             agents_path_mode: AgentsPathMode::Default,
             set_moondesk_as_co_author: false,
@@ -194,6 +202,75 @@ impl AppConfig {
         self
     }
 
+    fn validate_versioned(&self) -> std::io::Result<()> {
+        match self.config_version {
+            0 => {
+                if !self.workspaces.is_empty() {
+                    return Err(std::io::Error::other(
+                        "legacy config must not contain a workspace registry",
+                    ));
+                }
+            }
+            CURRENT_CONFIG_VERSION => {
+                if self.mcp_slug.is_some() {
+                    return Err(std::io::Error::other(
+                        "config v2 must not contain the legacy mcpSlug field",
+                    ));
+                }
+                if self.workspaces.is_empty() {
+                    return Err(std::io::Error::other(
+                        "config v2 must contain at least one workspace",
+                    ));
+                }
+                workspaces::validate_workspace_registry(&self.workspaces)
+                    .map_err(std::io::Error::other)?;
+            }
+            version => {
+                return Err(std::io::Error::other(format!(
+                    "unsupported MoonDesk config version: {version}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn load_for_app(path: &Path, legacy_workspace_root: &Path) -> std::io::Result<(Self, bool)> {
+        let mut config = Self::load_from_path(path)?;
+        let had_existing_workspace = match config.config_version {
+            CURRENT_CONFIG_VERSION => !config.workspaces.is_empty(),
+            0 => config
+                .mcp_slug
+                .as_deref()
+                .is_some_and(|slug| !slug.is_empty()),
+            _ => false,
+        };
+
+        if config.config_version == CURRENT_CONFIG_VERSION {
+            return Ok((config, had_existing_workspace));
+        }
+
+        let root = workspaces::canonicalize_existing_workspace_root(legacy_workspace_root)
+            .map_err(std::io::Error::other)?;
+        let mcp_slug = match config.mcp_slug.take() {
+            Some(slug) if !slug.is_empty() => slug,
+            _ => workspaces::generate_mcp_slug(),
+        };
+        workspaces::validate_mcp_slug(&mcp_slug).map_err(std::io::Error::other)?;
+        let workspace = WorkspaceConfig {
+            id: workspaces::WorkspaceId::new(),
+            name: workspaces::derive_workspace_name(&root),
+            root,
+            mcp_slug,
+        };
+
+        config.config_version = CURRENT_CONFIG_VERSION;
+        config.mcp_slug = None;
+        config.workspaces = vec![workspace];
+        config.validate_versioned()?;
+        config.save_to_path(path)?;
+        Ok((config, had_existing_workspace))
+    }
+
     fn load_from_path(path: &Path) -> std::io::Result<Self> {
         let text = match fs::read_to_string(path) {
             Ok(text) => text,
@@ -204,10 +281,12 @@ impl AppConfig {
         let migration =
             toml::from_str::<UsageConfigMigration>(&text).map_err(std::io::Error::other)?;
 
-        match (migration.usage_totals, migration.usage_by_model) {
-            (Some(_), Some(_)) => Err(std::io::Error::other(
-                "config contains both legacy usageTotals and usageByModel",
-            )),
+        let migrated_usage = match (migration.usage_totals, migration.usage_by_model) {
+            (Some(_), Some(_)) => {
+                return Err(std::io::Error::other(
+                    "config contains both legacy usageTotals and usageByModel",
+                ));
+            }
             (Some(legacy), None) => {
                 let _legacy_total_tokens = legacy.total_tokens;
                 config.usage_by_model.insert(
@@ -219,16 +298,21 @@ impl AppConfig {
                         tool_call_count: legacy.tool_call_count,
                     },
                 );
-                let config = config.normalized();
-                config.save_to_path(path)?;
-                Ok(config)
+                true
             }
-            (None, _) => Ok(config.normalized()),
+            (None, _) => false,
+        };
+        let config = config.normalized();
+        config.validate_versioned()?;
+        if migrated_usage {
+            config.save_to_path(path)?;
         }
+        Ok(config)
     }
 
     fn save_to_path(&self, path: &Path) -> std::io::Result<()> {
         let config = self.clone().normalized();
+        config.validate_versioned()?;
         let parent = path.parent().ok_or_else(|| {
             std::io::Error::other("failed to resolve config directory for config.toml")
         })?;
@@ -475,6 +559,7 @@ pub struct AppState {
     pub mode: Mode,
     pub tool_mode: ToolMode,
     pub mcp_slug: String,
+    pub workspaces: Vec<WorkspaceConfig>,
     pub ngrok_domain: Option<String>,
     ngrok_authtoken: Option<String>,
     agents_path_mode: AgentsPathMode,
@@ -867,22 +952,25 @@ impl AppState {
         workspace_root: String,
         config_path: PathBuf,
     ) -> std::io::Result<Self> {
-        let config = AppConfig::load_from_path(&config_path)?;
+        let (config, had_existing_workspace) =
+            AppConfig::load_for_app(&config_path, Path::new(&workspace_root))?;
         let ngrok_authtoken = config.ngrok_authtoken.clone();
         let agents_path_mode = config.agents_path_mode;
         let mascot_seed = rand::random::<u64>();
         let mascot = mascot::build_workspace_mascot(mascot_seed);
-        let is_returning_user = config.mcp_slug.is_some() && config.ngrok_domain.is_some();
-        let mcp_slug = match config.mcp_slug {
-            Some(slug) if !slug.is_empty() => slug,
-            _ => generate_mcp_slug(),
-        };
+        let is_returning_user = had_existing_workspace && config.ngrok_domain.is_some();
+        let primary_workspace = config.workspaces.first().cloned().ok_or_else(|| {
+            std::io::Error::other("config v2 did not provide a primary workspace")
+        })?;
+        let mcp_slug = primary_workspace.mcp_slug.clone();
+        let workspace_root = primary_workspace.root.to_string_lossy().into_owned();
 
         let mut app = Self {
             theme: config.theme,
             mode: config.mode,
             tool_mode: config.tool_mode,
             mcp_slug,
+            workspaces: config.workspaces,
             ngrok_domain: config.ngrok_domain.clone(),
             ngrok_authtoken,
             agents_path_mode,
@@ -1014,8 +1102,10 @@ impl AppState {
 
     fn app_config(&self) -> AppConfig {
         AppConfig {
+            config_version: CURRENT_CONFIG_VERSION,
             ngrok_authtoken: self.ngrok_authtoken.clone(),
-            mcp_slug: Some(self.mcp_slug.clone()),
+            mcp_slug: None,
+            workspaces: self.workspaces.clone(),
             ngrok_domain: self.ngrok_domain.clone(),
             agents_path_mode: self.agents_path_mode,
             set_moondesk_as_co_author: self.set_moondesk_as_co_author,
@@ -1029,7 +1119,11 @@ impl AppState {
     }
 
     pub fn regenerate_mcp_slug(&mut self) {
-        self.mcp_slug = generate_mcp_slug();
+        let slug = workspaces::generate_mcp_slug();
+        self.mcp_slug = slug.clone();
+        if let Some(primary_workspace) = self.workspaces.first_mut() {
+            primary_workspace.mcp_slug = slug;
+        }
         self.config_dirty = true;
     }
 
@@ -1317,11 +1411,6 @@ pub async fn flush_config(state: &SharedState, force: bool) -> std::io::Result<b
     Ok(true)
 }
 
-fn generate_mcp_slug() -> String {
-    let random = Uuid::new_v4();
-    URL_SAFE_NO_PAD.encode(&random.as_bytes()[..12])
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1480,6 +1569,10 @@ toolCallCount = 1
         app.persist_state().expect("persist state");
 
         let saved = AppConfig::load_from_path(&config_path).expect("load config file");
+        assert_eq!(saved.config_version, CURRENT_CONFIG_VERSION);
+        assert!(saved.mcp_slug.is_none());
+        assert_eq!(saved.workspaces.len(), 1);
+        assert_eq!(saved.workspaces[0].mcp_slug, app.mcp_slug);
         assert_eq!(saved.theme, "neon");
         assert!(matches!(saved.mode, Mode::Computer));
         assert!(matches!(saved.tool_mode, ToolMode::ReadOnly));
@@ -1549,6 +1642,143 @@ toolCallCount = 1
 
         let _ = std::fs::remove_file(config_path);
         let _ = std::fs::remove_dir(workspace);
+    }
+
+    #[test]
+    fn legacy_workspace_migration_preserves_slug_root_and_is_idempotent() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let workspace = std::env::temp_dir().join(format!("moondesk-legacy-root-{unique}"));
+        let other_workspace =
+            std::env::temp_dir().join(format!("moondesk-legacy-other-root-{unique}"));
+        let config_root = std::env::temp_dir().join(format!("moondesk-legacy-config-{unique}"));
+        std::fs::create_dir_all(&workspace).expect("create legacy workspace");
+        std::fs::create_dir_all(&other_workspace).expect("create alternate workspace");
+        std::fs::create_dir_all(&config_root).expect("create config root");
+        let config_path = config_root.join(APP_CONFIG_FILE_NAME);
+        let legacy_slug = "Ab3kL9xQ2pTm7VhC";
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"mcpSlug = "{legacy_slug}"
+ngrokDomain = "example.ngrok-free.dev"
+theme = "neon"
+mode = "both"
+toolMode = "multiTools"
+"#
+            ),
+        )
+        .expect("write legacy config");
+
+        let first = AppState::from_config_path(
+            8787,
+            workspace.to_string_lossy().into_owned(),
+            config_path.clone(),
+        )
+        .expect("migrate legacy config");
+        let expected_root = workspaces::canonicalize_existing_workspace_root(&workspace)
+            .expect("canonicalize legacy root");
+        assert_eq!(first.mcp_slug, legacy_slug);
+        assert_eq!(first.mcp_path(), format!("/{legacy_slug}/mcp"));
+        assert_eq!(first.workspace_root, expected_root.to_string_lossy());
+        assert!(first.is_returning_user);
+        assert_eq!(first.workspaces.len(), 1);
+        let first_workspace_id = first.workspaces[0].id.clone();
+
+        let saved = AppConfig::load_from_path(&config_path).expect("load migrated config");
+        assert_eq!(saved.config_version, CURRENT_CONFIG_VERSION);
+        assert!(saved.mcp_slug.is_none());
+        assert_eq!(saved.workspaces.len(), 1);
+        assert_eq!(saved.workspaces[0].id, first_workspace_id);
+        assert_eq!(saved.workspaces[0].mcp_slug, legacy_slug);
+        assert_eq!(saved.workspaces[0].root, expected_root);
+
+        let reloaded = AppState::from_config_path(
+            8787,
+            other_workspace.to_string_lossy().into_owned(),
+            config_path.clone(),
+        )
+        .expect("reload migrated config");
+        assert_eq!(reloaded.mcp_slug, legacy_slug);
+        assert_eq!(reloaded.workspaces[0].id, first_workspace_id);
+        assert_eq!(reloaded.workspace_root, first.workspace_root);
+
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_dir_all(config_root);
+        let _ = std::fs::remove_dir_all(other_workspace);
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn config_v2_rejects_duplicate_workspace_secrets() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let config_root = std::env::temp_dir().join(format!("moondesk-v2-duplicate-{unique}"));
+        std::fs::create_dir_all(&config_root).expect("create config root");
+        let config_path = config_root.join(APP_CONFIG_FILE_NAME);
+        let secret = "Ab3kL9xQ2pTm7VhC".to_string();
+        let config = AppConfig {
+            config_version: CURRENT_CONFIG_VERSION,
+            workspaces: vec![
+                WorkspaceConfig {
+                    id: workspaces::WorkspaceId::new(),
+                    name: "One".into(),
+                    root: std::env::temp_dir().join(format!("moondesk-v2-one-{unique}")),
+                    mcp_slug: secret.clone(),
+                },
+                WorkspaceConfig {
+                    id: workspaces::WorkspaceId::new(),
+                    name: "Two".into(),
+                    root: std::env::temp_dir().join(format!("moondesk-v2-two-{unique}")),
+                    mcp_slug: secret,
+                },
+            ],
+            ..AppConfig::default()
+        };
+        let text = toml::to_string_pretty(&config).expect("serialize corrupt config");
+        std::fs::write(&config_path, text).expect("write corrupt config");
+
+        let error = match AppConfig::load_from_path(&config_path) {
+            Ok(_) => panic!("duplicate secrets must fail closed"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("duplicate workspace MCP slug"));
+
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_dir_all(config_root);
+    }
+
+    #[test]
+    fn config_rejects_unsupported_future_version() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let config_root = std::env::temp_dir().join(format!("moondesk-config-version-{unique}"));
+        std::fs::create_dir_all(&config_root).expect("create config root");
+        let config_path = config_root.join(APP_CONFIG_FILE_NAME);
+        std::fs::write(
+            &config_path,
+            "configVersion = 999\ntheme = \"neon\"\nmode = \"both\"\ntoolMode = \"multiTools\"\n",
+        )
+        .expect("write future config");
+
+        let error = match AppConfig::load_from_path(&config_path) {
+            Ok(_) => panic!("future config version must fail closed"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported MoonDesk config version")
+        );
+
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_dir_all(config_root);
     }
 
     #[test]

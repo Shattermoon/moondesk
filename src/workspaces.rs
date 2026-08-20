@@ -1,3 +1,4 @@
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fmt;
@@ -8,6 +9,20 @@ use crate::command;
 
 pub const MAX_REGISTERED_WORKSPACES: usize = 32;
 const MAX_MCP_SLUG_CHARS: usize = 128;
+
+pub fn generate_mcp_slug() -> String {
+    let random = Uuid::new_v4();
+    URL_SAFE_NO_PAD.encode(&random.as_bytes()[..12])
+}
+
+pub fn derive_workspace_name(root: &Path) -> String {
+    root.file_name()
+        .and_then(|value| value.to_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && !value.chars().any(char::is_control))
+        .map(str::to_string)
+        .unwrap_or_else(|| "Workspace".to_string())
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -30,7 +45,14 @@ impl WorkspaceId {
     }
 
     pub fn validate(&self) -> Result<(), String> {
-        Self::parse(&self.0).map(|_| ())
+        let normalized = Self::parse(&self.0)?;
+        if normalized.0 != self.0 {
+            return Err(format!(
+                "workspace id must use canonical UUID form: {}",
+                self.0
+            ));
+        }
+        Ok(())
     }
 }
 

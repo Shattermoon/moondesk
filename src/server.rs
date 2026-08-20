@@ -14,7 +14,7 @@ use crate::command_jobs::CommandJobManager;
 use crate::devtools::DevtoolsBridge;
 use crate::mcp::{self, JsonRpcRequest};
 use crate::state::{CommandActivityState, FlowDirection, ServerUiEvent, SharedState};
-use crate::workspaces::{self, WorkspaceRequestContext};
+use crate::workspaces::{self, WorkspaceRequestContext, WorkspaceRequestLease};
 use uuid::Uuid;
 
 const STATELESS_FLOW_ID: &str = "stateless";
@@ -71,9 +71,15 @@ fn jsonrpc_error_response(status: StatusCode, code: i64, msg: &str) -> Response<
     response_with_body(status, "application/json", Body::from(body))
 }
 
-async fn resolve_workspace(state: &ServerState, slug: &str) -> Option<WorkspaceRequestContext> {
+async fn resolve_workspace(
+    state: &ServerState,
+    slug: &str,
+) -> Option<(WorkspaceRequestContext, WorkspaceRequestLease)> {
     let app = state.app.lock().await;
-    workspaces::resolve_workspace_by_slug(&app.workspaces, slug)
+    let workspace = workspaces::resolve_workspace_by_slug(&app.workspaces, slug)?;
+    let runtime = app.workspace_runtimes.get(&workspace.workspace_id)?.clone();
+    let lease = runtime.try_acquire()?;
+    Some((workspace, lease))
 }
 
 fn not_found_response() -> Response<Body> {
@@ -351,7 +357,7 @@ async fn post_mcp(
     State(s): State<ServerState>,
     body_bytes: Bytes,
 ) -> Response<Body> {
-    let Some(workspace) = resolve_workspace(&s, &slug).await else {
+    let Some((workspace, _request_lease)) = resolve_workspace(&s, &slug).await else {
         return not_found_response();
     };
 
@@ -504,9 +510,9 @@ async fn post_mcp(
 // ── GET /<slug>/mcp — pure HTTP mode (no SSE) ───────────────
 
 async fn get_mcp(AxumPath(slug): AxumPath<String>, State(s): State<ServerState>) -> Response<Body> {
-    if resolve_workspace(&s, &slug).await.is_none() {
+    let Some((_workspace, _request_lease)) = resolve_workspace(&s, &slug).await else {
         return not_found_response();
-    }
+    };
     response_with_body(
         StatusCode::METHOD_NOT_ALLOWED,
         "application/json",
@@ -522,9 +528,9 @@ async fn delete_mcp(
     AxumPath(slug): AxumPath<String>,
     State(s): State<ServerState>,
 ) -> Response<Body> {
-    if resolve_workspace(&s, &slug).await.is_none() {
+    let Some((_workspace, _request_lease)) = resolve_workspace(&s, &slug).await else {
         return not_found_response();
-    }
+    };
     let _ = s.ui_events.send(ServerUiEvent::SetRemoteConnected(false));
     let _ = s.ui_events.send(ServerUiEvent::BeginFlowClose {
         flow_id: STATELESS_FLOW_ID.to_string(),
@@ -891,6 +897,10 @@ mod tests {
         )
         .expect("create second workspace");
         let slug_b = second.mcp_slug.clone();
+        app.workspace_runtimes.insert(
+            second.id.clone(),
+            Arc::new(crate::workspaces::WorkspaceRuntime::default()),
+        );
         app.workspaces.push(second);
 
         let app_state = Arc::new(Mutex::new(app));

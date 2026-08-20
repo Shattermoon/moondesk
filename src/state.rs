@@ -11,7 +11,7 @@ use crate::browser::DetectedBrowser;
 use crate::command_jobs::CommandJobManager;
 use crate::mascot::{self, MascotPack};
 use crate::theme;
-use crate::workspaces::{self, WorkspaceConfig};
+use crate::workspaces::{self, WorkspaceConfig, WorkspaceId, WorkspaceRuntime};
 
 /// Log entry displayed in the TUI.
 #[derive(Clone)]
@@ -560,6 +560,8 @@ pub struct AppState {
     pub tool_mode: ToolMode,
     pub mcp_slug: String,
     pub workspaces: Vec<WorkspaceConfig>,
+    pub workspace_runtimes: HashMap<WorkspaceId, Arc<WorkspaceRuntime>>,
+    workspace_mutation_lock: Arc<Mutex<()>>,
     pub ngrok_domain: Option<String>,
     ngrok_authtoken: Option<String>,
     agents_path_mode: AgentsPathMode,
@@ -964,6 +966,11 @@ impl AppState {
         })?;
         let mcp_slug = primary_workspace.mcp_slug.clone();
         let workspace_root = primary_workspace.root.to_string_lossy().into_owned();
+        let workspace_runtimes = config
+            .workspaces
+            .iter()
+            .map(|workspace| (workspace.id.clone(), Arc::new(WorkspaceRuntime::default())))
+            .collect::<HashMap<_, _>>();
 
         let mut app = Self {
             theme: config.theme,
@@ -971,6 +978,8 @@ impl AppState {
             tool_mode: config.tool_mode,
             mcp_slug,
             workspaces: config.workspaces,
+            workspace_runtimes,
+            workspace_mutation_lock: Arc::new(Mutex::new(())),
             ngrok_domain: config.ngrok_domain.clone(),
             ngrok_authtoken,
             agents_path_mode,
@@ -1116,6 +1125,26 @@ impl AppState {
             selected_browser: self.selected_browser.clone(),
         }
         .normalized()
+    }
+
+    fn app_config_with_workspaces(&self, workspaces: Vec<WorkspaceConfig>) -> AppConfig {
+        let mut config = self.app_config();
+        config.workspaces = workspaces;
+        config
+    }
+
+    fn sync_primary_workspace_compatibility_fields(&mut self) {
+        if let Some(primary) = self.workspaces.first() {
+            self.mcp_slug = primary.mcp_slug.clone();
+            self.workspace_root = primary.root.to_string_lossy().into_owned();
+        }
+    }
+
+    fn save_workspace_registry(&self, workspaces: Vec<WorkspaceConfig>) -> Result<(), String> {
+        workspaces::validate_workspace_registry(&workspaces)?;
+        self.app_config_with_workspaces(workspaces)
+            .save_to_path(&self.config_path)
+            .map_err(|error| format!("failed to persist workspace registry: {error}"))
     }
 
     pub fn regenerate_mcp_slug(&mut self) {
@@ -1384,6 +1413,142 @@ impl AppState {
             now_ms.saturating_sub(closing_started_ms) < ttl_ms
         });
     }
+}
+
+fn unique_workspace_slug(workspaces: &[WorkspaceConfig]) -> Result<String, String> {
+    for _ in 0..64 {
+        let candidate = workspaces::generate_mcp_slug();
+        if workspaces
+            .iter()
+            .all(|workspace| workspace.mcp_slug != candidate)
+        {
+            return Ok(candidate);
+        }
+    }
+    Err("failed to generate a unique workspace MCP slug".to_string())
+}
+
+pub async fn add_workspace(
+    state: &SharedState,
+    name: String,
+    root: PathBuf,
+) -> Result<WorkspaceConfig, String> {
+    let mutation_lock = { state.lock().await.workspace_mutation_lock.clone() };
+    let _mutation_guard = mutation_lock.lock().await;
+    let mut app = state.lock().await;
+    let slug = unique_workspace_slug(&app.workspaces)?;
+    let workspace = WorkspaceConfig::new(name, root, slug)?;
+    let mut proposed = app.workspaces.clone();
+    proposed.push(workspace.clone());
+    app.save_workspace_registry(proposed.clone())?;
+    app.workspaces = proposed;
+    app.workspace_runtimes
+        .insert(workspace.id.clone(), Arc::new(WorkspaceRuntime::default()));
+    app.config_dirty = false;
+    Ok(workspace)
+}
+
+pub async fn rename_workspace(
+    state: &SharedState,
+    workspace_id: &WorkspaceId,
+    name: String,
+) -> Result<(), String> {
+    let mutation_lock = { state.lock().await.workspace_mutation_lock.clone() };
+    let _mutation_guard = mutation_lock.lock().await;
+    let mut app = state.lock().await;
+    let normalized = workspaces::normalize_workspace_name(&name)?;
+    let mut proposed = app.workspaces.clone();
+    let workspace = proposed
+        .iter_mut()
+        .find(|workspace| &workspace.id == workspace_id)
+        .ok_or_else(|| "workspace not found".to_string())?;
+    workspace.name = normalized;
+    app.save_workspace_registry(proposed.clone())?;
+    app.workspaces = proposed;
+    app.sync_primary_workspace_compatibility_fields();
+    app.config_dirty = false;
+    Ok(())
+}
+
+pub async fn rotate_workspace_secret(
+    state: &SharedState,
+    workspace_id: &WorkspaceId,
+) -> Result<String, String> {
+    let mutation_lock = { state.lock().await.workspace_mutation_lock.clone() };
+    let _mutation_guard = mutation_lock.lock().await;
+    let mut app = state.lock().await;
+    let slug = unique_workspace_slug(&app.workspaces)?;
+    let mut proposed = app.workspaces.clone();
+    let workspace = proposed
+        .iter_mut()
+        .find(|workspace| &workspace.id == workspace_id)
+        .ok_or_else(|| "workspace not found".to_string())?;
+    workspace.mcp_slug = slug.clone();
+    app.save_workspace_registry(proposed.clone())?;
+    app.workspaces = proposed;
+    app.sync_primary_workspace_compatibility_fields();
+    app.config_dirty = false;
+    Ok(slug)
+}
+
+pub async fn remove_workspace(
+    state: &SharedState,
+    workspace_id: &WorkspaceId,
+) -> Result<(), String> {
+    let mutation_lock = { state.lock().await.workspace_mutation_lock.clone() };
+    let _mutation_guard = mutation_lock.lock().await;
+    let (runtime, command_jobs) = {
+        let app = state.lock().await;
+        if app.workspaces.len() <= 1 {
+            return Err("cannot remove the final workspace".to_string());
+        }
+        if !app
+            .workspaces
+            .iter()
+            .any(|workspace| &workspace.id == workspace_id)
+        {
+            return Err("workspace not found".to_string());
+        }
+        let runtime = app
+            .workspace_runtimes
+            .get(workspace_id)
+            .cloned()
+            .ok_or_else(|| "workspace runtime not found".to_string())?;
+        (runtime, app.command_jobs.clone())
+    };
+
+    runtime.revoke();
+    if let Err(error) = command_jobs.cancel_workspace(workspace_id).await {
+        runtime.enable();
+        return Err(error);
+    }
+    runtime.wait_for_drain().await;
+
+    {
+        let mut app = state.lock().await;
+        let proposed = app
+            .workspaces
+            .iter()
+            .filter(|workspace| &workspace.id != workspace_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        if let Err(error) = app.save_workspace_registry(proposed.clone()) {
+            runtime.enable();
+            return Err(error);
+        }
+        app.workspaces = proposed;
+        app.workspace_runtimes.remove(workspace_id);
+        app.sync_primary_workspace_compatibility_fields();
+        app.config_dirty = false;
+    }
+
+    if let Err(error) = command_jobs.purge_workspace_state(workspace_id).await {
+        state.lock().await.log(
+            "WARN",
+            format!("Workspace removed, but retained command cleanup failed: {error}"),
+        );
+    }
+    Ok(())
 }
 
 pub async fn flush_config(state: &SharedState, force: bool) -> std::io::Result<bool> {
@@ -2098,5 +2263,154 @@ toolMode = "multiTools"
 
         let _ = std::fs::remove_file(config_path);
         let _ = std::fs::remove_dir_all(workspace);
+    }
+    #[tokio::test]
+    async fn workspace_lifecycle_mutations_persist_transactionally() {
+        let (app, primary_root, config_path) = test_app("moondesk-workspace-lifecycle");
+        let state = Arc::new(Mutex::new(app));
+        let secondary_root =
+            std::env::temp_dir().join(format!("moondesk-workspace-secondary-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&secondary_root).expect("create secondary workspace");
+
+        let added = add_workspace(&state, "Secondary".into(), secondary_root.clone())
+            .await
+            .expect("add workspace");
+        assert_eq!(state.lock().await.workspaces.len(), 2);
+
+        rename_workspace(&state, &added.id, "Renamed".into())
+            .await
+            .expect("rename workspace");
+        let old_slug = added.mcp_slug.clone();
+        let new_slug = rotate_workspace_secret(&state, &added.id)
+            .await
+            .expect("rotate workspace secret");
+        assert_ne!(old_slug, new_slug);
+
+        let saved = AppConfig::load_from_path(&config_path).expect("load persisted registry");
+        let persisted = saved
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == added.id)
+            .expect("persisted workspace");
+        assert_eq!(persisted.name, "Renamed");
+        assert_eq!(persisted.mcp_slug, new_slug);
+        assert!(
+            !saved
+                .workspaces
+                .iter()
+                .any(|workspace| workspace.mcp_slug == old_slug)
+        );
+
+        let _ = std::fs::remove_dir_all(secondary_root);
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_dir_all(primary_root);
+    }
+
+    #[tokio::test]
+    async fn workspace_removal_revokes_cancels_drains_and_purges() {
+        let (app, primary_root, config_path) = test_app("moondesk-workspace-remove");
+        let state = Arc::new(Mutex::new(app));
+        let secondary_root = std::env::temp_dir().join(format!(
+            "moondesk-workspace-remove-secondary-{}",
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&secondary_root).expect("create secondary workspace");
+        let added = add_workspace(&state, "Secondary".into(), secondary_root.clone())
+            .await
+            .expect("add workspace");
+
+        let (runtime, manager) = {
+            let app = state.lock().await;
+            (
+                app.workspace_runtimes
+                    .get(&added.id)
+                    .cloned()
+                    .expect("workspace runtime"),
+                app.command_jobs.clone(),
+            )
+        };
+        let lease = runtime
+            .try_acquire()
+            .expect("acquire in-flight request lease");
+        let command = if cfg!(windows) {
+            "Start-Sleep -Seconds 5"
+        } else {
+            "sleep 5"
+        };
+        let started = manager
+            .start_for_workspace(
+                &added.id,
+                command.to_string(),
+                secondary_root.clone(),
+                10_000,
+                None,
+            )
+            .await
+            .expect("start workspace job");
+
+        let mut removal = Box::pin(remove_workspace(&state, &added.id));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut removal)
+                .await
+                .is_err(),
+            "removal must wait for the existing request lease"
+        );
+        assert!(!runtime.accepting_requests());
+        assert!(runtime.try_acquire().is_none());
+        assert_eq!(runtime.in_flight_requests(), 1);
+        let cancelled = manager
+            .poll_for_workspace(&added.id, &started.snapshot.job_id, 0, 0)
+            .await
+            .expect("cancelled job remains visible until purge");
+        assert!(cancelled.state.is_terminal());
+
+        drop(lease);
+        removal.await.expect("remove workspace after drain");
+
+        {
+            let app = state.lock().await;
+            assert_eq!(app.workspaces.len(), 1);
+            assert!(
+                !app.workspaces
+                    .iter()
+                    .any(|workspace| workspace.id == added.id)
+            );
+            assert!(!app.workspace_runtimes.contains_key(&added.id));
+        }
+        assert!(
+            manager
+                .poll_for_workspace(&added.id, &started.snapshot.job_id, 0, 0)
+                .await
+                .is_err(),
+            "removed workspace retained jobs must be purged"
+        );
+        let saved = AppConfig::load_from_path(&config_path).expect("load registry after remove");
+        assert_eq!(saved.workspaces.len(), 1);
+        assert!(
+            !saved
+                .workspaces
+                .iter()
+                .any(|workspace| workspace.id == added.id)
+        );
+
+        let _ = std::fs::remove_dir_all(secondary_root);
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_dir_all(primary_root);
+    }
+
+    #[tokio::test]
+    async fn final_workspace_cannot_be_removed() {
+        let (app, root, config_path) = test_app("moondesk-final-workspace-remove");
+        let workspace_id = app.workspaces[0].id.clone();
+        let state = Arc::new(Mutex::new(app));
+        assert_eq!(
+            remove_workspace(&state, &workspace_id)
+                .await
+                .expect_err("final workspace removal must fail"),
+            "cannot remove the final workspace"
+        );
+        assert!(state.lock().await.workspace_runtimes[&workspace_id].accepting_requests());
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_dir_all(root);
     }
 }

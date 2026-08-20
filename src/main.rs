@@ -12,6 +12,9 @@ mod server;
 mod state;
 mod theme;
 mod workspace_tools;
+// P0 stages the multi-workspace architecture types before config/routing wiring lands in P1/P2.
+#[allow(dead_code)]
+mod workspaces;
 
 use crossterm::{
     ExecutableCommand,

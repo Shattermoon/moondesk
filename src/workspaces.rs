@@ -192,6 +192,9 @@ impl WorkspaceRuntime {
 
     pub fn set_remote_connected(&self, connected: bool) {
         self.remote_connected.store(connected, Ordering::Release);
+        if !connected {
+            self.last_remote_activity_ms.store(0, Ordering::Release);
+        }
     }
 
     pub fn remote_connected(&self) -> bool {
@@ -533,5 +536,18 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert!(validate_workspace_registry(&workspaces).is_err());
+    }
+
+    #[test]
+    fn disconnect_clears_workspace_remote_activity_timestamp() {
+        let runtime = WorkspaceRuntime::default();
+        runtime.set_remote_connected(true);
+        runtime.mark_remote_activity(42);
+        assert!(runtime.remote_connected());
+        assert_eq!(runtime.last_remote_activity_ms(), Some(42));
+
+        runtime.set_remote_connected(false);
+        assert!(!runtime.remote_connected());
+        assert_eq!(runtime.last_remote_activity_ms(), None);
     }
 }

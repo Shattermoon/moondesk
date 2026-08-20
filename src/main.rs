@@ -1295,28 +1295,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     stdout().execute(LeaveAlternateScreen)?;
 
     // Cleanup after the TUI is gone so quit never appears frozen on screen.
-    let command_jobs = { state.lock().await.command_jobs.clone() };
-    command_jobs.cancel_all().await;
-    {
+    // Stop accepting new MCP work first, then terminate owned command trees and
+    // shared host services before finally clearing local runtime status.
+    let (server_handle, command_jobs, remote_browser_child) = {
         let mut app = state.lock().await;
-        if let Some(handle) = app.server_handle.take() {
-            handle.abort();
-        }
-        if let Some(handle) = app.ngrok_task.take() {
-            handle.abort();
-        }
-        if let Some(child) = app.remote_browser_child.as_mut() {
-            let _ = child.start_kill();
-        }
-        if let Some(child) = app.devtools_child.as_mut() {
-            let _ = child.start_kill();
-        }
         app.server_running = false;
-        app.ngrok_running = false;
-        app.ngrok_url = None;
-        app.remote_connected = false;
-        app.last_remote_activity_ms = None;
+        (
+            app.server_handle.take(),
+            app.command_jobs.clone(),
+            app.remote_browser_child.take(),
+        )
+    };
+    if let Some(handle) = server_handle {
+        handle.abort();
+        let _ = handle.await;
     }
+    command_jobs.cancel_all().await;
+    ngrok::stop(state.clone()).await;
+    if let Some(mut child) = remote_browser_child {
+        let _ = child.start_kill();
+        let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
+    }
+    state.lock().await.clear_remote_connection_state();
 
     result
 }
@@ -1394,8 +1394,13 @@ async fn run_app(
     let (ui_event_tx, ui_event_rx) = ui_event_channel();
     let devtools_bridge = start_services(state.clone(), ui_event_tx).await;
 
-    // Phase 2: main TUI loop
-    run_tui(terminal, state, devtools_bridge, ui_event_rx).await
+    // Phase 2: main TUI loop. Keep ownership of the shared DevTools bridge here
+    // so it is explicitly stopped even if the TUI returns an error.
+    let result = run_tui(terminal, state, ui_event_rx).await;
+    if let Some(bridge) = devtools_bridge {
+        bridge.lock().await.stop().await;
+    }
+    result
 }
 
 fn draw_mode_select(f: &mut Frame, theme: &theme::ThemeDef, tool_mode: ToolMode) {
@@ -3616,6 +3621,28 @@ async fn ensure_selected_browser_remote_debugging(
 
 // ── Start services ──────────────────────────────────────────
 
+async fn port_hosts_moondesk(port: u16) -> bool {
+    let endpoint = format!("http://127.0.0.1:{port}/");
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(1))
+        .build()
+    {
+        Ok(client) => client,
+        Err(_) => return false,
+    };
+    let Ok(response) = client.get(endpoint).send().await else {
+        return false;
+    };
+    let Ok(body) = response.text().await else {
+        return false;
+    };
+    let Ok(payload) = serde_json::from_str::<serde_json::Value>(&body) else {
+        return false;
+    };
+    payload.get("status").and_then(serde_json::Value::as_str) == Some("ok")
+        && payload.get("name").and_then(serde_json::Value::as_str) == Some("MoonDesk")
+}
+
 async fn start_services(
     state: SharedState,
     ui_events: UiEventSender,
@@ -3628,6 +3655,24 @@ async fn start_services(
             app.detected_browsers.clone(),
             app.selected_browser.clone(),
         )
+    };
+
+    // Reserve the HTTP port before launching browser/devtools processes. A second
+    // MoonDesk instance should fail cheaply instead of creating duplicate host
+    // services and only discovering the collision afterwards.
+    let listener = match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
+        Ok(listener) => listener,
+        Err(error) => {
+            let message = if port_hosts_moondesk(port).await {
+                format!(
+                    "MoonDesk is already running on port {port}. Add this folder from [w] Workspaces in the running instance."
+                )
+            } else {
+                format!("Failed to bind port {port}: {error}")
+            };
+            state.lock().await.log("ERROR", message);
+            return None;
+        }
     };
 
     if mode.browser_enabled() && detected_browsers.is_empty() {
@@ -3761,17 +3806,6 @@ async fn start_services(
         command_jobs,
         ui_events,
     );
-    let listener = match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
-        Ok(l) => l,
-        Err(e) => {
-            state
-                .lock()
-                .await
-                .log("ERROR", format!("Failed to bind port {port}: {e}"));
-            return devtools_bridge;
-        }
-    };
-
     let server_state = state.clone();
     let handle = tokio::spawn(async move {
         let result = axum::serve(listener, router).await;
@@ -3803,7 +3837,6 @@ async fn start_services(
 async fn run_tui(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     state: SharedState,
-    _devtools: Option<Arc<Mutex<DevtoolsBridge>>>,
     mut ui_events: UiEventReceiver,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut log_scroll: usize = 0;

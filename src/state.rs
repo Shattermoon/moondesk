@@ -670,7 +670,6 @@ pub struct AppState {
     pub server_handle: Option<tokio::task::JoinHandle<()>>,
     pub ngrok_task: Option<tokio::task::JoinHandle<()>>,
     pub remote_browser_child: Option<tokio::process::Child>,
-    pub devtools_child: Option<tokio::process::Child>,
 }
 
 pub type SharedState = Arc<Mutex<AppState>>;
@@ -1088,7 +1087,6 @@ impl AppState {
             server_handle: None,
             ngrok_task: None,
             remote_browser_child: None,
-            devtools_child: None,
         };
         app.log("INFO", format!("ClippyMoon seed: {mascot_seed:016x}"));
         Ok(app)
@@ -1106,6 +1104,14 @@ impl AppState {
         self.ngrok_url
             .as_ref()
             .map(|url| format!("{url}{}", self.mcp_path()))
+    }
+
+    pub fn clear_remote_connection_state(&mut self) {
+        for runtime in self.workspace_runtimes.values() {
+            runtime.set_remote_connected(false);
+        }
+        self.remote_connected = false;
+        self.last_remote_activity_ms = None;
     }
 
     pub fn log(&mut self, level: &'static str, message: String) {
@@ -2549,6 +2555,38 @@ toolMode = "multiTools"
                 .get(&workspace_b)
                 .is_some_and(|runtime| !runtime.remote_connected())
         );
+
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn clear_remote_connection_state_resets_every_workspace() {
+        let (mut app, workspace, config_path) = test_app("moondesk-clear-remote-state");
+        let workspace_a = app.workspaces[0].id.clone();
+        let workspace_b = WorkspaceId::new();
+        app.workspace_runtimes
+            .insert(workspace_b.clone(), Arc::new(WorkspaceRuntime::default()));
+
+        for workspace_id in [&workspace_a, &workspace_b] {
+            let runtime = app
+                .workspace_runtimes
+                .get(workspace_id)
+                .expect("workspace runtime");
+            runtime.set_remote_connected(true);
+            runtime.mark_remote_activity(99);
+        }
+        app.remote_connected = true;
+        app.last_remote_activity_ms = Some(99);
+
+        app.clear_remote_connection_state();
+
+        assert!(!app.remote_connected);
+        assert_eq!(app.last_remote_activity_ms, None);
+        for runtime in app.workspace_runtimes.values() {
+            assert!(!runtime.remote_connected());
+            assert_eq!(runtime.last_remote_activity_ms(), None);
+        }
 
         let _ = std::fs::remove_file(config_path);
         let _ = std::fs::remove_dir_all(workspace);

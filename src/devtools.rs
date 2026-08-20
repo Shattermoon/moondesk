@@ -13,10 +13,10 @@ const MAX_DEVTOOLS_DIAGNOSTIC_CHARS: usize = 2_048;
 
 /// A running chrome-devtools-mcp child process with stdin/stdout JSON-RPC bridge.
 pub struct DevtoolsBridge {
-    #[allow(dead_code)]
     child: Child,
     stdin: tokio::io::BufWriter<tokio::process::ChildStdin>,
     pending: Arc<Mutex<std::collections::HashMap<Value, tokio::sync::oneshot::Sender<Value>>>>,
+    initialized: bool,
 }
 
 impl DevtoolsBridge {
@@ -65,6 +65,7 @@ impl DevtoolsBridge {
             child,
             stdin,
             pending: pending.clone(),
+            initialized: false,
         }));
 
         // Spawn stdout reader task. EOF means the child is no longer usable: clear
@@ -148,6 +149,24 @@ impl DevtoolsBridge {
         Ok(bridge)
     }
 
+    /// Initialize the shared chrome-devtools-mcp child at most once.
+    /// Multiple MoonDesk workspace connectors can initialize concurrently, but
+    /// the bridge itself is mutex-protected and only the first successful call
+    /// performs the underlying JSON-RPC handshake.
+    pub async fn ensure_initialized(&mut self, init_req: &Value) -> Result<(), String> {
+        if self.initialized {
+            return Ok(());
+        }
+        self.request(init_req).await?;
+        self.notify(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized"
+        }))
+        .await?;
+        self.initialized = true;
+        Ok(())
+    }
+
     /// Send a JSON-RPC request and wait for the response.
     pub async fn request(&mut self, req: &Value) -> Result<Value, String> {
         // Register the response channel *before* writing the request. A fast child
@@ -219,9 +238,13 @@ impl DevtoolsBridge {
         Ok(())
     }
 
-    /// Kill the child process.
-    #[allow(dead_code)]
+    /// Stop the shared bridge explicitly so MoonDesk never leaves the npx child
+    /// alive after the host exits.
     pub async fn stop(&mut self) {
-        let _ = self.child.kill().await;
+        self.initialized = false;
+        self.pending.lock().await.clear();
+        let _ = self.stdin.shutdown().await;
+        let _ = self.child.start_kill();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), self.child.wait()).await;
     }
 }

@@ -103,11 +103,7 @@ pub async fn handle_request(
                     }
                 });
                 let mut b = bridge.lock().await;
-                let _ = b.request(&init_req).await;
-                // Send initialized notification
-                let _ = b
-                    .notify(&json!({"jsonrpc":"2.0","method":"notifications/initialized"}))
-                    .await;
+                let _ = b.ensure_initialized(&init_req).await;
             }
             Some(handle_initialize(req))
         }

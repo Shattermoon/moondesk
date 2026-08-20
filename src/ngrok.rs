@@ -4,7 +4,7 @@ use reqwest::Url;
 
 /// Start an ngrok HTTP tunnel using the embedded Rust SDK.
 pub async fn start(state: SharedState) -> Result<(), String> {
-    let (port, mcp_path, authtoken, configured_domain) = {
+    let (port, authtoken, configured_domain) = {
         let app = state.lock().await;
         if app.ngrok_running {
             return Err("ngrok is already running".into());
@@ -13,12 +13,7 @@ pub async fn start(state: SharedState) -> Result<(), String> {
             .ngrok_authtoken()
             .map(str::to_string)
             .ok_or_else(|| "ngrok authtoken is not configured".to_string())?;
-        (
-            app.port,
-            app.mcp_path(),
-            authtoken,
-            app.ngrok_domain.clone(),
-        )
+        (app.port, authtoken, app.ngrok_domain.clone())
     };
 
     let forwards_to: Url = format!("http://127.0.0.1:{port}")
@@ -56,8 +51,7 @@ pub async fn start(state: SharedState) -> Result<(), String> {
         }
         app.ngrok_running = false;
         app.ngrok_url = None;
-        app.remote_connected = false;
-        app.last_remote_activity_ms = None;
+        app.clear_remote_connection_state();
     });
 
     {
@@ -65,9 +59,13 @@ pub async fn start(state: SharedState) -> Result<(), String> {
         app.ngrok_task = Some(watcher);
         app.ngrok_running = true;
         app.ngrok_url = Some(url.clone());
+        let workspace_count = app.workspaces.len();
         app.log("INFO", "ngrok SDK tunnel started".into());
         app.log("INFO", format!("ngrok URL: {url}"));
-        app.log("INFO", format!("MCP Server URL: {url}{mcp_path}"));
+        app.log(
+            "INFO",
+            format!("Workspace MCP endpoints ready: {workspace_count}"),
+        );
 
         if app.ngrok_domain.is_none()
             && let Ok(parsed_url) = reqwest::Url::parse(&url)
@@ -89,8 +87,7 @@ pub async fn stop(state: SharedState) {
         let task = app.ngrok_task.take();
         app.ngrok_running = false;
         app.ngrok_url = None;
-        app.remote_connected = false;
-        app.last_remote_activity_ms = None;
+        app.clear_remote_connection_state();
         task
     };
 

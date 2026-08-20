@@ -8,13 +8,13 @@ use axum::{
 };
 use serde_json::{Value, json};
 use std::sync::Arc;
-use subtle::ConstantTimeEq;
 use tokio::sync::{Mutex, mpsc::UnboundedSender};
 
 use crate::command_jobs::CommandJobManager;
 use crate::devtools::DevtoolsBridge;
 use crate::mcp::{self, JsonRpcRequest};
 use crate::state::{CommandActivityState, FlowDirection, ServerUiEvent, SharedState};
+use crate::workspaces::{self, WorkspaceRequestContext};
 use uuid::Uuid;
 
 const STATELESS_FLOW_ID: &str = "stateless";
@@ -71,9 +71,9 @@ fn jsonrpc_error_response(status: StatusCode, code: i64, msg: &str) -> Response<
     response_with_body(status, "application/json", Body::from(body))
 }
 
-async fn slug_is_authorized(state: &ServerState, slug: &str) -> bool {
-    let configured_slug = state.app.lock().await.mcp_slug.clone();
-    bool::from(configured_slug.as_bytes().ct_eq(slug.as_bytes()))
+async fn resolve_workspace(state: &ServerState, slug: &str) -> Option<WorkspaceRequestContext> {
+    let app = state.app.lock().await;
+    workspaces::resolve_workspace_by_slug(&app.workspaces, slug)
 }
 
 fn not_found_response() -> Response<Body> {
@@ -351,9 +351,9 @@ async fn post_mcp(
     State(s): State<ServerState>,
     body_bytes: Bytes,
 ) -> Response<Body> {
-    if !slug_is_authorized(&s, &slug).await {
+    let Some(workspace) = resolve_workspace(&s, &slug).await else {
         return not_found_response();
-    }
+    };
 
     let body: Value = match serde_json::from_slice(&body_bytes) {
         Ok(v) => v,
@@ -378,14 +378,11 @@ async fn post_mcp(
 
     let has_method = body.get("method").and_then(Value::as_str).is_some();
     if !has_method {
-        let mcp_path = {
-            let app = s.app.lock().await;
-            app.mcp_path()
-        };
         let _ = s.ui_events.send(ServerUiEvent::Log {
             level: "INFO",
             message: format!(
-                "POST {mcp_path} flow={STATELESS_FLOW_LABEL} accepted non-request JSON-RPC message"
+                "POST workspace={} flow={STATELESS_FLOW_LABEL} accepted non-request JSON-RPC message",
+                workspace.name
             ),
         });
         return response_with_body(StatusCode::ACCEPTED, "application/json", Body::empty());
@@ -415,14 +412,10 @@ async fn post_mcp(
     // not add command text or result data to ChatGPT's conversation state.
     let command_ui_request = begin_command_ui_request(&body, &s.ui_events);
 
-    let (workspace_root, mode, tool_mode, set_moondesk_as_co_author) = {
+    let workspace_root = workspace.root.to_string_lossy().into_owned();
+    let (mode, tool_mode, set_moondesk_as_co_author) = {
         let app = s.app.lock().await;
-        (
-            app.workspace_root.clone(),
-            app.mode,
-            app.tool_mode,
-            app.set_moondesk_as_co_author,
-        )
+        (app.mode, app.tool_mode, app.set_moondesk_as_co_author)
     };
 
     let mut response_json: Option<Value> = None;
@@ -462,9 +455,6 @@ async fn post_mcp(
     }
 
     {
-        let app = s.app.lock().await;
-        let mcp_path = app.mcp_path();
-        drop(app);
         if req.id.is_some() {
             let _ = s.ui_events.send(ServerUiEvent::RecordFlow {
                 flow_id: STATELESS_FLOW_ID.to_string(),
@@ -475,8 +465,8 @@ async fn post_mcp(
         let _ = s.ui_events.send(ServerUiEvent::Log {
             level: "INFO",
             message: format!(
-                "POST {mcp_path} flow={STATELESS_FLOW_LABEL} [{}]",
-                request_summary,
+                "POST workspace={} flow={STATELESS_FLOW_LABEL} [{}]",
+                workspace.name, request_summary,
             ),
         });
         if let Some(ref resp_json) = response_json {
@@ -484,7 +474,8 @@ async fn post_mcp(
             let _ = s.ui_events.send(ServerUiEvent::Log {
                 level: "INFO",
                 message: format!(
-                    "POST {mcp_path} flow={STATELESS_FLOW_LABEL} response [{response_summary}]"
+                    "POST workspace={} flow={STATELESS_FLOW_LABEL} response [{response_summary}]",
+                    workspace.name
                 ),
             });
         }
@@ -512,7 +503,7 @@ async fn post_mcp(
 // ── GET /<slug>/mcp — pure HTTP mode (no SSE) ───────────────
 
 async fn get_mcp(AxumPath(slug): AxumPath<String>, State(s): State<ServerState>) -> Response<Body> {
-    if !slug_is_authorized(&s, &slug).await {
+    if resolve_workspace(&s, &slug).await.is_none() {
         return not_found_response();
     }
     response_with_body(
@@ -530,7 +521,7 @@ async fn delete_mcp(
     AxumPath(slug): AxumPath<String>,
     State(s): State<ServerState>,
 ) -> Response<Body> {
-    if !slug_is_authorized(&s, &slug).await {
+    if resolve_workspace(&s, &slug).await.is_none() {
         return not_found_response();
     }
     let _ = s.ui_events.send(ServerUiEvent::SetRemoteConnected(false));
@@ -552,6 +543,7 @@ async fn delete_mcp(
 mod tests {
     use super::*;
     use crate::state::{AppState, Mode, ToolMode};
+    use crate::workspaces::WorkspaceConfig;
     use axum::body::to_bytes;
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -870,6 +862,102 @@ mod tests {
         let _ = std::fs::remove_file(config_path);
         let _ = std::fs::remove_dir_all(workspace_root);
         let _ = std::fs::remove_dir_all(config_root);
+    }
+
+    #[tokio::test]
+    async fn different_slugs_route_to_different_workspace_roots() {
+        let workspace_a = unique_temp_path("moondesk-routing-a");
+        let workspace_b = unique_temp_path("moondesk-routing-b");
+        let config_root = unique_temp_path("moondesk-routing-config");
+        let config_path = config_root.join("config.toml");
+        std::fs::create_dir_all(&workspace_a).expect("create workspace A");
+        std::fs::create_dir_all(&workspace_b).expect("create workspace B");
+        std::fs::create_dir_all(&config_root).expect("create config dir");
+        std::fs::write(workspace_a.join("marker.txt"), "workspace-a\n").expect("write marker A");
+        std::fs::write(workspace_b.join("marker.txt"), "workspace-b\n").expect("write marker B");
+
+        let mut app = AppState::new_for_test(
+            8787,
+            workspace_a.to_string_lossy().into_owned(),
+            config_path.clone(),
+        )
+        .expect("create app state");
+        let slug_a = app.workspaces[0].mcp_slug.clone();
+        let second = WorkspaceConfig::new(
+            "Workspace B",
+            &workspace_b,
+            crate::workspaces::generate_mcp_slug(),
+        )
+        .expect("create second workspace");
+        let slug_b = second.mcp_slug.clone();
+        app.workspaces.push(second);
+
+        let app_state = Arc::new(Mutex::new(app));
+        let (ui_tx, _ui_rx) = unbounded_channel();
+        let server_state = ServerState {
+            app: app_state,
+            devtools: None,
+            command_jobs: CommandJobManager::new(),
+            ui_events: ui_tx,
+        };
+
+        for (slug, expected) in [
+            (slug_a.clone(), "workspace-a\n"),
+            (slug_b.clone(), "workspace-b\n"),
+        ] {
+            let response = post_mcp(
+                AxumPath(slug),
+                State(server_state.clone()),
+                tool_call_body("read", json!({ "path": "marker.txt" })),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("read response");
+            let payload: Value = serde_json::from_slice(&body).expect("parse response");
+            assert_eq!(
+                payload
+                    .pointer("/result/structuredContent/text")
+                    .and_then(Value::as_str),
+                Some(expected)
+            );
+        }
+
+        let cross_root = post_mcp(
+            AxumPath(slug_a),
+            State(server_state.clone()),
+            tool_call_body(
+                "read",
+                json!({ "path": workspace_b.join("marker.txt").to_string_lossy() }),
+            ),
+        )
+        .await;
+        assert_eq!(cross_root.status(), StatusCode::OK);
+        let cross_body = to_bytes(cross_root.into_body(), usize::MAX)
+            .await
+            .expect("read cross-root response");
+        let cross_payload: Value =
+            serde_json::from_slice(&cross_body).expect("parse cross-root response");
+        assert_eq!(
+            cross_payload
+                .pointer("/result/isError")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+
+        let unknown = post_mcp(
+            AxumPath("definitely-not-a-workspace".to_string()),
+            State(server_state),
+            Bytes::from_static(br#"{"jsonrpc":"2.0","id":"unknown","method":"ping"}"#),
+        )
+        .await;
+        assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_dir_all(config_root);
+        let _ = std::fs::remove_dir_all(workspace_b);
+        let _ = std::fs::remove_dir_all(workspace_a);
     }
 
     #[tokio::test]

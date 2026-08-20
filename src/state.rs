@@ -4,7 +4,7 @@ use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 use tokio::sync::{
     Mutex,
     mpsc::{self, Receiver, Sender, error::TryRecvError, error::TrySendError},
@@ -76,6 +76,7 @@ pub struct FlowBootstrapProgress {
 const APP_CONFIG_DIR_NAME: &str = ".moondesk";
 const APP_CONFIG_FILE_NAME: &str = "config.toml";
 const CURRENT_CONFIG_VERSION: u32 = 2;
+const WORKSPACE_DRAIN_TIMEOUT: Duration = Duration::from_secs(130);
 pub const GPT_5_6_AND_EARLIER_USAGE_BUCKET: &str = "through-gpt-5.6";
 pub const CURRENT_USAGE_BUCKET: &str = GPT_5_6_AND_EARLIER_USAGE_BUCKET;
 
@@ -436,6 +437,9 @@ pub fn ui_event_channel() -> (UiEventSender, UiEventReceiver) {
 }
 
 impl UiEventSender {
+    /// Best-effort transport for transient local log/diagnostic events only.
+    /// Authoritative connection, flow, and command state is applied directly to
+    /// AppState so queue pressure cannot make the TUI state incorrect.
     pub fn send(&self, event: ServerUiEvent) -> Result<(), ()> {
         match self.sender.try_send(event) {
             Ok(()) => Ok(()),
@@ -475,7 +479,6 @@ pub enum ServerUiEvent {
         workspace_id: WorkspaceId,
         connected: bool,
     },
-    SetDevtoolsRunning(bool),
     RecordFlow {
         workspace_id: WorkspaceId,
         flow_id: String,
@@ -1295,11 +1298,15 @@ impl AppState {
         }
     }
 
-    fn save_workspace_registry(&self, workspaces: Vec<WorkspaceConfig>) -> Result<(), String> {
+    fn workspace_registry_snapshot(
+        &self,
+        workspaces: Vec<WorkspaceConfig>,
+    ) -> Result<(AppConfig, PathBuf), String> {
         workspaces::validate_workspace_registry(&workspaces)?;
-        self.app_config_with_workspaces(workspaces)
-            .save_to_path(&self.config_path)
-            .map_err(|error| format!("failed to persist workspace registry: {error}"))
+        Ok((
+            self.app_config_with_workspaces(workspaces),
+            self.config_path.clone(),
+        ))
     }
 
     pub fn ngrok_authtoken(&self) -> Option<&str> {
@@ -1369,9 +1376,6 @@ impl AppState {
                     runtime.set_remote_connected(connected);
                 }
                 self.recompute_remote_connection_state();
-            }
-            ServerUiEvent::SetDevtoolsRunning(running) => {
-                self.devtools_running = running;
             }
             ServerUiEvent::RecordFlow {
                 workspace_id,
@@ -1578,6 +1582,17 @@ impl AppState {
     }
 }
 
+async fn persist_workspace_registry(config: AppConfig, path: PathBuf) -> Result<(), String> {
+    match tokio::task::spawn_blocking(move || config.save_to_path(&path)).await {
+        Ok(result) => {
+            result.map_err(|error| format!("failed to persist workspace registry: {error}"))
+        }
+        Err(error) => Err(format!(
+            "workspace registry persistence task failed: {error}"
+        )),
+    }
+}
+
 fn unique_workspace_slug(workspaces: &[WorkspaceConfig]) -> Result<String, String> {
     for _ in 0..64 {
         let candidate = workspaces::generate_mcp_slug();
@@ -1598,16 +1613,24 @@ pub async fn add_workspace(
 ) -> Result<WorkspaceConfig, String> {
     let mutation_lock = { state.lock().await.workspace_mutation_lock.clone() };
     let _mutation_guard = mutation_lock.lock().await;
+    let (workspace, proposed, config, path) = {
+        let app = state.lock().await;
+        let slug = unique_workspace_slug(&app.workspaces)?;
+        let workspace = WorkspaceConfig::new(name, root, slug)?;
+        let mut proposed = app.workspaces.clone();
+        proposed.push(workspace.clone());
+        let (config, path) = app.workspace_registry_snapshot(proposed.clone())?;
+        (workspace, proposed, config, path)
+    };
+
+    persist_workspace_registry(config, path).await?;
+
     let mut app = state.lock().await;
-    let slug = unique_workspace_slug(&app.workspaces)?;
-    let workspace = WorkspaceConfig::new(name, root, slug)?;
-    let mut proposed = app.workspaces.clone();
-    proposed.push(workspace.clone());
-    app.save_workspace_registry(proposed.clone())?;
     app.workspaces = proposed;
     app.workspace_runtimes
         .insert(workspace.id.clone(), Arc::new(WorkspaceRuntime::default()));
-    app.config_dirty = false;
+    app.sync_primary_workspace_compatibility_fields();
+    app.config_dirty = true;
     Ok(workspace)
 }
 
@@ -1618,18 +1641,25 @@ pub async fn rename_workspace(
 ) -> Result<(), String> {
     let mutation_lock = { state.lock().await.workspace_mutation_lock.clone() };
     let _mutation_guard = mutation_lock.lock().await;
+    let (proposed, config, path) = {
+        let app = state.lock().await;
+        let normalized = workspaces::normalize_workspace_name(&name)?;
+        let mut proposed = app.workspaces.clone();
+        let workspace = proposed
+            .iter_mut()
+            .find(|workspace| &workspace.id == workspace_id)
+            .ok_or_else(|| "workspace not found".to_string())?;
+        workspace.name = normalized;
+        let (config, path) = app.workspace_registry_snapshot(proposed.clone())?;
+        (proposed, config, path)
+    };
+
+    persist_workspace_registry(config, path).await?;
+
     let mut app = state.lock().await;
-    let normalized = workspaces::normalize_workspace_name(&name)?;
-    let mut proposed = app.workspaces.clone();
-    let workspace = proposed
-        .iter_mut()
-        .find(|workspace| &workspace.id == workspace_id)
-        .ok_or_else(|| "workspace not found".to_string())?;
-    workspace.name = normalized;
-    app.save_workspace_registry(proposed.clone())?;
     app.workspaces = proposed;
     app.sync_primary_workspace_compatibility_fields();
-    app.config_dirty = false;
+    app.config_dirty = true;
     Ok(())
 }
 
@@ -1639,18 +1669,25 @@ pub async fn rotate_workspace_secret(
 ) -> Result<String, String> {
     let mutation_lock = { state.lock().await.workspace_mutation_lock.clone() };
     let _mutation_guard = mutation_lock.lock().await;
+    let (slug, proposed, config, path) = {
+        let app = state.lock().await;
+        let slug = unique_workspace_slug(&app.workspaces)?;
+        let mut proposed = app.workspaces.clone();
+        let workspace = proposed
+            .iter_mut()
+            .find(|workspace| &workspace.id == workspace_id)
+            .ok_or_else(|| "workspace not found".to_string())?;
+        workspace.mcp_slug = slug.clone();
+        let (config, path) = app.workspace_registry_snapshot(proposed.clone())?;
+        (slug, proposed, config, path)
+    };
+
+    persist_workspace_registry(config, path).await?;
+
     let mut app = state.lock().await;
-    let slug = unique_workspace_slug(&app.workspaces)?;
-    let mut proposed = app.workspaces.clone();
-    let workspace = proposed
-        .iter_mut()
-        .find(|workspace| &workspace.id == workspace_id)
-        .ok_or_else(|| "workspace not found".to_string())?;
-    workspace.mcp_slug = slug.clone();
-    app.save_workspace_registry(proposed.clone())?;
     app.workspaces = proposed;
     app.sync_primary_workspace_compatibility_fields();
-    app.config_dirty = false;
+    app.config_dirty = true;
     Ok(slug)
 }
 
@@ -1685,26 +1722,43 @@ pub async fn remove_workspace(
         runtime.enable();
         return Err(error);
     }
-    runtime.wait_for_drain().await;
-
+    if tokio::time::timeout(WORKSPACE_DRAIN_TIMEOUT, runtime.wait_for_drain())
+        .await
+        .is_err()
     {
-        let mut app = state.lock().await;
+        return Err(format!(
+            "timed out after {} seconds waiting for in-flight workspace requests to finish; the workspace remains revoked, so retry removal after the active request completes",
+            WORKSPACE_DRAIN_TIMEOUT.as_secs()
+        ));
+    }
+
+    let (proposed, config, path) = {
+        let app = state.lock().await;
         let proposed = app
             .workspaces
             .iter()
             .filter(|workspace| &workspace.id != workspace_id)
             .cloned()
             .collect::<Vec<_>>();
-        if let Err(error) = app.save_workspace_registry(proposed.clone()) {
-            runtime.enable();
-            return Err(error);
-        }
+        let (config, path) = app.workspace_registry_snapshot(proposed.clone())?;
+        (proposed, config, path)
+    };
+
+    if let Err(error) = persist_workspace_registry(config, path).await {
+        runtime.enable();
+        return Err(format!(
+            "{error}; workspace removal was not persisted and the workspace was re-enabled, but its background jobs had already been cancelled"
+        ));
+    }
+
+    {
+        let mut app = state.lock().await;
         app.workspaces = proposed;
         app.workspace_runtimes.remove(workspace_id);
         app.purge_workspace_observability(workspace_id);
         app.recompute_remote_connection_state();
         app.sync_primary_workspace_compatibility_fields();
-        app.config_dirty = false;
+        app.config_dirty = true;
     }
 
     if let Err(error) = command_jobs.purge_workspace_state(workspace_id).await {
@@ -1717,6 +1771,11 @@ pub async fn remove_workspace(
 }
 
 pub async fn flush_config(state: &SharedState, force: bool) -> std::io::Result<bool> {
+    // Serialize generic settings/usage flushes with workspace registry mutations.
+    // Otherwise an older snapshot could finish after a secret/root update and
+    // overwrite the newly persisted workspace registry.
+    let mutation_lock = { state.lock().await.workspace_mutation_lock.clone() };
+    let _mutation_guard = mutation_lock.lock().await;
     let snapshot = {
         let mut app = state.lock().await;
         app.take_config_snapshot(force)
@@ -2129,6 +2188,78 @@ toolMode = "multiTools"
         );
 
         let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_dir_all(config_root);
+    }
+
+    #[test]
+    fn config_v2_rejects_legacy_mcp_slug_field() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let config_root = std::env::temp_dir().join(format!("moondesk-v2-legacy-slug-{unique}"));
+        let workspace_root = config_root.join("workspace");
+        std::fs::create_dir_all(&workspace_root).expect("create workspace root");
+        let config_path = config_root.join(APP_CONFIG_FILE_NAME);
+        let workspace = WorkspaceConfig::new(
+            "Workspace",
+            &workspace_root,
+            workspaces::generate_mcp_slug(),
+        )
+        .expect("create workspace config");
+        let config = AppConfig {
+            config_version: CURRENT_CONFIG_VERSION,
+            mcp_slug: Some("LegacySlug123456".into()),
+            workspaces: vec![workspace],
+            ..AppConfig::default()
+        };
+        std::fs::write(
+            &config_path,
+            toml::to_string_pretty(&config).expect("serialize invalid v2 config"),
+        )
+        .expect("write invalid v2 config");
+
+        let error = AppConfig::load_from_path(&config_path)
+            .err()
+            .expect("legacy mcpSlug in config v2 must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("config v2 must not contain the legacy mcpSlug field")
+        );
+
+        let _ = std::fs::remove_dir_all(config_root);
+    }
+
+    #[test]
+    fn config_v2_rejects_empty_workspace_registry() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let config_root = std::env::temp_dir().join(format!("moondesk-v2-empty-registry-{unique}"));
+        std::fs::create_dir_all(&config_root).expect("create config root");
+        let config_path = config_root.join(APP_CONFIG_FILE_NAME);
+        let config = AppConfig {
+            config_version: CURRENT_CONFIG_VERSION,
+            workspaces: Vec::new(),
+            ..AppConfig::default()
+        };
+        std::fs::write(
+            &config_path,
+            toml::to_string_pretty(&config).expect("serialize empty v2 config"),
+        )
+        .expect("write empty v2 config");
+
+        let error = AppConfig::load_from_path(&config_path)
+            .err()
+            .expect("empty config v2 workspace registry must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("config v2 must contain at least one workspace")
+        );
+
         let _ = std::fs::remove_dir_all(config_root);
     }
 
@@ -2671,6 +2802,101 @@ toolMode = "multiTools"
 
         let _ = std::fs::remove_dir_all(secondary_root);
         let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_dir_all(primary_root);
+    }
+
+    #[tokio::test]
+    async fn concurrent_workspace_additions_do_not_overwrite_each_other() {
+        let (app, primary_root, config_path) = test_app("moondesk-workspace-concurrent-add");
+        let state = Arc::new(Mutex::new(app));
+        let root_a = std::env::temp_dir().join(format!(
+            "moondesk-workspace-concurrent-a-{}",
+            Uuid::new_v4()
+        ));
+        let root_b = std::env::temp_dir().join(format!(
+            "moondesk-workspace-concurrent-b-{}",
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root_a).expect("create workspace A");
+        std::fs::create_dir_all(&root_b).expect("create workspace B");
+
+        let (added_a, added_b) = tokio::join!(
+            add_workspace(&state, "Workspace A".into(), root_a.clone()),
+            add_workspace(&state, "Workspace B".into(), root_b.clone())
+        );
+        let added_a = added_a.expect("add workspace A");
+        let added_b = added_b.expect("add workspace B");
+        assert_ne!(added_a.id, added_b.id);
+
+        let app = state.lock().await;
+        assert_eq!(app.workspaces.len(), 3);
+        assert!(
+            app.workspaces
+                .iter()
+                .any(|workspace| workspace.id == added_a.id)
+        );
+        assert!(
+            app.workspaces
+                .iter()
+                .any(|workspace| workspace.id == added_b.id)
+        );
+        drop(app);
+
+        let saved = AppConfig::load_from_path(&config_path).expect("load concurrent registry");
+        assert_eq!(saved.workspaces.len(), 3);
+        assert!(
+            saved
+                .workspaces
+                .iter()
+                .any(|workspace| workspace.id == added_a.id)
+        );
+        assert!(
+            saved
+                .workspaces
+                .iter()
+                .any(|workspace| workspace.id == added_b.id)
+        );
+
+        let _ = std::fs::remove_dir_all(root_a);
+        let _ = std::fs::remove_dir_all(root_b);
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_dir_all(primary_root);
+    }
+
+    #[tokio::test]
+    async fn failed_workspace_persistence_does_not_publish_registry_changes() {
+        let (mut app, primary_root, original_config_path) =
+            test_app("moondesk-workspace-persist-failure");
+        let blocked_parent = primary_root.join("blocked-config-parent");
+        std::fs::write(&blocked_parent, "not a directory").expect("create blocked config parent");
+        app.config_path = blocked_parent.join(APP_CONFIG_FILE_NAME);
+        let original_workspace_id = app.workspaces[0].id.clone();
+        let state = Arc::new(Mutex::new(app));
+        let secondary_root = std::env::temp_dir().join(format!(
+            "moondesk-workspace-persist-failure-secondary-{}",
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&secondary_root).expect("create secondary workspace");
+
+        let error = add_workspace(&state, "Secondary".into(), secondary_root.clone())
+            .await
+            .expect_err("failed registry persistence must reject workspace addition");
+        assert!(error.contains("failed to persist workspace registry"));
+
+        let app = state.lock().await;
+        assert_eq!(app.workspaces.len(), 1);
+        assert_eq!(app.workspaces[0].id, original_workspace_id);
+        assert_eq!(app.workspace_runtimes.len(), 1);
+        assert!(
+            !app.workspaces
+                .iter()
+                .any(|workspace| workspace.root == secondary_root)
+        );
+        drop(app);
+
+        let _ = std::fs::remove_dir_all(secondary_root);
+        let _ = std::fs::remove_file(original_config_path);
+        let _ = std::fs::remove_file(blocked_parent);
         let _ = std::fs::remove_dir_all(primary_root);
     }
 

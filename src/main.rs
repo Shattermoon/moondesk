@@ -33,7 +33,7 @@ use state::{
     FlowAnimSegment, FlowDirection, FlowLane, GPT_5_6_AND_EARLIER_USAGE_BUCKET, Mode, SharedState,
     ToolMode, UiEventReceiver, UiEventSender, UsageTotals, add_workspace, app_config_path,
     flow_anim_lit_count, flush_config, normalize_ngrok_domain, remove_workspace, rename_workspace,
-    rotate_workspace_secret, ui_event_channel,
+    rotate_workspace_secret, ui_event_channel, user_home_dir,
 };
 use std::io::{Write, stdout};
 use std::path::PathBuf;
@@ -1392,13 +1392,15 @@ async fn run_app(
 
     // Start services
     let (ui_event_tx, ui_event_rx) = ui_event_channel();
-    let devtools_bridge = start_services(state.clone(), ui_event_tx).await;
+    let devtools_bridge = start_services(state.clone(), ui_event_tx)
+        .await
+        .map_err(std::io::Error::other)?;
 
     // Phase 2: main TUI loop. Keep ownership of the shared DevTools bridge here
     // so it is explicitly stopped even if the TUI returns an error.
     let result = run_tui(terminal, state, ui_event_rx).await;
     if let Some(bridge) = devtools_bridge {
-        bridge.lock().await.stop().await;
+        bridge.stop().await;
     }
     result
 }
@@ -2215,8 +2217,18 @@ fn workspace_public_mcp_url(base: Option<&str>, workspace: &WorkspaceConfig) -> 
     base.map(|base| format!("{}/{}/mcp", base.trim_end_matches('/'), workspace.mcp_slug))
 }
 
-fn normalize_workspace_path_input(value: &str) -> PathBuf {
-    PathBuf::from(value.trim().trim_matches(['\'', '"']))
+fn normalize_workspace_path_input(value: &str) -> std::io::Result<PathBuf> {
+    let value = value.trim().trim_matches(['\'', '"']);
+    if value == "~" {
+        return user_home_dir();
+    }
+    if let Some(rest) = value
+        .strip_prefix("~/")
+        .or_else(|| value.strip_prefix("~\\"))
+    {
+        return Ok(user_home_dir()?.join(rest));
+    }
+    Ok(PathBuf::from(value))
 }
 
 async fn run_workspaces(
@@ -2294,7 +2306,7 @@ async fn run_workspaces(
                 else {
                     continue;
                 };
-                let root = normalize_workspace_path_input(&path_input);
+                let root = normalize_workspace_path_input(&path_input)?;
                 let default_name = workspaces::derive_workspace_name(&root);
                 let Some(name) = run_prompt(terminal, "Workspace name:", &default_name).await?
                 else {
@@ -3621,6 +3633,8 @@ async fn ensure_selected_browser_remote_debugging(
 
 // ── Start services ──────────────────────────────────────────
 
+const MAX_HEALTH_PROBE_BODY_BYTES: usize = 4 * 1024;
+
 async fn port_hosts_moondesk(port: u16) -> bool {
     let endpoint = format!("http://127.0.0.1:{port}/");
     let client = match reqwest::Client::builder()
@@ -3630,13 +3644,31 @@ async fn port_hosts_moondesk(port: u16) -> bool {
         Ok(client) => client,
         Err(_) => return false,
     };
-    let Ok(response) = client.get(endpoint).send().await else {
+    let Ok(mut response) = client.get(endpoint).send().await else {
         return false;
     };
-    let Ok(body) = response.text().await else {
+    if !response.status().is_success()
+        || response
+            .content_length()
+            .is_some_and(|length| length > MAX_HEALTH_PROBE_BODY_BYTES as u64)
+    {
         return false;
-    };
-    let Ok(payload) = serde_json::from_str::<serde_json::Value>(&body) else {
+    }
+
+    let mut body = Vec::new();
+    loop {
+        match response.chunk().await {
+            Ok(Some(chunk)) => {
+                if body.len().saturating_add(chunk.len()) > MAX_HEALTH_PROBE_BODY_BYTES {
+                    return false;
+                }
+                body.extend_from_slice(&chunk);
+            }
+            Ok(None) => break,
+            Err(_) => return false,
+        }
+    }
+    let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&body) else {
         return false;
     };
     payload.get("status").and_then(serde_json::Value::as_str) == Some("ok")
@@ -3646,7 +3678,7 @@ async fn port_hosts_moondesk(port: u16) -> bool {
 async fn start_services(
     state: SharedState,
     ui_events: UiEventSender,
-) -> Option<Arc<Mutex<DevtoolsBridge>>> {
+) -> Result<Option<Arc<DevtoolsBridge>>, String> {
     let (port, mode, mut detected_browsers, mut selected_browser) = {
         let app = state.lock().await;
         (
@@ -3670,8 +3702,8 @@ async fn start_services(
             } else {
                 format!("Failed to bind port {port}: {error}")
             };
-            state.lock().await.log("ERROR", message);
-            return None;
+            state.lock().await.log("ERROR", message.clone());
+            return Err(message);
         }
     };
 
@@ -3781,7 +3813,9 @@ async fn start_services(
                 .lock()
                 .await
                 .log("INFO", "Starting chrome-devtools-mcp...".into());
-            match DevtoolsBridge::start(selected_browser.as_ref(), ui_events.clone()).await {
+            match DevtoolsBridge::start(selected_browser.as_ref(), ui_events.clone(), state.clone())
+                .await
+            {
                 Ok(bridge) => {
                     let mut app = state.lock().await;
                     app.devtools_running = true;
@@ -3829,7 +3863,7 @@ async fn start_services(
         state.lock().await.log("ERROR", format!("ngrok: {e}"));
     }
 
-    devtools_bridge
+    Ok(devtools_bridge)
 }
 
 // ── Phase 2: Main TUI ──────────────────────────────────────
@@ -4783,7 +4817,7 @@ fn draw_ui(f: &mut Frame, context: UiRenderContext<'_>) {
         ]),
         {
             let mut spans = vec![
-                status_label("MCP Server URL"),
+                status_label("Primary MCP URL"),
                 Span::styled(
                     &mcp_url,
                     Style::default().fg(if has_url {
@@ -5042,7 +5076,7 @@ fn draw_ui(f: &mut Frame, context: UiRenderContext<'_>) {
                 ]),
                 {
                     let mut spans = vec![
-                        Span::styled("     MCP Server URL", guide_detail_style),
+                        Span::styled("     Primary MCP URL", guide_detail_style),
                         Span::styled(" │ ", guide_separator_style),
                         Span::styled(
                             mcp_url.clone(),
@@ -5586,12 +5620,13 @@ mod tests {
     use super::{
         BottomPanelAreas, BottomPanelFocus, PanelItemHit, PanelScrollView, item_under_cursor,
         key_is_clipboard_paste, move_panel_selection, normalize_ngrok_authtoken_input,
-        normalize_ngrok_domain, panel_under_cursor, parse_clippymoon_export_args, parse_port_value,
-        scroll_panel_down, scroll_panel_up, tail_start_index, truncate_with_ellipsis,
-        wrap_preserving_chars,
+        normalize_ngrok_domain, normalize_workspace_path_input, panel_under_cursor,
+        parse_clippymoon_export_args, parse_port_value, scroll_panel_down, scroll_panel_up,
+        tail_start_index, truncate_with_ellipsis, user_home_dir, wrap_preserving_chars,
     };
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::layout::Rect;
+    use std::path::PathBuf;
 
     #[test]
     fn clippymoon_without_export_subcommand_returns_usage() {
@@ -5605,6 +5640,24 @@ mod tests {
         let args = vec!["clippymoon".to_string(), "--help".to_string()];
         let error = parse_clippymoon_export_args(&args).expect_err("help should return usage text");
         assert!(error.starts_with("usage: moondesk clippymoon export"));
+    }
+
+    #[test]
+    fn workspace_path_input_expands_home_tilde() {
+        let home = user_home_dir().expect("resolve user home directory");
+        assert_eq!(
+            normalize_workspace_path_input("~").expect("expand bare tilde"),
+            home
+        );
+        assert_eq!(
+            normalize_workspace_path_input("~/project").expect("expand tilde child"),
+            home.join("project")
+        );
+        assert_eq!(
+            normalize_workspace_path_input("  \"relative/project\"  ")
+                .expect("normalize quoted relative path"),
+            PathBuf::from("relative/project")
+        );
     }
 
     #[test]

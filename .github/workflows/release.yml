@@ -212,6 +212,16 @@ jobs:
           ref: main
           fetch-depth: 0
 
+      - name: Configure release Git identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          test -n "$(git config user.name)"
+          test -n "$(git config user.email)"
+          git var GIT_COMMITTER_IDENT >/dev/null
+
       - name: Publish tested release commit and tag
         id: publish_refs
         shell: bash

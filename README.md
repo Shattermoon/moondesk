@@ -98,17 +98,17 @@ I tried this with GPT-5.2 before, and the results were poor. However, **GPT-5.4 
 
    On first launch, MoonDesk will ask you to enter your **ngrok authtoken** and **ngrok static domain** (e.g. `my-app.ngrok-free.dev`). You can get both from the [ngrok dashboard](https://dashboard.ngrok.com/get-started/setup). These are saved to `~/.moondesk/config.toml` and reused on subsequent launches.
 
-   By default, MoonDesk listens on port `3200`. You can override it with `PORT`. The workspace root defaults to the current working directory and can be overridden with `WORKSPACE_ROOT`.
+   By default, MoonDesk listens on port `3200`. You can override it with `PORT`. On a first install (or when migrating the legacy single-workspace config), MoonDesk creates the first workspace from `WORKSPACE_ROOT` if it is set, otherwise from the directory where MoonDesk was launched. Once the multi-workspace registry exists, launching MoonDesk from a different directory does **not** repoint an existing connector; add or change projects from the `[w] Workspaces` screen instead.
 
    On macOS Terminal.app, MoonDesk manages a dedicated `MoonDesk` Terminal profile automatically. If the current Terminal tab is not already using that profile, MoonDesk applies it, closes any temporary helper window, and asks you to run the same command again in that tab. It only starts immediately when the current tab is already using `MoonDesk`. Set `MOONDESK_SKIP_MACOS_TERMINAL_PROFILE=1` if you want to keep the current Terminal session untouched.
 
-3. Wait for the TUI to show the MCP Server URL.
+3. Wait for the TUI to connect ngrok. Press `[w] Workspaces` to see the registered projects. Select a workspace and reveal/copy its MCP URL. The first workspace is created automatically; existing users keep their old workspace slug during migration, so the already configured connector URL does not change.
 
 4. Open [ChatGPT connector settings](https://chatgpt.com/plugins#settings/Connectors?create-connector=true&redirectAfter=%2Fplugins).
 
 5. In the pop-up window, fill in the connector form:
-   - Name: `MoonDesk` or any name you like
-   - MCP Server URL: the full URL shown in MoonDesk TUI
+   - Name: `MoonDesk · <workspace name>` (for example `MoonDesk · SiteAI`)
+   - MCP Server URL: the URL for that specific workspace from `[w] Workspaces`
    - Authentication: `None`
 
 6. Click `I understand and want to continue`.
@@ -146,6 +146,29 @@ MoonDesk is a coding tool and a custom connector. Always use MoonDesk if the use
   <em>3.9 GB Memory usage🥹</em>
 </p>
 
+
+## Working on multiple projects at the same time
+
+One MoonDesk process can host multiple project roots concurrently. It still uses one local server, one port, one ngrok tunnel/domain, and one shared browser/DevTools bridge. Each workspace gets its own stable internal ID and its own random secret MCP path.
+
+Press `[w] Workspaces` to add, rename, inspect, reveal/copy, rotate, or remove projects. Create one ChatGPT connector per workspace and select the matching connector in each ChatGPT chat. The endpoint itself selects the project; MoonDesk does not add workspace metadata or a workspace argument to every tool call.
+
+```text
+one MoonDesk process / port 3200 / ngrok domain
+├── MoonDesk · SiteAI   -> /<secret-A>/mcp -> D:\SiteAI
+├── MoonDesk · KUBA     -> /<secret-B>/mcp -> D:\KUBA
+└── MoonDesk · MoonDesk -> /<secret-C>/mcp -> D:\CatDesk
+```
+
+Important behavior:
+
+- A workspace keeps its own normal command/job/output and local-history allowances; one busy project does not consume another project's normal quota.
+- Browser control is intentionally shared. If two workspace connectors use Browser/Both mode, they control the same selected browser/DevTools bridge.
+- Rotating a workspace secret immediately invalidates only that workspace's old URL. Update that ChatGPT connector to the newly revealed URL; other workspace URLs are unchanged.
+- Removing a workspace revokes new requests, cancels its background jobs, lets already accepted foreground/file work drain safely, then removes its retained workspace state.
+- A missing workspace directory (for example an unplugged drive) stays registered and is shown as unavailable. It becomes usable again when the directory returns.
+- Duplicate and parent/child-overlapping workspace roots are rejected in V1 so two connectors cannot accidentally claim overlapping dedicated-file-tool authority.
+- Starting another MoonDesk process on the same normal port does not create a second host. If MoonDesk is already running, add the project from `[w] Workspaces` in the running instance.
 
 # Stack
 
@@ -246,13 +269,13 @@ MoonDesk does not count:
 
 These estimates stay local to MoonDesk for its own counters and are not attached to MCP tool responses sent back to ChatGPT.
 
-### What is workspace?
+### What is a workspace?
 
-Workspace is the root directory MoonDesk is allowed to work in.
+A workspace is one registered project root served by MoonDesk. One running MoonDesk host can keep multiple workspaces active at the same time, and each workspace has its own secret MCP URL for its ChatGPT connector.
 
-By default, it is the directory where you launch MoonDesk. You can also override it with `WORKSPACE_ROOT`.
+On first install/legacy migration, the initial workspace comes from `WORKSPACE_ROOT` when explicitly set, otherwise from the launch directory. After the workspace registry has been created, changing the launch directory or `WORKSPACE_ROOT` does not silently repoint existing workspace URLs. Use `[w] Workspaces` to add or manage projects.
 
-File tools use this directory as their base path, and paths outside the workspace are rejected.
+Dedicated file tools use the selected endpoint's workspace as their base path and reject traversal, absolute paths outside that root, and symlink/junction escapes. `run_command` and `start_command` are different: they start a real shell with the workspace as its working directory, but CWD is **not an OS sandbox**. A deliberately written absolute-path shell command can access other paths allowed by the operating system. Use a VM/container if you need OS-level isolation.
 
 ### Where to put my AGENTS.md?
 
@@ -272,23 +295,23 @@ MoonDesk checks these locations for `AGENTS.md` in this order. This happens ever
 # Safety
 
 > [!CAUTION]
-> Do **NOT** share the `MCP Server URL` with anyone. Anyone with the URL can access your computer.
+> Do **NOT** share any workspace's `MCP Server URL` with anyone. Each URL is a secret credential for that workspace and can expose powerful local tools.
 
-The URL is made of these parts:
+A workspace URL is made of these parts:
 
-| Part         | Example                       | What it means                                |
-| ------------ | ----------------------------- | -------------------------------------------- |
-| Public URL   | `https://xxxx.ngrok-free.dev` | Your ngrok static domain                     |
-| Random path  | `/Ab3kL9xQ2pTm7VhC`           | A random path generated on first launch      |
-| MCP endpoint | `/mcp`                        | The actual MCP endpoint                      |
+| Part         | Example                       | What it means                                      |
+| ------------ | ----------------------------- | -------------------------------------------------- |
+| Public URL   | `https://xxxx.ngrok-free.dev` | The one ngrok static domain shared by the host     |
+| Random path  | `/Ab3kL9xQ2pTm7VhC`           | A different random secret path for each workspace  |
+| MCP endpoint | `/mcp`                        | The actual MCP endpoint                            |
 
-So the full URL looks like this:
+So one workspace URL looks like this:
 
 ```text
 https://xxxx.ngrok-free.dev/Ab3kL9xQ2pTm7VhC/mcp
 ```
 
-Both the static domain and the random path are persisted in `~/.moondesk/config.toml`, so the full MCP URL stays the same across launches. You only need to set up the connector once.
+The domain and workspace registry are persisted in `~/.moondesk/config.toml`, so workspace URLs remain stable across launches. Upgrading an old single-workspace installation preserves its existing slug. If a workspace URL is exposed, rotate **that workspace's** secret from `[w] Workspaces`; its previous URL stops working immediately and the corresponding ChatGPT connector must be updated. Other workspaces are unaffected.
 
 # About ClippyMoon
 

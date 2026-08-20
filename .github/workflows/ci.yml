@@ -1,12 +1,9 @@
 name: CI
 
+# Automatic CI is temporarily disabled while MoonDesk is under active development.
+# Keep the workflow available for explicit manual validation before release/merge.
 on:
-  push:
-    branches:
-      - "**"
-  pull_request:
-    branches:
-      - "**"
+  workflow_dispatch:
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}

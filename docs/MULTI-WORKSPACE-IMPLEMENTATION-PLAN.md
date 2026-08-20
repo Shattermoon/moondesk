@@ -154,17 +154,17 @@ After a v2 workspace registry exists, process CWD must no longer silently repoin
 
 ## 6. Workspace root validation
 
-When adding or loading a workspace:
+When adding a workspace:
 
-- require a directory path
+- require an existing directory path
 - canonicalize it
 - normalize Windows verbatim path forms
 - keep the canonical absolute root
-- reject duplicate canonical roots
-- reject duplicate workspace IDs
-- reject duplicate MCP slugs
+- reject duplicate workspace IDs and MCP slugs
 - validate slug format and non-empty name
-- reject parent/child overlapping workspace roots for V1
+- reject duplicate or parent/child-overlapping roots using canonical/filesystem identity where available
+
+When loading persisted configuration, keep a syntactically valid absolute root even if it is temporarily missing or no longer resolves to the exact canonical identity that was originally stored. Such a workspace must load as `unavailable` rather than aborting host startup, and MoonDesk must not silently retarget the existing secret to a new symlink/reparse target. The user can explicitly remove/re-add the workspace to accept a changed root identity.
 
 Example rejected overlap:
 
@@ -212,15 +212,16 @@ Removing a workspace must be safe under concurrent ChatGPT activity.
 
 A valid request acquires a lightweight lease before beginning work. Removal follows:
 
-1. mark workspace disabled/revoked
-2. reject all new requests for its slug immediately
-3. cancel background jobs owned by that workspace
-4. allow already-running foreground/file operations to complete
-5. wait until its in-flight request count reaches zero
-6. purge retained command/output state belonging to that workspace as appropriate
-7. remove the workspace from persisted config
+1. install a reversible command-job closing gate for that workspace so an already-admitted request cannot create a new background job later
+2. revoke HTTP request admission for the workspace secret
+3. allow already-running foreground/file operations to complete and wait for the in-flight request count to reach zero with a bounded timeout
+4. if draining times out, remove the closing gate, re-enable the runtime, and abort removal without cancelling existing background jobs
+5. persist the workspace-registry removal atomically
+6. if persistence fails, remove the closing gate, re-enable the runtime, and abort removal without cancelling existing background jobs
+7. only after durable persistence succeeds, cancel workspace-owned background jobs and purge retained job/output state
+8. remove the workspace runtime/observability state from the live host
 
-Do not abort a file write halfway through solely because the workspace was removed from the UI.
+Do not abort a file write halfway through solely because the workspace was removed from the UI. Do not make a failed removal destructive: no irreversible job cancellation is allowed before registry removal is durable.
 
 Workspace mutation operations (add/remove/rotate) are security-sensitive and should be transactional with persistence: do not publish an in-memory credential change that failed to persist.
 

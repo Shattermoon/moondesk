@@ -377,6 +377,10 @@ struct ManagerState {
     // Retry dedupe is intentionally short-lived. JSON-RPC request IDs are only
     // correlation IDs and may be reused later by a stateless client.
     request_jobs: HashMap<(WorkspaceId, String), (String, Instant)>,
+    // A workspace being removed must stop admitting new background jobs before
+    // its request leases drain. This marker is reversible until config removal
+    // has been persisted successfully.
+    closing_workspaces: HashSet<WorkspaceId>,
     last_cleanup: Option<Instant>,
 }
 
@@ -721,6 +725,17 @@ impl CommandJobManager {
                 "command job manager is shutting down; new commands are not accepted".to_string(),
             );
         }
+        if self
+            .inner
+            .read()
+            .await
+            .closing_workspaces
+            .contains(workspace_id)
+        {
+            return Err(
+                "workspace removal is in progress; new command jobs are not accepted".to_string(),
+            );
+        }
         self.cleanup().await;
 
         let request_map_key = request_key.map(|key| (workspace_id.clone(), key));
@@ -880,11 +895,56 @@ impl CommandJobManager {
             .ok_or_else(|| format!("unknown or expired command job: {job_id}"))
     }
 
+    pub async fn begin_workspace_removal(&self, workspace_id: &WorkspaceId) -> Result<(), String> {
+        let _start_guard = self.start_lock.lock().await;
+        if self.shutting_down.load(Ordering::Acquire) {
+            return Err(
+                "command job manager is shutting down; workspace removal cannot start".to_string(),
+            );
+        }
+        let inserted = self
+            .inner
+            .write()
+            .await
+            .closing_workspaces
+            .insert(workspace_id.clone());
+        if !inserted {
+            return Err("workspace removal is already in progress".to_string());
+        }
+        Ok(())
+    }
+
+    pub async fn abort_workspace_removal(&self, workspace_id: &WorkspaceId) {
+        let _start_guard = self.start_lock.lock().await;
+        self.inner
+            .write()
+            .await
+            .closing_workspaces
+            .remove(workspace_id);
+    }
+
+    pub async fn finalize_workspace_removal(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<(), String> {
+        let prepared = self
+            .inner
+            .read()
+            .await
+            .closing_workspaces
+            .contains(workspace_id);
+        if !prepared {
+            return Err("workspace removal was not prepared".to_string());
+        }
+        self.cancel_workspace(workspace_id).await?;
+        self.purge_workspace_state(workspace_id).await
+    }
+
     pub async fn cancel_workspace(&self, workspace_id: &WorkspaceId) -> Result<(), String> {
-        // Production callers revoke workspace request admission before reaching
-        // this method. Hold the global start lock only long enough to snapshot
-        // the workspace's jobs and signal cancellation; unrelated workspaces
-        // must not lose their start capacity while process trees wind down.
+        // Hold the global start lock only long enough to snapshot the workspace's
+        // jobs and signal cancellation; unrelated workspaces must not lose their
+        // start capacity while process trees wind down. Removal callers install a
+        // closing marker first, so no new job can appear after this snapshot.
         let jobs = {
             let _start_guard = self.start_lock.lock().await;
             let jobs = {
@@ -947,6 +1007,7 @@ impl CommandJobManager {
             for id in &output_ids {
                 manager.run_outputs.remove(id);
             }
+            manager.closing_workspaces.remove(workspace_id);
             (job_ids, output_ids)
         };
         for id in job_ids.into_iter().chain(output_ids) {

@@ -165,7 +165,7 @@ Important behavior:
 - A workspace keeps its own normal command/job/output and local-history allowances; one busy project does not consume another project's normal quota.
 - Browser control is intentionally shared. If two workspace connectors use Browser/Both mode, they control the same selected browser/DevTools bridge.
 - Rotating a workspace secret immediately invalidates only that workspace's old URL. Update that ChatGPT connector to the newly revealed URL; other workspace URLs are unchanged.
-- Removing a workspace revokes new requests, cancels its background jobs, lets already accepted foreground/file work drain safely, then removes its retained workspace state.
+- Removing a workspace first blocks new requests/jobs and lets already accepted foreground/file work drain safely. Only after the registry removal is durably saved does MoonDesk cancel that workspace's background jobs and purge retained state; an aborted/failed removal re-enables the workspace without killing its running jobs.
 - A missing workspace directory (for example an unplugged drive) stays registered and is shown as unavailable. It becomes usable again when the directory returns.
 - Duplicate and parent/child-overlapping workspace roots are rejected in V1 so two connectors cannot accidentally claim overlapping dedicated-file-tool authority.
 - Starting another MoonDesk process on the same normal port does not create a second host. If MoonDesk is already running, add the project from `[w] Workspaces` in the running instance.

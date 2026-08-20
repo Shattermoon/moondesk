@@ -48,14 +48,28 @@ pub struct DevtoolsBridge {
     initialization: Arc<InitializationState>,
     initialization_lock: Mutex<()>,
     next_request_id: AtomicU64,
+    alive: Arc<AtomicBool>,
+}
+
+pub struct DevtoolsManager {
+    selected_browser: Option<DetectedBrowser>,
+    ui_events: UiEventSender,
+    state: SharedState,
+    bridge: Mutex<Option<Arc<DevtoolsBridge>>>,
+    restart_lock: Mutex<()>,
+    initialization_request: Mutex<Option<Value>>,
+    shutting_down: AtomicBool,
+    generation: Arc<AtomicU64>,
 }
 
 impl DevtoolsBridge {
     /// Spawn the tested chrome-devtools-mcp version and set up the stdio bridge.
-    pub async fn start(
+    async fn start(
         selected_browser: Option<&DetectedBrowser>,
         ui_events: UiEventSender,
         state: SharedState,
+        generation_counter: Arc<AtomicU64>,
+        generation: u64,
     ) -> Result<Arc<Self>, String> {
         let mut command = Command::new("npx");
         let package = format!("chrome-devtools-mcp@{CHROME_DEVTOOLS_MCP_VERSION}");
@@ -94,6 +108,7 @@ impl DevtoolsBridge {
         > = Arc::new(Mutex::new(std::collections::HashMap::new()));
 
         let initialization = Arc::new(InitializationState::default());
+        let alive = Arc::new(AtomicBool::new(true));
         let bridge = Arc::new(Self {
             child: Mutex::new(child),
             stdin: Mutex::new(stdin),
@@ -101,12 +116,14 @@ impl DevtoolsBridge {
             initialization: initialization.clone(),
             initialization_lock: Mutex::new(()),
             next_request_id: AtomicU64::new(1),
+            alive: alive.clone(),
         });
 
         // Spawn stdout reader task. EOF means the child is no longer usable: clear
         // pending requests so their receivers fail immediately and update the TUI.
         let pending_clone = pending;
         let stdout_state = state;
+        let stdout_alive = alive;
         tokio::spawn(async move {
             let mut reader = BufReader::new(child_stdout);
             let mut line = String::new();
@@ -131,9 +148,12 @@ impl DevtoolsBridge {
                     Err(_) => break,
                 }
             }
+            stdout_alive.store(false, Ordering::Release);
             initialization.reset();
             pending_clone.lock().await.clear();
-            stdout_state.lock().await.devtools_running = false;
+            if generation_counter.load(Ordering::Acquire) == generation {
+                stdout_state.lock().await.devtools_running = false;
+            }
         });
 
         // Drain stderr so diagnostics cannot block the child. Surface a bounded
@@ -248,6 +268,8 @@ impl DevtoolsBridge {
         };
 
         if let Err(error) = write_result {
+            self.alive.store(false, Ordering::Release);
+            self.initialization.reset();
             if let Some((id, _)) = &pending {
                 self.pending.lock().await.remove(id);
             }
@@ -280,31 +302,198 @@ impl DevtoolsBridge {
     /// Send a notification (no id, no response expected).
     pub async fn notify(&self, req: &Value) -> Result<(), String> {
         let line = serde_json::to_string(req).map_err(|e| e.to_string())?;
-        let mut stdin = self.stdin.lock().await;
-        stdin
-            .write_all(line.as_bytes())
+        let write_result = {
+            let mut stdin = self.stdin.lock().await;
+            async {
+                stdin
+                    .write_all(line.as_bytes())
+                    .await
+                    .map_err(|e| format!("stdin write: {e}"))?;
+                stdin
+                    .write_all(b"\n")
+                    .await
+                    .map_err(|e| format!("stdin write: {e}"))?;
+                stdin.flush().await.map_err(|e| format!("stdin flush: {e}"))
+            }
             .await
-            .map_err(|e| format!("stdin write: {e}"))?;
-        stdin
-            .write_all(b"\n")
-            .await
-            .map_err(|e| format!("stdin write: {e}"))?;
-        stdin
-            .flush()
-            .await
-            .map_err(|e| format!("stdin flush: {e}"))?;
-        Ok(())
+        };
+        if write_result.is_err() {
+            self.alive.store(false, Ordering::Release);
+            self.initialization.reset();
+        }
+        write_result
+    }
+
+    pub fn is_alive(&self) -> bool {
+        self.alive.load(Ordering::Acquire)
     }
 
     /// Stop the shared bridge explicitly so MoonDesk never leaves the npx child
     /// alive after the host exits.
     pub async fn stop(&self) {
+        self.alive.store(false, Ordering::Release);
         self.initialization.reset();
         self.pending.lock().await.clear();
         let _ = self.stdin.lock().await.shutdown().await;
         let mut child = self.child.lock().await;
         let _ = child.start_kill();
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), child.wait()).await;
+    }
+}
+
+impl DevtoolsManager {
+    pub async fn start(
+        selected_browser: Option<&DetectedBrowser>,
+        ui_events: UiEventSender,
+        state: SharedState,
+    ) -> Result<Arc<Self>, String> {
+        let manager = Arc::new(Self {
+            selected_browser: selected_browser.cloned(),
+            ui_events,
+            state,
+            bridge: Mutex::new(None),
+            restart_lock: Mutex::new(()),
+            initialization_request: Mutex::new(None),
+            shutting_down: AtomicBool::new(false),
+            generation: Arc::new(AtomicU64::new(0)),
+        });
+        let bridge = manager.spawn_bridge().await?;
+        *manager.bridge.lock().await = Some(bridge);
+        Ok(manager)
+    }
+
+    async fn spawn_bridge(&self) -> Result<Arc<DevtoolsBridge>, String> {
+        let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
+        DevtoolsBridge::start(
+            self.selected_browser.as_ref(),
+            self.ui_events.clone(),
+            self.state.clone(),
+            self.generation.clone(),
+            generation,
+        )
+        .await
+    }
+
+    async fn bridge_or_restart(&self) -> Result<Arc<DevtoolsBridge>, String> {
+        if self.shutting_down.load(Ordering::Acquire) {
+            return Err("chrome-devtools-mcp is shutting down".to_string());
+        }
+        if let Some(bridge) = self.bridge.lock().await.clone()
+            && bridge.is_alive()
+        {
+            return Ok(bridge);
+        }
+
+        let _restart_guard = self.restart_lock.lock().await;
+        if self.shutting_down.load(Ordering::Acquire) {
+            return Err("chrome-devtools-mcp is shutting down".to_string());
+        }
+        if let Some(bridge) = self.bridge.lock().await.clone()
+            && bridge.is_alive()
+        {
+            return Ok(bridge);
+        }
+
+        let previous = self.bridge.lock().await.take();
+        if let Some(previous) = previous {
+            previous.stop().await;
+        }
+
+        match self.spawn_bridge().await {
+            Ok(bridge) => {
+                if let Some(init_req) = self.initialization_request.lock().await.clone()
+                    && let Err(error) = bridge.ensure_initialized(&init_req).await
+                {
+                    bridge.stop().await;
+                    let mut app = self.state.lock().await;
+                    app.devtools_running = false;
+                    app.log(
+                        "ERROR",
+                        format!("chrome-devtools-mcp restart initialization failed: {error}"),
+                    );
+                    return Err(format!(
+                        "chrome-devtools-mcp restart initialization failed: {error}"
+                    ));
+                }
+                *self.bridge.lock().await = Some(bridge.clone());
+                let mut app = self.state.lock().await;
+                app.devtools_running = true;
+                app.log(
+                    "INFO",
+                    "chrome-devtools-mcp restarted after child exit".into(),
+                );
+                Ok(bridge)
+            }
+            Err(error) => {
+                let mut app = self.state.lock().await;
+                app.devtools_running = false;
+                app.log(
+                    "ERROR",
+                    format!("chrome-devtools-mcp restart failed: {error}"),
+                );
+                Err(error)
+            }
+        }
+    }
+
+    async fn recover_after_failure(
+        &self,
+        bridge: &Arc<DevtoolsBridge>,
+        original_error: String,
+    ) -> String {
+        if bridge.is_alive() || self.shutting_down.load(Ordering::Acquire) {
+            return original_error;
+        }
+        match self.bridge_or_restart().await {
+            Ok(_) => format!(
+                "{original_error}; chrome-devtools-mcp was restarted, retry the browser operation"
+            ),
+            Err(restart_error) => {
+                format!("{original_error}; chrome-devtools-mcp restart failed: {restart_error}")
+            }
+        }
+    }
+
+    pub async fn ensure_initialized(&self, init_req: &Value) -> Result<(), String> {
+        let bridge = self.bridge_or_restart().await?;
+        match bridge.ensure_initialized(init_req).await {
+            Ok(()) => {
+                *self.initialization_request.lock().await = Some(init_req.clone());
+                Ok(())
+            }
+            Err(error) if !bridge.is_alive() && !self.shutting_down.load(Ordering::Acquire) => {
+                let replacement = self.bridge_or_restart().await.map_err(|restart_error| {
+                    format!(
+                        "{error}; chrome-devtools-mcp restart failed during initialization: {restart_error}"
+                    )
+                })?;
+                replacement.ensure_initialized(init_req).await.map_err(|retry_error| {
+                    format!(
+                        "{error}; chrome-devtools-mcp restarted but initialization retry failed: {retry_error}"
+                    )
+                })?;
+                *self.initialization_request.lock().await = Some(init_req.clone());
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    pub async fn request(&self, req: &Value) -> Result<Value, String> {
+        let bridge = self.bridge_or_restart().await?;
+        match bridge.request(req).await {
+            Ok(response) => Ok(response),
+            Err(error) => Err(self.recover_after_failure(&bridge, error).await),
+        }
+    }
+
+    pub async fn stop(&self) {
+        self.shutting_down.store(true, Ordering::Release);
+        self.generation.fetch_add(1, Ordering::AcqRel);
+        if let Some(bridge) = self.bridge.lock().await.take() {
+            bridge.stop().await;
+        }
+        self.state.lock().await.devtools_running = false;
     }
 }
 

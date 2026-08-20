@@ -319,10 +319,14 @@ pub fn canonicalize_existing_workspace_root(path: &Path) -> Result<PathBuf, Stri
 }
 
 pub fn workspace_availability(root: &Path) -> WorkspaceAvailability {
-    if root.is_dir() {
-        WorkspaceAvailability::Available
-    } else {
-        WorkspaceAvailability::Unavailable
+    if !root.is_dir() {
+        return WorkspaceAvailability::Unavailable;
+    }
+    match canonicalize_existing_workspace_root(root) {
+        Ok(canonical) if comparable_root(&canonical) == comparable_root(root) => {
+            WorkspaceAvailability::Available
+        }
+        _ => WorkspaceAvailability::Unavailable,
     }
 }
 
@@ -336,7 +340,6 @@ pub fn validate_workspace_registry(workspaces: &[WorkspaceConfig]) -> Result<(),
 
     let mut ids = HashSet::with_capacity(workspaces.len());
     let mut slugs = HashSet::with_capacity(workspaces.len());
-    let mut roots = HashSet::with_capacity(workspaces.len());
     let mut normalized_roots = Vec::with_capacity(workspaces.len());
 
     for workspace in workspaces {
@@ -352,21 +355,31 @@ pub fn validate_workspace_registry(workspaces: &[WorkspaceConfig]) -> Result<(),
             return Err("duplicate workspace MCP slug".into());
         }
 
-        let root_key = comparable_root(&workspace.root);
-        if !roots.insert(root_key.clone()) {
-            return Err(format!(
-                "duplicate workspace root: {}",
-                workspace.root.display()
-            ));
-        }
-        normalized_roots.push((workspace.name.as_str(), workspace.root.as_path(), root_key));
+        let resolved = canonicalize_existing_workspace_root(&workspace.root)
+            .unwrap_or_else(|_| workspace.root.clone());
+        normalized_roots.push((
+            workspace.name.as_str(),
+            workspace.root.as_path(),
+            comparable_root(&resolved),
+        ));
     }
 
     for left in 0..normalized_roots.len() {
         for right in (left + 1)..normalized_roots.len() {
             let (left_name, left_root, left_key) = &normalized_roots[left];
             let (right_name, right_root, right_key) = &normalized_roots[right];
-            if left_key.starts_with(right_key) || right_key.starts_with(left_key) {
+            if left_key == right_key || same_filesystem_object(left_root, right_root) {
+                return Err(format!(
+                    "duplicate workspace root: {} and {}",
+                    left_root.display(),
+                    right_root.display()
+                ));
+            }
+            if left_key.starts_with(right_key)
+                || right_key.starts_with(left_key)
+                || filesystem_ancestor_of(left_root, right_root)
+                || filesystem_ancestor_of(right_root, left_root)
+            {
                 return Err(format!(
                     "workspace roots must not overlap: {left_name} ({}) and {right_name} ({})",
                     left_root.display(),
@@ -395,16 +408,44 @@ fn validate_persisted_root(root: &Path) -> Result<(), String> {
             root.display()
         ));
     }
-    if root.is_dir() {
-        let canonical = canonicalize_existing_workspace_root(root)?;
-        if comparable_root(&canonical) != comparable_root(root) {
-            return Err(format!(
-                "workspace root must be stored in canonical form: {}",
-                root.display()
-            ));
-        }
-    }
     Ok(())
+}
+
+#[cfg(unix)]
+fn filesystem_identity(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = std::fs::metadata(path).ok()?;
+    Some((metadata.dev(), metadata.ino()))
+}
+
+#[cfg(unix)]
+fn same_filesystem_object(left: &Path, right: &Path) -> bool {
+    matches!(
+        (filesystem_identity(left), filesystem_identity(right)),
+        (Some(left), Some(right)) if left == right
+    )
+}
+
+#[cfg(not(unix))]
+fn same_filesystem_object(_left: &Path, _right: &Path) -> bool {
+    false
+}
+
+#[cfg(unix)]
+fn filesystem_ancestor_of(ancestor: &Path, descendant: &Path) -> bool {
+    let Some(ancestor_identity) = filesystem_identity(ancestor) else {
+        return false;
+    };
+    descendant
+        .ancestors()
+        .skip(1)
+        .any(|candidate| filesystem_identity(candidate) == Some(ancestor_identity))
+}
+
+#[cfg(not(unix))]
+fn filesystem_ancestor_of(_ancestor: &Path, _descendant: &Path) -> bool {
+    false
 }
 
 #[cfg(windows)]
@@ -524,7 +565,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn registry_rejects_existing_symlink_root_alias() {
+    fn registry_loads_existing_symlink_root_alias_but_marks_it_unavailable() {
         use std::os::unix::fs::symlink;
 
         let target = absolute_test_root("persisted-symlink-target");
@@ -533,9 +574,31 @@ mod tests {
         symlink(&target, &alias).expect("create workspace root symlink");
         let workspace = config("Alias", alias.clone(), "SecretSlugAAAAAA");
 
-        let error = validate_workspace_registry(&[workspace])
-            .expect_err("persisted symlink aliases must fail canonical validation");
-        assert!(error.contains("canonical form"));
+        assert!(validate_workspace_registry(&[workspace]).is_ok());
+        assert_eq!(
+            workspace_availability(&alias),
+            WorkspaceAvailability::Unavailable,
+            "a persisted alias must not silently retarget an existing connector"
+        );
+
+        let _ = std::fs::remove_file(alias);
+        let _ = std::fs::remove_dir_all(target);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registry_rejects_two_roots_resolving_to_same_filesystem_directory() {
+        use std::os::unix::fs::symlink;
+
+        let target = absolute_test_root("filesystem-identity-target");
+        let alias = absolute_test_root("filesystem-identity-alias");
+        std::fs::create_dir_all(&target).expect("create target");
+        symlink(&target, &alias).expect("create alias");
+        let workspaces = [
+            config("Target", target.clone(), "SecretSlugAAAAAA"),
+            config("Alias", alias.clone(), "SecretSlugBBBBBB"),
+        ];
+        assert!(validate_workspace_registry(&workspaces).is_err());
 
         let _ = std::fs::remove_file(alias);
         let _ = std::fs::remove_dir_all(target);

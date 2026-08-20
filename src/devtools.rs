@@ -124,12 +124,14 @@ impl DevtoolsBridge {
                                 message.push('…');
                             }
                             let _ = ui_events.send(ServerUiEvent::Log {
+                                workspace_id: None,
                                 level: "WARN",
                                 message: format!("chrome-devtools-mcp: {message}"),
                             });
                             reported += 1;
                         } else if !suppression_reported {
                             let _ = ui_events.send(ServerUiEvent::Log {
+                                workspace_id: None,
                                 level: "WARN",
                                 message:
                                     "chrome-devtools-mcp: additional stderr diagnostics suppressed"

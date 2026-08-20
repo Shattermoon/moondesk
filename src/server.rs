@@ -14,7 +14,7 @@ use crate::command_jobs::CommandJobManager;
 use crate::devtools::DevtoolsBridge;
 use crate::mcp::{self, JsonRpcRequest};
 use crate::state::{CommandActivityState, FlowDirection, ServerUiEvent, SharedState};
-use crate::workspaces::{self, WorkspaceRequestContext, WorkspaceRequestLease};
+use crate::workspaces::{self, WorkspaceId, WorkspaceRequestContext, WorkspaceRequestLease};
 use uuid::Uuid;
 
 const STATELESS_FLOW_ID: &str = "stateless";
@@ -165,6 +165,7 @@ fn tool_arguments(req: &Value) -> Option<&Value> {
 
 fn begin_command_ui_request(
     req: &Value,
+    workspace_id: &WorkspaceId,
     ui_events: &UnboundedSender<ServerUiEvent>,
 ) -> Option<CommandUiRequest> {
     if req.get("method").and_then(Value::as_str) != Some("tools/call") {
@@ -178,6 +179,7 @@ fn begin_command_ui_request(
             let activity_id = Uuid::new_v4().to_string();
             let background = tool == "start_command";
             let _ = ui_events.send(ServerUiEvent::CommandStarted {
+                workspace_id: workspace_id.clone(),
                 activity_id: activity_id.clone(),
                 command,
                 background,
@@ -296,6 +298,7 @@ fn command_response_exit_code(response: &Value) -> Option<i32> {
 fn finish_command_ui_request(
     request: &CommandUiRequest,
     response: &Value,
+    workspace_id: &WorkspaceId,
     ui_events: &UnboundedSender<ServerUiEvent>,
 ) {
     let state = command_response_state(response);
@@ -304,6 +307,7 @@ fn finish_command_ui_request(
     match request {
         CommandUiRequest::Run { activity_id } => {
             let _ = ui_events.send(ServerUiEvent::CommandUpdated {
+                workspace_id: workspace_id.clone(),
                 activity_id: Some(activity_id.clone()),
                 job_id: None,
                 state,
@@ -317,11 +321,13 @@ fn finish_command_ui_request(
                 .and_then(Value::as_str)
             {
                 let _ = ui_events.send(ServerUiEvent::CommandBoundToJob {
+                    workspace_id: workspace_id.clone(),
                     activity_id: activity_id.clone(),
                     job_id: job_id.to_string(),
                 });
             }
             let _ = ui_events.send(ServerUiEvent::CommandUpdated {
+                workspace_id: workspace_id.clone(),
                 activity_id: Some(activity_id.clone()),
                 job_id: None,
                 state,
@@ -331,6 +337,7 @@ fn finish_command_ui_request(
         }
         CommandUiRequest::Poll { job_id } | CommandUiRequest::Cancel { job_id } => {
             let _ = ui_events.send(ServerUiEvent::CommandUpdated {
+                workspace_id: workspace_id.clone(),
                 activity_id: None,
                 job_id: Some(job_id.clone()),
                 state,
@@ -379,12 +386,18 @@ async fn post_mcp(
         );
     }
 
-    let _ = s.ui_events.send(ServerUiEvent::IncrementRequestCount);
-    let _ = s.ui_events.send(ServerUiEvent::SetRemoteConnected(true));
+    let _ = s.ui_events.send(ServerUiEvent::IncrementRequestCount {
+        workspace_id: workspace.workspace_id.clone(),
+    });
+    let _ = s.ui_events.send(ServerUiEvent::SetRemoteConnected {
+        workspace_id: workspace.workspace_id.clone(),
+        connected: true,
+    });
 
     let has_method = body.get("method").and_then(Value::as_str).is_some();
     if !has_method {
         let _ = s.ui_events.send(ServerUiEvent::Log {
+            workspace_id: Some(workspace.workspace_id.clone()),
             level: "INFO",
             message: format!(
                 "POST workspace={} flow={STATELESS_FLOW_LABEL} accepted non-request JSON-RPC message",
@@ -398,6 +411,7 @@ async fn post_mcp(
     let request_flow_event = request_flow_label(&body);
 
     let _ = s.ui_events.send(ServerUiEvent::RecordFlow {
+        workspace_id: workspace.workspace_id.clone(),
         flow_id: STATELESS_FLOW_ID.to_string(),
         events: vec![request_flow_event.clone()],
         direction: FlowDirection::Forward,
@@ -416,7 +430,7 @@ async fn post_mcp(
     // TUI-only observability: publish the shell command as soon as the MCP call
     // has been parsed. This channel is independent of the MCP response and does
     // not add command text or result data to ChatGPT's conversation state.
-    let command_ui_request = begin_command_ui_request(&body, &s.ui_events);
+    let command_ui_request = begin_command_ui_request(&body, &workspace.workspace_id, &s.ui_events);
 
     let workspace_root = workspace.root.to_string_lossy().into_owned();
     let (mode, tool_mode, set_moondesk_as_co_author) = {
@@ -456,7 +470,12 @@ async fn post_mcp(
             }
         };
         if let Some(command_ui_request) = command_ui_request.as_ref() {
-            finish_command_ui_request(command_ui_request, &response_value, &s.ui_events);
+            finish_command_ui_request(
+                command_ui_request,
+                &response_value,
+                &workspace.workspace_id,
+                &s.ui_events,
+            );
         }
         response_json = Some(response_value);
     }
@@ -464,12 +483,14 @@ async fn post_mcp(
     {
         if req.id.is_some() {
             let _ = s.ui_events.send(ServerUiEvent::RecordFlow {
+                workspace_id: workspace.workspace_id.clone(),
                 flow_id: STATELESS_FLOW_ID.to_string(),
                 events: vec![request_flow_event.clone()],
                 direction: FlowDirection::Backward,
             });
         }
         let _ = s.ui_events.send(ServerUiEvent::Log {
+            workspace_id: Some(workspace.workspace_id.clone()),
             level: "INFO",
             message: format!(
                 "POST workspace={} flow={STATELESS_FLOW_LABEL} [{}]",
@@ -479,6 +500,7 @@ async fn post_mcp(
         if let Some(ref resp_json) = response_json {
             let response_summary = summarize_response(resp_json);
             let _ = s.ui_events.send(ServerUiEvent::Log {
+                workspace_id: Some(workspace.workspace_id.clone()),
                 level: "INFO",
                 message: format!(
                     "POST workspace={} flow={STATELESS_FLOW_LABEL} response [{response_summary}]",
@@ -528,14 +550,19 @@ async fn delete_mcp(
     AxumPath(slug): AxumPath<String>,
     State(s): State<ServerState>,
 ) -> Response<Body> {
-    let Some((_workspace, _request_lease)) = resolve_workspace(&s, &slug).await else {
+    let Some((workspace, _request_lease)) = resolve_workspace(&s, &slug).await else {
         return not_found_response();
     };
-    let _ = s.ui_events.send(ServerUiEvent::SetRemoteConnected(false));
+    let _ = s.ui_events.send(ServerUiEvent::SetRemoteConnected {
+        workspace_id: workspace.workspace_id.clone(),
+        connected: false,
+    });
     let _ = s.ui_events.send(ServerUiEvent::BeginFlowClose {
+        workspace_id: workspace.workspace_id.clone(),
         flow_id: STATELESS_FLOW_ID.to_string(),
     });
     let _ = s.ui_events.send(ServerUiEvent::Log {
+        workspace_id: Some(workspace.workspace_id.clone()),
         level: "INFO",
         message: "DELETE mcp endpoint: stateless reset".to_string(),
     });
@@ -577,6 +604,7 @@ mod tests {
     #[test]
     fn command_ui_events_track_background_lifecycle_without_mutating_mcp_response() {
         let (ui_tx, mut ui_rx) = unbounded_channel();
+        let workspace_id = WorkspaceId::test_default();
         let start_request = json!({
             "jsonrpc": "2.0",
             "id": "req-start",
@@ -586,13 +614,14 @@ mod tests {
                 "arguments": { "command": "cargo test" }
             }
         });
-        let observation =
-            begin_command_ui_request(&start_request, &ui_tx).expect("observe start command");
+        let observation = begin_command_ui_request(&start_request, &workspace_id, &ui_tx)
+            .expect("observe start command");
         let activity_id = match ui_rx.try_recv().expect("immediate command-start event") {
             ServerUiEvent::CommandStarted {
                 activity_id,
                 command,
                 background,
+                ..
             } => {
                 assert_eq!(command, "cargo test");
                 assert!(background);
@@ -611,13 +640,14 @@ mod tests {
             }
         });
         let response_before = response.clone();
-        finish_command_ui_request(&observation, &response, &ui_tx);
+        finish_command_ui_request(&observation, &response, &workspace_id, &ui_tx);
         assert_eq!(response, response_before);
 
         match ui_rx.try_recv().expect("job binding event") {
             ServerUiEvent::CommandBoundToJob {
                 activity_id: bound_activity_id,
                 job_id,
+                ..
             } => {
                 assert_eq!(bound_activity_id, activity_id);
                 assert_eq!(job_id, "job-1");
@@ -640,8 +670,8 @@ mod tests {
                 "arguments": { "job_id": "job-1", "after": 0 }
             }
         });
-        let poll_observation =
-            begin_command_ui_request(&poll_request, &ui_tx).expect("observe poll command");
+        let poll_observation = begin_command_ui_request(&poll_request, &workspace_id, &ui_tx)
+            .expect("observe poll command");
         assert!(ui_rx.try_recv().is_err(), "poll must not add a command row");
         let poll_response = json!({
             "jsonrpc": "2.0",
@@ -656,7 +686,7 @@ mod tests {
                 "isError": false
             }
         });
-        finish_command_ui_request(&poll_observation, &poll_response, &ui_tx);
+        finish_command_ui_request(&poll_observation, &poll_response, &workspace_id, &ui_tx);
         match ui_rx.try_recv().expect("terminal update") {
             ServerUiEvent::CommandUpdated {
                 job_id,

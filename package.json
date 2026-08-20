@@ -5,7 +5,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Shattermoon/moondesk.git"
+    "url": "https://github.com/Shattermoon/moondesk"
   },
   "homepage": "https://github.com/Shattermoon/moondesk#readme",
   "bugs": {
@@ -25,5 +25,9 @@
   ],
   "engines": {
     "node": ">=18"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
   }
 }

@@ -3,7 +3,7 @@
 An open-source tool that lets you use ChatGPT Chat as a local coding agent. No reverse engineering, no API, no Codex, no Work mode. A ChatGPT Plus subscription is enough.
 
 > [!NOTE]
-> MoonDesk is maintained by **Shattermoon** and is built around a lightweight local MCP architecture. Its procedural companion, **ClippyMoon**, is generated locally from a deterministic random seed.
+> MoonDesk is maintained by **Shattermoon** and is built around a lightweight local MCP architecture. Its companion, **ClippyMoon**, selects a bright hand-tuned pixel-art identity from a deterministic random seed.
 
 <p align="center">
   <img src="docs/images/moondesk_preview.gif" alt="MoonDesk in ChatGPT Web"><br>
@@ -98,7 +98,7 @@ I tried this with GPT-5.2 before, and the results were poor. However, **GPT-5.4 
 
    On first launch, MoonDesk will ask you to enter your **ngrok authtoken** and **ngrok static domain** (e.g. `my-app.ngrok-free.dev`). You can get both from the [ngrok dashboard](https://dashboard.ngrok.com/get-started/setup). These are saved to `~/.moondesk/config.toml` and reused on subsequent launches.
 
-   By default, MoonDesk listens on port `3200`. You can override it with `PORT`. On a first install (or when migrating the legacy single-workspace config), MoonDesk creates the first workspace from `WORKSPACE_ROOT` if it is set, otherwise from the directory where MoonDesk was launched. Once the multi-workspace registry exists, launching MoonDesk from a different directory does **not** repoint an existing connector; add or change projects from the `[w] Workspaces` screen instead.
+   By default, MoonDesk listens on port `3200`. You can override it with `PORT`. On a first install (or when migrating the legacy single-workspace config), MoonDesk creates the first workspace from `WORKSPACE_ROOT` if it is set, otherwise from the directory where MoonDesk was launched. Once the multi-workspace registry exists, launching MoonDesk from a different directory never repoints an existing connector. If a MoonDesk host is already running on that port, running `moondesk` from another project directory securely attaches that directory as a new workspace to the existing host and exits; you can also add or change projects from the `[w] Workspaces` screen.
 
    On macOS Terminal.app, MoonDesk manages a dedicated `MoonDesk` Terminal profile automatically. If the current Terminal tab is not already using that profile, MoonDesk applies it, closes any temporary helper window, and asks you to run the same command again in that tab. It only starts immediately when the current tab is already using `MoonDesk`. Set `MOONDESK_SKIP_MACOS_TERMINAL_PROFILE=1` if you want to keep the current Terminal session untouched.
 
@@ -151,7 +151,7 @@ MoonDesk is a coding tool and a custom connector. Always use MoonDesk if the use
 
 One MoonDesk process can host multiple project roots concurrently. It still uses one local server, one port, one ngrok tunnel/domain, and one shared browser/DevTools bridge. Each workspace gets its own stable internal ID and its own random secret MCP path.
 
-Press `[w] Workspaces` to add, rename, inspect, reveal/copy, rotate, or remove projects. Create one ChatGPT connector per workspace and select the matching connector in each ChatGPT chat. The endpoint itself selects the project; MoonDesk does not add workspace metadata or a workspace argument to every tool call.
+Press `[w] Workspaces` to add, rename, inspect, reveal/copy, rotate, or remove projects. You can paste/type a path with `[a] Path`, open the native folder picker with `[b] Browse`, and click project rows plus the Reveal/Copy actions with the mouse. Create one ChatGPT connector per workspace and select the matching connector in each ChatGPT chat. The endpoint itself selects the project; MoonDesk does not add workspace metadata or a workspace argument to every tool call.
 
 ```text
 one MoonDesk process / port 3200 / ngrok domain
@@ -168,7 +168,7 @@ Important behavior:
 - Removing a workspace first blocks new requests/jobs and lets already accepted foreground/file work drain safely. Only after the registry removal is durably saved does MoonDesk cancel that workspace's background jobs and purge retained state; an aborted/failed removal re-enables the workspace without killing its running jobs.
 - A missing workspace directory (for example an unplugged drive) stays registered and is shown as unavailable. It becomes usable again when the directory returns.
 - Duplicate and parent/child-overlapping workspace roots are rejected in V1 so two connectors cannot accidentally claim overlapping dedicated-file-tool authority.
-- Starting another MoonDesk process on the same normal port does not create a second host. If MoonDesk is already running, add the project from `[w] Workspaces` in the running instance.
+- Starting `moondesk` from another project directory while the normal host is already running does not create a second host. The new invocation securely attaches its current directory to the existing host as a workspace/session, then exits. The same project can also be added from `[w] Workspaces`.
 
 # Stack
 
@@ -320,8 +320,8 @@ The domain and workspace registry are persisted in `~/.moondesk/config.toml`, so
   <em>ClippyMoon!</em>
 </p>
 
-ClippyMoon is MoonDesk's procedural lunar companion. It is generated entirely in Rust from a random 64-bit seed when MoonDesk starts; no image-generation model or bundled sprite sheet is used.
+ClippyMoon is MoonDesk's hand-tuned pixel-art lunar companion. It is rendered entirely in Rust from a random 64-bit seed when MoonDesk starts; no image-generation model or bundled sprite sheet is used.
 
-A seed determines ClippyMoon's identity: one of the eight major moon phases, an Earth-visible color mood, crater layout, facial expression, blush, and surrounding stars. The current color families are pale ivory, silver, warm yellow, harvest orange, amber, copper, and blood red. Animation then changes only temporary frame state such as blinking, subtle one-pixel bobbing, and star twinkling, so the same seed always recreates the same character.
+A seed now selects from a curated library of known-good bright identities instead of independently randomizing every visual trait. Normal mascots use only quarter, gibbous, and full shapes, so a seed can no longer produce an almost-black new/crescent moon. The color families are pale ivory, silver, warm yellow, harvest orange, and coral red, with deliberately light same-hue shadow tones. Crater and star arrangements are hand-authored layouts rather than random placements, and per-pixel noise is avoided so every seed stays clean at terminal scale. Animation changes only temporary frame state such as blinking, subtle one-pixel bobbing, and star twinkling, so the same seed always recreates the same character.
 
 Normal MoonDesk startup keeps ClippyMoon entirely in memory: nothing is archived or persisted and each launch creates a fresh random moon. The current moon's 16-digit hexadecimal seed is written once to the TUI log so it can be reproduced without saving mascot state. Export is explicit and opt-in. Run `moondesk clippymoon export` to create `clippymoon.png` and `clippymoon.gif` in the current directory, or use `--seed <hex>` to reproduce a specific moon and `--out <directory>` to choose the destination. Both exports are 512×512 pixel art; the GIF uses the same idle-animation sequence as the TUI and loops indefinitely. MoonDesk never writes these files unless the export command is invoked.

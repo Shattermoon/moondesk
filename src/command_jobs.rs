@@ -719,6 +719,10 @@ impl CommandJobManager {
         timeout_ms: u64,
         request_key: Option<String>,
     ) -> Result<StartCommandResult, String> {
+        // Cleanup may scan retained jobs and remove archived output from disk. Do
+        // it before taking the short host-wide start lock so one workspace's
+        // retention maintenance cannot stall job admission for every workspace.
+        self.cleanup().await;
         let _start_guard = self.start_lock.lock().await;
         if self.shutting_down.load(Ordering::Acquire) {
             return Err(
@@ -736,8 +740,6 @@ impl CommandJobManager {
                 "workspace removal is in progress; new command jobs are not accepted".to_string(),
             );
         }
-        self.cleanup().await;
-
         let request_map_key = request_key.map(|key| (workspace_id.clone(), key));
         if let Some(key) = request_map_key.as_ref() {
             let existing = {

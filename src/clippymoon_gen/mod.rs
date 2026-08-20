@@ -2,13 +2,139 @@ mod render;
 mod types;
 
 use image::RgbaImage;
-use rand::Rng;
-use rand_mt::Mt19937GenRand32;
 use std::collections::HashMap;
 
 pub use types::{ClippyMoonTraits, MoonColor, MoonExpression, MoonPhase};
 
-/// Render one ClippyMoon frame and return the deterministic traits selected for its seed.
+/// A small hand-curated identity library. Seeds select from these known-good
+/// combinations instead of independently randomizing phase/color/face traits.
+///
+/// This intentionally excludes new/crescent moons and muddy color families: the
+/// mascot should stay bright and recognizable at terminal scale for every seed.
+const CURATED_STYLES: &[ClippyMoonTraits] = &[
+    ClippyMoonTraits {
+        phase: MoonPhase::Full,
+        color: MoonColor::PaleIvory,
+        expression: MoonExpression::SoftSmile,
+        crater_count: 6,
+        star_count: 5,
+        blush: true,
+    },
+    ClippyMoonTraits {
+        phase: MoonPhase::WaxingGibbous,
+        color: MoonColor::Silver,
+        expression: MoonExpression::TinySmile,
+        crater_count: 5,
+        star_count: 6,
+        blush: true,
+    },
+    ClippyMoonTraits {
+        phase: MoonPhase::WaningGibbous,
+        color: MoonColor::WarmYellow,
+        expression: MoonExpression::SoftSmile,
+        crater_count: 6,
+        star_count: 4,
+        blush: true,
+    },
+    ClippyMoonTraits {
+        phase: MoonPhase::FirstQuarter,
+        color: MoonColor::PaleIvory,
+        expression: MoonExpression::Cheeky,
+        crater_count: 5,
+        star_count: 5,
+        blush: true,
+    },
+    ClippyMoonTraits {
+        phase: MoonPhase::LastQuarter,
+        color: MoonColor::Silver,
+        expression: MoonExpression::SoftSmile,
+        crater_count: 5,
+        star_count: 5,
+        blush: false,
+    },
+    ClippyMoonTraits {
+        phase: MoonPhase::Full,
+        color: MoonColor::WarmYellow,
+        expression: MoonExpression::TinySmile,
+        crater_count: 7,
+        star_count: 4,
+        blush: true,
+    },
+    ClippyMoonTraits {
+        phase: MoonPhase::WaxingGibbous,
+        color: MoonColor::HarvestOrange,
+        expression: MoonExpression::SoftSmile,
+        crater_count: 5,
+        star_count: 5,
+        blush: true,
+    },
+    ClippyMoonTraits {
+        phase: MoonPhase::WaningGibbous,
+        color: MoonColor::CoralRed,
+        expression: MoonExpression::TinySmile,
+        crater_count: 5,
+        star_count: 6,
+        blush: false,
+    },
+    ClippyMoonTraits {
+        phase: MoonPhase::Full,
+        color: MoonColor::HarvestOrange,
+        expression: MoonExpression::Cheeky,
+        crater_count: 6,
+        star_count: 5,
+        blush: true,
+    },
+    ClippyMoonTraits {
+        phase: MoonPhase::FirstQuarter,
+        color: MoonColor::WarmYellow,
+        expression: MoonExpression::SoftSmile,
+        crater_count: 4,
+        star_count: 6,
+        blush: true,
+    },
+    ClippyMoonTraits {
+        phase: MoonPhase::LastQuarter,
+        color: MoonColor::HarvestOrange,
+        expression: MoonExpression::TinySmile,
+        crater_count: 4,
+        star_count: 5,
+        blush: true,
+    },
+    ClippyMoonTraits {
+        phase: MoonPhase::Full,
+        color: MoonColor::CoralRed,
+        expression: MoonExpression::SoftSmile,
+        crater_count: 6,
+        star_count: 4,
+        blush: false,
+    },
+    ClippyMoonTraits {
+        phase: MoonPhase::WaxingGibbous,
+        color: MoonColor::PaleIvory,
+        expression: MoonExpression::Cheeky,
+        crater_count: 5,
+        star_count: 6,
+        blush: true,
+    },
+    ClippyMoonTraits {
+        phase: MoonPhase::WaningGibbous,
+        color: MoonColor::Silver,
+        expression: MoonExpression::SoftSmile,
+        crater_count: 6,
+        star_count: 5,
+        blush: true,
+    },
+    ClippyMoonTraits {
+        phase: MoonPhase::Full,
+        color: MoonColor::PaleIvory,
+        expression: MoonExpression::TinySmile,
+        crater_count: 4,
+        star_count: 6,
+        blush: true,
+    },
+];
+
+/// Render one ClippyMoon frame and return the deterministic curated traits selected for its seed.
 ///
 /// Passing `None` creates a fresh random seed; callers that need reproducibility should
 /// provide an explicit seed.
@@ -34,63 +160,24 @@ pub fn create_character(
     (image, traits.to_map())
 }
 
-/// Derive ClippyMoon's stable identity traits from a 64-bit seed.
+/// Select one known-good ClippyMoon identity from a 64-bit seed.
 pub fn traits_from_seed(seed: u64) -> ClippyMoonTraits {
-    let mut rng = Mt19937GenRand32::new_with_key(mt_key(seed ^ 0x6D6F_6F6E_6465_736B));
-
-    // Full moons are a little more common because they read best in small TUIs,
-    // while all eight major phases remain reachable and reproducible.
-    let phase_roll = rng.gen_range(0..100);
-    let phase = match phase_roll {
-        0..=7 => MoonPhase::New,
-        8..=18 => MoonPhase::WaxingCrescent,
-        19..=29 => MoonPhase::FirstQuarter,
-        30..=42 => MoonPhase::WaxingGibbous,
-        43..=62 => MoonPhase::Full,
-        63..=75 => MoonPhase::WaningGibbous,
-        76..=86 => MoonPhase::LastQuarter,
-        _ => MoonPhase::WaningCrescent,
-    };
-
-    // Pale/neutral moons dominate, while warm harvest/blood variants are rarer.
-    let color_roll = rng.gen_range(0..100);
-    let color = match color_roll {
-        0..=31 => MoonColor::PaleIvory,
-        32..=43 => MoonColor::Silver,
-        44..=62 => MoonColor::WarmYellow,
-        63..=76 => MoonColor::HarvestOrange,
-        77..=86 => MoonColor::Amber,
-        87..=93 => MoonColor::Copper,
-        _ => MoonColor::BloodRed,
-    };
-
-    let expression = match rng.gen_range(0..100) {
-        0..=59 => MoonExpression::SoftSmile,
-        60..=84 => MoonExpression::TinySmile,
-        _ => MoonExpression::Cheeky,
-    };
-
-    ClippyMoonTraits {
-        phase,
-        color,
-        expression,
-        crater_count: rng.gen_range(5..=10),
-        star_count: rng.gen_range(3..=8),
-        blush: !matches!(phase, MoonPhase::New) && rng.gen_bool(0.72),
-    }
+    let mixed = mix_seed(seed ^ 0x6D6F_6F6E_6465_736B);
+    CURATED_STYLES[(mixed as usize) % CURATED_STYLES.len()]
 }
 
-fn mt_key(seed: u64) -> Vec<u32> {
-    if seed >> 32 == 0 {
-        vec![seed as u32]
-    } else {
-        vec![seed as u32, (seed >> 32) as u32]
-    }
+fn mix_seed(mut value: u64) -> u64 {
+    value ^= value >> 30;
+    value = value.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    value ^= value >> 27;
+    value = value.wrapping_mul(0x94D0_49BB_1331_11EB);
+    value ^ (value >> 31)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{create_character, traits_from_seed};
+    use super::{CURATED_STYLES, create_character, traits_from_seed};
+    use crate::clippymoon_gen::MoonColor;
 
     #[test]
     fn same_seed_produces_same_traits_and_sprite() {
@@ -113,26 +200,34 @@ mod tests {
     }
 
     #[test]
-    fn seed_space_reaches_every_phase_and_color_family() {
+    fn curated_styles_use_only_supported_bright_color_families() {
+        assert!(!CURATED_STYLES.is_empty());
+        for style in CURATED_STYLES {
+            assert!(MoonColor::ALL.contains(&style.color));
+        }
+    }
+
+    #[test]
+    fn seed_space_reaches_every_curated_phase_and_color_family() {
+        let expected_phases = CURATED_STYLES
+            .iter()
+            .map(|style| style.phase.name())
+            .collect::<std::collections::BTreeSet<_>>();
+        let expected_colors = CURATED_STYLES
+            .iter()
+            .map(|style| style.color.name())
+            .collect::<std::collections::BTreeSet<_>>();
         let mut phases = std::collections::BTreeSet::new();
         let mut colors = std::collections::BTreeSet::new();
-        for seed in 0..10_000_u64 {
+        for seed in 0..20_000_u64 {
             let traits = traits_from_seed(seed);
             phases.insert(traits.phase.name());
             colors.insert(traits.color.name());
-            if phases.len() == 8 && colors.len() == 7 {
+            if phases == expected_phases && colors == expected_colors {
                 break;
             }
         }
-        assert_eq!(
-            phases.len(),
-            8,
-            "all eight major moon phases should be reachable"
-        );
-        assert_eq!(
-            colors.len(),
-            7,
-            "all configured Earth-visible color moods should be reachable"
-        );
+        assert_eq!(phases, expected_phases);
+        assert_eq!(colors, expected_colors);
     }
 }

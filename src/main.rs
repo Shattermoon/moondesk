@@ -28,6 +28,7 @@ use ratatui::{
     prelude::*,
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
 };
+use serde::{Deserialize, Serialize};
 use state::{
     AppState, CommandActivityState, FLOW_ANIM_CELLS, FLOW_BOOTSTRAP_PHASES, FlowAnimKind,
     FlowAnimSegment, FlowDirection, FlowLane, GPT_5_6_AND_EARLIER_USAGE_BUCKET, Mode, SharedState,
@@ -40,6 +41,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::Mutex;
+use uuid::Uuid;
 use workspaces::{WorkspaceAvailability, WorkspaceConfig, WorkspaceId, workspace_availability};
 
 const FLOW_ROW_CELLS: usize = FLOW_ANIM_CELLS;
@@ -1235,6 +1237,138 @@ fn parse_port_value(value: Option<&str>) -> Result<u16, String> {
     Ok(port)
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct HostRuntimeRegistration {
+    port: u16,
+    pid: u32,
+    token: String,
+}
+
+struct HostRuntimeGuard {
+    path: PathBuf,
+}
+
+impl Drop for HostRuntimeGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+#[derive(Debug)]
+struct HostAttachResult {
+    workspace_name: String,
+    already_registered: bool,
+}
+
+fn host_runtime_path(port: u16) -> std::io::Result<PathBuf> {
+    let config_path = app_config_path()?;
+    let directory = config_path.parent().ok_or_else(|| {
+        std::io::Error::other("MoonDesk config path does not have a parent directory")
+    })?;
+    Ok(directory.join(format!("host-{port}.json")))
+}
+
+fn write_host_runtime_registration(port: u16, token: &str) -> std::io::Result<HostRuntimeGuard> {
+    let path = host_runtime_path(port)?;
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::other("MoonDesk host runtime path does not have a parent directory")
+    })?;
+    std::fs::create_dir_all(parent)?;
+    let payload = serde_json::to_vec(&HostRuntimeRegistration {
+        port,
+        pid: std::process::id(),
+        token: token.to_string(),
+    })
+    .map_err(std::io::Error::other)?;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).truncate(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&path)?;
+    file.write_all(&payload)?;
+    file.flush()?;
+    file.sync_all()?;
+    Ok(HostRuntimeGuard { path })
+}
+
+fn read_host_runtime_registration(port: u16) -> Result<HostRuntimeRegistration, String> {
+    let path = host_runtime_path(port).map_err(|error| error.to_string())?;
+    let payload = std::fs::read(&path).map_err(|error| {
+        format!(
+            "could not read the running host registration file {}: {error}",
+            path.display()
+        )
+    })?;
+    let registration: HostRuntimeRegistration = serde_json::from_slice(&payload)
+        .map_err(|error| format!("invalid host registration: {error}"))?;
+    if registration.port != port {
+        return Err(format!(
+            "host registration is for port {}, expected {port}",
+            registration.port
+        ));
+    }
+    if registration.token.is_empty() {
+        return Err("host registration token is empty".into());
+    }
+    Ok(registration)
+}
+
+async fn attach_workspace_to_running_host(
+    port: u16,
+    root: &std::path::Path,
+) -> Result<HostAttachResult, String> {
+    let registration = read_host_runtime_registration(port)?;
+    let body = serde_json::to_vec(&serde_json::json!({
+        "root": root.to_string_lossy(),
+    }))
+    .map_err(|error| error.to_string())?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .map_err(|error| error.to_string())?;
+    let endpoint = format!("http://127.0.0.1:{port}{}", server::HOST_CONTROL_ROUTE);
+    let response = client
+        .post(endpoint)
+        .header(server::HOST_CONTROL_HEADER, registration.token)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(body)
+        .send()
+        .await
+        .map_err(|error| format!("failed to contact the running MoonDesk host: {error}"))?;
+    let status = response.status();
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|error| format!("failed to read the running host response: {error}"))?;
+    let payload: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("running host returned an invalid response: {error}"))?;
+    if !status.is_success() {
+        let message = payload
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("workspace registration was rejected");
+        return Err(format!("{message} (HTTP {status})"));
+    }
+    let workspace_name = payload
+        .get("workspaceName")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "running host response did not include a workspace name".to_string())?
+        .to_string();
+    let already_registered = payload
+        .get("alreadyRegistered")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    Ok(HostAttachResult {
+        workspace_name,
+        already_registered,
+    })
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli_args = std::env::args().skip(1).collect::<Vec<_>>();
@@ -1250,6 +1384,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Ok(());
         }
         Err(message) => return Err(std::io::Error::other(message).into()),
+    }
+
+    let port_value = std::env::var("PORT")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    let port = parse_port_value(port_value.as_deref()).map_err(std::io::Error::other)?;
+    let workspace_root = match std::env::var("WORKSPACE_ROOT") {
+        Ok(path) => path,
+        Err(_) => std::env::current_dir()?.to_string_lossy().into_owned(),
+    };
+
+    // Attaching another project is a non-interactive client action, so do it
+    // before any terminal-profile bootstrap. This keeps `cd project && moondesk`
+    // fast on macOS as well as Windows/Linux when a host is already running.
+    if port_hosts_moondesk(port).await {
+        match attach_workspace_to_running_host(port, std::path::Path::new(&workspace_root)).await {
+            Ok(result) => {
+                if result.already_registered {
+                    println!(
+                        "MoonDesk is already running on port {port}; workspace '{}' is already attached.",
+                        result.workspace_name
+                    );
+                } else {
+                    println!(
+                        "MoonDesk is already running on port {port}; attached this directory as workspace '{}'.",
+                        result.workspace_name
+                    );
+                }
+                return Ok(());
+            }
+            Err(error) => {
+                return Err(std::io::Error::other(format!(
+                    "MoonDesk is already running on port {port}, but this directory could not be attached automatically: {error}. Open [w] Workspaces in the running MoonDesk host to add it manually."
+                ))
+                .into());
+            }
+        }
     }
 
     match macos_terminal::maybe_relaunch_in_terminal_profile() {
@@ -1268,15 +1439,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .into());
         }
     }
-
-    let port_value = std::env::var("PORT")
-        .ok()
-        .filter(|value| !value.trim().is_empty());
-    let port = parse_port_value(port_value.as_deref()).map_err(std::io::Error::other)?;
-    let workspace_root = match std::env::var("WORKSPACE_ROOT") {
-        Ok(path) => path,
-        Err(_) => std::env::current_dir()?.to_string_lossy().into_owned(),
-    };
 
     let state: SharedState = Arc::new(Mutex::new(AppState::new(port, workspace_root)?));
 
@@ -1392,7 +1554,10 @@ async fn run_app(
 
     // Start services
     let (ui_event_tx, ui_event_rx) = ui_event_channel();
-    let devtools_bridge = start_services(state.clone(), ui_event_tx)
+    let StartedServices {
+        devtools: devtools_bridge,
+        _host_runtime,
+    } = start_services(state.clone(), ui_event_tx)
         .await
         .map_err(std::io::Error::other)?;
 
@@ -2160,8 +2325,22 @@ async fn run_prompt(
                         crossterm::event::KeyCode::Backspace => {
                             input.pop();
                         }
+                        crossterm::event::KeyCode::Insert if key_is_clipboard_paste(&key) => {
+                            if let Some(text) = clipboard_paste() {
+                                input.push_str(&text);
+                            }
+                        }
                         crossterm::event::KeyCode::Char(c) => {
-                            input.push(c);
+                            if key_is_clipboard_paste(&key) {
+                                if let Some(text) = clipboard_paste() {
+                                    input.push_str(&text);
+                                }
+                            } else if !key
+                                .modifiers
+                                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                            {
+                                input.push(c);
+                            }
                         }
                         _ => {}
                     }
@@ -2231,6 +2410,167 @@ fn normalize_workspace_path_input(value: &str) -> std::io::Result<PathBuf> {
     Ok(PathBuf::from(value))
 }
 
+#[cfg(target_os = "windows")]
+fn pick_workspace_folder_blocking() -> Result<Option<PathBuf>, String> {
+    let script = r#"Add-Type -AssemblyName System.Windows.Forms; $dialog = New-Object System.Windows.Forms.FolderBrowserDialog; $dialog.Description = 'Choose a MoonDesk workspace'; $dialog.ShowNewFolderButton = $false; if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($dialog.SelectedPath) }"#;
+    let output = std::process::Command::new("powershell.exe")
+        .args(["-NoProfile", "-STA", "-Command", script])
+        .output()
+        .map_err(|error| format!("failed to open the Windows folder picker: {error}"))?;
+    if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if detail.is_empty() {
+            "Windows folder picker exited unexpectedly".into()
+        } else {
+            format!("Windows folder picker failed: {detail}")
+        });
+    }
+    let selected = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if selected.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(PathBuf::from(selected)))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn pick_workspace_folder_blocking() -> Result<Option<PathBuf>, String> {
+    let output = std::process::Command::new("/usr/bin/osascript")
+        .args([
+            "-e",
+            "POSIX path of (choose folder with prompt \"Choose a MoonDesk workspace\")",
+        ])
+        .output()
+        .map_err(|error| format!("failed to open the macOS folder picker: {error}"))?;
+    if !output.status.success() {
+        // AppleScript returns a non-zero status when the user presses Cancel.
+        return Ok(None);
+    }
+    let selected = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if selected.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(PathBuf::from(selected)))
+    }
+}
+
+#[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+fn pick_workspace_folder_blocking() -> Result<Option<PathBuf>, String> {
+    const PICKERS: &[(&str, &[&str])] = &[
+        (
+            "zenity",
+            &[
+                "--file-selection",
+                "--directory",
+                "--title=Choose a MoonDesk workspace",
+            ],
+        ),
+        ("kdialog", &["--getexistingdirectory"]),
+    ];
+    for (program, args) in PICKERS {
+        let output = match std::process::Command::new(program).args(*args).output() {
+            Ok(output) => output,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(format!("failed to open {program}: {error}")),
+        };
+        if !output.status.success() {
+            return Ok(None);
+        }
+        let selected = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        return if selected.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(PathBuf::from(selected)))
+        };
+    }
+    Err("no supported graphical folder picker was found (install zenity or kdialog)".into())
+}
+
+async fn pick_workspace_folder() -> Result<Option<PathBuf>, String> {
+    tokio::task::spawn_blocking(pick_workspace_folder_blocking)
+        .await
+        .map_err(|error| format!("folder picker task failed: {error}"))?
+}
+
+#[derive(Default)]
+struct WorkspaceHitAreas {
+    project_rows: Vec<(usize, Rect)>,
+    url: Option<Rect>,
+    add: Option<Rect>,
+    browse: Option<Rect>,
+    rename: Option<Rect>,
+    reveal: Option<Rect>,
+    copy: Option<Rect>,
+    rotate: Option<Rect>,
+    remove: Option<Rect>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WorkspaceUiAction {
+    Back,
+    MoveUp,
+    MoveDown,
+    Select(usize),
+    AddPath,
+    BrowseAdd,
+    Rename,
+    Reveal,
+    Copy,
+    Rotate,
+    Remove,
+}
+
+fn workspace_action_from_event(
+    event: Event,
+    hit_areas: &WorkspaceHitAreas,
+) -> Option<WorkspaceUiAction> {
+    match event {
+        Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => Some(WorkspaceUiAction::Back),
+            KeyCode::Up => Some(WorkspaceUiAction::MoveUp),
+            KeyCode::Down => Some(WorkspaceUiAction::MoveDown),
+            KeyCode::Char('a') => Some(WorkspaceUiAction::AddPath),
+            KeyCode::Char('b') => Some(WorkspaceUiAction::BrowseAdd),
+            KeyCode::Char('r') => Some(WorkspaceUiAction::Rename),
+            KeyCode::Enter | KeyCode::Char('v') => Some(WorkspaceUiAction::Reveal),
+            KeyCode::Char('c') => Some(WorkspaceUiAction::Copy),
+            KeyCode::Char('x') => Some(WorkspaceUiAction::Rotate),
+            KeyCode::Char('d') => Some(WorkspaceUiAction::Remove),
+            _ => None,
+        },
+        Event::Mouse(mouse) if matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left)) => {
+            for (index, area) in &hit_areas.project_rows {
+                if rect_contains(*area, mouse.column, mouse.row) {
+                    return Some(WorkspaceUiAction::Select(*index));
+                }
+            }
+            if hit_areas
+                .url
+                .is_some_and(|area| rect_contains(area, mouse.column, mouse.row))
+                || hit_areas
+                    .reveal
+                    .is_some_and(|area| rect_contains(area, mouse.column, mouse.row))
+            {
+                return Some(WorkspaceUiAction::Reveal);
+            }
+            for (area, action) in [
+                (hit_areas.add, WorkspaceUiAction::AddPath),
+                (hit_areas.browse, WorkspaceUiAction::BrowseAdd),
+                (hit_areas.rename, WorkspaceUiAction::Rename),
+                (hit_areas.copy, WorkspaceUiAction::Copy),
+                (hit_areas.rotate, WorkspaceUiAction::Rotate),
+                (hit_areas.remove, WorkspaceUiAction::Remove),
+            ] {
+                if area.is_some_and(|area| rect_contains(area, mouse.column, mouse.row)) {
+                    return Some(action);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
 async fn run_workspaces(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     state: SharedState,
@@ -2259,6 +2599,7 @@ async fn run_workspaces(
         }
         let selected_url = workspace_public_mcp_url(public_base.as_deref(), &selected_row.config);
 
+        let mut hit_areas = WorkspaceHitAreas::default();
         terminal.draw(|f| {
             draw_workspaces(
                 f,
@@ -2272,41 +2613,51 @@ async fn run_workspaces(
                     confirm_rotate: confirm_rotate.as_ref() == Some(&selected_row.config.id),
                     confirm_remove: confirm_remove.as_ref() == Some(&selected_row.config.id),
                 },
+                &mut hit_areas,
             )
         })?;
 
         if !event::poll(UI_POLL_INTERVAL)? {
             continue;
         }
-        let Event::Key(key) = event::read()? else {
+        let Some(action) = workspace_action_from_event(event::read()?, &hit_areas) else {
             continue;
         };
-        if key.kind != KeyEventKind::Press {
-            continue;
-        }
 
-        match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => return Ok(()),
-            KeyCode::Up => {
+        match action {
+            WorkspaceUiAction::Back => return Ok(()),
+            WorkspaceUiAction::MoveUp => {
                 selected = selected.saturating_sub(1);
                 confirm_rotate = None;
                 confirm_remove = None;
                 message = None;
             }
-            KeyCode::Down => {
+            WorkspaceUiAction::MoveDown => {
                 selected = (selected + 1).min(rows.len().saturating_sub(1));
                 confirm_rotate = None;
                 confirm_remove = None;
                 message = None;
             }
-            KeyCode::Char('a') => {
+            WorkspaceUiAction::Select(index) => {
+                selected = index.min(rows.len().saturating_sub(1));
+                confirm_rotate = None;
+                confirm_remove = None;
+                message = None;
+            }
+            WorkspaceUiAction::AddPath => {
                 confirm_rotate = None;
                 confirm_remove = None;
                 let Some(path_input) = run_prompt(terminal, "Workspace folder path:", "").await?
                 else {
                     continue;
                 };
-                let root = normalize_workspace_path_input(&path_input)?;
+                let root = match normalize_workspace_path_input(&path_input) {
+                    Ok(root) => root,
+                    Err(error) => {
+                        message = Some(format!("Invalid workspace path: {error}"));
+                        continue;
+                    }
+                };
                 let default_name = workspaces::derive_workspace_name(&root);
                 let Some(name) = run_prompt(terminal, "Workspace name:", &default_name).await?
                 else {
@@ -2324,7 +2675,38 @@ async fn run_workspaces(
                     Err(error) => message = Some(format!("Add failed: {error}")),
                 }
             }
-            KeyCode::Char('r') => {
+            WorkspaceUiAction::BrowseAdd => {
+                confirm_rotate = None;
+                confirm_remove = None;
+                let root = match pick_workspace_folder().await {
+                    Ok(Some(root)) => root,
+                    Ok(None) => {
+                        message = Some("Folder selection cancelled".into());
+                        continue;
+                    }
+                    Err(error) => {
+                        message = Some(format!("Folder picker failed: {error}"));
+                        continue;
+                    }
+                };
+                let default_name = workspaces::derive_workspace_name(&root);
+                let Some(name) = run_prompt(terminal, "Workspace name:", &default_name).await?
+                else {
+                    continue;
+                };
+                match add_workspace(&state, name, root).await {
+                    Ok(workspace) => {
+                        let (_, _, refreshed) = workspace_ui_snapshot(&state).await;
+                        selected = refreshed
+                            .iter()
+                            .position(|row| row.config.id == workspace.id)
+                            .unwrap_or_else(|| refreshed.len().saturating_sub(1));
+                        message = Some(format!("Added workspace {}", workspace.name));
+                    }
+                    Err(error) => message = Some(format!("Add failed: {error}")),
+                }
+            }
+            WorkspaceUiAction::Rename => {
                 confirm_rotate = None;
                 confirm_remove = None;
                 if let Some(name) =
@@ -2336,7 +2718,7 @@ async fn run_workspaces(
                     }
                 }
             }
-            KeyCode::Char('x') => {
+            WorkspaceUiAction::Rotate => {
                 confirm_remove = None;
                 if confirm_rotate.as_ref() == Some(&selected_row.config.id) {
                     match rotate_workspace_secret(&state, &selected_row.config.id).await {
@@ -2358,7 +2740,7 @@ async fn run_workspaces(
                     message = Some("Press x again to rotate this workspace URL".into());
                 }
             }
-            KeyCode::Char('d') => {
+            WorkspaceUiAction::Remove => {
                 confirm_rotate = None;
                 if confirm_remove.as_ref() == Some(&selected_row.config.id) {
                     let removed_name = selected_row.config.name.clone();
@@ -2379,7 +2761,7 @@ async fn run_workspaces(
                     message = Some("Press d again to remove this workspace".into());
                 }
             }
-            KeyCode::Enter | KeyCode::Char('v') => {
+            WorkspaceUiAction::Reveal => {
                 confirm_rotate = None;
                 confirm_remove = None;
                 if selected_url.is_some() {
@@ -2392,32 +2774,21 @@ async fn run_workspaces(
                     message = Some("Start/configure ngrok before copying a public MCP URL".into());
                 }
             }
-            KeyCode::Char('c') => {
+            WorkspaceUiAction::Copy => {
                 confirm_rotate = None;
                 confirm_remove = None;
                 match selected_url.as_deref() {
-                    Some(url) if reveal_active => {
+                    Some(url) => {
                         message = Some(if clipboard_copy(url) {
                             "MCP URL copied".into()
                         } else {
                             "Copy failed".into()
                         });
                     }
-                    Some(_) => {
-                        revealed = Some((
-                            selected_row.config.id.clone(),
-                            Instant::now() + MCP_URL_REVEAL_DURATION,
-                        ));
-                        message = Some("URL revealed; press c again to copy".into());
-                    }
                     None => {
                         message = Some("No public MCP URL is available yet".into());
                     }
                 }
-            }
-            _ => {
-                confirm_rotate = None;
-                confirm_remove = None;
             }
         }
     }
@@ -2434,7 +2805,8 @@ struct WorkspacesView<'a> {
     confirm_remove: bool,
 }
 
-fn draw_workspaces(f: &mut Frame, view: WorkspacesView<'_>) {
+fn draw_workspaces(f: &mut Frame, view: WorkspacesView<'_>, hit_areas: &mut WorkspaceHitAreas) {
+    *hit_areas = WorkspaceHitAreas::default();
     let WorkspacesView {
         current_theme,
         rows,
@@ -2487,10 +2859,19 @@ fn draw_workspaces(f: &mut Frame, view: WorkspacesView<'_>) {
             .split(outer[1])
     };
 
-    let items = rows
+    let list_inner_height = body[0].height.saturating_sub(2);
+    let visible_count = usize::from((list_inner_height / 2).max(1));
+    let list_start = if selected < visible_count {
+        0
+    } else {
+        selected + 1 - visible_count
+    };
+    let list_end = (list_start + visible_count).min(rows.len());
+    let items = rows[list_start..list_end]
         .iter()
         .enumerate()
-        .map(|(index, row)| {
+        .map(|(offset, row)| {
+            let index = list_start + offset;
             let status = match (row.availability, row.connected, row.accepting_requests) {
                 (WorkspaceAvailability::Unavailable, _, _) => "UNAVAILABLE",
                 (_, _, false) => "DRAINING",
@@ -2517,14 +2898,47 @@ fn draw_workspaces(f: &mut Frame, view: WorkspacesView<'_>) {
             ])
         })
         .collect::<Vec<_>>();
+    let list_title = if rows.len() > visible_count {
+        format!(
+            " Projects  {}-{} of {} ",
+            list_start + 1,
+            list_end,
+            rows.len()
+        )
+    } else {
+        " Projects ".to_string()
+    };
     let list = List::new(items).block(
         Block::default()
-            .title(" Projects ")
+            .title(list_title)
             .borders(Borders::ALL)
             .border_type(palette.border_type)
             .border_style(Style::default().fg(palette.border_fg)),
     );
     f.render_widget(list, body[0]);
+    let list_inner = Rect::new(
+        body[0].x.saturating_add(1),
+        body[0].y.saturating_add(1),
+        body[0].width.saturating_sub(2),
+        body[0].height.saturating_sub(2),
+    );
+    for offset in 0..(list_end - list_start) {
+        let y = list_inner
+            .y
+            .saturating_add((offset as u16).saturating_mul(2));
+        let height = 2.min(
+            list_inner
+                .y
+                .saturating_add(list_inner.height)
+                .saturating_sub(y),
+        );
+        if height > 0 {
+            hit_areas.project_rows.push((
+                list_start + offset,
+                Rect::new(list_inner.x, y, list_inner.width, height),
+            ));
+        }
+    }
 
     let row = &rows[selected];
     let availability = match row.availability {
@@ -2601,17 +3015,38 @@ fn draw_workspaces(f: &mut Frame, view: WorkspacesView<'_>) {
             .border_style(Style::default().fg(palette.border_fg)),
     );
     f.render_widget(details, body[1]);
+    let details_inner = Rect::new(
+        body[1].x.saturating_add(1),
+        body[1].y.saturating_add(1),
+        body[1].width.saturating_sub(2),
+        body[1].height.saturating_sub(2),
+    );
+    if details_inner.height > 7 {
+        let link_y = details_inner.y.saturating_add(7);
+        let link_height = 2.min(
+            details_inner
+                .y
+                .saturating_add(details_inner.height)
+                .saturating_sub(link_y),
+        );
+        if link_height > 0 {
+            hit_areas.url = Some(Rect::new(
+                details_inner.x,
+                link_y,
+                details_inner.width,
+                link_height,
+            ));
+        }
+    }
 
     let mut footer_lines = vec![Line::from(vec![
-        Span::styled(" [a] Add  ", Style::default().fg(palette.key_fg)),
-        Span::styled("[r] Rename  ", Style::default().fg(palette.key_fg)),
-        Span::styled(
-            "[Enter/v] Reveal URL  ",
-            Style::default().fg(palette.key_fg),
-        ),
-        Span::styled("[c] Copy  ", Style::default().fg(palette.key_fg)),
-        Span::styled("[x] Rotate  ", Style::default().fg(palette.key_fg)),
-        Span::styled("[d] Remove  ", Style::default().fg(palette.danger_fg)),
+        Span::styled(" [a] Path ", Style::default().fg(palette.key_fg)),
+        Span::styled("[b] Browse ", Style::default().fg(palette.key_fg)),
+        Span::styled("[r] Name ", Style::default().fg(palette.key_fg)),
+        Span::styled("[v] Reveal ", Style::default().fg(palette.key_fg)),
+        Span::styled("[c] Copy ", Style::default().fg(palette.key_fg)),
+        Span::styled("[x] Rotate ", Style::default().fg(palette.key_fg)),
+        Span::styled("[d] Remove ", Style::default().fg(palette.danger_fg)),
         Span::styled("[Esc] Back", Style::default().fg(palette.muted_fg)),
     ])];
     if let Some(message) = message {
@@ -2629,6 +3064,39 @@ fn draw_workspaces(f: &mut Frame, view: WorkspacesView<'_>) {
             .border_style(Style::default().fg(palette.border_fg)),
     );
     f.render_widget(footer, outer[2]);
+
+    let footer_y = outer[2].y.saturating_add(1);
+    let footer_right = outer[2].x.saturating_add(outer[2].width.saturating_sub(1));
+    let mut footer_x = outer[2].x.saturating_add(1);
+    for (label, action) in [
+        (" [a] Path ", WorkspaceUiAction::AddPath),
+        ("[b] Browse ", WorkspaceUiAction::BrowseAdd),
+        ("[r] Name ", WorkspaceUiAction::Rename),
+        ("[v] Reveal ", WorkspaceUiAction::Reveal),
+        ("[c] Copy ", WorkspaceUiAction::Copy),
+        ("[x] Rotate ", WorkspaceUiAction::Rotate),
+        ("[d] Remove ", WorkspaceUiAction::Remove),
+    ] {
+        let width = u16::try_from(label.chars().count()).unwrap_or(u16::MAX);
+        let available = footer_right.saturating_sub(footer_x);
+        let rect = Rect::new(footer_x, footer_y, width.min(available), 1);
+        if rect.width > 0 {
+            match action {
+                WorkspaceUiAction::AddPath => hit_areas.add = Some(rect),
+                WorkspaceUiAction::BrowseAdd => hit_areas.browse = Some(rect),
+                WorkspaceUiAction::Rename => hit_areas.rename = Some(rect),
+                WorkspaceUiAction::Reveal => hit_areas.reveal = Some(rect),
+                WorkspaceUiAction::Copy => hit_areas.copy = Some(rect),
+                WorkspaceUiAction::Rotate => hit_areas.rotate = Some(rect),
+                WorkspaceUiAction::Remove => hit_areas.remove = Some(rect),
+                WorkspaceUiAction::Back
+                | WorkspaceUiAction::MoveUp
+                | WorkspaceUiAction::MoveDown
+                | WorkspaceUiAction::Select(_) => {}
+            }
+        }
+        footer_x = footer_x.saturating_add(width);
+    }
 }
 
 async fn run_settings(
@@ -3633,6 +4101,11 @@ async fn ensure_selected_browser_remote_debugging(
 
 // ── Start services ──────────────────────────────────────────
 
+struct StartedServices {
+    devtools: Option<Arc<DevtoolsManager>>,
+    _host_runtime: HostRuntimeGuard,
+}
+
 const MAX_HEALTH_PROBE_BODY_BYTES: usize = 4 * 1024;
 
 async fn port_hosts_moondesk(port: u16) -> bool {
@@ -3678,7 +4151,7 @@ async fn port_hosts_moondesk(port: u16) -> bool {
 async fn start_services(
     state: SharedState,
     ui_events: UiEventSender,
-) -> Result<Option<Arc<DevtoolsManager>>, String> {
+) -> Result<StartedServices, String> {
     let (port, mode, mut detected_browsers, mut selected_browser) = {
         let app = state.lock().await;
         (
@@ -3837,12 +4310,16 @@ async fn start_services(
         None
     };
 
+    let host_control_token: Arc<str> = Arc::from(format!("{}{}", Uuid::new_v4(), Uuid::new_v4()));
+    let host_runtime = write_host_runtime_registration(port, &host_control_token)
+        .map_err(|error| format!("failed to publish local host registration: {error}"))?;
     let command_jobs = { state.lock().await.command_jobs.clone() };
     let router = server::router(
         state.clone(),
         devtools_bridge.clone(),
         command_jobs,
         ui_events,
+        host_control_token,
     );
     let server_state = state.clone();
     let handle = tokio::spawn(async move {
@@ -3867,7 +4344,10 @@ async fn start_services(
         state.lock().await.log("ERROR", format!("ngrok: {e}"));
     }
 
-    Ok(devtools_bridge)
+    Ok(StartedServices {
+        devtools: devtools_bridge,
+        _host_runtime: host_runtime,
+    })
 }
 
 // ── Phase 2: Main TUI ──────────────────────────────────────
@@ -5622,13 +6102,16 @@ fn draw_ui(f: &mut Frame, context: UiRenderContext<'_>) {
 #[cfg(test)]
 mod tests {
     use super::{
-        BottomPanelAreas, BottomPanelFocus, PanelItemHit, PanelScrollView, item_under_cursor,
-        key_is_clipboard_paste, move_panel_selection, normalize_ngrok_authtoken_input,
-        normalize_ngrok_domain, normalize_workspace_path_input, panel_under_cursor,
-        parse_clippymoon_export_args, parse_port_value, scroll_panel_down, scroll_panel_up,
-        tail_start_index, truncate_with_ellipsis, user_home_dir, wrap_preserving_chars,
+        BottomPanelAreas, BottomPanelFocus, PanelItemHit, PanelScrollView, WorkspaceHitAreas,
+        WorkspaceUiAction, item_under_cursor, key_is_clipboard_paste, move_panel_selection,
+        normalize_ngrok_authtoken_input, normalize_ngrok_domain, normalize_workspace_path_input,
+        panel_under_cursor, parse_clippymoon_export_args, parse_port_value, scroll_panel_down,
+        scroll_panel_up, tail_start_index, truncate_with_ellipsis, user_home_dir,
+        workspace_action_from_event, wrap_preserving_chars,
     };
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use crossterm::event::{
+        Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    };
     use ratatui::layout::Rect;
     use std::path::PathBuf;
 
@@ -5748,6 +6231,37 @@ mod tests {
             KeyCode::Insert,
             KeyModifiers::SHIFT
         )));
+    }
+
+    #[test]
+    fn workspace_mouse_actions_hit_reveal_copy_and_project_rows() {
+        let hit_areas = WorkspaceHitAreas {
+            project_rows: vec![(3, Rect::new(2, 4, 30, 2))],
+            reveal: Some(Rect::new(20, 20, 10, 1)),
+            copy: Some(Rect::new(31, 20, 9, 1)),
+            ..WorkspaceHitAreas::default()
+        };
+        let click = |column, row| {
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Up(MouseButton::Left),
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+
+        assert_eq!(
+            workspace_action_from_event(click(5, 5), &hit_areas),
+            Some(WorkspaceUiAction::Select(3))
+        );
+        assert_eq!(
+            workspace_action_from_event(click(22, 20), &hit_areas),
+            Some(WorkspaceUiAction::Reveal)
+        );
+        assert_eq!(
+            workspace_action_from_event(click(34, 20), &hit_areas),
+            Some(WorkspaceUiAction::Copy)
+        );
     }
 
     #[test]

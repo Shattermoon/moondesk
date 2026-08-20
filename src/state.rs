@@ -77,6 +77,8 @@ const APP_CONFIG_DIR_NAME: &str = ".moondesk";
 const APP_CONFIG_FILE_NAME: &str = "config.toml";
 const CURRENT_CONFIG_VERSION: u32 = 2;
 const WORKSPACE_DRAIN_TIMEOUT: Duration = Duration::from_secs(130);
+const WORKSPACE_CLEANUP_RETRY_ATTEMPTS: usize = 4;
+const WORKSPACE_CLEANUP_RETRY_DELAY: Duration = Duration::from_secs(1);
 pub const GPT_5_6_AND_EARLIER_USAGE_BUCKET: &str = "through-gpt-5.6";
 pub const CURRENT_USAGE_BUCKET: &str = GPT_5_6_AND_EARLIER_USAGE_BUCKET;
 
@@ -1301,12 +1303,11 @@ impl AppState {
     fn workspace_registry_snapshot(
         &self,
         workspaces: Vec<WorkspaceConfig>,
-    ) -> Result<(AppConfig, PathBuf), String> {
-        workspaces::validate_workspace_registry(&workspaces)?;
-        Ok((
+    ) -> (AppConfig, PathBuf) {
+        (
             self.app_config_with_workspaces(workspaces),
             self.config_path.clone(),
-        ))
+        )
     }
 
     pub fn ngrok_authtoken(&self) -> Option<&str> {
@@ -1361,6 +1362,25 @@ impl AppState {
     }
 
     pub fn apply_server_ui_event(&mut self, event: ServerUiEvent) {
+        // Server events are delivered asynchronously. A workspace can be removed
+        // after an event was queued but before the TUI drains it; never let those
+        // late events recreate logs/flows/command history for a deleted workspace.
+        let event_workspace_id = match &event {
+            ServerUiEvent::IncrementRequestCount { workspace_id }
+            | ServerUiEvent::SetRemoteConnected { workspace_id, .. }
+            | ServerUiEvent::RecordFlow { workspace_id, .. }
+            | ServerUiEvent::BeginFlowClose { workspace_id, .. }
+            | ServerUiEvent::CommandStarted { workspace_id, .. }
+            | ServerUiEvent::CommandBoundToJob { workspace_id, .. }
+            | ServerUiEvent::CommandUpdated { workspace_id, .. } => Some(workspace_id),
+            ServerUiEvent::Log { workspace_id, .. } => workspace_id.as_ref(),
+        };
+        if event_workspace_id
+            .is_some_and(|workspace_id| !self.workspace_runtimes.contains_key(workspace_id))
+        {
+            return;
+        }
+
         match event {
             ServerUiEvent::IncrementRequestCount { workspace_id } => {
                 self.request_count = self.request_count.saturating_add(1);
@@ -1593,6 +1613,27 @@ async fn persist_workspace_registry(config: AppConfig, path: PathBuf) -> Result<
     }
 }
 
+async fn validate_workspace_registry_off_thread(
+    workspaces: Vec<WorkspaceConfig>,
+) -> Result<Vec<WorkspaceConfig>, String> {
+    tokio::task::spawn_blocking(move || {
+        workspaces::validate_workspace_registry(&workspaces)?;
+        Ok(workspaces)
+    })
+    .await
+    .map_err(|error| format!("workspace registry validation task failed: {error}"))?
+}
+
+async fn build_workspace_config_off_thread(
+    name: String,
+    root: PathBuf,
+    slug: String,
+) -> Result<WorkspaceConfig, String> {
+    tokio::task::spawn_blocking(move || WorkspaceConfig::new(name, root, slug))
+        .await
+        .map_err(|error| format!("workspace path validation task failed: {error}"))?
+}
+
 fn unique_workspace_slug(workspaces: &[WorkspaceConfig]) -> Result<String, String> {
     for _ in 0..64 {
         let candidate = workspaces::generate_mcp_slug();
@@ -1613,14 +1654,22 @@ pub async fn add_workspace(
 ) -> Result<WorkspaceConfig, String> {
     let mutation_lock = { state.lock().await.workspace_mutation_lock.clone() };
     let _mutation_guard = mutation_lock.lock().await;
-    let (workspace, proposed, config, path) = {
+    let (slug, mut proposed) = {
         let app = state.lock().await;
-        let slug = unique_workspace_slug(&app.workspaces)?;
-        let workspace = WorkspaceConfig::new(name, root, slug)?;
-        let mut proposed = app.workspaces.clone();
-        proposed.push(workspace.clone());
-        let (config, path) = app.workspace_registry_snapshot(proposed.clone())?;
-        (workspace, proposed, config, path)
+        (
+            unique_workspace_slug(&app.workspaces)?,
+            app.workspaces.clone(),
+        )
+    };
+
+    // Canonicalization and overlap validation can touch the filesystem. Keep that
+    // work off the async AppState mutex so requests for other workspaces continue.
+    let workspace = build_workspace_config_off_thread(name, root, slug).await?;
+    proposed.push(workspace.clone());
+    let proposed = validate_workspace_registry_off_thread(proposed).await?;
+    let (config, path) = {
+        let app = state.lock().await;
+        app.workspace_registry_snapshot(proposed.clone())
     };
 
     persist_workspace_registry(config, path).await?;
@@ -1641,17 +1690,17 @@ pub async fn rename_workspace(
 ) -> Result<(), String> {
     let mutation_lock = { state.lock().await.workspace_mutation_lock.clone() };
     let _mutation_guard = mutation_lock.lock().await;
-    let (proposed, config, path) = {
+    let normalized = workspaces::normalize_workspace_name(&name)?;
+    let mut proposed = { state.lock().await.workspaces.clone() };
+    let workspace = proposed
+        .iter_mut()
+        .find(|workspace| &workspace.id == workspace_id)
+        .ok_or_else(|| "workspace not found".to_string())?;
+    workspace.name = normalized;
+    let proposed = validate_workspace_registry_off_thread(proposed).await?;
+    let (config, path) = {
         let app = state.lock().await;
-        let normalized = workspaces::normalize_workspace_name(&name)?;
-        let mut proposed = app.workspaces.clone();
-        let workspace = proposed
-            .iter_mut()
-            .find(|workspace| &workspace.id == workspace_id)
-            .ok_or_else(|| "workspace not found".to_string())?;
-        workspace.name = normalized;
-        let (config, path) = app.workspace_registry_snapshot(proposed.clone())?;
-        (proposed, config, path)
+        app.workspace_registry_snapshot(proposed.clone())
     };
 
     persist_workspace_registry(config, path).await?;
@@ -1669,17 +1718,22 @@ pub async fn rotate_workspace_secret(
 ) -> Result<String, String> {
     let mutation_lock = { state.lock().await.workspace_mutation_lock.clone() };
     let _mutation_guard = mutation_lock.lock().await;
-    let (slug, proposed, config, path) = {
+    let (slug, mut proposed) = {
         let app = state.lock().await;
-        let slug = unique_workspace_slug(&app.workspaces)?;
-        let mut proposed = app.workspaces.clone();
-        let workspace = proposed
-            .iter_mut()
-            .find(|workspace| &workspace.id == workspace_id)
-            .ok_or_else(|| "workspace not found".to_string())?;
-        workspace.mcp_slug = slug.clone();
-        let (config, path) = app.workspace_registry_snapshot(proposed.clone())?;
-        (slug, proposed, config, path)
+        (
+            unique_workspace_slug(&app.workspaces)?,
+            app.workspaces.clone(),
+        )
+    };
+    let workspace = proposed
+        .iter_mut()
+        .find(|workspace| &workspace.id == workspace_id)
+        .ok_or_else(|| "workspace not found".to_string())?;
+    workspace.mcp_slug = slug.clone();
+    let proposed = validate_workspace_registry_off_thread(proposed).await?;
+    let (config, path) = {
+        let app = state.lock().await;
+        app.workspace_registry_snapshot(proposed.clone())
     };
 
     persist_workspace_registry(config, path).await?;
@@ -1697,7 +1751,7 @@ pub async fn remove_workspace(
 ) -> Result<(), String> {
     let mutation_lock = { state.lock().await.workspace_mutation_lock.clone() };
     let _mutation_guard = mutation_lock.lock().await;
-    let (runtime, command_jobs, proposed, config, path) = {
+    let (runtime, command_jobs, proposed) = {
         let app = state.lock().await;
         if app.workspaces.len() <= 1 {
             return Err("cannot remove the final workspace".to_string());
@@ -1720,8 +1774,12 @@ pub async fn remove_workspace(
             .filter(|workspace| &workspace.id != workspace_id)
             .cloned()
             .collect::<Vec<_>>();
-        let (config, path) = app.workspace_registry_snapshot(proposed.clone())?;
-        (runtime, app.command_jobs.clone(), proposed, config, path)
+        (runtime, app.command_jobs.clone(), proposed)
+    };
+    let proposed = validate_workspace_registry_off_thread(proposed).await?;
+    let (config, path) = {
+        let app = state.lock().await;
+        app.workspace_registry_snapshot(proposed.clone())
     };
 
     // Preparation is reversible: block new background jobs, then stop admitting
@@ -1771,11 +1829,41 @@ pub async fn remove_workspace(
         app.config_dirty = true;
     }
 
-    if let Some(error) = cleanup_error {
-        state.lock().await.log(
-            "WARN",
-            format!("Workspace removed, but command cleanup is still incomplete: {error}"),
-        );
+    if let Some(initial_error) = cleanup_error {
+        // The workspace is already durably removed at this point. Keep its command
+        // closing marker installed and retry cleanup without blocking the workspace
+        // manager; runners that needed a little longer to terminate can then be
+        // purged instead of leaking retained state until the host exits.
+        let retry_state = state.clone();
+        let retry_jobs = command_jobs.clone();
+        let retry_workspace_id = workspace_id.clone();
+        tokio::spawn(async move {
+            let mut last_error = initial_error;
+            for attempt in 1..=WORKSPACE_CLEANUP_RETRY_ATTEMPTS {
+                tokio::time::sleep(WORKSPACE_CLEANUP_RETRY_DELAY).await;
+                match retry_jobs
+                    .finalize_workspace_removal(&retry_workspace_id)
+                    .await
+                {
+                    Ok(()) => {
+                        retry_state.lock().await.log(
+                            "INFO",
+                            format!(
+                                "Finished deferred command cleanup for removed workspace after {attempt} retry attempt(s)"
+                            ),
+                        );
+                        return;
+                    }
+                    Err(error) => last_error = error,
+                }
+            }
+            retry_state.lock().await.log(
+                "WARN",
+                format!(
+                    "Workspace was removed, but command cleanup is still incomplete after {WORKSPACE_CLEANUP_RETRY_ATTEMPTS} retries: {last_error}"
+                ),
+            );
+        });
     }
     Ok(())
 }
@@ -2587,6 +2675,56 @@ toolMode = "multiTools"
             job_id: "job-1".into(),
         });
         assert_eq!(app.command_activities.len(), 1);
+
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn late_workspace_events_are_ignored_after_runtime_removal() {
+        let (mut app, workspace, config_path) = test_app("moondesk-late-workspace-events");
+        let workspace_id = app.workspaces[0].id.clone();
+        let request_count_before = app.request_count;
+        app.workspace_runtimes.remove(&workspace_id);
+        app.purge_workspace_observability(&workspace_id);
+
+        app.apply_server_ui_event(ServerUiEvent::Log {
+            workspace_id: Some(workspace_id.clone()),
+            level: "INFO",
+            message: "late log".into(),
+        });
+        app.apply_server_ui_event(ServerUiEvent::CommandStarted {
+            workspace_id: workspace_id.clone(),
+            activity_id: "late-command".into(),
+            command: "echo late".into(),
+            background: false,
+        });
+        app.apply_server_ui_event(ServerUiEvent::RecordFlow {
+            workspace_id: workspace_id.clone(),
+            flow_id: "late-flow".into(),
+            events: vec!["ping".into()],
+            direction: FlowDirection::Forward,
+        });
+        app.apply_server_ui_event(ServerUiEvent::IncrementRequestCount {
+            workspace_id: workspace_id.clone(),
+        });
+
+        assert_eq!(app.request_count, request_count_before);
+        assert!(
+            app.logs
+                .iter()
+                .all(|entry| entry.workspace_id.as_ref() != Some(&workspace_id))
+        );
+        assert!(
+            app.command_activities
+                .iter()
+                .all(|activity| activity.workspace_id != workspace_id)
+        );
+        assert!(
+            app.flows
+                .iter()
+                .all(|flow| !flow.flow_id.starts_with(workspace_id.as_str()))
+        );
 
         let _ = std::fs::remove_file(config_path);
         let _ = std::fs::remove_dir_all(workspace);

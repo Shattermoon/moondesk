@@ -75,8 +75,8 @@ impl MascotPack {
     }
 }
 
-/// Build one procedural ClippyMoon entirely in memory for the current MoonDesk session.
-/// The seed determines its identity; animation frames only vary blink/bob/twinkle state.
+/// Build one curated ClippyMoon entirely in memory for the current MoonDesk session.
+/// The seed selects a known-good identity; animation frames only vary blink/bob/twinkle state.
 pub fn build_workspace_mascot(seed: u64) -> MascotPack {
     let frames = mascot_source_frames(seed);
     let tui_frames = frames.iter().map(build_tui_frame).collect();

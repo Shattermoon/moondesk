@@ -1,4 +1,7 @@
-use super::types::{ClippyMoonTraits, Color, MoonExpression, MoonPalette, MoonPhase, rgba};
+use super::{
+    pick_index,
+    types::{ClippyMoonTraits, Color, MoonExpression, MoonPalette, MoonPhase, rgba},
+};
 use image::{Rgba, RgbaImage};
 
 #[derive(Clone, Copy)]
@@ -245,8 +248,7 @@ fn phase_is_lit(phase: MoonPhase, dx: i32, dy: i32, radius: i32) -> bool {
 }
 
 fn curated_craters(seed: u64, count: u8, radius: i32) -> Vec<Crater> {
-    let pattern =
-        CRATER_PATTERNS[(mix_seed(seed ^ 0xC11F_C8A7_E250_2026) as usize) % CRATER_PATTERNS.len()];
+    let pattern = CRATER_PATTERNS[pick_index(seed, 0xC11F_C8A7_E250_2026, CRATER_PATTERNS.len())];
     let limit = (radius - 2).max(2);
     let mut craters = Vec::with_capacity(count as usize);
 
@@ -457,8 +459,7 @@ fn curated_stars(
     moon_cy: i32,
     moon_radius: i32,
 ) -> Vec<Star> {
-    let pattern =
-        STAR_PATTERNS[(mix_seed(seed ^ 0x57A2_5A11_C11F_2026) as usize) % STAR_PATTERNS.len()];
+    let pattern = STAR_PATTERNS[pick_index(seed, 0x57A2_5A11_C11F_2026, STAR_PATTERNS.len())];
     let mut stars = Vec::with_capacity(count as usize);
 
     for &(x_percent, y_percent, phase) in pattern.iter().take(count as usize) {
@@ -549,19 +550,14 @@ fn blend(a: Color, b: Color, amount_b: f32) -> Color {
     Rgba([mix(a[0], b[0]), mix(a[1], b[1]), mix(a[2], b[2]), 255])
 }
 
-fn mix_seed(mut value: u64) -> u64 {
-    value ^= value >> 30;
-    value = value.wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    value ^= value >> 27;
-    value = value.wrapping_mul(0x94D0_49BB_1331_11EB);
-    value ^ (value >> 31)
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{Circle, Star, draw_face, draw_stars, phase_is_lit, render_clippymoon};
+    use super::{
+        CRATER_PATTERNS, Circle, STAR_PATTERNS, Star, draw_face, draw_stars, phase_is_lit,
+        render_clippymoon,
+    };
     use crate::clippymoon_gen::{
-        traits_from_seed,
+        CURATED_STYLES, traits_from_seed,
         types::{MoonColor, MoonExpression, MoonPhase},
     };
     use image::RgbaImage;
@@ -633,6 +629,33 @@ mod tests {
             phase: 5,
         }];
         draw_stars(&mut image, &stars, MoonColor::PaleIvory.palette(), u8::MAX);
+    }
+
+    #[test]
+    fn authored_layouts_cover_every_curated_identity_count() {
+        let max_craters = CURATED_STYLES
+            .iter()
+            .map(|style| usize::from(style.crater_count))
+            .max()
+            .unwrap_or(0);
+        let max_stars = CURATED_STYLES
+            .iter()
+            .map(|style| usize::from(style.star_count))
+            .max()
+            .unwrap_or(0);
+
+        assert!(
+            CRATER_PATTERNS
+                .iter()
+                .all(|pattern| pattern.len() >= max_craters),
+            "every authored crater pattern must cover the largest curated crater count"
+        );
+        assert!(
+            STAR_PATTERNS
+                .iter()
+                .all(|pattern| pattern.len() >= max_stars),
+            "every authored star pattern must cover the largest curated star count"
+        );
     }
 
     #[test]

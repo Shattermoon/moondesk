@@ -1647,32 +1647,54 @@ fn unique_workspace_slug(workspaces: &[WorkspaceConfig]) -> Result<String, Strin
     Err("failed to generate a unique workspace MCP slug".to_string())
 }
 
+#[derive(Debug)]
+pub enum AddWorkspaceError {
+    Validation(String),
+    Persistence(String),
+}
+
+impl std::fmt::Display for AddWorkspaceError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Validation(message) | Self::Persistence(message) => formatter.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for AddWorkspaceError {}
+
 pub async fn add_workspace(
     state: &SharedState,
     name: String,
     root: PathBuf,
-) -> Result<WorkspaceConfig, String> {
+) -> Result<WorkspaceConfig, AddWorkspaceError> {
     let mutation_lock = { state.lock().await.workspace_mutation_lock.clone() };
     let _mutation_guard = mutation_lock.lock().await;
     let (slug, mut proposed) = {
         let app = state.lock().await;
         (
-            unique_workspace_slug(&app.workspaces)?,
+            unique_workspace_slug(&app.workspaces).map_err(AddWorkspaceError::Validation)?,
             app.workspaces.clone(),
         )
     };
 
     // Canonicalization and overlap validation can touch the filesystem. Keep that
     // work off the async AppState mutex so requests for other workspaces continue.
-    let workspace = build_workspace_config_off_thread(name, root, slug).await?;
+    let workspace = build_workspace_config_off_thread(name, root, slug)
+        .await
+        .map_err(AddWorkspaceError::Validation)?;
     proposed.push(workspace.clone());
-    let proposed = validate_workspace_registry_off_thread(proposed).await?;
+    let proposed = validate_workspace_registry_off_thread(proposed)
+        .await
+        .map_err(AddWorkspaceError::Validation)?;
     let (config, path) = {
         let app = state.lock().await;
         app.workspace_registry_snapshot(proposed.clone())
     };
 
-    persist_workspace_registry(config, path).await?;
+    persist_workspace_registry(config, path)
+        .await
+        .map_err(AddWorkspaceError::Persistence)?;
 
     let mut app = state.lock().await;
     app.workspaces = proposed;
@@ -3075,7 +3097,12 @@ toolMode = "multiTools"
         let error = add_workspace(&state, "Secondary".into(), secondary_root.clone())
             .await
             .expect_err("failed registry persistence must reject workspace addition");
-        assert!(error.contains("failed to persist workspace registry"));
+        assert!(matches!(error, AddWorkspaceError::Persistence(_)));
+        assert!(
+            error
+                .to_string()
+                .contains("failed to persist workspace registry")
+        );
 
         let app = state.lock().await;
         assert_eq!(app.workspaces.len(), 1);

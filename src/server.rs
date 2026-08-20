@@ -1,7 +1,7 @@
 use axum::{
     Router,
     body::{Body, Bytes},
-    extract::{Path as AxumPath, State},
+    extract::{DefaultBodyLimit, Path as AxumPath, State},
     http::{HeaderMap, HeaderValue, Response, StatusCode, header},
     response::Json,
     routing::{delete, get, post},
@@ -16,7 +16,8 @@ use crate::command_jobs::CommandJobManager;
 use crate::devtools::DevtoolsManager;
 use crate::mcp::{self, JsonRpcRequest};
 use crate::state::{
-    CommandActivityState, FlowDirection, ServerUiEvent, SharedState, UiEventSender, add_workspace,
+    AddWorkspaceError, CommandActivityState, FlowDirection, ServerUiEvent, SharedState,
+    UiEventSender, add_workspace,
 };
 use crate::workspaces::{self, WorkspaceId, WorkspaceRequestContext, WorkspaceRequestLease};
 use uuid::Uuid;
@@ -53,7 +54,11 @@ pub fn router(
     };
     Router::new()
         .route("/", get(health))
-        .route(HOST_CONTROL_ROUTE, post(register_workspace_from_local_host))
+        .route(
+            HOST_CONTROL_ROUTE,
+            post(register_workspace_from_local_host)
+                .layer(DefaultBodyLimit::max(MAX_HOST_CONTROL_BODY_BYTES)),
+        )
         .route("/{slug}/mcp", post(post_mcp))
         .route("/{slug}/mcp", get(get_mcp))
         .route("/{slug}/mcp", delete(delete_mcp))
@@ -386,6 +391,13 @@ fn host_control_authorized(headers: &HeaderMap, expected_token: &str) -> bool {
     candidate.as_bytes().ct_eq(expected_token.as_bytes()).into()
 }
 
+fn host_workspace_add_error_status(error: &AddWorkspaceError) -> StatusCode {
+    match error {
+        AddWorkspaceError::Validation(_) => StatusCode::CONFLICT,
+        AddWorkspaceError::Persistence(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
 async fn register_workspace_from_local_host(
     State(s): State<ServerState>,
     headers: HeaderMap,
@@ -484,11 +496,14 @@ async fn register_workspace_from_local_host(
                 .to_string(),
             ),
         ),
-        Err(error) => response_with_body(
-            StatusCode::CONFLICT,
-            "application/json",
-            Body::from(json!({"error": error}).to_string()),
-        ),
+        Err(error) => {
+            let status = host_workspace_add_error_status(&error);
+            response_with_body(
+                status,
+                "application/json",
+                Body::from(json!({"error": error.to_string()}).to_string()),
+            )
+        }
     }
 }
 
@@ -898,6 +913,68 @@ mod tests {
         )
     }
 
+    #[test]
+    fn host_workspace_registration_maps_internal_persistence_failures_to_500() {
+        let validation = AddWorkspaceError::Validation("bad workspace".into());
+        let persistence = AddWorkspaceError::Persistence("disk failure".into());
+        assert_eq!(
+            host_workspace_add_error_status(&validation),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            host_workspace_add_error_status(&persistence),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    #[tokio::test]
+    async fn host_control_route_rejects_oversized_body_before_handler_extraction() {
+        let workspace_root = unique_temp_path("moondesk-host-body-limit-workspace");
+        let config_root = unique_temp_path("moondesk-host-body-limit-config");
+        let config_path = config_root.join("config.toml");
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        std::fs::create_dir_all(&config_root).expect("create config dir");
+
+        let app = AppState::new_for_test(
+            8787,
+            workspace_root.to_string_lossy().into_owned(),
+            config_path.clone(),
+        )
+        .expect("create app state");
+        let app_state = Arc::new(Mutex::new(app));
+        let (ui_tx, _ui_rx) = ui_event_channel();
+        let app = router(
+            app_state,
+            None,
+            CommandJobManager::new(),
+            ui_tx,
+            Arc::from("test-host-control-token"),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let address = listener.local_addr().expect("test server address");
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let response = reqwest::Client::new()
+            .post(format!("http://{address}{HOST_CONTROL_ROUTE}"))
+            .header(HOST_CONTROL_HEADER, "test-host-control-token")
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(vec![b'x'; MAX_HOST_CONTROL_BODY_BYTES + 1])
+            .send()
+            .await
+            .expect("send oversized host-control request");
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        server.abort();
+        let _ = server.await;
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_dir_all(config_root);
+        let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
     #[tokio::test]
     async fn host_workspace_registration_is_authenticated_and_idempotent() {
         let workspace_a = unique_temp_path("moondesk-host-register-a");
@@ -942,6 +1019,33 @@ mod tests {
             HOST_CONTROL_HEADER,
             HeaderValue::from_static("test-host-control-token"),
         );
+
+        let oversized_name = "x".repeat(workspaces::MAX_WORKSPACE_NAME_CHARS + 1);
+        let invalid_name_request = Bytes::from(
+            serde_json::to_vec(&json!({
+                "root": workspace_b.to_string_lossy(),
+                "name": oversized_name,
+            }))
+            .expect("serialize invalid registration request"),
+        );
+        let invalid_name = register_workspace_from_local_host(
+            State(server_state.clone()),
+            headers.clone(),
+            invalid_name_request,
+        )
+        .await;
+        assert_eq!(invalid_name.status(), StatusCode::CONFLICT);
+        assert_eq!(app_state.lock().await.workspaces.len(), 1);
+
+        let oversized_body = Bytes::from(vec![b'x'; MAX_HOST_CONTROL_BODY_BYTES + 1]);
+        let oversized = register_workspace_from_local_host(
+            State(server_state.clone()),
+            headers.clone(),
+            oversized_body,
+        )
+        .await;
+        assert_eq!(oversized.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
         let created = register_workspace_from_local_host(
             State(server_state.clone()),
             headers.clone(),

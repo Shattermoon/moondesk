@@ -970,7 +970,7 @@ mod tests {
         }
 
         let cross_root = post_mcp(
-            AxumPath(slug_a),
+            AxumPath(slug_a.clone()),
             State(server_state.clone()),
             tool_call_body(
                 "read",
@@ -991,6 +991,26 @@ mod tests {
             Some(true)
         );
 
+        // ngrok restart clears host connection state but must not mutate the
+        // workspace registry or endpoint routing table.
+        {
+            let mut app = server_state.app.lock().await;
+            app.ngrok_url = Some("https://old.example".into());
+            app.clear_remote_connection_state();
+            app.ngrok_url = Some("https://new.example".into());
+        }
+        for slug in [slug_a, slug_b] {
+            let response = post_mcp(
+                AxumPath(slug),
+                State(server_state.clone()),
+                Bytes::from_static(
+                    br#"{"jsonrpc":"2.0","id":"after-tunnel-reset","method":"ping"}"#,
+                ),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
         let unknown = post_mcp(
             AxumPath("definitely-not-a-workspace".to_string()),
             State(server_state),
@@ -1003,6 +1023,174 @@ mod tests {
         let _ = std::fs::remove_dir_all(config_root);
         let _ = std::fs::remove_dir_all(workspace_b);
         let _ = std::fs::remove_dir_all(workspace_a);
+    }
+
+    #[tokio::test]
+    async fn workspace_routes_support_concurrent_reads_and_writes() {
+        let workspace_a = unique_temp_path("moondesk-concurrent-a");
+        let workspace_b = unique_temp_path("moondesk-concurrent-b");
+        let config_root = unique_temp_path("moondesk-concurrent-config");
+        let config_path = config_root.join("config.toml");
+        std::fs::create_dir_all(&workspace_a).expect("create workspace A");
+        std::fs::create_dir_all(&workspace_b).expect("create workspace B");
+        std::fs::create_dir_all(&config_root).expect("create config dir");
+
+        let mut app = AppState::new_for_test(
+            8787,
+            workspace_a.to_string_lossy().into_owned(),
+            config_path.clone(),
+        )
+        .expect("create app state");
+        let slug_a = app.workspaces[0].mcp_slug.clone();
+        let second = WorkspaceConfig::new(
+            "Workspace B",
+            &workspace_b,
+            crate::workspaces::generate_mcp_slug(),
+        )
+        .expect("create second workspace");
+        let slug_b = second.mcp_slug.clone();
+        app.workspace_runtimes.insert(
+            second.id.clone(),
+            Arc::new(crate::workspaces::WorkspaceRuntime::default()),
+        );
+        app.workspaces.push(second);
+
+        let app_state = Arc::new(Mutex::new(app));
+        let (ui_tx, _ui_rx) = ui_event_channel();
+        let server_state = ServerState {
+            app: app_state,
+            devtools: None,
+            command_jobs: CommandJobManager::new(),
+            ui_events: ui_tx,
+        };
+
+        // tool_call_body deliberately uses the same JSON-RPC id for both calls.
+        let (write_a, write_b) = tokio::join!(
+            post_mcp(
+                AxumPath(slug_a.clone()),
+                State(server_state.clone()),
+                tool_call_body("write", json!({ "path": "concurrent.txt", "content": "A" })),
+            ),
+            post_mcp(
+                AxumPath(slug_b.clone()),
+                State(server_state.clone()),
+                tool_call_body("write", json!({ "path": "concurrent.txt", "content": "B" })),
+            )
+        );
+        assert_eq!(write_a.status(), StatusCode::OK);
+        assert_eq!(write_b.status(), StatusCode::OK);
+        assert_eq!(
+            std::fs::read_to_string(workspace_a.join("concurrent.txt")).expect("read A file"),
+            "A"
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace_b.join("concurrent.txt")).expect("read B file"),
+            "B"
+        );
+
+        let (read_a, read_b) = tokio::join!(
+            post_mcp(
+                AxumPath(slug_a),
+                State(server_state.clone()),
+                tool_call_body("read", json!({ "path": "concurrent.txt" })),
+            ),
+            post_mcp(
+                AxumPath(slug_b),
+                State(server_state),
+                tool_call_body("read", json!({ "path": "concurrent.txt" })),
+            )
+        );
+        let read_a_body = to_bytes(read_a.into_body(), usize::MAX)
+            .await
+            .expect("read A response");
+        let read_b_body = to_bytes(read_b.into_body(), usize::MAX)
+            .await
+            .expect("read B response");
+        let read_a_payload: Value = serde_json::from_slice(&read_a_body).expect("parse A response");
+        let read_b_payload: Value = serde_json::from_slice(&read_b_body).expect("parse B response");
+        assert_eq!(
+            read_a_payload
+                .pointer("/result/structuredContent/text")
+                .and_then(Value::as_str),
+            Some("A")
+        );
+        assert_eq!(
+            read_b_payload
+                .pointer("/result/structuredContent/text")
+                .and_then(Value::as_str),
+            Some("B")
+        );
+
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_dir_all(config_root);
+        let _ = std::fs::remove_dir_all(workspace_b);
+        let _ = std::fs::remove_dir_all(workspace_a);
+    }
+
+    #[tokio::test]
+    async fn deleting_one_workspace_endpoint_does_not_disconnect_another() {
+        let workspace_a_root = unique_temp_path("moondesk-delete-isolation-a");
+        let workspace_b_root = unique_temp_path("moondesk-delete-isolation-b");
+        let config_root = unique_temp_path("moondesk-delete-isolation-config");
+        let config_path = config_root.join("config.toml");
+        std::fs::create_dir_all(&workspace_a_root).expect("create workspace A");
+        std::fs::create_dir_all(&workspace_b_root).expect("create workspace B");
+        std::fs::create_dir_all(&config_root).expect("create config dir");
+
+        let mut app = AppState::new_for_test(
+            8787,
+            workspace_a_root.to_string_lossy().into_owned(),
+            config_path.clone(),
+        )
+        .expect("create app state");
+        let workspace_a_id = app.workspaces[0].id.clone();
+        let slug_a = app.workspaces[0].mcp_slug.clone();
+        let workspace_b = WorkspaceConfig::new(
+            "Workspace B",
+            &workspace_b_root,
+            crate::workspaces::generate_mcp_slug(),
+        )
+        .expect("create workspace B");
+        let workspace_b_id = workspace_b.id.clone();
+        app.workspace_runtimes.insert(
+            workspace_b_id.clone(),
+            Arc::new(crate::workspaces::WorkspaceRuntime::default()),
+        );
+        app.workspaces.push(workspace_b);
+        app.apply_server_ui_event(ServerUiEvent::SetRemoteConnected {
+            workspace_id: workspace_a_id.clone(),
+            connected: true,
+        });
+        app.apply_server_ui_event(ServerUiEvent::SetRemoteConnected {
+            workspace_id: workspace_b_id.clone(),
+            connected: true,
+        });
+
+        let app_state = Arc::new(Mutex::new(app));
+        let (ui_tx, mut ui_rx) = ui_event_channel();
+        let server_state = ServerState {
+            app: app_state.clone(),
+            devtools: None,
+            command_jobs: CommandJobManager::new(),
+            ui_events: ui_tx,
+        };
+
+        let response = delete_mcp(AxumPath(slug_a), State(server_state)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        while let Ok(event) = ui_rx.try_recv() {
+            app_state.lock().await.apply_server_ui_event(event);
+        }
+
+        let app = app_state.lock().await;
+        assert!(app.remote_connected);
+        assert!(!app.workspace_runtimes[&workspace_a_id].remote_connected());
+        assert!(app.workspace_runtimes[&workspace_b_id].remote_connected());
+        drop(app);
+
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_dir_all(config_root);
+        let _ = std::fs::remove_dir_all(workspace_b_root);
+        let _ = std::fs::remove_dir_all(workspace_a_root);
     }
 
     #[tokio::test]
@@ -1026,12 +1214,14 @@ mod tests {
     #[tokio::test]
     async fn rotating_mcp_slug_immediately_rejects_old_slug_and_accepts_new_slug() {
         let workspace_root = unique_temp_path("moondesk-slug-rotation-workspace");
+        let workspace_b_root = unique_temp_path("moondesk-slug-rotation-workspace-b");
         let config_root = unique_temp_path("moondesk-slug-rotation-config");
         let config_path = config_root.join("config.toml");
         std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        std::fs::create_dir_all(&workspace_b_root).expect("create workspace B");
         std::fs::create_dir_all(&config_root).expect("create config dir");
 
-        let app = AppState::new_for_test(
+        let mut app = AppState::new_for_test(
             8787,
             workspace_root.to_string_lossy().into_owned(),
             config_path.clone(),
@@ -1039,6 +1229,18 @@ mod tests {
         .expect("create app state");
         let old_slug = app.mcp_slug.clone();
         let workspace_id = app.workspaces[0].id.clone();
+        let workspace_b = WorkspaceConfig::new(
+            "Workspace B",
+            &workspace_b_root,
+            crate::workspaces::generate_mcp_slug(),
+        )
+        .expect("create workspace B");
+        let workspace_b_slug = workspace_b.mcp_slug.clone();
+        app.workspace_runtimes.insert(
+            workspace_b.id.clone(),
+            Arc::new(crate::workspaces::WorkspaceRuntime::default()),
+        );
+        app.workspaces.push(workspace_b);
         let app_state = Arc::new(Mutex::new(app));
         let (ui_tx, _ui_rx) = ui_event_channel();
         let server_state = ServerState {
@@ -1072,11 +1274,29 @@ mod tests {
         .await;
         assert_eq!(old_response.status(), StatusCode::NOT_FOUND);
 
+        {
+            let app = app_state.lock().await;
+            assert!(
+                app.workspaces
+                    .iter()
+                    .any(|workspace| workspace.mcp_slug == workspace_b_slug),
+                "rotating workspace A must not change workspace B's secret"
+            );
+        }
+        let workspace_b_response = post_mcp(
+            AxumPath(workspace_b_slug),
+            State(server_state.clone()),
+            ping.clone(),
+        )
+        .await;
+        assert_eq!(workspace_b_response.status(), StatusCode::OK);
+
         let new_response = post_mcp(AxumPath(new_slug), State(server_state), ping).await;
         assert_eq!(new_response.status(), StatusCode::OK);
 
         let _ = std::fs::remove_file(config_path);
         let _ = std::fs::remove_dir_all(workspace_root);
+        let _ = std::fs::remove_dir_all(workspace_b_root);
         let _ = std::fs::remove_dir_all(config_root);
     }
 }

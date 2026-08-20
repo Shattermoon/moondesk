@@ -1697,7 +1697,7 @@ pub async fn remove_workspace(
 ) -> Result<(), String> {
     let mutation_lock = { state.lock().await.workspace_mutation_lock.clone() };
     let _mutation_guard = mutation_lock.lock().await;
-    let (runtime, command_jobs) = {
+    let (runtime, command_jobs, proposed, config, path) = {
         let app = state.lock().await;
         if app.workspaces.len() <= 1 {
             return Err("cannot remove the final workspace".to_string());
@@ -1714,26 +1714,6 @@ pub async fn remove_workspace(
             .get(workspace_id)
             .cloned()
             .ok_or_else(|| "workspace runtime not found".to_string())?;
-        (runtime, app.command_jobs.clone())
-    };
-
-    runtime.revoke();
-    if let Err(error) = command_jobs.cancel_workspace(workspace_id).await {
-        runtime.enable();
-        return Err(error);
-    }
-    if tokio::time::timeout(WORKSPACE_DRAIN_TIMEOUT, runtime.wait_for_drain())
-        .await
-        .is_err()
-    {
-        return Err(format!(
-            "timed out after {} seconds waiting for in-flight workspace requests to finish; the workspace remains revoked, so retry removal after the active request completes",
-            WORKSPACE_DRAIN_TIMEOUT.as_secs()
-        ));
-    }
-
-    let (proposed, config, path) = {
-        let app = state.lock().await;
         let proposed = app
             .workspaces
             .iter()
@@ -1741,15 +1721,45 @@ pub async fn remove_workspace(
             .cloned()
             .collect::<Vec<_>>();
         let (config, path) = app.workspace_registry_snapshot(proposed.clone())?;
-        (proposed, config, path)
+        (runtime, app.command_jobs.clone(), proposed, config, path)
     };
 
-    if let Err(error) = persist_workspace_registry(config, path).await {
+    // Preparation is reversible: block new background jobs, then stop admitting
+    // new HTTP requests. Existing foreground/file operations keep their leases
+    // and are allowed to finish without killing already-running background jobs.
+    command_jobs.begin_workspace_removal(workspace_id).await?;
+    runtime.revoke();
+    if tokio::time::timeout(WORKSPACE_DRAIN_TIMEOUT, runtime.wait_for_drain())
+        .await
+        .is_err()
+    {
+        command_jobs.abort_workspace_removal(workspace_id).await;
         runtime.enable();
         return Err(format!(
-            "{error}; workspace removal was not persisted and the workspace was re-enabled, but its background jobs had already been cancelled"
+            "timed out after {} seconds waiting for in-flight workspace requests to finish; workspace removal was aborted and the workspace was re-enabled",
+            WORKSPACE_DRAIN_TIMEOUT.as_secs()
         ));
     }
+
+    // No irreversible job cancellation happens until the registry removal is
+    // durable. A persistence failure therefore restores normal request/job
+    // admission without changing the workspace's running commands.
+    if let Err(error) = persist_workspace_registry(config, path).await {
+        command_jobs.abort_workspace_removal(workspace_id).await;
+        runtime.enable();
+        return Err(format!(
+            "{error}; workspace removal was not persisted and the workspace was re-enabled"
+        ));
+    }
+
+    // Persistence is committed at this point, so irreversible cancellation and
+    // retained-output cleanup are now safe. The closing marker stays installed
+    // until purge succeeds, preventing a stale pre-revocation caller from
+    // creating an orphaned background job.
+    let cleanup_error = command_jobs
+        .finalize_workspace_removal(workspace_id)
+        .await
+        .err();
 
     {
         let mut app = state.lock().await;
@@ -1761,10 +1771,10 @@ pub async fn remove_workspace(
         app.config_dirty = true;
     }
 
-    if let Err(error) = command_jobs.purge_workspace_state(workspace_id).await {
+    if let Some(error) = cleanup_error {
         state.lock().await.log(
             "WARN",
-            format!("Workspace removed, but retained command cleanup failed: {error}"),
+            format!("Workspace removed, but command cleanup is still incomplete: {error}"),
         );
     }
     Ok(())
@@ -2119,6 +2129,52 @@ toolMode = "multiTools"
         let _ = std::fs::remove_dir_all(config_root);
         let _ = std::fs::remove_dir_all(other_workspace);
         let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_v2_loads_noncanonical_existing_root_as_unavailable() {
+        use std::os::unix::fs::symlink;
+
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let config_root = std::env::temp_dir().join(format!("moondesk-v2-alias-config-{unique}"));
+        let target = std::env::temp_dir().join(format!("moondesk-v2-alias-target-{unique}"));
+        let alias = std::env::temp_dir().join(format!("moondesk-v2-alias-root-{unique}"));
+        std::fs::create_dir_all(&config_root).expect("create config root");
+        std::fs::create_dir_all(&target).expect("create target root");
+        symlink(&target, &alias).expect("create root alias");
+        let config_path = config_root.join(APP_CONFIG_FILE_NAME);
+        let config = AppConfig {
+            config_version: CURRENT_CONFIG_VERSION,
+            workspaces: vec![WorkspaceConfig {
+                id: workspaces::WorkspaceId::new(),
+                name: "Alias".into(),
+                root: alias.clone(),
+                mcp_slug: "Ab3kL9xQ2pTm7VhC".into(),
+            }],
+            ..AppConfig::default()
+        };
+        std::fs::write(
+            &config_path,
+            toml::to_string_pretty(&config).expect("serialize alias config"),
+        )
+        .expect("write alias config");
+
+        let loaded = AppConfig::load_from_path(&config_path)
+            .expect("noncanonical root must not prevent config loading");
+        assert_eq!(loaded.workspaces[0].root, alias);
+        assert_eq!(
+            workspaces::workspace_availability(&loaded.workspaces[0].root),
+            workspaces::WorkspaceAvailability::Unavailable
+        );
+
+        let _ = std::fs::remove_file(&config_path);
+        let _ = std::fs::remove_file(&loaded.workspaces[0].root);
+        let _ = std::fs::remove_dir_all(target);
+        let _ = std::fs::remove_dir_all(config_root);
     }
 
     #[test]
@@ -2980,11 +3036,25 @@ toolMode = "multiTools"
         assert!(!runtime.accepting_requests());
         assert!(runtime.try_acquire().is_none());
         assert_eq!(runtime.in_flight_requests(), 1);
-        let cancelled = manager
+        let still_running = manager
             .poll_for_workspace(&added.id, &started.snapshot.job_id, 0, 0)
             .await
-            .expect("cancelled job remains visible until purge");
-        assert!(cancelled.state.is_terminal());
+            .expect("existing job remains visible while removal is reversible");
+        assert_eq!(
+            still_running.state,
+            crate::command_jobs::CommandJobState::Running
+        );
+        let late_start_error = manager
+            .start_for_workspace(
+                &added.id,
+                command.to_string(),
+                secondary_root.clone(),
+                10_000,
+                None,
+            )
+            .await
+            .expect_err("pre-revocation request must not start a new job during removal");
+        assert!(late_start_error.contains("workspace removal is in progress"));
 
         drop(lease);
         removal.await.expect("remove workspace after drain");
@@ -3050,6 +3120,88 @@ toolMode = "multiTools"
 
         let _ = std::fs::remove_dir_all(secondary_root);
         let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_dir_all(primary_root);
+    }
+
+    #[tokio::test]
+    async fn failed_workspace_removal_persistence_keeps_running_jobs_and_reenables_workspace() {
+        let (app, primary_root, original_config_path) =
+            test_app("moondesk-workspace-remove-persist-failure");
+        let state = Arc::new(Mutex::new(app));
+        let secondary_root = std::env::temp_dir().join(format!(
+            "moondesk-workspace-remove-persist-failure-secondary-{}",
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&secondary_root).expect("create secondary workspace");
+        let added = add_workspace(&state, "Secondary".into(), secondary_root.clone())
+            .await
+            .expect("add workspace");
+
+        let blocked_parent = primary_root.join("blocked-remove-config-parent");
+        std::fs::write(&blocked_parent, "not a directory").expect("create blocked config parent");
+        {
+            let mut app = state.lock().await;
+            app.config_path = blocked_parent.join(APP_CONFIG_FILE_NAME);
+        }
+
+        let (runtime, manager) = {
+            let app = state.lock().await;
+            (
+                app.workspace_runtimes
+                    .get(&added.id)
+                    .cloned()
+                    .expect("workspace runtime"),
+                app.command_jobs.clone(),
+            )
+        };
+        let command = if cfg!(windows) {
+            "Start-Sleep -Seconds 5"
+        } else {
+            "sleep 5"
+        };
+        let started = manager
+            .start_for_workspace(
+                &added.id,
+                command.to_string(),
+                secondary_root.clone(),
+                10_000,
+                None,
+            )
+            .await
+            .expect("start workspace job");
+
+        let error = remove_workspace(&state, &added.id)
+            .await
+            .expect_err("removal persistence must fail");
+        assert!(error.contains("workspace removal was not persisted"));
+        assert!(runtime.accepting_requests());
+        assert!(runtime.try_acquire().is_some());
+        let snapshot = manager
+            .poll_for_workspace(&added.id, &started.snapshot.job_id, 0, 0)
+            .await
+            .expect("running job must survive failed removal");
+        assert_eq!(
+            snapshot.state,
+            crate::command_jobs::CommandJobState::Running,
+            "failed removal must not cancel an existing background job"
+        );
+        assert!(
+            state
+                .lock()
+                .await
+                .workspaces
+                .iter()
+                .any(|workspace| workspace.id == added.id),
+            "failed removal must keep the workspace registered"
+        );
+
+        manager
+            .cancel_workspace(&added.id)
+            .await
+            .expect("cancel surviving test job");
+        let _ = std::fs::remove_file(original_config_path);
+        let _ = std::fs::remove_file(blocked_parent);
+        let _ = std::fs::remove_dir_all(secondary_root);
         let _ = std::fs::remove_dir_all(primary_root);
     }
 

@@ -1,9 +1,11 @@
 name: CI
 
-# Automatic CI is temporarily disabled while MoonDesk is under active development.
-# Keep the workflow available for explicit manual validation before release/merge.
+# Draft PRs stay quiet during active development. Validation becomes automatic
+# as soon as a PR is ready for review, and remains available manually at any time.
 on:
   workflow_dispatch:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
@@ -14,6 +16,7 @@ permissions:
 
 jobs:
   validate:
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.draft == false
     name: Validate
     runs-on: ubuntu-22.04
 

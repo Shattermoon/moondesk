@@ -12,10 +12,10 @@ use crate::command_jobs::{
     CommandJobManager, CommandJobSnapshot, DEFAULT_JOB_TIMEOUT_MS, MAX_COMMAND_OUTPUT_READ_BYTES,
     MAX_JOB_TIMEOUT_MS, MAX_POLL_WAIT_MS,
 };
-use crate::devtools::DevtoolsBridge;
+use crate::devtools::DevtoolsManager;
 use crate::state::{AgentsPathMode, Mode, ToolMode, load_app_config, user_home_dir};
 use crate::workspace_tools;
-use crate::workspaces::WorkspaceId;
+use crate::workspaces::{self, WorkspaceAvailability, WorkspaceId};
 
 const SERVER_NAME: &str = "moondesk";
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -80,7 +80,7 @@ pub struct McpRequestContext<'a> {
     pub tool_mode: ToolMode,
     pub set_moondesk_as_co_author: bool,
     pub command_jobs: &'a CommandJobManager,
-    pub devtools: &'a Option<Arc<DevtoolsBridge>>,
+    pub devtools: &'a Option<Arc<DevtoolsManager>>,
 }
 
 pub async fn handle_request(
@@ -255,7 +255,7 @@ async fn handle_tools_list(
     req: &JsonRpcRequest,
     mode: Mode,
     tool_mode: ToolMode,
-    devtools: &Option<Arc<DevtoolsBridge>>,
+    devtools: &Option<Arc<DevtoolsManager>>,
 ) -> JsonRpcResponse {
     let mut tools: Vec<Value> = Vec::new();
 
@@ -485,7 +485,7 @@ async fn handle_tools_call(
     tool_mode: ToolMode,
     set_moondesk_as_co_author: bool,
     command_jobs: &CommandJobManager,
-    devtools: &Option<Arc<DevtoolsBridge>>,
+    devtools: &Option<Arc<DevtoolsManager>>,
 ) -> JsonRpcResponse {
     let workspace_id = WorkspaceId::test_default();
     handle_tools_call_for_workspace(
@@ -525,8 +525,16 @@ async fn handle_tools_call_for_workspace(
 
     if matches!(
         tool_name.as_str(),
-        "read" | "search" | "write" | "edit" | "delete" | "run_command" | "start_command"
-    ) && !Path::new(workspace_root).is_dir()
+        "moondesk_instruction"
+            | "read"
+            | "search"
+            | "write"
+            | "edit"
+            | "delete"
+            | "run_command"
+            | "start_command"
+    ) && workspaces::workspace_availability(Path::new(workspace_root))
+        == WorkspaceAvailability::Unavailable
     {
         return tool_error_response(
             req,
@@ -630,7 +638,7 @@ async fn forward_to_devtools(
     req: &JsonRpcRequest,
     tool_name: &str,
     tool_mode: ToolMode,
-    devtools: &Option<Arc<DevtoolsBridge>>,
+    devtools: &Option<Arc<DevtoolsManager>>,
 ) -> JsonRpcResponse {
     let params = &req.params;
     let Some(bridge) = devtools else {
@@ -1647,7 +1655,7 @@ fn tool_is_read_only(tool: &Value) -> bool {
         .unwrap_or(false)
 }
 
-async fn fetch_devtools_tools(bridge: &Arc<DevtoolsBridge>) -> Option<Vec<Value>> {
+async fn fetch_devtools_tools(bridge: &Arc<DevtoolsManager>) -> Option<Vec<Value>> {
     let list_req = json!({
         "jsonrpc": "2.0",
         "id": "dt-tools-list",
@@ -1663,7 +1671,10 @@ async fn fetch_devtools_tools(bridge: &Arc<DevtoolsBridge>) -> Option<Vec<Value>
     Some(dt_tools)
 }
 
-async fn devtools_tool_is_read_only(bridge: &Arc<DevtoolsBridge>, tool_name: &str) -> Option<bool> {
+async fn devtools_tool_is_read_only(
+    bridge: &Arc<DevtoolsManager>,
+    tool_name: &str,
+) -> Option<bool> {
     let dt_tools = fetch_devtools_tools(bridge).await?;
     dt_tools
         .iter()
@@ -3689,6 +3700,26 @@ mod tests {
             Some(true)
         );
         assert!(result_text(&read).contains("Workspace is currently unavailable"));
+
+        let instruction = handle_tools_call(
+            &tool_call_request("moondesk_instruction", json!({})),
+            &missing_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &manager,
+            &None,
+        )
+        .await;
+        assert_eq!(
+            instruction
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(result_text(&instruction).contains("Workspace is currently unavailable"));
 
         let poll = handle_tools_call(
             &tool_call_request(

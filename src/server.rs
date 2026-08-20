@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 use std::sync::Arc;
 
 use crate::command_jobs::CommandJobManager;
-use crate::devtools::DevtoolsBridge;
+use crate::devtools::DevtoolsManager;
 use crate::mcp::{self, JsonRpcRequest};
 use crate::state::{
     CommandActivityState, FlowDirection, ServerUiEvent, SharedState, UiEventSender,
@@ -24,7 +24,7 @@ const STATELESS_FLOW_LABEL: &str = "stateless";
 #[derive(Clone)]
 struct ServerState {
     app: SharedState,
-    devtools: Option<Arc<DevtoolsBridge>>,
+    devtools: Option<Arc<DevtoolsManager>>,
     command_jobs: CommandJobManager,
     ui_events: UiEventSender,
 }
@@ -32,7 +32,7 @@ struct ServerState {
 /// Build the axum router.
 pub fn router(
     app_state: SharedState,
-    devtools: Option<Arc<DevtoolsBridge>>,
+    devtools: Option<Arc<DevtoolsManager>>,
     command_jobs: CommandJobManager,
     ui_events: UiEventSender,
 ) -> Router {

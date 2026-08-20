@@ -22,7 +22,7 @@ use crossterm::{
     },
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use devtools::DevtoolsBridge;
+use devtools::DevtoolsManager;
 use mascot::{TUI_MASCOT_BLOCK_HEIGHT, TUI_MASCOT_BLOCK_WIDTH, render_tui_lines};
 use ratatui::{
     prelude::*,
@@ -3678,7 +3678,7 @@ async fn port_hosts_moondesk(port: u16) -> bool {
 async fn start_services(
     state: SharedState,
     ui_events: UiEventSender,
-) -> Result<Option<Arc<DevtoolsBridge>>, String> {
+) -> Result<Option<Arc<DevtoolsManager>>, String> {
     let (port, mode, mut detected_browsers, mut selected_browser) = {
         let app = state.lock().await;
         (
@@ -3813,8 +3813,12 @@ async fn start_services(
                 .lock()
                 .await
                 .log("INFO", "Starting chrome-devtools-mcp...".into());
-            match DevtoolsBridge::start(selected_browser.as_ref(), ui_events.clone(), state.clone())
-                .await
+            match DevtoolsManager::start(
+                selected_browser.as_ref(),
+                ui_events.clone(),
+                state.clone(),
+            )
+            .await
             {
                 Ok(bridge) => {
                     let mut app = state.lock().await;

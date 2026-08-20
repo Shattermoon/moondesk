@@ -162,8 +162,14 @@ pub fn create_character(
 
 /// Select one known-good ClippyMoon identity from a 64-bit seed.
 pub fn traits_from_seed(seed: u64) -> ClippyMoonTraits {
-    let mixed = mix_seed(seed ^ 0x6D6F_6F6E_6465_736B);
-    CURATED_STYLES[(mixed as usize) % CURATED_STYLES.len()]
+    CURATED_STYLES[pick_index(seed, 0x6D6F_6F6E_6465_736B, CURATED_STYLES.len())]
+}
+
+pub(super) fn pick_index(seed: u64, salt: u64, len: usize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    (mix_seed(seed ^ salt) % len as u64) as usize
 }
 
 fn mix_seed(mut value: u64) -> u64 {

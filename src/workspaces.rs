@@ -12,6 +12,7 @@ use uuid::Uuid;
 use crate::command;
 
 pub const MAX_REGISTERED_WORKSPACES: usize = 32;
+pub const MAX_WORKSPACE_NAME_CHARS: usize = 128;
 const MAX_MCP_SLUG_CHARS: usize = 128;
 
 pub fn generate_mcp_slug() -> String {
@@ -24,7 +25,7 @@ pub fn derive_workspace_name(root: &Path) -> String {
         .and_then(|value| value.to_str())
         .map(str::trim)
         .filter(|value| !value.is_empty() && !value.chars().any(char::is_control))
-        .map(str::to_string)
+        .map(|value| value.chars().take(MAX_WORKSPACE_NAME_CHARS).collect())
         .unwrap_or_else(|| "Workspace".to_string())
 }
 
@@ -254,6 +255,11 @@ pub fn normalize_workspace_name(value: &str) -> Result<String, String> {
     }
     if value.chars().any(char::is_control) {
         return Err("workspace name cannot contain control characters".into());
+    }
+    if value.chars().count() > MAX_WORKSPACE_NAME_CHARS {
+        return Err(format!(
+            "workspace name is too long; maximum is {MAX_WORKSPACE_NAME_CHARS} characters"
+        ));
     }
     Ok(value.to_string())
 }
@@ -518,6 +524,26 @@ mod tests {
         std::fs::write(&root, "not a directory").expect("write temp file");
         assert!(WorkspaceConfig::new("Project", &root, "Ab3kL9xQ2pTm7VhC").is_err());
         let _ = std::fs::remove_file(root);
+    }
+
+    #[test]
+    fn workspace_names_are_bounded_and_derived_names_are_valid() {
+        let maximum = "x".repeat(MAX_WORKSPACE_NAME_CHARS);
+        assert_eq!(
+            normalize_workspace_name(&maximum).as_deref(),
+            Ok(maximum.as_str())
+        );
+
+        let too_long = "x".repeat(MAX_WORKSPACE_NAME_CHARS + 1);
+        assert!(normalize_workspace_name(&too_long).is_err());
+
+        let long_root = PathBuf::from(format!(
+            "root-{}",
+            "y".repeat(MAX_WORKSPACE_NAME_CHARS + 20)
+        ));
+        let derived = derive_workspace_name(&long_root);
+        assert_eq!(derived.chars().count(), MAX_WORKSPACE_NAME_CHARS);
+        assert!(normalize_workspace_name(&derived).is_ok());
     }
 
     #[test]

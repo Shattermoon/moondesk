@@ -161,7 +161,7 @@ When adding a workspace:
 - normalize Windows verbatim path forms
 - keep the canonical absolute root
 - reject duplicate workspace IDs and MCP slugs
-- validate slug format and non-empty name
+- validate slug format and a trimmed, control-character-free display name of at most 128 characters
 - reject duplicate or parent/child-overlapping roots using canonical/filesystem identity where available
 
 When loading persisted configuration, keep a syntactically valid absolute root even if it is temporarily missing or no longer resolves to the exact canonical identity that was originally stored. Such a workspace must load as `unavailable` rather than aborting host startup, and MoonDesk must not silently retarget the existing secret to a new symlink/reparse target. The user can explicitly remove/re-add the workspace to accept a changed root identity.
@@ -259,11 +259,13 @@ Include workspace identity in retry/dedupe ownership. Reused JSON-RPC IDs in dif
 
 `output_id` entries must also record workspace ownership. `read_command_output` from another workspace must reject the ID.
 
-### Cleanup
+### Admission and cleanup
+
+Background-job admission uses one short manager-level start critical section. Dedupe lookup, workspace-closing checks, the selected workspace's active-job quota check, and registry insertion happen while that guard is held, so concurrent starts cannot both pass the same per-workspace capacity check. Expensive retained-output cleanup runs before that short admission guard.
 
 Cleanup should prune per-workspace retained jobs/output according to current semantics without evicting Workspace A simply because Workspace B is busy.
 
-A future very-high host emergency ceiling may be considered separately, but it is not a replacement for the per-workspace compatibility invariant and is not required for V1.
+A future very-high host emergency ceiling may be considered separately, but it is not a replacement for the per-workspace compatibility invariant and is not required for V1. V1 intentionally does not impose one shared normal job/output pool whose exhaustion by Workspace A reduces Workspace B's documented allowance.
 
 ## 10. Filesystem isolation semantics
 
@@ -309,11 +311,13 @@ Multi-workspace work must **not reduce any existing tool limit** as part of this
 
 There is currently no equivalent existing 4 MiB MCP POST-body cap to preserve; the 4 MiB value in the code is command-output retention. Do not conflate the two.
 
-For this feature:
+For normal MCP routes:
 
 - do not introduce a tighter body limit that can regress current calls
-- if an explicit defensive HTTP body limit is later added, choose it only after testing all current local and DevTools tool payloads and keep it comfortably above valid usage
+- if an explicit defensive MCP HTTP body limit is later added, choose it only after testing all current local and DevTools tool payloads and keep it comfortably above valid usage
 - a value such as 16–32 MiB may be evaluated separately, but is not required for the core multi-workspace implementation
+
+The localhost host-control registration route is different: it only accepts a tiny JSON object containing a workspace root and optional display name. It uses an Axum `DefaultBodyLimit` of 16 KiB before `Bytes` extraction, plus a defensive in-handler length check. That control-plane limit does not apply to `/{slug}/mcp`.
 
 ## 13. Local observability and TUI state
 
@@ -338,17 +342,17 @@ Running · npm run build
 
 ## 14. UI event transport hardening
 
-The current server-to-TUI transport is an unbounded channel. Multi-chat concurrency increases the chance that transient observability events can accumulate faster than the TUI consumes them.
+The server-to-TUI transport is a bounded, non-blocking queue used only for transient local observability such as logs/diagnostics. MCP execution never waits for the TUI, and queue pressure increments a local dropped-event counter rather than growing memory without bound.
 
-This queue is not authoritative command/job storage and should not be allowed to grow without bound.
+Workspace connection state, request counts, flows, and command lifecycle state are applied directly to authoritative `AppState`/runtime state by the request handlers before any best-effort telemetry is queued. Command output/jobs remain authoritative in their managers. A busy workspace therefore cannot cause another workspace's final connection/command state to disappear merely by filling the transient log queue.
 
-Replace or wrap it with a bounded/non-blocking observability sink, but preserve meaningful state:
+Requirements that remain in force:
 
 - MCP execution must never block waiting for the TUI
 - command output/jobs remain authoritative in their managers
-- repetitive/intermediate visual updates may be coalesced/dropped under pressure
-- terminal/final state should be recoverable from authoritative state
-- optionally expose a local dropped/coalesced UI-event counter
+- only transient/repetitive observability may be dropped under pressure
+- final workspace/command state must remain recoverable from authoritative state
+- expose/report local dropped transient-event counts
 
 Do not use queue bounding as an excuse to reduce per-workspace command/job/history retention.
 
@@ -394,7 +398,7 @@ No additional tunnel, domain, local port, or proxy layer is required.
 
 Changing the ngrok domain is a global operation because it changes the public host for every workspace URL. Workspace secret slugs remain independent.
 
-Do not log raw secret paths in routine request logs. Prefer local labels/IDs, e.g. `workspace=SiteAI`, while keeping secret URL reveal/copy behind the existing masked/reveal UX.
+Do not log raw secret paths in routine request logs. Prefer local labels/IDs, e.g. `workspace=SiteAI`, while keeping secret URL reveal/copy behind the existing masked/reveal UX. MoonDesk does not install generic URI/access tracing around these routes; if such middleware is added later, it must sanitize/redact the secret slug before emitting the request path. Regression coverage verifies routine emitted logs do not contain a configured workspace slug.
 
 ## 18. TUI workspace manager
 
@@ -417,17 +421,21 @@ The selected row is UI-only. There is no global "active workspace" that changes 
 
 Move the current single global slug controls out of Settings into per-workspace details/actions. Keep ngrok domain global in Settings.
 
-## 19. Second-instance behavior
+## 19. Second-instance / launch-directory behavior
 
-One running MoonDesk host should own the normal local port.
+One running MoonDesk host owns the normal local port. Running `moondesk` from another project directory is a convenience path for attaching that directory to the existing host rather than starting duplicate infrastructure.
 
-If a second `moondesk` process is launched and port 3200 is already occupied:
+If a second `moondesk` invocation sees the normal port already serving MoonDesk:
 
-- probe the local health endpoint when feasible
-- if MoonDesk is detected, show a clear message that the host is already running and the folder should be added from the workspace manager
-- do not silently start a second tunnel/process on another port as the default architecture
+1. probe the local health endpoint
+2. read the owner-local `~/.moondesk/host-<port>.json` runtime registration containing the per-process host-control token
+3. POST the launch directory to the authenticated local host-control route
+4. return success when the workspace is newly added or was already registered
+5. exit without starting a second Axum server, ngrok tunnel, DevTools bridge, browser process, or TUI
 
-No daemon/IPC registration mechanism is required for V1.
+The host-control route lives on the same router that ngrok can expose, so possession of the random per-process token is mandatory and unauthenticated callers receive the same generic 404 response as an unknown route. On Unix the runtime registration file is forced to owner-only `0600`, including when rewriting a stale file. The route has its own small request-body limit because it only accepts local workspace-registration metadata; this does not reduce normal MCP request/tool limits.
+
+The Workspaces UI remains the interactive alternative for adding, naming, browsing, rotating, and removing workspaces. MoonDesk still does not use a separate daemon/broker architecture or silently start a second host on another port.
 
 ## 20. Config corruption / fail-closed rules
 
@@ -547,7 +555,7 @@ Acceptance:
 - idempotent DevTools initialization
 - explicit DevTools shutdown
 - aggregate/per-workspace remote status correctness
-- clear second-instance detection/message
+- secure second-invocation detection and launch-directory attachment to the running host
 - keep one ngrok tunnel and one browser bridge
 
 Acceptance:
@@ -597,7 +605,7 @@ Run full current CI validation:
 Update README/usage docs to explain:
 
 - first/legacy workspace migration
-- add more projects through Workspaces UI
+- add more projects through Workspaces UI or by running `moondesk` from another project while the host is already running
 - one ChatGPT app/connector per workspace
 - one process / port / ngrok domain
 - browser is shared

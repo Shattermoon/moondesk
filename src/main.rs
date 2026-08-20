@@ -1290,6 +1290,11 @@ fn write_host_runtime_registration(port: u16, token: &str) -> std::io::Result<Ho
         options.mode(0o600);
     }
     let mut file = options.open(&path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
     file.write_all(&payload)?;
     file.flush()?;
     file.sync_all()?;
@@ -2505,6 +2510,14 @@ struct WorkspaceHitAreas {
     remove: Option<Rect>,
 }
 
+fn workspace_detail_sections(inner: Rect) -> (Rect, Rect) {
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(3)])
+        .split(inner);
+    (sections[0], sections[1])
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum WorkspaceUiAction {
     Back,
@@ -2584,6 +2597,11 @@ async fn run_workspaces(
     loop {
         let (current_theme, public_base, rows) = workspace_ui_snapshot(&state).await;
         if rows.is_empty() {
+            state.lock().await.log(
+                "ERROR",
+                "Workspace manager found no registered workspaces; restart MoonDesk to repair the workspace registry"
+                    .into(),
+            );
             return Ok(());
         }
         selected = selected.min(rows.len().saturating_sub(1));
@@ -2956,7 +2974,16 @@ fn draw_workspaces(f: &mut Frame, view: WorkspacesView<'_>, hit_areas: &mut Work
     } else {
         Style::default().fg(palette.muted_fg)
     };
-    let details = Paragraph::new(vec![
+    let details_block = Block::default()
+        .title(" Selected workspace ")
+        .borders(Borders::ALL)
+        .border_type(palette.border_type)
+        .border_style(Style::default().fg(palette.border_fg));
+    let details_inner = details_block.inner(body[1]);
+    f.render_widget(details_block, body[1]);
+    let (metadata_area, url_area) = workspace_detail_sections(details_inner);
+
+    let metadata = Paragraph::new(vec![
         Line::from(""),
         Line::from(vec![
             Span::styled("  Name           ", Style::default().fg(palette.muted_fg)),
@@ -2984,7 +3011,7 @@ fn draw_workspaces(f: &mut Frame, view: WorkspacesView<'_>, hit_areas: &mut Work
                 Style::default().fg(palette.primary_fg),
             ),
             Span::styled(
-                format!("  · {} in flight", row.in_flight_requests),
+                format!("  \u{00B7} {} in flight", row.in_flight_requests),
                 Style::default().fg(palette.muted_fg),
             ),
         ]),
@@ -2992,63 +3019,52 @@ fn draw_workspaces(f: &mut Frame, view: WorkspacesView<'_>, hit_areas: &mut Work
         Line::from(vec![
             Span::styled("  ChatGPT app    ", Style::default().fg(palette.muted_fg)),
             Span::styled(
-                format!("MoonDesk · {}", row.config.name),
+                format!("MoonDesk \u{00B7} {}", row.config.name),
                 Style::default().fg(palette.primary_fg),
             ),
         ]),
-        Line::from(vec![
-            Span::styled("  MCP Server URL ", Style::default().fg(palette.muted_fg)),
-            Span::styled(url, url_style),
-        ]),
-        Line::from(""),
         Line::from(Span::styled(
             "  Browser/DevTools is shared by the MoonDesk host.",
             Style::default().fg(palette.muted_fg),
         )),
     ])
-    .wrap(Wrap { trim: false })
-    .block(
-        Block::default()
-            .title(" Selected workspace ")
-            .borders(Borders::ALL)
-            .border_type(palette.border_type)
-            .border_style(Style::default().fg(palette.border_fg)),
-    );
-    f.render_widget(details, body[1]);
-    let details_inner = Rect::new(
-        body[1].x.saturating_add(1),
-        body[1].y.saturating_add(1),
-        body[1].width.saturating_sub(2),
-        body[1].height.saturating_sub(2),
-    );
-    if details_inner.height > 7 {
-        let link_y = details_inner.y.saturating_add(7);
-        let link_height = 2.min(
-            details_inner
-                .y
-                .saturating_add(details_inner.height)
-                .saturating_sub(link_y),
-        );
-        if link_height > 0 {
-            hit_areas.url = Some(Rect::new(
-                details_inner.x,
-                link_y,
-                details_inner.width,
-                link_height,
-            ));
-        }
-    }
+    .wrap(Wrap { trim: false });
+    f.render_widget(metadata, metadata_area);
 
-    let mut footer_lines = vec![Line::from(vec![
-        Span::styled(" [a] Path ", Style::default().fg(palette.key_fg)),
-        Span::styled("[b] Browse ", Style::default().fg(palette.key_fg)),
-        Span::styled("[r] Name ", Style::default().fg(palette.key_fg)),
-        Span::styled("[v] Reveal ", Style::default().fg(palette.key_fg)),
-        Span::styled("[c] Copy ", Style::default().fg(palette.key_fg)),
-        Span::styled("[x] Rotate ", Style::default().fg(palette.key_fg)),
-        Span::styled("[d] Remove ", Style::default().fg(palette.danger_fg)),
-        Span::styled("[Esc] Back", Style::default().fg(palette.muted_fg)),
-    ])];
+    let url_widget = Paragraph::new(Line::from(vec![
+        Span::styled("  MCP Server URL ", Style::default().fg(palette.muted_fg)),
+        Span::styled(url, url_style),
+    ]))
+    .wrap(Wrap { trim: false });
+    f.render_widget(url_widget, url_area);
+    if url_area.width > 0 && url_area.height > 0 {
+        hit_areas.url = Some(url_area);
+    }
+    let footer_actions = [
+        (" [a] Path ", WorkspaceUiAction::AddPath),
+        ("[b] Browse ", WorkspaceUiAction::BrowseAdd),
+        ("[r] Name ", WorkspaceUiAction::Rename),
+        ("[v] Reveal ", WorkspaceUiAction::Reveal),
+        ("[c] Copy ", WorkspaceUiAction::Copy),
+        ("[x] Rotate ", WorkspaceUiAction::Rotate),
+        ("[d] Remove ", WorkspaceUiAction::Remove),
+    ];
+    let mut footer_spans = footer_actions
+        .iter()
+        .map(|(label, action)| {
+            let foreground = if matches!(*action, WorkspaceUiAction::Remove) {
+                palette.danger_fg
+            } else {
+                palette.key_fg
+            };
+            Span::styled(*label, Style::default().fg(foreground))
+        })
+        .collect::<Vec<_>>();
+    footer_spans.push(Span::styled(
+        "[Esc] Back",
+        Style::default().fg(palette.muted_fg),
+    ));
+    let mut footer_lines = vec![Line::from(footer_spans)];
     if let Some(message) = message {
         let style = if confirm_rotate || confirm_remove {
             Style::default().fg(palette.warning_fg)
@@ -3068,15 +3084,7 @@ fn draw_workspaces(f: &mut Frame, view: WorkspacesView<'_>, hit_areas: &mut Work
     let footer_y = outer[2].y.saturating_add(1);
     let footer_right = outer[2].x.saturating_add(outer[2].width.saturating_sub(1));
     let mut footer_x = outer[2].x.saturating_add(1);
-    for (label, action) in [
-        (" [a] Path ", WorkspaceUiAction::AddPath),
-        ("[b] Browse ", WorkspaceUiAction::BrowseAdd),
-        ("[r] Name ", WorkspaceUiAction::Rename),
-        ("[v] Reveal ", WorkspaceUiAction::Reveal),
-        ("[c] Copy ", WorkspaceUiAction::Copy),
-        ("[x] Rotate ", WorkspaceUiAction::Rotate),
-        ("[d] Remove ", WorkspaceUiAction::Remove),
-    ] {
+    for (label, action) in footer_actions {
         let width = u16::try_from(label.chars().count()).unwrap_or(u16::MAX);
         let available = footer_right.saturating_sub(footer_x);
         let rect = Rect::new(footer_x, footer_y, width.min(available), 1);
@@ -6107,7 +6115,7 @@ mod tests {
         normalize_ngrok_authtoken_input, normalize_ngrok_domain, normalize_workspace_path_input,
         panel_under_cursor, parse_clippymoon_export_args, parse_port_value, scroll_panel_down,
         scroll_panel_up, tail_start_index, truncate_with_ellipsis, user_home_dir,
-        workspace_action_from_event, wrap_preserving_chars,
+        workspace_action_from_event, workspace_detail_sections, wrap_preserving_chars,
     };
     use crossterm::event::{
         Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -6145,6 +6153,97 @@ mod tests {
                 .expect("normalize quoted relative path"),
             PathBuf::from("relative/project")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn host_runtime_registration_tightens_permissions_on_existing_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let port = 49_321;
+        let path = super::host_runtime_path(port).expect("resolve host runtime path");
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("create runtime directory");
+        }
+        std::fs::write(&path, b"stale").expect("create stale runtime file");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .expect("make stale runtime file too permissive");
+
+        let guard = super::write_host_runtime_registration(port, "test-secret")
+            .expect("rewrite host runtime registration");
+        let mode = std::fs::metadata(&path)
+            .expect("read runtime metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+
+        drop(guard);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn attach_workspace_client_uses_runtime_token_and_requested_root() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake MoonDesk host");
+        let port = listener.local_addr().expect("fake host address").port();
+        let token = "attach-client-test-token";
+        let runtime_guard = super::write_host_runtime_registration(port, token)
+            .expect("write test host runtime registration");
+        let root =
+            std::env::temp_dir().join(format!("moondesk-attach-client-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("create attach test workspace");
+        let expected_root = root.to_string_lossy().into_owned();
+        let seen = std::sync::Arc::new(tokio::sync::Mutex::new(None::<(String, String)>));
+        let seen_by_handler = seen.clone();
+
+        let app = axum::Router::new().route(
+            super::server::HOST_CONTROL_ROUTE,
+            axum::routing::post(
+                move |headers: axum::http::HeaderMap, body: axum::body::Bytes| {
+                    let seen = seen_by_handler.clone();
+                    async move {
+                        let received_token = headers
+                            .get(super::server::HOST_CONTROL_HEADER)
+                            .and_then(|value| value.to_str().ok())
+                            .unwrap_or_default()
+                            .to_string();
+                        let payload: serde_json::Value =
+                            serde_json::from_slice(&body).unwrap_or_default();
+                        let received_root = payload
+                            .get("root")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or_default()
+                            .to_string();
+                        *seen.lock().await = Some((received_token, received_root));
+                        axum::Json(serde_json::json!({
+                            "status": "ok",
+                            "workspaceName": "Attached Project",
+                            "alreadyRegistered": false,
+                        }))
+                    }
+                },
+            ),
+        );
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let result = super::attach_workspace_to_running_host(port, &root)
+            .await
+            .expect("attach workspace through client path");
+        assert_eq!(result.workspace_name, "Attached Project");
+        assert!(!result.already_registered);
+        assert_eq!(
+            seen.lock().await.as_ref(),
+            Some(&(token.to_string(), expected_root))
+        );
+
+        server.abort();
+        let _ = server.await;
+        drop(runtime_guard);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -6233,6 +6332,20 @@ mod tests {
         )));
     }
 
+    #[test]
+    fn workspace_url_uses_a_dedicated_stable_hit_region() {
+        let inner = Rect::new(4, 8, 18, 20);
+        let (metadata, url) = workspace_detail_sections(inner);
+
+        assert_eq!(metadata.x, inner.x);
+        assert_eq!(metadata.y, inner.y);
+        assert_eq!(metadata.width, inner.width);
+        assert_eq!(metadata.height + url.height, inner.height);
+        assert_eq!(url.height, 3);
+        assert_eq!(url.y, inner.y + inner.height - url.height);
+        assert_eq!(url.x, inner.x);
+        assert_eq!(url.width, inner.width);
+    }
     #[test]
     fn workspace_mouse_actions_hit_reveal_copy_and_project_rows() {
         let hit_areas = WorkspaceHitAreas {

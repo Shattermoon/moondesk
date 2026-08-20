@@ -11,12 +11,31 @@ const CHROME_DEVTOOLS_MCP_VERSION: &str = "1.7.0";
 const MAX_DEVTOOLS_DIAGNOSTIC_LINES: usize = 100;
 const MAX_DEVTOOLS_DIAGNOSTIC_CHARS: usize = 2_048;
 
+#[derive(Default)]
+struct InitializationGate {
+    initialized: bool,
+}
+
+impl InitializationGate {
+    fn needs_initialization(&self) -> bool {
+        !self.initialized
+    }
+
+    fn mark_initialized(&mut self) {
+        self.initialized = true;
+    }
+
+    fn reset(&mut self) {
+        self.initialized = false;
+    }
+}
+
 /// A running chrome-devtools-mcp child process with stdin/stdout JSON-RPC bridge.
 pub struct DevtoolsBridge {
     child: Child,
     stdin: tokio::io::BufWriter<tokio::process::ChildStdin>,
     pending: Arc<Mutex<std::collections::HashMap<Value, tokio::sync::oneshot::Sender<Value>>>>,
-    initialized: bool,
+    initialization: InitializationGate,
 }
 
 impl DevtoolsBridge {
@@ -65,7 +84,7 @@ impl DevtoolsBridge {
             child,
             stdin,
             pending: pending.clone(),
-            initialized: false,
+            initialization: InitializationGate::default(),
         }));
 
         // Spawn stdout reader task. EOF means the child is no longer usable: clear
@@ -154,7 +173,7 @@ impl DevtoolsBridge {
     /// the bridge itself is mutex-protected and only the first successful call
     /// performs the underlying JSON-RPC handshake.
     pub async fn ensure_initialized(&mut self, init_req: &Value) -> Result<(), String> {
-        if self.initialized {
+        if !self.initialization.needs_initialization() {
             return Ok(());
         }
         self.request(init_req).await?;
@@ -163,7 +182,7 @@ impl DevtoolsBridge {
             "method": "notifications/initialized"
         }))
         .await?;
-        self.initialized = true;
+        self.initialization.mark_initialized();
         Ok(())
     }
 
@@ -241,10 +260,31 @@ impl DevtoolsBridge {
     /// Stop the shared bridge explicitly so MoonDesk never leaves the npx child
     /// alive after the host exits.
     pub async fn stop(&mut self) {
-        self.initialized = false;
+        self.initialization.reset();
         self.pending.lock().await.clear();
         let _ = self.stdin.shutdown().await;
         let _ = self.child.start_kill();
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), self.child.wait()).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::InitializationGate;
+
+    #[test]
+    fn initialization_gate_allows_one_handshake_until_reset() {
+        let mut gate = InitializationGate::default();
+        let mut handshakes = 0;
+        for _ in 0..3 {
+            if gate.needs_initialization() {
+                handshakes += 1;
+                gate.mark_initialized();
+            }
+        }
+        assert_eq!(handshakes, 1);
+
+        gate.reset();
+        assert!(gate.needs_initialization());
     }
 }

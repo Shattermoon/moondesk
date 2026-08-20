@@ -2268,4 +2268,134 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(root);
     }
+
+    #[tokio::test]
+    async fn retained_job_limit_is_independent_per_workspace() {
+        let root = workspace("workspace-retained-count");
+        let manager = CommandJobManager::new();
+        let workspace_a = WorkspaceId::new();
+        let workspace_b = WorkspaceId::new();
+
+        for workspace_id in [&workspace_a, &workspace_b] {
+            for index in 0..(MAX_RETAINED_JOBS + 6) {
+                let (job, _cancel_rx) = CommandJob::new_for_workspace(
+                    workspace_id.clone(),
+                    "synthetic".into(),
+                    root.clone(),
+                    5_000,
+                );
+                {
+                    let mut runtime = job.runtime.lock().await;
+                    runtime.state = CommandJobState::Succeeded;
+                    runtime.finished_at =
+                        Some(Instant::now() - StdDuration::from_millis(index as u64));
+                }
+                manager.inner.write().await.jobs.insert(job.id.clone(), job);
+            }
+        }
+
+        manager.inner.write().await.last_cleanup = None;
+        manager.cleanup().await;
+        let state = manager.inner.read().await;
+        let retained_a = state
+            .jobs
+            .values()
+            .filter(|job| job.workspace_id == workspace_a)
+            .count();
+        let retained_b = state
+            .jobs
+            .values()
+            .filter(|job| job.workspace_id == workspace_b)
+            .count();
+        assert_eq!(retained_a, MAX_RETAINED_JOBS);
+        assert_eq!(retained_b, MAX_RETAINED_JOBS);
+        assert_eq!(state.jobs.len(), MAX_RETAINED_JOBS * 2);
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn identical_request_keys_are_independent_per_workspace() {
+        let root = workspace("workspace-dedupe-key");
+        let manager = CommandJobManager::new();
+        let workspace_a = WorkspaceId::new();
+        let workspace_b = WorkspaceId::new();
+        let command = if cfg!(windows) {
+            "Write-Output done"
+        } else {
+            "printf 'done\\n'"
+        };
+
+        let started_a = manager
+            .start_for_workspace(
+                &workspace_a,
+                command.to_string(),
+                root.clone(),
+                5_000,
+                Some("same-json-rpc-id".into()),
+            )
+            .await
+            .expect("start workspace A job");
+        let started_b = manager
+            .start_for_workspace(
+                &workspace_b,
+                command.to_string(),
+                root.clone(),
+                5_000,
+                Some("same-json-rpc-id".into()),
+            )
+            .await
+            .expect("start workspace B job");
+
+        assert_ne!(started_a.snapshot.job_id, started_b.snapshot.job_id);
+        manager.cancel_all().await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn cancel_all_terminates_jobs_across_multiple_workspaces() {
+        let root = workspace("workspace-shutdown-all");
+        let manager = CommandJobManager::new();
+        let workspace_a = WorkspaceId::new();
+        let workspace_b = WorkspaceId::new();
+        let sentinel_a = root.join("a-survived.txt");
+        let sentinel_b = root.join("b-survived.txt");
+        let command_a = if cfg!(windows) {
+            "Start-Sleep -Milliseconds 800; Set-Content a-survived.txt survived"
+        } else {
+            "sleep 0.8; printf survived > a-survived.txt"
+        };
+        let command_b = if cfg!(windows) {
+            "Start-Sleep -Milliseconds 800; Set-Content b-survived.txt survived"
+        } else {
+            "sleep 0.8; printf survived > b-survived.txt"
+        };
+
+        manager
+            .start_for_workspace(
+                &workspace_a,
+                command_a.to_string(),
+                root.clone(),
+                5_000,
+                None,
+            )
+            .await
+            .expect("start workspace A shutdown job");
+        manager
+            .start_for_workspace(
+                &workspace_b,
+                command_b.to_string(),
+                root.clone(),
+                5_000,
+                None,
+            )
+            .await
+            .expect("start workspace B shutdown job");
+
+        manager.cancel_all().await;
+        tokio::time::sleep(StdDuration::from_millis(1_000)).await;
+        assert!(!sentinel_a.exists());
+        assert!(!sentinel_b.exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
 }

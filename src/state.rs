@@ -16,6 +16,7 @@ use crate::workspaces::{self, WorkspaceConfig, WorkspaceId, WorkspaceRuntime};
 /// Log entry displayed in the TUI.
 #[derive(Clone)]
 pub struct LogEntry {
+    pub workspace_id: Option<WorkspaceId>,
     pub time: String,
     pub level: &'static str,
     pub message: String,
@@ -33,6 +34,7 @@ pub enum CommandActivityState {
 
 #[derive(Clone, Debug)]
 pub struct CommandActivity {
+    pub workspace_id: WorkspaceId,
     pub id: String,
     pub time: String,
     pub command: String,
@@ -399,28 +401,39 @@ pub enum FlowDirection {
     Backward, // response: ChatGPT Web -> Your computer
 }
 
+#[derive(Clone)]
 pub enum ServerUiEvent {
-    IncrementRequestCount,
-    SetRemoteConnected(bool),
+    IncrementRequestCount {
+        workspace_id: WorkspaceId,
+    },
+    SetRemoteConnected {
+        workspace_id: WorkspaceId,
+        connected: bool,
+    },
     SetDevtoolsRunning(bool),
     RecordFlow {
+        workspace_id: WorkspaceId,
         flow_id: String,
         events: Vec<String>,
         direction: FlowDirection,
     },
     BeginFlowClose {
+        workspace_id: WorkspaceId,
         flow_id: String,
     },
     CommandStarted {
+        workspace_id: WorkspaceId,
         activity_id: String,
         command: String,
         background: bool,
     },
     CommandBoundToJob {
+        workspace_id: WorkspaceId,
         activity_id: String,
         job_id: String,
     },
     CommandUpdated {
+        workspace_id: WorkspaceId,
         activity_id: Option<String>,
         job_id: Option<String>,
         state: CommandActivityState,
@@ -428,6 +441,7 @@ pub enum ServerUiEvent {
         preview: Option<String>,
     },
     Log {
+        workspace_id: Option<WorkspaceId>,
         level: &'static str,
         message: String,
     },
@@ -1030,19 +1044,54 @@ impl AppState {
     }
 
     pub fn log(&mut self, level: &'static str, message: String) {
-        let now = now_hms();
+        self.log_scoped(None, level, message);
+    }
+
+    pub fn log_workspace(
+        &mut self,
+        workspace_id: WorkspaceId,
+        level: &'static str,
+        message: String,
+    ) {
+        self.log_scoped(Some(workspace_id), level, message);
+    }
+
+    fn log_scoped(
+        &mut self,
+        workspace_id: Option<WorkspaceId>,
+        level: &'static str,
+        message: String,
+    ) {
         self.logs.push(LogEntry {
-            time: now,
+            workspace_id: workspace_id.clone(),
+            time: now_hms(),
             level,
             message,
         });
-        if self.logs.len() > 500 {
-            self.logs.remove(0);
+        let matching = self
+            .logs
+            .iter()
+            .filter(|entry| entry.workspace_id == workspace_id)
+            .count();
+        if matching > 500
+            && let Some(index) = self
+                .logs
+                .iter()
+                .position(|entry| entry.workspace_id == workspace_id)
+        {
+            self.logs.remove(index);
         }
     }
 
-    fn command_started(&mut self, activity_id: String, command: String, background: bool) {
+    fn command_started(
+        &mut self,
+        workspace_id: WorkspaceId,
+        activity_id: String,
+        command: String,
+        background: bool,
+    ) {
         self.command_activities.push_back(CommandActivity {
+            workspace_id: workspace_id.clone(),
             id: activity_id,
             time: now_hms(),
             command,
@@ -1052,20 +1101,29 @@ impl AppState {
             exit_code: None,
             preview: None,
         });
-        while self.command_activities.len() > MAX_COMMAND_ACTIVITIES {
-            self.command_activities.pop_front();
+        let matching = self
+            .command_activities
+            .iter()
+            .filter(|activity| activity.workspace_id == workspace_id)
+            .count();
+        if matching > MAX_COMMAND_ACTIVITIES
+            && let Some(index) = self
+                .command_activities
+                .iter()
+                .position(|activity| activity.workspace_id == workspace_id)
+        {
+            self.command_activities.remove(index);
         }
     }
 
-    fn command_bind_job(&mut self, activity_id: &str, job_id: String) {
-        let target_index = self
-            .command_activities
-            .iter()
-            .position(|activity| activity.id == activity_id);
-        let existing_index = self
-            .command_activities
-            .iter()
-            .position(|activity| activity.job_id.as_deref() == Some(job_id.as_str()));
+    fn command_bind_job(&mut self, workspace_id: &WorkspaceId, activity_id: &str, job_id: String) {
+        let target_index = self.command_activities.iter().position(|activity| {
+            &activity.workspace_id == workspace_id && activity.id == activity_id
+        });
+        let existing_index = self.command_activities.iter().position(|activity| {
+            &activity.workspace_id == workspace_id
+                && activity.job_id.as_deref() == Some(job_id.as_str())
+        });
 
         if let (Some(target_index), Some(existing_index)) = (target_index, existing_index)
             && target_index != existing_index
@@ -1077,11 +1135,10 @@ impl AppState {
             return;
         }
 
-        if let Some(activity) = self
-            .command_activities
-            .iter_mut()
-            .rev()
-            .find(|activity| activity.id == activity_id)
+        if let Some(activity) =
+            self.command_activities.iter_mut().rev().find(|activity| {
+                &activity.workspace_id == workspace_id && activity.id == activity_id
+            })
         {
             activity.job_id = Some(job_id);
         }
@@ -1089,6 +1146,7 @@ impl AppState {
 
     fn command_update(
         &mut self,
+        workspace_id: &WorkspaceId,
         activity_id: Option<&str>,
         job_id: Option<&str>,
         state: CommandActivityState,
@@ -1096,8 +1154,9 @@ impl AppState {
         preview: Option<String>,
     ) {
         let activity = self.command_activities.iter_mut().rev().find(|activity| {
-            activity_id.is_some_and(|id| activity.id == id)
-                || job_id.is_some_and(|id| activity.job_id.as_deref() == Some(id))
+            &activity.workspace_id == workspace_id
+                && (activity_id.is_some_and(|id| activity.id == id)
+                    || job_id.is_some_and(|id| activity.job_id.as_deref() == Some(id)))
         });
         let Some(activity) = activity else {
             return;
@@ -1209,44 +1268,66 @@ impl AppState {
 
     pub fn apply_server_ui_event(&mut self, event: ServerUiEvent) {
         match event {
-            ServerUiEvent::IncrementRequestCount => {
+            ServerUiEvent::IncrementRequestCount { workspace_id } => {
                 self.request_count = self.request_count.saturating_add(1);
-            }
-            ServerUiEvent::SetRemoteConnected(connected) => {
-                self.remote_connected = connected;
-                if connected {
-                    self.last_remote_activity_ms = Some(now_unix_millis());
-                } else {
-                    self.last_remote_activity_ms = None;
+                if let Some(runtime) = self.workspace_runtimes.get(&workspace_id) {
+                    runtime.mark_remote_activity(now_unix_millis().min(u64::MAX as u128) as u64);
                 }
+            }
+            ServerUiEvent::SetRemoteConnected {
+                workspace_id,
+                connected,
+            } => {
+                if let Some(runtime) = self.workspace_runtimes.get(&workspace_id) {
+                    runtime.set_remote_connected(connected);
+                }
+                self.remote_connected = self
+                    .workspace_runtimes
+                    .values()
+                    .any(|runtime| runtime.remote_connected());
+                self.last_remote_activity_ms = self
+                    .workspace_runtimes
+                    .values()
+                    .filter_map(|runtime| runtime.last_remote_activity_ms())
+                    .max()
+                    .map(u128::from);
             }
             ServerUiEvent::SetDevtoolsRunning(running) => {
                 self.devtools_running = running;
             }
             ServerUiEvent::RecordFlow {
+                workspace_id,
                 flow_id,
                 events,
                 direction,
             } => {
+                let flow_id = format!("{}:{flow_id}", workspace_id.as_str());
                 self.record_flow(&flow_id, &events, direction);
             }
-            ServerUiEvent::BeginFlowClose { flow_id } => {
+            ServerUiEvent::BeginFlowClose {
+                workspace_id,
+                flow_id,
+            } => {
+                let flow_id = format!("{}:{flow_id}", workspace_id.as_str());
                 self.begin_flow_close(&flow_id);
             }
             ServerUiEvent::CommandStarted {
+                workspace_id,
                 activity_id,
                 command,
                 background,
             } => {
-                self.command_started(activity_id, command, background);
+                self.command_started(workspace_id, activity_id, command, background);
             }
             ServerUiEvent::CommandBoundToJob {
+                workspace_id,
                 activity_id,
                 job_id,
             } => {
-                self.command_bind_job(&activity_id, job_id);
+                self.command_bind_job(&workspace_id, &activity_id, job_id);
             }
             ServerUiEvent::CommandUpdated {
+                workspace_id,
                 activity_id,
                 job_id,
                 state,
@@ -1254,6 +1335,7 @@ impl AppState {
                 preview,
             } => {
                 self.command_update(
+                    &workspace_id,
                     activity_id.as_deref(),
                     job_id.as_deref(),
                     state,
@@ -1261,14 +1343,17 @@ impl AppState {
                     preview,
                 );
             }
-            ServerUiEvent::Log { level, message } => {
-                self.log(level, message);
-            }
+            ServerUiEvent::Log {
+                workspace_id,
+                level,
+                message,
+            } => match workspace_id {
+                Some(workspace_id) => self.log_workspace(workspace_id, level, message),
+                None => self.log(level, message),
+            },
         }
     }
-}
 
-impl AppState {
     pub fn record_flow(&mut self, flow_id: &str, events: &[String], direction: FlowDirection) {
         if events.is_empty() {
             return;
@@ -2162,17 +2247,21 @@ toolMode = "multiTools"
     #[test]
     fn command_activity_tracks_background_job_without_poll_duplicates() {
         let (mut app, workspace, config_path) = test_app("moondesk-command-activity");
+        let workspace_id = app.workspaces[0].id.clone();
 
         app.apply_server_ui_event(ServerUiEvent::CommandStarted {
+            workspace_id: workspace_id.clone(),
             activity_id: "activity-a".into(),
             command: "cargo test".into(),
             background: true,
         });
         app.apply_server_ui_event(ServerUiEvent::CommandBoundToJob {
+            workspace_id: workspace_id.clone(),
             activity_id: "activity-a".into(),
             job_id: "job-1".into(),
         });
         app.apply_server_ui_event(ServerUiEvent::CommandUpdated {
+            workspace_id: workspace_id.clone(),
             activity_id: None,
             job_id: Some("job-1".into()),
             state: CommandActivityState::Running,
@@ -2180,6 +2269,7 @@ toolMode = "multiTools"
             preview: Some("Compiling moondesk".into()),
         });
         app.apply_server_ui_event(ServerUiEvent::CommandUpdated {
+            workspace_id: workspace_id.clone(),
             activity_id: None,
             job_id: Some("job-1".into()),
             state: CommandActivityState::Succeeded,
@@ -2198,11 +2288,13 @@ toolMode = "multiTools"
         // A retried start_command can return the same deduplicated job. The TUI
         // should still show one actual execution, not a duplicate command row.
         app.apply_server_ui_event(ServerUiEvent::CommandStarted {
+            workspace_id: workspace_id.clone(),
             activity_id: "activity-b".into(),
             command: "cargo test".into(),
             background: true,
         });
         app.apply_server_ui_event(ServerUiEvent::CommandBoundToJob {
+            workspace_id: workspace_id.clone(),
             activity_id: "activity-b".into(),
             job_id: "job-1".into(),
         });
@@ -2216,8 +2308,11 @@ toolMode = "multiTools"
     fn command_activity_history_is_bounded() {
         let (mut app, workspace, config_path) = test_app("moondesk-command-history");
 
+        let workspace_id = app.workspaces[0].id.clone();
+
         for index in 0..(MAX_COMMAND_ACTIVITIES + 20) {
             app.command_started(
+                workspace_id.clone(),
                 format!("activity-{index}"),
                 format!("command-{index}"),
                 false,
@@ -2236,6 +2331,146 @@ toolMode = "multiTools"
                 .back()
                 .map(|activity| activity.command.clone()),
             Some(format!("command-{}", MAX_COMMAND_ACTIVITIES + 19))
+        );
+
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn workspace_logs_keep_independent_history_limits() {
+        let (mut app, workspace, config_path) = test_app("moondesk-workspace-log-history");
+        let workspace_a = app.workspaces[0].id.clone();
+        let workspace_b = WorkspaceId::new();
+
+        for index in 0..520 {
+            app.log_workspace(workspace_a.clone(), "INFO", format!("a-{index}"));
+        }
+        for index in 0..510 {
+            app.log_workspace(workspace_b.clone(), "INFO", format!("b-{index}"));
+        }
+
+        let a = app
+            .logs
+            .iter()
+            .filter(|entry| entry.workspace_id.as_ref() == Some(&workspace_a))
+            .collect::<Vec<_>>();
+        let b = app
+            .logs
+            .iter()
+            .filter(|entry| entry.workspace_id.as_ref() == Some(&workspace_b))
+            .collect::<Vec<_>>();
+        assert_eq!(a.len(), 500);
+        assert_eq!(b.len(), 500);
+        assert_eq!(a.first().map(|entry| entry.message.as_str()), Some("a-20"));
+        assert_eq!(b.first().map(|entry| entry.message.as_str()), Some("b-10"));
+
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn workspace_command_history_limits_are_independent() {
+        let (mut app, workspace, config_path) = test_app("moondesk-workspace-command-history");
+        let workspace_a = app.workspaces[0].id.clone();
+        let workspace_b = WorkspaceId::new();
+
+        for index in 0..(MAX_COMMAND_ACTIVITIES + 20) {
+            app.command_started(
+                workspace_a.clone(),
+                format!("a-{index}"),
+                format!("a-command-{index}"),
+                false,
+            );
+        }
+        for index in 0..(MAX_COMMAND_ACTIVITIES + 10) {
+            app.command_started(
+                workspace_b.clone(),
+                format!("b-{index}"),
+                format!("b-command-{index}"),
+                false,
+            );
+        }
+
+        assert_eq!(
+            app.command_activities
+                .iter()
+                .filter(|activity| activity.workspace_id == workspace_a)
+                .count(),
+            MAX_COMMAND_ACTIVITIES
+        );
+        assert_eq!(
+            app.command_activities
+                .iter()
+                .filter(|activity| activity.workspace_id == workspace_b)
+                .count(),
+            MAX_COMMAND_ACTIVITIES
+        );
+        assert!(app.command_activities.iter().any(|activity| {
+            activity.workspace_id == workspace_a && activity.command == "a-command-20"
+        }));
+        assert!(app.command_activities.iter().any(|activity| {
+            activity.workspace_id == workspace_b && activity.command == "b-command-10"
+        }));
+
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn workspace_flows_and_connection_status_are_isolated() {
+        let (mut app, workspace, config_path) = test_app("moondesk-workspace-flow-isolation");
+        let workspace_a = app.workspaces[0].id.clone();
+        let workspace_b = WorkspaceId::new();
+        app.workspace_runtimes
+            .insert(workspace_b.clone(), Arc::new(WorkspaceRuntime::default()));
+
+        app.apply_server_ui_event(ServerUiEvent::RecordFlow {
+            workspace_id: workspace_a.clone(),
+            flow_id: "stateless".into(),
+            events: vec!["initialize".into()],
+            direction: FlowDirection::Forward,
+        });
+        app.apply_server_ui_event(ServerUiEvent::RecordFlow {
+            workspace_id: workspace_b.clone(),
+            flow_id: "stateless".into(),
+            events: vec!["tools/list".into()],
+            direction: FlowDirection::Forward,
+        });
+        assert_eq!(app.flows.len(), 2);
+        assert!(
+            app.flows
+                .iter()
+                .any(|flow| flow.flow_id == format!("{}:stateless", workspace_a))
+        );
+        assert!(
+            app.flows
+                .iter()
+                .any(|flow| flow.flow_id == format!("{}:stateless", workspace_b))
+        );
+
+        app.apply_server_ui_event(ServerUiEvent::SetRemoteConnected {
+            workspace_id: workspace_a.clone(),
+            connected: true,
+        });
+        app.apply_server_ui_event(ServerUiEvent::SetRemoteConnected {
+            workspace_id: workspace_b.clone(),
+            connected: true,
+        });
+        app.apply_server_ui_event(ServerUiEvent::SetRemoteConnected {
+            workspace_id: workspace_b.clone(),
+            connected: false,
+        });
+        assert!(app.remote_connected);
+        assert!(
+            app.workspace_runtimes
+                .get(&workspace_a)
+                .is_some_and(|runtime| runtime.remote_connected())
+        );
+        assert!(
+            app.workspace_runtimes
+                .get(&workspace_b)
+                .is_some_and(|runtime| !runtime.remote_connected())
         );
 
         let _ = std::fs::remove_file(config_path);

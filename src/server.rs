@@ -2,24 +2,30 @@ use axum::{
     Router,
     body::{Body, Bytes},
     extract::{Path as AxumPath, State},
-    http::{HeaderValue, Response, StatusCode, header},
+    http::{HeaderMap, HeaderValue, Response, StatusCode, header},
     response::Json,
     routing::{delete, get, post},
 };
+use serde::Deserialize;
 use serde_json::{Value, json};
+use std::path::PathBuf;
 use std::sync::Arc;
+use subtle::ConstantTimeEq;
 
 use crate::command_jobs::CommandJobManager;
 use crate::devtools::DevtoolsManager;
 use crate::mcp::{self, JsonRpcRequest};
 use crate::state::{
-    CommandActivityState, FlowDirection, ServerUiEvent, SharedState, UiEventSender,
+    CommandActivityState, FlowDirection, ServerUiEvent, SharedState, UiEventSender, add_workspace,
 };
 use crate::workspaces::{self, WorkspaceId, WorkspaceRequestContext, WorkspaceRequestLease};
 use uuid::Uuid;
 
 const STATELESS_FLOW_ID: &str = "stateless";
 const STATELESS_FLOW_LABEL: &str = "stateless";
+const MAX_HOST_CONTROL_BODY_BYTES: usize = 16 * 1024;
+pub const HOST_CONTROL_ROUTE: &str = "/__moondesk/workspaces";
+pub const HOST_CONTROL_HEADER: &str = "x-moondesk-host-token";
 
 #[derive(Clone)]
 struct ServerState {
@@ -27,6 +33,7 @@ struct ServerState {
     devtools: Option<Arc<DevtoolsManager>>,
     command_jobs: CommandJobManager,
     ui_events: UiEventSender,
+    host_control_token: Arc<str>,
 }
 
 /// Build the axum router.
@@ -35,15 +42,18 @@ pub fn router(
     devtools: Option<Arc<DevtoolsManager>>,
     command_jobs: CommandJobManager,
     ui_events: UiEventSender,
+    host_control_token: Arc<str>,
 ) -> Router {
     let state = ServerState {
         app: app_state,
         devtools,
         command_jobs,
         ui_events,
+        host_control_token,
     };
     Router::new()
         .route("/", get(health))
+        .route(HOST_CONTROL_ROUTE, post(register_workspace_from_local_host))
         .route("/{slug}/mcp", post(post_mcp))
         .route("/{slug}/mcp", get(get_mcp))
         .route("/{slug}/mcp", delete(delete_mcp))
@@ -357,6 +367,128 @@ fn finish_command_ui_request(
                 preview,
             }]
         }
+    }
+}
+
+#[derive(Deserialize)]
+struct HostWorkspaceRegistrationRequest {
+    root: String,
+    name: Option<String>,
+}
+
+fn host_control_authorized(headers: &HeaderMap, expected_token: &str) -> bool {
+    let Some(candidate) = headers
+        .get(HOST_CONTROL_HEADER)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return false;
+    };
+    candidate.as_bytes().ct_eq(expected_token.as_bytes()).into()
+}
+
+async fn register_workspace_from_local_host(
+    State(s): State<ServerState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response<Body> {
+    // This route is reachable through the same local HTTP server that ngrok can
+    // tunnel, so possession of the per-host runtime token is mandatory. Invalid
+    // callers get the same generic response as an unknown route.
+    if !host_control_authorized(&headers, &s.host_control_token) {
+        return not_found_response();
+    }
+    if body.len() > MAX_HOST_CONTROL_BODY_BYTES {
+        return response_with_body(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "application/json",
+            Body::from(r#"{"error":"request too large"}"#),
+        );
+    }
+
+    let request: HostWorkspaceRegistrationRequest = match serde_json::from_slice(&body) {
+        Ok(request) => request,
+        Err(_) => {
+            return response_with_body(
+                StatusCode::BAD_REQUEST,
+                "application/json",
+                Body::from(r#"{"error":"invalid request"}"#),
+            );
+        }
+    };
+
+    let requested_root = PathBuf::from(request.root);
+    let canonical_root = match tokio::task::spawn_blocking(move || {
+        workspaces::canonicalize_existing_workspace_root(&requested_root)
+    })
+    .await
+    {
+        Ok(Ok(root)) => root,
+        Ok(Err(error)) => {
+            return response_with_body(
+                StatusCode::BAD_REQUEST,
+                "application/json",
+                Body::from(json!({"error": error}).to_string()),
+            );
+        }
+        Err(error) => {
+            return response_with_body(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "application/json",
+                Body::from(
+                    json!({"error": format!("workspace path validation failed: {error}")})
+                        .to_string(),
+                ),
+            );
+        }
+    };
+
+    let existing = {
+        let app = s.app.lock().await;
+        app.workspaces
+            .iter()
+            .find(|workspace| workspace.root == canonical_root)
+            .cloned()
+    };
+    if let Some(workspace) = existing {
+        return response_with_body(
+            StatusCode::OK,
+            "application/json",
+            Body::from(
+                json!({
+                    "status": "ok",
+                    "workspaceName": workspace.name,
+                    "alreadyRegistered": true
+                })
+                .to_string(),
+            ),
+        );
+    }
+
+    let name = request
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| workspaces::derive_workspace_name(&canonical_root));
+    match add_workspace(&s.app, name, canonical_root).await {
+        Ok(workspace) => response_with_body(
+            StatusCode::CREATED,
+            "application/json",
+            Body::from(
+                json!({
+                    "status": "ok",
+                    "workspaceName": workspace.name,
+                    "alreadyRegistered": false
+                })
+                .to_string(),
+            ),
+        ),
+        Err(error) => response_with_body(
+            StatusCode::CONFLICT,
+            "application/json",
+            Body::from(json!({"error": error}).to_string()),
+        ),
     }
 }
 
@@ -767,6 +899,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn host_workspace_registration_is_authenticated_and_idempotent() {
+        let workspace_a = unique_temp_path("moondesk-host-register-a");
+        let workspace_b = unique_temp_path("moondesk-host-register-b");
+        let config_root = unique_temp_path("moondesk-host-register-config");
+        let config_path = config_root.join("config.toml");
+        std::fs::create_dir_all(&workspace_a).expect("create workspace A");
+        std::fs::create_dir_all(&workspace_b).expect("create workspace B");
+        std::fs::create_dir_all(&config_root).expect("create config dir");
+
+        let app = AppState::new_for_test(
+            8787,
+            workspace_a.to_string_lossy().into_owned(),
+            config_path.clone(),
+        )
+        .expect("create app state");
+        let app_state = Arc::new(Mutex::new(app));
+        let (ui_tx, _ui_rx) = ui_event_channel();
+        let server_state = ServerState {
+            app: app_state.clone(),
+            devtools: None,
+            command_jobs: CommandJobManager::new(),
+            ui_events: ui_tx,
+            host_control_token: Arc::from("test-host-control-token"),
+        };
+        let request = Bytes::from(
+            serde_json::to_vec(&json!({"root": workspace_b.to_string_lossy()}))
+                .expect("serialize registration request"),
+        );
+
+        let denied = register_workspace_from_local_host(
+            State(server_state.clone()),
+            HeaderMap::new(),
+            request.clone(),
+        )
+        .await;
+        assert_eq!(denied.status(), StatusCode::NOT_FOUND);
+        assert_eq!(app_state.lock().await.workspaces.len(), 1);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HOST_CONTROL_HEADER,
+            HeaderValue::from_static("test-host-control-token"),
+        );
+        let created = register_workspace_from_local_host(
+            State(server_state.clone()),
+            headers.clone(),
+            request.clone(),
+        )
+        .await;
+        assert_eq!(created.status(), StatusCode::CREATED);
+        assert_eq!(app_state.lock().await.workspaces.len(), 2);
+
+        let repeated =
+            register_workspace_from_local_host(State(server_state), headers, request).await;
+        assert_eq!(repeated.status(), StatusCode::OK);
+        assert_eq!(app_state.lock().await.workspaces.len(), 2);
+
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_dir_all(config_root);
+        let _ = std::fs::remove_dir_all(workspace_a);
+        let _ = std::fs::remove_dir_all(workspace_b);
+    }
+
+    #[tokio::test]
     async fn background_command_survives_separate_stateless_http_requests() {
         let workspace_root = unique_temp_path("moondesk-post-mcp-command-job");
         let config_root = unique_temp_path("moondesk-post-mcp-command-job-config");
@@ -789,6 +985,7 @@ mod tests {
             devtools: None,
             command_jobs: command_jobs.clone(),
             ui_events: ui_tx,
+            host_control_token: Arc::from("test-host-control-token"),
         };
         let command = if cfg!(windows) {
             "Start-Sleep -Milliseconds 250; Write-Output http-job-done"
@@ -902,6 +1099,7 @@ mod tests {
             devtools: None,
             command_jobs: CommandJobManager::new(),
             ui_events: ui_tx,
+            host_control_token: Arc::from("test-host-control-token"),
         };
 
         let response = post_mcp(
@@ -978,6 +1176,7 @@ mod tests {
             devtools: None,
             command_jobs: CommandJobManager::new(),
             ui_events: ui_tx,
+            host_control_token: Arc::from("test-host-control-token"),
         };
 
         for (slug, expected) in [
@@ -1096,6 +1295,7 @@ mod tests {
             devtools: None,
             command_jobs: CommandJobManager::new(),
             ui_events: ui_tx,
+            host_control_token: Arc::from("test-host-control-token"),
         };
 
         // tool_call_body deliberately uses the same JSON-RPC id for both calls.
@@ -1207,6 +1407,7 @@ mod tests {
             devtools: None,
             command_jobs: CommandJobManager::new(),
             ui_events: ui_tx,
+            host_control_token: Arc::from("test-host-control-token"),
         };
 
         let response = delete_mcp(AxumPath(slug_a), State(server_state)).await;
@@ -1265,6 +1466,7 @@ mod tests {
             devtools: None,
             command_jobs: CommandJobManager::new(),
             ui_events: ui_tx,
+            host_control_token: Arc::from("test-host-control-token"),
         };
         let command = if cfg!(windows) {
             "Write-Output queue-ok"
@@ -1315,6 +1517,7 @@ mod tests {
             devtools: None,
             command_jobs: CommandJobManager::new(),
             ui_events: ui_tx,
+            host_control_token: Arc::from("test-host-control-token"),
         };
 
         let response = post_mcp(
@@ -1402,6 +1605,7 @@ mod tests {
             devtools: None,
             command_jobs: CommandJobManager::new(),
             ui_events: ui_tx,
+            host_control_token: Arc::from("test-host-control-token"),
         };
         let ping = Bytes::from_static(
             br#"{"jsonrpc":"2.0","id":"slug-check","method":"ping","params":{}}"#,

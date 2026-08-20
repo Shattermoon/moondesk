@@ -1,7 +1,5 @@
 use super::types::{ClippyMoonTraits, Color, MoonExpression, MoonPalette, MoonPhase, rgba};
 use image::{Rgba, RgbaImage};
-use rand::Rng;
-use rand_mt::Mt19937GenRand32;
 
 #[derive(Clone, Copy)]
 struct Circle {
@@ -24,10 +22,89 @@ struct Star {
     phase: u8,
 }
 
+// These layouts are deliberately hand-authored. A seed chooses a layout, but it
+// does not invent arbitrary crater positions that can crowd the face or make a
+// visually noisy mascot.
+const CRATER_PATTERNS: &[&[(i8, i8, u8)]] = &[
+    &[
+        (-7, -6, 2),
+        (7, -6, 1),
+        (-8, 3, 1),
+        (8, 5, 2),
+        (-5, 8, 1),
+        (8, 0, 1),
+        (1, -9, 1),
+    ],
+    &[
+        (-8, -2, 1),
+        (7, -7, 2),
+        (-6, 8, 1),
+        (8, 2, 1),
+        (-5, -8, 1),
+        (6, 8, 1),
+        (0, -9, 1),
+    ],
+    &[
+        (-7, -7, 1),
+        (8, -3, 2),
+        (-8, 6, 2),
+        (7, 7, 1),
+        (-8, 0, 1),
+        (5, -8, 1),
+        (0, 9, 1),
+    ],
+    &[
+        (-8, -5, 1),
+        (8, -6, 1),
+        (-9, 2, 2),
+        (9, 4, 1),
+        (-6, 8, 1),
+        (7, 8, 2),
+        (2, -9, 1),
+    ],
+];
+
+// x/y are percentages of the full frame. This keeps the sparse star layouts
+// balanced at different render sizes while preserving the same authored shape.
+const STAR_PATTERNS: &[&[(u8, u8, u8)]] = &[
+    &[
+        (8, 22, 0),
+        (88, 18, 2),
+        (11, 76, 4),
+        (91, 68, 1),
+        (50, 7, 3),
+        (48, 92, 5),
+    ],
+    &[
+        (13, 12, 1),
+        (90, 28, 4),
+        (8, 63, 2),
+        (83, 82, 5),
+        (54, 8, 0),
+        (45, 91, 3),
+    ],
+    &[
+        (7, 34, 3),
+        (92, 14, 0),
+        (15, 86, 5),
+        (89, 62, 2),
+        (40, 7, 4),
+        (61, 91, 1),
+    ],
+    &[
+        (11, 16, 5),
+        (86, 9, 2),
+        (7, 72, 0),
+        (93, 79, 4),
+        (57, 6, 1),
+        (38, 93, 3),
+    ],
+];
+
 /// Render a single transparent-background ClippyMoon animation frame.
 ///
-/// Identity comes from `traits` and `seed`; animation-only inputs control the blink,
-/// one-pixel bob, and star-twinkle state without changing the moon's identity.
+/// Identity comes from a curated trait preset and a curated crater/star layout.
+/// Animation-only inputs control blinking, one-pixel bobbing, and star twinkling.
 pub fn render_clippymoon(
     seed: u64,
     width: u32,
@@ -49,10 +126,9 @@ pub fn render_clippymoon(
     let cy = height as i32 / 2 + bob_offset.clamp(-1, 1);
     let palette = traits.color.palette();
 
-    let mut rng = Mt19937GenRand32::new_with_key(mt_key(seed ^ 0xC11F_F1E5_0A11_2026));
-    let craters = generate_craters(&mut rng, traits.crater_count, radius);
-    let stars = generate_stars(
-        &mut rng,
+    let craters = curated_craters(seed, traits.crater_count, radius);
+    let stars = curated_stars(
+        seed,
         traits.star_count,
         width as i32,
         height as i32,
@@ -62,7 +138,7 @@ pub fn render_clippymoon(
     );
 
     draw_stars(&mut image, &stars, palette, twinkle_frame);
-    draw_moon_disc(&mut image, seed, cx, cy, radius, traits.phase, palette);
+    draw_moon_disc(&mut image, cx, cy, radius, traits.phase, palette);
     draw_craters(&mut image, cx, cy, radius, traits.phase, palette, &craters);
     draw_face(
         &mut image,
@@ -71,7 +147,6 @@ pub fn render_clippymoon(
             y: cy,
             radius,
         },
-        traits.phase,
         traits.expression,
         traits.blush,
         palette,
@@ -83,7 +158,6 @@ pub fn render_clippymoon(
 
 fn draw_moon_disc(
     image: &mut RgbaImage,
-    seed: u64,
     cx: i32,
     cy: i32,
     radius: i32,
@@ -120,30 +194,24 @@ fn draw_moon_disc(
                     palette.shadow_soft
                 };
             } else if lit {
-                // A little top-left light and bottom-right shade gives the sphere volume.
+                // Keep volume subtle and clean. The mascot is pixel art, not a
+                // noisy simulated rock texture.
                 if dx + dy < -radius / 2 {
-                    color = blend(color, palette.highlight, 0.30);
+                    color = blend(color, palette.highlight, 0.24);
                 } else if dx + dy > radius / 2 {
-                    color = blend(color, palette.shade, 0.28);
+                    color = blend(color, palette.shade, 0.20);
                 }
             } else if dx + dy < -radius / 2 {
-                color = blend(color, palette.shadow_soft, 0.22);
+                color = blend(color, palette.shadow_soft, 0.25);
             }
 
-            // Deterministic one-pixel mottling keeps the moon organic without frame-to-frame noise.
-            let noise = pixel_hash(seed, x, y) % 17;
-            color = match noise {
-                0 if lit => adjust(color, 9),
-                1 if lit => adjust(color, -8),
-                2 if !lit => adjust(color, 5),
-                _ => color,
-            };
             put(image, x, y, color);
         }
     }
 
-    // Sparse outer halo pixels. They stay crisp in the TUI rather than becoming a blurry glow.
-    let halo = blend(palette.star, rgba(20, 24, 34, 255), 0.58);
+    // Sparse halo pixels use the moon's own mid-tone rather than a near-black
+    // neutral, so they add depth without making the mascot look muddy.
+    let halo = blend(palette.star, palette.shadow_soft, 0.45);
     for &(dx, dy) in &[
         (0, -radius - 2),
         (radius + 2, 0),
@@ -157,9 +225,6 @@ fn draw_moon_disc(
 }
 
 fn phase_is_lit(phase: MoonPhase, dx: i32, dy: i32, radius: i32) -> bool {
-    if matches!(phase, MoonPhase::New) {
-        return false;
-    }
     if matches!(phase, MoonPhase::Full) {
         return true;
     }
@@ -179,27 +244,23 @@ fn phase_is_lit(phase: MoonPhase, dx: i32, dy: i32, radius: i32) -> bool {
     }
 }
 
-fn generate_craters(rng: &mut Mt19937GenRand32, count: u8, radius: i32) -> Vec<Crater> {
+fn curated_craters(seed: u64, count: u8, radius: i32) -> Vec<Crater> {
+    let pattern =
+        CRATER_PATTERNS[(mix_seed(seed ^ 0xC11F_C8A7_E250_2026) as usize) % CRATER_PATTERNS.len()];
+    let limit = (radius - 2).max(2);
     let mut craters = Vec::with_capacity(count as usize);
-    let safe_radius = (radius - 3).max(2);
-    let mut attempts = 0;
-    while craters.len() < count as usize && attempts < count as usize * 30 {
-        attempts += 1;
-        let x = rng.gen_range(-safe_radius..=safe_radius);
-        let y = rng.gen_range(-safe_radius..=safe_radius);
-        if x * x + y * y > safe_radius * safe_radius {
+
+    for &(base_x, base_y, base_radius) in pattern.iter().take(count as usize) {
+        let x = scale_layout_coordinate(i32::from(base_x), radius).clamp(-limit, limit);
+        let y = scale_layout_coordinate(i32::from(base_y), radius).clamp(-limit, limit);
+        let crater_radius = if base_radius > 1 && radius >= 9 { 2 } else { 1 };
+
+        // Keep the eyes/mouth area visually clean even at smaller render sizes.
+        let face_half_width = (radius / 2).max(2);
+        if x.abs() <= face_half_width && (-radius / 4..=radius / 2).contains(&y) {
             continue;
         }
-        // Keep the central face area comparatively clean.
-        if x.abs() <= 5 && (-3..=5).contains(&y) {
-            continue;
-        }
-        let crater_radius = if rng.gen_ratio(1, 5) { 2 } else { 1 };
-        if craters.iter().any(|other: &Crater| {
-            let dx = other.x - x;
-            let dy = other.y - y;
-            dx * dx + dy * dy <= (other.radius + crater_radius + 1).pow(2)
-        }) {
+        if x * x + y * y > limit * limit {
             continue;
         }
         craters.push(Crater {
@@ -209,6 +270,11 @@ fn generate_craters(rng: &mut Mt19937GenRand32, count: u8, radius: i32) -> Vec<C
         });
     }
     craters
+}
+
+fn scale_layout_coordinate(value: i32, radius: i32) -> i32 {
+    // Layouts are authored against the normal radius-12 TUI sprite.
+    (value * radius).div_euclid(12)
 }
 
 fn draw_craters(
@@ -227,7 +293,7 @@ fn draw_craters(
         let base = if lit {
             palette.crater
         } else {
-            blend(palette.shadow, palette.crater, 0.20)
+            blend(palette.shadow, palette.crater, 0.34)
         };
         let hi = if lit {
             palette.crater_highlight
@@ -263,7 +329,6 @@ fn draw_craters(
 fn draw_face(
     image: &mut RgbaImage,
     moon: Circle,
-    phase: MoonPhase,
     expression: MoonExpression,
     blush: bool,
     palette: MoonPalette,
@@ -274,12 +339,11 @@ fn draw_face(
         y: cy,
         radius,
     } = moon;
-    let face_dark = if matches!(phase, MoonPhase::New) {
-        palette.star
-    } else {
-        rgba(19, 26, 35, 255)
-    };
-    let eye_glint = rgba(235, 244, 246, 255);
+
+    // This is intentionally the only near-black family in the mascot: a small
+    // amount of deep navy gives the face enough contrast without darkening the moon.
+    let face_dark = rgba(31, 39, 52, 255);
+    let eye_glint = rgba(244, 249, 251, 255);
     let left_eye_x = cx - 4;
     let right_eye_x = cx + 4;
     let eye_y = cy;
@@ -373,7 +437,9 @@ fn draw_eye(
         return;
     }
 
-    for y in -1..=2 {
+    // Open eyes are compact 3x3 blocks; the old 3x4 eyes consumed too much of
+    // the small sprite and amplified the amount of near-black pixels.
+    for y in -1..=1 {
         for x in -1..=1 {
             put_eye_pixel(eye_cx + x, eye_cy + y, dark);
         }
@@ -382,8 +448,8 @@ fn draw_eye(
     put_eye_pixel(eye_cx, eye_cy - 1, glint);
 }
 
-fn generate_stars(
-    rng: &mut Mt19937GenRand32,
+fn curated_stars(
+    seed: u64,
     count: u8,
     width: i32,
     height: i32,
@@ -391,35 +457,25 @@ fn generate_stars(
     moon_cy: i32,
     moon_radius: i32,
 ) -> Vec<Star> {
+    let pattern =
+        STAR_PATTERNS[(mix_seed(seed ^ 0x57A2_5A11_C11F_2026) as usize) % STAR_PATTERNS.len()];
     let mut stars = Vec::with_capacity(count as usize);
-    let mut attempts = 0;
-    while stars.len() < count as usize && attempts < count as usize * 40 {
-        attempts += 1;
-        let x = rng.gen_range(2..width.saturating_sub(2).max(3));
-        let y = rng.gen_range(2..height.saturating_sub(2).max(3));
+
+    for &(x_percent, y_percent, phase) in pattern.iter().take(count as usize) {
+        let x = (width * i32::from(x_percent) / 100).clamp(1, width.saturating_sub(2));
+        let y = (height * i32::from(y_percent) / 100).clamp(1, height.saturating_sub(2));
         let dx = x - moon_cx;
         let dy = y - moon_cy;
-        if dx * dx + dy * dy <= (moon_radius + 4).pow(2) {
+        if dx * dx + dy * dy <= (moon_radius + 3).pow(2) {
             continue;
         }
-        if stars.iter().any(|other: &Star| {
-            let sx = other.x - x;
-            let sy = other.y - y;
-            sx * sx + sy * sy <= 9
-        }) {
-            continue;
-        }
-        stars.push(Star {
-            x,
-            y,
-            phase: rng.gen_range(0..6),
-        });
+        stars.push(Star { x, y, phase });
     }
     stars
 }
 
 fn draw_stars(image: &mut RgbaImage, stars: &[Star], palette: MoonPalette, twinkle_frame: u8) {
-    let dim = blend(palette.star, rgba(40, 48, 67, 255), 0.62);
+    let dim = blend(palette.star, palette.shadow_soft, 0.42);
     for star in stars {
         let age = (twinkle_frame % 6 + 6 - star.phase) % 6;
         match age {
@@ -493,34 +549,21 @@ fn blend(a: Color, b: Color, amount_b: f32) -> Color {
     Rgba([mix(a[0], b[0]), mix(a[1], b[1]), mix(a[2], b[2]), 255])
 }
 
-fn adjust(color: Color, delta: i16) -> Color {
-    let apply = |v: u8| (v as i16 + delta).clamp(0, 255) as u8;
-    Rgba([apply(color[0]), apply(color[1]), apply(color[2]), color[3]])
-}
-
-fn pixel_hash(seed: u64, x: i32, y: i32) -> u64 {
-    let mut z = seed
-        ^ (x as i64 as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
-        ^ (y as i64 as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    z ^= z >> 30;
-    z = z.wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    z ^= z >> 27;
-    z = z.wrapping_mul(0x94D0_49BB_1331_11EB);
-    z ^ (z >> 31)
-}
-
-fn mt_key(seed: u64) -> Vec<u32> {
-    if seed >> 32 == 0 {
-        vec![seed as u32]
-    } else {
-        vec![seed as u32, (seed >> 32) as u32]
-    }
+fn mix_seed(mut value: u64) -> u64 {
+    value ^= value >> 30;
+    value = value.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    value ^= value >> 27;
+    value = value.wrapping_mul(0x94D0_49BB_1331_11EB);
+    value ^ (value >> 31)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Circle, Star, draw_face, draw_stars, phase_is_lit};
-    use crate::clippymoon_gen::types::{MoonColor, MoonExpression, MoonPhase};
+    use super::{Circle, Star, draw_face, draw_stars, phase_is_lit, render_clippymoon};
+    use crate::clippymoon_gen::{
+        traits_from_seed,
+        types::{MoonColor, MoonExpression, MoonPhase},
+    };
     use image::RgbaImage;
 
     fn lit_pixels(phase: MoonPhase) -> usize {
@@ -536,16 +579,15 @@ mod tests {
         count
     }
 
+    fn luminance(pixel: &image::Rgba<u8>) -> f32 {
+        0.2126 * f32::from(pixel[0]) + 0.7152 * f32::from(pixel[1]) + 0.0722 * f32::from(pixel[2])
+    }
+
     #[test]
-    fn phase_mask_orders_illumination_sensibly() {
-        let new = lit_pixels(MoonPhase::New);
-        let crescent = lit_pixels(MoonPhase::WaxingCrescent);
+    fn phase_mask_orders_supported_bright_phases_sensibly() {
         let quarter = lit_pixels(MoonPhase::FirstQuarter);
         let gibbous = lit_pixels(MoonPhase::WaxingGibbous);
         let full = lit_pixels(MoonPhase::Full);
-        assert_eq!(new, 0);
-        assert!(new < crescent);
-        assert!(crescent < quarter);
         assert!(quarter < gibbous);
         assert!(gibbous < full);
     }
@@ -563,7 +605,6 @@ mod tests {
                 y: cy,
                 radius,
             },
-            MoonPhase::Full,
             MoonExpression::Cheeky,
             true,
             MoonColor::PaleIvory.palette(),
@@ -592,5 +633,26 @@ mod tests {
             phase: 5,
         }];
         draw_stars(&mut image, &stars, MoonColor::PaleIvory.palette(), u8::MAX);
+    }
+
+    #[test]
+    fn curated_mascots_keep_near_black_pixels_to_small_face_details() {
+        for seed in 0..512_u64 {
+            let traits = traits_from_seed(seed);
+            let image = render_clippymoon(seed, 40, 32, traits, 1.0, 0, 0);
+            let mut opaque = 0usize;
+            let mut very_dark = 0usize;
+            for pixel in image.pixels().filter(|pixel| pixel[3] > 0) {
+                opaque += 1;
+                if luminance(pixel) < 70.0 {
+                    very_dark += 1;
+                }
+            }
+            assert!(opaque > 0);
+            assert!(
+                very_dark * 100 <= opaque * 12,
+                "seed {seed:#x} produced too many near-black pixels: {very_dark}/{opaque}"
+            );
+        }
     }
 }

@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
+use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
 use crate::command;
@@ -157,6 +158,36 @@ pub fn validate_mcp_slug(value: &str) -> Result<(), String> {
         return Err("workspace MCP slug must use only URL-safe letters, digits, '-' or '_'".into());
     }
     Ok(())
+}
+
+pub fn resolve_workspace_by_slug(
+    workspaces: &[WorkspaceConfig],
+    candidate: &str,
+) -> Option<WorkspaceRequestContext> {
+    let candidate = fixed_slug_bytes(candidate)?;
+    let mut matched_index = None;
+    for (index, workspace) in workspaces.iter().enumerate() {
+        let Some(configured) = fixed_slug_bytes(&workspace.mcp_slug) else {
+            continue;
+        };
+        let content_matches = configured.0.ct_eq(&candidate.0);
+        let configured_len = (configured.1 as u64).to_le_bytes();
+        let candidate_len = (candidate.1 as u64).to_le_bytes();
+        let length_matches = configured_len.ct_eq(&candidate_len);
+        if bool::from(content_matches & length_matches) {
+            matched_index = Some(index);
+        }
+    }
+    matched_index.map(|index| WorkspaceRequestContext::from(&workspaces[index]))
+}
+
+fn fixed_slug_bytes(value: &str) -> Option<([u8; MAX_MCP_SLUG_CHARS], usize)> {
+    if value.len() > MAX_MCP_SLUG_CHARS {
+        return None;
+    }
+    let mut padded = [0_u8; MAX_MCP_SLUG_CHARS];
+    padded[..value.len()].copy_from_slice(value.as_bytes());
+    Some((padded, value.len()))
 }
 
 pub fn canonicalize_existing_workspace_root(path: &Path) -> Result<PathBuf, String> {

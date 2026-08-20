@@ -2,10 +2,10 @@ use serde_json::Value;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
-use tokio::sync::{Mutex, mpsc::UnboundedSender};
+use tokio::sync::Mutex;
 
 use crate::browser::DetectedBrowser;
-use crate::state::ServerUiEvent;
+use crate::state::{ServerUiEvent, UiEventSender};
 
 const CHROME_DEVTOOLS_MCP_VERSION: &str = "1.7.0";
 const MAX_DEVTOOLS_DIAGNOSTIC_LINES: usize = 100;
@@ -23,7 +23,7 @@ impl DevtoolsBridge {
     /// Spawn the tested chrome-devtools-mcp version and set up the stdio bridge.
     pub async fn start(
         selected_browser: Option<&DetectedBrowser>,
-        ui_events: UnboundedSender<ServerUiEvent>,
+        ui_events: UiEventSender,
     ) -> Result<Arc<Mutex<Self>>, String> {
         let mut command = Command::new("npx");
         let package = format!("chrome-devtools-mcp@{CHROME_DEVTOOLS_MCP_VERSION}");

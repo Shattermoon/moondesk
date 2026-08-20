@@ -3,8 +3,12 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
-use tokio::sync::Mutex;
+use tokio::sync::{
+    Mutex,
+    mpsc::{self, Receiver, Sender, error::TryRecvError, error::TrySendError},
+};
 use uuid::Uuid;
 
 use crate::browser::DetectedBrowser;
@@ -399,6 +403,67 @@ fn replace_config_file(temp_path: &Path, target_path: &Path) -> std::io::Result<
 pub enum FlowDirection {
     Forward,  // request: Your computer -> ChatGPT Web
     Backward, // response: ChatGPT Web -> Your computer
+}
+
+pub const UI_EVENT_QUEUE_CAPACITY: usize = 2_048;
+
+#[derive(Clone)]
+pub struct UiEventSender {
+    sender: Sender<ServerUiEvent>,
+    dropped: Arc<AtomicU64>,
+}
+
+pub struct UiEventReceiver {
+    receiver: Receiver<ServerUiEvent>,
+    dropped: Arc<AtomicU64>,
+    reported_dropped: u64,
+}
+
+pub fn ui_event_channel() -> (UiEventSender, UiEventReceiver) {
+    let (sender, receiver) = mpsc::channel(UI_EVENT_QUEUE_CAPACITY);
+    let dropped = Arc::new(AtomicU64::new(0));
+    (
+        UiEventSender {
+            sender,
+            dropped: dropped.clone(),
+        },
+        UiEventReceiver {
+            receiver,
+            dropped,
+            reported_dropped: 0,
+        },
+    )
+}
+
+impl UiEventSender {
+    pub fn send(&self, event: ServerUiEvent) -> Result<(), ()> {
+        match self.sender.try_send(event) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_)) => {
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+                Err(())
+            }
+            Err(TrySendError::Closed(_)) => Err(()),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn dropped_count(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
+    }
+}
+
+impl UiEventReceiver {
+    pub fn try_recv(&mut self) -> Result<ServerUiEvent, TryRecvError> {
+        self.receiver.try_recv()
+    }
+
+    pub fn take_dropped_since_last_report(&mut self) -> u64 {
+        let total = self.dropped.load(Ordering::Relaxed);
+        let delta = total.saturating_sub(self.reported_dropped);
+        self.reported_dropped = total;
+        delta
+    }
 }
 
 #[derive(Clone)]
@@ -1666,6 +1731,27 @@ mod tests {
     use super::*;
 
     const LEGACY_CONFIG_FIXTURE: &str = include_str!("../tests/fixtures/legacy_config.toml");
+
+    #[test]
+    fn ui_event_channel_is_bounded_and_reports_drops() {
+        let (sender, mut receiver) = ui_event_channel();
+        for index in 0..(UI_EVENT_QUEUE_CAPACITY + 50) {
+            let _ = sender.send(ServerUiEvent::Log {
+                workspace_id: None,
+                level: "INFO",
+                message: format!("event-{index}"),
+            });
+        }
+
+        assert_eq!(sender.dropped_count(), 50);
+        let mut queued = 0usize;
+        while receiver.try_recv().is_ok() {
+            queued += 1;
+        }
+        assert_eq!(queued, UI_EVENT_QUEUE_CAPACITY);
+        assert_eq!(receiver.take_dropped_since_last_report(), 50);
+        assert_eq!(receiver.take_dropped_since_last_report(), 0);
+    }
 
     fn test_app(name: &str) -> (AppState, PathBuf, PathBuf) {
         let unique = SystemTime::now()

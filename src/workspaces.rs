@@ -427,6 +427,11 @@ fn same_filesystem_object(left: &Path, right: &Path) -> bool {
     )
 }
 
+// Existing roots are canonicalized before these identity fallbacks are used, so
+// Windows junction aliases normally collapse to the same comparable path. On
+// non-Unix targets we do not additionally compare stable file IDs; if an alias
+// cannot be resolved by canonicalization, overlap detection falls back to the
+// normalized `comparable_root` path checks.
 #[cfg(not(unix))]
 fn same_filesystem_object(_left: &Path, _right: &Path) -> bool {
     false
@@ -443,6 +448,7 @@ fn filesystem_ancestor_of(ancestor: &Path, descendant: &Path) -> bool {
         .any(|candidate| filesystem_identity(candidate) == Some(ancestor_identity))
 }
 
+// Same non-Unix fallback limitation as `same_filesystem_object` above.
 #[cfg(not(unix))]
 fn filesystem_ancestor_of(_ancestor: &Path, _descendant: &Path) -> bool {
     false

@@ -3,6 +3,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
@@ -13,6 +14,8 @@ use crate::state::{ServerUiEvent, SharedState, UiEventSender};
 const CHROME_DEVTOOLS_MCP_VERSION: &str = "1.7.0";
 const MAX_DEVTOOLS_DIAGNOSTIC_LINES: usize = 100;
 const MAX_DEVTOOLS_DIAGNOSTIC_CHARS: usize = 2_048;
+const DEVTOOLS_RESTART_COOLDOWN: Duration = Duration::from_secs(10);
+const DEVTOOLS_RESTART_INIT_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Default)]
 struct InitializationState {
@@ -40,6 +43,12 @@ fn internal_request_id(sequence: u64) -> Value {
     ))
 }
 
+fn restart_cooldown_remaining(last_failure: Option<Instant>, now: Instant) -> Option<Duration> {
+    let failed_at = last_failure?;
+    let elapsed = now.saturating_duration_since(failed_at);
+    (elapsed < DEVTOOLS_RESTART_COOLDOWN).then(|| DEVTOOLS_RESTART_COOLDOWN.saturating_sub(elapsed))
+}
+
 /// A running chrome-devtools-mcp child process with stdin/stdout JSON-RPC bridge.
 pub struct DevtoolsBridge {
     child: Mutex<Child>,
@@ -58,6 +67,7 @@ pub struct DevtoolsManager {
     bridge: Mutex<Option<Arc<DevtoolsBridge>>>,
     restart_lock: Mutex<()>,
     initialization_request: Mutex<Option<Value>>,
+    last_restart_failure: Mutex<Option<Instant>>,
     shutting_down: AtomicBool,
     generation: Arc<AtomicU64>,
 }
@@ -283,10 +293,14 @@ impl DevtoolsBridge {
         {
             Ok(Ok(resp)) => resp,
             Ok(Err(_)) => {
+                self.alive.store(false, Ordering::Release);
+                self.initialization.reset();
                 self.pending.lock().await.remove(&internal_id);
                 return Err("Response channel closed".into());
             }
             Err(_) => {
+                self.alive.store(false, Ordering::Release);
+                self.initialization.reset();
                 self.pending.lock().await.remove(&internal_id);
                 return Err("Request timed out (120s)".into());
             }
@@ -354,6 +368,7 @@ impl DevtoolsManager {
             bridge: Mutex::new(None),
             restart_lock: Mutex::new(()),
             initialization_request: Mutex::new(None),
+            last_restart_failure: Mutex::new(None),
             shutting_down: AtomicBool::new(false),
             generation: Arc::new(AtomicU64::new(0)),
         });
@@ -393,6 +408,14 @@ impl DevtoolsManager {
         {
             return Ok(bridge);
         }
+        if let Some(remaining) =
+            restart_cooldown_remaining(*self.last_restart_failure.lock().await, Instant::now())
+        {
+            return Err(format!(
+                "chrome-devtools-mcp restart is cooling down after a failure; retry in about {} seconds",
+                remaining.as_secs().max(1)
+            ));
+        }
 
         let previous = self.bridge.lock().await.take();
         if let Some(previous) = previous {
@@ -401,20 +424,35 @@ impl DevtoolsManager {
 
         match self.spawn_bridge().await {
             Ok(bridge) => {
-                if let Some(init_req) = self.initialization_request.lock().await.clone()
-                    && let Err(error) = bridge.ensure_initialized(&init_req).await
-                {
-                    bridge.stop().await;
-                    let mut app = self.state.lock().await;
-                    app.devtools_running = false;
-                    app.log(
-                        "ERROR",
-                        format!("chrome-devtools-mcp restart initialization failed: {error}"),
-                    );
-                    return Err(format!(
-                        "chrome-devtools-mcp restart initialization failed: {error}"
-                    ));
+                if let Some(init_req) = self.initialization_request.lock().await.clone() {
+                    let init_result = tokio::time::timeout(
+                        DEVTOOLS_RESTART_INIT_TIMEOUT,
+                        bridge.ensure_initialized(&init_req),
+                    )
+                    .await;
+                    let init_error = match init_result {
+                        Ok(Ok(())) => None,
+                        Ok(Err(error)) => Some(error),
+                        Err(_) => Some(format!(
+                            "timed out after {} seconds",
+                            DEVTOOLS_RESTART_INIT_TIMEOUT.as_secs()
+                        )),
+                    };
+                    if let Some(error) = init_error {
+                        *self.last_restart_failure.lock().await = Some(Instant::now());
+                        bridge.stop().await;
+                        let mut app = self.state.lock().await;
+                        app.devtools_running = false;
+                        app.log(
+                            "ERROR",
+                            format!("chrome-devtools-mcp restart initialization failed: {error}"),
+                        );
+                        return Err(format!(
+                            "chrome-devtools-mcp restart initialization failed: {error}"
+                        ));
+                    }
                 }
+                *self.last_restart_failure.lock().await = None;
                 *self.bridge.lock().await = Some(bridge.clone());
                 let mut app = self.state.lock().await;
                 app.devtools_running = true;
@@ -425,6 +463,7 @@ impl DevtoolsManager {
                 Ok(bridge)
             }
             Err(error) => {
+                *self.last_restart_failure.lock().await = Some(Instant::now());
                 let mut app = self.state.lock().await;
                 app.devtools_running = false;
                 app.log(
@@ -436,7 +475,7 @@ impl DevtoolsManager {
         }
     }
 
-    async fn recover_after_failure(
+    fn recover_after_failure(
         &self,
         bridge: &Arc<DevtoolsBridge>,
         original_error: String,
@@ -444,14 +483,9 @@ impl DevtoolsManager {
         if bridge.is_alive() || self.shutting_down.load(Ordering::Acquire) {
             return original_error;
         }
-        match self.bridge_or_restart().await {
-            Ok(_) => format!(
-                "{original_error}; chrome-devtools-mcp was restarted, retry the browser operation"
-            ),
-            Err(restart_error) => {
-                format!("{original_error}; chrome-devtools-mcp restart failed: {restart_error}")
-            }
-        }
+        format!(
+            "{original_error}; chrome-devtools-mcp stopped unexpectedly; the next browser request will attempt a restart"
+        )
     }
 
     pub async fn ensure_initialized(&self, init_req: &Value) -> Result<(), String> {
@@ -467,13 +501,35 @@ impl DevtoolsManager {
                         "{error}; chrome-devtools-mcp restart failed during initialization: {restart_error}"
                     )
                 })?;
-                replacement.ensure_initialized(init_req).await.map_err(|retry_error| {
-                    format!(
-                        "{error}; chrome-devtools-mcp restarted but initialization retry failed: {retry_error}"
-                    )
-                })?;
-                *self.initialization_request.lock().await = Some(init_req.clone());
-                Ok(())
+                let retry_result = tokio::time::timeout(
+                    DEVTOOLS_RESTART_INIT_TIMEOUT,
+                    replacement.ensure_initialized(init_req),
+                )
+                .await;
+                match retry_result {
+                    Ok(Ok(())) => {
+                        *self.last_restart_failure.lock().await = None;
+                        *self.initialization_request.lock().await = Some(init_req.clone());
+                        Ok(())
+                    }
+                    Ok(Err(retry_error)) => {
+                        *self.last_restart_failure.lock().await = Some(Instant::now());
+                        replacement.stop().await;
+                        self.state.lock().await.devtools_running = false;
+                        Err(format!(
+                            "{error}; chrome-devtools-mcp restarted but initialization retry failed: {retry_error}"
+                        ))
+                    }
+                    Err(_) => {
+                        *self.last_restart_failure.lock().await = Some(Instant::now());
+                        replacement.stop().await;
+                        self.state.lock().await.devtools_running = false;
+                        Err(format!(
+                            "{error}; chrome-devtools-mcp restarted but initialization retry timed out after {} seconds",
+                            DEVTOOLS_RESTART_INIT_TIMEOUT.as_secs()
+                        ))
+                    }
+                }
             }
             Err(error) => Err(error),
         }
@@ -483,7 +539,7 @@ impl DevtoolsManager {
         let bridge = self.bridge_or_restart().await?;
         match bridge.request(req).await {
             Ok(response) => Ok(response),
-            Err(error) => Err(self.recover_after_failure(&bridge, error).await),
+            Err(error) => Err(self.recover_after_failure(&bridge, error)),
         }
     }
 
@@ -520,5 +576,19 @@ mod tests {
     fn internal_devtools_request_ids_are_unique_and_do_not_reuse_client_ids() {
         assert_ne!(internal_request_id(1), internal_request_id(2));
         assert_ne!(internal_request_id(1), Value::String("1".into()));
+    }
+
+    #[test]
+    fn restart_cooldown_blocks_only_the_configured_failure_window() {
+        let failed_at = Instant::now();
+        assert_eq!(
+            restart_cooldown_remaining(Some(failed_at), failed_at + Duration::from_secs(4)),
+            Some(Duration::from_secs(6))
+        );
+        assert_eq!(
+            restart_cooldown_remaining(Some(failed_at), failed_at + DEVTOOLS_RESTART_COOLDOWN),
+            None
+        );
+        assert_eq!(restart_cooldown_remaining(None, failed_at), None);
     }
 }

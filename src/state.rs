@@ -1106,12 +1106,37 @@ impl AppState {
             .map(|url| format!("{url}{}", self.mcp_path()))
     }
 
+    fn recompute_remote_connection_state(&mut self) {
+        self.remote_connected = self
+            .workspace_runtimes
+            .values()
+            .any(|runtime| runtime.remote_connected());
+        self.last_remote_activity_ms = self
+            .workspace_runtimes
+            .values()
+            .filter_map(|runtime| runtime.last_remote_activity_ms())
+            .max()
+            .map(u128::from);
+    }
+
     pub fn clear_remote_connection_state(&mut self) {
         for runtime in self.workspace_runtimes.values() {
             runtime.set_remote_connected(false);
         }
-        self.remote_connected = false;
-        self.last_remote_activity_ms = None;
+        self.recompute_remote_connection_state();
+    }
+
+    fn purge_workspace_observability(&mut self, workspace_id: &WorkspaceId) {
+        self.logs
+            .retain(|entry| entry.workspace_id.as_ref() != Some(workspace_id));
+        self.command_activities
+            .retain(|activity| &activity.workspace_id != workspace_id);
+
+        let flow_prefix = format!("{}:", workspace_id.as_str());
+        self.flows
+            .retain(|flow| !flow.flow_id.starts_with(&flow_prefix));
+        self.flow_bootstrap_progress
+            .retain(|flow_id, _| !flow_id.starts_with(&flow_prefix));
     }
 
     pub fn log(&mut self, level: &'static str, message: String) {
@@ -1343,16 +1368,7 @@ impl AppState {
                 if let Some(runtime) = self.workspace_runtimes.get(&workspace_id) {
                     runtime.set_remote_connected(connected);
                 }
-                self.remote_connected = self
-                    .workspace_runtimes
-                    .values()
-                    .any(|runtime| runtime.remote_connected());
-                self.last_remote_activity_ms = self
-                    .workspace_runtimes
-                    .values()
-                    .filter_map(|runtime| runtime.last_remote_activity_ms())
-                    .max()
-                    .map(u128::from);
+                self.recompute_remote_connection_state();
             }
             ServerUiEvent::SetDevtoolsRunning(running) => {
                 self.devtools_running = running;
@@ -1685,6 +1701,8 @@ pub async fn remove_workspace(
         }
         app.workspaces = proposed;
         app.workspace_runtimes.remove(workspace_id);
+        app.purge_workspace_observability(workspace_id);
+        app.recompute_remote_connection_state();
         app.sync_primary_workspace_compatibility_fields();
         app.config_dirty = false;
     }
@@ -2669,6 +2687,34 @@ toolMode = "multiTools"
             .await
             .expect("add workspace");
 
+        {
+            let mut app = state.lock().await;
+            let primary_id = app.workspaces[0].id.clone();
+            app.log_workspace(primary_id.clone(), "INFO", "primary survives".into());
+            app.log_workspace(added.id.clone(), "INFO", "secondary removed".into());
+            app.apply_server_ui_event(ServerUiEvent::CommandStarted {
+                workspace_id: added.id.clone(),
+                activity_id: "secondary-command".into(),
+                command: "echo secondary".into(),
+                background: false,
+            });
+            app.apply_server_ui_event(ServerUiEvent::RecordFlow {
+                workspace_id: added.id.clone(),
+                flow_id: "stateless".into(),
+                events: vec!["initialize".into()],
+                direction: FlowDirection::Forward,
+            });
+            app.apply_server_ui_event(ServerUiEvent::IncrementRequestCount {
+                workspace_id: added.id.clone(),
+            });
+            app.apply_server_ui_event(ServerUiEvent::SetRemoteConnected {
+                workspace_id: added.id.clone(),
+                connected: true,
+            });
+            assert!(app.remote_connected);
+            assert!(app.last_remote_activity_ms.is_some());
+        }
+
         let (runtime, manager) = {
             let app = state.lock().await;
             (
@@ -2726,6 +2772,39 @@ toolMode = "multiTools"
                     .any(|workspace| workspace.id == added.id)
             );
             assert!(!app.workspace_runtimes.contains_key(&added.id));
+            assert!(
+                app.logs
+                    .iter()
+                    .all(|entry| entry.workspace_id.as_ref() != Some(&added.id)),
+                "removed workspace logs must be purged"
+            );
+            assert!(
+                app.logs
+                    .iter()
+                    .any(|entry| entry.message == "primary survives"),
+                "other workspace logs must be preserved"
+            );
+            assert!(
+                app.command_activities
+                    .iter()
+                    .all(|activity| activity.workspace_id != added.id),
+                "removed workspace command history must be purged"
+            );
+            let removed_flow_prefix = format!("{}:", added.id.as_str());
+            assert!(
+                app.flows
+                    .iter()
+                    .all(|flow| !flow.flow_id.starts_with(&removed_flow_prefix)),
+                "removed workspace flows must be purged"
+            );
+            assert!(
+                app.flow_bootstrap_progress
+                    .keys()
+                    .all(|flow_id| !flow_id.starts_with(&removed_flow_prefix)),
+                "removed workspace bootstrap state must be purged"
+            );
+            assert!(!app.remote_connected);
+            assert_eq!(app.last_remote_activity_ms, None);
         }
         assert!(
             manager

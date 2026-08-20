@@ -443,13 +443,15 @@ async fn post_mcp(
     let mut response_json: Option<Value> = None;
     if let Some(resp) = mcp::handle_request(
         &req,
-        &workspace.workspace_id,
-        &workspace_root,
-        mode,
-        tool_mode,
-        set_moondesk_as_co_author,
-        &s.command_jobs,
-        &s.devtools,
+        mcp::McpRequestContext {
+            workspace_id: &workspace.workspace_id,
+            workspace_root: &workspace_root,
+            mode,
+            tool_mode,
+            set_moondesk_as_co_author,
+            command_jobs: &s.command_jobs,
+            devtools: &s.devtools,
+        },
     )
     .await
     {
@@ -578,7 +580,7 @@ async fn delete_mcp(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::{AppState, Mode, ToolMode, ui_event_channel};
+    use crate::state::{AppState, Mode, ToolMode, rotate_workspace_secret, ui_event_channel};
     use crate::workspaces::WorkspaceConfig;
     use axum::body::to_bytes;
     use std::path::PathBuf;
@@ -1036,6 +1038,7 @@ mod tests {
         )
         .expect("create app state");
         let old_slug = app.mcp_slug.clone();
+        let workspace_id = app.workspaces[0].id.clone();
         let app_state = Arc::new(Mutex::new(app));
         let (ui_tx, _ui_rx) = ui_event_channel();
         let server_state = ServerState {
@@ -1056,11 +1059,9 @@ mod tests {
         .await;
         assert_eq!(before_rotation.status(), StatusCode::OK);
 
-        let new_slug = {
-            let mut app = app_state.lock().await;
-            app.regenerate_mcp_slug();
-            app.mcp_slug.clone()
-        };
+        let new_slug = rotate_workspace_secret(&app_state, &workspace_id)
+            .await
+            .expect("rotate workspace secret");
         assert_ne!(old_slug, new_slug);
 
         let old_response = post_mcp(

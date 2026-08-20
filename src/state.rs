@@ -1271,15 +1271,6 @@ impl AppState {
             .map_err(|error| format!("failed to persist workspace registry: {error}"))
     }
 
-    pub fn regenerate_mcp_slug(&mut self) {
-        let slug = workspaces::generate_mcp_slug();
-        self.mcp_slug = slug.clone();
-        if let Some(primary_workspace) = self.workspaces.first_mut() {
-            primary_workspace.mcp_slug = slug;
-        }
-        self.config_dirty = true;
-    }
-
     pub fn ngrok_authtoken(&self) -> Option<&str> {
         self.ngrok_authtoken.as_deref()
     }

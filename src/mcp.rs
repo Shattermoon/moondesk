@@ -16,6 +16,7 @@ use crate::command_jobs::{
 use crate::devtools::DevtoolsBridge;
 use crate::state::{AgentsPathMode, Mode, ToolMode, load_app_config, user_home_dir};
 use crate::workspace_tools;
+use crate::workspaces::WorkspaceId;
 
 const SERVER_NAME: &str = "moondesk";
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -74,6 +75,7 @@ impl JsonRpcResponse {
 
 pub async fn handle_request(
     req: &JsonRpcRequest,
+    workspace_id: &WorkspaceId,
     workspace_root: &str,
     mode: Mode,
     tool_mode: ToolMode,
@@ -107,8 +109,9 @@ pub async fn handle_request(
         m if m.starts_with("notifications/") => None,
         "tools/list" => Some(handle_tools_list(req, mode, tool_mode, devtools).await),
         "tools/call" => Some(
-            handle_tools_call(
+            handle_tools_call_for_workspace(
                 req,
+                workspace_id,
                 workspace_root,
                 mode,
                 tool_mode,
@@ -485,8 +488,32 @@ async fn handle_tools_list(
 
 // ── tools/call ──────────────────────────────────────────────
 
+#[cfg(test)]
 async fn handle_tools_call(
     req: &JsonRpcRequest,
+    workspace_root: &str,
+    mode: Mode,
+    tool_mode: ToolMode,
+    set_moondesk_as_co_author: bool,
+    command_jobs: &CommandJobManager,
+    devtools: &Option<Arc<Mutex<DevtoolsBridge>>>,
+) -> JsonRpcResponse {
+    handle_tools_call_for_workspace(
+        req,
+        &WorkspaceId::test_default(),
+        workspace_root,
+        mode,
+        tool_mode,
+        set_moondesk_as_co_author,
+        command_jobs,
+        devtools,
+    )
+    .await
+}
+
+async fn handle_tools_call_for_workspace(
+    req: &JsonRpcRequest,
+    workspace_id: &WorkspaceId,
     workspace_root: &str,
     mode: Mode,
     tool_mode: ToolMode,
@@ -517,6 +544,7 @@ async fn handle_tools_call(
                         "run_command" => {
                             handle_run_command(
                                 req,
+                                workspace_id,
                                 workspace_root,
                                 set_moondesk_as_co_author,
                                 command_jobs,
@@ -526,15 +554,22 @@ async fn handle_tools_call(
                         "start_command" => {
                             handle_start_command(
                                 req,
+                                workspace_id,
                                 workspace_root,
                                 set_moondesk_as_co_author,
                                 command_jobs,
                             )
                             .await
                         }
-                        "poll_command" => handle_poll_command(req, command_jobs).await,
-                        "read_command_output" => handle_read_command_output(req, command_jobs),
-                        "cancel_command" => handle_cancel_command(req, command_jobs).await,
+                        "poll_command" => {
+                            handle_poll_command(req, workspace_id, command_jobs).await
+                        }
+                        "read_command_output" => {
+                            handle_read_command_output(req, workspace_id, command_jobs).await
+                        }
+                        "cancel_command" => {
+                            handle_cancel_command(req, workspace_id, command_jobs).await
+                        }
                         _ => tool_error_response(req, format!("Unknown tool: {tool_name}")),
                     }
                 } else if tool_mode.read_only() {
@@ -712,6 +747,7 @@ fn command_cancel_structured(snapshot: &CommandJobSnapshot) -> Value {
 
 async fn handle_start_command(
     req: &JsonRpcRequest,
+    workspace_id: &WorkspaceId,
     workspace_root: &str,
     set_moondesk_as_co_author: bool,
     command_jobs: &CommandJobManager,
@@ -772,7 +808,13 @@ async fn handle_start_command(
         format!("start_command:{id}:{:016x}", hasher.finish())
     });
     match command_jobs
-        .start(effective_command, cwd, timeout_ms, request_key)
+        .start_for_workspace(
+            workspace_id,
+            effective_command,
+            cwd,
+            timeout_ms,
+            request_key,
+        )
         .await
     {
         Ok(started) => tool_success_response_with_structured(
@@ -789,6 +831,7 @@ async fn handle_start_command(
 
 async fn handle_poll_command(
     req: &JsonRpcRequest,
+    workspace_id: &WorkspaceId,
     command_jobs: &CommandJobManager,
 ) -> JsonRpcResponse {
     let arguments = tool_arguments(req);
@@ -831,7 +874,10 @@ async fn handle_poll_command(
         },
         None => 0,
     };
-    match command_jobs.poll(job_id, after, wait_ms).await {
+    match command_jobs
+        .poll_for_workspace(workspace_id, job_id, after, wait_ms)
+        .await
+    {
         Ok(snapshot) => tool_success_response_with_structured(
             req,
             String::new(),
@@ -841,8 +887,9 @@ async fn handle_poll_command(
     }
 }
 
-fn handle_read_command_output(
+async fn handle_read_command_output(
     req: &JsonRpcRequest,
+    workspace_id: &WorkspaceId,
     command_jobs: &CommandJobManager,
 ) -> JsonRpcResponse {
     let arguments = tool_arguments(req);
@@ -871,7 +918,10 @@ fn handle_read_command_output(
         Err(error) => return tool_error_response(req, error),
     };
 
-    match command_jobs.read_output(output_id, stream, start_byte, max_bytes) {
+    match command_jobs
+        .read_output_for_workspace(workspace_id, output_id, stream, start_byte, max_bytes)
+        .await
+    {
         Ok(output) => {
             let mut structured = Map::new();
             structured.insert("startByte".to_string(), json!(output.start_byte));
@@ -888,6 +938,7 @@ fn handle_read_command_output(
 
 async fn handle_cancel_command(
     req: &JsonRpcRequest,
+    workspace_id: &WorkspaceId,
     command_jobs: &CommandJobManager,
 ) -> JsonRpcResponse {
     let arguments = tool_arguments(req);
@@ -895,7 +946,10 @@ async fn handle_cancel_command(
         Ok(value) => value,
         Err(error) => return tool_error_response(req, error),
     };
-    match command_jobs.cancel(job_id).await {
+    match command_jobs
+        .cancel_for_workspace(workspace_id, job_id)
+        .await
+    {
         Ok(snapshot) => tool_success_response_with_structured(
             req,
             String::new(),
@@ -962,6 +1016,7 @@ fn run_command_structured(input: RunCommandStructured<'_>) -> Value {
 
 async fn handle_run_command(
     req: &JsonRpcRequest,
+    workspace_id: &WorkspaceId,
     workspace_root: &str,
     set_moondesk_as_co_author: bool,
     command_jobs: &CommandJobManager,
@@ -1058,7 +1113,10 @@ async fn handle_run_command(
         return handle_run_command_move_path_intercept(req, workspace_root, &cwd, &intercept);
     }
 
-    let (output_id, output_paths) = match command_jobs.create_run_output().await {
+    let (output_id, output_paths) = match command_jobs
+        .create_run_output_for_workspace(workspace_id)
+        .await
+    {
         Ok(value) => value,
         Err(error) => return tool_error_response(req, error),
     };
@@ -1076,7 +1134,9 @@ async fn handle_run_command(
     let recoverable_output_id =
         (needs_recovery && archive_error.is_none()).then_some(output_id.as_str());
     if !needs_recovery {
-        command_jobs.discard_output(&output_id).await;
+        let _ = command_jobs
+            .discard_output_for_workspace(workspace_id, &output_id)
+            .await;
     }
     let structured = run_command_structured(RunCommandStructured {
         stdout: &result.stdout,
@@ -1973,7 +2033,12 @@ mod tests {
     #[tokio::test]
     async fn poll_command_requires_explicit_cursor() {
         let req = tool_call_request("poll_command", json!({ "job_id": "missing" }));
-        let response = handle_poll_command(&req, &CommandJobManager::new()).await;
+        let response = handle_poll_command(
+            &req,
+            &WorkspaceId::test_default(),
+            &CommandJobManager::new(),
+        )
+        .await;
         assert_eq!(
             response
                 .result
@@ -3471,8 +3536,10 @@ mod tests {
                     "max_bytes": 8
                 }),
             ),
+            &WorkspaceId::test_default(),
             &manager,
-        );
+        )
+        .await;
         let first = first
             .result
             .as_ref()
@@ -3496,8 +3563,10 @@ mod tests {
                     "max_bytes": 18
                 }),
             ),
+            &WorkspaceId::test_default(),
             &manager,
-        );
+        )
+        .await;
         let second = second
             .result
             .as_ref()

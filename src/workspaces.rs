@@ -45,6 +45,11 @@ impl WorkspaceId {
         &self.0
     }
 
+    #[cfg(test)]
+    pub fn test_default() -> Self {
+        Self("00000000-0000-0000-0000-000000000001".to_string())
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         let normalized = Self::parse(&self.0)?;
         if normalized.0 != self.0 {

@@ -13,6 +13,7 @@ use tokio::time::{Duration, timeout};
 use uuid::Uuid;
 
 use crate::process_runner;
+use crate::workspaces::WorkspaceId;
 
 pub const DEFAULT_JOB_TIMEOUT_MS: u64 = 30 * 60 * 1_000;
 pub const MAX_JOB_TIMEOUT_MS: u64 = 24 * 60 * 60 * 1_000;
@@ -133,6 +134,7 @@ impl Default for JobRuntime {
 #[derive(Debug)]
 struct CommandJob {
     id: String,
+    workspace_id: WorkspaceId,
     command: String,
     cwd: PathBuf,
     started_at: Instant,
@@ -149,6 +151,7 @@ struct CommandJob {
 impl CommandJob {
     fn new_with_output(
         id: String,
+        workspace_id: WorkspaceId,
         command: String,
         cwd: PathBuf,
         timeout_ms: u64,
@@ -172,6 +175,7 @@ impl CommandJob {
         Ok((
             Arc::new(Self {
                 id,
+                workspace_id,
                 command,
                 cwd,
                 started_at: Instant::now(),
@@ -190,6 +194,16 @@ impl CommandJob {
 
     #[cfg(test)]
     fn new(command: String, cwd: PathBuf, timeout_ms: u64) -> (Arc<Self>, watch::Receiver<bool>) {
+        Self::new_for_workspace(WorkspaceId::test_default(), command, cwd, timeout_ms)
+    }
+
+    #[cfg(test)]
+    fn new_for_workspace(
+        workspace_id: WorkspaceId,
+        command: String,
+        cwd: PathBuf,
+        timeout_ms: u64,
+    ) -> (Arc<Self>, watch::Receiver<bool>) {
         let id = Uuid::new_v4().to_string();
         let output_dir = cwd.join(format!(".moondesk-command-output-{id}"));
         fs::create_dir_all(&output_dir).expect("create test command output dir");
@@ -197,7 +211,7 @@ impl CommandJob {
             stdout: output_dir.join("stdout.log"),
             stderr: output_dir.join("stderr.log"),
         };
-        Self::new_with_output(id, command, cwd, timeout_ms, &output_paths)
+        Self::new_with_output(id, workspace_id, command, cwd, timeout_ms, &output_paths)
             .expect("create test command output archive")
     }
 
@@ -350,13 +364,19 @@ impl CommandJob {
     }
 }
 
+#[derive(Clone)]
+struct RunOutputRecord {
+    workspace_id: WorkspaceId,
+    created_at: Instant,
+}
+
 #[derive(Default)]
 struct ManagerState {
     jobs: HashMap<String, Arc<CommandJob>>,
-    run_outputs: HashMap<String, Instant>,
+    run_outputs: HashMap<String, RunOutputRecord>,
     // Retry dedupe is intentionally short-lived. JSON-RPC request IDs are only
     // correlation IDs and may be reused later by a stateless client.
-    request_jobs: HashMap<String, (String, Instant)>,
+    request_jobs: HashMap<(WorkspaceId, String), (String, Instant)>,
     last_cleanup: Option<Instant>,
 }
 
@@ -505,17 +525,28 @@ impl CommandJobManager {
         Ok(paths)
     }
 
-    pub async fn create_run_output(
+    pub async fn create_run_output_for_workspace(
         &self,
+        workspace_id: &WorkspaceId,
     ) -> Result<(String, process_runner::CommandOutputPaths), String> {
         let output_id = Uuid::new_v4().to_string();
         let paths = self.prepare_output(&output_id)?;
-        self.inner
-            .write()
-            .await
-            .run_outputs
-            .insert(output_id.clone(), Instant::now());
+        self.inner.write().await.run_outputs.insert(
+            output_id.clone(),
+            RunOutputRecord {
+                workspace_id: workspace_id.clone(),
+                created_at: Instant::now(),
+            },
+        );
         Ok((output_id, paths))
+    }
+
+    #[cfg(test)]
+    pub async fn create_run_output(
+        &self,
+    ) -> Result<(String, process_runner::CommandOutputPaths), String> {
+        self.create_run_output_for_workspace(&WorkspaceId::test_default())
+            .await
     }
 
     fn discard_output_dir(&self, output_id: &str) {
@@ -526,12 +557,64 @@ impl CommandJobManager {
         }
     }
 
-    pub async fn discard_output(&self, output_id: &str) {
-        self.inner.write().await.run_outputs.remove(output_id);
-        self.discard_output_dir(output_id);
+    pub async fn discard_output_for_workspace(
+        &self,
+        workspace_id: &WorkspaceId,
+        output_id: &str,
+    ) -> Result<(), String> {
+        let removed = {
+            let mut manager = self.inner.write().await;
+            let Some(record) = manager.run_outputs.get(output_id) else {
+                return Err("command output archive not found".to_string());
+            };
+            if &record.workspace_id != workspace_id {
+                return Err("command output archive not found".to_string());
+            }
+            manager.run_outputs.remove(output_id).is_some()
+        };
+        if removed {
+            self.discard_output_dir(output_id);
+        }
+        Ok(())
     }
 
+    pub async fn read_output_for_workspace(
+        &self,
+        workspace_id: &WorkspaceId,
+        output_id: &str,
+        stream: &str,
+        start_byte: u64,
+        max_bytes: usize,
+    ) -> Result<CommandOutputChunk, String> {
+        let owned = {
+            let manager = self.inner.read().await;
+            manager
+                .jobs
+                .get(output_id)
+                .is_some_and(|job| &job.workspace_id == workspace_id)
+                || manager
+                    .run_outputs
+                    .get(output_id)
+                    .is_some_and(|record| &record.workspace_id == workspace_id)
+        };
+        if !owned {
+            return Err("command output archive not found".to_string());
+        }
+        self.read_output_unchecked(output_id, stream, start_byte, max_bytes)
+    }
+
+    #[cfg(test)]
     pub fn read_output(
+        &self,
+        output_id: &str,
+        stream: &str,
+        start_byte: u64,
+        max_bytes: usize,
+    ) -> Result<CommandOutputChunk, String> {
+        self.read_output_unchecked(output_id, stream, start_byte, max_bytes)
+    }
+
+    fn read_output_unchecked(
         &self,
         output_id: &str,
         stream: &str,
@@ -596,8 +679,9 @@ impl CommandJobManager {
         }
     }
 
-    pub async fn start(
+    pub async fn start_for_workspace(
         &self,
+        workspace_id: &WorkspaceId,
         command: String,
         cwd: PathBuf,
         timeout_ms: u64,
@@ -611,7 +695,8 @@ impl CommandJobManager {
         }
         self.cleanup().await;
 
-        if let Some(key) = request_key.as_deref() {
+        let request_map_key = request_key.map(|key| (workspace_id.clone(), key));
+        if let Some(key) = request_map_key.as_ref() {
             let existing = {
                 let manager = self.inner.read().await;
                 manager
@@ -641,7 +726,12 @@ impl CommandJobManager {
         let active_count = {
             let jobs = {
                 let manager = self.inner.read().await;
-                manager.jobs.values().cloned().collect::<Vec<_>>()
+                manager
+                    .jobs
+                    .values()
+                    .filter(|job| &job.workspace_id == workspace_id)
+                    .cloned()
+                    .collect::<Vec<_>>()
             };
             let mut active = 0usize;
             for job in jobs {
@@ -659,12 +749,18 @@ impl CommandJobManager {
 
         let job_id = Uuid::new_v4().to_string();
         let output_paths = self.prepare_output(&job_id)?;
-        let (job, cancel_rx) =
-            CommandJob::new_with_output(job_id.clone(), command, cwd, timeout_ms, &output_paths)?;
+        let (job, cancel_rx) = CommandJob::new_with_output(
+            job_id.clone(),
+            workspace_id.clone(),
+            command,
+            cwd,
+            timeout_ms,
+            &output_paths,
+        )?;
         {
             let mut manager = self.inner.write().await;
             manager.jobs.insert(job_id.clone(), job.clone());
-            if let Some(key) = request_key {
+            if let Some(key) = request_map_key {
                 manager
                     .request_jobs
                     .insert(key, (job_id.clone(), Instant::now()));
@@ -677,14 +773,15 @@ impl CommandJobManager {
         })
     }
 
-    pub async fn poll(
+    pub async fn poll_for_workspace(
         &self,
+        workspace_id: &WorkspaceId,
         job_id: &str,
         after: u64,
         wait_ms: u64,
     ) -> Result<CommandJobSnapshot, String> {
         self.cleanup().await;
-        let job = self.get_job(job_id).await?;
+        let job = self.get_job_for_workspace(workspace_id, job_id).await?;
         let wait_ms = wait_ms.min(MAX_POLL_WAIT_MS);
 
         // `Notify::notified()` does not register with `notify_waiters()` until
@@ -702,9 +799,13 @@ impl CommandJobManager {
         Ok(job.snapshot(after).await)
     }
 
-    pub async fn cancel(&self, job_id: &str) -> Result<CommandJobSnapshot, String> {
+    pub async fn cancel_for_workspace(
+        &self,
+        workspace_id: &WorkspaceId,
+        job_id: &str,
+    ) -> Result<CommandJobSnapshot, String> {
         self.cleanup().await;
-        let job = self.get_job(job_id).await?;
+        let job = self.get_job_for_workspace(workspace_id, job_id).await?;
 
         let current = job.snapshot(0).await;
         if current.state.is_terminal() {
@@ -736,14 +837,138 @@ impl CommandJobManager {
         }
     }
 
-    async fn get_job(&self, job_id: &str) -> Result<Arc<CommandJob>, String> {
+    async fn get_job_for_workspace(
+        &self,
+        workspace_id: &WorkspaceId,
+        job_id: &str,
+    ) -> Result<Arc<CommandJob>, String> {
         self.inner
             .read()
             .await
             .jobs
             .get(job_id)
+            .filter(|job| &job.workspace_id == workspace_id)
             .cloned()
             .ok_or_else(|| format!("unknown or expired command job: {job_id}"))
+    }
+
+    pub async fn cancel_workspace(&self, workspace_id: &WorkspaceId) -> Result<(), String> {
+        let _start_guard = self.start_lock.lock().await;
+        let jobs = {
+            let manager = self.inner.read().await;
+            manager
+                .jobs
+                .values()
+                .filter(|job| &job.workspace_id == workspace_id)
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        for job in &jobs {
+            if job.runtime.lock().await.state == CommandJobState::Running {
+                let _ = job.cancel_tx.send(true);
+            }
+        }
+
+        let deadline = Instant::now() + StdDuration::from_secs(5);
+        loop {
+            let mut any_running = false;
+            for job in &jobs {
+                if job.runtime.lock().await.state == CommandJobState::Running {
+                    any_running = true;
+                    break;
+                }
+            }
+            if !any_running {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err("timed out waiting for workspace command jobs to stop".to_string());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    pub async fn purge_workspace_state(&self, workspace_id: &WorkspaceId) -> Result<(), String> {
+        let _start_guard = self.start_lock.lock().await;
+        let jobs = {
+            let manager = self.inner.read().await;
+            manager
+                .jobs
+                .values()
+                .filter(|job| &job.workspace_id == workspace_id)
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        for job in &jobs {
+            if job.runtime.lock().await.state == CommandJobState::Running {
+                return Err("workspace still has active command jobs".to_string());
+            }
+        }
+
+        let (job_ids, output_ids) = {
+            let mut manager = self.inner.write().await;
+            let job_ids = manager
+                .jobs
+                .iter()
+                .filter(|(_, job)| &job.workspace_id == workspace_id)
+                .map(|(id, _)| id.clone())
+                .collect::<Vec<_>>();
+            for id in &job_ids {
+                manager.jobs.remove(id);
+            }
+            manager
+                .request_jobs
+                .retain(|(owner, _), _| owner != workspace_id);
+            let output_ids = manager
+                .run_outputs
+                .iter()
+                .filter(|(_, record)| &record.workspace_id == workspace_id)
+                .map(|(id, _)| id.clone())
+                .collect::<Vec<_>>();
+            for id in &output_ids {
+                manager.run_outputs.remove(id);
+            }
+            (job_ids, output_ids)
+        };
+        for id in job_ids.into_iter().chain(output_ids) {
+            self.discard_output_dir(&id);
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub async fn start(
+        &self,
+        command: String,
+        cwd: PathBuf,
+        timeout_ms: u64,
+        request_key: Option<String>,
+    ) -> Result<StartCommandResult, String> {
+        self.start_for_workspace(
+            &WorkspaceId::test_default(),
+            command,
+            cwd,
+            timeout_ms,
+            request_key,
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    pub async fn poll(
+        &self,
+        job_id: &str,
+        after: u64,
+        wait_ms: u64,
+    ) -> Result<CommandJobSnapshot, String> {
+        self.poll_for_workspace(&WorkspaceId::test_default(), job_id, after, wait_ms)
+            .await
+    }
+
+    #[cfg(test)]
+    pub async fn cancel(&self, job_id: &str) -> Result<CommandJobSnapshot, String> {
+        self.cancel_for_workspace(&WorkspaceId::test_default(), job_id)
+            .await
     }
 
     /// Cancel every command still owned by MoonDesk and wait briefly for the
@@ -802,52 +1027,73 @@ impl CommandJobManager {
                 .collect::<Vec<_>>()
         };
 
-        let mut expired = Vec::new();
-        let mut terminal = Vec::new();
+        let mut expired = HashSet::new();
+        let mut retained_by_workspace: HashMap<WorkspaceId, usize> = HashMap::new();
+        let mut terminal_by_workspace: HashMap<WorkspaceId, Vec<(String, StdDuration, usize)>> =
+            HashMap::new();
+
         for (id, job) in jobs {
+            *retained_by_workspace
+                .entry(job.workspace_id.clone())
+                .or_default() += 1;
             let runtime = job.runtime.lock().await;
             let Some(finished_at) = runtime.finished_at else {
                 continue;
             };
             let age = finished_at.elapsed();
             if age >= TERMINAL_JOB_TTL {
-                expired.push(id);
+                expired.insert(id);
+                if let Some(count) = retained_by_workspace.get_mut(&job.workspace_id) {
+                    *count = count.saturating_sub(1);
+                }
             } else {
-                terminal.push((id, age, runtime.retained_output_bytes));
+                terminal_by_workspace
+                    .entry(job.workspace_id.clone())
+                    .or_default()
+                    .push((id, age, runtime.retained_output_bytes));
             }
         }
 
-        // Oldest terminal jobs are the first eviction candidates both for the
-        // retained-job count and for the global decoded-output memory budget.
-        terminal.sort_by_key(|(_, age, _)| std::cmp::Reverse(*age));
-        let retained_count = {
-            let manager = self.inner.read().await;
-            manager.jobs.len().saturating_sub(expired.len())
-        };
-        if retained_count > MAX_RETAINED_JOBS {
-            let overflow = retained_count - MAX_RETAINED_JOBS;
-            expired.extend(terminal.iter().take(overflow).map(|(id, _, _)| id.clone()));
-        }
+        for (workspace_id, terminal) in &mut terminal_by_workspace {
+            // Oldest terminal jobs are evicted first. Both retention count and
+            // decoded-output memory budgets are independent per workspace.
+            terminal.sort_by_key(|(_, age, _)| std::cmp::Reverse(*age));
 
-        let already_expired = expired.iter().cloned().collect::<HashSet<_>>();
-        let mut terminal_output_bytes = terminal
-            .iter()
-            .filter(|(id, _, _)| !already_expired.contains(id))
-            .map(|(_, _, bytes)| *bytes)
-            .sum::<usize>();
-        if terminal_output_bytes > MAX_TERMINAL_OUTPUT_BYTES {
-            for (id, _, bytes) in &terminal {
-                if terminal_output_bytes <= MAX_TERMINAL_OUTPUT_BYTES {
-                    break;
+            let retained_count = retained_by_workspace
+                .entry(workspace_id.clone())
+                .or_default();
+            if *retained_count > MAX_RETAINED_JOBS {
+                let mut overflow = *retained_count - MAX_RETAINED_JOBS;
+                for (id, _, _) in terminal.iter() {
+                    if overflow == 0 {
+                        break;
+                    }
+                    if expired.insert(id.clone()) {
+                        *retained_count = retained_count.saturating_sub(1);
+                        overflow -= 1;
+                    }
                 }
-                if already_expired.contains(id) || expired.contains(id) {
-                    continue;
+            }
+
+            let mut terminal_output_bytes = terminal
+                .iter()
+                .filter(|(id, _, _)| !expired.contains(id))
+                .map(|(_, _, bytes)| *bytes)
+                .sum::<usize>();
+            if terminal_output_bytes > MAX_TERMINAL_OUTPUT_BYTES {
+                for (id, _, bytes) in terminal.iter() {
+                    if terminal_output_bytes <= MAX_TERMINAL_OUTPUT_BYTES {
+                        break;
+                    }
+                    if expired.insert(id.clone()) {
+                        terminal_output_bytes = terminal_output_bytes.saturating_sub(*bytes);
+                        *retained_count = retained_count.saturating_sub(1);
+                    }
                 }
-                expired.push(id.clone());
-                terminal_output_bytes = terminal_output_bytes.saturating_sub(*bytes);
             }
         }
 
+        let expired = expired.into_iter().collect::<Vec<_>>();
         let expired_run_outputs = {
             let mut manager = self.inner.write().await;
             for id in &expired {
@@ -860,7 +1106,7 @@ impl CommandJobManager {
             let expired_outputs = manager
                 .run_outputs
                 .iter()
-                .filter(|(_, created_at)| created_at.elapsed() >= TERMINAL_JOB_TTL)
+                .filter(|(_, record)| record.created_at.elapsed() >= TERMINAL_JOB_TTL)
                 .map(|(id, _)| id.clone())
                 .collect::<Vec<_>>();
             for id in &expired_outputs {
@@ -1447,7 +1693,10 @@ mod tests {
             let mut state = manager.inner.write().await;
             let entry = state
                 .request_jobs
-                .get_mut("expired-request-key")
+                .get_mut(&(
+                    WorkspaceId::test_default(),
+                    "expired-request-key".to_string(),
+                ))
                 .expect("request key exists before cleanup");
             entry.1 = Instant::now() - IDEMPOTENCY_WINDOW - StdDuration::from_secs(1);
             state.last_cleanup = None;
@@ -1457,7 +1706,10 @@ mod tests {
         manager.cleanup().await;
         let state = manager.inner.read().await;
         assert!(
-            !state.request_jobs.contains_key("expired-request-key"),
+            !state.request_jobs.contains_key(&(
+                WorkspaceId::test_default(),
+                "expired-request-key".to_string()
+            )),
             "expired idempotency metadata must be pruned even when no job is evicted"
         );
         assert!(
@@ -1595,6 +1847,7 @@ mod tests {
             .expect("prepare output archive");
         let (job, _cancel_rx) = CommandJob::new_with_output(
             job_id.clone(),
+            WorkspaceId::test_default(),
             "synthetic".into(),
             root.clone(),
             5_000,
@@ -1635,9 +1888,15 @@ mod tests {
         let paths = manager
             .prepare_output(&job_id)
             .expect("prepare output archive");
-        let (job, _cancel_rx) =
-            CommandJob::new_with_output(job_id, "synthetic".into(), root.clone(), 5_000, &paths)
-                .expect("create archived job");
+        let (job, _cancel_rx) = CommandJob::new_with_output(
+            job_id,
+            WorkspaceId::test_default(),
+            "synthetic".into(),
+            root.clone(),
+            5_000,
+            &paths,
+        )
+        .expect("create archived job");
 
         job.archive_bytes.store(
             process_runner::MAX_COMMAND_ARCHIVE_BYTES - 4,
@@ -1808,7 +2067,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cleanup_enforces_global_terminal_output_budget() {
+    async fn cleanup_enforces_terminal_output_budget_per_workspace() {
         let root = workspace("global-output-budget");
         let manager = CommandJobManager::new();
 
@@ -1836,6 +2095,177 @@ mod tests {
                 retained_bytes.saturating_add(job.runtime.lock().await.retained_output_bytes);
         }
         assert!(retained_bytes <= MAX_TERMINAL_OUTPUT_BYTES);
+        let _ = std::fs::remove_dir_all(root);
+    }
+    #[tokio::test]
+    async fn workspace_ownership_blocks_cross_workspace_job_and_output_access() {
+        let root = workspace("workspace-ownership");
+        let manager = CommandJobManager::new();
+        let workspace_a = WorkspaceId::new();
+        let workspace_b = WorkspaceId::new();
+        let command = if cfg!(windows) {
+            "Start-Sleep -Seconds 2"
+        } else {
+            "sleep 2"
+        };
+        let started = manager
+            .start_for_workspace(
+                &workspace_a,
+                command.to_string(),
+                root.clone(),
+                10_000,
+                None,
+            )
+            .await
+            .expect("start workspace A job");
+
+        assert!(
+            manager
+                .poll_for_workspace(&workspace_b, &started.snapshot.job_id, 0, 0)
+                .await
+                .expect_err("workspace B must not poll workspace A job")
+                .contains("unknown or expired command job")
+        );
+        assert!(
+            manager
+                .cancel_for_workspace(&workspace_b, &started.snapshot.job_id)
+                .await
+                .expect_err("workspace B must not cancel workspace A job")
+                .contains("unknown or expired command job")
+        );
+
+        let (output_id, paths) = manager
+            .create_run_output_for_workspace(&workspace_a)
+            .await
+            .expect("create workspace A output");
+        std::fs::write(&paths.stdout, "workspace-a-output").expect("write output");
+        assert_eq!(
+            manager
+                .read_output_for_workspace(&workspace_b, &output_id, "stdout", 0, 128)
+                .await
+                .expect_err("workspace B must not read workspace A output"),
+            "command output archive not found"
+        );
+
+        manager
+            .cancel_for_workspace(&workspace_a, &started.snapshot.job_id)
+            .await
+            .expect("cancel workspace A job");
+        manager
+            .discard_output_for_workspace(&workspace_a, &output_id)
+            .await
+            .expect("discard workspace A output");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn active_job_quota_is_independent_per_workspace() {
+        let root = workspace("workspace-capacity");
+        let manager = CommandJobManager::new();
+        let workspace_a = WorkspaceId::new();
+        let workspace_b = WorkspaceId::new();
+        let command = if cfg!(windows) {
+            "Start-Sleep -Seconds 5"
+        } else {
+            "sleep 5"
+        };
+
+        for _ in 0..MAX_ACTIVE_JOBS {
+            manager
+                .start_for_workspace(
+                    &workspace_a,
+                    command.to_string(),
+                    root.clone(),
+                    10_000,
+                    None,
+                )
+                .await
+                .expect("workspace A should receive its full active-job allowance");
+        }
+        manager
+            .start_for_workspace(
+                &workspace_b,
+                command.to_string(),
+                root.clone(),
+                10_000,
+                None,
+            )
+            .await
+            .expect("workspace B must retain its independent allowance");
+        assert!(
+            manager
+                .start_for_workspace(
+                    &workspace_a,
+                    command.to_string(),
+                    root.clone(),
+                    10_000,
+                    None,
+                )
+                .await
+                .expect_err("workspace A ninth job must still be rejected")
+                .contains("too many active command jobs")
+        );
+
+        manager
+            .cancel_workspace(&workspace_a)
+            .await
+            .expect("cancel workspace A jobs");
+        manager
+            .cancel_workspace(&workspace_b)
+            .await
+            .expect("cancel workspace B jobs");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn terminal_output_budget_is_independent_per_workspace() {
+        let root = workspace("workspace-output-budget");
+        let manager = CommandJobManager::new();
+        let workspace_a = WorkspaceId::new();
+        let workspace_b = WorkspaceId::new();
+
+        for workspace_id in [&workspace_a, &workspace_b] {
+            for index in 0..9u64 {
+                let (job, _cancel_rx) = CommandJob::new_for_workspace(
+                    workspace_id.clone(),
+                    "synthetic".into(),
+                    root.clone(),
+                    5_000,
+                );
+                {
+                    let mut runtime = job.runtime.lock().await;
+                    runtime.state = CommandJobState::Succeeded;
+                    runtime.finished_at = Some(Instant::now() - StdDuration::from_millis(index));
+                    runtime.retained_output_bytes = MAX_OUTPUT_BYTES_PER_JOB;
+                }
+                manager.inner.write().await.jobs.insert(job.id.clone(), job);
+            }
+        }
+
+        manager.inner.write().await.last_cleanup = None;
+        manager.cleanup().await;
+
+        let jobs = {
+            let state = manager.inner.read().await;
+            state.jobs.values().cloned().collect::<Vec<_>>()
+        };
+        let mut bytes_a = 0usize;
+        let mut bytes_b = 0usize;
+        for job in jobs {
+            let bytes = job.runtime.lock().await.retained_output_bytes;
+            if job.workspace_id == workspace_a {
+                bytes_a = bytes_a.saturating_add(bytes);
+            } else if job.workspace_id == workspace_b {
+                bytes_b = bytes_b.saturating_add(bytes);
+            }
+        }
+        assert!(bytes_a <= MAX_TERMINAL_OUTPUT_BYTES);
+        assert!(bytes_b <= MAX_TERMINAL_OUTPUT_BYTES);
+        assert!(bytes_a > 0 && bytes_b > 0);
+        assert!(
+            bytes_a.saturating_add(bytes_b) > MAX_TERMINAL_OUTPUT_BYTES,
+            "workspace budgets must not be collapsed into one global 32 MiB pool"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 }

@@ -32,17 +32,14 @@ use ratatui::{
 };
 use state::{
     AppState, CommandActivityState, FLOW_ANIM_CELLS, FLOW_BOOTSTRAP_PHASES, FlowAnimKind,
-    FlowAnimSegment, FlowDirection, FlowLane, GPT_5_6_AND_EARLIER_USAGE_BUCKET, Mode,
-    ServerUiEvent, SharedState, ToolMode, UsageTotals, app_config_path, flow_anim_lit_count,
-    flush_config, normalize_ngrok_domain,
+    FlowAnimSegment, FlowDirection, FlowLane, GPT_5_6_AND_EARLIER_USAGE_BUCKET, Mode, SharedState,
+    ToolMode, UiEventReceiver, UiEventSender, UsageTotals, app_config_path, flow_anim_lit_count,
+    flush_config, normalize_ngrok_domain, ui_event_channel,
 };
 use std::io::{Write, stdout};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
-use tokio::sync::{
-    Mutex,
-    mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
-};
+use tokio::sync::Mutex;
 
 const FLOW_ROW_CELLS: usize = FLOW_ANIM_CELLS;
 const FLOW_LANE_LEFT_LABEL: &str = "Your computer ";
@@ -1129,13 +1126,18 @@ fn normalize_ngrok_authtoken_input(text: &str) -> String {
     trimmed.to_string()
 }
 
-fn drain_server_ui_events(
-    app: &mut AppState,
-    ui_events: &mut UnboundedReceiver<ServerUiEvent>,
-) -> bool {
+fn drain_server_ui_events(app: &mut AppState, ui_events: &mut UiEventReceiver) -> bool {
     let mut changed = false;
     while let Ok(event) = ui_events.try_recv() {
         app.apply_server_ui_event(event);
+        changed = true;
+    }
+    let dropped = ui_events.take_dropped_since_last_report();
+    if dropped > 0 {
+        app.log(
+            "WARN",
+            format!("Dropped {dropped} transient local UI events during heavy activity"),
+        );
         changed = true;
     }
     changed
@@ -1372,7 +1374,7 @@ async fn run_app(
     }
 
     // Start services
-    let (ui_event_tx, ui_event_rx) = unbounded_channel();
+    let (ui_event_tx, ui_event_rx) = ui_event_channel();
     let devtools_bridge = start_services(state.clone(), ui_event_tx).await;
 
     // Phase 2: main TUI loop
@@ -3199,7 +3201,7 @@ async fn ensure_selected_browser_remote_debugging(
 
 async fn start_services(
     state: SharedState,
-    ui_events: UnboundedSender<ServerUiEvent>,
+    ui_events: UiEventSender,
 ) -> Option<Arc<Mutex<DevtoolsBridge>>> {
     let (port, mode, mut detected_browsers, mut selected_browser) = {
         let app = state.lock().await;
@@ -3385,7 +3387,7 @@ async fn run_tui(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     state: SharedState,
     _devtools: Option<Arc<Mutex<DevtoolsBridge>>>,
-    mut ui_events: UnboundedReceiver<ServerUiEvent>,
+    mut ui_events: UiEventReceiver,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut log_scroll: usize = 0;
     let mut log_follow_tail = true;

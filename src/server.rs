@@ -8,12 +8,14 @@ use axum::{
 };
 use serde_json::{Value, json};
 use std::sync::Arc;
-use tokio::sync::{Mutex, mpsc::UnboundedSender};
+use tokio::sync::Mutex;
 
 use crate::command_jobs::CommandJobManager;
 use crate::devtools::DevtoolsBridge;
 use crate::mcp::{self, JsonRpcRequest};
-use crate::state::{CommandActivityState, FlowDirection, ServerUiEvent, SharedState};
+use crate::state::{
+    CommandActivityState, FlowDirection, ServerUiEvent, SharedState, UiEventSender,
+};
 use crate::workspaces::{self, WorkspaceId, WorkspaceRequestContext, WorkspaceRequestLease};
 use uuid::Uuid;
 
@@ -25,7 +27,7 @@ struct ServerState {
     app: SharedState,
     devtools: Option<Arc<Mutex<DevtoolsBridge>>>,
     command_jobs: CommandJobManager,
-    ui_events: UnboundedSender<ServerUiEvent>,
+    ui_events: UiEventSender,
 }
 
 /// Build the axum router.
@@ -33,7 +35,7 @@ pub fn router(
     app_state: SharedState,
     devtools: Option<Arc<Mutex<DevtoolsBridge>>>,
     command_jobs: CommandJobManager,
-    ui_events: UnboundedSender<ServerUiEvent>,
+    ui_events: UiEventSender,
 ) -> Router {
     let state = ServerState {
         app: app_state,
@@ -166,7 +168,7 @@ fn tool_arguments(req: &Value) -> Option<&Value> {
 fn begin_command_ui_request(
     req: &Value,
     workspace_id: &WorkspaceId,
-    ui_events: &UnboundedSender<ServerUiEvent>,
+    ui_events: &UiEventSender,
 ) -> Option<CommandUiRequest> {
     if req.get("method").and_then(Value::as_str) != Some("tools/call") {
         return None;
@@ -299,7 +301,7 @@ fn finish_command_ui_request(
     request: &CommandUiRequest,
     response: &Value,
     workspace_id: &WorkspaceId,
-    ui_events: &UnboundedSender<ServerUiEvent>,
+    ui_events: &UiEventSender,
 ) {
     let state = command_response_state(response);
     let exit_code = command_response_exit_code(response);
@@ -576,13 +578,13 @@ async fn delete_mcp(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::{AppState, Mode, ToolMode};
+    use crate::state::{AppState, Mode, ToolMode, ui_event_channel};
     use crate::workspaces::WorkspaceConfig;
     use axum::body::to_bytes;
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
-    use tokio::sync::{Mutex, mpsc::unbounded_channel};
+    use tokio::sync::Mutex;
 
     #[test]
     fn summarize_initialize_response_includes_protocol_version() {
@@ -603,7 +605,7 @@ mod tests {
 
     #[test]
     fn command_ui_events_track_background_lifecycle_without_mutating_mcp_response() {
-        let (ui_tx, mut ui_rx) = unbounded_channel();
+        let (ui_tx, mut ui_rx) = ui_event_channel();
         let workspace_id = WorkspaceId::test_default();
         let start_request = json!({
             "jsonrpc": "2.0",
@@ -744,7 +746,7 @@ mod tests {
         .expect("create app state");
         let mcp_slug = app.mcp_slug.clone();
         let app_state = Arc::new(Mutex::new(app));
-        let (ui_tx, _ui_rx) = unbounded_channel();
+        let (ui_tx, _ui_rx) = ui_event_channel();
         let command_jobs = CommandJobManager::new();
         let server_state = ServerState {
             app: app_state,
@@ -858,7 +860,7 @@ mod tests {
         .expect("create app state");
         let mcp_slug = app.mcp_slug.clone();
         let app_state = Arc::new(Mutex::new(app));
-        let (ui_tx, _ui_rx) = unbounded_channel();
+        let (ui_tx, _ui_rx) = ui_event_channel();
         let server_state = ServerState {
             app: app_state.clone(),
             devtools: None,
@@ -934,7 +936,7 @@ mod tests {
         app.workspaces.push(second);
 
         let app_state = Arc::new(Mutex::new(app));
-        let (ui_tx, _ui_rx) = unbounded_channel();
+        let (ui_tx, _ui_rx) = ui_event_channel();
         let server_state = ServerState {
             app: app_state,
             devtools: None,
@@ -1035,7 +1037,7 @@ mod tests {
         .expect("create app state");
         let old_slug = app.mcp_slug.clone();
         let app_state = Arc::new(Mutex::new(app));
-        let (ui_tx, _ui_rx) = unbounded_channel();
+        let (ui_tx, _ui_rx) = ui_event_channel();
         let server_state = ServerState {
             app: app_state.clone(),
             devtools: None,

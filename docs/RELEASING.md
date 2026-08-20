@@ -51,7 +51,7 @@ Before merging the release-automation PR:
 3. Add a repository secret named `NPM_TOKEN` containing that token.
 4. Merge the release-automation PR. Its merge to `main` will run the pipeline and publish the first release.
 
-The workflow prints a clear error at the npm step if the first publication is attempted without an npm credential. It will never publish npm before all binary builds and the GitHub Release are successful.
+When `NPM_TOKEN` is configured, the prepare job verifies it with `npm whoami` before spending time on the five-platform release build. If the secret is absent, that preflight skips so Trusted Publishing/OIDC can be used instead. The workflow still never publishes npm before all binary builds and the GitHub Release are successful.
 
 ## Switch to tokenless npm Trusted Publishing
 

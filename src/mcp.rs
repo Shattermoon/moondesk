@@ -528,6 +528,17 @@ async fn handle_tools_call_for_workspace(
         .unwrap_or("")
         .to_string();
 
+    if matches!(
+        tool_name.as_str(),
+        "read" | "search" | "write" | "edit" | "delete" | "run_command" | "start_command"
+    ) && !Path::new(workspace_root).is_dir()
+    {
+        return tool_error_response(
+            req,
+            format!("Workspace is currently unavailable: {workspace_root}"),
+        );
+    }
+
     {
         // Local computer tools
         if mode.computer_enabled() {
@@ -3662,5 +3673,47 @@ mod tests {
         let sample = writer.sampled_text();
         assert!(!sample.contains('\u{FFFD}'));
         assert!(writer.estimate_tokens() > 0);
+    }
+    #[tokio::test]
+    async fn unavailable_workspace_blocks_filesystem_tools_without_disabling_job_management() {
+        let missing_root =
+            std::env::temp_dir().join(format!("moondesk-missing-workspace-{}", Uuid::new_v4()));
+        let missing_root_str = missing_root.to_string_lossy().into_owned();
+        let manager = CommandJobManager::new();
+
+        let read = handle_tools_call(
+            &tool_call_request("read", json!({ "path": "README.md" })),
+            &missing_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &manager,
+            &None,
+        )
+        .await;
+        assert_eq!(
+            read.result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(result_text(&read).contains("Workspace is currently unavailable"));
+
+        let poll = handle_tools_call(
+            &tool_call_request(
+                "poll_command",
+                json!({ "job_id": "missing-job", "after": 0 }),
+            ),
+            &missing_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &manager,
+            &None,
+        )
+        .await;
+        assert!(result_text(&poll).contains("unknown or expired command job"));
+        assert!(!result_text(&poll).contains("Workspace is currently unavailable"));
     }
 }

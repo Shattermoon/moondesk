@@ -3,7 +3,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use subtle::ConstantTimeEq;
+use tokio::sync::Notify;
 use uuid::Uuid;
 
 use crate::command;
@@ -109,14 +112,119 @@ pub enum WorkspaceAvailability {
     Unavailable,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct WorkspaceRuntime {
-    pub availability: WorkspaceAvailability,
-    pub accepting_requests: bool,
-    pub in_flight_requests: usize,
-    pub remote_connected: bool,
-    pub last_remote_activity_ms: Option<u128>,
-    pub request_count: u64,
+    accepting_requests: AtomicBool,
+    in_flight_requests: AtomicUsize,
+    remote_connected: AtomicBool,
+    last_remote_activity_ms: AtomicU64,
+    request_count: AtomicU64,
+    drain_notify: Notify,
+}
+
+impl Default for WorkspaceRuntime {
+    fn default() -> Self {
+        Self {
+            accepting_requests: AtomicBool::new(true),
+            in_flight_requests: AtomicUsize::new(0),
+            remote_connected: AtomicBool::new(false),
+            last_remote_activity_ms: AtomicU64::new(0),
+            request_count: AtomicU64::new(0),
+            drain_notify: Notify::new(),
+        }
+    }
+}
+
+impl WorkspaceRuntime {
+    pub fn try_acquire(self: &Arc<Self>) -> Option<WorkspaceRequestLease> {
+        if !self.accepting_requests.load(Ordering::Acquire) {
+            return None;
+        }
+        self.in_flight_requests.fetch_add(1, Ordering::AcqRel);
+        if !self.accepting_requests.load(Ordering::Acquire) {
+            self.release_request();
+            return None;
+        }
+        Some(WorkspaceRequestLease {
+            runtime: self.clone(),
+        })
+    }
+
+    fn release_request(&self) {
+        if self.in_flight_requests.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.drain_notify.notify_waiters();
+        }
+    }
+
+    pub fn revoke(&self) {
+        self.accepting_requests.store(false, Ordering::Release);
+        if self.in_flight_requests.load(Ordering::Acquire) == 0 {
+            self.drain_notify.notify_waiters();
+        }
+    }
+
+    pub fn enable(&self) {
+        self.accepting_requests.store(true, Ordering::Release);
+    }
+
+    pub fn accepting_requests(&self) -> bool {
+        self.accepting_requests.load(Ordering::Acquire)
+    }
+
+    pub fn in_flight_requests(&self) -> usize {
+        self.in_flight_requests.load(Ordering::Acquire)
+    }
+
+    pub async fn wait_for_drain(&self) {
+        loop {
+            if self.in_flight_requests() == 0 {
+                return;
+            }
+            let notified = self.drain_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.in_flight_requests() == 0 {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    pub fn set_remote_connected(&self, connected: bool) {
+        self.remote_connected.store(connected, Ordering::Release);
+    }
+
+    pub fn remote_connected(&self) -> bool {
+        self.remote_connected.load(Ordering::Acquire)
+    }
+
+    pub fn mark_remote_activity(&self, timestamp_ms: u64) {
+        self.last_remote_activity_ms
+            .store(timestamp_ms, Ordering::Release);
+        self.request_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn last_remote_activity_ms(&self) -> Option<u64> {
+        match self.last_remote_activity_ms.load(Ordering::Acquire) {
+            0 => None,
+            value => Some(value),
+        }
+    }
+
+    pub fn request_count(&self) -> u64 {
+        self.request_count.load(Ordering::Relaxed)
+    }
+}
+
+#[derive(Debug)]
+pub struct WorkspaceRequestLease {
+    runtime: Arc<WorkspaceRuntime>,
+}
+
+impl Drop for WorkspaceRequestLease {
+    fn drop(&mut self) {
+        self.runtime.release_request();
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

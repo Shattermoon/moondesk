@@ -39,6 +39,14 @@ function bumpVersion(version, kind) {
   return `${major}.${minor}.${patch + 1}`;
 }
 
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function firstCommitLine(message) {
+  return message.split(/\r?\n/, 1)[0] ?? "";
+}
+
 function latestReleaseTag() {
   const output = git("tag", "--merged", "HEAD", "--list", "v[0-9]*", "--sort=-version:refname");
   if (!output) return null;
@@ -55,15 +63,68 @@ function automaticBumpSince(tag) {
     throw new Error(`nothing to release after ${tag}`);
   }
 
-  const breaking = messages.some(
-    (message) =>
-      /^[a-z]+(?:\([^)]+\))?!:/m.test(message) ||
-      /^BREAKING[ -]CHANGE:/m.test(message),
-  );
+  const breaking = messages.some((message) => {
+    const subject = firstCommitLine(message);
+    return (
+      /^[a-z]+(?:\([^)]+\))?!:/.test(subject) ||
+      /^BREAKING[ -]CHANGE:/m.test(message)
+    );
+  });
   if (breaking) return "major";
 
-  const feature = messages.some((message) => /^feat(?:\([^)]+\))?:/m.test(message));
+  const feature = messages.some((message) =>
+    /^feat(?:\([^)]+\))?:/.test(firstCommitLine(message)),
+  );
   return feature ? "minor" : "patch";
+}
+
+function findTomlTableBody(text, tableName) {
+  const headerPattern = new RegExp(`^\\[${escapeRegExp(tableName)}\\][ \\t]*\\r?$`, "m");
+  const headerMatch = headerPattern.exec(text);
+  if (!headerMatch) return null;
+
+  const bodyStart = headerMatch.index + headerMatch[0].length;
+  const rest = text.slice(bodyStart);
+  const nextTable = /^[ \t]*\[[^\r\n]+\][ \t]*\r?$/m.exec(rest);
+  const bodyEnd = nextTable ? bodyStart + nextTable.index : text.length;
+  return {
+    bodyStart,
+    bodyEnd,
+    body: text.slice(bodyStart, bodyEnd),
+  };
+}
+
+function cargoPackageMetadata(text) {
+  const table = findTomlTableBody(text, "package");
+  if (!table) throw new Error("could not read [package] table from Cargo.toml");
+
+  const nameMatch = /^name[ \t]*=[ \t]*"([^"]+)"[ \t]*(?:#.*)?$/m.exec(table.body);
+  if (!nameMatch) throw new Error("could not read [package] name from Cargo.toml");
+
+  const versionMatch = /^version[ \t]*=[ \t]*"([^"]+)"[ \t]*(?:#.*)?$/m.exec(table.body);
+  if (!versionMatch) {
+    throw new Error(
+      "could not read a literal [package] version from Cargo.toml (workspace-based versions are not supported)",
+    );
+  }
+
+  return {
+    ...table,
+    name: nameMatch[1],
+    version: versionMatch[1],
+  };
+}
+
+function rewriteCargoPackageVersion(text, nextVersion) {
+  const table = cargoPackageMetadata(text);
+  const updatedBody = table.body.replace(
+    /^(version[ \t]*=[ \t]*")[^"]+(".*)$/m,
+    `$1${nextVersion}$2`,
+  );
+  if (updatedBody === table.body) {
+    throw new Error("failed to update [package] version in Cargo.toml");
+  }
+  return text.slice(0, table.bodyStart) + updatedBody + text.slice(table.bodyEnd);
 }
 
 const packagePath = "package.json";
@@ -71,28 +132,43 @@ const cargoPath = "Cargo.toml";
 const lockPath = "Cargo.lock";
 
 const packageJson = JSON.parse(readFileSync(packagePath, "utf8"));
+if (typeof packageJson.name !== "string" || packageJson.name.length === 0) {
+  throw new Error("package.json must contain a non-empty package name");
+}
+const packageName = packageJson.name;
 const currentVersion = packageJson.version;
 parseVersion(currentVersion, "package.json version");
 
 const cargoText = readFileSync(cargoPath, "utf8");
-const cargoVersionMatch = cargoText.match(/\[package\][\s\S]*?^version\s*=\s*"([^"]+)"/m);
-if (!cargoVersionMatch) throw new Error("could not read [package] version from Cargo.toml");
-if (cargoVersionMatch[1] !== currentVersion) {
-  throw new Error(`package.json (${currentVersion}) and Cargo.toml (${cargoVersionMatch[1]}) disagree`);
+const cargoPackage = cargoPackageMetadata(cargoText);
+if (cargoPackage.name !== packageName) {
+  throw new Error(`package.json (${packageName}) and Cargo.toml (${cargoPackage.name}) package names disagree`);
+}
+if (cargoPackage.version !== currentVersion) {
+  throw new Error(`package.json (${currentVersion}) and Cargo.toml (${cargoPackage.version}) disagree`);
 }
 
 const lockText = readFileSync(lockPath, "utf8");
-const lockVersionMatch = lockText.match(/\[\[package\]\]\r?\nname = "moondesk"\r?\nversion = "([^"]+)"/);
-if (!lockVersionMatch) throw new Error("could not read moondesk version from Cargo.lock");
-if (lockVersionMatch[1] !== currentVersion) {
-  throw new Error(`package.json (${currentVersion}) and Cargo.lock (${lockVersionMatch[1]}) disagree`);
+const escapedPackageName = escapeRegExp(packageName);
+const lockVersionPattern = new RegExp(
+  `(\\[\\[package\\]\\]\\r?\\nname = "${escapedPackageName}"\\r?\\nversion = ")([^"]+)(")`,
+);
+const lockVersionMatch = lockVersionPattern.exec(lockText);
+if (!lockVersionMatch) throw new Error(`could not read ${packageName} version from Cargo.lock`);
+if (lockVersionMatch[2] !== currentVersion) {
+  throw new Error(`package.json (${currentVersion}) and Cargo.lock (${lockVersionMatch[2]}) disagree`);
 }
 
 const latestTag = latestReleaseTag();
 let nextVersion = currentVersion;
 let chosenBump = "current";
 
-if (latestTag) {
+if (!latestTag) {
+  if (requestedBump !== "auto") {
+    chosenBump = requestedBump;
+    nextVersion = bumpVersion(currentVersion, chosenBump);
+  }
+} else {
   const taggedVersion = latestTag.slice(1);
   const comparison = compareVersions(
     parseVersion(currentVersion, "current version"),
@@ -106,6 +182,11 @@ if (latestTag) {
   if (comparison === 0) {
     chosenBump = requestedBump === "auto" ? automaticBumpSince(latestTag) : requestedBump;
     nextVersion = bumpVersion(currentVersion, chosenBump);
+  } else if (requestedBump !== "auto") {
+    throw new Error(
+      `explicit ${requestedBump} bump cannot be applied because manifest version ${currentVersion} ` +
+        `already exceeds latest release ${latestTag}; use --bump auto to release the manifest version as-is`,
+    );
   }
 }
 
@@ -127,21 +208,11 @@ if (apply && nextVersion !== currentVersion) {
   packageJson.version = nextVersion;
   writeFileSync(packagePath, `${JSON.stringify(packageJson, null, 2)}\n`);
 
-  const updatedCargo = cargoText.replace(
-    /(\[package\][\s\S]*?^version\s*=\s*")[^"]+(".*$)/m,
-    `$1${nextVersion}$2`,
-  );
-  if (updatedCargo === cargoText && nextVersion !== currentVersion) {
-    throw new Error("failed to update Cargo.toml version");
-  }
-  writeFileSync(cargoPath, updatedCargo);
+  writeFileSync(cargoPath, rewriteCargoPackageVersion(cargoText, nextVersion));
 
-  const updatedLock = lockText.replace(
-    /(\[\[package\]\]\r?\nname = "moondesk"\r?\nversion = ")[^"]+("\r?\n)/,
-    `$1${nextVersion}$2`,
-  );
-  if (updatedLock === lockText && nextVersion !== currentVersion) {
-    throw new Error("failed to update Cargo.lock version");
+  const updatedLock = lockText.replace(lockVersionPattern, `$1${nextVersion}$3`);
+  if (updatedLock === lockText) {
+    throw new Error(`failed to update ${packageName} version in Cargo.lock`);
   }
   writeFileSync(lockPath, updatedLock);
 }

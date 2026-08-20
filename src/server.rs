@@ -421,6 +421,7 @@ async fn post_mcp(
     let mut response_json: Option<Value> = None;
     if let Some(resp) = mcp::handle_request(
         &req,
+        &workspace.workspace_id,
         &workspace_root,
         mode,
         tool_mode,

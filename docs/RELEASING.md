@@ -46,7 +46,7 @@ At the time this automation was added, `moondesk` had not been published to npm 
 
 Before merging the release-automation PR:
 
-1. Create a granular npm access token that can publish `moondesk` and is suitable for non-interactive CI publishing.
+1. Create a granular npm access token with package **Read and write** permission that can publish `moondesk`. If npm publishing on the account/package requires 2FA, enable **Bypass two-factor authentication** on this short-lived bootstrap token so GitHub Actions can publish non-interactively.
 2. In GitHub, open `Shattermoon/moondesk` -> **Settings** -> **Secrets and variables** -> **Actions**.
 3. Add a repository secret named `NPM_TOKEN` containing that token.
 4. Merge the release-automation PR. Its merge to `main` will run the pipeline and publish the first release.
@@ -73,7 +73,7 @@ The publish job uses a GitHub-hosted runner, Node 24, npm 12, and `id-token: wri
 
 ## Recovery
 
-The release workflow also supports manual dispatch from GitHub Actions. Candidate branches are temporary. They are cleaned after a build failure or after the tested release refs have been published successfully; if publishing the release refs succeeds but GitHub Release creation itself fails, the candidate branch is intentionally retained so a rerun can recover from the exact tested commit.
+The release workflow also supports manual dispatch from GitHub Actions. Candidate branches are temporary. They are cleaned after a build failure, when the release stops before publishing refs (for example because `main` advanced), or after the tested release refs have been published successfully. If publishing the release refs succeeds but GitHub Release creation itself fails, the candidate branch is intentionally retained so a rerun can recover from the exact tested commit.
 
 If a matrix build fails, no release tag, GitHub Release, or npm version is created.
 

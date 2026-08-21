@@ -40,36 +40,22 @@ The workflow can also be started manually from GitHub Actions with an explicit `
 
 `package.json`, `Cargo.toml`, and the root `moondesk` entry in `Cargo.lock` are kept at the same version. The Rust binary embeds `CARGO_PKG_VERSION`, so the binaries are compiled from the versioned release-candidate commit rather than from an unversioned merge checkout.
 
-## One-time npm bootstrap
+## npm Trusted Publishing
 
-At the time this automation was added, `moondesk` had not been published to npm yet. npm Trusted Publishing can only be configured for a package that already exists, so the first publish needs a normal npm publishing credential.
+`moondesk` is published through npm Trusted Publishing using GitHub Actions OIDC. The npm package remains unscoped as `moondesk`, while publishing authority comes from the Shattermoon repository and release workflow.
 
-Before merging the release-automation PR:
+The npm Trusted Publisher must be configured as:
 
-1. Create a granular npm access token with package **Read and write** permission that can publish `moondesk`. If npm publishing on the account/package requires 2FA, enable **Bypass two-factor authentication** on this short-lived bootstrap token so GitHub Actions can publish non-interactively.
-2. In GitHub, open `Shattermoon/moondesk` -> **Settings** -> **Secrets and variables** -> **Actions**.
-3. Add a repository secret named `NPM_TOKEN` containing that token.
-4. Merge the release-automation PR. Its merge to `main` will run the pipeline and publish the first release.
+- publisher: **GitHub Actions**;
+- organization/user: `Shattermoon`;
+- repository: `moondesk`;
+- workflow filename: `release.yml`;
+- environment: blank unless this workflow is later changed to use a matching GitHub Actions environment;
+- allowed action: `npm publish`.
 
-When `NPM_TOKEN` is configured, the prepare job verifies it with `npm whoami` before spending time on the five-platform release build. If the secret is absent, that preflight skips so Trusted Publishing/OIDC can be used instead. The workflow still never publishes npm before all binary builds and the GitHub Release are successful.
+The publish job deliberately does not read or inject an `NPM_TOKEN`. It uses a GitHub-hosted runner, Node 24, npm 12, and `id-token: write`, so npm authenticates the exact `Shattermoon/moondesk` workflow through OIDC. If a version is already present on npm, the job treats it as idempotently complete instead of attempting to republish an immutable npm version.
 
-## Switch to tokenless npm Trusted Publishing
-
-After the first npm package exists:
-
-1. Open the `moondesk` package settings on npmjs.com.
-2. Under **Trusted Publisher**, choose **GitHub Actions**.
-3. Configure:
-   - organization/user: `Shattermoon`
-   - repository: `moondesk`
-   - workflow filename: `release.yml`
-   - allowed action: `npm publish`
-4. Do not set an npm environment name unless the GitHub workflow is changed to use the same environment.
-5. Trigger a later release and verify npm shows the trusted/provenance publication.
-6. Remove the GitHub `NPM_TOKEN` secret once OIDC publishing has been verified.
-7. Optionally configure npm publishing access to disallow traditional tokens after Trusted Publishing is working.
-
-The publish job uses a GitHub-hosted runner, Node 24, npm 12, and `id-token: write`, so npm can authenticate the workflow through OIDC. If a version is already present on npm, the job treats it as idempotently complete instead of attempting to republish an immutable npm version.
+After Trusted Publishing has been verified with a real release, remove any old `NPM_TOKEN` GitHub secret and revoke the corresponding npm granular access token. npm package publishing access can then use the most restrictive option that disallows bypass-2FA tokens; Trusted Publishing continues to work independently of traditional npm tokens.
 
 ## Recovery
 

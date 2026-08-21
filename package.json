@@ -1,7 +1,8 @@
 {
   "name": "moondesk",
   "version": "0.1.0",
-  "description": "Use ChatGPT Chat as a local coding agent.",
+  "description": "MoonDesk — use ChatGPT Chat as a local coding agent, by Shattermoon.",
+  "author": "Shattermoon",
   "license": "MIT",
   "repository": {
     "type": "git",

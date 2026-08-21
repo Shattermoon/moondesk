@@ -27,9 +27,12 @@ function makeFetch(binary, assetName, options = {}) {
     }
 
     if (url.endsWith("/SHA256SUMS")) {
-      return new Response(`${expected}  ${assetName}\n`, {
+      const body = `${expected}  ${assetName}\n`;
+      return new Response(body, {
         status: 200,
-        headers: { "content-length": String(66 + assetName.length) },
+        headers: {
+          "content-length": String(options.checksumContentLength ?? Buffer.byteLength(body)),
+        },
       });
     }
     if (url.endsWith(`/${assetName}`)) {
@@ -81,6 +84,33 @@ test("ensureBinary downloads, verifies, and reuses a cached binary", async () =>
   }
 });
 
+test("unchanged cached binaries use metadata without rehashing", async () => {
+  const dir = tempDir();
+  try {
+    const target = resolveTarget();
+    const binary = Buffer.from(`moondesk-fast-cache-${crypto.randomUUID()}\n`);
+    const { fetchImpl } = makeFetch(binary, target.assetName);
+    const options = {
+      installDir: dir,
+      releaseBaseUrl: "https://example.invalid/releases/v-test",
+      fetchImpl,
+    };
+
+    const binaryPath = await ensureBinary(options);
+    const originalCreateHash = crypto.createHash;
+    crypto.createHash = () => {
+      throw new Error("cached fast path unexpectedly rehashed the native binary");
+    };
+    try {
+      assert.equal(await ensureBinary(options), binaryPath);
+    } finally {
+      crypto.createHash = originalCreateHash;
+    }
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("ensureBinary refuses checksum mismatches without leaving a partial binary", async () => {
   const dir = tempDir();
   try {
@@ -107,6 +137,28 @@ test("ensureBinary refuses checksum mismatches without leaving a partial binary"
   }
 });
 
+test("ensureBinary rejects an oversized declared checksum response", async () => {
+  const dir = tempDir();
+  try {
+    const target = resolveTarget();
+    const binary = Buffer.from("small-binary");
+    const { fetchImpl } = makeFetch(binary, target.assetName, {
+      checksumContentLength: 2 * 1024 * 1024,
+    });
+
+    await assert.rejects(
+      ensureBinary({
+        installDir: dir,
+        releaseBaseUrl: "https://example.invalid/releases/v-test",
+        fetchImpl,
+      }),
+      /unexpectedly large/,
+    );
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("concurrent first runs share one atomic installation", async () => {
   const dir = tempDir();
   try {
@@ -127,7 +179,11 @@ test("concurrent first runs share one atomic installation", async () => {
 
     assert.equal(first, second);
     assert.equal(fs.readFileSync(first).compare(binary), 0);
-    assert.equal(calls.length, 2, "only the lock holder should download release files");
+    assert.equal(
+      calls.filter((url) => url.endsWith("/SHA256SUMS")).length,
+      1,
+      "only one installer should request release metadata",
+    );
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

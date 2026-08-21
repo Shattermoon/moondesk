@@ -13,9 +13,10 @@ const defaultReleaseBaseUrl = `https://github.com/Shattermoon/moondesk/releases/
 
 const MAX_BINARY_BYTES = 128 * 1024 * 1024;
 const MAX_CHECKSUM_BYTES = 1024 * 1024;
-const DOWNLOAD_TIMEOUT_MS = 60_000;
-const LOCK_STALE_MS = 5 * 60_000;
-const LOCK_WAIT_MS = 30_000;
+const METADATA_TIMEOUT_MS = 60_000;
+const BINARY_TIMEOUT_MS = 10 * 60_000;
+const LOCK_STALE_MS = 15 * 60_000;
+const LOCK_WAIT_MS = 15 * 60_000;
 const LOCK_POLL_MS = 100;
 
 const supportedTargets = new Set([
@@ -51,12 +52,12 @@ function defaultInstallDir(target) {
   return path.join(os.homedir(), ".moondesk", "npm-bin", releaseTag, target);
 }
 
-async function fetchRequired(fetchImpl, url, maxBytes) {
+async function fetchRequired(fetchImpl, url, maxBytes, timeoutMs = METADATA_TIMEOUT_MS) {
   const response = await fetchImpl(url, {
     headers: {
       "User-Agent": `moondesk-npm/${version}`,
     },
-    signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS),
+    signal: AbortSignal.timeout(timeoutMs),
   });
 
   if (!response.ok) {
@@ -95,12 +96,29 @@ function sha256File(filePath) {
   return sha256Buffer(fs.readFileSync(filePath));
 }
 
-function validCachedBinary(binaryPath, checksumPath, platform) {
+function cacheMetadata(stat, expected) {
+  return {
+    version: 1,
+    sha256: expected,
+    size: stat.size,
+    mtimeMs: stat.mtimeMs,
+    ctimeMs: stat.ctimeMs,
+  };
+}
+
+function writeCacheMetadata(metadataPath, binaryPath, expected) {
+  const stat = fs.statSync(binaryPath);
+  fs.writeFileSync(metadataPath, `${JSON.stringify(cacheMetadata(stat, expected))}\n`, {
+    mode: 0o600,
+  });
+}
+
+function validCachedBinary(binaryPath, checksumPath, metadataPath, platform) {
   if (!fs.existsSync(binaryPath) || !fs.existsSync(checksumPath)) {
     return false;
   }
 
-  const stat = fs.statSync(binaryPath);
+  let stat = fs.statSync(binaryPath);
   if (!stat.isFile() || stat.size === 0 || stat.size > MAX_BINARY_BYTES) {
     return false;
   }
@@ -110,14 +128,36 @@ function validCachedBinary(binaryPath, checksumPath, platform) {
     return false;
   }
 
+  let metadata;
+  try {
+    metadata = JSON.parse(fs.readFileSync(metadataPath, "utf8"));
+  } catch {
+    metadata = null;
+  }
+
+  const fastPathMatches =
+    metadata?.version === 1 &&
+    metadata.sha256 === expected &&
+    metadata.size === stat.size &&
+    metadata.mtimeMs === stat.mtimeMs &&
+    metadata.ctimeMs === stat.ctimeMs;
+
+  if (fastPathMatches) {
+    return true;
+  }
+
   if (sha256File(binaryPath) !== expected) {
     return false;
   }
 
-  if (platform !== "win32") {
+  if (platform !== "win32" && (stat.mode & 0o111) === 0) {
     fs.chmodSync(binaryPath, 0o755);
+    stat = fs.statSync(binaryPath);
   }
 
+  fs.writeFileSync(metadataPath, `${JSON.stringify(cacheMetadata(stat, expected))}\n`, {
+    mode: 0o600,
+  });
   return true;
 }
 
@@ -153,11 +193,17 @@ function lockOwnerIsAlive(lockPath) {
   }
 }
 
-async function acquireInstallLock(lockPath, binaryPath, checksumPath, platform) {
+async function acquireInstallLock(
+  lockPath,
+  binaryPath,
+  checksumPath,
+  metadataPath,
+  platform,
+) {
   const deadline = Date.now() + LOCK_WAIT_MS;
 
   while (Date.now() < deadline) {
-    if (validCachedBinary(binaryPath, checksumPath, platform)) {
+    if (validCachedBinary(binaryPath, checksumPath, metadataPath, platform)) {
       return null;
     }
 
@@ -186,7 +232,7 @@ async function acquireInstallLock(lockPath, binaryPath, checksumPath, platform) 
     }
   }
 
-  if (validCachedBinary(binaryPath, checksumPath, platform)) {
+  if (validCachedBinary(binaryPath, checksumPath, metadataPath, platform)) {
     return null;
   }
 
@@ -205,11 +251,12 @@ async function ensureBinary(options = {}) {
 
   const binaryPath = path.join(installDir, targetInfo.executableName);
   const checksumPath = `${binaryPath}.sha256`;
+  const metadataPath = `${binaryPath}.metadata.json`;
   const lockPath = path.join(installDir, ".install.lock");
 
   fs.mkdirSync(installDir, { recursive: true, mode: 0o700 });
 
-  if (validCachedBinary(binaryPath, checksumPath, targetInfo.platform)) {
+  if (validCachedBinary(binaryPath, checksumPath, metadataPath, targetInfo.platform)) {
     return binaryPath;
   }
 
@@ -217,6 +264,7 @@ async function ensureBinary(options = {}) {
     lockPath,
     binaryPath,
     checksumPath,
+    metadataPath,
     targetInfo.platform,
   );
 
@@ -229,7 +277,7 @@ async function ensureBinary(options = {}) {
   const tempChecksum = `${checksumPath}.tmp-${nonce}`;
 
   try {
-    if (validCachedBinary(binaryPath, checksumPath, targetInfo.platform)) {
+    if (validCachedBinary(binaryPath, checksumPath, metadataPath, targetInfo.platform)) {
       return binaryPath;
     }
 
@@ -243,6 +291,7 @@ async function ensureBinary(options = {}) {
       fetchImpl,
       `${releaseBaseUrl}/${targetInfo.assetName}`,
       MAX_BINARY_BYTES,
+      BINARY_TIMEOUT_MS,
     );
     const actual = sha256Buffer(binary);
 
@@ -260,10 +309,12 @@ async function ensureBinary(options = {}) {
 
     fs.rmSync(binaryPath, { force: true });
     fs.rmSync(checksumPath, { force: true });
+    fs.rmSync(metadataPath, { force: true });
     fs.renameSync(tempBinary, binaryPath);
     fs.renameSync(tempChecksum, checksumPath);
+    writeCacheMetadata(metadataPath, binaryPath, expected);
 
-    if (!validCachedBinary(binaryPath, checksumPath, targetInfo.platform)) {
+    if (!validCachedBinary(binaryPath, checksumPath, metadataPath, targetInfo.platform)) {
       throw new Error(`Installed ${targetInfo.assetName} failed its local checksum verification`);
     }
 

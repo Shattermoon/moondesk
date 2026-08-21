@@ -34,4 +34,7 @@ async function main() {
   });
 }
 
-main();
+main().catch((error) => {
+  console.error(`MoonDesk failed to start: ${error.message}`);
+  process.exit(1);
+});

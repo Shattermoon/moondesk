@@ -16,6 +16,8 @@ A `push` event by itself is **not** enough to release. The first job is a read-o
 
 If a commit was pushed directly to `main`, is a release-bot version commit, or has already been superseded by a newer `main`, the gate reports `should_release=false` and every mutation/build/publish job is skipped. Opening, updating, approving, or otherwise reviewing a PR never invokes the Release workflow at all; normal PR validation is handled by `.github/workflows/ci.yml`.
 
+`release.yml` also exposes one deliberately constrained `workflow_dispatch` operation named `publish-tag`. It cannot create a version, candidate, tag, or GitHub Release. It only publishes an already-existing verified `vX.Y.Z` tag to npm, and exists so the parent merge-triggered release can publish from the tag's real GitHub ref/SHA for correct npm provenance and so the same immutable tag can be retried after a registry outage.
+
 GitHub does not recursively trigger normal `push` workflows for commits pushed with the repository `GITHUB_TOKEN`, and the merged-PR gate is an additional backstop if that platform behavior ever changes or a release commit is pushed by some other credential.
 
 ## Pipeline
@@ -24,14 +26,14 @@ After the merged-PR gate succeeds, the pipeline runs in this order:
 
 1. **npm OIDC preflight** — before creating a candidate branch, tag, GitHub Release, or npm version, a minimal job with only `id-token: write` asks GitHub for an OIDC identity and exchanges it with npm's Trusted Publishing endpoint for `moondesk`. The short-lived npm token is validated and immediately discarded. If npm does not trust this workflow identity, release mutation never begins.
 2. **Merged-source validation** — formatting, normal Clippy, strict production Clippy, all Rust tests, npm wrapper syntax, npm installer unit tests, repository metadata, and npm package contents are checked again on the exact merged SHA.
-3. **Previous-gap repair** — before planning the newly merged PR, the workflow checks whether the current manifest/tag represents a modern GitHub-only release that never reached npm. If so, it publishes and smoke-tests that immutable older version first. Older tags that used lifecycle `postinstall` are intentionally left GitHub-only.
+3. **Previous-gap repair** — before planning the newly merged PR, the workflow checks whether the current manifest/tag represents a modern GitHub-only release that never reached npm. If so, it internally dispatches `publish-tag` at that exact immutable tag and waits for the provenance-correct npm publication to finish. Older tags that used lifecycle `postinstall` are intentionally left GitHub-only.
 4. **Release planning** — the merged PR's optional release label selects patch/minor/major, otherwise conventional commits select the bump.
 5. **Versioned candidate** — `package.json`, `Cargo.toml`, and the root MoonDesk entry in `Cargo.lock` are versioned together and committed to a temporary release-candidate branch.
 6. **Five-platform matrix** — Linux x64, Linux arm64, macOS Intel, macOS arm64, and Windows x64 compile the exact candidate. Every binary runs a ClippyMoon help/export smoke test before becoming an artifact.
-7. **Refs + GitHub Release** — `main` must still equal the original merged SHA. Only then does the workflow atomically advance `main` to the tested version commit and create the annotated `vX.Y.Z` tag. All five binaries are assembled, SHA-256 checksums are generated and checked, and the GitHub Release is created from those exact artifacts.
-8. **npm publish** — a separate minimal OIDC job checks out the immutable release tag, uses a clean token-free npm configuration, publishes with explicit provenance, and confirms the immutable version appears in the registry.
-9. **Fresh-install E2E** — the just-published npm package is installed with lifecycle scripts explicitly disabled. Running its CLI must bootstrap the correct GitHub Release binary, verify the checksum, and successfully export ClippyMoon. This proves npm + GitHub Release + checksum + wrapper + first-run bootstrap work as one system.
-10. **Cleanup** — temporary candidate branches are removed once they are no longer required for safe recovery.
+7. **Refs + GitHub Release** — `main` must still equal the original merged SHA. Only then does the workflow atomically advance `main` to the tested version commit and create the annotated `vX.Y.Z` tag. All five binaries are assembled, SHA-256 checksums are generated, uploaded, then downloaded again from the public GitHub Release and independently verified.
+8. **Tag-context npm publish** — after the GitHub Release is verified, the parent run internally dispatches the same `release.yml` at the immutable tag and waits. That child run has no release-creation permissions; it verifies the tag/release/assets again, performs a tag-context OIDC exchange, publishes with explicit provenance, and confirms the immutable version appears in the registry.
+9. **Provenance + fresh-install E2E** — the tag-context run decodes npm's published SLSA attestation and requires its source ref/commit to equal the exact `refs/tags/vX.Y.Z` and tag commit. It then installs the package with lifecycle scripts disabled, bootstraps the GitHub Release binary, compares its SHA-256 with `SHA256SUMS`, and successfully exports ClippyMoon.
+10. **Cleanup** — the temporary candidate branch is removed only after the complete GitHub + npm release path succeeds; failed release attempts retain the candidate so GitHub's rerun flow can reuse the exact tested commit.
 
 ## Version selection
 
@@ -57,7 +59,7 @@ Conflicting bump labels fail at the read-only merge gate before OIDC, builds, or
 
 The pipeline is intentionally state-aware because Git refs, GitHub Releases, and npm cannot be updated atomically as one transaction.
 
-If a modern MoonDesk tag already exists at the manifest version, is an ancestor of `main`, contains the lifecycle-script-free npm bootstrap, and that exact version is missing from npm, the next verified merged-PR release repairs that npm gap **before** planning the newly merged PR. It verifies the existing GitHub Release asset set, publishes the immutable tagged package with OIDC/provenance, performs a fresh-install smoke test, and then continues to create the new release for the current merge.
+If a modern MoonDesk tag already exists at the manifest version, is an ancestor of `main`, contains the lifecycle-script-free npm bootstrap, and that exact version is missing from npm, the next verified merged-PR release repairs that npm gap **before** planning the newly merged PR. The parent run dispatches `release.yml` with `--ref vX.Y.Z`, waits for that child run, and only continues when npm publication, provenance verification, and the fresh-install E2E all pass. Publishing from the actual tag context is important: npm provenance records GitHub's triggering ref/SHA, so merely checking out an older tag inside a newer `main` run would create misleading provenance.
 
 Older partial tags that predate `npm/install-binary.js` are deliberately not backfilled to npm because those packages relied on lifecycle `postinstall`. A later release gets a new version instead of rewriting the old public tag or publishing an obsolete installation model.
 
@@ -82,7 +84,7 @@ The npm Trusted Publisher should be configured as:
 
 The release uses a GitHub-hosted runner, Node 24, a pinned npm 12 CLI, `id-token: write`, and a clean npmrc containing only the npm registry and provenance setting. It deliberately does **not** use `actions/setup-node`'s `registry-url` option in the publish job, because that option can write an empty `_authToken=${NODE_AUTH_TOKEN}` placeholder that interferes with OIDC in some npm/setup-node combinations.
 
-The early preflight performs the same GitHub-OIDC -> npm token exchange that `npm publish` relies on. This moves Trusted Publisher configuration failures before any irreversible release mutation.
+The early preflight uses `.github/scripts/npm-oidc-preflight.mjs` to perform the same GitHub-OIDC -> npm token exchange that `npm publish` relies on without placing either bearer token in a child-process command line. This catches Trusted Publisher configuration failures before irreversible release mutation. The tag-context publisher repeats the same preflight after the tag exists, so the exact publishing identity is also checked before npm mutation.
 
 Trusted Publishing automatically supports provenance; MoonDesk additionally requests `--provenance` explicitly so loss of provenance is treated as a release failure rather than silently degrading the supply-chain guarantee.
 
@@ -100,7 +102,7 @@ The npm package now contains a small JS wrapper plus `npm/install-binary.js`. On
 4. verifies SHA-256 before installation;
 5. writes through a lock and temporary files so concurrent first launches cannot leave a partial binary;
 6. stores the binary and its checksum in a versioned user cache under `~/.moondesk/npm-bin/vX.Y.Z/<platform-arch>/`;
-7. verifies the cached binary before subsequent launches.
+7. records checksum/size/mtime/ctime metadata after verification so normal launches can take a fast metadata path instead of hashing the whole native executable every time; if those attributes change or metadata is missing, MoonDesk falls back to a full SHA-256 verification before launch.
 
 Keeping the native executable outside npm's `node_modules` also avoids the common Windows failure where `npm update -g` cannot replace/delete an `.exe` that is still running from inside the package directory.
 
@@ -111,9 +113,10 @@ Keeping the native executable outside npm's `node_modules` also avoids the commo
 `.github/workflows/release.yml` is the post-merge workflow. Its privileged capabilities are split by job:
 
 - the merge gate is read-only;
-- the npm preflight has `id-token: write` but checks out no project source;
+- the npm preflight has only `contents: read` plus `id-token: write` and executes the small OIDC preflight helper from the already-merged SHA;
+- the previous-gap repair coordinator has `actions: write` only so it can dispatch/wait for a tag-context repair run; it has no npm OIDC identity;
 - build jobs have no publishing identity and no repository write permission;
-- the Git/tag/Release job has `contents: write` but no npm OIDC permission;
-- the npm publish job has `id-token: write` and `contents: read`, with no repository write permission.
+- the Git/tag/Release job has `contents: write` plus `actions: write` so it can create the immutable release and dispatch/wait for the constrained tag-context publisher, but it has no npm OIDC permission;
+- the tag-context npm publisher has `id-token: write` and `contents: read`, with no repository or release write permission.
 
 This separation reduces the blast radius of any single job and prevents build/test code from sharing a runner with the npm publishing identity.

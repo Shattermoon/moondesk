@@ -1,12 +1,33 @@
 name: Release
 
+run-name: >-
+  ${{ github.event_name == 'workflow_dispatch'
+      && format('Publish {0} ({1})', github.ref_name, inputs.dispatch_nonce)
+      || format('Release {0}', github.sha) }}
+
 on:
   push:
     branches:
       - main
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: Recovery-only operation for an existing release tag
+        required: true
+        default: publish-tag
+        type: choice
+        options:
+          - publish-tag
+      dispatch_nonce:
+        description: Internal correlation value used by the parent release run
+        required: false
+        type: string
 
 concurrency:
-  group: release-main
+  group: >-
+    ${{ github.event_name == 'workflow_dispatch'
+        && format('release-publish-{0}', github.ref_name)
+        || 'release-main' }}
   cancel-in-progress: false
 
 permissions:
@@ -15,6 +36,7 @@ permissions:
 jobs:
   gate:
     name: Verify merged PR release source
+    if: github.event_name == 'push'
     runs-on: ubuntu-22.04
     timeout-minutes: 10
     permissions:
@@ -91,7 +113,7 @@ jobs:
           done
 
           if [ "$count" -gt 1 ]; then
-            echo "::error::PR #${pr_number} has conflicting release bump labels. Use at most one of release:patch, release:minor, or release:major."
+            echo "::error::PR #${pr_number} has conflicting release bump labels. Use at most one release bump label."
             exit 1
           fi
 
@@ -107,62 +129,34 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 10
     permissions:
+      contents: read
       id-token: write
-    env:
-      PACKAGE_NAME: moondesk
 
     steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          package-manager-cache: false
+
       - name: Exchange GitHub OIDC identity with npm
-        shell: bash
-        run: |
-          set -euo pipefail
-          test "$GITHUB_EVENT_NAME" = "push"
-          test "$GITHUB_REF" = "refs/heads/main"
-          test -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}"
-          test -n "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}"
+        run: node .github/scripts/npm-oidc-preflight.mjs moondesk
 
-          separator='&'
-          if [[ "$ACTIONS_ID_TOKEN_REQUEST_URL" != *\?* ]]; then
-            separator='?'
-          fi
-          oidc_url="${ACTIONS_ID_TOKEN_REQUEST_URL}${separator}audience=npm%3Aregistry.npmjs.org"
-
-          oidc_response="$(curl --fail --silent --show-error \
-            -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
-            "$oidc_url")"
-          oidc_token="$(jq -er '.value | select(type == "string" and length > 0)' <<<"$oidc_response")"
-
-          encoded_package="$(jq -nr --arg value "$PACKAGE_NAME" '$value | @uri')"
-          exchange_file="$RUNNER_TEMP/npm-oidc-exchange.json"
-          trap 'rm -f "$exchange_file"' EXIT
-
-          exchange_status="$(curl --silent --show-error \
-            --output "$exchange_file" \
-            --write-out '%{http_code}' \
-            --request POST \
-            -H "Authorization: Bearer ${oidc_token}" \
-            "https://registry.npmjs.org/-/npm/v1/oidc/token/exchange/package/${encoded_package}")"
-
-          if [ "$exchange_status" != "200" ] && [ "$exchange_status" != "201" ]; then
-            message="$(jq -r '.message // .error // "npm OIDC token exchange rejected the workflow identity"' "$exchange_file" 2>/dev/null || true)"
-            echo "::error::npm Trusted Publishing preflight failed with HTTP ${exchange_status}: ${message}"
-            exit 1
-          fi
-
-          jq -e '.token | type == "string" and length > 0' "$exchange_file" >/dev/null
-          echo "npm Trusted Publisher accepted this push-to-main release workflow identity."
-
-  repair-npm-gap:
-    name: Repair previous npm gap before new release
+  repair-previous:
+    name: Repair previous modern npm gap
     needs:
       - gate
       - npm-preflight
     if: needs.gate.outputs.should_release == 'true' && needs.npm-preflight.result == 'success'
     runs-on: ubuntu-22.04
-    timeout-minutes: 15
+    timeout-minutes: 20
     permissions:
       contents: read
-      id-token: write
+      actions: write
 
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -171,31 +165,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          node-version: 24
-          package-manager-cache: false
-
-      - name: Use pinned Trusted-Publishing capable npm CLI
-        run: npm install --global npm@12.0.2
-
-      - name: Configure clean npm OIDC environment
-        shell: bash
-        run: |
-          set -euo pipefail
-          npmrc="$RUNNER_TEMP/moondesk-oidc.npmrc"
-          printf '%s\n' \
-            'registry=https://registry.npmjs.org/' \
-            'provenance=true' > "$npmrc"
-          echo "NPM_CONFIG_USERCONFIG=$npmrc" >> "$GITHUB_ENV"
-          test -z "${NPM_TOKEN:-}"
-          test -z "${NODE_AUTH_TOKEN:-}"
-          if grep -Eqi '(_auth|authToken|token=)' "$npmrc"; then
-            echo "::error::OIDC npm config unexpectedly contains token authentication."
-            exit 1
-          fi
-
-      - name: Repair a previous modern GitHub-only release before continuing
+      - name: Repair a previous tagged version before releasing new work
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
@@ -206,7 +176,7 @@ jobs:
           current_tag="v${current_version}"
 
           if ! git show-ref --verify --quiet "refs/tags/${current_tag}"; then
-            echo "No tag exists at the current manifest version; there is no previous release gap to repair."
+            echo "No tag exists at the current manifest version; there is no previous release gap."
             exit 0
           fi
 
@@ -217,18 +187,18 @@ jobs:
           fi
 
           if ! git cat-file -e "${current_tag}:npm/install-binary.js" 2>/dev/null; then
-            echo "${current_tag} predates the lifecycle-script-free installer and will remain GitHub-only rather than being backfilled to npm."
+            echo "${current_tag} predates lifecycle-script-free installation; leaving it GitHub-only."
             exit 0
           fi
 
-          registry_body="$RUNNER_TEMP/npm-previous-version.json"
+          registry_file="$RUNNER_TEMP/npm-previous-version.json"
           registry_status="$(curl --silent --show-error \
-            --output "$registry_body" \
+            --output "$registry_file" \
             --write-out '%{http_code}' \
             "https://registry.npmjs.org/moondesk/${current_version}")"
 
           if [ "$registry_status" = "200" ]; then
-            echo "moondesk@${current_version} already exists on npm; no previous gap to repair."
+            echo "moondesk@${current_version} already exists on npm."
             exit 0
           fi
           if [ "$registry_status" != "404" ]; then
@@ -236,55 +206,48 @@ jobs:
             exit 1
           fi
 
-          echo "Repairing GitHub-only ${current_tag} on npm before releasing the newly merged PR."
-          actual_assets="$(gh release view "$current_tag" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' | sort)"
-          expected_assets="$(printf '%s\n' \
-            SHA256SUMS \
-            moondesk-darwin-arm64 \
-            moondesk-darwin-x64 \
-            moondesk-linux-arm64 \
-            moondesk-linux-x64 \
-            moondesk-win32-x64.exe | sort)"
-          test "$actual_assets" = "$expected_assets"
+          nonce="repair-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          title="Publish ${current_tag} (${nonce})"
+          echo "Dispatching provenance-correct npm repair for ${current_tag}."
+          gh workflow run release.yml \
+            --repo "$GITHUB_REPOSITORY" \
+            --ref "$current_tag" \
+            -f operation=publish-tag \
+            -f dispatch_nonce="$nonce"
 
-          git checkout --detach "$current_tag"
-          test "$(node -p "require('./package.json').version")" = "$current_version"
-          test "$(node -p "require('./package.json').repository.url")" = "git+https://github.com/Shattermoon/moondesk.git"
-          test -f npm/install-binary.js
-          test ! -e npm/postinstall.js
-          node -e "const p=require('./package.json'); const s=p.scripts||{}; if (s.preinstall||s.install||s.postinstall) process.exit(1)"
-          npm pack --dry-run --ignore-scripts
-          npm publish --access public --provenance
-
-          for attempt in $(seq 1 12); do
-            published_version="$(npm view "moondesk@${current_version}" version 2>/dev/null || true)"
-            if [ "$published_version" = "$current_version" ]; then
+          child_id=""
+          for attempt in $(seq 1 30); do
+            runs_json="$(gh run list \
+              --repo "$GITHUB_REPOSITORY" \
+              --workflow Release \
+              --event workflow_dispatch \
+              --limit 50 \
+              --json databaseId,displayTitle)"
+            child_id="$(jq -r --arg title "$title" '.[] | select(.displayTitle == $title) | .databaseId' <<<"$runs_json" | head -n 1)"
+            if [ -n "$child_id" ] && [ "$child_id" != "null" ]; then
               break
             fi
-            if [ "$attempt" -eq 12 ]; then
-              echo "::error::Repaired npm publish was not visible after one minute."
-              exit 1
-            fi
-            sleep 5
+            sleep 2
           done
 
-          prefix="$RUNNER_TEMP/moondesk-repair-prefix"
-          cache="$RUNNER_TEMP/moondesk-repair-cache"
-          export MOONDESK_BINARY_CACHE_DIR="$cache"
-          npm install --global --prefix "$prefix" --ignore-scripts "moondesk@${current_version}"
-          test ! -e "$cache/moondesk"
-          "$prefix/bin/moondesk" clippymoon --help
+          if [ -z "$child_id" ] || [ "$child_id" = "null" ]; then
+            echo "::error::Timed out locating the dispatched repair run for ${current_tag}."
+            exit 1
+          fi
+
+          echo "Waiting for repair run ${child_id}."
+          gh run watch "$child_id" --repo "$GITHUB_REPOSITORY" --exit-status
 
   prepare:
     name: Validate and prepare release candidate
     needs:
       - gate
       - npm-preflight
-      - repair-npm-gap
+      - repair-previous
     if: >-
       needs.gate.outputs.should_release == 'true' &&
       needs.npm-preflight.result == 'success' &&
-      needs.repair-npm-gap.result == 'success'
+      needs.repair-previous.result == 'success'
     runs-on: ubuntu-22.04
     timeout-minutes: 30
     permissions:
@@ -333,6 +296,7 @@ jobs:
             -D clippy::panic \
             -D clippy::unreachable
           cargo +stable test --locked
+          node --check .github/scripts/npm-oidc-preflight.mjs
           node --check npm/moondesk.js
           node --check npm/install-binary.js
           node --test npm/install-binary.test.js
@@ -390,6 +354,7 @@ jobs:
   build:
     name: Build ${{ matrix.asset }}
     needs: prepare
+    if: needs.prepare.result == 'success'
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     strategy:
@@ -458,14 +423,16 @@ jobs:
           retention-days: 7
 
   release:
-    name: Commit, tag, and create GitHub Release
+    name: Commit, tag, create GitHub Release, and publish npm
     needs:
       - prepare
       - build
+    if: needs.prepare.result == 'success' && needs.build.result == 'success'
     runs-on: ubuntu-22.04
-    timeout-minutes: 30
+    timeout-minutes: 40
     permissions:
       contents: write
+      actions: write
     outputs:
       refs_published: ${{ steps.publish_refs.outputs.refs_published }}
 
@@ -514,11 +481,10 @@ jobs:
           fi
 
           if [ "$current_main" != "$base_sha" ]; then
-            echo "::error::main advanced while this release was building. Refusing to overwrite newer work; the newer main run can release the combined changes."
+            echo "::error::main advanced while this release was building. Refusing to overwrite newer work."
             exit 1
           fi
 
-          test -n "$candidate_branch"
           git fetch origin \
             "refs/heads/${candidate_branch}:refs/remotes/origin/${candidate_branch}"
           test "$(git rev-parse "origin/${candidate_branch}")" = "$candidate_sha"
@@ -542,7 +508,6 @@ jobs:
           cd release
           test "$(find . -maxdepth 1 -type f -name 'moondesk-*' | wc -l)" -eq 5
           sha256sum moondesk-* > SHA256SUMS
-          sha256sum --check SHA256SUMS
           ls -la
 
       - name: Create or repair GitHub Release
@@ -553,7 +518,7 @@ jobs:
           set -euo pipefail
           tag="${{ needs.prepare.outputs.tag }}"
           if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "GitHub Release $tag already exists; refreshing assets rebuilt from the tagged commit."
+            echo "GitHub Release $tag already exists; refreshing tested assets."
             gh release upload "$tag" release/* --repo "$GITHUB_REPOSITORY" --clobber
           else
             gh release create "$tag" release/* \
@@ -574,13 +539,57 @@ jobs:
             moondesk-win32-x64.exe | sort)"
           test "$actual_assets" = "$expected_assets"
 
-  publish-npm:
-    name: Publish npm package
-    needs:
-      - prepare
-      - release
+          verify_dir="$RUNNER_TEMP/release-download"
+          rm -rf "$verify_dir"
+          mkdir -p "$verify_dir"
+          gh release download "$tag" --repo "$GITHUB_REPOSITORY" --dir "$verify_dir"
+          cd "$verify_dir"
+          sha256sum --check SHA256SUMS
+
+      - name: Publish npm from the immutable tag context
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ needs.prepare.outputs.tag }}"
+          nonce="release-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          title="Publish ${tag} (${nonce})"
+
+          gh workflow run release.yml \
+            --repo "$GITHUB_REPOSITORY" \
+            --ref "$tag" \
+            -f operation=publish-tag \
+            -f dispatch_nonce="$nonce"
+
+          child_id=""
+          for attempt in $(seq 1 30); do
+            runs_json="$(gh run list \
+              --repo "$GITHUB_REPOSITORY" \
+              --workflow Release \
+              --event workflow_dispatch \
+              --limit 50 \
+              --json databaseId,displayTitle)"
+            child_id="$(jq -r --arg title "$title" '.[] | select(.displayTitle == $title) | .databaseId' <<<"$runs_json" | head -n 1)"
+            if [ -n "$child_id" ] && [ "$child_id" != "null" ]; then
+              break
+            fi
+            sleep 2
+          done
+
+          if [ -z "$child_id" ] || [ "$child_id" = "null" ]; then
+            echo "::error::Timed out locating the tag publication run for ${tag}."
+            exit 1
+          fi
+
+          echo "Waiting for npm publication run ${child_id}."
+          gh run watch "$child_id" --repo "$GITHUB_REPOSITORY" --exit-status
+
+  publish-tag:
+    name: Publish verified tag to npm
+    if: github.event_name == 'workflow_dispatch' && inputs.operation == 'publish-tag'
     runs-on: ubuntu-22.04
-    timeout-minutes: 30
+    timeout-minutes: 20
     permissions:
       contents: read
       id-token: write
@@ -588,13 +597,57 @@ jobs:
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          ref: ${{ needs.prepare.outputs.tag }}
+          ref: ${{ github.ref_name }}
+          fetch-depth: 0
           persist-credentials: false
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24
           package-manager-cache: false
+
+      - name: Verify immutable tag and GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF_TYPE" = "tag"
+          [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+
+          version="$(node -p "require('./package.json').version")"
+          test "$GITHUB_REF_NAME" = "v${version}"
+          grep -q "^version = \"${version}\"$" Cargo.toml
+          test -f npm/install-binary.js
+          test ! -e npm/postinstall.js
+          node -e "const p=require('./package.json'); const s=p.scripts||{}; if (s.preinstall||s.install||s.postinstall) process.exit(1)"
+          test "$(node -p "require('./package.json').repository.url")" = "git+https://github.com/Shattermoon/moondesk.git"
+
+          git fetch origin --tags "refs/heads/main:refs/remotes/origin/main"
+          git merge-base --is-ancestor HEAD origin/main
+          test "$(git rev-parse "${GITHUB_REF_NAME}^{}")" = "$GITHUB_SHA"
+
+          release_target="$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json targetCommitish --jq '.targetCommitish')"
+          test "$release_target" = "$GITHUB_SHA"
+
+          actual_assets="$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' | sort)"
+          expected_assets="$(printf '%s\n' \
+            SHA256SUMS \
+            moondesk-darwin-arm64 \
+            moondesk-darwin-x64 \
+            moondesk-linux-arm64 \
+            moondesk-linux-x64 \
+            moondesk-win32-x64.exe | sort)"
+          test "$actual_assets" = "$expected_assets"
+
+          verify_dir="$RUNNER_TEMP/release-assets"
+          gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --dir "$verify_dir"
+          cd "$verify_dir"
+          sha256sum --check SHA256SUMS
+
+      - name: Verify npm Trusted Publisher for this tag context
+        run: node .github/scripts/npm-oidc-preflight.mjs moondesk
 
       - name: Use pinned Trusted-Publishing capable npm CLI
         run: npm install --global npm@12.0.2
@@ -608,78 +661,84 @@ jobs:
             'registry=https://registry.npmjs.org/' \
             'provenance=true' > "$npmrc"
           echo "NPM_CONFIG_USERCONFIG=$npmrc" >> "$GITHUB_ENV"
-
           test -z "${NPM_TOKEN:-}"
           test -z "${NODE_AUTH_TOKEN:-}"
           if grep -Eqi '(_auth|authToken|token=)' "$npmrc"; then
             echo "::error::OIDC npm config unexpectedly contains token authentication."
             exit 1
           fi
-
           npm --version
           node --version
 
-      - name: Verify release assets and package before npm publish
-        env:
-          GH_TOKEN: ${{ github.token }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          tag="${{ needs.prepare.outputs.tag }}"
-          version="${{ needs.prepare.outputs.version }}"
-          test "$(git rev-parse HEAD)" = "${{ needs.prepare.outputs.candidate_sha }}"
-          test "$(node -p "require('./package.json').version")" = "$version"
-          test "$(node -p "require('./package.json').repository.url")" = "git+https://github.com/Shattermoon/moondesk.git"
-
-          actual_assets="$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' | sort)"
-          expected_assets="$(printf '%s\n' \
-            SHA256SUMS \
-            moondesk-darwin-arm64 \
-            moondesk-darwin-x64 \
-            moondesk-linux-arm64 \
-            moondesk-linux-x64 \
-            moondesk-win32-x64.exe | sort)"
-          test "$actual_assets" = "$expected_assets"
-
-          npm pack --dry-run --ignore-scripts
-
-      - name: Publish to npm with Trusted Publishing and provenance
+      - name: Publish immutable package with provenance
         shell: bash
         run: |
           set -euo pipefail
           package_name="$(node -p "require('./package.json').name")"
-          version="${{ needs.prepare.outputs.version }}"
+          version="$(node -p "require('./package.json').version")"
+          npm pack --dry-run --ignore-scripts
 
           if npm view "${package_name}@${version}" version >/dev/null 2>&1; then
-            echo "${package_name}@${version} is already published; nothing to do."
-            exit 0
-          fi
-
-          if ! npm publish --access public --provenance; then
-            echo "::error::npm publish failed even though the earlier OIDC exchange preflight succeeded. Inspect the npm output for registry, metadata, provenance, or transient service errors."
-            exit 1
+            echo "${package_name}@${version} is already published; verifying it instead of republishing."
+          else
+            npm publish --access public --provenance
           fi
 
           for attempt in $(seq 1 12); do
             published_version="$(npm view "${package_name}@${version}" version 2>/dev/null || true)"
             if [ "$published_version" = "$version" ]; then
-              echo "Confirmed ${package_name}@${version} on npm."
-              exit 0
+              break
             fi
-            if [ "$attempt" -lt 12 ]; then
-              echo "npm registry has not surfaced ${package_name}@${version} yet; retrying in 5 seconds..."
-              sleep 5
+            if [ "$attempt" -eq 12 ]; then
+              echo "::error::${package_name}@${version} was not visible after one minute."
+              exit 1
             fi
+            sleep 5
           done
 
-          echo "::error::npm publish returned successfully, but ${package_name}@${version} was not visible after one minute of registry checks."
-          exit 1
+      - name: Verify npm provenance points to this exact tag commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          package_name="$(node -p "require('./package.json').name")"
+          version="$(node -p "require('./package.json').version")"
+          attestation_file="$RUNNER_TEMP/npm-attestations.json"
+          slsa_file="$RUNNER_TEMP/npm-slsa.json"
+
+          for attempt in $(seq 1 12); do
+            attestation_url="$(npm view "${package_name}@${version}" dist.attestations.url --json 2>/dev/null | jq -r '. // empty' || true)"
+            if [ -n "$attestation_url" ]; then
+              if curl --fail --silent --show-error "$attestation_url" -o "$attestation_file"; then
+                payload="$(jq -r '.attestations[] | select(.predicateType == "https://slsa.dev/provenance/v1") | .bundle.dsseEnvelope.payload' "$attestation_file" | head -n 1)"
+                if [ -n "$payload" ] && [ "$payload" != "null" ]; then
+                  printf '%s' "$payload" | base64 --decode > "$slsa_file"
+                  break
+                fi
+              fi
+            fi
+            if [ "$attempt" -eq 12 ]; then
+              echo "::error::SLSA provenance was not available after one minute."
+              exit 1
+            fi
+            sleep 5
+          done
+
+          expected_uri="git+https://github.com/${GITHUB_REPOSITORY}@${GITHUB_REF}"
+          jq -e \
+            --arg sha "$GITHUB_SHA" \
+            --arg ref "$GITHUB_REF" \
+            --arg uri "$expected_uri" \
+            '.predicate.buildDefinition.externalParameters.workflow.ref == $ref and
+             any(.predicate.buildDefinition.resolvedDependencies[];
+               .uri == $uri and .digest.gitCommit == $sha)' \
+            "$slsa_file" >/dev/null
+          echo "Verified npm provenance for $GITHUB_REF at $GITHUB_SHA."
 
       - name: Verify fresh npm install and first-run binary bootstrap
         shell: bash
         run: |
           set -euo pipefail
-          version="${{ needs.prepare.outputs.version }}"
+          version="$(node -p "require('./package.json').version")"
           prefix="$RUNNER_TEMP/moondesk-e2e-prefix"
           cache="$RUNNER_TEMP/moondesk-e2e-cache"
           export MOONDESK_BINARY_CACHE_DIR="$cache"
@@ -694,23 +753,24 @@ jobs:
 
           test -s "$RUNNER_TEMP/npm-e2e-export/clippymoon.png"
           test -s "$RUNNER_TEMP/npm-e2e-export/clippymoon.gif"
+          test -s "$cache/moondesk"
+
+          checksums="$RUNNER_TEMP/release-assets/SHA256SUMS"
+          expected_sha="$(awk '$2 == "moondesk-linux-x64" {print $1}' "$checksums")"
+          actual_sha="$(sha256sum "$cache/moondesk" | awk '{print $1}')"
+          test -n "$expected_sha"
+          test "$actual_sha" = "$expected_sha"
 
   cleanup-candidate:
     name: Clean release candidate branch
     if: >-
       always() &&
       needs.prepare.result == 'success' &&
-      needs.prepare.outputs.candidate_branch != '' &&
-      (
-        needs.build.result != 'success' ||
-        needs.release.result == 'success' ||
-        (needs.release.result == 'failure' && needs.release.outputs.refs_published != 'true')
-      )
+      needs.release.result == 'success'
     needs:
       - prepare
       - build
       - release
-      - publish-npm
     runs-on: ubuntu-22.04
     timeout-minutes: 10
     permissions:

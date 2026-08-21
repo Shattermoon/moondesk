@@ -48,7 +48,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          node --check .github/scripts/npm-oidc-preflight.mjs
           node --check npm/moondesk.js
           node --check npm/install-binary.js
           node --test npm/install-binary.test.js
+          node -e "const p=require('./package.json'); const s=p.scripts||{}; if (s.preinstall||s.install||s.postinstall) process.exit(1)"
           npm pack --dry-run --ignore-scripts

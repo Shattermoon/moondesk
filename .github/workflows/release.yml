@@ -702,37 +702,12 @@ jobs:
           set -euo pipefail
           package_name="$(node -p "require('./package.json').name")"
           version="$(node -p "require('./package.json').version")"
-          attestation_file="$RUNNER_TEMP/npm-attestations.json"
-          slsa_file="$RUNNER_TEMP/npm-slsa.json"
-
-          for attempt in $(seq 1 12); do
-            attestation_url="$(npm view "${package_name}@${version}" dist.attestations.url --json 2>/dev/null | jq -r '. // empty' || true)"
-            if [ -n "$attestation_url" ]; then
-              if curl --fail --silent --show-error "$attestation_url" -o "$attestation_file"; then
-                payload="$(jq -r '.attestations[] | select(.predicateType == "https://slsa.dev/provenance/v1") | .bundle.dsseEnvelope.payload' "$attestation_file" | head -n 1)"
-                if [ -n "$payload" ] && [ "$payload" != "null" ]; then
-                  printf '%s' "$payload" | base64 --decode > "$slsa_file"
-                  break
-                fi
-              fi
-            fi
-            if [ "$attempt" -eq 12 ]; then
-              echo "::error::SLSA provenance was not available after one minute."
-              exit 1
-            fi
-            sleep 5
-          done
-
-          expected_uri="git+https://github.com/${GITHUB_REPOSITORY}@${GITHUB_REF}"
-          jq -e \
-            --arg sha "$GITHUB_SHA" \
-            --arg ref "$GITHUB_REF" \
-            --arg uri "$expected_uri" \
-            '.predicate.buildDefinition.externalParameters.workflow.ref == $ref and
-             any(.predicate.buildDefinition.resolvedDependencies[];
-               .uri == $uri and .digest.gitCommit == $sha)' \
-            "$slsa_file" >/dev/null
-          echo "Verified npm provenance for $GITHUB_REF at $GITHUB_SHA."
+          node .github/scripts/verify-npm-provenance.mjs \
+            "$package_name" \
+            "$version" \
+            "$GITHUB_REF" \
+            "$GITHUB_SHA" \
+            "$GITHUB_REPOSITORY"
 
       - name: Verify fresh npm install and first-run binary bootstrap
         shell: bash
@@ -766,7 +741,7 @@ jobs:
     if: >-
       always() &&
       needs.prepare.result == 'success' &&
-      needs.release.result == 'success'
+      needs.prepare.outputs.candidate_branch != ''
     needs:
       - prepare
       - build

@@ -49,6 +49,7 @@ jobs:
         run: |
           set -euo pipefail
           node --check .github/scripts/npm-oidc-preflight.mjs
+          node --check .github/scripts/verify-npm-provenance.mjs
           node --check npm/moondesk.js
           node --check npm/install-binary.js
           node --test npm/install-binary.test.js

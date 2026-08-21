@@ -696,7 +696,21 @@ jobs:
             sleep 5
           done
 
-      - name: Verify npm provenance points to this exact tag commit
+      - name: Authenticate npm signatures and provenance bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          package_name="$(node -p "require('./package.json').name")"
+          version="$(node -p "require('./package.json').version")"
+          audit_dir="$RUNNER_TEMP/npm-signature-audit"
+          rm -rf "$audit_dir"
+          mkdir -p "$audit_dir"
+          printf '%s\n' '{"name":"moondesk-release-verification","private":true}' > "$audit_dir/package.json"
+          cd "$audit_dir"
+          npm install --ignore-scripts --no-audit --no-fund "${package_name}@${version}"
+          npm audit signatures
+
+      - name: Verify authenticated npm provenance points to this exact tag commit
         shell: bash
         run: |
           set -euo pipefail

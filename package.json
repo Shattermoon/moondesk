@@ -6,7 +6,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/Shattermoon/moondesk"
+    "url": "git+https://github.com/Shattermoon/moondesk.git"
   },
   "homepage": "https://github.com/Shattermoon/moondesk#readme",
   "bugs": {

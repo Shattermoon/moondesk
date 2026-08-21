@@ -90,6 +90,8 @@ I tried this with GPT-5.2 before, and the results were poor. However, **GPT-5.4 
 
    MoonDesk does not rely on npm lifecycle/install scripts. On the first `moondesk` run, the small npm wrapper downloads the matching native binary from the GitHub Release, verifies it against that release's `SHA256SUMS`, and stores it in a versioned user cache under `~/.moondesk/npm-bin/`. This works with npm 12's default-deny install-script policy and also keeps the running native executable outside npm's `node_modules`, which makes Windows package upgrades less likely to hit locked-file errors.
 
+   Globally installed npm copies also check `moondesk@latest` in the background. When a newer stable release is available, the Status panel shows the current version and `[u] Update & Restart`. Pressing `u` always opens a confirmation modal first: make sure no ChatGPT/MCP session or command is running because MoonDesk will restart and the active connection will be interrupted. Press `Enter` to continue or `Esc` to abort. The wrapper then installs the exact version that was shown, verifies that npm really replaced the package with that version, restarts MoonDesk in the same working directory with the same arguments, and removes older verified native/update caches on subsequent startup. Multiple MoonDesk processes serialize global npm updates so they do not race each other. Local dependency or `npx` copies never offer in-app self-update.
+
 2. Run MoonDesk from any terminal directory.
 
    ```bash

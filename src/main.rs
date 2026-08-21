@@ -11,6 +11,7 @@ mod process_runner;
 mod server;
 mod state;
 mod theme;
+mod update;
 mod workspace_tools;
 mod workspaces;
 
@@ -49,17 +50,29 @@ const FLOW_LANE_LEFT_LABEL: &str = "Your computer ";
 const REMOTE_CONNECT_UI_GRACE_MS: u128 = 8_000;
 const UI_POLL_INTERVAL: Duration = Duration::from_nanos(1_000_000_000 / 60);
 const CONFIG_FLUSH_INTERVAL: Duration = Duration::from_millis(500);
+const UPDATE_STATE_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+const UPDATE_CONFIRM_SESSION_WARNING: &str =
+    "Make sure no ChatGPT/MCP session or command is currently running.";
+const UPDATE_CONFIRM_CONNECTION_WARNING: &str =
+    "Updating restarts MoonDesk, so the current connection will be lost.";
 const MCP_URL_REVEAL_DURATION: Duration = Duration::from_secs(10);
 const MCP_URL_MASK: &str = "https://▓▓▓▓▓▓▓▓/▓▓▓▓▓▓▓▓/mcp";
 const NGROK_URL_MASK: &str = "https://▓▓▓▓▓▓▓▓";
 const NGROK_DOMAIN_MASK: &str = "▓▓▓▓▓▓▓▓";
 const MCP_URL_REVEAL_BAR_CELLS: usize = 10;
-const STATUS_PANEL_HEIGHT: u16 = TUI_MASCOT_BLOCK_HEIGHT + 4;
+// Reserve one extra row for Version without removing the normal live-flow slot.
+const STATUS_PANEL_HEIGHT: u16 = TUI_MASCOT_BLOCK_HEIGHT + 5;
 const STATUS_LABEL_WIDTH: usize = 19;
 const GPT_5_6_AND_EARLIER_INPUT_USD_PER_1M: f64 = 5.0;
 const GPT_5_6_AND_EARLIER_OUTPUT_USD_PER_1M: f64 = 30.0;
 const PRICE_DISPLAY_DECIMALS: usize = 6;
 const NGROK_SETUP_URL: &str = "https://dashboard.ngrok.com/get-started/setup";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum AppExit {
+    Quit,
+    UpdateRestart(String),
+}
 
 // ── Selection ───────────────────────────────────────────────
 
@@ -1485,7 +1498,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     state.lock().await.clear_remote_connection_state();
 
-    result
+    match result {
+        Ok(AppExit::Quit) => Ok(()),
+        Ok(AppExit::UpdateRestart(target_version)) => {
+            update::write_update_request(&target_version)?;
+            std::process::exit(update::UPDATE_EXIT_CODE);
+        }
+        Err(error) => Err(error),
+    }
 }
 
 // ── Phase 1: Mode selection ─────────────────────────────────
@@ -1493,7 +1513,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn run_app(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     state: SharedState,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<AppExit, Box<dyn std::error::Error>> {
     // Draw mode selection screen
     loop {
         let (current_theme, current_tool_mode) = {
@@ -1512,7 +1532,7 @@ async fn run_app(
                 KeyCode::Char('1') => Mode::Computer,
                 KeyCode::Char('2') => Mode::Browser,
                 KeyCode::Char('3') => Mode::Both,
-                KeyCode::Char('q') => return Ok(()),
+                KeyCode::Char('q') => return Ok(AppExit::Quit),
                 KeyCode::Char('w') => {
                     run_workspaces(terminal, state.clone()).await?;
                     continue;
@@ -1536,18 +1556,18 @@ async fn run_app(
     if mode_is_browser_enabled(state.clone()).await {
         let continue_run = run_browser_select(terminal, state.clone()).await?;
         if !continue_run {
-            return Ok(());
+            return Ok(AppExit::Quit);
         }
     }
 
     let continue_run = run_ngrok_auth_setup(terminal, state.clone()).await?;
     if !continue_run {
-        return Ok(());
+        return Ok(AppExit::Quit);
     }
 
     let continue_run = run_ngrok_domain_setup(terminal, state.clone()).await?;
     if !continue_run {
-        return Ok(());
+        return Ok(AppExit::Quit);
     }
 
     if let Err(error) = flush_config(&state, true).await {
@@ -1588,7 +1608,7 @@ fn draw_mode_select(f: &mut Frame, theme: &theme::ThemeDef, tool_mode: ToolMode)
         ])
         .split(area);
 
-    let header = Paragraph::new("  MoonDesk - Turns ChatGPT Web into a coding agent =w=")
+    let header = Paragraph::new("  MoonDesk - Turns ChatGPT Web into a coding agent")
         .style(
             Style::default()
                 .fg(palette.header_fg)
@@ -4364,7 +4384,7 @@ async fn run_tui(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     state: SharedState,
     mut ui_events: UiEventReceiver,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<AppExit, Box<dyn std::error::Error>> {
     let mut log_scroll: usize = 0;
     let mut log_follow_tail = true;
     let mut command_scroll: usize = 0;
@@ -4397,6 +4417,9 @@ async fn run_tui(
     let mut log_ngrok_url_revealed_until: Option<Instant> = None;
     let mut log_ngrok_domain_revealed_until: Option<Instant> = None;
     let mut last_config_flush = Instant::now();
+    let mut update_info = update::available_update();
+    let mut last_update_refresh = Instant::now();
+    let mut exit = AppExit::Quit;
 
     loop {
         let app = {
@@ -4413,6 +4436,10 @@ async fn run_tui(
                     .log("WARN", format!("Failed to persist config: {error}"));
             }
             last_config_flush = Instant::now();
+        }
+        if last_update_refresh.elapsed() >= UPDATE_STATE_REFRESH_INTERVAL {
+            update_info = update::available_update();
+            last_update_refresh = Instant::now();
         }
         {
             let reveal_remaining = mcp_url_revealed_until
@@ -4464,6 +4491,7 @@ async fn run_tui(
                     f,
                     UiRenderContext {
                         app: &app,
+                        update_info: update_info.as_ref(),
                         log_scroll,
                         log_follow_tail,
                         command_scroll,
@@ -4574,6 +4602,15 @@ async fn run_tui(
                         KeyCode::Char('q') => break,
                         KeyCode::Char('w') => {
                             run_workspaces(terminal, state.clone()).await?;
+                        }
+                        KeyCode::Char('u') if update_info.is_some() => {
+                            let Some(selected_update) = update_info.clone() else {
+                                continue;
+                            };
+                            if run_update_confirm(terminal, &state, &selected_update).await? {
+                                exit = AppExit::UpdateRestart(selected_update.latest_version);
+                                break;
+                            }
                         }
                         KeyCode::Tab | KeyCode::BackTab => {
                             if bottom_panel_areas.shell_commands.is_some() {
@@ -5043,13 +5080,132 @@ async fn run_tui(
             format!("Failed to persist config on shutdown: {error}"),
         );
     }
-    Ok(())
+    Ok(exit)
+}
+
+fn update_confirm_action(code: KeyCode) -> Option<bool> {
+    match code {
+        KeyCode::Enter => Some(true),
+        KeyCode::Esc => Some(false),
+        _ => None,
+    }
+}
+
+async fn run_update_confirm(
+    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    state: &SharedState,
+    update_info: &update::UpdateInfo,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    loop {
+        let (theme, active_commands) = {
+            let app = state.lock().await;
+            let active_commands = app
+                .command_activities
+                .iter()
+                .filter(|activity| activity.state == CommandActivityState::Running)
+                .count();
+            (app.current_theme(), active_commands)
+        };
+
+        terminal.draw(|f| draw_update_confirm(f, theme, update_info, active_commands))?;
+        if !event::poll(UI_POLL_INTERVAL)? {
+            continue;
+        }
+        if let Event::Key(key) = event::read()? {
+            if key.kind != KeyEventKind::Press {
+                continue;
+            }
+            if let Some(confirmed) = update_confirm_action(key.code) {
+                return Ok(confirmed);
+            }
+        }
+    }
+}
+
+fn draw_update_confirm(
+    f: &mut Frame,
+    theme: &theme::ThemeDef,
+    update_info: &update::UpdateInfo,
+    active_commands: usize,
+) {
+    let palette = theme.palette;
+    let area = centered_rect(78, 13, f.area());
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .title(" Update MoonDesk ")
+        .borders(Borders::ALL)
+        .border_type(palette.border_type)
+        .border_style(Style::default().fg(palette.warning_fg));
+    let inner = block.inner(area).inner(Margin {
+        horizontal: 2,
+        vertical: 1,
+    });
+    f.render_widget(block, area);
+
+    let mut lines = vec![
+        Line::from(Span::styled(
+            format!(
+                "MoonDesk {}  →  {}",
+                update_info.current_version, update_info.latest_version
+            ),
+            Style::default()
+                .fg(palette.title_fg)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            UPDATE_CONFIRM_SESSION_WARNING,
+            Style::default()
+                .fg(palette.warning_fg)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            UPDATE_CONFIRM_CONNECTION_WARNING,
+            Style::default().fg(palette.primary_fg),
+        )),
+        Line::from(Span::styled(
+            "After the exact new version is installed, MoonDesk will restart here.",
+            Style::default().fg(palette.primary_fg),
+        )),
+        Line::from(""),
+    ];
+    if active_commands > 0 {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "Detected now: {active_commands} active command{} will be stopped.",
+                if active_commands == 1 { "" } else { "s" }
+            ),
+            Style::default()
+                .fg(palette.danger_fg)
+                .add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(""));
+    }
+    lines.push(Line::from(vec![
+        Span::styled(
+            "[Enter]",
+            Style::default()
+                .fg(palette.success_fg)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" Continue with Update & Restart    "),
+        Span::styled(
+            "[Esc]",
+            Style::default()
+                .fg(palette.danger_fg)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" Abort"),
+    ]));
+
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 
 // ── Draw main UI ────────────────────────────────────────────
 
 struct UiRenderContext<'a> {
     app: &'a UiSnapshot,
+    update_info: Option<&'a update::UpdateInfo>,
     log_scroll: usize,
     log_follow_tail: bool,
     command_scroll: usize,
@@ -5073,6 +5229,7 @@ struct UiRenderContext<'a> {
 fn draw_ui(f: &mut Frame, context: UiRenderContext<'_>) {
     let UiRenderContext {
         app,
+        update_info,
         log_scroll,
         log_follow_tail,
         command_scroll,
@@ -5124,7 +5281,7 @@ fn draw_ui(f: &mut Frame, context: UiRenderContext<'_>) {
         .split(area);
 
     // ── Header ──
-    let header = Paragraph::new("  MoonDesk - Turns ChatGPT Web into a coding agent =w=")
+    let header = Paragraph::new("  MoonDesk - Turns ChatGPT Web into a coding agent")
         .style(
             Style::default()
                 .fg(palette.header_fg)
@@ -5255,7 +5412,35 @@ fn draw_ui(f: &mut Frame, context: UiRenderContext<'_>) {
         &all_time_usage_totals,
         all_time_usage_cost_usd,
     );
+    let version_line = {
+        let mut spans = vec![
+            status_label("Version"),
+            Span::styled(
+                update::CURRENT_VERSION.to_string(),
+                Style::default()
+                    .fg(palette.secondary_fg)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ];
+        if let Some(update) = update_info {
+            spans.push(Span::styled("  ·  ", Style::default().fg(palette.muted_fg)));
+            spans.push(Span::styled(
+                format!("v{} available", update.latest_version),
+                Style::default()
+                    .fg(palette.warning_fg)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::styled(
+                "  [u] Update & Restart",
+                Style::default()
+                    .fg(palette.key_fg)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        Line::from(spans)
+    };
     let mut status_lines: Vec<Line> = vec![
+        version_line,
         Line::from(vec![
             status_label("Mode"),
             Span::styled(
@@ -5701,7 +5886,7 @@ fn draw_ui(f: &mut Frame, context: UiRenderContext<'_>) {
     };
 
     // ── Keys / bottom-pane focus ──
-    let key_spans = vec![
+    let mut key_spans = vec![
         Span::styled("  [q]", Style::default().fg(palette.danger_fg)),
         Span::raw(" Quit  "),
         Span::styled("[w]", Style::default().fg(palette.key_fg)),
@@ -5722,6 +5907,16 @@ fn draw_ui(f: &mut Frame, context: UiRenderContext<'_>) {
         Span::styled("[Home/End]", Style::default().fg(palette.key_fg)),
         Span::raw(" First/Latest"),
     ];
+    if update_info.is_some() {
+        key_spans.push(Span::raw("  "));
+        key_spans.push(Span::styled(
+            "[u]",
+            Style::default()
+                .fg(palette.warning_fg)
+                .add_modifier(Modifier::BOLD),
+        ));
+        key_spans.push(Span::raw(" Update & Restart"));
+    }
     let keys = Paragraph::new(Line::from(key_spans)).block(
         Block::default()
             .title(Line::from(vec![
@@ -6111,16 +6306,17 @@ fn draw_ui(f: &mut Frame, context: UiRenderContext<'_>) {
 mod tests {
     use super::{
         BottomPanelAreas, BottomPanelFocus, PanelItemHit, PanelScrollView, WorkspaceHitAreas,
-        WorkspaceUiAction, item_under_cursor, key_is_clipboard_paste, move_panel_selection,
-        normalize_ngrok_authtoken_input, normalize_ngrok_domain, normalize_workspace_path_input,
-        panel_under_cursor, parse_clippymoon_export_args, parse_port_value, scroll_panel_down,
-        scroll_panel_up, tail_start_index, truncate_with_ellipsis, user_home_dir,
-        workspace_action_from_event, workspace_detail_sections, wrap_preserving_chars,
+        WorkspaceUiAction, draw_update_confirm, item_under_cursor, key_is_clipboard_paste,
+        move_panel_selection, normalize_ngrok_authtoken_input, normalize_ngrok_domain,
+        normalize_workspace_path_input, panel_under_cursor, parse_clippymoon_export_args,
+        parse_port_value, scroll_panel_down, scroll_panel_up, tail_start_index,
+        truncate_with_ellipsis, update_confirm_action, user_home_dir, workspace_action_from_event,
+        workspace_detail_sections, wrap_preserving_chars,
     };
     use crossterm::event::{
         Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     };
-    use ratatui::layout::Rect;
+    use ratatui::{Terminal, backend::TestBackend, layout::Rect};
     use std::path::PathBuf;
 
     #[test]
@@ -6472,5 +6668,45 @@ mod tests {
         assert_eq!(selected, Some(4));
         move_panel_selection(&mut selected, 0, -1);
         assert_eq!(selected, None);
+    }
+    #[test]
+    fn update_confirmation_only_accepts_enter_or_escape() {
+        assert_eq!(update_confirm_action(KeyCode::Enter), Some(true));
+        assert_eq!(update_confirm_action(KeyCode::Esc), Some(false));
+        assert_eq!(update_confirm_action(KeyCode::Char('q')), None);
+        assert_eq!(update_confirm_action(KeyCode::Char('u')), None);
+    }
+
+    #[test]
+    fn update_confirmation_warns_that_sessions_disconnect_before_proceeding() {
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).expect("create update confirmation terminal");
+        let theme = super::theme::resolve(super::theme::DEFAULT_THEME_ID);
+        let update_info = super::update::UpdateInfo {
+            current_version: "1.2.3".into(),
+            latest_version: "1.2.4".into(),
+        };
+
+        terminal
+            .draw(|frame| draw_update_confirm(frame, theme, &update_info, 2))
+            .expect("render update confirmation");
+
+        let buffer = terminal.backend().buffer();
+        let mut rendered = String::new();
+        for row in 0..30 {
+            for column in 0..120 {
+                rendered.push_str(buffer[(column, row)].symbol());
+            }
+            rendered.push('\n');
+        }
+
+        assert!(rendered.contains("Make sure no ChatGPT/MCP session or command is currently"));
+        assert!(
+            rendered
+                .contains("Updating restarts MoonDesk, so the current connection will be lost.")
+        );
+        assert!(rendered.contains("Detected now: 2 active commands will be stopped."));
+        assert!(rendered.contains("[Enter] Continue with Update & Restart"));
+        assert!(rendered.contains("[Esc] Abort"));
     }
 }

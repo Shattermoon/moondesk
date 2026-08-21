@@ -299,10 +299,13 @@ jobs:
           node --check .github/scripts/npm-oidc-preflight.mjs
           node --check npm/moondesk.js
           node --check npm/install-binary.js
-          node --test npm/install-binary.test.js
+          node --check npm/update-manager.js
+          node --check .github/scripts/verify-npm-package.mjs
+          node --test npm/install-binary.test.js npm/update-manager.test.js npm/moondesk.test.js
           test "$(node -p "require('./package.json').repository.url")" = "git+https://github.com/Shattermoon/moondesk.git"
           node -e "const p=require('./package.json'); const s=p.scripts||{}; if (s.preinstall||s.install||s.postinstall) process.exit(1)"
-          npm pack --dry-run --ignore-scripts
+          node -e "const p=require('./package.json'); for (const f of ['npm/moondesk.js','npm/install-binary.js','npm/update-manager.js']) if (!p.files?.includes(f)) throw new Error('missing packaged runtime file: '+f)"
+          node .github/scripts/verify-npm-package.mjs
 
       - name: Plan and apply new release version
         id: version
@@ -324,8 +327,8 @@ jobs:
           test "$(node -p "require('./package.json').version")" = "$expected"
           grep -q "^version = \"$expected\"$" Cargo.toml
           cargo +stable check --locked
-          node --test npm/install-binary.test.js
-          npm pack --dry-run --ignore-scripts
+          node --test npm/install-binary.test.js npm/update-manager.test.js npm/moondesk.test.js
+          node .github/scripts/verify-npm-package.mjs
 
       - name: Create tested release candidate
         id: candidate
@@ -620,8 +623,10 @@ jobs:
           test "$GITHUB_REF_NAME" = "v${version}"
           grep -q "^version = \"${version}\"$" Cargo.toml
           test -f npm/install-binary.js
+          test -f npm/update-manager.js
           test ! -e npm/postinstall.js
           node -e "const p=require('./package.json'); const s=p.scripts||{}; if (s.preinstall||s.install||s.postinstall) process.exit(1)"
+          node -e "const p=require('./package.json'); for (const f of ['npm/moondesk.js','npm/install-binary.js','npm/update-manager.js']) if (!p.files?.includes(f)) throw new Error('missing packaged runtime file: '+f)"
           test "$(node -p "require('./package.json').repository.url")" = "git+https://github.com/Shattermoon/moondesk.git"
 
           git fetch origin --tags "refs/heads/main:refs/remotes/origin/main"
@@ -676,7 +681,7 @@ jobs:
           set -euo pipefail
           package_name="$(node -p "require('./package.json').name")"
           version="$(node -p "require('./package.json').version")"
-          npm pack --dry-run --ignore-scripts
+          node .github/scripts/verify-npm-package.mjs
 
           if npm view "${package_name}@${version}" version >/dev/null 2>&1; then
             echo "${package_name}@${version} is already published; verifying it instead of republishing."

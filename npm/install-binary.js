@@ -44,12 +44,70 @@ function resolveTarget(platform = process.platform, arch = process.arch) {
   };
 }
 
+function defaultBinaryCacheRoot() {
+  return path.join(os.homedir(), ".moondesk", "npm-bin");
+}
+
 function defaultInstallDir(target) {
   if (process.env.MOONDESK_BINARY_CACHE_DIR) {
     return path.resolve(process.env.MOONDESK_BINARY_CACHE_DIR);
   }
 
-  return path.join(os.homedir(), ".moondesk", "npm-bin", releaseTag, target);
+  return path.join(defaultBinaryCacheRoot(), releaseTag, target);
+}
+
+function stableTagParts(tag) {
+  const match = tag.match(/^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/);
+  return match ? match.slice(1).map((part) => BigInt(part)) : null;
+}
+
+function stableTagIsOlder(candidate, current) {
+  const left = stableTagParts(candidate);
+  const right = stableTagParts(current);
+  if (!left || !right) return false;
+  for (let index = 0; index < 3; index += 1) {
+    if (left[index] < right[index]) return true;
+    if (left[index] > right[index]) return false;
+  }
+  return false;
+}
+
+function cleanupOldBinaryVersions(options = {}) {
+  if (process.env.MOONDESK_BINARY_CACHE_DIR && !options.cacheRoot) {
+    return { removed: [], skipped: [] };
+  }
+
+  const cacheRoot = options.cacheRoot ?? defaultBinaryCacheRoot();
+  const keepTag = options.keepTag ?? releaseTag;
+  const removed = [];
+  const skipped = [];
+
+  let entries;
+  try {
+    entries = fs.readdirSync(cacheRoot, { withFileTypes: true });
+  } catch (error) {
+    if (error.code === "ENOENT") {
+      return { removed, skipped };
+    }
+    throw error;
+  }
+
+  for (const entry of entries) {
+    if (!entry.isDirectory() || !stableTagIsOlder(entry.name, keepTag)) {
+      continue;
+    }
+    const stalePath = path.join(cacheRoot, entry.name);
+    try {
+      fs.rmSync(stalePath, { recursive: true, force: true, maxRetries: 2, retryDelay: 100 });
+      removed.push(entry.name);
+    } catch {
+      // Another still-running MoonDesk process may hold an older Windows binary open.
+      // Leave it in place and retry on the next managed launch.
+      skipped.push(entry.name);
+    }
+  }
+
+  return { removed, skipped };
 }
 
 async function fetchRequired(fetchImpl, url, maxBytes, timeoutMs = METADATA_TIMEOUT_MS) {
@@ -331,6 +389,7 @@ async function ensureBinary(options = {}) {
 }
 
 module.exports = {
+  cleanupOldBinaryVersions,
   ensureBinary,
   expectedSha256,
   resolveTarget,

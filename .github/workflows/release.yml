@@ -51,18 +51,6 @@ jobs:
           registry-url: https://registry.npmjs.org
           package-manager-cache: false
 
-      - name: Verify bootstrap npm token when configured
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [ -z "${NODE_AUTH_TOKEN:-}" ]; then
-            echo "NPM_TOKEN is not configured; npm publishing must use Trusted Publishing/OIDC."
-            exit 0
-          fi
-          npm whoami --registry=https://registry.npmjs.org/
-
       - name: Install Rust
         run: rustup toolchain install stable --profile minimal --component rustfmt --component clippy
 
@@ -335,9 +323,7 @@ jobs:
           test "$(node -p "require('./package.json').version")" = "${{ needs.prepare.outputs.version }}"
           npm pack --dry-run --ignore-scripts
 
-      - name: Publish to npm
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - name: Publish to npm with Trusted Publishing
         shell: bash
         run: |
           set -euo pipefail
@@ -350,7 +336,7 @@ jobs:
           fi
 
           if ! npm publish --access public; then
-            echo "::error::npm publish failed. For the first MoonDesk publication, add a repository secret named NPM_TOKEN with publish permission. After the package exists, configure npm Trusted Publishing for Shattermoon/moondesk + release.yml and the workflow will publish through OIDC without a long-lived token."
+            echo "::error::npm Trusted Publishing failed. Verify the npm trusted publisher is GitHub Actions / Shattermoon / moondesk / release.yml and that this job retains id-token: write."
             exit 1
           fi
 

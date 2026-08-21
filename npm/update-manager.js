@@ -352,7 +352,11 @@ function startUpdateMonitor(options = {}) {
       // Update checks are optional. Offline/npm/registry failures must never affect MoonDesk startup.
     } finally {
       if (stopped) {
-        fs.rmSync(statePath, { force: true });
+        try {
+          fs.rmSync(statePath, { force: true });
+        } catch {
+          // Removing ephemeral update state must never fail MoonDesk.
+        }
       }
       controller = null;
       checking = false;

@@ -412,6 +412,7 @@ test("self-update path failures disable updates without blocking MoonDesk startu
     assert.equal(monitorStarted, false);
     assert.equal(warnings.length, 1);
     assert.match(warnings[0], /disabled in-app self-update/);
+    assert.match(warnings[0], /read-only home/);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

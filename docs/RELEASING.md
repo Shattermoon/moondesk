@@ -4,7 +4,9 @@ MoonDesk releases are built and published by `.github/workflows/release.yml`.
 
 ## What happens after a merge to `main`
 
-A normal push to `main` (including a merged PR) starts the release workflow. Release commits created by GitHub Actions are ignored so the workflow cannot recursively release itself.
+The release workflow listens only for a pull request being **closed against `main`**, and its release jobs run only when GitHub reports that pull request as **merged**. Opening a PR, pushing review updates, requesting review, approving it, or closing it without merging does not execute the release pipeline. Direct pushes to `main` also do not trigger a release. GitHub Actions release commits therefore cannot recursively release themselves.
+
+The workflow uses `pull_request_target` for the post-merge event so a merged PR from a fork can still use the repository's release permissions. It never builds the untrusted PR head: after `merged == true`, it checks out the exact `merge_commit_sha` that GitHub says landed in `main`, verifies that SHA is now an ancestor of `origin/main`, and only then validates/builds it.
 
 The pipeline:
 
@@ -36,7 +38,7 @@ After a release tag exists, automatic releases inspect commits since the latest 
 - `feat:` -> minor;
 - everything else -> patch.
 
-The workflow can also be started manually from GitHub Actions with an explicit `patch`, `minor`, or `major` bump.
+A merged PR may explicitly choose the bump by carrying exactly one of these labels before merge: `release:patch`, `release:minor`, or `release:major`. With no release label, the workflow uses the conventional-commit rules above. Conflicting release bump labels fail the release before any candidate is published.
 
 `package.json`, `Cargo.toml`, and the root `moondesk` entry in `Cargo.lock` are kept at the same version. The Rust binary embeds `CARGO_PKG_VERSION`, so the binaries are compiled from the versioned release-candidate commit rather than from an unversioned merge checkout.
 
@@ -55,11 +57,11 @@ The npm Trusted Publisher must be configured as:
 
 The publish job deliberately does not read or inject an `NPM_TOKEN`. It uses a GitHub-hosted runner, Node 24, npm 12, and `id-token: write`, so npm authenticates the exact `Shattermoon/moondesk` workflow through OIDC. If a version is already present on npm, the job treats it as idempotently complete instead of attempting to republish an immutable npm version.
 
-After Trusted Publishing has been verified with a real release, first confirm the repository and release workflow have no remaining `NPM_TOKEN` or `NODE_AUTH_TOKEN` consumers. Then remove the old `NPM_TOKEN` GitHub secret and revoke the corresponding granular npm access token. Set npm package publishing access to the most restrictive **Require two-factor authentication and disallow bypass 2FA tokens** option. Trusted Publishing remains compatible because it authenticates through OIDC rather than a traditional npm publishing token.
+Trusted Publishing has been verified with a real npm release and the release workflow has no `NPM_TOKEN` or `NODE_AUTH_TOKEN` consumer. The obsolete GitHub Actions `NPM_TOKEN` secret has been removed. The corresponding granular npm access token must also be revoked in npm account settings once it is no longer needed anywhere else. Package publishing access should stay on the most restrictive **Require two-factor authentication and disallow bypass 2FA tokens** option. Trusted Publishing remains compatible because it authenticates through OIDC rather than a traditional npm publishing token.
 
 ## Recovery
 
-The release workflow also supports manual dispatch from GitHub Actions. Candidate branches are temporary. They are cleaned after a build failure, when the release stops before publishing refs (for example because `main` advanced), or after the tested release refs have been published successfully. If publishing the release refs succeeds but GitHub Release creation itself fails, the candidate branch is intentionally retained so a rerun can recover from the exact tested commit.
+The release workflow intentionally has no manual-dispatch or review-time release trigger: normal releases originate only from a merged PR into `main`. Candidate branches are temporary. They are cleaned after a build failure, when the release stops before publishing refs (for example because `main` advanced), or after the tested release refs have been published successfully. If publishing the release refs succeeds but GitHub Release creation itself fails, the candidate branch is intentionally retained so GitHub's **Re-run failed jobs** action can recover from the exact tested commit and event payload without creating a second release source.
 
 If a matrix build fails, no release tag, GitHub Release, or npm version is created.
 

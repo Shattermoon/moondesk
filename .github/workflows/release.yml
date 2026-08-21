@@ -1,21 +1,11 @@
 name: Release
 
 on:
-  push:
+  pull_request_target:
     branches:
       - main
-  workflow_dispatch:
-    inputs:
-      bump:
-        description: Version bump to use (auto follows conventional commit messages)
-        required: true
-        default: auto
-        type: choice
-        options:
-          - auto
-          - patch
-          - minor
-          - major
+    types:
+      - closed
 
 concurrency:
   group: release-main
@@ -27,7 +17,7 @@ permissions:
 jobs:
   prepare:
     name: Validate and prepare release candidate
-    if: github.event_name == 'workflow_dispatch' || github.actor != 'github-actions[bot]'
+    if: github.event.pull_request.merged == true
     runs-on: ubuntu-22.04
     timeout-minutes: 30
     permissions:
@@ -42,8 +32,18 @@ jobs:
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
           fetch-depth: 0
+
+      - name: Verify merged-main trigger
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "${{ github.event.pull_request.merged }}" = "true"
+          test "${{ github.event.pull_request.base.ref }}" = "main"
+          test "$(git rev-parse HEAD)" = "${{ github.event.pull_request.merge_commit_sha }}"
+          git fetch origin "refs/heads/main:refs/remotes/origin/main"
+          git merge-base --is-ancestor HEAD origin/main
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
@@ -69,14 +69,45 @@ jobs:
           cargo +stable test --locked
           npm pack --dry-run --ignore-scripts
 
-      - name: Plan and apply release version
-        id: version
+      - name: Select release bump from merged PR
+        id: bump
         env:
-          REQUESTED_BUMP: ${{ inputs.bump }}
+          RELEASE_PATCH: ${{ contains(github.event.pull_request.labels.*.name, 'release:patch') }}
+          RELEASE_MINOR: ${{ contains(github.event.pull_request.labels.*.name, 'release:minor') }}
+          RELEASE_MAJOR: ${{ contains(github.event.pull_request.labels.*.name, 'release:major') }}
         shell: bash
         run: |
           set -euo pipefail
-          bump="${REQUESTED_BUMP:-auto}"
+          count=0
+          bump="auto"
+
+          if [ "$RELEASE_PATCH" = "true" ]; then
+            count=$((count + 1))
+            bump="patch"
+          fi
+          if [ "$RELEASE_MINOR" = "true" ]; then
+            count=$((count + 1))
+            bump="minor"
+          fi
+          if [ "$RELEASE_MAJOR" = "true" ]; then
+            count=$((count + 1))
+            bump="major"
+          fi
+
+          if [ "$count" -gt 1 ]; then
+            echo "::error::Use at most one release bump label: release:patch, release:minor, or release:major."
+            exit 1
+          fi
+
+          echo "bump=$bump" >> "$GITHUB_OUTPUT"
+          echo "Release bump: $bump"
+
+      - name: Plan and apply release version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          bump="${{ steps.bump.outputs.bump }}"
           version="$(node .github/scripts/release-version.mjs --bump "$bump" --apply)"
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "tag=v$version" >> "$GITHUB_OUTPUT"

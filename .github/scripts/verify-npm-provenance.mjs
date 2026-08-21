@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 
+// This script validates source claims after the workflow has authenticated the
+// package's registry signatures and Sigstore attestations with `npm audit signatures`.
 const [packageName, version, expectedRef, expectedSha, repository] = process.argv.slice(2);
 
 if (!packageName || !version || !expectedRef || !expectedSha || !repository) {

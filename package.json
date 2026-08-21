@@ -18,6 +18,7 @@
   "files": [
     "npm/moondesk.js",
     "npm/install-binary.js",
+    "npm/update-manager.js",
     "LICENSE",
     "README.md"
   ],

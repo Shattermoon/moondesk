@@ -52,6 +52,36 @@ jobs:
           node --check .github/scripts/verify-npm-provenance.mjs
           node --check npm/moondesk.js
           node --check npm/install-binary.js
-          node --test npm/install-binary.test.js
+          node --check npm/update-manager.js
+          node --check .github/scripts/verify-npm-package.mjs
+          node --test npm/install-binary.test.js npm/update-manager.test.js npm/moondesk.test.js
           node -e "const p=require('./package.json'); const s=p.scripts||{}; if (s.preinstall||s.install||s.postinstall) process.exit(1)"
-          npm pack --dry-run --ignore-scripts
+          node -e "const p=require('./package.json'); for (const f of ['npm/moondesk.js','npm/install-binary.js','npm/update-manager.js']) if (!p.files?.includes(f)) throw new Error('missing packaged runtime file: '+f)"
+          node .github/scripts/verify-npm-package.mjs
+
+  npm-runtime:
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.draft == false
+    name: npm runtime (Node ${{ matrix.node-version }})
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: [18, 24]
+
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      - name: Verify supported npm runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --check npm/moondesk.js
+          node --check npm/install-binary.js
+          node --check npm/update-manager.js
+          node --test npm/install-binary.test.js npm/update-manager.test.js npm/moondesk.test.js

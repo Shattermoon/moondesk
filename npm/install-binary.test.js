@@ -6,6 +6,7 @@ const path = require("node:path");
 const test = require("node:test");
 
 const {
+  cleanupOldBinaryVersions,
   ensureBinary,
   resolveTarget,
   sha256Buffer,
@@ -207,6 +208,43 @@ test("a corrupt abandoned install lock is recovered immediately", async () => {
     assert.equal(fs.readFileSync(binaryPath).compare(binary), 0);
     assert.ok(Date.now() - startedAt < 5_000, "lock recovery should not wait for the normal lock timeout");
   } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("cleanupOldBinaryVersions removes stale version caches and keeps the active version", () => {
+  const dir = tempDir();
+  try {
+    for (const tag of ["v0.1.1", "v0.1.2", "v0.1.3", "v9.0.0", "notes"]) {
+      fs.mkdirSync(path.join(dir, tag), { recursive: true });
+      fs.writeFileSync(path.join(dir, tag, "marker"), tag);
+    }
+
+    const result = cleanupOldBinaryVersions({ cacheRoot: dir, keepTag: "v0.1.3" });
+    assert.deepEqual(result.skipped, []);
+    assert.deepEqual(result.removed.sort(), ["v0.1.1", "v0.1.2"]);
+    assert.equal(fs.existsSync(path.join(dir, "v0.1.1")), false);
+    assert.equal(fs.existsSync(path.join(dir, "v0.1.2")), false);
+    assert.equal(fs.existsSync(path.join(dir, "v0.1.3")), true);
+    assert.equal(fs.existsSync(path.join(dir, "v9.0.0")), true, "newer caches are not deleted during a downgrade");
+    assert.equal(fs.existsSync(path.join(dir, "notes")), true, "non-version directories are untouched");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("cleanupOldBinaryVersions never touches an explicitly overridden cache directory", () => {
+  const dir = tempDir();
+  const previous = process.env.MOONDESK_BINARY_CACHE_DIR;
+  process.env.MOONDESK_BINARY_CACHE_DIR = dir;
+  try {
+    fs.mkdirSync(path.join(dir, "v0.0.1"), { recursive: true });
+    const result = cleanupOldBinaryVersions();
+    assert.deepEqual(result, { removed: [], skipped: [] });
+    assert.equal(fs.existsSync(path.join(dir, "v0.0.1")), true);
+  } finally {
+    if (previous === undefined) delete process.env.MOONDESK_BINARY_CACHE_DIR;
+    else process.env.MOONDESK_BINARY_CACHE_DIR = previous;
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });

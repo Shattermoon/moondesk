@@ -4,6 +4,7 @@ const crypto = require("node:crypto");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
+const { compareStableVersions, parseStableVersion } = require("./update-manager");
 
 const packageRoot = path.resolve(__dirname, "..");
 const packageJson = require(path.join(packageRoot, "package.json"));
@@ -44,12 +45,62 @@ function resolveTarget(platform = process.platform, arch = process.arch) {
   };
 }
 
+function defaultBinaryCacheRoot() {
+  return path.join(os.homedir(), ".moondesk", "npm-bin");
+}
+
 function defaultInstallDir(target) {
   if (process.env.MOONDESK_BINARY_CACHE_DIR) {
     return path.resolve(process.env.MOONDESK_BINARY_CACHE_DIR);
   }
 
-  return path.join(os.homedir(), ".moondesk", "npm-bin", releaseTag, target);
+  return path.join(defaultBinaryCacheRoot(), releaseTag, target);
+}
+
+function stableTagIsOlder(candidate, current) {
+  if (!candidate.startsWith("v") || !current.startsWith("v")) return false;
+  const candidateVersion = candidate.slice(1);
+  const currentVersionText = current.slice(1);
+  if (!parseStableVersion(candidateVersion) || !parseStableVersion(currentVersionText)) return false;
+  return compareStableVersions(candidateVersion, currentVersionText) < 0;
+}
+
+function cleanupOldBinaryVersions(options = {}) {
+  if (process.env.MOONDESK_BINARY_CACHE_DIR && !options.cacheRoot) {
+    return { removed: [], skipped: [] };
+  }
+
+  const cacheRoot = options.cacheRoot ?? defaultBinaryCacheRoot();
+  const keepTag = options.keepTag ?? releaseTag;
+  const removed = [];
+  const skipped = [];
+
+  let entries;
+  try {
+    entries = fs.readdirSync(cacheRoot, { withFileTypes: true });
+  } catch (error) {
+    if (error.code === "ENOENT") {
+      return { removed, skipped };
+    }
+    throw error;
+  }
+
+  for (const entry of entries) {
+    if (!entry.isDirectory() || !stableTagIsOlder(entry.name, keepTag)) {
+      continue;
+    }
+    const stalePath = path.join(cacheRoot, entry.name);
+    try {
+      fs.rmSync(stalePath, { recursive: true, force: true, maxRetries: 2, retryDelay: 100 });
+      removed.push(entry.name);
+    } catch {
+      // Another still-running MoonDesk process may hold an older Windows binary open.
+      // Leave it in place and retry on the next managed launch.
+      skipped.push(entry.name);
+    }
+  }
+
+  return { removed, skipped };
 }
 
 async function fetchRequired(fetchImpl, url, maxBytes, timeoutMs = METADATA_TIMEOUT_MS) {
@@ -331,6 +382,7 @@ async function ensureBinary(options = {}) {
 }
 
 module.exports = {
+  cleanupOldBinaryVersions,
   ensureBinary,
   expectedSha256,
   resolveTarget,

@@ -1,11 +1,9 @@
 name: Release
 
 on:
-  pull_request_target:
+  push:
     branches:
       - main
-    types:
-      - closed
 
 concurrency:
   group: release-main
@@ -15,9 +13,278 @@ permissions:
   contents: read
 
 jobs:
+  gate:
+    name: Verify merged PR release source
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      should_release: ${{ steps.source.outputs.should_release }}
+      pr_number: ${{ steps.source.outputs.pr_number }}
+      bump: ${{ steps.source.outputs.bump }}
+
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Prove main push came from a merged pull request
+        id: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "should_release=false" >> "$GITHUB_OUTPUT"
+          echo "pr_number=" >> "$GITHUB_OUTPUT"
+          echo "bump=auto" >> "$GITHUB_OUTPUT"
+
+          test "$GITHUB_EVENT_NAME" = "push"
+          test "$GITHUB_REF" = "refs/heads/main"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+
+          git fetch origin "refs/heads/main:refs/remotes/origin/main"
+          current_main="$(git rev-parse origin/main)"
+          if [ "$current_main" != "$GITHUB_SHA" ]; then
+            echo "main already advanced to $current_main; this older push will not release."
+            exit 0
+          fi
+
+          pulls_json="$(gh api \
+            -H 'Accept: application/vnd.github+json' \
+            "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/pulls")"
+
+          merged_matches="$(jq \
+            --arg sha "$GITHUB_SHA" \
+            '[.[] | select(
+              .state == "closed" and
+              .merged_at != null and
+              .base.ref == "main" and
+              .merge_commit_sha == $sha
+            )]' \
+            <<<"$pulls_json")"
+          match_count="$(jq 'length' <<<"$merged_matches")"
+
+          if [ "$match_count" -eq 0 ]; then
+            echo "main push $GITHUB_SHA is not the merge SHA of a merged PR into main; release blocked."
+            exit 0
+          fi
+          if [ "$match_count" -ne 1 ]; then
+            echo "::error::Expected exactly one merged PR for $GITHUB_SHA, found $match_count."
+            exit 1
+          fi
+
+          pr_number="$(jq -r '.[0].number' <<<"$merged_matches")"
+          labels="$(jq -r '.[0].labels[].name' <<<"$merged_matches")"
+
+          count=0
+          bump="auto"
+          for candidate in patch minor major; do
+            if grep -Fxq "release:${candidate}" <<<"$labels"; then
+              count=$((count + 1))
+              bump="$candidate"
+            fi
+          done
+
+          if [ "$count" -gt 1 ]; then
+            echo "::error::PR #${pr_number} has conflicting release bump labels. Use at most one of release:patch, release:minor, or release:major."
+            exit 1
+          fi
+
+          echo "Verified merged PR #${pr_number} at $GITHUB_SHA; release bump: $bump"
+          echo "should_release=true" >> "$GITHUB_OUTPUT"
+          echo "pr_number=$pr_number" >> "$GITHUB_OUTPUT"
+          echo "bump=$bump" >> "$GITHUB_OUTPUT"
+
+  npm-preflight:
+    name: Verify npm Trusted Publisher before mutation
+    needs: gate
+    if: needs.gate.outputs.should_release == 'true'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    permissions:
+      id-token: write
+    env:
+      PACKAGE_NAME: moondesk
+
+    steps:
+      - name: Exchange GitHub OIDC identity with npm
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_EVENT_NAME" = "push"
+          test "$GITHUB_REF" = "refs/heads/main"
+          test -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}"
+          test -n "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}"
+
+          separator='&'
+          if [[ "$ACTIONS_ID_TOKEN_REQUEST_URL" != *\?* ]]; then
+            separator='?'
+          fi
+          oidc_url="${ACTIONS_ID_TOKEN_REQUEST_URL}${separator}audience=npm%3Aregistry.npmjs.org"
+
+          oidc_response="$(curl --fail --silent --show-error \
+            -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "$oidc_url")"
+          oidc_token="$(jq -er '.value | select(type == "string" and length > 0)' <<<"$oidc_response")"
+
+          encoded_package="$(jq -nr --arg value "$PACKAGE_NAME" '$value | @uri')"
+          exchange_file="$RUNNER_TEMP/npm-oidc-exchange.json"
+          trap 'rm -f "$exchange_file"' EXIT
+
+          exchange_status="$(curl --silent --show-error \
+            --output "$exchange_file" \
+            --write-out '%{http_code}' \
+            --request POST \
+            -H "Authorization: Bearer ${oidc_token}" \
+            "https://registry.npmjs.org/-/npm/v1/oidc/token/exchange/package/${encoded_package}")"
+
+          if [ "$exchange_status" != "200" ] && [ "$exchange_status" != "201" ]; then
+            message="$(jq -r '.message // .error // "npm OIDC token exchange rejected the workflow identity"' "$exchange_file" 2>/dev/null || true)"
+            echo "::error::npm Trusted Publishing preflight failed with HTTP ${exchange_status}: ${message}"
+            exit 1
+          fi
+
+          jq -e '.token | type == "string" and length > 0' "$exchange_file" >/dev/null
+          echo "npm Trusted Publisher accepted this push-to-main release workflow identity."
+
+  repair-npm-gap:
+    name: Repair previous npm gap before new release
+    needs:
+      - gate
+      - npm-preflight
+    if: needs.gate.outputs.should_release == 'true' && needs.npm-preflight.result == 'success'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          package-manager-cache: false
+
+      - name: Use pinned Trusted-Publishing capable npm CLI
+        run: npm install --global npm@12.0.2
+
+      - name: Configure clean npm OIDC environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          npmrc="$RUNNER_TEMP/moondesk-oidc.npmrc"
+          printf '%s\n' \
+            'registry=https://registry.npmjs.org/' \
+            'provenance=true' > "$npmrc"
+          echo "NPM_CONFIG_USERCONFIG=$npmrc" >> "$GITHUB_ENV"
+          test -z "${NPM_TOKEN:-}"
+          test -z "${NODE_AUTH_TOKEN:-}"
+          if grep -Eqi '(_auth|authToken|token=)' "$npmrc"; then
+            echo "::error::OIDC npm config unexpectedly contains token authentication."
+            exit 1
+          fi
+
+      - name: Repair a previous modern GitHub-only release before continuing
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin --tags
+          current_version="$(node -p "require('./package.json').version")"
+          current_tag="v${current_version}"
+
+          if ! git show-ref --verify --quiet "refs/tags/${current_tag}"; then
+            echo "No tag exists at the current manifest version; there is no previous release gap to repair."
+            exit 0
+          fi
+
+          tag_sha="$(git rev-parse "${current_tag}^{}")"
+          if ! git merge-base --is-ancestor "$tag_sha" HEAD; then
+            echo "::error::${current_tag} exists but is not an ancestor of current main."
+            exit 1
+          fi
+
+          if ! git cat-file -e "${current_tag}:npm/install-binary.js" 2>/dev/null; then
+            echo "${current_tag} predates the lifecycle-script-free installer and will remain GitHub-only rather than being backfilled to npm."
+            exit 0
+          fi
+
+          registry_body="$RUNNER_TEMP/npm-previous-version.json"
+          registry_status="$(curl --silent --show-error \
+            --output "$registry_body" \
+            --write-out '%{http_code}' \
+            "https://registry.npmjs.org/moondesk/${current_version}")"
+
+          if [ "$registry_status" = "200" ]; then
+            echo "moondesk@${current_version} already exists on npm; no previous gap to repair."
+            exit 0
+          fi
+          if [ "$registry_status" != "404" ]; then
+            echo "::error::Could not determine npm state for moondesk@${current_version}; registry returned HTTP ${registry_status}."
+            exit 1
+          fi
+
+          echo "Repairing GitHub-only ${current_tag} on npm before releasing the newly merged PR."
+          actual_assets="$(gh release view "$current_tag" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' | sort)"
+          expected_assets="$(printf '%s\n' \
+            SHA256SUMS \
+            moondesk-darwin-arm64 \
+            moondesk-darwin-x64 \
+            moondesk-linux-arm64 \
+            moondesk-linux-x64 \
+            moondesk-win32-x64.exe | sort)"
+          test "$actual_assets" = "$expected_assets"
+
+          git checkout --detach "$current_tag"
+          test "$(node -p "require('./package.json').version")" = "$current_version"
+          test "$(node -p "require('./package.json').repository.url")" = "git+https://github.com/Shattermoon/moondesk.git"
+          test -f npm/install-binary.js
+          test ! -e npm/postinstall.js
+          node -e "const p=require('./package.json'); const s=p.scripts||{}; if (s.preinstall||s.install||s.postinstall) process.exit(1)"
+          npm pack --dry-run --ignore-scripts
+          npm publish --access public --provenance
+
+          for attempt in $(seq 1 12); do
+            published_version="$(npm view "moondesk@${current_version}" version 2>/dev/null || true)"
+            if [ "$published_version" = "$current_version" ]; then
+              break
+            fi
+            if [ "$attempt" -eq 12 ]; then
+              echo "::error::Repaired npm publish was not visible after one minute."
+              exit 1
+            fi
+            sleep 5
+          done
+
+          prefix="$RUNNER_TEMP/moondesk-repair-prefix"
+          cache="$RUNNER_TEMP/moondesk-repair-cache"
+          export MOONDESK_BINARY_CACHE_DIR="$cache"
+          npm install --global --prefix "$prefix" --ignore-scripts "moondesk@${current_version}"
+          test ! -e "$cache/moondesk"
+          "$prefix/bin/moondesk" clippymoon --help
+
   prepare:
     name: Validate and prepare release candidate
-    if: github.event.pull_request.merged == true
+    needs:
+      - gate
+      - npm-preflight
+      - repair-npm-gap
+    if: >-
+      needs.gate.outputs.should_release == 'true' &&
+      needs.npm-preflight.result == 'success' &&
+      needs.repair-npm-gap.result == 'success'
     runs-on: ubuntu-22.04
     timeout-minutes: 30
     permissions:
@@ -26,29 +293,28 @@ jobs:
       base_sha: ${{ steps.candidate.outputs.base_sha }}
       candidate_branch: ${{ steps.candidate.outputs.candidate_branch }}
       candidate_sha: ${{ steps.candidate.outputs.candidate_sha }}
-      tag: ${{ steps.version.outputs.tag }}
-      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.candidate.outputs.tag }}
+      version: ${{ steps.candidate.outputs.version }}
 
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          ref: ${{ github.event.pull_request.merge_commit_sha }}
+          ref: ${{ github.sha }}
           fetch-depth: 0
 
-      - name: Verify merged-main trigger
+      - name: Verify merged-main source identity
         shell: bash
         run: |
           set -euo pipefail
-          test "${{ github.event.pull_request.merged }}" = "true"
-          test "${{ github.event.pull_request.base.ref }}" = "main"
-          test "$(git rev-parse HEAD)" = "${{ github.event.pull_request.merge_commit_sha }}"
-          git fetch origin "refs/heads/main:refs/remotes/origin/main"
-          git merge-base --is-ancestor HEAD origin/main
+          test "$GITHUB_EVENT_NAME" = "push"
+          test "$GITHUB_REF" = "refs/heads/main"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git fetch origin --tags "refs/heads/main:refs/remotes/origin/main"
+          test "$(git rev-parse origin/main)" = "$GITHUB_SHA"
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24
-          registry-url: https://registry.npmjs.org
           package-manager-cache: false
 
       - name: Install Rust
@@ -67,51 +333,24 @@ jobs:
             -D clippy::panic \
             -D clippy::unreachable
           cargo +stable test --locked
+          node --check npm/moondesk.js
+          node --check npm/install-binary.js
+          node --test npm/install-binary.test.js
+          test "$(node -p "require('./package.json').repository.url")" = "git+https://github.com/Shattermoon/moondesk.git"
+          node -e "const p=require('./package.json'); const s=p.scripts||{}; if (s.preinstall||s.install||s.postinstall) process.exit(1)"
           npm pack --dry-run --ignore-scripts
 
-      - name: Select release bump from merged PR
-        id: bump
-        env:
-          RELEASE_PATCH: ${{ contains(github.event.pull_request.labels.*.name, 'release:patch') }}
-          RELEASE_MINOR: ${{ contains(github.event.pull_request.labels.*.name, 'release:minor') }}
-          RELEASE_MAJOR: ${{ contains(github.event.pull_request.labels.*.name, 'release:major') }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          count=0
-          bump="auto"
-
-          if [ "$RELEASE_PATCH" = "true" ]; then
-            count=$((count + 1))
-            bump="patch"
-          fi
-          if [ "$RELEASE_MINOR" = "true" ]; then
-            count=$((count + 1))
-            bump="minor"
-          fi
-          if [ "$RELEASE_MAJOR" = "true" ]; then
-            count=$((count + 1))
-            bump="major"
-          fi
-
-          if [ "$count" -gt 1 ]; then
-            echo "::error::Use at most one release bump label: release:patch, release:minor, or release:major."
-            exit 1
-          fi
-
-          echo "bump=$bump" >> "$GITHUB_OUTPUT"
-          echo "Release bump: $bump"
-
-      - name: Plan and apply release version
+      - name: Plan and apply new release version
         id: version
+        env:
+          RELEASE_BUMP: ${{ needs.gate.outputs.bump }}
         shell: bash
         run: |
           set -euo pipefail
-          bump="${{ steps.bump.outputs.bump }}"
-          version="$(node .github/scripts/release-version.mjs --bump "$bump" --apply)"
+          version="$(node .github/scripts/release-version.mjs --bump "$RELEASE_BUMP" --apply)"
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "tag=v$version" >> "$GITHUB_OUTPUT"
-          echo "Preparing MoonDesk v$version"
+          echo "Preparing MoonDesk v$version from merged PR #${{ needs.gate.outputs.pr_number }}"
 
       - name: Verify versioned source
         shell: bash
@@ -121,27 +360,32 @@ jobs:
           test "$(node -p "require('./package.json').version")" = "$expected"
           grep -q "^version = \"$expected\"$" Cargo.toml
           cargo +stable check --locked
+          node --test npm/install-binary.test.js
           npm pack --dry-run --ignore-scripts
 
-      - name: Create release candidate commit
+      - name: Create tested release candidate
         id: candidate
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          TAG: ${{ steps.version.outputs.tag }}
         shell: bash
         run: |
           set -euo pipefail
           base_sha="$(git rev-parse HEAD)"
-          version="${{ steps.version.outputs.version }}"
-          candidate_branch="release-candidate/v${version}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          candidate_branch="release-candidate/${TAG}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add package.json Cargo.toml Cargo.lock
-          git commit --allow-empty -m "chore(release): v${version}"
+          git commit --allow-empty -m "chore(release): ${TAG}"
           candidate_sha="$(git rev-parse HEAD)"
           git push origin "HEAD:refs/heads/${candidate_branch}"
 
           echo "base_sha=$base_sha" >> "$GITHUB_OUTPUT"
           echo "candidate_branch=$candidate_branch" >> "$GITHUB_OUTPUT"
           echo "candidate_sha=$candidate_sha" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
   build:
     name: Build ${{ matrix.asset }}
@@ -241,7 +485,7 @@ jobs:
           test -n "$(git config user.email)"
           git var GIT_COMMITTER_IDENT >/dev/null
 
-      - name: Publish tested release commit and tag
+      - name: Publish or verify tested release refs
         id: publish_refs
         shell: bash
         run: |
@@ -264,7 +508,7 @@ jobs:
               echo "::error::$tag matches the candidate, but that release commit is no longer an ancestor of main."
               exit 1
             fi
-            echo "Release refs already contain the tested candidate; continuing recovery."
+            echo "Release refs already contain the tested candidate; continuing idempotent recovery."
             echo "refs_published=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -274,6 +518,7 @@ jobs:
             exit 1
           fi
 
+          test -n "$candidate_branch"
           git fetch origin \
             "refs/heads/${candidate_branch}:refs/remotes/origin/${candidate_branch}"
           test "$(git rev-parse "origin/${candidate_branch}")" = "$candidate_sha"
@@ -297,6 +542,7 @@ jobs:
           cd release
           test "$(find . -maxdepth 1 -type f -name 'moondesk-*' | wc -l)" -eq 5
           sha256sum moondesk-* > SHA256SUMS
+          sha256sum --check SHA256SUMS
           ls -la
 
       - name: Create or repair GitHub Release
@@ -307,7 +553,7 @@ jobs:
           set -euo pipefail
           tag="${{ needs.prepare.outputs.tag }}"
           if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "GitHub Release $tag already exists; refreshing tested assets."
+            echo "GitHub Release $tag already exists; refreshing assets rebuilt from the tagged commit."
             gh release upload "$tag" release/* --repo "$GITHUB_REPOSITORY" --clobber
           else
             gh release create "$tag" release/* \
@@ -317,6 +563,16 @@ jobs:
               --generate-notes \
               --verify-tag
           fi
+
+          actual_assets="$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' | sort)"
+          expected_assets="$(printf '%s\n' \
+            SHA256SUMS \
+            moondesk-darwin-arm64 \
+            moondesk-darwin-x64 \
+            moondesk-linux-arm64 \
+            moondesk-linux-x64 \
+            moondesk-win32-x64.exe | sort)"
+          test "$actual_assets" = "$expected_assets"
 
   publish-npm:
     name: Publish npm package
@@ -338,23 +594,56 @@ jobs:
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24
-          registry-url: https://registry.npmjs.org
           package-manager-cache: false
 
-      - name: Use trusted-publishing capable npm CLI
+      - name: Use pinned Trusted-Publishing capable npm CLI
         run: npm install --global npm@12.0.2
 
-      - name: Verify release assets exist before npm publish
+      - name: Configure clean npm OIDC environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          npmrc="$RUNNER_TEMP/moondesk-oidc.npmrc"
+          printf '%s\n' \
+            'registry=https://registry.npmjs.org/' \
+            'provenance=true' > "$npmrc"
+          echo "NPM_CONFIG_USERCONFIG=$npmrc" >> "$GITHUB_ENV"
+
+          test -z "${NPM_TOKEN:-}"
+          test -z "${NODE_AUTH_TOKEN:-}"
+          if grep -Eqi '(_auth|authToken|token=)' "$npmrc"; then
+            echo "::error::OIDC npm config unexpectedly contains token authentication."
+            exit 1
+          fi
+
+          npm --version
+          node --version
+
+      - name: Verify release assets and package before npm publish
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
-          gh release view "${{ needs.prepare.outputs.tag }}" --repo "$GITHUB_REPOSITORY" >/dev/null
-          test "$(node -p "require('./package.json').version")" = "${{ needs.prepare.outputs.version }}"
+          tag="${{ needs.prepare.outputs.tag }}"
+          version="${{ needs.prepare.outputs.version }}"
+          test "$(git rev-parse HEAD)" = "${{ needs.prepare.outputs.candidate_sha }}"
+          test "$(node -p "require('./package.json').version")" = "$version"
+          test "$(node -p "require('./package.json').repository.url")" = "git+https://github.com/Shattermoon/moondesk.git"
+
+          actual_assets="$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' | sort)"
+          expected_assets="$(printf '%s\n' \
+            SHA256SUMS \
+            moondesk-darwin-arm64 \
+            moondesk-darwin-x64 \
+            moondesk-linux-arm64 \
+            moondesk-linux-x64 \
+            moondesk-win32-x64.exe | sort)"
+          test "$actual_assets" = "$expected_assets"
+
           npm pack --dry-run --ignore-scripts
 
-      - name: Publish to npm with Trusted Publishing
+      - name: Publish to npm with Trusted Publishing and provenance
         shell: bash
         run: |
           set -euo pipefail
@@ -366,31 +655,52 @@ jobs:
             exit 0
           fi
 
-          if ! npm publish --access public; then
-            echo "::error::npm Trusted Publishing failed. Verify the npm trusted publisher is GitHub Actions / Shattermoon / moondesk / release.yml and that this job retains id-token: write."
+          if ! npm publish --access public --provenance; then
+            echo "::error::npm publish failed even though the earlier OIDC exchange preflight succeeded. Inspect the npm output for registry, metadata, provenance, or transient service errors."
             exit 1
           fi
 
-          for attempt in 1 2 3 4 5 6; do
+          for attempt in $(seq 1 12); do
             published_version="$(npm view "${package_name}@${version}" version 2>/dev/null || true)"
             if [ "$published_version" = "$version" ]; then
               echo "Confirmed ${package_name}@${version} on npm."
               exit 0
             fi
-            if [ "$attempt" -lt 6 ]; then
+            if [ "$attempt" -lt 12 ]; then
               echo "npm registry has not surfaced ${package_name}@${version} yet; retrying in 5 seconds..."
               sleep 5
             fi
           done
 
-          echo "::error::npm publish returned successfully, but ${package_name}@${version} was not visible after 6 registry checks."
+          echo "::error::npm publish returned successfully, but ${package_name}@${version} was not visible after one minute of registry checks."
           exit 1
+
+      - name: Verify fresh npm install and first-run binary bootstrap
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ needs.prepare.outputs.version }}"
+          prefix="$RUNNER_TEMP/moondesk-e2e-prefix"
+          cache="$RUNNER_TEMP/moondesk-e2e-cache"
+          export MOONDESK_BINARY_CACHE_DIR="$cache"
+
+          npm install --global --prefix "$prefix" --ignore-scripts "moondesk@${version}"
+          test ! -e "$cache/moondesk"
+
+          "$prefix/bin/moondesk" clippymoon --help
+          "$prefix/bin/moondesk" clippymoon export \
+            --seed 0000000000000042 \
+            --out "$RUNNER_TEMP/npm-e2e-export"
+
+          test -s "$RUNNER_TEMP/npm-e2e-export/clippymoon.png"
+          test -s "$RUNNER_TEMP/npm-e2e-export/clippymoon.gif"
 
   cleanup-candidate:
     name: Clean release candidate branch
     if: >-
       always() &&
       needs.prepare.result == 'success' &&
+      needs.prepare.outputs.candidate_branch != '' &&
       (
         needs.build.result != 'success' ||
         needs.release.result == 'success' ||
@@ -402,7 +712,7 @@ jobs:
       - release
       - publish-npm
     runs-on: ubuntu-22.04
-    timeout-minutes: 30
+    timeout-minutes: 10
     permissions:
       contents: write
 
@@ -414,4 +724,5 @@ jobs:
       - name: Delete candidate branch
         shell: bash
         run: |
+          set -euo pipefail
           git push origin --delete "${{ needs.prepare.outputs.candidate_branch }}" || true

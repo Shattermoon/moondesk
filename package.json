@@ -15,12 +15,9 @@
   "bin": {
     "moondesk": "npm/moondesk.js"
   },
-  "scripts": {
-    "postinstall": "node npm/postinstall.js"
-  },
   "files": [
     "npm/moondesk.js",
-    "npm/postinstall.js",
+    "npm/install-binary.js",
     "LICENSE",
     "README.md"
   ],

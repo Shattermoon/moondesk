@@ -88,6 +88,8 @@ I tried this with GPT-5.2 before, and the results were poor. However, **GPT-5.4 
    npm install -g moondesk
    ```
 
+   MoonDesk does not rely on npm lifecycle/install scripts. On the first `moondesk` run, the small npm wrapper downloads the matching native binary from the GitHub Release, verifies it against that release's `SHA256SUMS`, and stores it in a versioned user cache under `~/.moondesk/npm-bin/`. This works with npm 12's default-deny install-script policy and also keeps the running native executable outside npm's `node_modules`, which makes Windows package upgrades less likely to hit locked-file errors.
+
 2. Run MoonDesk from any terminal directory.
 
    ```bash

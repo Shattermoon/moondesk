@@ -27,8 +27,14 @@ function cleanManagedUpdateEnv(source = process.env) {
 }
 
 function cleanupEphemeralUpdateFiles(statePath, requestPath) {
-  fs.rmSync(statePath, { force: true });
-  fs.rmSync(requestPath, { force: true });
+  for (const filePath of [statePath, requestPath]) {
+    if (!filePath) continue;
+    try {
+      fs.rmSync(filePath, { force: true });
+    } catch {
+      // Ephemeral updater metadata must never make normal MoonDesk startup or shutdown fail.
+    }
+  }
 }
 
 function runNative(binaryPath, args, options = {}) {
@@ -49,8 +55,24 @@ async function orchestrate(options = {}) {
   const originalArgs = options.args ?? process.argv.slice(2);
   const originalCwd = options.cwd ?? process.cwd();
   const baseEnv = cleanManagedUpdateEnv(options.env ?? process.env);
-  const updateStatePath = options.updateStatePath ?? createUpdateStatePath();
-  const updateRequestPath = options.updateRequestPath ?? createUpdateRequestPath();
+  const createUpdateStatePathImpl = options.createUpdateStatePathImpl ?? createUpdateStatePath;
+  const createUpdateRequestPathImpl = options.createUpdateRequestPathImpl ?? createUpdateRequestPath;
+  let updateStatePath = options.updateStatePath ?? null;
+  let updateRequestPath = options.updateRequestPath ?? null;
+  let selfUpdateEnabled = true;
+  try {
+    updateStatePath = updateStatePath ?? createUpdateStatePathImpl();
+    updateRequestPath = updateRequestPath ?? createUpdateRequestPathImpl();
+  } catch (error) {
+    if (!options.updateStatePath) cleanupEphemeralUpdateFiles(updateStatePath, null);
+    if (!options.updateRequestPath) cleanupEphemeralUpdateFiles(null, updateRequestPath);
+    updateStatePath = null;
+    updateRequestPath = null;
+    selfUpdateEnabled = false;
+    logger.warn?.(
+      `MoonDesk disabled in-app self-update because it could not prepare update metadata: ${error.message}`,
+    );
+  }
   const ensureBinaryImpl = options.ensureBinaryImpl ?? ensureBinary;
   const cleanupOldBinaryVersionsImpl = options.cleanupOldBinaryVersionsImpl ?? cleanupOldBinaryVersions;
   const cleanupOldUpdateVersionsImpl = options.cleanupOldUpdateVersionsImpl ?? cleanupOldUpdateVersions;
@@ -65,11 +87,13 @@ async function orchestrate(options = {}) {
   const restartUpdatedWrapperImpl = options.restartUpdatedWrapperImpl ?? restartUpdatedWrapper;
   const wrapperPath = options.wrapperPath ?? __filename;
 
-  const stopUpdateMonitor = startUpdateMonitorImpl({
-    statePath: updateStatePath,
-    cwd: originalCwd,
-    env: baseEnv,
-  });
+  const stopUpdateMonitor = selfUpdateEnabled
+    ? startUpdateMonitorImpl({
+        statePath: updateStatePath,
+        cwd: originalCwd,
+        env: baseEnv,
+      })
+    : () => {};
 
   let binaryPath;
   try {
@@ -96,12 +120,14 @@ async function orchestrate(options = {}) {
     logger.warn?.(`MoonDesk could not remove older update metadata yet: ${error.message}`);
   }
 
-  const childEnv = {
-    ...baseEnv,
-    MOONDESK_NPM_MANAGED: "1",
-    MOONDESK_UPDATE_REQUEST_PATH: updateRequestPath,
-    MOONDESK_UPDATE_STATE_PATH: updateStatePath,
-  };
+  const childEnv = { ...baseEnv };
+  if (selfUpdateEnabled) {
+    Object.assign(childEnv, {
+      MOONDESK_NPM_MANAGED: "1",
+      MOONDESK_UPDATE_REQUEST_PATH: updateRequestPath,
+      MOONDESK_UPDATE_STATE_PATH: updateStatePath,
+    });
+  }
 
   let result;
   try {
@@ -117,16 +143,21 @@ async function orchestrate(options = {}) {
   }
 
   stopUpdateMonitor();
-  fs.rmSync(updateStatePath, { force: true });
+  cleanupEphemeralUpdateFiles(updateStatePath, null);
 
   if (result.signal) {
-    fs.rmSync(updateRequestPath, { force: true });
+    cleanupEphemeralUpdateFiles(null, updateRequestPath);
     return result;
   }
 
   if (result.code !== UPDATE_EXIT_CODE) {
-    fs.rmSync(updateRequestPath, { force: true });
+    cleanupEphemeralUpdateFiles(null, updateRequestPath);
     return { code: result.code ?? 1, signal: null };
+  }
+
+  if (!selfUpdateEnabled || !updateRequestPath) {
+    logger.error("MoonDesk requested an update restart, but in-app self-update is unavailable for this launch.");
+    return { code: 1, signal: null };
   }
 
   const request = readUpdateRequestImpl(updateRequestPath);

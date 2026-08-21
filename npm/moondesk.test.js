@@ -376,3 +376,43 @@ test("failure to acquire the npm update lock touches neither npm nor restart", a
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+
+test("self-update path failures disable updates without blocking MoonDesk startup", async () => {
+  const dir = tempDir();
+  const warnings = [];
+  let monitorStarted = false;
+  try {
+    const result = await orchestrate({
+      cwd: dir,
+      logger: { log() {}, error() {}, warn(message) { warnings.push(message); } },
+      createUpdateStatePathImpl: () => {
+        const error = new Error("read-only home");
+        error.code = "EROFS";
+        throw error;
+      },
+      createUpdateRequestPathImpl: () => {
+        throw new Error("request path should not be attempted after state path failure");
+      },
+      ensureBinaryImpl: async () => "/fake/moondesk",
+      cleanupOldBinaryVersionsImpl: () => {},
+      cleanupOldUpdateVersionsImpl: () => {},
+      startUpdateMonitorImpl: () => {
+        monitorStarted = true;
+        return () => {};
+      },
+      runNativeImpl: async (_binary, _args, options) => {
+        assert.equal(options.env.MOONDESK_NPM_MANAGED, undefined);
+        assert.equal(options.env.MOONDESK_UPDATE_STATE_PATH, undefined);
+        assert.equal(options.env.MOONDESK_UPDATE_REQUEST_PATH, undefined);
+        return { code: 0, signal: null };
+      },
+    });
+    assert.deepEqual(result, { code: 0, signal: null });
+    assert.equal(monitorStarted, false);
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0], /disabled in-app self-update/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

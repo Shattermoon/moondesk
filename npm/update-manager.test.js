@@ -263,6 +263,76 @@ test("update check rejects wrong package, prerelease, and missing integrity meta
   }
 });
 
+test("update metadata streaming enforces the byte limit without content-length", async () => {
+  const dir = tempDir();
+  try {
+    const fetchImpl = async () => ({
+      ok: true,
+      status: 200,
+      headers: { get: () => null },
+      body: {
+        async *[Symbol.asyncIterator]() {
+          yield Buffer.alloc(64 * 1024);
+          yield Buffer.from("x");
+        },
+      },
+    });
+    await assert.rejects(
+      checkForUpdate({
+        statePath: path.join(dir, "state.json"),
+        managedInstall: true,
+        fetchImpl,
+      }),
+      /metadata exceeded the download limit/,
+    );
+    assert.equal(fs.existsSync(path.join(dir, "state.json")), false);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("stopping a monitor removes state even when a late response ignores abort", async () => {
+  const dir = tempDir();
+  const statePath = path.join(dir, "state.json");
+  let releaseBody;
+  let fetchStartedResolve;
+  const fetchStarted = new Promise((resolve) => { fetchStartedResolve = resolve; });
+  const bodyReleased = new Promise((resolve) => { releaseBody = resolve; });
+  try {
+    const fetchImpl = async () => {
+      fetchStartedResolve();
+      const payload = Buffer.from(JSON.stringify(npmMetadata(nextVersion())));
+      return {
+        ok: true,
+        status: 200,
+        headers: { get: () => null },
+        body: {
+          async *[Symbol.asyncIterator]() {
+            await bodyReleased;
+            yield payload;
+          },
+        },
+      };
+    };
+    const stop = startUpdateMonitor({
+      statePath,
+      fetchImpl,
+      intervalMs: 60_000,
+      isGlobalPackageInstallImpl: async () => true,
+    });
+    await fetchStarted;
+    stop();
+    releaseBody();
+    for (let attempt = 0; attempt < 40; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      if (!fs.existsSync(statePath)) break;
+    }
+    assert.equal(fs.existsSync(statePath), false);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("stopping the update monitor aborts an in-flight registry request", async () => {
   const dir = tempDir();
   let requestStarted = false;

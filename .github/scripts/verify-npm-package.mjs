@@ -29,19 +29,26 @@ try {
   throw new Error(`npm pack did not return valid JSON: ${error.message}`);
 }
 
-if (!Array.isArray(report) || report.length !== 1 || !Array.isArray(report[0]?.files)) {
+let packageReport;
+if (Array.isArray(report)) {
+  if (report.length === 1) packageReport = report[0];
+} else if (report && typeof report === "object") {
+  const entries = Object.values(report);
+  if (entries.length === 1) packageReport = entries[0];
+}
+if (!packageReport || !Array.isArray(packageReport.files)) {
   throw new Error("npm pack returned an unexpected report shape");
 }
 
-const actual = report[0].files.map((entry) => entry.path).sort();
+const actual = packageReport.files.map((entry) => entry.path).sort();
 if (JSON.stringify(actual) !== JSON.stringify(expected)) {
   throw new Error(
     `unexpected npm package contents\nexpected: ${expected.join(", ")}\nactual:   ${actual.join(", ")}`,
   );
 }
 
-if (report[0].entryCount !== expected.length) {
-  throw new Error(`npm package entry count ${report[0].entryCount} did not match ${expected.length}`);
+if (packageReport.entryCount !== expected.length) {
+  throw new Error(`npm package entry count ${packageReport.entryCount} did not match ${expected.length}`);
 }
 
 console.log(`Verified npm package contents (${expected.length} files).`);

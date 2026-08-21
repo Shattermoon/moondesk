@@ -1501,7 +1501,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match result {
         Ok(AppExit::Quit) => Ok(()),
         Ok(AppExit::UpdateRestart(target_version)) => {
-            update::write_update_request(&target_version)?;
+            update::write_update_request(&target_version).map_err(|error| {
+                std::io::Error::new(
+                    error.kind(),
+                    format!("could not prepare MoonDesk {target_version} update restart: {error}"),
+                )
+            })?;
             std::process::exit(update::UPDATE_EXIT_CODE);
         }
         Err(error) => Err(error),
@@ -5141,6 +5146,14 @@ fn draw_update_confirm(
         vertical: 1,
     });
     f.render_widget(block, area);
+    let compact_actions = inner.width < 48;
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(1),
+            Constraint::Length(if compact_actions { 2 } else { 1 }),
+        ])
+        .split(inner);
 
     let mut lines = vec![
         Line::from(Span::styled(
@@ -5181,24 +5194,51 @@ fn draw_update_confirm(
         )));
         lines.push(Line::from(""));
     }
-    lines.push(Line::from(vec![
-        Span::styled(
-            "[Enter]",
-            Style::default()
-                .fg(palette.success_fg)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" Continue with Update & Restart    "),
-        Span::styled(
-            "[Esc]",
-            Style::default()
-                .fg(palette.danger_fg)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" Abort"),
-    ]));
+    let action_lines = if compact_actions {
+        vec![
+            Line::from(vec![
+                Span::styled(
+                    "[Enter]",
+                    Style::default()
+                        .fg(palette.success_fg)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(" Update & Restart"),
+            ]),
+            Line::from(vec![
+                Span::styled(
+                    "[Esc]",
+                    Style::default()
+                        .fg(palette.danger_fg)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(" Abort"),
+            ]),
+        ]
+    } else {
+        vec![Line::from(vec![
+            Span::styled(
+                "[Enter]",
+                Style::default()
+                    .fg(palette.success_fg)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" Continue with Update & Restart    "),
+            Span::styled(
+                "[Esc]",
+                Style::default()
+                    .fg(palette.danger_fg)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" Abort"),
+        ])]
+    };
 
-    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+    f.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: false }),
+        sections[0],
+    );
+    f.render_widget(Paragraph::new(action_lines), sections[1]);
 }
 
 // ── Draw main UI ────────────────────────────────────────────
@@ -6675,6 +6715,33 @@ mod tests {
         assert_eq!(update_confirm_action(KeyCode::Esc), Some(false));
         assert_eq!(update_confirm_action(KeyCode::Char('q')), None);
         assert_eq!(update_confirm_action(KeyCode::Char('u')), None);
+    }
+
+    #[test]
+    fn update_confirmation_keeps_enter_and_escape_visible_on_narrow_terminals() {
+        let backend = TestBackend::new(52, 16);
+        let mut terminal =
+            Terminal::new(backend).expect("create compact update confirmation terminal");
+        let theme = super::theme::resolve(super::theme::DEFAULT_THEME_ID);
+        let update_info = super::update::UpdateInfo {
+            current_version: "1.2.3".into(),
+            latest_version: "1.2.4".into(),
+        };
+
+        terminal
+            .draw(|frame| draw_update_confirm(frame, theme, &update_info, 2))
+            .expect("render compact update confirmation");
+
+        let buffer = terminal.backend().buffer();
+        let mut rendered = String::new();
+        for row in 0..16 {
+            for column in 0..52 {
+                rendered.push_str(buffer[(column, row)].symbol());
+            }
+            rendered.push('\n');
+        }
+        assert!(rendered.contains("[Enter] Update & Restart"));
+        assert!(rendered.contains("[Esc] Abort"));
     }
 
     #[test]

@@ -142,6 +142,15 @@ pub fn write_update_request(target_version: &str) -> std::io::Result<()> {
         )
     })?;
     write_validated_update_request(&state_path, &request_path, CURRENT_VERSION, target_version)
+        .map_err(|error| {
+            std::io::Error::new(
+                error.kind(),
+                format!(
+                    "could not write MoonDesk update request {}: {error}",
+                    request_path.display()
+                ),
+            )
+        })
 }
 
 fn write_private_create_new(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
@@ -153,13 +162,21 @@ fn write_private_create_new(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         options.mode(0o600);
     }
     let mut file = options.open(path)?;
-    file.write_all(bytes)?;
-    file.write_all(b"\n")?;
-    file.sync_all()?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    let result = (|| -> std::io::Result<()> {
+        file.write_all(bytes)?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = result {
+        drop(file);
+        let _ = fs::remove_file(path);
+        return Err(error);
     }
     Ok(())
 }
@@ -275,6 +292,49 @@ mod tests {
         )
         .expect("write same state");
         assert_eq!(available_update_from_path(&state_path, "1.2.3"), None);
+
+        let rejected = [
+            serde_json::json!({
+                "schemaVersion": 1,
+                "packageName": "not-moondesk",
+                "currentVersion": "1.2.3",
+                "latestVersion": "1.2.4",
+                "managedInstall": true,
+                "available": true
+            }),
+            serde_json::json!({
+                "schemaVersion": 99,
+                "packageName": "moondesk",
+                "currentVersion": "1.2.3",
+                "latestVersion": "1.2.4",
+                "managedInstall": true,
+                "available": true
+            }),
+            serde_json::json!({
+                "schemaVersion": 1,
+                "packageName": "moondesk",
+                "currentVersion": "1.2.3",
+                "latestVersion": "1.2.4",
+                "managedInstall": true,
+                "available": false
+            }),
+        ];
+        for state in rejected {
+            fs::write(
+                &state_path,
+                serde_json::to_vec(&state).expect("encode rejected state"),
+            )
+            .expect("write rejected state");
+            assert_eq!(
+                available_update_from_path(&state_path, "1.2.3"),
+                None,
+                "state must be rejected: {state}"
+            );
+        }
+
+        let oversized = dir.join("oversized.json");
+        fs::write(&oversized, vec![b' '; 17 * 1024]).expect("write oversized update state");
+        assert_eq!(available_update_from_path(&oversized, "1.2.3"), None);
 
         let _ = fs::remove_dir_all(dir);
     }

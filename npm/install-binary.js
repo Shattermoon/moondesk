@@ -4,6 +4,7 @@ const crypto = require("node:crypto");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
+const { compareStableVersions, parseStableVersion } = require("./update-manager");
 
 const packageRoot = path.resolve(__dirname, "..");
 const packageJson = require(path.join(packageRoot, "package.json"));
@@ -56,20 +57,12 @@ function defaultInstallDir(target) {
   return path.join(defaultBinaryCacheRoot(), releaseTag, target);
 }
 
-function stableTagParts(tag) {
-  const match = tag.match(/^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/);
-  return match ? match.slice(1).map((part) => BigInt(part)) : null;
-}
-
 function stableTagIsOlder(candidate, current) {
-  const left = stableTagParts(candidate);
-  const right = stableTagParts(current);
-  if (!left || !right) return false;
-  for (let index = 0; index < 3; index += 1) {
-    if (left[index] < right[index]) return true;
-    if (left[index] > right[index]) return false;
-  }
-  return false;
+  if (!candidate.startsWith("v") || !current.startsWith("v")) return false;
+  const candidateVersion = candidate.slice(1);
+  const currentVersionText = current.slice(1);
+  if (!parseStableVersion(candidateVersion) || !parseStableVersion(currentVersionText)) return false;
+  return compareStableVersions(candidateVersion, currentVersionText) < 0;
 }
 
 function cleanupOldBinaryVersions(options = {}) {

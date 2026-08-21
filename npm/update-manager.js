@@ -260,13 +260,25 @@ async function fetchJsonLimited(fetchImpl, url, externalSignal) {
     }
     const contentLength = Number(response.headers.get("content-length"));
     if (Number.isFinite(contentLength) && contentLength > MAX_UPDATE_METADATA_BYTES) {
+      controller.abort();
       throw new Error(`MoonDesk update metadata is unexpectedly large (${contentLength} bytes)`);
     }
-    const buffer = Buffer.from(await response.arrayBuffer());
-    if (buffer.length > MAX_UPDATE_METADATA_BYTES) {
-      throw new Error("MoonDesk update metadata exceeded the download limit");
+    if (!response.body || typeof response.body[Symbol.asyncIterator] !== "function") {
+      throw new Error("MoonDesk update metadata response did not include a readable body");
     }
-    return JSON.parse(buffer.toString("utf8"));
+
+    const chunks = [];
+    let totalBytes = 0;
+    for await (const chunk of response.body) {
+      const buffer = Buffer.from(chunk);
+      totalBytes += buffer.length;
+      if (totalBytes > MAX_UPDATE_METADATA_BYTES) {
+        controller.abort();
+        throw new Error("MoonDesk update metadata exceeded the download limit");
+      }
+      chunks.push(buffer);
+    }
+    return JSON.parse(Buffer.concat(chunks, totalBytes).toString("utf8"));
   } finally {
     clearTimeout(timeout);
     externalSignal?.removeEventListener("abort", abortFromParent);
@@ -339,6 +351,9 @@ function startUpdateMonitor(options = {}) {
     } catch {
       // Update checks are optional. Offline/npm/registry failures must never affect MoonDesk startup.
     } finally {
+      if (stopped) {
+        fs.rmSync(statePath, { force: true });
+      }
       controller = null;
       checking = false;
     }

@@ -232,3 +232,19 @@ test("cleanupOldBinaryVersions removes stale version caches and keeps the active
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("cleanupOldBinaryVersions never touches an explicitly overridden cache directory", () => {
+  const dir = tempDir();
+  const previous = process.env.MOONDESK_BINARY_CACHE_DIR;
+  process.env.MOONDESK_BINARY_CACHE_DIR = dir;
+  try {
+    fs.mkdirSync(path.join(dir, "v0.0.1"), { recursive: true });
+    const result = cleanupOldBinaryVersions();
+    assert.deepEqual(result, { removed: [], skipped: [] });
+    assert.equal(fs.existsSync(path.join(dir, "v0.0.1")), true);
+  } finally {
+    if (previous === undefined) delete process.env.MOONDESK_BINARY_CACHE_DIR;
+    else process.env.MOONDESK_BINARY_CACHE_DIR = previous;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

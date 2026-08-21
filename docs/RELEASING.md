@@ -55,7 +55,7 @@ The npm Trusted Publisher must be configured as:
 
 The publish job deliberately does not read or inject an `NPM_TOKEN`. It uses a GitHub-hosted runner, Node 24, npm 12, and `id-token: write`, so npm authenticates the exact `Shattermoon/moondesk` workflow through OIDC. If a version is already present on npm, the job treats it as idempotently complete instead of attempting to republish an immutable npm version.
 
-After Trusted Publishing has been verified with a real release, remove any old `NPM_TOKEN` GitHub secret and revoke the corresponding npm granular access token. npm package publishing access can then use the most restrictive option that disallows bypass-2FA tokens; Trusted Publishing continues to work independently of traditional npm tokens.
+After Trusted Publishing has been verified with a real release, first confirm the repository and release workflow have no remaining `NPM_TOKEN` or `NODE_AUTH_TOKEN` consumers. Then remove the old `NPM_TOKEN` GitHub secret and revoke the corresponding granular npm access token. Set npm package publishing access to the most restrictive **Require two-factor authentication and disallow bypass 2FA tokens** option. Trusted Publishing remains compatible because it authenticates through OIDC rather than a traditional npm publishing token.
 
 ## Recovery
 

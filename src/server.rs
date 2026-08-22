@@ -9,8 +9,10 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use subtle::ConstantTimeEq;
 
 use crate::command_jobs::CommandJobManager;
@@ -20,7 +22,9 @@ use crate::state::{
     AddWorkspaceError, CommandActivityState, FlowDirection, ServerUiEvent, SharedState,
     UiEventSender, add_workspace,
 };
-use crate::workspaces::{self, WorkspaceId, WorkspaceRequestContext, WorkspaceRequestLease};
+use crate::workspaces::{
+    self, WorkspaceId, WorkspaceRequestContext, WorkspaceRequestLease, WorkspaceRuntime,
+};
 use uuid::Uuid;
 
 const STATELESS_FLOW_ID: &str = "stateless";
@@ -39,7 +43,15 @@ struct ServerState {
 }
 
 fn is_loopback_origin_host(host: &str) -> bool {
-    matches!(host, "localhost" | "127.0.0.1" | "::1")
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    let host = host
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(host);
+    host.parse::<IpAddr>()
+        .is_ok_and(|address| address.is_loopback())
 }
 
 fn same_http_origin(candidate: &reqwest::Url, expected: &reqwest::Url) -> bool {
@@ -165,15 +177,39 @@ fn jsonrpc_error_response(status: StatusCode, code: i64, msg: &str) -> Response<
     response_with_body(status, "application/json", Body::from(body))
 }
 
+fn tool_rate_limit_response(retry_after: Duration) -> Response<Body> {
+    let mut response = jsonrpc_error_response(
+        StatusCode::TOO_MANY_REQUESTS,
+        -32000,
+        "Tool invocation rate limit exceeded; retry shortly",
+    );
+    let retry_after_seconds = retry_after
+        .as_secs()
+        .saturating_add(u64::from(retry_after.subsec_nanos() != 0))
+        .max(1);
+    let header_value = match HeaderValue::from_str(&retry_after_seconds.to_string()) {
+        Ok(value) => value,
+        Err(_) => HeaderValue::from_static("1"),
+    };
+    response
+        .headers_mut()
+        .insert(header::RETRY_AFTER, header_value);
+    response
+}
+
 async fn resolve_workspace(
     state: &ServerState,
     slug: &str,
-) -> Option<(WorkspaceRequestContext, WorkspaceRequestLease)> {
+) -> Option<(
+    WorkspaceRequestContext,
+    Arc<WorkspaceRuntime>,
+    WorkspaceRequestLease,
+)> {
     let app = state.app.lock().await;
     let workspace = workspaces::resolve_workspace_by_slug(&app.workspaces, slug)?;
     let runtime = app.workspace_runtimes.get(&workspace.workspace_id)?.clone();
     let lease = runtime.try_acquire()?;
-    Some((workspace, lease))
+    Some((workspace, runtime, lease))
 }
 
 fn not_found_response() -> Response<Body> {
@@ -601,7 +637,7 @@ async fn post_mcp(
     State(s): State<ServerState>,
     body_bytes: Bytes,
 ) -> Response<Body> {
-    let Some((workspace, _request_lease)) = resolve_workspace(&s, &slug).await else {
+    let Some((workspace, runtime, _request_lease)) = resolve_workspace(&s, &slug).await else {
         return not_found_response();
     };
 
@@ -623,20 +659,10 @@ async fn post_mcp(
         );
     }
 
-    if body.get("method").and_then(Value::as_str) == Some("tools/call") {
-        let allowed = {
-            let app = s.app.lock().await;
-            app.workspace_runtimes
-                .get(&workspace.workspace_id)
-                .is_some_and(|runtime| runtime.allow_tool_invocation())
-        };
-        if !allowed {
-            return jsonrpc_error_response(
-                StatusCode::TOO_MANY_REQUESTS,
-                -32000,
-                "Tool invocation rate limit exceeded; retry shortly",
-            );
-        }
+    if body.get("method").and_then(Value::as_str) == Some("tools/call")
+        && let Err(retry_after) = runtime.check_tool_invocation()
+    {
+        return tool_rate_limit_response(retry_after);
     }
 
     {
@@ -802,7 +828,7 @@ async fn post_mcp(
 // ── GET /<slug>/mcp — pure HTTP mode (no SSE) ───────────────
 
 async fn get_mcp(AxumPath(slug): AxumPath<String>, State(s): State<ServerState>) -> Response<Body> {
-    let Some((_workspace, _request_lease)) = resolve_workspace(&s, &slug).await else {
+    let Some((_workspace, _runtime, _request_lease)) = resolve_workspace(&s, &slug).await else {
         return not_found_response();
     };
     response_with_body(
@@ -820,7 +846,7 @@ async fn delete_mcp(
     AxumPath(slug): AxumPath<String>,
     State(s): State<ServerState>,
 ) -> Response<Body> {
-    let Some((workspace, _request_lease)) = resolve_workspace(&s, &slug).await else {
+    let Some((workspace, _runtime, _request_lease)) = resolve_workspace(&s, &slug).await else {
         return not_found_response();
     };
     {
@@ -1113,14 +1139,21 @@ mod tests {
             .expect("send request without Origin");
         assert_eq!(no_origin.status(), StatusCode::OK);
 
-        let local_origin = client
-            .post(&endpoint)
-            .header(reqwest::header::ORIGIN, "http://127.0.0.1:9999")
-            .body(payload)
-            .send()
-            .await
-            .expect("send local-origin request");
-        assert_eq!(local_origin.status(), StatusCode::OK);
+        for local_origin in [
+            "http://localhost:9999",
+            "http://127.0.0.1:9999",
+            "http://127.0.0.2:9999",
+            "http://[::1]:9999",
+        ] {
+            let response = client
+                .post(&endpoint)
+                .header(reqwest::header::ORIGIN, local_origin)
+                .body(payload)
+                .send()
+                .await
+                .expect("send local-origin request");
+            assert_eq!(response.status(), StatusCode::OK, "{local_origin}");
+        }
 
         let public_origin = client
             .post(&endpoint)
@@ -1341,9 +1374,8 @@ mod tests {
         let workspace_id = app.workspaces[0].id.clone();
         let runtime = app.workspace_runtimes[&workspace_id].clone();
         for _ in 0..workspaces::MAX_TOOL_INVOCATIONS_PER_WINDOW {
-            assert!(runtime.allow_tool_invocation());
+            assert!(runtime.check_tool_invocation().is_ok());
         }
-        assert!(!runtime.allow_tool_invocation());
 
         let app_state = Arc::new(Mutex::new(app));
         let (ui_tx, _ui_rx) = ui_event_channel();
@@ -1362,6 +1394,13 @@ mod tests {
         )
         .await;
         assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+        let retry_after = limited
+            .headers()
+            .get(header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok())
+            .expect("429 response should include an integer Retry-After header");
+        assert!((1..=workspaces::TOOL_INVOCATION_RATE_WINDOW.as_secs()).contains(&retry_after));
 
         let ping = post_mcp(
             AxumPath(slug),

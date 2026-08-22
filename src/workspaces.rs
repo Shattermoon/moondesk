@@ -230,11 +230,11 @@ impl WorkspaceRuntime {
         self.request_count.load(Ordering::Relaxed)
     }
 
-    pub fn allow_tool_invocation(&self) -> bool {
-        self.allow_tool_invocation_at(Instant::now())
+    pub fn check_tool_invocation(&self) -> Result<(), Duration> {
+        self.check_tool_invocation_at(Instant::now())
     }
 
-    fn allow_tool_invocation_at(&self, now: Instant) -> bool {
+    fn check_tool_invocation_at(&self, now: Instant) -> Result<(), Duration> {
         let mut window = self
             .tool_invocations
             .lock()
@@ -247,10 +247,12 @@ impl WorkspaceRuntime {
             window.count = 0;
         }
         if window.count >= MAX_TOOL_INVOCATIONS_PER_WINDOW {
-            return false;
+            let started = window.started_at.unwrap_or(now);
+            let elapsed = now.saturating_duration_since(started);
+            return Err(TOOL_INVOCATION_RATE_WINDOW.saturating_sub(elapsed));
         }
         window.count += 1;
-        true
+        Ok(())
     }
 }
 
@@ -363,10 +365,27 @@ pub fn workspace_availability(root: &Path) -> WorkspaceAvailability {
         return WorkspaceAvailability::Unavailable;
     }
     match canonicalize_existing_workspace_root(root) {
-        Ok(canonical) if comparable_root(&canonical) == comparable_root(root) => {
+        Ok(canonical) if workspace_root_matches_canonical(root, &canonical) => {
             WorkspaceAvailability::Available
         }
         _ => WorkspaceAvailability::Unavailable,
+    }
+}
+
+fn workspace_root_matches_canonical(root: &Path, canonical: &Path) -> bool {
+    if comparable_root(canonical) == comparable_root(root) {
+        return true;
+    }
+
+    #[cfg(windows)]
+    {
+        same_filesystem_object(root, canonical)
+            && windows_path_traverses_name_surrogate(root) == Some(false)
+    }
+
+    #[cfg(not(windows))]
+    {
+        false
     }
 }
 
@@ -467,12 +486,140 @@ fn same_filesystem_object(left: &Path, right: &Path) -> bool {
     )
 }
 
-// Existing roots are canonicalized before these identity fallbacks are used, so
-// Windows junction aliases normally collapse to the same comparable path. On
-// non-Unix targets we do not additionally compare stable file IDs; if an alias
-// cannot be resolved by canonicalization, overlap detection falls back to the
-// normalized `comparable_root` path checks.
-#[cfg(not(unix))]
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct WindowsFileIdentity {
+    volume_serial_number: u64,
+    file_id: [u8; 16],
+}
+
+#[cfg(windows)]
+struct WindowsPathHandle(windows_sys::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+impl Drop for WindowsPathHandle {
+    fn drop(&mut self) {
+        // SAFETY: `self.0` is an owned handle returned by `CreateFileW`.
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(self.0);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn open_windows_path(path: &Path, open_reparse_point: bool) -> Option<WindowsPathHandle> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+
+    let mut wide_path = path.as_os_str().encode_wide().collect::<Vec<_>>();
+    if wide_path.contains(&0) {
+        return None;
+    }
+    wide_path.push(0);
+    let flags = FILE_FLAG_BACKUP_SEMANTICS
+        | if open_reparse_point {
+            FILE_FLAG_OPEN_REPARSE_POINT
+        } else {
+            0
+        };
+
+    // SAFETY: `wide_path` is NUL-terminated and remains alive for the call. The
+    // returned handle is wrapped immediately so it is closed on every path.
+    let handle = unsafe {
+        CreateFileW(
+            wide_path.as_ptr(),
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            flags,
+            std::ptr::null_mut(),
+        )
+    };
+    (handle != INVALID_HANDLE_VALUE).then_some(WindowsPathHandle(handle))
+}
+
+#[cfg(windows)]
+fn windows_file_identity(path: &Path) -> Option<WindowsFileIdentity> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ID_INFO, FileIdInfo, GetFileInformationByHandleEx,
+    };
+
+    let handle = open_windows_path(path, false)?;
+    let mut info = FILE_ID_INFO::default();
+    // SAFETY: `info` is a correctly sized writable `FILE_ID_INFO` buffer and the
+    // handle stays valid for the duration of the query.
+    let succeeded = unsafe {
+        GetFileInformationByHandleEx(
+            handle.0,
+            FileIdInfo,
+            std::ptr::from_mut(&mut info).cast(),
+            u32::try_from(std::mem::size_of::<FILE_ID_INFO>()).ok()?,
+        )
+    };
+    (succeeded != 0).then_some(WindowsFileIdentity {
+        volume_serial_number: info.VolumeSerialNumber,
+        file_id: info.FileId.Identifier,
+    })
+}
+
+#[cfg(windows)]
+fn windows_reparse_tag(path: &Path) -> Option<u32> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_TAG_INFO, FileAttributeTagInfo, GetFileInformationByHandleEx,
+    };
+
+    let handle = open_windows_path(path, true)?;
+    let mut info = FILE_ATTRIBUTE_TAG_INFO::default();
+    // SAFETY: `info` is a correctly sized writable `FILE_ATTRIBUTE_TAG_INFO`
+    // buffer and the handle stays valid for the duration of the query.
+    let succeeded = unsafe {
+        GetFileInformationByHandleEx(
+            handle.0,
+            FileAttributeTagInfo,
+            std::ptr::from_mut(&mut info).cast(),
+            u32::try_from(std::mem::size_of::<FILE_ATTRIBUTE_TAG_INFO>()).ok()?,
+        )
+    };
+    (succeeded != 0).then_some(info.ReparseTag)
+}
+
+#[cfg(windows)]
+fn windows_path_traverses_name_surrogate(path: &Path) -> Option<bool> {
+    use std::os::windows::fs::MetadataExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+    // Microsoft marks name-surrogate reparse tags with bit 29. Symlinks and
+    // junction/mount-point redirects set it; metadata-only reparse points (for
+    // example some cloud-file tags) need not be rejected as path redirects.
+    const IO_REPARSE_TAG_NAME_SURROGATE: u32 = 0x2000_0000;
+
+    for candidate in path.ancestors() {
+        let metadata = std::fs::symlink_metadata(candidate).ok()?;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0 {
+            continue;
+        }
+        let tag = windows_reparse_tag(candidate)?;
+        if tag & IO_REPARSE_TAG_NAME_SURROGATE != 0 {
+            return Some(true);
+        }
+    }
+    Some(false)
+}
+
+#[cfg(windows)]
+fn same_filesystem_object(left: &Path, right: &Path) -> bool {
+    matches!(
+        (windows_file_identity(left), windows_file_identity(right)),
+        (Some(left), Some(right)) if left == right
+    )
+}
+
+#[cfg(all(not(unix), not(windows)))]
 fn same_filesystem_object(_left: &Path, _right: &Path) -> bool {
     false
 }
@@ -534,6 +681,102 @@ mod tests {
         let parsed = WorkspaceId::parse(&upper).expect("valid UUID should parse");
         assert_eq!(parsed.as_str(), upper.to_ascii_lowercase());
         assert!(WorkspaceId::parse("not-a-uuid").is_err());
+    }
+
+    #[cfg(windows)]
+    fn windows_short_path(path: &Path) -> Option<PathBuf> {
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+        use windows_sys::Win32::Storage::FileSystem::GetShortPathNameW;
+
+        let mut wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
+        wide.push(0);
+        // SAFETY: the input is NUL-terminated and no output buffer is supplied,
+        // which asks Windows for the required UTF-16 buffer size.
+        let required = unsafe { GetShortPathNameW(wide.as_ptr(), std::ptr::null_mut(), 0) };
+        if required == 0 {
+            return None;
+        }
+        let mut output = vec![0_u16; required as usize];
+        // SAFETY: `output` has the size returned by the first call and both
+        // buffers remain alive for the duration of the API call.
+        let written = unsafe { GetShortPathNameW(wide.as_ptr(), output.as_mut_ptr(), required) };
+        if written == 0 || written >= required {
+            return None;
+        }
+        output.truncate(written as usize);
+        Some(PathBuf::from(std::ffi::OsString::from_wide(&output)))
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn workspace_availability_accepts_windows_short_name_alias_for_same_directory() {
+        let root =
+            std::env::temp_dir().join(format!("MoonDesk Long Workspace Alias {}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("create long-name workspace root");
+        let short = windows_short_path(&root).expect("query Windows short path");
+
+        if comparable_root(&short) == comparable_root(&root) {
+            // 8.3 name generation can be disabled per-volume. The GitHub Windows
+            // runner that exposed this bug has it enabled, as do normal NTFS
+            // installations where this regression is relevant.
+            let _ = std::fs::remove_dir_all(root);
+            return;
+        }
+
+        let canonical = canonicalize_existing_workspace_root(&short)
+            .expect("canonicalize short-name workspace root");
+        assert_ne!(
+            comparable_root(&canonical),
+            comparable_root(&short),
+            "test must exercise a short-name/canonical-name mismatch"
+        );
+        assert!(same_filesystem_object(&short, &canonical));
+        assert_eq!(windows_path_traverses_name_surrogate(&short), Some(false));
+        assert_eq!(
+            workspace_availability(&short),
+            WorkspaceAvailability::Available,
+            "8.3 and long-name spellings of the same directory must not make a workspace unavailable"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn workspace_availability_rejects_windows_junction_ancestor_alias() {
+        let target = absolute_test_root("junction-target");
+        let alias = absolute_test_root("junction-alias");
+        let child = target.join("project");
+        std::fs::create_dir_all(&child).expect("create junction target workspace");
+
+        let output = std::process::Command::new("cmd")
+            .args(["/D", "/C", "mklink", "/J"])
+            .arg(&alias)
+            .arg(&target)
+            .output()
+            .expect("run mklink junction command");
+        assert!(
+            output.status.success(),
+            "failed to create test junction: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let aliased_child = alias.join("project");
+        let canonical = canonicalize_existing_workspace_root(&aliased_child)
+            .expect("canonicalize junction-backed workspace");
+        assert!(same_filesystem_object(&aliased_child, &canonical));
+        assert_eq!(
+            windows_path_traverses_name_surrogate(&aliased_child),
+            Some(true)
+        );
+        assert_eq!(
+            workspace_availability(&aliased_child),
+            WorkspaceAvailability::Unavailable,
+            "junction traversal must remain unavailable even when it resolves to the same file ID"
+        );
+
+        let _ = std::fs::remove_dir(&alias);
+        let _ = std::fs::remove_dir_all(target);
     }
 
     #[test]
@@ -715,15 +958,22 @@ mod tests {
         let workspace_b = WorkspaceRuntime::default();
 
         for _ in 0..MAX_TOOL_INVOCATIONS_PER_WINDOW {
-            assert!(workspace_a.allow_tool_invocation_at(now));
+            assert!(workspace_a.check_tool_invocation_at(now).is_ok());
         }
-        assert!(!workspace_a.allow_tool_invocation_at(now));
+        assert_eq!(
+            workspace_a
+                .check_tool_invocation_at(now)
+                .expect_err("workspace A should be rate limited"),
+            TOOL_INVOCATION_RATE_WINDOW
+        );
         assert!(
-            workspace_b.allow_tool_invocation_at(now),
+            workspace_b.check_tool_invocation_at(now).is_ok(),
             "one workspace must not consume another workspace's allowance"
         );
         assert!(
-            workspace_a.allow_tool_invocation_at(now + TOOL_INVOCATION_RATE_WINDOW),
+            workspace_a
+                .check_tool_invocation_at(now + TOOL_INVOCATION_RATE_WINDOW)
+                .is_ok(),
             "the fixed window must reset after its configured duration"
         );
     }

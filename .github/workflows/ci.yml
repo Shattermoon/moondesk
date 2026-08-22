@@ -81,6 +81,9 @@ jobs:
       - name: Run tests
         run: cargo +stable test --locked
 
+      - name: Run Windows developer toolchain smoke
+        run: cargo +stable test --locked windows_developer_toolchain_smoke_uses_normal_host_environment -- --ignored
+
   npm-runtime:
     if: github.event_name == 'workflow_dispatch' || github.event.pull_request.draft == false
     name: npm runtime (Node ${{ matrix.node-version }})

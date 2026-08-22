@@ -804,6 +804,132 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn developer_shell_preserves_host_path_and_home() {
+        let root = workspace("developer-env");
+        let command = if cfg!(windows) {
+            "if ([string]::IsNullOrWhiteSpace($env:PATH) -or [string]::IsNullOrWhiteSpace($env:USERPROFILE)) { exit 19 }; cargo --version"
+        } else {
+            r#"test -n "$PATH" && test -n "$HOME" && cargo --version"#
+        };
+        let result = run_shell_command(command, &root, 5_000, 8 * 1024, None).await;
+        assert!(
+            result.success,
+            "developer environment was not preserved: {}",
+            result.stderr
+        );
+        assert!(result.stdout.to_ascii_lowercase().contains("cargo"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    fn where_first_in_test(name: &str) -> Option<PathBuf> {
+        std::process::Command::new("where.exe")
+            .arg(name)
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .and_then(|output| String::from_utf8(output.stdout).ok())
+            .and_then(|text| text.lines().next().map(PathBuf::from))
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    #[ignore = "local Windows developer-tool compatibility smoke"]
+    async fn windows_developer_toolchain_smoke_uses_normal_host_environment() {
+        let root = workspace("developer-toolchain");
+        let command = r#"
+$checks = @{
+    git = @('--version')
+    cargo = @('--version')
+    rustc = @('--version')
+    python = @('--version')
+    node = @('--version')
+    npm = @('--version')
+    pnpm = @('--version')
+    bun = @('--version')
+    deno = @('--version')
+    uv = @('--version')
+    java = @('-version')
+    javac = @('-version')
+    dotnet = @('--version')
+    docker = @('--version')
+    kubectl = @('version','--client')
+    gcc = @('--version')
+}
+$seen = 0
+foreach ($tool in $checks.Keys) {
+    if (Get-Command $tool -ErrorAction SilentlyContinue) {
+        $seen++
+        $toolArgs = $checks[$tool]
+        & $tool @toolArgs
+        if ($LASTEXITCODE -ne 0) { exit 20 }
+    }
+}
+if ($seen -lt 5) { exit 21 }
+
+git init -q
+if ($LASTEXITCODE -ne 0) { exit 22 }
+git status --short
+if ($LASTEXITCODE -ne 0) { exit 23 }
+
+if (Get-Command python -ErrorAction SilentlyContinue) {
+    python -c "open('python-smoke.txt','w').write('ok')"
+    if ($LASTEXITCODE -ne 0) { exit 24 }
+}
+if (Get-Command node -ErrorAction SilentlyContinue) {
+    node -e "require('fs').writeFileSync('node-smoke.txt','ok')"
+    if ($LASTEXITCODE -ne 0) { exit 25 }
+}
+if (Test-Path Env:CUDA_PATH) { Write-Output "CUDA_PATH_PRESENT" }
+"#;
+        let result = run_shell_command(command, &root, 30_000, 128 * 1024, None).await;
+        let git_created = root.join(".git").is_dir();
+        let expected_cuda_path = std::env::var_os("CUDA_PATH").is_some();
+        let python_created =
+            where_first_in_test("python").is_none() || root.join("python-smoke.txt").is_file();
+        let node_created =
+            where_first_in_test("node").is_none() || root.join("node-smoke.txt").is_file();
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(
+            result.success,
+            "developer toolchain smoke failed (exit {:?}): stdout={} stderr={}",
+            result.exit_code, result.stdout, result.stderr
+        );
+        assert!(git_created, "git init did not create .git");
+        if expected_cuda_path {
+            assert!(
+                result.stdout.contains("CUDA_PATH_PRESENT"),
+                "host CUDA_PATH was not inherited by the developer shell"
+            );
+        }
+        assert!(
+            python_created,
+            "Python was discoverable but could not write in the workspace"
+        );
+        assert!(
+            node_created,
+            "Node was discoverable but could not write in the workspace"
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn developer_shell_can_bind_localhost_for_dev_servers() {
+        let root = workspace("localhost-bind");
+        let command = r#"
+$listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
+$listener.Start()
+$port = ([System.Net.IPEndPoint]$listener.LocalEndpoint).Port
+Write-Output $port
+$listener.Stop()
+"#;
+        let result = run_shell_command(command, &root, 5_000, 8 * 1024, None).await;
+        let _ = std::fs::remove_dir_all(root);
+        assert!(result.success, "localhost bind failed: {}", result.stderr);
+        assert!(result.stdout.trim().parse::<u16>().is_ok());
+    }
+
+    #[tokio::test]
     async fn run_shell_command_captures_output_and_exit_status() {
         let root = workspace("success");
         let command = if cfg!(windows) {

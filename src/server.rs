@@ -1,15 +1,18 @@
 use axum::{
     Router,
     body::{Body, Bytes},
-    extract::{DefaultBodyLimit, Path as AxumPath, State},
+    extract::{DefaultBodyLimit, Path as AxumPath, Request, State},
     http::{HeaderMap, HeaderValue, Response, StatusCode, header},
+    middleware::{self, Next},
     response::Json,
     routing::{delete, get, post},
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use subtle::ConstantTimeEq;
 
 use crate::command_jobs::CommandJobManager;
@@ -19,7 +22,9 @@ use crate::state::{
     AddWorkspaceError, CommandActivityState, FlowDirection, ServerUiEvent, SharedState,
     UiEventSender, add_workspace,
 };
-use crate::workspaces::{self, WorkspaceId, WorkspaceRequestContext, WorkspaceRequestLease};
+use crate::workspaces::{
+    self, WorkspaceId, WorkspaceRequestContext, WorkspaceRequestLease, WorkspaceRuntime,
+};
 use uuid::Uuid;
 
 const STATELESS_FLOW_ID: &str = "stateless";
@@ -37,6 +42,84 @@ struct ServerState {
     host_control_token: Arc<str>,
 }
 
+fn is_loopback_origin_host(host: &str) -> bool {
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    let host = host
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(host);
+    host.parse::<IpAddr>()
+        .is_ok_and(|address| address.is_loopback())
+}
+
+fn same_http_origin(candidate: &reqwest::Url, expected: &reqwest::Url) -> bool {
+    candidate.scheme().eq_ignore_ascii_case(expected.scheme())
+        && candidate
+            .host_str()
+            .zip(expected.host_str())
+            .is_some_and(|(candidate, expected)| candidate.eq_ignore_ascii_case(expected))
+        && candidate.port_or_known_default() == expected.port_or_known_default()
+}
+
+async fn request_origin_allowed(state: &ServerState, headers: &HeaderMap) -> bool {
+    let Some(origin) = headers.get(header::ORIGIN) else {
+        // Non-browser MCP clients normally omit Origin. The MCP transport rule
+        // only requires rejecting an Origin when one is present and invalid.
+        return true;
+    };
+    let Ok(origin) = origin.to_str() else {
+        return false;
+    };
+    let Ok(url) = reqwest::Url::parse(origin) else {
+        return false;
+    };
+    if !matches!(url.scheme(), "http" | "https")
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || !matches!(url.path(), "" | "/")
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return false;
+    }
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    if is_loopback_origin_host(host) {
+        return true;
+    }
+
+    let app = state.app.lock().await;
+    if app
+        .ngrok_domain
+        .as_deref()
+        .and_then(|domain| reqwest::Url::parse(&format!("https://{domain}")).ok())
+        .is_some_and(|expected| same_http_origin(&url, &expected))
+    {
+        return true;
+    }
+    app.ngrok_url
+        .as_deref()
+        .and_then(|value| reqwest::Url::parse(value).ok())
+        .is_some_and(|expected| same_http_origin(&url, &expected))
+}
+
+async fn validate_request_origin(
+    State(state): State<ServerState>,
+    request: Request,
+    next: Next,
+) -> Response<Body> {
+    if !request_origin_allowed(&state, request.headers()).await {
+        return response_with_body(
+            StatusCode::FORBIDDEN,
+            "application/json",
+            Body::from(r#"{"error":"forbidden origin"}"#),
+        );
+    }
+    next.run(request).await
+}
 /// Build the axum router.
 pub fn router(
     app_state: SharedState,
@@ -52,6 +135,15 @@ pub fn router(
         ui_events,
         host_control_token,
     };
+    let mcp_routes = Router::new()
+        .route("/{slug}/mcp", post(post_mcp))
+        .route("/{slug}/mcp", get(get_mcp))
+        .route("/{slug}/mcp", delete(delete_mcp))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            validate_request_origin,
+        ));
+
     Router::new()
         .route("/", get(health))
         .route(
@@ -59,9 +151,7 @@ pub fn router(
             post(register_workspace_from_local_host)
                 .layer(DefaultBodyLimit::max(MAX_HOST_CONTROL_BODY_BYTES)),
         )
-        .route("/{slug}/mcp", post(post_mcp))
-        .route("/{slug}/mcp", get(get_mcp))
-        .route("/{slug}/mcp", delete(delete_mcp))
+        .merge(mcp_routes)
         .with_state(state)
 }
 
@@ -87,15 +177,39 @@ fn jsonrpc_error_response(status: StatusCode, code: i64, msg: &str) -> Response<
     response_with_body(status, "application/json", Body::from(body))
 }
 
+fn tool_rate_limit_response(retry_after: Duration) -> Response<Body> {
+    let mut response = jsonrpc_error_response(
+        StatusCode::TOO_MANY_REQUESTS,
+        -32000,
+        "Tool invocation rate limit exceeded; retry shortly",
+    );
+    let retry_after_seconds = retry_after
+        .as_secs()
+        .saturating_add(u64::from(retry_after.subsec_nanos() != 0))
+        .max(1);
+    let header_value = match HeaderValue::from_str(&retry_after_seconds.to_string()) {
+        Ok(value) => value,
+        Err(_) => HeaderValue::from_static("1"),
+    };
+    response
+        .headers_mut()
+        .insert(header::RETRY_AFTER, header_value);
+    response
+}
+
 async fn resolve_workspace(
     state: &ServerState,
     slug: &str,
-) -> Option<(WorkspaceRequestContext, WorkspaceRequestLease)> {
+) -> Option<(
+    WorkspaceRequestContext,
+    Arc<WorkspaceRuntime>,
+    WorkspaceRequestLease,
+)> {
     let app = state.app.lock().await;
     let workspace = workspaces::resolve_workspace_by_slug(&app.workspaces, slug)?;
     let runtime = app.workspace_runtimes.get(&workspace.workspace_id)?.clone();
     let lease = runtime.try_acquire()?;
-    Some((workspace, lease))
+    Some((workspace, runtime, lease))
 }
 
 fn not_found_response() -> Response<Body> {
@@ -523,7 +637,7 @@ async fn post_mcp(
     State(s): State<ServerState>,
     body_bytes: Bytes,
 ) -> Response<Body> {
-    let Some((workspace, _request_lease)) = resolve_workspace(&s, &slug).await else {
+    let Some((workspace, runtime, _request_lease)) = resolve_workspace(&s, &slug).await else {
         return not_found_response();
     };
 
@@ -543,6 +657,12 @@ async fn post_mcp(
             -32600,
             "Invalid request: expected a single JSON-RPC message object",
         );
+    }
+
+    if body.get("method").and_then(Value::as_str) == Some("tools/call")
+        && let Err(retry_after) = runtime.check_tool_invocation()
+    {
+        return tool_rate_limit_response(retry_after);
     }
 
     {
@@ -708,7 +828,7 @@ async fn post_mcp(
 // ── GET /<slug>/mcp — pure HTTP mode (no SSE) ───────────────
 
 async fn get_mcp(AxumPath(slug): AxumPath<String>, State(s): State<ServerState>) -> Response<Body> {
-    let Some((_workspace, _request_lease)) = resolve_workspace(&s, &slug).await else {
+    let Some((_workspace, _runtime, _request_lease)) = resolve_workspace(&s, &slug).await else {
         return not_found_response();
     };
     response_with_body(
@@ -726,7 +846,7 @@ async fn delete_mcp(
     AxumPath(slug): AxumPath<String>,
     State(s): State<ServerState>,
 ) -> Response<Body> {
-    let Some((workspace, _request_lease)) = resolve_workspace(&s, &slug).await else {
+    let Some((workspace, _runtime, _request_lease)) = resolve_workspace(&s, &slug).await else {
         return not_found_response();
     };
     {
@@ -976,6 +1096,176 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn router_rejects_invalid_origins_without_blocking_normal_clients() {
+        let workspace_root = unique_temp_path("moondesk-origin-workspace");
+        let config_root = unique_temp_path("moondesk-origin-config");
+        let config_path = config_root.join("config.toml");
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        std::fs::create_dir_all(&config_root).expect("create config dir");
+
+        let mut app = AppState::new_for_test(
+            8787,
+            workspace_root.to_string_lossy().into_owned(),
+            config_path.clone(),
+        )
+        .expect("create app state");
+        app.ngrok_domain = Some("moon-origin-test.ngrok-free.app".into());
+        let slug = app.mcp_slug.clone();
+        let app_state = Arc::new(Mutex::new(app));
+        let (ui_tx, _ui_rx) = ui_event_channel();
+        let app = router(
+            app_state,
+            None,
+            CommandJobManager::new(),
+            ui_tx,
+            Arc::from("test-host-control-token"),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let address = listener.local_addr().expect("test server address");
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let endpoint = format!("http://{address}/{slug}/mcp");
+        let payload = r#"{"jsonrpc":"2.0","id":"origin-check","method":"ping","params":{}}"#;
+        let client = reqwest::Client::new();
+
+        let no_origin = client
+            .post(&endpoint)
+            .body(payload)
+            .send()
+            .await
+            .expect("send request without Origin");
+        assert_eq!(no_origin.status(), StatusCode::OK);
+
+        for local_origin in [
+            "http://localhost:9999",
+            "http://127.0.0.1:9999",
+            "http://127.0.0.2:9999",
+            "http://[::1]:9999",
+        ] {
+            let response = client
+                .post(&endpoint)
+                .header(reqwest::header::ORIGIN, local_origin)
+                .body(payload)
+                .send()
+                .await
+                .expect("send local-origin request");
+            assert_eq!(response.status(), StatusCode::OK, "{local_origin}");
+        }
+
+        let public_origin = client
+            .post(&endpoint)
+            .header(
+                reqwest::header::ORIGIN,
+                "https://moon-origin-test.ngrok-free.app",
+            )
+            .body(payload)
+            .send()
+            .await
+            .expect("send configured-origin request");
+        assert_eq!(public_origin.status(), StatusCode::OK);
+
+        let public_origin_default_port = client
+            .post(&endpoint)
+            .header(
+                reqwest::header::ORIGIN,
+                "https://moon-origin-test.ngrok-free.app:443",
+            )
+            .body(payload)
+            .send()
+            .await
+            .expect("send configured-origin request with explicit default port");
+        assert_eq!(public_origin_default_port.status(), StatusCode::OK);
+
+        for invalid_public_origin in [
+            "http://moon-origin-test.ngrok-free.app",
+            "https://moon-origin-test.ngrok-free.app:8443",
+        ] {
+            let response = client
+                .post(&endpoint)
+                .header(reqwest::header::ORIGIN, invalid_public_origin)
+                .body(payload)
+                .send()
+                .await
+                .expect("send wrong public origin tuple");
+            assert_eq!(
+                response.status(),
+                StatusCode::FORBIDDEN,
+                "{invalid_public_origin}"
+            );
+        }
+
+        let bad_origin = client
+            .post(&endpoint)
+            .header(reqwest::header::ORIGIN, "https://attacker.example")
+            .body(payload)
+            .send()
+            .await
+            .expect("send invalid-origin request");
+        assert_eq!(bad_origin.status(), StatusCode::FORBIDDEN);
+
+        let bad_get_origin = client
+            .get(&endpoint)
+            .header(reqwest::header::ORIGIN, "https://attacker.example")
+            .send()
+            .await
+            .expect("send invalid-origin GET request");
+        assert_eq!(bad_get_origin.status(), StatusCode::FORBIDDEN);
+
+        let bad_delete_origin = client
+            .delete(&endpoint)
+            .header(reqwest::header::ORIGIN, "https://attacker.example")
+            .send()
+            .await
+            .expect("send invalid-origin DELETE request");
+        assert_eq!(bad_delete_origin.status(), StatusCode::FORBIDDEN);
+
+        let health_with_foreign_origin = client
+            .get(format!("http://{address}/"))
+            .header(reqwest::header::ORIGIN, "https://attacker.example")
+            .send()
+            .await
+            .expect("send health request with unrelated Origin");
+        assert_eq!(
+            health_with_foreign_origin.status(),
+            StatusCode::OK,
+            "Origin validation must stay scoped to MCP routes"
+        );
+
+        let opaque_origin = client
+            .post(&endpoint)
+            .header(reqwest::header::ORIGIN, "null")
+            .body(payload)
+            .send()
+            .await
+            .expect("send opaque-origin request");
+        assert_eq!(opaque_origin.status(), StatusCode::FORBIDDEN);
+
+        for invalid_origin in [
+            "https://moon-origin-test.ngrok-free.app/path",
+            "https://user@moon-origin-test.ngrok-free.app",
+            "file://moon-origin-test.ngrok-free.app",
+        ] {
+            let response = client
+                .post(&endpoint)
+                .header(reqwest::header::ORIGIN, invalid_origin)
+                .body(payload)
+                .send()
+                .await
+                .expect("send syntactically invalid Origin");
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{invalid_origin}");
+        }
+
+        server.abort();
+        let _ = server.await;
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_dir_all(config_root);
+        let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
     async fn host_workspace_registration_is_authenticated_and_idempotent() {
         let workspace_a = unique_temp_path("moondesk-host-register-a");
         let workspace_b = unique_temp_path("moondesk-host-register-b");
@@ -1064,6 +1354,67 @@ mod tests {
         let _ = std::fs::remove_dir_all(config_root);
         let _ = std::fs::remove_dir_all(workspace_a);
         let _ = std::fs::remove_dir_all(workspace_b);
+    }
+
+    #[tokio::test]
+    async fn tool_invocation_rate_limit_returns_429_without_blocking_ping() {
+        let workspace_root = unique_temp_path("moondesk-rate-workspace");
+        let config_root = unique_temp_path("moondesk-rate-config");
+        let config_path = config_root.join("config.toml");
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        std::fs::create_dir_all(&config_root).expect("create config dir");
+
+        let app = AppState::new_for_test(
+            8787,
+            workspace_root.to_string_lossy().into_owned(),
+            config_path.clone(),
+        )
+        .expect("create app state");
+        let slug = app.mcp_slug.clone();
+        let workspace_id = app.workspaces[0].id.clone();
+        let runtime = app.workspace_runtimes[&workspace_id].clone();
+        for _ in 0..workspaces::MAX_TOOL_INVOCATIONS_PER_WINDOW {
+            assert!(runtime.check_tool_invocation().is_ok());
+        }
+
+        let app_state = Arc::new(Mutex::new(app));
+        let (ui_tx, _ui_rx) = ui_event_channel();
+        let server_state = ServerState {
+            app: app_state,
+            devtools: None,
+            command_jobs: CommandJobManager::new(),
+            ui_events: ui_tx,
+            host_control_token: Arc::from("test-host-control-token"),
+        };
+
+        let limited = post_mcp(
+            AxumPath(slug.clone()),
+            State(server_state.clone()),
+            tool_call_body("read", json!({ "path": "README.md" })),
+        )
+        .await;
+        assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+        let retry_after = limited
+            .headers()
+            .get(header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok())
+            .expect("429 response should include an integer Retry-After header");
+        assert!((1..=workspaces::TOOL_INVOCATION_RATE_WINDOW.as_secs()).contains(&retry_after));
+
+        let ping = post_mcp(
+            AxumPath(slug),
+            State(server_state),
+            Bytes::from_static(
+                br#"{"jsonrpc":"2.0","id":"rate-ping","method":"ping","params":{}}"#,
+            ),
+        )
+        .await;
+        assert_eq!(ping.status(), StatusCode::OK);
+
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_dir_all(config_root);
+        let _ = std::fs::remove_dir_all(workspace_root);
     }
 
     #[tokio::test]

@@ -265,7 +265,7 @@ async fn handle_tools_list(
             tools.push(json!({
                 "name": "run_command",
                 "title": "Run command",
-                "description": "Execute a short shell command inside the workspace root. Common directory-listing commands may be compacted before execution. For commands that may produce large output, prefer start_command plus poll_command. If a one-shot command exceeds the inline capture limit, run_command returns outputId and read_command_output can retrieve the complete preserved stdout/stderr without rerunning it.",
+                "description": "Execute a short command in the user's normal developer shell with the workspace root as its working directory. The shell inherits the user's normal PATH, home directory, environment, and OS permissions; it is not an OS filesystem sandbox. Prefer dedicated workspace file tools when they can complete the task. Common directory-listing commands may be compacted before execution. For commands that may produce large output, prefer start_command plus poll_command. If a one-shot command exceeds the inline capture limit, run_command returns outputId and read_command_output can retrieve the complete preserved stdout/stderr without rerunning it.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -288,7 +288,7 @@ async fn handle_tools_list(
             tools.push(json!({
                 "name": "start_command",
                 "title": "Start command",
-                "description": "Start a long-running shell command inside the workspace and return a job ID immediately. Prefer this for builds, compilation, dependency installation, long test suites, and development servers instead of keeping run_command open.",
+                "description": "Start a long-running command in the user's normal developer shell with the workspace root as its working directory and return a job ID immediately. The shell inherits normal user environment and OS permissions and is not an OS filesystem sandbox. Prefer this for builds, compilation, dependency installation, long test suites, and development servers instead of keeping run_command open.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -1412,7 +1412,7 @@ Always specify the branch explicitly when using `git push`."#
 
     if mode.computer_enabled() && tool_mode.run_command_enabled() {
         lines.push(
-            "Use run_command only as a last resort when the available dedicated tools cannot complete the operation, and keep it for short commands that should finish quickly."
+            "Use run_command only as a last resort when the available dedicated tools cannot complete the operation, and keep it for short commands that should finish quickly. It is a real developer shell with the workspace as CWD, not an OS sandbox: it inherits normal user PATH/environment and can access other paths permitted to the MoonDesk user."
                 .to_string(),
         );
         lines.push(

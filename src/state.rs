@@ -619,7 +619,9 @@ impl ToolMode {
 
     pub fn description(self) -> &'static str {
         match self {
-            ToolMode::MultiTools => "Expose workspace read/write tools plus run_command.",
+            ToolMode::MultiTools => {
+                "Expose workspace tools plus the user's normal developer shell."
+            }
             ToolMode::ReadOnly => "Expose safe read-only workspace tools only.",
         }
     }
@@ -1106,9 +1108,12 @@ impl AppState {
     }
 
     pub fn public_mcp_url(&self) -> Option<String> {
-        self.ngrok_url
-            .as_ref()
-            .map(|url| format!("{url}{}", self.mcp_path()))
+        let base = self.ngrok_url.clone().or_else(|| {
+            self.ngrok_domain
+                .as_ref()
+                .map(|domain| format!("https://{domain}"))
+        })?;
+        Some(format!("{}{}", base.trim_end_matches('/'), self.mcp_path()))
     }
 
     fn recompute_remote_connection_state(&mut self) {
@@ -2212,6 +2217,10 @@ toolMode = "multiTools"
             .expect("canonicalize legacy root");
         assert_eq!(first.mcp_slug, legacy_slug);
         assert_eq!(first.mcp_path(), format!("/{legacy_slug}/mcp"));
+        assert_eq!(
+            first.public_mcp_url().as_deref(),
+            Some("https://example.ngrok-free.dev/Ab3kL9xQ2pTm7VhC/mcp")
+        );
         assert_eq!(first.workspace_root, expected_root.to_string_lossy());
         assert!(first.is_returning_user);
         assert_eq!(first.workspaces.len(), 1);
@@ -2232,12 +2241,76 @@ toolMode = "multiTools"
         )
         .expect("reload migrated config");
         assert_eq!(reloaded.mcp_slug, legacy_slug);
+        assert_eq!(
+            reloaded.public_mcp_url().as_deref(),
+            first.public_mcp_url().as_deref()
+        );
         assert_eq!(reloaded.workspaces[0].id, first_workspace_id);
         assert_eq!(reloaded.workspace_root, first.workspace_root);
 
         let _ = std::fs::remove_file(config_path);
         let _ = std::fs::remove_dir_all(config_root);
         let _ = std::fs::remove_dir_all(other_workspace);
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn legacy_workspace_without_domain_keeps_secret_when_domain_is_added() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let workspace =
+            std::env::temp_dir().join(format!("moondesk-legacy-no-domain-root-{unique}"));
+        let alternate_launch_root =
+            std::env::temp_dir().join(format!("moondesk-legacy-no-domain-other-{unique}"));
+        let config_root =
+            std::env::temp_dir().join(format!("moondesk-legacy-no-domain-config-{unique}"));
+        std::fs::create_dir_all(&workspace).expect("create legacy workspace");
+        std::fs::create_dir_all(&alternate_launch_root).expect("create alternate launch root");
+        std::fs::create_dir_all(&config_root).expect("create config root");
+        let config_path = config_root.join(APP_CONFIG_FILE_NAME);
+        let legacy_slug = "LegacyStableSlug1";
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"mcpSlug = "{legacy_slug}"
+theme = "neon"
+mode = "both"
+toolMode = "multiTools"
+"#
+            ),
+        )
+        .expect("write legacy config without domain");
+
+        let mut migrated = AppState::from_config_path(
+            8787,
+            workspace.to_string_lossy().into_owned(),
+            config_path.clone(),
+        )
+        .expect("migrate legacy config without domain");
+        assert_eq!(migrated.mcp_slug, legacy_slug);
+        assert!(migrated.ngrok_domain.is_none());
+        assert!(migrated.public_mcp_url().is_none());
+
+        migrated.set_ngrok_domain(Some("stable-after-migration.ngrok-free.app".into()));
+        migrated.persist_state().expect("persist static domain");
+
+        let reloaded = AppState::from_config_path(
+            8787,
+            alternate_launch_root.to_string_lossy().into_owned(),
+            config_path.clone(),
+        )
+        .expect("reload migrated config with domain");
+        assert_eq!(reloaded.mcp_slug, legacy_slug);
+        assert_eq!(
+            reloaded.public_mcp_url().as_deref(),
+            Some("https://stable-after-migration.ngrok-free.app/LegacyStableSlug1/mcp")
+        );
+
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_dir_all(config_root);
+        let _ = std::fs::remove_dir_all(alternate_launch_root);
         let _ = std::fs::remove_dir_all(workspace);
     }
 
@@ -2979,6 +3052,76 @@ toolMode = "multiTools"
         let _ = std::fs::remove_file(config_path);
         let _ = std::fs::remove_dir_all(workspace);
     }
+    #[tokio::test]
+    async fn workspace_connector_identity_survives_persistence_and_reload() {
+        let (mut app, primary_root, config_path) = test_app("moondesk-workspace-url-stability");
+        let alternate_launch_root = std::env::temp_dir().join(format!(
+            "moondesk-workspace-url-stability-launch-{}",
+            Uuid::new_v4()
+        ));
+        let secondary_root = std::env::temp_dir().join(format!(
+            "moondesk-workspace-url-stability-secondary-{}",
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&alternate_launch_root).expect("create alternate launch root");
+        std::fs::create_dir_all(&secondary_root).expect("create secondary workspace");
+
+        app.set_ngrok_domain(Some("stable-test.ngrok-free.app".into()));
+        app.persist_state().expect("persist stable ngrok domain");
+        let primary_id = app.workspaces[0].id.clone();
+        let primary_slug = app.workspaces[0].mcp_slug.clone();
+        let primary_url = app.public_mcp_url().expect("primary connector URL");
+        let state = Arc::new(Mutex::new(app));
+
+        let secondary = add_workspace(&state, "Secondary".into(), secondary_root.clone())
+            .await
+            .expect("add secondary workspace");
+        rename_workspace(&state, &secondary.id, "Secondary Renamed".into())
+            .await
+            .expect("rename secondary workspace");
+        let secondary_slug = secondary.mcp_slug.clone();
+        let secondary_url = format!("https://stable-test.ngrok-free.app/{secondary_slug}/mcp");
+        drop(state);
+
+        let reloaded = AppState::from_config_path(
+            8787,
+            alternate_launch_root.to_string_lossy().into_owned(),
+            config_path.clone(),
+        )
+        .expect("reload persisted workspace registry");
+
+        assert_eq!(
+            reloaded.ngrok_domain.as_deref(),
+            Some("stable-test.ngrok-free.app")
+        );
+        assert_eq!(reloaded.workspaces[0].id, primary_id);
+        assert_eq!(reloaded.workspaces[0].mcp_slug, primary_slug);
+        assert_eq!(
+            reloaded.public_mcp_url().as_deref(),
+            Some(primary_url.as_str())
+        );
+        let reloaded_secondary = reloaded
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == secondary.id)
+            .expect("reloaded secondary workspace");
+        assert_eq!(reloaded_secondary.name, "Secondary Renamed");
+        assert_eq!(reloaded_secondary.mcp_slug, secondary_slug);
+        assert_eq!(
+            format!(
+                "https://{}/{}/mcp",
+                reloaded.ngrok_domain.as_deref().expect("persisted domain"),
+                reloaded_secondary.mcp_slug
+            ),
+            secondary_url
+        );
+
+        let _ = std::fs::remove_dir_all(secondary_root);
+        let _ = std::fs::remove_dir_all(alternate_launch_root);
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_dir_all(primary_root);
+    }
+
     #[tokio::test]
     async fn workspace_lifecycle_mutations_persist_transactionally() {
         let (app, primary_root, config_path) = test_app("moondesk-workspace-lifecycle");

@@ -3,8 +3,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use subtle::ConstantTimeEq;
 use tokio::sync::Notify;
 use uuid::Uuid;
@@ -13,6 +14,8 @@ use crate::command;
 
 pub const MAX_REGISTERED_WORKSPACES: usize = 32;
 pub const MAX_WORKSPACE_NAME_CHARS: usize = 128;
+pub const MAX_TOOL_INVOCATIONS_PER_WINDOW: usize = 600;
+pub const TOOL_INVOCATION_RATE_WINDOW: Duration = Duration::from_secs(60);
 const MAX_MCP_SLUG_CHARS: usize = 128;
 
 pub fn generate_mcp_slug() -> String {
@@ -113,6 +116,12 @@ pub enum WorkspaceAvailability {
     Unavailable,
 }
 
+#[derive(Debug, Default)]
+struct ToolInvocationWindow {
+    started_at: Option<Instant>,
+    count: usize,
+}
+
 #[derive(Debug)]
 pub struct WorkspaceRuntime {
     accepting_requests: AtomicBool,
@@ -120,6 +129,7 @@ pub struct WorkspaceRuntime {
     remote_connected: AtomicBool,
     last_remote_activity_ms: AtomicU64,
     request_count: AtomicU64,
+    tool_invocations: Mutex<ToolInvocationWindow>,
     drain_notify: Notify,
 }
 
@@ -131,6 +141,7 @@ impl Default for WorkspaceRuntime {
             remote_connected: AtomicBool::new(false),
             last_remote_activity_ms: AtomicU64::new(0),
             request_count: AtomicU64::new(0),
+            tool_invocations: Mutex::new(ToolInvocationWindow::default()),
             drain_notify: Notify::new(),
         }
     }
@@ -217,6 +228,29 @@ impl WorkspaceRuntime {
 
     pub fn request_count(&self) -> u64 {
         self.request_count.load(Ordering::Relaxed)
+    }
+
+    pub fn allow_tool_invocation(&self) -> bool {
+        self.allow_tool_invocation_at(Instant::now())
+    }
+
+    fn allow_tool_invocation_at(&self, now: Instant) -> bool {
+        let mut window = self
+            .tool_invocations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let expired = window.started_at.is_none_or(|started| {
+            now.saturating_duration_since(started) >= TOOL_INVOCATION_RATE_WINDOW
+        });
+        if expired {
+            window.started_at = Some(now);
+            window.count = 0;
+        }
+        if window.count >= MAX_TOOL_INVOCATIONS_PER_WINDOW {
+            return false;
+        }
+        window.count += 1;
+        true
     }
 }
 
@@ -672,5 +706,25 @@ mod tests {
         runtime.set_remote_connected(false);
         assert!(!runtime.remote_connected());
         assert_eq!(runtime.last_remote_activity_ms(), None);
+    }
+
+    #[test]
+    fn tool_invocation_rate_limit_is_generous_per_workspace_and_resets() {
+        let now = Instant::now();
+        let workspace_a = WorkspaceRuntime::default();
+        let workspace_b = WorkspaceRuntime::default();
+
+        for _ in 0..MAX_TOOL_INVOCATIONS_PER_WINDOW {
+            assert!(workspace_a.allow_tool_invocation_at(now));
+        }
+        assert!(!workspace_a.allow_tool_invocation_at(now));
+        assert!(
+            workspace_b.allow_tool_invocation_at(now),
+            "one workspace must not consume another workspace's allowance"
+        );
+        assert!(
+            workspace_a.allow_tool_invocation_at(now + TOOL_INVOCATION_RATE_WINDOW),
+            "the fixed window must reset after its configured duration"
+        );
     }
 }

@@ -540,7 +540,11 @@ fn open_windows_path(path: &Path, open_reparse_point: bool) -> Option<WindowsPat
             std::ptr::null_mut(),
         )
     };
-    (handle != INVALID_HANDLE_VALUE).then_some(WindowsPathHandle(handle))
+    if handle == INVALID_HANDLE_VALUE {
+        None
+    } else {
+        Some(WindowsPathHandle(handle))
+    }
 }
 
 #[cfg(windows)]

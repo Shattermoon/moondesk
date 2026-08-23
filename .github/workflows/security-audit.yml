@@ -36,7 +36,13 @@ jobs:
         run: |
           set -euo pipefail
           rustup toolchain install stable --profile minimal
-          cargo +stable install cargo-audit --version 0.22.2 --locked
+          install_dir="${RUNNER_TEMP}/moondesk-cargo-audit"
+          rm -rf "$install_dir"
+          mkdir -p "$install_dir/cargo-home" "$install_dir/root"
+          export CARGO_HOME="$install_dir/cargo-home"
+          cd "$RUNNER_TEMP"
+          cargo +stable install cargo-audit --version 0.22.2 --locked --root "$install_dir/root"
+          echo "$install_dir/root/bin" >> "$GITHUB_PATH"
 
       # Audit only the checked-in lockfile from an isolated directory. A pull
       # request can modify `.cargo/audit.toml`, so running inside the checkout

@@ -78,8 +78,11 @@ jobs:
       - name: Reject production panics and unchecked assumptions
         run: cargo +stable clippy --bin moondesk --locked -- -D warnings -D clippy::unwrap_used -D clippy::expect_used -D clippy::panic -D clippy::unreachable
 
+      # Several command-job tests intentionally spawn PowerShell processes. GitHub-hosted
+      # Windows runners can serialize process startup under load, so avoid making those
+      # tests compete with each other for the same short readiness/timeout budgets.
       - name: Run tests
-        run: cargo +stable test --locked
+        run: cargo +stable test --locked -- --test-threads 1
 
       - name: Run Windows developer toolchain smoke
         run: cargo +stable test --locked windows_developer_toolchain_smoke_uses_normal_host_environment -- --ignored

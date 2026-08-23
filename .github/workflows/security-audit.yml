@@ -24,18 +24,33 @@ jobs:
   rustsec:
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     name: RustSec
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
 
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
 
-      # GitHub's ubuntu-22.04 image includes cargo-audit. Plain `cargo audit`
-      # reports informational advisories without failing, but exits non-zero for
-      # security vulnerabilities. Printing the version keeps the runner-provided
-      # scanner version visible in every audit log.
-      - name: Audit Rust dependencies
+      - name: Install pinned cargo-audit
+        shell: bash
         run: |
-          cargo audit --version
-          cargo audit
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal
+          cargo +stable install cargo-audit --version 0.22.2 --locked
+
+      # Audit only the checked-in lockfile from an isolated directory. A pull
+      # request can modify `.cargo/audit.toml`, so running inside the checkout
+      # would let PR-controlled configuration weaken or suppress the audit.
+      - name: Audit Rust dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f "$GITHUB_WORKSPACE/Cargo.lock"
+          audit_dir="${RUNNER_TEMP}/moondesk-rustsec-audit"
+          rm -rf "$audit_dir"
+          mkdir -p "$audit_dir/cargo-home"
+          cp "$GITHUB_WORKSPACE/Cargo.lock" "$audit_dir/Cargo.lock"
+          export CARGO_HOME="$audit_dir/cargo-home"
+          cd "$audit_dir"
+          cargo +stable audit --version
+          cargo +stable audit

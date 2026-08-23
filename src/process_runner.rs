@@ -43,6 +43,10 @@ pub struct SpawnedProcess {
 }
 
 impl SpawnedProcess {
+    pub fn pid(&self) -> Option<u32> {
+        self.child.id()
+    }
+
     pub fn take_stdout(&mut self) -> Option<ChildStdout> {
         self.stdout.take()
     }
@@ -326,6 +330,98 @@ fn terminate_process_tree(pid: u32) {
 
 #[cfg(not(any(windows, unix)))]
 fn terminate_process_tree(_pid: u32) {}
+
+#[cfg(windows)]
+pub fn process_tree_size(root_pid: u32) -> Option<usize> {
+    use std::collections::{HashMap, VecDeque};
+    use std::mem::{size_of, zeroed};
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+        TH32CS_SNAPPROCESS,
+    };
+
+    unsafe {
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snapshot == INVALID_HANDLE_VALUE {
+            return None;
+        }
+
+        let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+        let mut root_found = false;
+        let mut entry: PROCESSENTRY32W = zeroed();
+        entry.dwSize = size_of::<PROCESSENTRY32W>() as u32;
+        let mut found = Process32FirstW(snapshot, &mut entry) != 0;
+        while found {
+            root_found |= entry.th32ProcessID == root_pid;
+            children
+                .entry(entry.th32ParentProcessID)
+                .or_default()
+                .push(entry.th32ProcessID);
+            found = Process32NextW(snapshot, &mut entry) != 0;
+        }
+        CloseHandle(snapshot);
+        if !root_found {
+            return None;
+        }
+
+        let mut count = 0usize;
+        let mut queue = VecDeque::from([root_pid]);
+        while let Some(pid) = queue.pop_front() {
+            count = count.saturating_add(1);
+            if let Some(descendants) = children.get(&pid) {
+                queue.extend(descendants.iter().copied());
+            }
+        }
+        Some(count)
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub fn process_tree_size(root_pid: u32) -> Option<usize> {
+    use std::collections::{HashMap, VecDeque};
+
+    let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+    let mut root_found = false;
+    for entry in std::fs::read_dir("/proc").ok()?.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|value| value.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        root_found |= pid == root_pid;
+        let Ok(status) = std::fs::read_to_string(entry.path().join("status")) else {
+            continue;
+        };
+        let parent = status.lines().find_map(|line| {
+            line.strip_prefix("PPid:")
+                .and_then(|value| value.trim().parse::<u32>().ok())
+        });
+        if let Some(parent) = parent {
+            children.entry(parent).or_default().push(pid);
+        }
+    }
+    if !root_found {
+        return None;
+    }
+
+    let mut count = 0usize;
+    let mut queue = VecDeque::from([root_pid]);
+    while let Some(pid) = queue.pop_front() {
+        count = count.saturating_add(1);
+        if let Some(descendants) = children.get(&pid) {
+            queue.extend(descendants.iter().copied());
+        }
+    }
+    Some(count)
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+pub fn process_tree_size(_root_pid: u32) -> Option<usize> {
+    None
+}
 
 fn shell_command(command: &str) -> Command {
     #[cfg(windows)]
@@ -767,6 +863,13 @@ mod tests {
         let path = std::env::temp_dir().join(format!("moondesk-process-{name}-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&path).expect("create test workspace");
         path
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    #[test]
+    fn process_tree_size_requires_a_live_root_process() {
+        assert!(process_tree_size(std::process::id()).is_some_and(|count| count >= 1));
+        assert_eq!(process_tree_size(u32::MAX), None);
     }
 
     #[tokio::test]

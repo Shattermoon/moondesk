@@ -189,7 +189,7 @@ Important behavior:
 
 # Tools
 
-MoonDesk has two local tool modes: `multi-tools` exposes 11 tools, and `read-only` exposes 3 tools.
+MoonDesk has two local tool modes: `multi-tools` exposes 12 tools, and `read-only` exposes 3 tools.
 
 MoonDesk's local tools in `multi-tools` mode are:
 
@@ -203,11 +203,12 @@ MoonDesk's local tools in `multi-tools` mode are:
 | `delete`              | Write | Deletes a file or directory                                                |
 | `run_command`         | Shell | Runs a short shell command and waits for completion                        |
 | `start_command`       | Job   | Starts a long-running shell command and immediately returns a job ID       |
+| `list_commands`       | Read  | Lists active (or retained completed) command jobs for this workspace       |
 | `poll_command`        | Job   | Reads incremental output and status from a background command              |
 | `read_command_output` | Read  | Reads bounded chunks from complete preserved command stdout/stderr         |
 | `cancel_command`      | Job   | Stops a background command and its child process tree                      |
 
-Long-running commands are deliberately decoupled from the lifetime of an MCP HTTP request. Builds, compilation, dependency installation, long test suites, development servers, and commands expected to produce large output should use `start_command`, then `poll_command`. The first poll uses `after: 0`; every later poll must pass the previous `nextCursor`, so each response contains only new output. Poll responses stay bounded. Complete stdout/stderr is also preserved locally for the MoonDesk session, so if a poll reports `outputTruncated`, `read_command_output` can recover either full stream in bounded byte chunks using the same job ID. `run_command` remains the simpler path for short commands; if its inline 1 MiB-per-stream capture is exceeded, it returns an `outputId` that `read_command_output` can use instead of permanently discarding the overflow.
+Long-running commands are deliberately decoupled from the lifetime of an MCP HTTP request. Builds, compilation, dependency installation, long test suites, development servers, and commands expected to produce large output should use `start_command`, then `poll_command`. Before starting work that may already be alive, `list_commands` lets an agent rediscover the workspace's active jobs after retries, long conversations, or context loss. `start_command` also reuses an exact running command in the same working directory by default instead of accidentally launching another copy; set `allow_duplicate: true` only when another concurrent copy is intentional. Active job listings include the owned root PID and, on supported platforms, the current process-tree size so multiple Node/compiler workers can be attributed to one logical command. The first poll uses `after: 0`; every later poll must pass the previous `nextCursor`, so each response contains only new output. Poll responses stay bounded. Complete stdout/stderr is also preserved locally for the MoonDesk session, so if a poll reports `outputTruncated`, `read_command_output` can recover either full stream in bounded byte chunks using the same job ID. `run_command` remains the simpler path for short commands; if its inline 1 MiB-per-stream capture is exceeded, it returns an `outputId` that `read_command_output` can use instead of permanently discarding the overflow.
 
 On wide terminals, the lower TUI is split into a compact Logs pane and a larger Shell Commands pane. Shell Commands is focused by default. `Tab`/`Shift+Tab` switches pane focus; arrow keys, Page Up/Down, and the mouse wheel select/scroll entries in the focused or pointed pane; Home/End jumps to the first/latest entry. Clicking a rendered row selects it. Long log messages and shell commands stay compact with an explicit ellipsis; press `Enter` or `Space` to expand the selected row and wrap its full locally stored text, then `Esc` to collapse it. Shell command entries always keep one blank line between executions for readability. Each pane keeps independent scroll/follow state, so inspecting command history no longer moves the Logs pane.
 

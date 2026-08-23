@@ -171,6 +171,16 @@ fn local_tool_output_schema(name: &str) -> Option<Value> {
         "start_command" => {
             properties.insert("jobId".to_string(), json!({ "type": "string" }));
             properties.insert("state".to_string(), json!({ "type": "string" }));
+            properties.insert("reusedExisting".to_string(), json!({ "type": "boolean" }));
+        }
+        "list_commands" => {
+            properties.insert(
+                "jobs".to_string(),
+                json!({
+                    "type": "array",
+                    "items": { "type": "object" }
+                }),
+            );
         }
         "poll_command" => {
             properties.insert("state".to_string(), json!({ "type": "string" }));
@@ -303,11 +313,24 @@ async fn handle_tools_list(
                                 DEFAULT_JOB_TIMEOUT_MS,
                                 MAX_JOB_TIMEOUT_MS
                             )
-                        }
+                        },
+                        "allow_duplicate": { "type": "boolean", "description": "Start another copy even when the exact same command is already running in the same working directory (default false)" }
                     },
                     "required": ["command"]
                 },
                 "annotations": { "readOnlyHint": false, "openWorldHint": true, "destructiveHint": true }
+            }));
+            tools.push(json!({
+                "name": "list_commands",
+                "title": "List commands",
+                "description": "List command jobs known to this workspace so an agent can rediscover long-running work before starting another copy. By default only active jobs are returned; set include_completed=true to include retained terminal jobs. Running jobs include the root process ID and, where supported, the current size of the owned process tree.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "include_completed": { "type": "boolean", "description": "Include retained completed/cancelled/timed-out jobs (default false)" }
+                    }
+                },
+                "annotations": { "readOnlyHint": true, "openWorldHint": false, "destructiveHint": false }
             }));
             tools.push(json!({
                 "name": "poll_command",
@@ -549,6 +572,7 @@ async fn handle_tools_call_for_workspace(
                 tool_name.as_str(),
                 "run_command"
                     | "start_command"
+                    | "list_commands"
                     | "poll_command"
                     | "read_command_output"
                     | "cancel_command"
@@ -574,6 +598,9 @@ async fn handle_tools_call_for_workspace(
                                 command_jobs,
                             )
                             .await
+                        }
+                        "list_commands" => {
+                            handle_list_commands(req, workspace_id, command_jobs).await
                         }
                         "poll_command" => {
                             handle_poll_command(req, workspace_id, command_jobs).await
@@ -807,6 +834,10 @@ async fn handle_start_command(
         Ok(value) => value,
         Err(error) => return tool_error_response(req, error),
     };
+    let allow_duplicate = match optional_bool_argument(&arguments, "allow_duplicate", false) {
+        Ok(value) => value,
+        Err(error) => return tool_error_response(req, error),
+    };
     let effective_command =
         if set_moondesk_as_co_author && command::command_contains_git_commit(command_text) {
             command::inject_moondesk_co_author_trailer(command_text)
@@ -818,14 +849,16 @@ async fn handle_start_command(
         effective_command.hash(&mut hasher);
         cwd.hash(&mut hasher);
         timeout_ms.hash(&mut hasher);
+        allow_duplicate.hash(&mut hasher);
         format!("start_command:{id}:{:016x}", hasher.finish())
     });
     match command_jobs
-        .start_for_workspace(
+        .start_for_workspace_with_options(
             workspace_id,
             effective_command,
             cwd,
             timeout_ms,
+            allow_duplicate,
             request_key,
         )
         .await
@@ -836,10 +869,27 @@ async fn handle_start_command(
             json!({
                 "jobId": started.snapshot.job_id,
                 "state": started.snapshot.state.as_str(),
+                "reusedExisting": started.reused_existing,
             }),
         ),
         Err(error) => tool_error_response(req, error),
     }
+}
+
+async fn handle_list_commands(
+    req: &JsonRpcRequest,
+    workspace_id: &WorkspaceId,
+    command_jobs: &CommandJobManager,
+) -> JsonRpcResponse {
+    let arguments = tool_arguments(req);
+    let include_completed = match optional_bool_argument(&arguments, "include_completed", false) {
+        Ok(value) => value,
+        Err(error) => return tool_error_response(req, error),
+    };
+    let jobs = command_jobs
+        .list_for_workspace(workspace_id, include_completed)
+        .await;
+    tool_success_response_with_structured(req, String::new(), json!({ "jobs": jobs }))
 }
 
 async fn handle_poll_command(
@@ -1416,7 +1466,7 @@ Always specify the branch explicitly when using `git push`."#
                 .to_string(),
         );
         lines.push(
-            "For builds, compilation, dependency installation, long-running test suites, development servers, or commands that may take more than about one minute, use start_command instead of keeping run_command open."
+            "For builds, compilation, dependency installation, long-running test suites, development servers, or commands that may take more than about one minute, use start_command instead of keeping run_command open. Before starting work that may already be running, call list_commands and reuse or poll the existing job when appropriate. start_command automatically reuses an exact running command in the same working directory; set allow_duplicate=true only when another concurrent copy is intentional."
                 .to_string(),
         );
         lines.push(
@@ -2228,6 +2278,138 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn start_command_reuses_logical_duplicate_and_list_commands_rediscovers_it() {
+        let workspace_root =
+            std::env::temp_dir().join(format!("moondesk-mcp-command-dedupe-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        let workspace_root_str = workspace_root.to_string_lossy().into_owned();
+        let command_jobs = CommandJobManager::new();
+        let command = if cfg!(windows) {
+            "Start-Sleep -Seconds 5"
+        } else {
+            "sleep 5"
+        };
+
+        let mut first_req = tool_call_request("start_command", json!({ "command": command }));
+        first_req.id = Some(json!("logical-first"));
+        let first = handle_tools_call(
+            &first_req,
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &None,
+        )
+        .await;
+        let first_structured = first
+            .result
+            .as_ref()
+            .and_then(|result| result.get("structuredContent"))
+            .expect("first start structured content");
+        let first_job_id = first_structured
+            .get("jobId")
+            .and_then(Value::as_str)
+            .expect("first job id")
+            .to_string();
+        assert_eq!(
+            first_structured
+                .get("reusedExisting")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+
+        let mut second_req = tool_call_request("start_command", json!({ "command": command }));
+        second_req.id = Some(json!("logical-second"));
+        let second = handle_tools_call(
+            &second_req,
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &None,
+        )
+        .await;
+        let second_structured = second
+            .result
+            .as_ref()
+            .and_then(|result| result.get("structuredContent"))
+            .expect("second start structured content");
+        assert_eq!(
+            second_structured.get("jobId").and_then(Value::as_str),
+            Some(first_job_id.as_str())
+        );
+        assert_eq!(
+            second_structured
+                .get("reusedExisting")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+
+        let list_req = tool_call_request("list_commands", json!({}));
+        let listed = handle_tools_call(
+            &list_req,
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &None,
+        )
+        .await;
+        let jobs = listed
+            .result
+            .as_ref()
+            .and_then(|result| result.get("structuredContent"))
+            .and_then(|structured| structured.get("jobs"))
+            .and_then(Value::as_array)
+            .expect("listed command jobs");
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(
+            jobs[0].get("jobId").and_then(Value::as_str),
+            Some(first_job_id.as_str())
+        );
+        assert_eq!(
+            jobs[0].get("state").and_then(Value::as_str),
+            Some("running")
+        );
+
+        let mut duplicate_req = tool_call_request(
+            "start_command",
+            json!({ "command": command, "allow_duplicate": true }),
+        );
+        duplicate_req.id = Some(json!("logical-third"));
+        let duplicate = handle_tools_call(
+            &duplicate_req,
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &None,
+        )
+        .await;
+        let duplicate_structured = duplicate
+            .result
+            .as_ref()
+            .and_then(|result| result.get("structuredContent"))
+            .expect("duplicate start structured content");
+        assert_ne!(
+            duplicate_structured.get("jobId").and_then(Value::as_str),
+            Some(first_job_id.as_str())
+        );
+        assert_eq!(
+            duplicate_structured
+                .get("reusedExisting")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+
+        command_jobs.cancel_all().await;
+        let _ = std::fs::remove_dir_all(workspace_root);
+    }
+    #[tokio::test]
     async fn reused_json_rpc_id_with_different_start_arguments_creates_distinct_jobs() {
         let workspace_root =
             std::env::temp_dir().join(format!("moondesk-mcp-id-reuse-{}", Uuid::new_v4()));
@@ -2525,6 +2707,7 @@ mod tests {
             vec![
                 "run_command",
                 "start_command",
+                "list_commands",
                 "poll_command",
                 "read_command_output",
                 "cancel_command",
@@ -2582,6 +2765,7 @@ mod tests {
         for (tool_name, field) in [
             ("run_command", "stdout"),
             ("start_command", "jobId"),
+            ("list_commands", "jobs"),
             ("poll_command", "output"),
             ("read_command_output", "text"),
             ("cancel_command", "state"),

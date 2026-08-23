@@ -361,11 +361,12 @@ fn collect_processes() -> Vec<ProcessInfo> {
 
     const SCRIPT: &str = r#"
 $names = @('chrome.exe','msedge.exe','brave.exe','vivaldi.exe','opera.exe','firefox.exe')
-@(
+$rows = @(
     Get-CimInstance Win32_Process |
         Where-Object { $_.Name -in $names } |
         Select-Object ProcessId, Name, CommandLine
-) | ConvertTo-Json -Compress
+)
+ConvertTo-Json -InputObject $rows -Compress
 "#;
 
     let output = std::process::Command::new("powershell.exe")

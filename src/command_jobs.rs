@@ -82,9 +82,24 @@ pub struct CommandJobSnapshot {
     pub timeout_ms: u64,
 }
 
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommandJobSummary {
+    pub job_id: String,
+    pub command: String,
+    pub cwd: String,
+    pub state: CommandJobState,
+    pub elapsed_ms: u64,
+    pub exit_code: Option<i32>,
+    pub timeout_ms: u64,
+    pub root_pid: Option<u32>,
+    pub process_count: Option<usize>,
+}
+
 #[derive(Clone, Debug)]
 pub struct StartCommandResult {
     pub snapshot: CommandJobSnapshot,
+    pub reused_existing: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -110,6 +125,7 @@ impl Drop for OutputRootGuard {
 struct JobRuntime {
     state: CommandJobState,
     exit_code: Option<i32>,
+    root_pid: Option<u32>,
     finished_at: Option<Instant>,
     events: VecDeque<CommandOutputEvent>,
     retained_output_bytes: usize,
@@ -122,6 +138,7 @@ impl Default for JobRuntime {
         Self {
             state: CommandJobState::Running,
             exit_code: None,
+            root_pid: None,
             finished_at: None,
             events: VecDeque::new(),
             retained_output_bytes: 0,
@@ -302,6 +319,35 @@ impl CommandJob {
             }
         }
         None
+    }
+
+    async fn set_root_pid(&self, root_pid: u32) {
+        self.runtime.lock().await.root_pid = Some(root_pid);
+        self.changed.notify_waiters();
+    }
+
+    async fn summary(&self) -> CommandJobSummary {
+        let runtime = self.runtime.lock().await;
+        let state = runtime.state;
+        let root_pid = runtime.root_pid;
+        let exit_code = runtime.exit_code;
+        drop(runtime);
+        let process_count = if state == CommandJobState::Running {
+            root_pid.and_then(process_runner::process_tree_size)
+        } else {
+            None
+        };
+        CommandJobSummary {
+            job_id: self.id.clone(),
+            command: self.command.clone(),
+            cwd: self.cwd.to_string_lossy().into_owned(),
+            state,
+            elapsed_ms: self.started_at.elapsed().as_millis() as u64,
+            exit_code,
+            timeout_ms: self.timeout_ms,
+            root_pid,
+            process_count,
+        }
     }
 
     async fn finish(&self, state: CommandJobState, exit_code: Option<i32>) {
@@ -711,12 +757,33 @@ impl CommandJobManager {
         }
     }
 
+    #[cfg(test)]
     pub async fn start_for_workspace(
         &self,
         workspace_id: &WorkspaceId,
         command: String,
         cwd: PathBuf,
         timeout_ms: u64,
+        request_key: Option<String>,
+    ) -> Result<StartCommandResult, String> {
+        self.start_for_workspace_with_options(
+            workspace_id,
+            command,
+            cwd,
+            timeout_ms,
+            true,
+            request_key,
+        )
+        .await
+    }
+
+    pub async fn start_for_workspace_with_options(
+        &self,
+        workspace_id: &WorkspaceId,
+        command: String,
+        cwd: PathBuf,
+        timeout_ms: u64,
+        allow_duplicate: bool,
         request_key: Option<String>,
     ) -> Result<StartCommandResult, String> {
         // Cleanup may scan retained jobs and remove archived output from disk. Do
@@ -764,7 +831,32 @@ impl CommandJobManager {
                 }
                 return Ok(StartCommandResult {
                     snapshot: job.snapshot(0).await,
+                    reused_existing: true,
                 });
+            }
+        }
+
+        if !allow_duplicate {
+            let jobs = {
+                let manager = self.inner.read().await;
+                manager
+                    .jobs
+                    .values()
+                    .filter(|job| {
+                        &job.workspace_id == workspace_id
+                            && job.command == command
+                            && job.cwd == cwd
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>()
+            };
+            for job in jobs {
+                if job.runtime.lock().await.state == CommandJobState::Running {
+                    return Ok(StartCommandResult {
+                        snapshot: job.snapshot(0).await,
+                        reused_existing: true,
+                    });
+                }
             }
         }
 
@@ -815,7 +907,34 @@ impl CommandJobManager {
         tokio::spawn(run_job(job.clone(), cancel_rx));
         Ok(StartCommandResult {
             snapshot: job.snapshot(0).await,
+            reused_existing: false,
         })
+    }
+
+    pub async fn list_for_workspace(
+        &self,
+        workspace_id: &WorkspaceId,
+        include_completed: bool,
+    ) -> Vec<CommandJobSummary> {
+        self.cleanup().await;
+        let jobs = {
+            let manager = self.inner.read().await;
+            manager
+                .jobs
+                .values()
+                .filter(|job| &job.workspace_id == workspace_id)
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        let mut summaries = Vec::with_capacity(jobs.len());
+        for job in jobs {
+            let summary = job.summary().await;
+            if include_completed || summary.state == CommandJobState::Running {
+                summaries.push(summary);
+            }
+        }
+        summaries.sort_by_key(|summary| std::cmp::Reverse(summary.elapsed_ms));
+        summaries
     }
 
     pub async fn poll_for_workspace(
@@ -1277,6 +1396,9 @@ async fn run_job(job: Arc<CommandJob>, mut cancel_rx: watch::Receiver<bool>) {
             return;
         }
     };
+    if let Some(root_pid) = process.pid() {
+        job.set_root_pid(root_pid).await;
+    }
 
     let stdout_task = process
         .take_stdout()
@@ -1870,6 +1992,78 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    #[tokio::test]
+    async fn duplicate_running_command_is_reused_unless_explicitly_allowed() {
+        let root = workspace("duplicate-awareness");
+        let manager = CommandJobManager::new();
+        let workspace_id = WorkspaceId::test_default();
+        let command = if cfg!(windows) {
+            "Start-Sleep -Seconds 5"
+        } else {
+            "sleep 5"
+        };
+
+        let first = manager
+            .start_for_workspace_with_options(
+                &workspace_id,
+                command.to_string(),
+                root.clone(),
+                10_000,
+                false,
+                None,
+            )
+            .await
+            .expect("start first job");
+        assert!(!first.reused_existing);
+
+        let reused = manager
+            .start_for_workspace_with_options(
+                &workspace_id,
+                command.to_string(),
+                root.clone(),
+                20_000,
+                false,
+                None,
+            )
+            .await
+            .expect("reuse duplicate job");
+        assert!(reused.reused_existing);
+        assert_eq!(reused.snapshot.job_id, first.snapshot.job_id);
+
+        let duplicate = manager
+            .start_for_workspace_with_options(
+                &workspace_id,
+                command.to_string(),
+                root.clone(),
+                10_000,
+                true,
+                None,
+            )
+            .await
+            .expect("start intentional duplicate");
+        assert!(!duplicate.reused_existing);
+        assert_ne!(duplicate.snapshot.job_id, first.snapshot.job_id);
+
+        let mut jobs = Vec::new();
+        for _ in 0..50 {
+            jobs = manager.list_for_workspace(&workspace_id, false).await;
+            if jobs.len() == 2 && jobs.iter().all(|job| job.root_pid.is_some()) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(jobs.len(), 2);
+        assert!(jobs.iter().all(|job| job.state == CommandJobState::Running));
+        assert!(jobs.iter().all(|job| job.root_pid.is_some()));
+        #[cfg(any(windows, target_os = "linux"))]
+        assert!(
+            jobs.iter()
+                .all(|job| job.process_count.is_some_and(|count| count >= 1))
+        );
+
+        manager.cancel_all().await;
+        let _ = std::fs::remove_dir_all(root);
+    }
     #[tokio::test]
     async fn oversized_output_is_bounded_and_marks_old_cursor_truncated() {
         let root = workspace("output-limit");

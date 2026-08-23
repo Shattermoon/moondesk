@@ -323,7 +323,6 @@ impl CommandJob {
 
     async fn set_root_pid(&self, root_pid: u32) {
         self.runtime.lock().await.root_pid = Some(root_pid);
-        self.changed.notify_waiters();
     }
 
     async fn summary(&self) -> CommandJobSummary {
@@ -851,9 +850,10 @@ impl CommandJobManager {
                     .collect::<Vec<_>>()
             };
             for job in jobs {
-                if job.runtime.lock().await.state == CommandJobState::Running {
+                let snapshot = job.snapshot(0).await;
+                if snapshot.state == CommandJobState::Running {
                     return Ok(StartCommandResult {
-                        snapshot: job.snapshot(0).await,
+                        snapshot,
                         reused_existing: true,
                     });
                 }
@@ -2044,26 +2044,71 @@ mod tests {
         assert!(!duplicate.reused_existing);
         assert_ne!(duplicate.snapshot.job_id, first.snapshot.job_id);
 
-        let mut jobs = Vec::new();
-        for _ in 0..50 {
-            jobs = manager.list_for_workspace(&workspace_id, false).await;
-            if jobs.len() == 2 && jobs.iter().all(|job| job.root_pid.is_some()) {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        let jobs = manager.list_for_workspace(&workspace_id, false).await;
         assert_eq!(jobs.len(), 2);
         assert!(jobs.iter().all(|job| job.state == CommandJobState::Running));
-        assert!(jobs.iter().all(|job| job.root_pid.is_some()));
-        #[cfg(any(windows, target_os = "linux"))]
-        assert!(
-            jobs.iter()
-                .all(|job| job.process_count.is_some_and(|count| count >= 1))
-        );
 
         manager.cancel_all().await;
         let _ = std::fs::remove_dir_all(root);
     }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    #[tokio::test]
+    async fn job_summary_reports_live_root_process_metadata() {
+        let root = workspace("process-metadata");
+        let (job, _cancel_rx) = CommandJob::new("synthetic".into(), root.clone(), 5_000);
+        job.set_root_pid(std::process::id()).await;
+
+        let summary = job.summary().await;
+        assert_eq!(summary.root_pid, Some(std::process::id()));
+        assert!(summary.process_count.is_some_and(|count| count >= 1));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn terminal_duplicate_falls_through_to_a_new_job() {
+        let root = workspace("terminal-duplicate");
+        let manager = CommandJobManager::new();
+        let workspace_id = WorkspaceId::test_default();
+        let command = if cfg!(windows) {
+            "Write-Output done"
+        } else {
+            "printf 'done\\n'"
+        };
+
+        let first = manager
+            .start_for_workspace_with_options(
+                &workspace_id,
+                command.to_string(),
+                root.clone(),
+                5_000,
+                false,
+                None,
+            )
+            .await
+            .expect("start first job");
+        let terminal = wait_terminal(&manager, &first.snapshot.job_id).await;
+        assert_eq!(terminal.state, CommandJobState::Succeeded);
+
+        let second = manager
+            .start_for_workspace_with_options(
+                &workspace_id,
+                command.to_string(),
+                root.clone(),
+                5_000,
+                false,
+                None,
+            )
+            .await
+            .expect("start second job after terminal match");
+        assert!(!second.reused_existing);
+        assert_ne!(second.snapshot.job_id, first.snapshot.job_id);
+
+        manager.cancel_all().await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[tokio::test]
     async fn oversized_output_is_bounded_and_marks_old_cursor_truncated() {
         let root = workspace("output-limit");

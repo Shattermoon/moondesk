@@ -189,7 +189,7 @@ Important behavior:
 
 # Tools
 
-MoonDesk has two local tool modes: `multi-tools` exposes 11 tools, and `read-only` exposes 3 tools.
+MoonDesk has two local tool modes: `multi-tools` exposes 12 tools, and `read-only` exposes 3 tools.
 
 MoonDesk's local tools in `multi-tools` mode are:
 

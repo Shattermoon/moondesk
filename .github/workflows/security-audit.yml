@@ -17,44 +17,25 @@ concurrency:
   group: security-audit-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 jobs:
   rustsec:
-    if: github.event_name != 'schedule' && (github.event_name != 'pull_request' || github.event.pull_request.draft == false)
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     name: RustSec
     runs-on: ubuntu-22.04
-    permissions:
-      contents: read
-      checks: write
 
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
 
-      # Informational advisories (including the two currently inherited through
-      # ngrok) remain visible but do not fail the check. Security advisories do.
+      # GitHub's ubuntu-22.04 image includes cargo-audit. Plain `cargo audit`
+      # reports informational advisories without failing, but exits non-zero for
+      # security vulnerabilities. Printing the version keeps the runner-provided
+      # scanner version visible in every audit log.
       - name: Audit Rust dependencies
-        uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-
-  scheduled-rustsec:
-    if: github.event_name == 'schedule'
-    name: Scheduled RustSec
-    runs-on: ubuntu-22.04
-    permissions:
-      contents: read
-      checks: write
-      issues: write
-
-    steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-        with:
-          persist-credentials: false
-
-      # Scheduled runs may open an issue when a real advisory is found so a new
-      # RustSec publication cannot silently age in the default branch.
-      - name: Audit Rust dependencies
-        uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cargo audit --version
+          cargo audit

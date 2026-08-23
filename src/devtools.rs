@@ -17,6 +17,17 @@ const MAX_DEVTOOLS_DIAGNOSTIC_CHARS: usize = 2_048;
 const DEVTOOLS_RESTART_COOLDOWN: Duration = Duration::from_secs(10);
 const DEVTOOLS_RESTART_INIT_TIMEOUT: Duration = Duration::from_secs(30);
 
+fn npx_program() -> &'static str {
+    #[cfg(windows)]
+    {
+        "npx.cmd"
+    }
+    #[cfg(not(windows))]
+    {
+        "npx"
+    }
+}
+
 #[derive(Default)]
 struct InitializationState {
     initialized: AtomicBool,
@@ -81,7 +92,7 @@ impl DevtoolsBridge {
         generation_counter: Arc<AtomicU64>,
         generation: u64,
     ) -> Result<Arc<Self>, String> {
-        let mut command = Command::new("npx");
+        let mut command = Command::new(npx_program());
         let package = format!("chrome-devtools-mcp@{CHROME_DEVTOOLS_MCP_VERSION}");
         command.args(["-y", package.as_str()]);
 
@@ -590,5 +601,29 @@ mod tests {
             None
         );
         assert_eq!(restart_cooldown_remaining(None, failed_at), None);
+    }
+
+    #[test]
+    fn devtools_uses_the_platform_npx_launcher() {
+        if cfg!(windows) {
+            assert_eq!(npx_program(), "npx.cmd");
+        } else {
+            assert_eq!(npx_program(), "npx");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "local Windows npx compatibility smoke"]
+    fn windows_npx_launcher_is_spawnable() {
+        let output = std::process::Command::new(npx_program())
+            .arg("--version")
+            .output()
+            .expect("spawn npx.cmd");
+        assert!(
+            output.status.success(),
+            "npx.cmd --version failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 }

@@ -4127,6 +4127,7 @@ async fn ensure_selected_browser_remote_debugging(
         }
     };
     let launched_pid = child.id();
+    let launched_profile_dir = user_data_dir.clone();
 
     let existing_browser = {
         let mut app = state.lock().await;
@@ -4177,8 +4178,7 @@ async fn ensure_selected_browser_remote_debugging(
             if app
                 .remote_browser
                 .as_ref()
-                .and_then(|browser| browser.child.id())
-                == launched_pid
+                .is_some_and(|browser| browser.profile_dir == launched_profile_dir)
             {
                 app.remote_browser.take()
             } else {

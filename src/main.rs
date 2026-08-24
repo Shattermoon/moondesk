@@ -4086,10 +4086,11 @@ async fn ensure_selected_browser_remote_debugging(
     };
 
     let user_data_dir = std::env::temp_dir().join(format!(
-        "moondesk-remote-debug-{}-{}-{}",
+        "moondesk-remote-debug-{}-{}-{}-{}",
         sanitize_for_filename(&selected.binary),
         std::process::id(),
-        port
+        port,
+        Uuid::new_v4()
     ));
     if let Err(e) = std::fs::create_dir_all(&user_data_dir) {
         state.lock().await.log(

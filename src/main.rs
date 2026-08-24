@@ -32,13 +32,13 @@ use ratatui::{
 use serde::{Deserialize, Serialize};
 use state::{
     AppState, CommandActivityState, FLOW_ANIM_CELLS, FLOW_BOOTSTRAP_PHASES, FlowAnimKind,
-    FlowAnimSegment, FlowDirection, FlowLane, GPT_5_6_AND_EARLIER_USAGE_BUCKET, Mode, SharedState,
-    ToolMode, UiEventReceiver, UiEventSender, UsageTotals, add_workspace, app_config_path,
-    flow_anim_lit_count, flush_config, normalize_ngrok_domain, remove_workspace, rename_workspace,
-    rotate_workspace_secret, ui_event_channel, user_home_dir,
+    FlowAnimSegment, FlowDirection, FlowLane, GPT_5_6_AND_EARLIER_USAGE_BUCKET, Mode,
+    OwnedRemoteBrowser, SharedState, ToolMode, UiEventReceiver, UiEventSender, UsageTotals,
+    add_workspace, app_config_path, flow_anim_lit_count, flush_config, normalize_ngrok_domain,
+    remove_workspace, rename_workspace, rotate_workspace_secret, ui_event_channel, user_home_dir,
 };
 use std::io::{Write, stdout};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::Mutex;
@@ -1477,13 +1477,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Cleanup after the TUI is gone so quit never appears frozen on screen.
     // Stop accepting new MCP work first, then terminate owned command trees and
     // shared host services before finally clearing local runtime status.
-    let (server_handle, command_jobs, remote_browser_child) = {
+    let (server_handle, command_jobs, remote_browser) = {
         let mut app = state.lock().await;
         app.server_running = false;
         (
             app.server_handle.take(),
             app.command_jobs.clone(),
-            app.remote_browser_child.take(),
+            app.remote_browser.take(),
         )
     };
     if let Some(handle) = server_handle {
@@ -1492,9 +1492,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     command_jobs.cancel_all().await;
     ngrok::stop(state.clone()).await;
-    if let Some(mut child) = remote_browser_child {
-        let _ = child.start_kill();
-        let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
+    if let Some(browser) = remote_browser {
+        stop_owned_remote_browser(&state, browser).await;
     }
     state.lock().await.clear_remote_connection_state();
 
@@ -4019,6 +4018,31 @@ async fn wait_remote_debug_ready(port: u16, timeout: Duration) -> bool {
     false
 }
 
+fn remove_remote_browser_profile_dir(profile_dir: &Path) -> std::io::Result<()> {
+    match std::fs::remove_dir_all(profile_dir) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+async fn cleanup_remote_browser_profile(state: &SharedState, profile_dir: PathBuf) {
+    if let Err(error) = remove_remote_browser_profile_dir(&profile_dir) {
+        state.lock().await.log(
+            "WARN",
+            format!(
+                "Failed to remove remote browser profile {}: {error}",
+                profile_dir.display()
+            ),
+        );
+    }
+}
+
+async fn stop_owned_remote_browser(state: &SharedState, mut browser: OwnedRemoteBrowser) {
+    let _ = browser.child.start_kill();
+    let _ = tokio::time::timeout(Duration::from_secs(5), browser.child.wait()).await;
+    cleanup_remote_browser_profile(state, browser.profile_dir).await;
+}
 async fn ensure_selected_browser_remote_debugging(
     state: SharedState,
     selected_browser: Option<browser::DetectedBrowser>,
@@ -4035,6 +4059,21 @@ async fn ensure_selected_browser_remote_debugging(
         return None;
     }
     if selected.remote_debug_active && selected.remote_debug_target.is_some() {
+        let replaced_browser = {
+            let mut app = state.lock().await;
+            let owned_pid = app
+                .remote_browser
+                .as_ref()
+                .and_then(|browser| browser.child.id());
+            if app.remote_browser.is_some() && owned_pid != selected.remote_debug_pid {
+                app.remote_browser.take()
+            } else {
+                None
+            }
+        };
+        if let Some(browser) = replaced_browser {
+            stop_owned_remote_browser(&state, browser).await;
+        }
         return Some(selected);
     }
 
@@ -4047,9 +4086,10 @@ async fn ensure_selected_browser_remote_debugging(
     };
 
     let user_data_dir = std::env::temp_dir().join(format!(
-        "moondesk-remote-debug-{}-{}",
+        "moondesk-remote-debug-{}-{}-{}",
         sanitize_for_filename(&selected.binary),
-        std::process::id()
+        std::process::id(),
+        port
     ));
     if let Err(e) = std::fs::create_dir_all(&user_data_dir) {
         state.lock().await.log(
@@ -4082,22 +4122,18 @@ async fn ensure_selected_browser_remote_debugging(
                     selected.name, e
                 ),
             );
+            cleanup_remote_browser_profile(&state, user_data_dir).await;
             return Some(selected);
         }
     };
     let launched_pid = child.id();
 
-    let existing_child = {
+    let existing_browser = {
         let mut app = state.lock().await;
-        app.remote_browser_child.take()
-    };
-    if let Some(mut old_child) = existing_child {
-        let _ = old_child.kill().await;
-    }
-
-    {
-        let mut app = state.lock().await;
-        app.remote_browser_child = Some(child);
+        let existing = app.remote_browser.replace(OwnedRemoteBrowser {
+            child,
+            profile_dir: user_data_dir,
+        });
         app.log(
             "INFO",
             format!(
@@ -4105,6 +4141,10 @@ async fn ensure_selected_browser_remote_debugging(
                 selected.name, port
             ),
         );
+        existing
+    };
+    if let Some(old_browser) = existing_browser {
+        stop_owned_remote_browser(&state, old_browser).await;
     }
 
     if wait_remote_debug_ready(port, Duration::from_secs(10)).await {
@@ -4132,6 +4172,22 @@ async fn ensure_selected_browser_remote_debugging(
                 selected.name
             ),
         );
+        let failed_browser = {
+            let mut app = state.lock().await;
+            if app
+                .remote_browser
+                .as_ref()
+                .and_then(|browser| browser.child.id())
+                == launched_pid
+            {
+                app.remote_browser.take()
+            } else {
+                None
+            }
+        };
+        if let Some(browser) = failed_browser {
+            stop_owned_remote_browser(&state, browser).await;
+        }
         Some(selected)
     }
 }
@@ -6353,9 +6409,9 @@ mod tests {
         WorkspaceUiAction, draw_update_confirm, item_under_cursor, key_is_clipboard_paste,
         move_panel_selection, normalize_ngrok_authtoken_input, normalize_ngrok_domain,
         normalize_workspace_path_input, panel_under_cursor, parse_clippymoon_export_args,
-        parse_port_value, scroll_panel_down, scroll_panel_up, tail_start_index,
-        truncate_with_ellipsis, update_confirm_action, user_home_dir, workspace_action_from_event,
-        workspace_detail_sections, wrap_preserving_chars,
+        parse_port_value, remove_remote_browser_profile_dir, scroll_panel_down, scroll_panel_up,
+        tail_start_index, truncate_with_ellipsis, update_confirm_action, user_home_dir,
+        workspace_action_from_event, workspace_detail_sections, wrap_preserving_chars,
     };
     use crossterm::event::{
         Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -6484,6 +6540,23 @@ mod tests {
         let _ = server.await;
         drop(runtime_guard);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn remote_browser_profile_cleanup_removes_tree_and_tolerates_missing_directory() {
+        let profile_dir = std::env::temp_dir().join(format!(
+            "moondesk-profile-cleanup-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let nested = profile_dir.join("Default").join("Cache");
+        std::fs::create_dir_all(&nested).expect("create nested browser profile");
+        std::fs::write(nested.join("cache.bin"), b"temporary browser data")
+            .expect("write browser profile data");
+
+        remove_remote_browser_profile_dir(&profile_dir).expect("remove browser profile tree");
+        assert!(!profile_dir.exists());
+        remove_remote_browser_profile_dir(&profile_dir)
+            .expect("missing browser profile should already be clean");
     }
 
     #[test]

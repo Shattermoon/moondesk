@@ -639,6 +639,12 @@ impl ToolMode {
     }
 }
 
+/// Browser process launched and owned by MoonDesk for remote debugging.
+pub struct OwnedRemoteBrowser {
+    pub child: tokio::process::Child,
+    pub profile_dir: PathBuf,
+}
+
 /// Shared application state across server, ngrok, and TUI.
 pub struct AppState {
     pub theme: String,
@@ -676,7 +682,7 @@ pub struct AppState {
     config_path: PathBuf,
     pub server_handle: Option<tokio::task::JoinHandle<()>>,
     pub ngrok_task: Option<tokio::task::JoinHandle<()>>,
-    pub remote_browser_child: Option<tokio::process::Child>,
+    pub remote_browser: Option<OwnedRemoteBrowser>,
 }
 
 pub type SharedState = Arc<Mutex<AppState>>;
@@ -1093,7 +1099,7 @@ impl AppState {
             config_path,
             server_handle: None,
             ngrok_task: None,
-            remote_browser_child: None,
+            remote_browser: None,
         };
         app.log("INFO", format!("ClippyMoon seed: {mascot_seed:016x}"));
         Ok(app)

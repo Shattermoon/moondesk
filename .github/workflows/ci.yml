@@ -89,6 +89,8 @@ jobs:
 
       - name: Run Windows remote browser lifecycle smoke
         run: cargo +stable test --locked remote_browser_termination_confirms_child_exit -- --ignored
+      - name: Run Windows DevTools process-tree shutdown smoke
+        run: cargo +stable test --locked windows_devtools_stop_terminates_npx_process_tree -- --ignored
 
   npm-runtime:
     if: github.event_name == 'workflow_dispatch' || github.event.pull_request.draft == false

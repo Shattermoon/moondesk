@@ -3934,10 +3934,23 @@ fn draw_browser_select(
                     .remote_debug_pid
                     .map(|v| v.to_string())
                     .unwrap_or_else(|| "--".into());
+                let pages = browser
+                    .remote_debug_page_count
+                    .map(|count| format!(", {count} pages"))
+                    .unwrap_or_default();
                 lines.push(Line::from(vec![Span::styled(
-                    format!("     remote debugging ACTIVE at {target} (pid {pid})"),
+                    format!("     remote debugging ACTIVE at {target} (pid {pid}{pages})"),
                     Style::default().fg(palette.success_fg),
                 )]));
+                if browser
+                    .remote_debug_page_count
+                    .is_some_and(|count| count >= browser::LARGE_REMOTE_DEBUG_PAGE_COUNT)
+                {
+                    lines.push(Line::from(vec![Span::styled(
+                        "     WARNING large debug session: DevTools may wake many tabs and use high CPU",
+                        Style::default().fg(palette.warning_fg),
+                    )]));
+                }
             } else {
                 lines.push(Line::from(vec![Span::styled(
                     format!(
@@ -4332,7 +4345,7 @@ async fn start_services(
         .iter()
         .map(|b| {
             format!(
-                "Browser: {} (binary: {}, path: {}, support: {}, remote debug flag: {}, remote debug active: {}, pid: {})",
+                "Browser: {} (binary: {}, path: {}, support: {}, remote debug flag: {}, remote debug active: {}, pid: {}, pages: {})",
                 b.name,
                 b.binary,
                 b.path,
@@ -4341,6 +4354,9 @@ async fn start_services(
                 b.remote_debug_target.as_deref().unwrap_or("no"),
                 b.remote_debug_pid
                     .map(|pid| pid.to_string())
+                    .unwrap_or_else(|| "--".into()),
+                b.remote_debug_page_count
+                    .map(|count| count.to_string())
                     .unwrap_or_else(|| "--".into())
             )
         })
@@ -4388,6 +4404,16 @@ async fn start_services(
                         selected.name, selected.path, target
                     ),
                 );
+                if let Some(page_count) = selected.remote_debug_page_count
+                    && page_count >= browser::LARGE_REMOTE_DEBUG_PAGE_COUNT
+                {
+                    app.log(
+                        "WARN",
+                        format!(
+                            "Selected remote-debug browser exposes {page_count} pages; chrome-devtools-mcp may wake many tabs and use high CPU"
+                        ),
+                    );
+                }
             } else {
                 app.log("WARN", "No browser was selected before startup".into());
             }

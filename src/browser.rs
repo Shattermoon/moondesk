@@ -2,7 +2,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 #[cfg(target_os = "linux")]
 use std::fs;
+use std::io::{Read, Write};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct DetectedBrowser {
@@ -16,6 +19,8 @@ pub struct DetectedBrowser {
     pub remote_debug_active: bool,
     pub remote_debug_target: Option<String>,
     pub remote_debug_pid: Option<u32>,
+    #[serde(skip)]
+    pub remote_debug_page_count: Option<usize>,
 }
 
 struct BrowserCandidate {
@@ -26,6 +31,10 @@ struct BrowserCandidate {
     mcp_supported: bool,
     support_note: &'static str,
 }
+
+pub const LARGE_REMOTE_DEBUG_PAGE_COUNT: usize = 25;
+const REMOTE_DEBUG_PROBE_TIMEOUT: Duration = Duration::from_millis(350);
+const MAX_REMOTE_DEBUG_RESPONSE_BYTES: u64 = 512 * 1024;
 
 const CANDIDATES: &[BrowserCandidate] = &[
     // Native Windows executable names come first. They simply do not resolve on
@@ -182,6 +191,9 @@ pub fn detect_browsers() -> Vec<DetectedBrowser> {
         }
 
         let active_remote = find_active_remote_debug_for_binary(candidate.binary, &processes);
+        let remote_debug_page_count = active_remote
+            .as_ref()
+            .and_then(|remote| probe_remote_debug_page_count(&remote.target));
 
         found.push(DetectedBrowser {
             name: candidate.name.to_string(),
@@ -194,6 +206,7 @@ pub fn detect_browsers() -> Vec<DetectedBrowser> {
             remote_debug_active: active_remote.is_some(),
             remote_debug_target: active_remote.as_ref().map(|r| r.target.clone()),
             remote_debug_pid: active_remote.as_ref().map(|r| r.pid),
+            remote_debug_page_count,
         });
     }
 
@@ -307,6 +320,118 @@ struct ProcessInfo {
 struct ActiveRemoteDebug {
     pid: u32,
     target: String,
+}
+
+fn loopback_remote_debug_addr(target: &str) -> Option<SocketAddr> {
+    if target == "pipe" {
+        return None;
+    }
+
+    let parsed = target.parse::<SocketAddr>().ok().or_else(|| {
+        let (host, port) = target.rsplit_once(':')?;
+        let port = port.parse::<u16>().ok()?;
+        let ip = if host.eq_ignore_ascii_case("localhost") {
+            IpAddr::V4(Ipv4Addr::LOCALHOST)
+        } else {
+            host.trim_matches(['[', ']']).parse::<IpAddr>().ok()?
+        };
+        Some(SocketAddr::new(ip, port))
+    })?;
+
+    if parsed.ip().is_loopback() {
+        return Some(parsed);
+    }
+    if parsed.ip().is_unspecified() {
+        let loopback = match parsed.ip() {
+            IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::LOCALHOST),
+        };
+        return Some(SocketAddr::new(loopback, parsed.port()));
+    }
+    None
+}
+
+fn http_body_bounds(response: &[u8]) -> Option<(usize, usize)> {
+    let header_end = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")?;
+    let headers = std::str::from_utf8(&response[..header_end]).ok()?;
+    let status_ok = headers
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        == Some("200");
+    if !status_ok
+        || headers.lines().any(|line| {
+            line.to_ascii_lowercase()
+                .starts_with("transfer-encoding: chunked")
+        })
+    {
+        return None;
+    }
+
+    let content_length = headers.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.trim()
+            .eq_ignore_ascii_case("content-length")
+            .then(|| value.trim().parse::<usize>().ok())
+            .flatten()
+    })?;
+    let body_start = header_end.checked_add(4)?;
+    let body_end = body_start.checked_add(content_length)?;
+    (body_end <= MAX_REMOTE_DEBUG_RESPONSE_BYTES as usize).then_some((body_start, body_end))
+}
+
+fn read_http_body(stream: &mut TcpStream, deadline: Instant) -> Option<Vec<u8>> {
+    let mut response = Vec::new();
+    let mut buffer = [0_u8; 8 * 1024];
+    loop {
+        if let Some((body_start, body_end)) = http_body_bounds(&response)
+            && response.len() >= body_end
+        {
+            return Some(response[body_start..body_end].to_vec());
+        }
+
+        let remaining = (MAX_REMOTE_DEBUG_RESPONSE_BYTES as usize).saturating_sub(response.len());
+        if remaining == 0 {
+            return None;
+        }
+        let time_left = deadline.saturating_duration_since(Instant::now());
+        if time_left.is_zero() {
+            return None;
+        }
+        stream.set_read_timeout(Some(time_left)).ok()?;
+
+        let read_limit = remaining.min(buffer.len());
+        let read = stream.read(&mut buffer[..read_limit]).ok()?;
+        if read == 0 {
+            let (body_start, body_end) = http_body_bounds(&response)?;
+            return (response.len() >= body_end).then(|| response[body_start..body_end].to_vec());
+        }
+        response.extend_from_slice(&buffer[..read]);
+    }
+}
+
+fn probe_remote_debug_page_count(target: &str) -> Option<usize> {
+    let addr = loopback_remote_debug_addr(target)?;
+    let deadline = Instant::now() + REMOTE_DEBUG_PROBE_TIMEOUT;
+    let mut stream = TcpStream::connect_timeout(&addr, REMOTE_DEBUG_PROBE_TIMEOUT).ok()?;
+    let write_time_left = deadline.saturating_duration_since(Instant::now());
+    if write_time_left.is_zero() {
+        return None;
+    }
+    stream.set_write_timeout(Some(write_time_left)).ok()?;
+    let request = format!("GET /json/list HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
+    stream.write_all(request.as_bytes()).ok()?;
+
+    let body = read_http_body(&mut stream, deadline)?;
+    let targets = serde_json::from_slice::<Vec<serde_json::Value>>(&body).ok()?;
+    Some(
+        targets
+            .iter()
+            .filter(|target| target.get("type").and_then(serde_json::Value::as_str) == Some("page"))
+            .count(),
+    )
 }
 
 #[cfg(target_os = "linux")]
@@ -598,6 +723,71 @@ mod tests {
     }
 
     #[test]
+    fn remote_debug_page_probe_counts_pages_without_attaching_devtools() {
+        let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind probe");
+        let port = listener.local_addr().expect("probe address").port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept probe");
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).expect("read probe request");
+            let body = r#"[{"type":"page"},{"type":"service_worker"},{"type":"page"}]"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{body}",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write probe response");
+            // Real Chrome can keep this HTTP connection open after the complete
+            // Content-Length body arrives. The probe must not wait for EOF.
+            std::thread::sleep(REMOTE_DEBUG_PROBE_TIMEOUT + Duration::from_millis(250));
+        });
+
+        assert_eq!(
+            probe_remote_debug_page_count(&format!("0.0.0.0:{port}")),
+            Some(2)
+        );
+        server.join().expect("probe server");
+        assert_eq!(probe_remote_debug_page_count("192.0.2.1:9222"), None);
+        assert_eq!(probe_remote_debug_page_count("pipe"), None);
+        assert_eq!(
+            loopback_remote_debug_addr("localhost:9333"),
+            Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9333))
+        );
+        assert_eq!(
+            loopback_remote_debug_addr("[::]:9444"),
+            Some(SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 9444))
+        );
+        assert_eq!(loopback_remote_debug_addr("example.com:9222"), None);
+    }
+
+    #[test]
+    fn remote_debug_page_count_is_runtime_only_config_metadata() {
+        let browser = DetectedBrowser {
+            name: "Chrome".into(),
+            binary: "chrome".into(),
+            path: "/chrome".into(),
+            remote_debugging: true,
+            remote_debug_hint: "--remote-debugging-port=<port>".into(),
+            mcp_supported: true,
+            support_note: "Chromium (supported)".into(),
+            remote_debug_active: true,
+            remote_debug_target: Some("127.0.0.1:9222".into()),
+            remote_debug_pid: Some(42),
+            remote_debug_page_count: Some(64),
+        };
+        let mut value = serde_json::to_value(&browser).expect("serialize browser");
+        assert!(value.get("remote_debug_page_count").is_none());
+
+        value
+            .as_object_mut()
+            .expect("browser JSON is an object")
+            .insert("remote_debug_page_count".into(), serde_json::json!(999));
+        let restored: DetectedBrowser = serde_json::from_value(value).expect("deserialize browser");
+        assert_eq!(restored.remote_debug_page_count, None);
+    }
+
+    #[test]
     fn process_matching_uses_the_recorded_executable_name() {
         let process = ProcessInfo {
             pid: 42,
@@ -671,6 +861,24 @@ mod tests {
             browsers.iter().any(|browser| browser.mcp_supported),
             "no supported Chromium browser detected: {}",
             format_browser_names(&browsers)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires a locally running Chromium remote-debug endpoint"]
+    fn windows_active_remote_debug_browser_reports_page_count() {
+        let browsers = detect_browsers();
+        let active = browsers
+            .iter()
+            .find(|browser| browser.mcp_supported && browser.remote_debug_active)
+            .expect("no active Chromium remote-debug endpoint detected");
+        assert!(
+            active
+                .remote_debug_page_count
+                .is_some_and(|count| count >= 1),
+            "active remote-debug browser did not report pages: {}",
+            active.name
         );
     }
 }

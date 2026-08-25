@@ -63,6 +63,8 @@ const MCP_URL_REVEAL_BAR_CELLS: usize = 10;
 // Reserve one extra row for Version without removing the normal live-flow slot.
 const STATUS_PANEL_HEIGHT: u16 = TUI_MASCOT_BLOCK_HEIGHT + 5;
 const STATUS_LABEL_WIDTH: usize = 19;
+const STATUS_PRIMARY_MCP_URL_LINE: usize = 6;
+const CONNECT_GUIDE_PRIMARY_MCP_URL_LINE: usize = 7;
 const GPT_5_6_AND_EARLIER_INPUT_USD_PER_1M: f64 = 5.0;
 const GPT_5_6_AND_EARLIER_OUTPUT_USD_PER_1M: f64 = 30.0;
 const PRICE_DISPLAY_DECIMALS: usize = 6;
@@ -240,6 +242,58 @@ struct PanelItemHit {
 struct BottomPanelHitMaps {
     logs: Vec<PanelItemHit>,
     shell_commands: Vec<PanelItemHit>,
+}
+
+#[derive(Default)]
+struct DashboardHitAreas {
+    secrets: Vec<DashboardSecretHit>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DashboardSecretTarget {
+    PrimaryMcpUrl,
+    LogMcpUrl,
+    LogNgrokUrl,
+    LogNgrokDomain,
+}
+
+impl DashboardSecretTarget {
+    fn reveal_message(self) -> &'static str {
+        match self {
+            Self::LogNgrokDomain => "Domain revealed for 10s",
+            Self::PrimaryMcpUrl | Self::LogMcpUrl | Self::LogNgrokUrl => "URL revealed for 10s",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DashboardSecretHit {
+    target: DashboardSecretTarget,
+    area: Rect,
+}
+
+fn dashboard_secret_target_at(
+    hit_areas: &DashboardHitAreas,
+    column: u16,
+    row: u16,
+) -> Option<DashboardSecretTarget> {
+    hit_areas
+        .secrets
+        .iter()
+        .find(|hit| rect_contains(hit.area, column, row))
+        .map(|hit| hit.target)
+}
+
+fn log_secret_target(message: &str) -> Option<DashboardSecretTarget> {
+    if message.starts_with("MCP Server URL: ") {
+        Some(DashboardSecretTarget::LogMcpUrl)
+    } else if message.starts_with("ngrok URL: ") {
+        Some(DashboardSecretTarget::LogNgrokUrl)
+    } else if message.starts_with("Auto-saved ngrok static domain: ") {
+        Some(DashboardSecretTarget::LogNgrokDomain)
+    } else {
+        None
+    }
 }
 
 fn item_under_cursor(hits: &[PanelItemHit], row: u16) -> Option<usize> {
@@ -569,6 +623,32 @@ fn mcp_url_reveal_seconds(remaining: Duration) -> u64 {
         .as_millis()
         .div_ceil(1_000)
         .min(MCP_URL_REVEAL_DURATION.as_secs() as u128) as u64
+}
+
+fn active_reveal_remaining(deadline: Option<Instant>, now: Instant) -> Option<Duration> {
+    deadline
+        .and_then(|deadline| deadline.checked_duration_since(now))
+        .filter(|remaining| !remaining.is_zero())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum TimedSecretClick {
+    Revealed,
+    Copy(String),
+}
+
+fn timed_secret_click(
+    value: Option<&str>,
+    revealed_until: &mut Option<Instant>,
+    now: Instant,
+) -> Option<TimedSecretClick> {
+    let value = value?;
+    if active_reveal_remaining(*revealed_until, now).is_some() {
+        Some(TimedSecretClick::Copy(value.to_string()))
+    } else {
+        *revealed_until = Some(now + MCP_URL_REVEAL_DURATION);
+        Some(TimedSecretClick::Revealed)
+    }
 }
 
 fn mcp_url_reveal_bar_segments(remaining: Duration) -> (String, String) {
@@ -2152,6 +2232,62 @@ fn rect_contains(area: Rect, column: u16, row: u16) -> bool {
         && column < area.x.saturating_add(area.width)
         && row >= area.y
         && row < area.y.saturating_add(area.height)
+}
+
+fn wrapped_line_hit_area(area: Rect, lines: &[Line<'_>], line_index: usize) -> Option<Rect> {
+    if area.width == 0 || area.height == 0 {
+        return None;
+    }
+
+    let marker_color = Color::Rgb(1, 2, 3);
+    let marker_style = Style::default().bg(marker_color);
+    let mut measured_lines = lines.to_vec();
+    let target_line = measured_lines.get_mut(line_index)?;
+    target_line.style = target_line.style.patch(marker_style);
+    for span in &mut target_line.spans {
+        span.style = span.style.patch(marker_style);
+    }
+
+    let measurement_area = Rect::new(0, 0, area.width, area.height);
+    let mut measurement_buffer = Buffer::empty(measurement_area);
+    Paragraph::new(measured_lines)
+        .wrap(Wrap { trim: false })
+        .render(measurement_area, &mut measurement_buffer);
+
+    let mut first_row = None;
+    let mut last_row = None;
+    for row in 0..measurement_area.height {
+        let contains_target = (0..measurement_area.width)
+            .any(|column| measurement_buffer[(column, row)].bg == marker_color);
+        if contains_target {
+            first_row.get_or_insert(row);
+            last_row = Some(row);
+        }
+    }
+
+    let first_row = first_row?;
+    let last_row = last_row?;
+
+    Some(Rect::new(
+        area.x,
+        area.y.saturating_add(first_row),
+        area.width,
+        last_row.saturating_sub(first_row).saturating_add(1),
+    ))
+}
+
+fn primary_mcp_url_line_index(
+    show_guide: bool,
+    is_returning_user: bool,
+    bootstrap_status_visible: bool,
+) -> Option<usize> {
+    if show_guide && !is_returning_user {
+        Some(CONNECT_GUIDE_PRIMARY_MCP_URL_LINE)
+    } else if !show_guide && !bootstrap_status_visible {
+        Some(STATUS_PRIMARY_MCP_URL_LINE)
+    } else {
+        None
+    }
 }
 
 fn ngrok_auth_setup_modal_area(anchor_area: Rect) -> Rect {
@@ -4515,6 +4651,7 @@ async fn run_tui(
     let mut last_command_view = PanelScrollView::default();
     let mut bottom_panel_areas = BottomPanelAreas::default();
     let mut bottom_panel_hits = BottomPanelHitMaps::default();
+    let mut dashboard_hit_areas = DashboardHitAreas::default();
     let mut focused_bottom_panel = BottomPanelFocus::ShellCommands;
     let mut selected_log: Option<usize> = None;
     let mut selected_command: Option<usize> = None;
@@ -4564,23 +4701,22 @@ async fn run_tui(
             last_update_refresh = Instant::now();
         }
         {
-            let reveal_remaining = mcp_url_revealed_until
-                .and_then(|deadline| deadline.checked_duration_since(Instant::now()));
+            let reveal_remaining = active_reveal_remaining(mcp_url_revealed_until, Instant::now());
             if mcp_url_revealed_until.is_some() && reveal_remaining.is_none() {
                 mcp_url_revealed_until = None;
             }
-            let log_mcp_reveal_remaining = log_mcp_url_revealed_until
-                .and_then(|deadline| deadline.checked_duration_since(Instant::now()));
+            let log_mcp_reveal_remaining =
+                active_reveal_remaining(log_mcp_url_revealed_until, Instant::now());
             if log_mcp_url_revealed_until.is_some() && log_mcp_reveal_remaining.is_none() {
                 log_mcp_url_revealed_until = None;
             }
-            let log_ngrok_reveal_remaining = log_ngrok_url_revealed_until
-                .and_then(|deadline| deadline.checked_duration_since(Instant::now()));
+            let log_ngrok_reveal_remaining =
+                active_reveal_remaining(log_ngrok_url_revealed_until, Instant::now());
             if log_ngrok_url_revealed_until.is_some() && log_ngrok_reveal_remaining.is_none() {
                 log_ngrok_url_revealed_until = None;
             }
-            let log_ngrok_domain_reveal_remaining = log_ngrok_domain_revealed_until
-                .and_then(|deadline| deadline.checked_duration_since(Instant::now()));
+            let log_ngrok_domain_reveal_remaining =
+                active_reveal_remaining(log_ngrok_domain_revealed_until, Instant::now());
             if log_ngrok_domain_revealed_until.is_some()
                 && log_ngrok_domain_reveal_remaining.is_none()
             {
@@ -4627,6 +4763,7 @@ async fn run_tui(
                         command_view: &mut last_command_view,
                         bottom_panel_areas: &mut bottom_panel_areas,
                         bottom_panel_hits: &mut bottom_panel_hits,
+                        dashboard_hit_areas: &mut dashboard_hit_areas,
                         toast: toast_ref,
                         mcp_url_reveal_remaining: reveal_remaining,
                         log_mcp_url_reveal_remaining: log_mcp_reveal_remaining,
@@ -4986,105 +5123,60 @@ async fn run_tui(
                                 let row = start.1 as usize;
                                 if row < screen_lines.len() {
                                     let line = &screen_lines[row];
-                                    let copy_value = if line.contains("chatgpt.com/apps") {
+                                    let now = Instant::now();
+                                    let secret_click = dashboard_secret_target_at(
+                                        &dashboard_hit_areas,
+                                        mouse.column,
+                                        mouse.row,
+                                    )
+                                    .and_then(|target| {
+                                        let click = match target {
+                                            DashboardSecretTarget::PrimaryMcpUrl => {
+                                                timed_secret_click(
+                                                    last_mcp_url.as_deref(),
+                                                    &mut mcp_url_revealed_until,
+                                                    now,
+                                                )
+                                            }
+                                            DashboardSecretTarget::LogMcpUrl => timed_secret_click(
+                                                last_mcp_url.as_deref(),
+                                                &mut log_mcp_url_revealed_until,
+                                                now,
+                                            ),
+                                            DashboardSecretTarget::LogNgrokUrl => {
+                                                timed_secret_click(
+                                                    last_ngrok_url.as_deref(),
+                                                    &mut log_ngrok_url_revealed_until,
+                                                    now,
+                                                )
+                                            }
+                                            DashboardSecretTarget::LogNgrokDomain => {
+                                                timed_secret_click(
+                                                    last_ngrok_domain.as_deref(),
+                                                    &mut log_ngrok_domain_revealed_until,
+                                                    now,
+                                                )
+                                            }
+                                        }?;
+                                        Some((target, click))
+                                    });
+                                    let copy_value = if let Some((target, click)) = secret_click {
+                                        match click {
+                                            TimedSecretClick::Revealed => {
+                                                toast = Some((
+                                                    target.reveal_message(),
+                                                    (mouse.column, mouse.row),
+                                                    now,
+                                                ));
+                                                None
+                                            }
+                                            TimedSecretClick::Copy(value) => Some(value),
+                                        }
+                                    } else if line.contains("chatgpt.com/apps") {
                                         Some(
                                             "https://chatgpt.com/apps#settings/Connectors"
                                                 .to_string(),
                                         )
-                                    } else if line.contains("Auto-saved ngrok static domain:") {
-                                        if let Some(ref domain) = last_ngrok_domain {
-                                            let revealed = log_ngrok_domain_revealed_until
-                                                .and_then(|deadline| {
-                                                    deadline.checked_duration_since(Instant::now())
-                                                })
-                                                .is_some();
-                                            if revealed {
-                                                Some(domain.clone())
-                                            } else {
-                                                let now = Instant::now();
-                                                log_ngrok_domain_revealed_until =
-                                                    Some(now + MCP_URL_REVEAL_DURATION);
-                                                toast = Some((
-                                                    "Domain revealed for 10s",
-                                                    (mouse.column, mouse.row),
-                                                    now,
-                                                ));
-                                                None
-                                            }
-                                        } else {
-                                            None
-                                        }
-                                    } else if line.contains("ngrok URL:") {
-                                        if let Some(ref url) = last_ngrok_url {
-                                            let revealed = log_ngrok_url_revealed_until
-                                                .and_then(|deadline| {
-                                                    deadline.checked_duration_since(Instant::now())
-                                                })
-                                                .is_some();
-                                            if revealed {
-                                                Some(url.clone())
-                                            } else {
-                                                let now = Instant::now();
-                                                log_ngrok_url_revealed_until =
-                                                    Some(now + MCP_URL_REVEAL_DURATION);
-                                                toast = Some((
-                                                    "URL revealed for 10s",
-                                                    (mouse.column, mouse.row),
-                                                    now,
-                                                ));
-                                                None
-                                            }
-                                        } else {
-                                            None
-                                        }
-                                    } else if line.contains("MCP Server URL:") {
-                                        if let Some(ref url) = last_mcp_url {
-                                            let revealed = log_mcp_url_revealed_until
-                                                .and_then(|deadline| {
-                                                    deadline.checked_duration_since(Instant::now())
-                                                })
-                                                .is_some();
-                                            if revealed {
-                                                Some(url.clone())
-                                            } else {
-                                                let now = Instant::now();
-                                                log_mcp_url_revealed_until =
-                                                    Some(now + MCP_URL_REVEAL_DURATION);
-                                                toast = Some((
-                                                    "URL revealed for 10s",
-                                                    (mouse.column, mouse.row),
-                                                    now,
-                                                ));
-                                                None
-                                            }
-                                        } else {
-                                            None
-                                        }
-                                    } else if let Some(ref url) = last_mcp_url {
-                                        let prefix = url.chars().take(30).collect::<String>();
-                                        if line.contains("MCP Server URL") || line.contains(&prefix)
-                                        {
-                                            let revealed = mcp_url_revealed_until
-                                                .and_then(|deadline| {
-                                                    deadline.checked_duration_since(Instant::now())
-                                                })
-                                                .is_some();
-                                            if revealed {
-                                                Some(url.clone())
-                                            } else {
-                                                let now = Instant::now();
-                                                mcp_url_revealed_until =
-                                                    Some(now + MCP_URL_REVEAL_DURATION);
-                                                toast = Some((
-                                                    "URL revealed for 10s",
-                                                    (mouse.column, mouse.row),
-                                                    now,
-                                                ));
-                                                None
-                                            }
-                                        } else {
-                                            None
-                                        }
                                     } else {
                                         None
                                     }
@@ -5376,6 +5468,7 @@ struct UiRenderContext<'a> {
     command_view: &'a mut PanelScrollView,
     bottom_panel_areas: &'a mut BottomPanelAreas,
     bottom_panel_hits: &'a mut BottomPanelHitMaps,
+    dashboard_hit_areas: &'a mut DashboardHitAreas,
     toast: Option<(&'a str, (u16, u16))>,
     mcp_url_reveal_remaining: Option<Duration>,
     log_mcp_url_reveal_remaining: Option<Duration>,
@@ -5400,12 +5493,14 @@ fn draw_ui(f: &mut Frame, context: UiRenderContext<'_>) {
         command_view,
         bottom_panel_areas,
         bottom_panel_hits,
+        dashboard_hit_areas,
         toast,
         mcp_url_reveal_remaining,
         log_mcp_url_reveal_remaining,
         log_ngrok_url_reveal_remaining,
         log_ngrok_domain_reveal_remaining,
     } = context;
+    *dashboard_hit_areas = DashboardHitAreas::default();
     let palette = app.current_theme().palette;
     let area = f.area();
     let now_millis = SystemTime::now()
@@ -5982,6 +6077,11 @@ fn draw_ui(f: &mut Frame, context: UiRenderContext<'_>) {
     if show_guide {
         status_lines = guide_lines;
     }
+    let primary_mcp_url_line = primary_mcp_url_line_index(
+        show_guide,
+        app.is_returning_user,
+        bootstrap_status_flow.is_some(),
+    );
 
     let show_mascot = area.width >= 120;
     let status_columns = if show_mascot {
@@ -6032,6 +6132,15 @@ fn draw_ui(f: &mut Frame, context: UiRenderContext<'_>) {
         horizontal: 2,
         vertical: 1,
     });
+    if let Some(area) = primary_mcp_url_line
+        .filter(|_| has_url)
+        .and_then(|line_index| wrapped_line_hit_area(status_content, &status_lines, line_index))
+    {
+        dashboard_hit_areas.secrets.push(DashboardSecretHit {
+            target: DashboardSecretTarget::PrimaryMcpUrl,
+            area,
+        });
+    }
     let status = Paragraph::new(status_lines).wrap(Wrap { trim: false });
     f.render_widget(status, status_content);
 
@@ -6249,6 +6358,21 @@ fn draw_ui(f: &mut Frame, context: UiRenderContext<'_>) {
         bottom_panel_hits
             .logs
             .push(PanelItemHit { top, bottom, index });
+        if let Some(target) = app
+            .logs
+            .get(index)
+            .and_then(|entry| log_secret_target(&entry.message))
+        {
+            dashboard_hit_areas.secrets.push(DashboardSecretHit {
+                target,
+                area: Rect::new(
+                    logs_area.x.saturating_add(1),
+                    top,
+                    logs_area.width.saturating_sub(2),
+                    bottom.saturating_sub(top).saturating_add(1),
+                ),
+            });
+        }
         visible_log_items.push(ListItem::new(lines));
         used_log_lines = used_log_lines.saturating_add(height);
     }
@@ -6462,19 +6586,29 @@ fn draw_ui(f: &mut Frame, context: UiRenderContext<'_>) {
 #[cfg(test)]
 mod tests {
     use super::{
-        BottomPanelAreas, BottomPanelFocus, PanelItemHit, PanelScrollView, WorkspaceHitAreas,
-        WorkspaceUiAction, draw_update_confirm, item_under_cursor, key_is_clipboard_paste,
+        BottomPanelAreas, BottomPanelFocus, DashboardHitAreas, DashboardSecretHit,
+        DashboardSecretTarget, PanelItemHit, PanelScrollView, TimedSecretClick, WorkspaceHitAreas,
+        WorkspaceUiAction, active_reveal_remaining, dashboard_secret_target_at,
+        draw_update_confirm, item_under_cursor, key_is_clipboard_paste, log_secret_target,
         move_panel_selection, normalize_ngrok_authtoken_input, normalize_ngrok_domain,
         normalize_workspace_path_input, panel_under_cursor, parse_clippymoon_export_args,
-        parse_port_value, remove_remote_browser_profile_dir, scroll_panel_down, scroll_panel_up,
-        tail_start_index, terminate_remote_browser_child, truncate_with_ellipsis,
-        update_confirm_action, user_home_dir, workspace_action_from_event,
-        workspace_detail_sections, wrap_preserving_chars,
+        parse_port_value, primary_mcp_url_line_index, remove_remote_browser_profile_dir,
+        scroll_panel_down, scroll_panel_up, tail_start_index, terminate_remote_browser_child,
+        timed_secret_click, truncate_with_ellipsis, update_confirm_action, user_home_dir,
+        workspace_action_from_event, workspace_detail_sections, wrap_preserving_chars,
+        wrapped_line_hit_area,
     };
     use crossterm::event::{
         Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     };
-    use ratatui::{Terminal, backend::TestBackend, layout::Rect};
+    use ratatui::{
+        Terminal,
+        backend::TestBackend,
+        layout::Rect,
+        style::{Color, Style},
+        text::{Line, Span},
+        widgets::{Paragraph, Wrap},
+    };
     use std::path::PathBuf;
 
     #[test]
@@ -6783,6 +6917,145 @@ mod tests {
             workspace_action_from_event(click(34, 20), &hit_areas),
             Some(WorkspaceUiAction::Copy)
         );
+    }
+
+    #[test]
+    fn dashboard_secret_hitboxes_target_primary_and_log_values_without_text_inference() {
+        let hit_areas = DashboardHitAreas {
+            secrets: vec![
+                DashboardSecretHit {
+                    target: DashboardSecretTarget::PrimaryMcpUrl,
+                    area: Rect::new(20, 8, 48, 1),
+                },
+                DashboardSecretHit {
+                    target: DashboardSecretTarget::LogNgrokDomain,
+                    area: Rect::new(2, 20, 70, 2),
+                },
+            ],
+        };
+
+        assert_eq!(
+            dashboard_secret_target_at(&hit_areas, 24, 8),
+            Some(DashboardSecretTarget::PrimaryMcpUrl)
+        );
+        assert_eq!(
+            dashboard_secret_target_at(&hit_areas, 30, 21),
+            Some(DashboardSecretTarget::LogNgrokDomain)
+        );
+        assert_eq!(dashboard_secret_target_at(&hit_areas, 24, 9), None);
+    }
+
+    #[test]
+    fn every_secret_log_kind_maps_to_a_dedicated_reveal_target() {
+        assert_eq!(
+            log_secret_target("MCP Server URL: https://secret/mcp"),
+            Some(DashboardSecretTarget::LogMcpUrl)
+        );
+        assert_eq!(
+            log_secret_target("ngrok URL: https://secret"),
+            Some(DashboardSecretTarget::LogNgrokUrl)
+        );
+        assert_eq!(
+            log_secret_target("Auto-saved ngrok static domain: secret.ngrok.app"),
+            Some(DashboardSecretTarget::LogNgrokDomain)
+        );
+        assert_eq!(log_secret_target("ordinary status message"), None);
+    }
+
+    #[test]
+    fn every_dashboard_secret_uses_the_same_ten_second_reveal_then_copy_method() {
+        let now = std::time::Instant::now();
+        let mut revealed_until = None;
+
+        assert_eq!(
+            timed_secret_click(Some("https://secret/mcp"), &mut revealed_until, now),
+            Some(TimedSecretClick::Revealed)
+        );
+        assert_eq!(
+            revealed_until,
+            Some(now + std::time::Duration::from_secs(10))
+        );
+        assert_eq!(
+            timed_secret_click(
+                Some("https://secret/mcp"),
+                &mut revealed_until,
+                now + std::time::Duration::from_secs(5),
+            ),
+            Some(TimedSecretClick::Copy("https://secret/mcp".into()))
+        );
+
+        let mut unavailable_deadline = None;
+        assert_eq!(
+            timed_secret_click(None, &mut unavailable_deadline, now),
+            None
+        );
+        assert_eq!(unavailable_deadline, None);
+    }
+
+    #[test]
+    fn dashboard_primary_url_logical_line_tracks_status_and_connect_guide() {
+        assert_eq!(primary_mcp_url_line_index(false, false, false), Some(6));
+        assert_eq!(primary_mcp_url_line_index(true, false, false), Some(7));
+        assert_eq!(primary_mcp_url_line_index(false, false, true), None);
+        assert_eq!(primary_mcp_url_line_index(true, true, false), None);
+    }
+
+    #[test]
+    fn dashboard_primary_url_hitbox_matches_every_wrapped_rendered_row() {
+        let target_color = Color::Rgb(17, 181, 229);
+        let target_index = 2;
+        let lines = vec![
+            Line::from("Open connector settings at https://chatgpt.com/apps#settings/Connectors"),
+            Line::from("Fill in the form using these connection details"),
+            Line::from(Span::styled(
+                "Primary MCP URL | https://example.ngrok.app/WorkspaceSecret123/mcp",
+                Style::default().fg(target_color),
+            )),
+            Line::from("Authentication | None"),
+        ];
+        let content = Rect::new(2, 1, 22, 14);
+        let hit_area = wrapped_line_hit_area(content, &lines, target_index)
+            .expect("wrapped primary URL should remain visible");
+        let backend = TestBackend::new(28, 18);
+        let mut terminal = Terminal::new(backend).expect("create narrow dashboard terminal");
+
+        terminal
+            .draw(|frame| {
+                frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), content);
+            })
+            .expect("render wrapped dashboard content");
+
+        let buffer = terminal.backend().buffer();
+        let rendered_target_rows = (content.y..content.y.saturating_add(content.height))
+            .filter(|row| {
+                (content.x..content.x.saturating_add(content.width))
+                    .any(|column| buffer[(column, *row)].fg == target_color)
+            })
+            .collect::<Vec<_>>();
+        let first_target_row = rendered_target_rows
+            .first()
+            .copied()
+            .expect("target URL should render");
+
+        assert!(first_target_row > content.y + target_index as u16);
+        assert!(rendered_target_rows.len() > 1);
+        assert_eq!(hit_area.y, first_target_row);
+        assert_eq!(hit_area.height as usize, rendered_target_rows.len());
+        assert_eq!(hit_area.x, content.x);
+        assert_eq!(hit_area.width, content.width);
+    }
+
+    #[test]
+    fn url_reveal_deadline_is_inactive_at_exact_expiry() {
+        let now = std::time::Instant::now();
+        let deadline = now + std::time::Duration::from_secs(10);
+
+        assert_eq!(
+            active_reveal_remaining(Some(deadline), now),
+            Some(std::time::Duration::from_secs(10))
+        );
+        assert_eq!(active_reveal_remaining(Some(deadline), deadline), None);
+        assert_eq!(active_reveal_remaining(None, now), None);
     }
 
     #[test]

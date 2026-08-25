@@ -350,6 +350,38 @@ fn collect_processes() -> Vec<ProcessInfo> {
 }
 
 #[cfg(windows)]
+fn parse_windows_command_line(command_line: &str) -> Vec<String> {
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::UI::Shell::CommandLineToArgvW;
+
+    let mut wide = command_line.encode_utf16().collect::<Vec<_>>();
+    wide.push(0);
+    let mut argc = 0i32;
+    let argv = unsafe { CommandLineToArgvW(wide.as_ptr(), &mut argc) };
+    if argv.is_null() || argc <= 0 {
+        return Vec::new();
+    }
+
+    let args = unsafe {
+        std::slice::from_raw_parts(argv, argc as usize)
+            .iter()
+            .map(|arg| {
+                let ptr = *arg;
+                let mut len = 0usize;
+                while *ptr.add(len) != 0 {
+                    len += 1;
+                }
+                String::from_utf16_lossy(std::slice::from_raw_parts(ptr, len))
+            })
+            .collect::<Vec<_>>()
+    };
+    unsafe {
+        let _ = LocalFree(argv.cast());
+    }
+    args
+}
+
+#[cfg(windows)]
 fn collect_processes() -> Vec<ProcessInfo> {
     #[derive(Deserialize)]
     #[serde(rename_all = "PascalCase")]
@@ -393,10 +425,7 @@ ConvertTo-Json -InputObject $rows -Compress
     rows.into_iter()
         .filter_map(|row| {
             let command_line = row.command_line?;
-            let cmdline = command_line
-                .split_whitespace()
-                .map(|part| part.trim_matches('"').to_string())
-                .collect::<Vec<_>>();
+            let cmdline = parse_windows_command_line(&command_line);
             Some(ProcessInfo {
                 pid: row.process_id,
                 binary: row.name,
@@ -585,6 +614,26 @@ mod tests {
             "google-chrome"
         };
         assert!(process_matches_binary(&process, expected));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_command_line_parser_preserves_quoted_paths_and_unquotes_flag_values() {
+        let args = parse_windows_command_line(
+            r#""C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port="9222" --user-data-dir="C:\Temp\Moon Desk""#,
+        );
+        assert_eq!(
+            args,
+            vec![
+                r#"C:\Program Files\Google\Chrome\Application\chrome.exe"#.to_string(),
+                "--remote-debugging-port=9222".to_string(),
+                r#"--user-data-dir=C:\Temp\Moon Desk"#.to_string(),
+            ]
+        );
+        assert_eq!(
+            extract_remote_debug_target(&args),
+            Some("127.0.0.1:9222".to_string())
+        );
     }
 
     #[cfg(windows)]

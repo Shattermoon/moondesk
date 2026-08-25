@@ -1,334 +1,211 @@
 # MoonDesk
 
-An open-source tool that lets you use ChatGPT Chat as a local coding agent. No reverse engineering, no API, no Codex, no Work mode. A ChatGPT Plus subscription is enough.
+**Turn ChatGPT Chat into a local coding agent.**
 
-> [!NOTE]
-> MoonDesk is maintained by **Shattermoon** and is built around a lightweight local MCP architecture. Its companion, **ClippyMoon**, selects a bright hand-tuned pixel-art identity from a deterministic random seed.
+MoonDesk is an open-source local MCP server that gives ChatGPT tools to read and edit files, run commands, manage long-running jobs, and control Chromium-based browsers — without using the OpenAI API.
 
-<p align="center">
-  <img src="docs/images/moondesk_preview.gif" alt="MoonDesk in ChatGPT Web"><br>
-  <em>MoonDesk in ChatGPT Web</em>
-</p>
-
-# Disclaimer
-
-This is an independent open-source project and is not affiliated with or endorsed by OpenAI. I built it as a personal tool and decided to open-source it. Some features are still buggy and may cause unexpected behavior. Use it at your own risk. I am not responsible for any loss caused by this tool. It is strongly recommended to run it inside a VM or container.
-
-# Why MoonDesk?
-
-Codex has a very generous weekly quota (reset usage frequently) compared to Antigravity (good at good morning) and Claude Code (RIP 5h quota 💀), that's why I love OpenAI so much.
-
-<p align="center">
-  <img src="docs/images/codex_2x_usage.png" alt="Codex reset usage frequently🙏" width="700"><br>
-  <em>Codex reset usage frequently🙏</em>
-</p>
-
-However, the quota runs out very quickly if you work on a large project.
-
-<p align="center">
-  <img src="docs/images/no_remaining_usage.png" alt="I used up my Codex quota on the first day after it reset" width="700"><br>
-  <em>I used up my Codex quota on the first day after it reset</em>
-</p>
-
-Then you need to wait another 7 days. What are you going to do for the rest of the week?
-
-Here's the solution: most people with a Plus subscription do not use even 10% of their weekly thinking messages.
-
-**_So why not use your 3,000 weekly messages for coding?_**
-
-That's the idea behind MoonDesk! It gives ChatGPT Web tools like `write` and `run_command` to edit files on your computer.
-
-<p align="center">
-  <img src="docs/images/thinking_usage_limits.png" alt="ChatGPT reasoning usage limits for GPT-5.5 and GPT-5.6" width="900"><br>
-  <em>GPT-5.5: <a href="https://web.archive.org/web/20260519111010/https://help.openai.com/en/articles/11909943-gpt-55-in-chatgpt">3,000 messages/week</a>, GPT-5.6: <a href="https://help.openai.com/en/articles/20001354-gpt-56-in-chatgpt">unknown</a> but I have never hit the limit</em>
-</p>
-
-# How does this work?
-
-1. A ChatGPT Plus or above subscription is required.
-2. MoonDesk runs as a local MCP server on your computer. It has the ability to run commands and edit files, just like Codex.
-3. You can connect ChatGPT Web to MoonDesk using a Custom Connector, which is a feature available only to Plus and Pro users.
-4. Done! Now ChatGPT Web can control your computer and code on it.
-
-In short,
-
-```text
-ChatGPT Web + MoonDesk
-= a stripped-down version of Codex
-= OpenClaw without cron and other active utilities
+```bash
+npm install -g moondesk
 ```
 
-I tried this with GPT-5.2 before, and the results were poor. However, **GPT-5.4 Thinking is now really good at tool calling and computer use.** The first time I tried it with GPT-5.4, I was honestly surprised by how well it worked. GPT-5.5 and GPT-5.6 are even smoother, and GPT-5.6 is extremely good at using MoonDesk. It's also very fast.
+> [!IMPORTANT]
+> MoonDesk runs tools on your computer with your user account's permissions. Use a VM or container when you need strong isolation.
 
-# Differences between ChatGPT Chat + MoonDesk, Codex, and the API (let's say Plus plan)
+## Why MoonDesk?
 
-|       | ChatGPT Chat + MoonDesk                             | Codex                   | OpenAI API           |
-| ----- | -------------------------------------------------- | ----------------------- | -------------------- |
-| Usage | 3,000 messages/week                                | Generous weekly quota   | Pay as you go        |
-| Pros  | Stable, no extra fee, and nearly unlimited\* quota | Stable and no extra fee | Stable               |
-| Cons  | Not as smooth as native Codex                      | Runs out very quickly   | Tokens are expensive |
+MoonDesk lets you use the ChatGPT subscription you already have for local coding work. ChatGPT connects to MoonDesk through a Custom Connector, and MoonDesk exposes your project as a set of MCP tools.
 
-\*Let's say you sleep 6 hours a day and use MoonDesk every day. In that case, you can send 3,000 / (24 - 6) / 7 = 23.8 messages per hour. Since thinking and tool calls take time, it is very difficult to use up your weekly 3,000 message limit.
+```text
+ChatGPT Chat
+     │
+     │ Custom Connector
+     ▼
+  MoonDesk
+  ├─ Files
+  ├─ Shell jobs
+  ├─ Workspaces
+  └─ Browser / DevTools
+```
 
-# Who needs this?
+No reverse engineering. No API key. No separate agent service.
 
-- People who used up their Codex quota on the first few day after it reset (me🥺)
-- People who are working on web development and crawlers. (MoonDesk enables ChatGPT Web to read elements and control your browser tab through chrome-devtools-mcp integration.)
+## Features
 
-# Quickstart
+- **Local file tools** — read, search, write, edit, and delete inside a workspace.
+- **Shell commands** — run short commands or start background jobs with polling, preserved output, and cancellation.
+- **Multiple workspaces** — serve several projects from one MoonDesk process, each with its own secret MCP URL.
+- **Browser control** — connect ChatGPT to supported Chromium browsers through `chrome-devtools-mcp`.
+- **Read-only mode** — expose only safe local read tools when mutation is unnecessary.
+- **Cross-platform** — Windows, macOS, and Linux.
+- **Native binary distribution** — install with npm; MoonDesk downloads and verifies the matching release binary on first run.
+- **Self-update** — global npm installs can update and restart from the TUI after confirmation.
 
-> [!CAUTION]
-> This tool is very powerful and can potentially wipe your whole disk or produce unexpected results.
-> Run it inside a VM or container (DevContainer is a good option).
-> Treat it like OpenClaw, keep it containerized and isolated.
+## Quickstart
 
-1. Install MoonDesk globally with npm.
+### 1. Install
 
-   ```bash
-   npm install -g moondesk
-   ```
+Node.js 18 or newer is required.
 
-   MoonDesk does not rely on npm lifecycle/install scripts. On the first `moondesk` run, the small npm wrapper downloads the matching native binary from the GitHub Release, verifies it against that release's `SHA256SUMS`, and stores it in a versioned user cache under `~/.moondesk/npm-bin/`. This works with npm 12's default-deny install-script policy and also keeps the running native executable outside npm's `node_modules`, which makes Windows package upgrades less likely to hit locked-file errors.
+```bash
+npm install -g moondesk
+```
 
-   Globally installed npm copies also check `moondesk@latest` in the background. When a newer stable release is available, the Status panel shows the current version and `[u] Update & Restart`. Pressing `u` always opens a confirmation modal first: make sure no ChatGPT/MCP session or command is running because MoonDesk will restart and the active connection will be interrupted. Press `Enter` to continue or `Esc` to abort. The wrapper then installs the exact version that was shown, verifies that npm really replaced the package with that version, restarts MoonDesk in the same working directory with the same arguments, and removes older verified native/update caches on subsequent startup. Multiple MoonDesk processes serialize global npm updates so they do not race each other. Local dependency or `npx` copies never offer in-app self-update.
+### 2. Run
 
-2. Run MoonDesk from any terminal directory.
+Start MoonDesk inside the project you want to use:
 
-   ```bash
-   moondesk
-   ```
+```bash
+cd your-project
+moondesk
+```
 
-   When MoonDesk starts, choose `Control Computer`, `Control Browser`, or `Both`. If browser control is enabled, select a supported Chromium browser.
+Choose:
 
-   On first launch, MoonDesk will ask you to enter your **ngrok authtoken** and **ngrok static domain** (e.g. `my-app.ngrok-free.dev`). You can get both from the [ngrok dashboard](https://dashboard.ngrok.com/get-started/setup). These are saved to `~/.moondesk/config.toml` and reused on subsequent launches.
+- `Control Computer`
+- `Control Browser`
+- `Both`
 
-   By default, MoonDesk listens on port `3200`. You can override it with `PORT`. On a first install (or when migrating the legacy single-workspace config), MoonDesk creates the first workspace from `WORKSPACE_ROOT` if it is set, otherwise from the directory where MoonDesk was launched. Once the multi-workspace registry exists, launching MoonDesk from a different directory never repoints an existing connector. If a MoonDesk host is already running on that port, running `moondesk` from another project directory securely attaches that directory as a new workspace to the existing host and exits; you can also add or change projects from the `[w] Workspaces` screen.
+On first launch, MoonDesk asks for your **ngrok authtoken** and **static domain**. These are stored in `~/.moondesk/config.toml`.
 
-   On macOS Terminal.app, MoonDesk manages a dedicated `MoonDesk` Terminal profile automatically. If the current Terminal tab is not already using that profile, MoonDesk applies it, closes any temporary helper window, and asks you to run the same command again in that tab. It only starts immediately when the current tab is already using `MoonDesk`. Set `MOONDESK_SKIP_MACOS_TERMINAL_PROFILE=1` if you want to keep the current Terminal session untouched.
+### 3. Copy the workspace URL
 
-3. Wait for the TUI to connect ngrok. Press `[w] Workspaces` to see the registered projects. Select a workspace and reveal/copy its MCP URL. The first workspace is created automatically; existing users keep their old workspace slug during migration, so the already configured connector URL does not change.
+Open `[w] Workspaces` in the TUI and copy the MCP URL for your project.
 
-4. Open [ChatGPT connector settings](https://chatgpt.com/plugins#settings/Connectors?create-connector=true&redirectAfter=%2Fplugins).
+Each workspace has its own secret URL, for example:
 
-5. In the pop-up window, fill in the connector form:
-   - Name: `MoonDesk · <workspace name>` (for example `MoonDesk · SiteAI`)
-   - MCP Server URL: the URL for that specific workspace from `[w] Workspaces`
-   - Authentication: `None`
+```text
+https://your-domain.ngrok-free.dev/<workspace-secret>/mcp
+```
 
-6. Click `I understand and want to continue`.
+### 4. Create the ChatGPT connector
 
-7. Click `Create`, then click `Connect`.
+Open ChatGPT's Custom Connector settings and create a connector with:
 
-   - Permission defaults to **Allow read actions**. For the smoothest experience, I recommend **Allow all actions** (equivalent to Codex's `--yolo`; use with caution).
+```text
+Name: MoonDesk · <project name>
+MCP Server URL: <URL copied from MoonDesk>
+Authentication: None
+```
 
-8. Add this to your ChatGPT `Custom instructions`:
+For full coding-agent behavior, allow write actions only when you trust the current workspace and task.
+
+### 5. Add the recommended instruction
+
+Add this to your ChatGPT custom instructions:
 
 ```text
 MoonDesk is a coding tool and a custom connector. Always use MoonDesk if the user wants to do anything related to file operations. Always call `moondesk_instruction` after `list_resources`, and follow the instructions it contains.
 ```
 
-9. Start using the connector from ChatGPT Web. Some important tips:
+That's it. Select the MoonDesk connector in a ChatGPT conversation and start working.
 
-- I recommend let ChatGPT to decide which connector automatically. You can manually selecting the connector using `/` or `@`. This way, ChatGPT can only access the connector you selected, which may improve stability. However, the downside is, `web.search` and `web.open` will be disabled. Which means it can't search latest info. The `web` tool and a custom connector cannot be used at the same time.
+## Multiple projects
 
-<table align="center">
-  <tr>
-    <td align="center">
-      <img src="docs/images/connector_slash.png" alt="Select MoonDesk from the slash command menu" width="300"><br>
-      <em>Select MoonDesk manually with <code>/</code></em>
-    </td>
-    <td align="center">
-      <img src="docs/images/connector_at.png" alt="Select MoonDesk from the at-sign menu" width="300"><br>
-      <em>Select MoonDesk manually with <code>@</code></em>
-    </td>
-  </tr>
-</table>
-
-- To improve performance and avoid high memory usage, I strongly recommend **opening a new session for every small feature**. If you need context, you can ask ChatGPT to create a handoff note and paste it into the new session. It will become extremely laggy after 50+ tool calls.
-<p align="center">
-  <img src="docs/images/high_ram_usage.png" alt="3.9 GB Memory usage🥹" width="300"><br>
-  <em>3.9 GB Memory usage🥹</em>
-</p>
-
-
-## Working on multiple projects at the same time
-
-One MoonDesk process can host multiple project roots concurrently. It still uses one local server, one port, one ngrok tunnel/domain, and one shared browser/DevTools bridge. Each workspace gets its own stable internal ID and its own random secret MCP path.
-
-Press `[w] Workspaces` to add, rename, inspect, reveal/copy, rotate, or remove projects. You can paste/type a path with `[a] Path`, open the native folder picker with `[b] Browse`, and click project rows plus the Reveal/Copy actions with the mouse. Create one ChatGPT connector per workspace and select the matching connector in each ChatGPT chat. The endpoint itself selects the project; MoonDesk does not add workspace metadata or a workspace argument to every tool call.
+One MoonDesk host can serve several project roots at once:
 
 ```text
-one MoonDesk process / port 3200 / ngrok domain
-├── MoonDesk · SiteAI   -> /<secret-A>/mcp -> D:\SiteAI
-├── MoonDesk · KUBA     -> /<secret-B>/mcp -> D:\KUBA
-└── MoonDesk · MoonDesk -> /<secret-C>/mcp -> D:\CatDesk
+one MoonDesk process
+one local server :3200
+one ngrok domain
+
+├── Project A -> /<secret-A>/mcp -> D:\ProjectA
+├── Project B -> /<secret-B>/mcp -> D:\ProjectB
+└── Project C -> /<secret-C>/mcp -> D:\ProjectC
 ```
 
-Important behavior:
+Each workspace keeps its own file boundary, command jobs, retained output, history, and secret connector URL.
 
-- A workspace keeps its own normal command/job/output and local-history allowances; one busy project does not consume another project's normal quota.
-- Browser control is intentionally shared. If two workspace connectors use Browser/Both mode, they control the same selected browser/DevTools bridge.
-- Rotating a workspace secret immediately invalidates only that workspace's old URL. Update that ChatGPT connector to the newly revealed URL; other workspace URLs are unchanged.
-- Removing a workspace first blocks new requests/jobs and lets already accepted foreground/file work drain safely. Only after the registry removal is durably saved does MoonDesk cancel that workspace's background jobs and purge retained state; an aborted/failed removal re-enables the workspace without killing its running jobs.
-- A missing workspace directory (for example an unplugged drive) stays registered and is shown as unavailable. It becomes usable again when the directory returns.
-- Duplicate and parent/child-overlapping workspace roots are rejected in V1 so two connectors cannot accidentally claim overlapping dedicated-file-tool authority.
-- Starting `moondesk` from another project directory while the normal host is already running does not create a second host. The new invocation securely attaches its current directory to the existing host as a workspace/session, then exits. The same project can also be added from `[w] Workspaces`.
+Use `[w] Workspaces` to add, rename, inspect, copy, rotate, or remove projects. Launching `moondesk` from another project while a host is already running can attach that directory to the existing host instead of starting another server.
 
-# Stack
+Browser control is shared by the host, so workspaces using browser mode control the same selected browser/DevTools bridge.
 
-| Part | Stack |
+## Tools
+
+In `multi-tools` mode MoonDesk exposes 12 local tools:
+
+| Tool | Purpose |
 | --- | --- |
-| Core | Rust |
-| MCP server | Custom implementation (no SDK) |
-| MCP protocolVersion | `2025-11-25` |
-| Server | Axum + Tokio |
-| TUI | Ratatui |
-| Tunnel | ngrok |
-| Browser control | chrome-devtools-mcp |
-| Distribution | npm |
+| `moondesk_instruction` | MoonDesk usage guidance |
+| `read` | Read workspace files |
+| `search` | Search workspace text |
+| `write` | Create or overwrite files |
+| `edit` | Replace exact text |
+| `delete` | Delete files or directories |
+| `run_command` | Run a short shell command |
+| `start_command` | Start a background command |
+| `list_commands` | List current and retained jobs |
+| `poll_command` | Read incremental job output |
+| `read_command_output` | Read preserved command output |
+| `cancel_command` | Stop a job and its process tree |
 
-# Tools
+Use `run_command` for short work. Use `start_command` + `poll_command` for builds, tests, package installs, dev servers, and other long-running commands.
 
-MoonDesk has two local tool modes: `multi-tools` exposes 12 tools, and `read-only` exposes 3 tools.
+`read-only` mode exposes only the local guide/read tools.
 
-MoonDesk's local tools in `multi-tools` mode are:
+Browser mode can add DevTools tools depending on the selected browser and environment.
 
-| Tool                  | Type  | What it does                                                               |
-| --------------------- | ----- | -------------------------------------------------------------------------- |
-| `moondesk_instruction` | Guide | Returns MoonDesk usage instructions                                        |
-| `read`                | Read  | Reads bounded line ranges or byte chunks from a workspace text file        |
-| `search`              | Read  | Searches workspace text and returns compact bounded results                |
-| `write`               | Write | Creates or overwrites a file                                               |
-| `edit`                | Write | Replaces exact text inside a file                                          |
-| `delete`              | Write | Deletes a file or directory                                                |
-| `run_command`         | Shell | Runs a short shell command and waits for completion                        |
-| `start_command`       | Job   | Starts a long-running shell command and immediately returns a job ID       |
-| `list_commands`       | Read  | Lists active (or retained completed) command jobs for this workspace       |
-| `poll_command`        | Job   | Reads incremental output and status from a background command              |
-| `read_command_output` | Read  | Reads bounded chunks from complete preserved command stdout/stderr         |
-| `cancel_command`      | Job   | Stops a background command and its child process tree                      |
+## Workspace security
 
-Long-running commands are deliberately decoupled from the lifetime of an MCP HTTP request. Builds, compilation, dependency installation, long test suites, development servers, and commands expected to produce large output should use `start_command`, then `poll_command`. Before starting work that may already be alive, `list_commands` lets an agent rediscover the workspace's active jobs after retries, long conversations, or context loss. `start_command` also reuses an exact running command in the same working directory by default instead of accidentally launching another copy; set `allow_duplicate: true` only when another concurrent copy is intentional. Active job listings include the owned root PID and, on supported platforms, the current process-tree size so multiple Node/compiler workers can be attributed to one logical command. The first poll uses `after: 0`; every later poll must pass the previous `nextCursor`, so each response contains only new output. Poll responses stay bounded. Complete stdout/stderr is also preserved locally for the MoonDesk session, so if a poll reports `outputTruncated`, `read_command_output` can recover either full stream in bounded byte chunks using the same job ID. `run_command` remains the simpler path for short commands; if its inline 1 MiB-per-stream capture is exceeded, it returns an `outputId` that `read_command_output` can use instead of permanently discarding the overflow.
+Dedicated file tools are confined to the selected workspace. MoonDesk rejects path traversal and symlink/junction escapes outside that root.
 
-On wide terminals, the lower TUI is split into a compact Logs pane and a larger Shell Commands pane. Shell Commands is focused by default. `Tab`/`Shift+Tab` switches pane focus; arrow keys, Page Up/Down, and the mouse wheel select/scroll entries in the focused or pointed pane; Home/End jumps to the first/latest entry. Clicking a rendered row selects it. Long log messages and shell commands stay compact with an explicit ellipsis; press `Enter` or `Space` to expand the selected row and wrap its full locally stored text, then `Esc` to collapse it. Shell command entries always keep one blank line between executions for readability. Each pane keeps independent scroll/follow state, so inspecting command history no longer moves the Logs pane.
+Shell commands are different. `run_command` and `start_command` launch your normal developer shell with the workspace as its working directory. They inherit your normal environment, credentials, PATH, and OS permissions.
 
-On sufficiently wide terminals, the bottom of the MoonDesk TUI is split into `Logs` and `Shell Commands`. The command panel is local-only: it shows `run_command`/`start_command` immediately when the request arrives, then updates that command with bounded progress/result previews from later responses and polls. This does not add command data or result previews to ChatGPT's MCP responses.
+**The working directory is not an OS sandbox.** A shell command can access anything your user account can access.
 
-`read` defaults to 200 lines and exposes `nextStartLine` for normal pagination. If one line is too large for a single response, MoonDesk returns a bounded byte chunk and `nextStartByte`; continue with `start_byte`/`max_bytes` so minified files, source maps, and other long-line text remain fully inspectable without one huge tool result.
+Use:
 
-If browser mode is enabled, MoonDesk can also expose extra browser/devtools tools. Those are provided by the browser bridge, so the exact list depends on your environment.
-
-`search` uses `rg` when it is available, falls back to `grep`, then falls back to MoonDesk's built-in scanner. Installing ripgrep is optional, but gives the best search performance and behavior.
-
-# Context window
-
-According to [the blog](<https://help.openai.com/en/articles/11909943-gpt-53-and-gpt-54-in-chatgpt#:~:text=Thinking%20(GPT%E2%80%915.4%20Thinking)>) and [the code](https://github.com/openai/codex/blob/main/codex-rs/models-manager/src/model_info.rs#L85), the context window in ChatGPT web is different from Codex.
-
-| Tier | MoonDesk + ChatGPT Web (in + out = sum) | Codex CLI (sum)        |
-| ---- | -------------------------------------- | ---------------------- |
-| Plus | 128K + 128K = 256K                     | 258K (1M experimental) |
-| Pro  | 272K + 128K = 400K                     | 258K (1M experimental) |
-
-# FAQ
-
-### I've already connected. Why do I need to connect again and again?
-
-There doesn't seem to be any obvious pattern for when the connector triggers `Connect`. I'm sure it's not triggered by the tool call count, but I don't know the exact reason.
-
-<table align="center">
-  <tr>
-    <td align="center">
-      <img src="docs/images/connect1.png" alt="Connector asks to connect again" width="700"><br>
-      <em>Connector asks to connect again</em>
-    </td>
-    <td align="center">
-      <img src="docs/images/connect2.png" alt="Connector asks to connect again (After you click Continue)" width="700"><br>
-      <em>Connector asks to connect again (After you click Continue)</em>
-    </td>
-  </tr>
-</table>
-
-I know it’s annoying. I’m trying to find a solution now.
-
-### Can MoonDesk be used in other apps?
-
-Yes, in theory. MoonDesk may also work with other apps that support custom remote MCP servers, including Claude. (I don't think anyone will use MoonDesk with Claude though, since Claude Chat mode and Claude Code share the same usage limits.)
-
-However, MoonDesk is built specifically for ChatGPT Chat and its Custom Connector (They renamed it to _Apps_, and now they renamed it again and call it _Plugins_, but to prevent confusion with _Application_, I still prefer call it _Connector_) flow. ChatGPT Chat is the environment MoonDesk is designed and tested for, so other apps may not work as smoothly.
-
-### How does the input/output token be calculated?
-
-MoonDesk does not get official token usage numbers from ChatGPT Web. It estimates them locally with `o200k_base`, the same tokenizer family used by GPT-5.5-style models, so the numbers are useful, but still only estimates.
-
-| Field          | Symbol | What it means                | Price                         |
-| -------------- | ------ | ---------------------------- | ----------------------------- |
-| `inputTokens`  | `↓`    | Tool input ≈ LLM output      | ≈ `$30.00 / 1M` output tokens |
-| `outputTokens` | `↑`    | Tool output ≈ LLM input      | ≈ `$5.00 / 1M` input tokens   |
-| `totalTokens`  | `Σ`    | `inputTokens + outputTokens` | `input price + output price`  |
-
-MoonDesk does not count:
-
-- the full ChatGPT conversation
-- hidden prompts or reasoning tokens
-- other internal tokens on OpenAI's side
-
-These estimates stay local to MoonDesk for its own counters and are not attached to MCP tool responses sent back to ChatGPT.
-
-### What is a workspace?
-
-A workspace is one registered project root served by MoonDesk. One running MoonDesk host can keep multiple workspaces active at the same time, and each workspace has its own secret MCP URL for its ChatGPT connector.
-
-On first install/legacy migration, the initial workspace comes from `WORKSPACE_ROOT` when explicitly set, otherwise from the launch directory. After the workspace registry has been created, changing the launch directory or `WORKSPACE_ROOT` does not silently repoint existing workspace URLs. Use `[w] Workspaces` to add or manage projects.
-
-A workspace connector URL is intentionally stable across MoonDesk restarts. MoonDesk persists both the ngrok static domain and each workspace's random secret path in `~/.moondesk/config.toml`, then reuses them on every later session. You should normally create the ChatGPT connector for a workspace once and keep using it. The URL changes only when you explicitly rotate that workspace's secret, change the configured ngrok domain, remove and re-add the workspace, or lose/delete the MoonDesk config file. Renaming a workspace, restarting MoonDesk/ngrok, launching MoonDesk from another directory, or upgrading MoonDesk does not rotate the URL. Legacy single-workspace installs keep their existing secret during migration.
-
-Dedicated file tools use the selected endpoint's workspace as their base path and reject traversal, absolute paths outside that root, and symlink/junction escapes. `run_command` and `start_command` are intentionally different: they start the user's normal developer shell with the workspace as its working directory. The shell inherits the normal PATH, home directory, environment, developer configuration, credentials, and OS permissions so tools such as Git, package managers, SDKs, compilers, Docker, and development servers behave normally. CWD is **not an OS sandbox**: an absolute-path shell command can read or modify other paths allowed to the MoonDesk user. Use `read-only` mode when shell/write access should not be exposed, and use a VM/container when you need OS-level isolation.
-
-### Where to put my AGENTS.md?
-
-You can put it in 3 places.
-
-1. Workspace root
-2. `~/.moondesk/AGENTS.md`
-3. `~/.codex/AGENTS.md`
-
-MoonDesk checks these locations for `AGENTS.md` in this order. This happens every time `moondesk_instruction` is called. You can also manually choose which `AGENTS.md` to use.
-
-<p align="center">
-  <img src="docs/images/set_agents_md.png" alt="Set AGENTS.md manually" width="500"><br>
-  <em>Set AGENTS.md manually</em>
-</p>
-
-# Safety
+- `read-only` mode when write/shell access is unnecessary;
+- a VM or container when you need OS-level isolation;
+- secret rotation from `[w] Workspaces` if a workspace MCP URL is ever exposed.
 
 > [!CAUTION]
-> Do **NOT** share any workspace's `MCP Server URL` with anyone. Each URL is a secret credential for that workspace and can expose powerful local tools.
+> Never share a workspace MCP URL. Treat it like a credential.
 
-A workspace URL is made of these parts:
+## Configuration
 
-| Part         | Example                       | What it means                                      |
-| ------------ | ----------------------------- | -------------------------------------------------- |
-| Public URL   | `https://xxxx.ngrok-free.dev` | The one ngrok static domain shared by the host     |
-| Random path  | `/Ab3kL9xQ2pTm7VhC`           | A different random secret path for each workspace  |
-| MCP endpoint | `/mcp`                        | The actual MCP endpoint                            |
+| Setting | Default / location |
+| --- | --- |
+| Config | `~/.moondesk/config.toml` |
+| Port | `3200` |
+| Port override | `PORT` |
+| Initial workspace override | `WORKSPACE_ROOT` |
+| Global instructions | `~/.moondesk/AGENTS.md` |
+| Codex-compatible instructions | `~/.codex/AGENTS.md` |
 
-So one workspace URL looks like this:
+MoonDesk also checks `AGENTS.md` in the current workspace. Workspace instructions take priority.
 
-```text
-https://xxxx.ngrok-free.dev/Ab3kL9xQ2pTm7VhC/mcp
-```
+On macOS Terminal.app, MoonDesk can manage a dedicated terminal profile. Set `MOONDESK_SKIP_MACOS_TERMINAL_PROFILE=1` to disable that behavior.
 
-The domain and workspace registry are persisted in `~/.moondesk/config.toml`, so workspace URLs remain stable across launches. Upgrading an old single-workspace installation preserves its existing slug. If a workspace URL is exposed, rotate **that workspace's** secret from `[w] Workspaces`; its previous URL stops working immediately and the corresponding ChatGPT connector must be updated. Other workspaces are unaffected.
+## Stack
 
-# About ClippyMoon
+| Part | Technology |
+| --- | --- |
+| Core | Rust |
+| Async runtime / server | Tokio + Axum |
+| TUI | Ratatui |
+| Tunnel | ngrok |
+| MCP server | Custom implementation |
+| MCP protocol | `2025-11-25` |
+| Browser bridge | `chrome-devtools-mcp` |
+| Distribution | npm + native binaries |
+
+## Contributing
+
+Contributions are welcome. See [`CONTRIBUTING.md`](CONTRIBUTING.md) for development setup, required checks, PR rules, and security-sensitive invariants.
+
+Release maintainers should also read [`docs/RELEASING.md`](docs/RELEASING.md).
+
+## ClippyMoon
 
 <p align="center">
-  <img src="docs/images/clippymoon.gif" alt="ClippyMoon!" width="500"><br>
+  <img src="docs/images/clippymoon.gif" alt="ClippyMoon" width="420"><br>
   <em>ClippyMoon!</em>
 </p>
 
-ClippyMoon is MoonDesk's hand-tuned pixel-art lunar companion. It is rendered entirely in Rust from a random 64-bit seed when MoonDesk starts; no image-generation model or bundled sprite sheet is used.
+## Disclaimer
 
-A seed now selects from a curated library of known-good bright identities instead of independently randomizing every visual trait. Normal mascots use only quarter, gibbous, and full shapes, so a seed can no longer produce an almost-black new/crescent moon. The color families are pale ivory, silver, warm yellow, harvest orange, and coral red, with deliberately light same-hue shadow tones. Crater and star arrangements are hand-authored layouts rather than random placements, and per-pixel noise is avoided so every seed stays clean at terminal scale. Animation changes only temporary frame state such as blinking, subtle one-pixel bobbing, and star twinkling, so the same seed always recreates the same character.
+MoonDesk is an independent open-source project and is not affiliated with or endorsed by OpenAI. It can execute powerful local actions. Review permissions carefully and use it at your own risk.
 
-Normal MoonDesk startup keeps ClippyMoon entirely in memory: nothing is archived or persisted and each launch creates a fresh random moon. The current moon's 16-digit hexadecimal seed is written once to the TUI log so it can be reproduced without saving mascot state. Export is explicit and opt-in. Run `moondesk clippymoon export` to create `clippymoon.png` and `clippymoon.gif` in the current directory, or use `--seed <hex>` to reproduce a specific moon and `--out <directory>` to choose the destination. Both exports are 512×512 pixel art; the GIF uses the same idle-animation sequence as the TUI and loops indefinitely. MoonDesk never writes these files unless the export command is invoked.
+## License
+
+[MIT](LICENSE)

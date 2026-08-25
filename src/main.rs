@@ -2234,16 +2234,45 @@ fn rect_contains(area: Rect, column: u16, row: u16) -> bool {
         && row < area.y.saturating_add(area.height)
 }
 
-fn line_hit_area(area: Rect, line_index: usize) -> Option<Rect> {
-    let line_index = u16::try_from(line_index).ok()?;
-    if area.width == 0 || line_index >= area.height {
+fn wrapped_line_hit_area(area: Rect, lines: &[Line<'_>], line_index: usize) -> Option<Rect> {
+    if area.width == 0 || area.height == 0 {
         return None;
     }
+
+    let marker_color = Color::Rgb(1, 2, 3);
+    let marker_style = Style::default().bg(marker_color);
+    let mut measured_lines = lines.to_vec();
+    let target_line = measured_lines.get_mut(line_index)?;
+    target_line.style = target_line.style.patch(marker_style);
+    for span in &mut target_line.spans {
+        span.style = span.style.patch(marker_style);
+    }
+
+    let measurement_area = Rect::new(0, 0, area.width, area.height);
+    let mut measurement_buffer = Buffer::empty(measurement_area);
+    Paragraph::new(measured_lines)
+        .wrap(Wrap { trim: false })
+        .render(measurement_area, &mut measurement_buffer);
+
+    let mut first_row = None;
+    let mut last_row = None;
+    for row in 0..measurement_area.height {
+        let contains_target = (0..measurement_area.width)
+            .any(|column| measurement_buffer[(column, row)].bg == marker_color);
+        if contains_target {
+            first_row.get_or_insert(row);
+            last_row = Some(row);
+        }
+    }
+
+    let first_row = first_row?;
+    let last_row = last_row?;
+
     Some(Rect::new(
         area.x,
-        area.y.saturating_add(line_index),
+        area.y.saturating_add(first_row),
         area.width,
-        1,
+        last_row.saturating_sub(first_row).saturating_add(1),
     ))
 }
 
@@ -6105,7 +6134,7 @@ fn draw_ui(f: &mut Frame, context: UiRenderContext<'_>) {
     });
     if let Some(area) = primary_mcp_url_line
         .filter(|_| has_url)
-        .and_then(|line_index| line_hit_area(status_content, line_index))
+        .and_then(|line_index| wrapped_line_hit_area(status_content, &status_lines, line_index))
     {
         dashboard_hit_areas.secrets.push(DashboardSecretHit {
             target: DashboardSecretTarget::PrimaryMcpUrl,
@@ -6560,19 +6589,26 @@ mod tests {
         BottomPanelAreas, BottomPanelFocus, DashboardHitAreas, DashboardSecretHit,
         DashboardSecretTarget, PanelItemHit, PanelScrollView, TimedSecretClick, WorkspaceHitAreas,
         WorkspaceUiAction, active_reveal_remaining, dashboard_secret_target_at,
-        draw_update_confirm, item_under_cursor, key_is_clipboard_paste, line_hit_area,
-        log_secret_target, move_panel_selection, normalize_ngrok_authtoken_input,
-        normalize_ngrok_domain, normalize_workspace_path_input, panel_under_cursor,
-        parse_clippymoon_export_args, parse_port_value, primary_mcp_url_line_index,
-        remove_remote_browser_profile_dir, scroll_panel_down, scroll_panel_up, tail_start_index,
-        terminate_remote_browser_child, timed_secret_click, truncate_with_ellipsis,
-        update_confirm_action, user_home_dir, workspace_action_from_event,
-        workspace_detail_sections, wrap_preserving_chars,
+        draw_update_confirm, item_under_cursor, key_is_clipboard_paste, log_secret_target,
+        move_panel_selection, normalize_ngrok_authtoken_input, normalize_ngrok_domain,
+        normalize_workspace_path_input, panel_under_cursor, parse_clippymoon_export_args,
+        parse_port_value, primary_mcp_url_line_index, remove_remote_browser_profile_dir,
+        scroll_panel_down, scroll_panel_up, tail_start_index, terminate_remote_browser_child,
+        timed_secret_click, truncate_with_ellipsis, update_confirm_action, user_home_dir,
+        workspace_action_from_event, workspace_detail_sections, wrap_preserving_chars,
+        wrapped_line_hit_area,
     };
     use crossterm::event::{
         Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     };
-    use ratatui::{Terminal, backend::TestBackend, layout::Rect};
+    use ratatui::{
+        Terminal,
+        backend::TestBackend,
+        layout::Rect,
+        style::{Color, Style},
+        text::{Line, Span},
+        widgets::{Paragraph, Wrap},
+    };
     use std::path::PathBuf;
 
     #[test]
@@ -6957,23 +6993,56 @@ mod tests {
     }
 
     #[test]
-    fn dashboard_primary_url_hitbox_tracks_status_and_connect_guide_rows() {
-        let content = Rect::new(3, 4, 90, 12);
-        let status_line = primary_mcp_url_line_index(false, false, false)
-            .expect("normal status should expose a URL row");
-        let guide_line = primary_mcp_url_line_index(true, false, false)
-            .expect("first-run guide should expose a URL row");
-
-        assert_eq!(
-            line_hit_area(content, status_line),
-            Some(Rect::new(3, 10, 90, 1))
-        );
-        assert_eq!(
-            line_hit_area(content, guide_line),
-            Some(Rect::new(3, 11, 90, 1))
-        );
+    fn dashboard_primary_url_logical_line_tracks_status_and_connect_guide() {
+        assert_eq!(primary_mcp_url_line_index(false, false, false), Some(6));
+        assert_eq!(primary_mcp_url_line_index(true, false, false), Some(7));
         assert_eq!(primary_mcp_url_line_index(false, false, true), None);
         assert_eq!(primary_mcp_url_line_index(true, true, false), None);
+    }
+
+    #[test]
+    fn dashboard_primary_url_hitbox_matches_every_wrapped_rendered_row() {
+        let target_color = Color::Rgb(17, 181, 229);
+        let target_index = 2;
+        let lines = vec![
+            Line::from("Open connector settings at https://chatgpt.com/apps#settings/Connectors"),
+            Line::from("Fill in the form using these connection details"),
+            Line::from(Span::styled(
+                "Primary MCP URL | https://example.ngrok.app/WorkspaceSecret123/mcp",
+                Style::default().fg(target_color),
+            )),
+            Line::from("Authentication | None"),
+        ];
+        let content = Rect::new(2, 1, 22, 14);
+        let hit_area = wrapped_line_hit_area(content, &lines, target_index)
+            .expect("wrapped primary URL should remain visible");
+        let backend = TestBackend::new(28, 18);
+        let mut terminal = Terminal::new(backend).expect("create narrow dashboard terminal");
+
+        terminal
+            .draw(|frame| {
+                frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), content);
+            })
+            .expect("render wrapped dashboard content");
+
+        let buffer = terminal.backend().buffer();
+        let rendered_target_rows = (content.y..content.y.saturating_add(content.height))
+            .filter(|row| {
+                (content.x..content.x.saturating_add(content.width))
+                    .any(|column| buffer[(column, *row)].fg == target_color)
+            })
+            .collect::<Vec<_>>();
+        let first_target_row = rendered_target_rows
+            .first()
+            .copied()
+            .expect("target URL should render");
+
+        assert!(first_target_row > content.y + target_index as u16);
+        assert!(rendered_target_rows.len() > 1);
+        assert_eq!(hit_area.y, first_target_row);
+        assert_eq!(hit_area.height as usize, rendered_target_rows.len());
+        assert_eq!(hit_area.x, content.x);
+        assert_eq!(hit_area.width, content.width);
     }
 
     #[test]

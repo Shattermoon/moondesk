@@ -4018,8 +4018,8 @@ async fn wait_remote_debug_ready(port: u16, timeout: Duration) -> bool {
     false
 }
 
-fn remove_remote_browser_profile_dir(profile_dir: &Path) -> std::io::Result<()> {
-    match std::fs::remove_dir_all(profile_dir) {
+async fn remove_remote_browser_profile_dir(profile_dir: &Path) -> std::io::Result<()> {
+    match tokio::fs::remove_dir_all(profile_dir).await {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error),
@@ -4027,7 +4027,7 @@ fn remove_remote_browser_profile_dir(profile_dir: &Path) -> std::io::Result<()> 
 }
 
 async fn cleanup_remote_browser_profile(state: &SharedState, profile_dir: PathBuf) {
-    if let Err(error) = remove_remote_browser_profile_dir(&profile_dir) {
+    if let Err(error) = remove_remote_browser_profile_dir(&profile_dir).await {
         state.lock().await.log(
             "WARN",
             format!(
@@ -4038,10 +4038,39 @@ async fn cleanup_remote_browser_profile(state: &SharedState, profile_dir: PathBu
     }
 }
 
+async fn terminate_remote_browser_child(child: &mut tokio::process::Child) -> std::io::Result<()> {
+    if child.try_wait()?.is_some() {
+        return Ok(());
+    }
+
+    match child.kill().await {
+        Ok(()) => Ok(()),
+        Err(kill_error) => match child.try_wait() {
+            Ok(Some(_)) => Ok(()),
+            Ok(None) => Err(kill_error),
+            Err(wait_error) => Err(std::io::Error::new(
+                wait_error.kind(),
+                format!(
+                    "failed to terminate remote browser ({kill_error}); failed to confirm exit: {wait_error}"
+                ),
+            )),
+        },
+    }
+}
+
 async fn stop_owned_remote_browser(state: &SharedState, mut browser: OwnedRemoteBrowser) {
-    let _ = browser.child.start_kill();
-    let _ = tokio::time::timeout(Duration::from_secs(5), browser.child.wait()).await;
-    cleanup_remote_browser_profile(state, browser.profile_dir).await;
+    match terminate_remote_browser_child(&mut browser.child).await {
+        Ok(()) => cleanup_remote_browser_profile(state, browser.profile_dir).await,
+        Err(error) => {
+            state.lock().await.log(
+                "WARN",
+                format!(
+                    "Could not confirm remote browser exit; retaining profile {}: {error}",
+                    browser.profile_dir.display()
+                ),
+            );
+        }
+    }
 }
 async fn ensure_selected_browser_remote_debugging(
     state: SharedState,
@@ -4111,7 +4140,8 @@ async fn ensure_selected_browser_remote_debugging(
         .arg("--no-default-browser-check")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
 
     let child = match command.spawn() {
         Ok(child) => child,
@@ -6411,8 +6441,9 @@ mod tests {
         move_panel_selection, normalize_ngrok_authtoken_input, normalize_ngrok_domain,
         normalize_workspace_path_input, panel_under_cursor, parse_clippymoon_export_args,
         parse_port_value, remove_remote_browser_profile_dir, scroll_panel_down, scroll_panel_up,
-        tail_start_index, truncate_with_ellipsis, update_confirm_action, user_home_dir,
-        workspace_action_from_event, workspace_detail_sections, wrap_preserving_chars,
+        tail_start_index, terminate_remote_browser_child, truncate_with_ellipsis,
+        update_confirm_action, user_home_dir, workspace_action_from_event,
+        workspace_detail_sections, wrap_preserving_chars,
     };
     use crossterm::event::{
         Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -6543,21 +6574,58 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    #[test]
-    fn remote_browser_profile_cleanup_removes_tree_and_tolerates_missing_directory() {
+    #[tokio::test]
+    async fn remote_browser_profile_cleanup_removes_tree_and_tolerates_missing_directory() {
         let profile_dir = std::env::temp_dir().join(format!(
             "moondesk-profile-cleanup-test-{}",
             uuid::Uuid::new_v4()
         ));
         let nested = profile_dir.join("Default").join("Cache");
-        std::fs::create_dir_all(&nested).expect("create nested browser profile");
-        std::fs::write(nested.join("cache.bin"), b"temporary browser data")
+        tokio::fs::create_dir_all(&nested)
+            .await
+            .expect("create nested browser profile");
+        tokio::fs::write(nested.join("cache.bin"), b"temporary browser data")
+            .await
             .expect("write browser profile data");
 
-        remove_remote_browser_profile_dir(&profile_dir).expect("remove browser profile tree");
+        remove_remote_browser_profile_dir(&profile_dir)
+            .await
+            .expect("remove browser profile tree");
         assert!(!profile_dir.exists());
         remove_remote_browser_profile_dir(&profile_dir)
+            .await
             .expect("missing browser profile should already be clean");
+    }
+
+    #[tokio::test]
+    #[cfg_attr(windows, ignore = "serialized Windows remote browser lifecycle smoke")]
+    async fn remote_browser_termination_confirms_child_exit() {
+        #[cfg(windows)]
+        let mut command = {
+            let mut command = tokio::process::Command::new("ping.exe");
+            command.args(["-n", "30", "127.0.0.1"]);
+            command
+        };
+        #[cfg(not(windows))]
+        let mut command = {
+            let mut command = tokio::process::Command::new("/bin/sh");
+            command.args(["-c", "sleep 30"]);
+            command
+        };
+        command
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true);
+        let mut child = command.spawn().expect("spawn remote browser stand-in");
+
+        terminate_remote_browser_child(&mut child)
+            .await
+            .expect("terminate and reap remote browser stand-in");
+        assert!(
+            child.try_wait().expect("query terminated child").is_some(),
+            "remote browser child was not reaped before cleanup"
+        );
     }
 
     #[test]

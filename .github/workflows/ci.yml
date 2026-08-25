@@ -87,6 +87,9 @@ jobs:
       - name: Run Windows developer toolchain smoke
         run: cargo +stable test --locked windows_developer_toolchain_smoke_uses_normal_host_environment -- --ignored
 
+      - name: Run Windows remote browser lifecycle smoke
+        run: cargo +stable test --locked remote_browser_termination_confirms_child_exit -- --ignored
+
   npm-runtime:
     if: github.event_name == 'workflow_dispatch' || github.event.pull_request.draft == false
     name: npm runtime (Node ${{ matrix.node-version }})

@@ -165,6 +165,66 @@ impl Drop for ProcessTreeGuard {
     }
 }
 
+/// Windows-only ownership guard for direct child processes that need the same
+/// descendant cleanup guarantees as MoonDesk shell commands.
+#[cfg(windows)]
+pub(crate) struct WindowsProcessTreeGuard {
+    inner: ProcessTreeGuard,
+}
+
+#[cfg(windows)]
+impl WindowsProcessTreeGuard {
+    /// Suspend the initial process so it cannot spawn descendants before MoonDesk
+    /// assigns it to the Job Object. `kill_on_drop` is a root-process fallback for
+    /// failures that happen before the Job Object ownership is established.
+    pub(crate) fn prepare_command(command: &mut Command) {
+        use std::os::windows::process::CommandExt;
+        use windows_sys::Win32::System::Threading::CREATE_SUSPENDED;
+
+        command.kill_on_drop(true);
+        command.as_std_mut().creation_flags(CREATE_SUSPENDED);
+    }
+
+    /// Assign a freshly spawned, suspended child to a kill-on-close Job Object and
+    /// only then resume it, so all subsequently-created descendants inherit the job.
+    pub(crate) fn attach(child: &mut Child) -> io::Result<Self> {
+        let Some(pid) = child.id() else {
+            let _ = child.start_kill();
+            return Err(io::Error::other(
+                "spawned process did not expose a process id",
+            ));
+        };
+
+        let job_handle = match create_windows_job_for_process(pid) {
+            Ok(handle) => handle,
+            Err(error) => {
+                let _ = child.start_kill();
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!("failed to assign process to Windows Job Object: {error}"),
+                ));
+            }
+        };
+
+        if let Err(error) = resume_windows_process(pid) {
+            let mut job_handle = Some(job_handle);
+            close_windows_job(&mut job_handle);
+            let _ = child.start_kill();
+            return Err(io::Error::new(
+                error.kind(),
+                format!("failed to resume suspended process: {error}"),
+            ));
+        }
+
+        Ok(Self {
+            inner: ProcessTreeGuard::with_windows_job(pid, job_handle),
+        })
+    }
+
+    pub(crate) async fn terminate(&mut self) {
+        self.inner.terminate().await;
+    }
+}
 #[cfg(windows)]
 fn create_windows_job_for_process(pid: u32) -> io::Result<usize> {
     use std::ffi::c_void;

@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+#[cfg(target_os = "linux")]
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -27,6 +28,57 @@ struct BrowserCandidate {
 }
 
 const CANDIDATES: &[BrowserCandidate] = &[
+    // Native Windows executable names come first. They simply do not resolve on
+    // Unix, while the Unix aliases below do not resolve on a normal Windows
+    // install, so the shared candidate list stays deterministic across platforms.
+    BrowserCandidate {
+        name: "Google Chrome",
+        binary: "chrome.exe",
+        remote_debugging: true,
+        remote_debug_hint: "--remote-debugging-port=<port>",
+        mcp_supported: true,
+        support_note: "Chromium (supported)",
+    },
+    BrowserCandidate {
+        name: "Microsoft Edge",
+        binary: "msedge.exe",
+        remote_debugging: true,
+        remote_debug_hint: "--remote-debugging-port=<port>",
+        mcp_supported: true,
+        support_note: "Chromium (supported)",
+    },
+    BrowserCandidate {
+        name: "Brave",
+        binary: "brave.exe",
+        remote_debugging: true,
+        remote_debug_hint: "--remote-debugging-port=<port>",
+        mcp_supported: true,
+        support_note: "Chromium (supported)",
+    },
+    BrowserCandidate {
+        name: "Vivaldi",
+        binary: "vivaldi.exe",
+        remote_debugging: true,
+        remote_debug_hint: "--remote-debugging-port=<port>",
+        mcp_supported: true,
+        support_note: "Chromium (supported)",
+    },
+    BrowserCandidate {
+        name: "Opera",
+        binary: "opera.exe",
+        remote_debugging: true,
+        remote_debug_hint: "--remote-debugging-port=<port>",
+        mcp_supported: true,
+        support_note: "Chromium (supported)",
+    },
+    BrowserCandidate {
+        name: "Firefox",
+        binary: "firefox.exe",
+        remote_debugging: false,
+        remote_debug_hint: "--remote-debugging-port <port>",
+        mcp_supported: false,
+        support_note: "Not supported yet (CDP bridge for Firefox not wired)",
+    },
     BrowserCandidate {
         name: "Google Chrome",
         binary: "google-chrome-stable",
@@ -151,21 +203,92 @@ pub fn detect_browsers() -> Vec<DetectedBrowser> {
 
 fn resolve_binary(binary: &str) -> Option<PathBuf> {
     let input = Path::new(binary);
-    if input.is_absolute() || binary.contains('/') {
+    if input.is_absolute() || binary.contains('/') || binary.contains('\\') {
         if input.is_file() {
             return Some(input.to_path_buf());
         }
         return None;
     }
 
-    let path_var = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path_var) {
-        let candidate = dir.join(binary);
-        if candidate.is_file() {
-            return Some(candidate);
+    if let Some(path_var) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path_var) {
+            let candidate = dir.join(binary);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
         }
     }
+
+    #[cfg(windows)]
+    return windows_known_install_paths(binary)
+        .into_iter()
+        .find(|candidate| candidate.is_file());
+
+    #[cfg(not(windows))]
     None
+}
+
+#[cfg(windows)]
+fn windows_known_install_paths(binary: &str) -> Vec<PathBuf> {
+    fn under(env_name: &str, relative: &str) -> Option<PathBuf> {
+        std::env::var_os(env_name).map(|root| PathBuf::from(root).join(relative))
+    }
+
+    let mut paths = Vec::new();
+    let mut push = |env_name: &str, relative: &str| {
+        if let Some(path) = under(env_name, relative) {
+            paths.push(path);
+        }
+    };
+
+    match binary.to_ascii_lowercase().as_str() {
+        "chrome.exe" => {
+            push("ProgramFiles", r"Google\Chrome\Application\chrome.exe");
+            push("ProgramFiles(x86)", r"Google\Chrome\Application\chrome.exe");
+            push("LOCALAPPDATA", r"Google\Chrome\Application\chrome.exe");
+        }
+        "msedge.exe" => {
+            push("ProgramFiles", r"Microsoft\Edge\Application\msedge.exe");
+            push(
+                "ProgramFiles(x86)",
+                r"Microsoft\Edge\Application\msedge.exe",
+            );
+            push("LOCALAPPDATA", r"Microsoft\Edge\Application\msedge.exe");
+        }
+        "brave.exe" => {
+            push(
+                "ProgramFiles",
+                r"BraveSoftware\Brave-Browser\Application\brave.exe",
+            );
+            push(
+                "ProgramFiles(x86)",
+                r"BraveSoftware\Brave-Browser\Application\brave.exe",
+            );
+            push(
+                "LOCALAPPDATA",
+                r"BraveSoftware\Brave-Browser\Application\brave.exe",
+            );
+        }
+        "vivaldi.exe" => {
+            push("LOCALAPPDATA", r"Vivaldi\Application\vivaldi.exe");
+            push("ProgramFiles", r"Vivaldi\Application\vivaldi.exe");
+            push("ProgramFiles(x86)", r"Vivaldi\Application\vivaldi.exe");
+        }
+        "opera.exe" => {
+            push("LOCALAPPDATA", r"Programs\Opera\opera.exe");
+            push("LOCALAPPDATA", r"Programs\Opera GX\opera.exe");
+            push("ProgramFiles", r"Opera\opera.exe");
+            push("ProgramFiles(x86)", r"Opera\opera.exe");
+        }
+        "firefox.exe" => {
+            push("ProgramFiles", r"Mozilla Firefox\firefox.exe");
+            push("ProgramFiles(x86)", r"Mozilla Firefox\firefox.exe");
+            push("LOCALAPPDATA", r"Mozilla Firefox\firefox.exe");
+        }
+        _ => {}
+    }
+
+    paths
 }
 
 fn normalize_path(path: &Path) -> String {
@@ -177,6 +300,7 @@ fn normalize_path(path: &Path) -> String {
 
 struct ProcessInfo {
     pid: u32,
+    binary: String,
     cmdline: Vec<String>,
 }
 
@@ -185,6 +309,7 @@ struct ActiveRemoteDebug {
     target: String,
 }
 
+#[cfg(target_os = "linux")]
 fn collect_processes() -> Vec<ProcessInfo> {
     let mut processes = Vec::new();
     let Ok(entries) = fs::read_dir("/proc") else {
@@ -214,10 +339,105 @@ fn collect_processes() -> Vec<ProcessInfo> {
         if args.is_empty() {
             continue;
         }
-        processes.push(ProcessInfo { pid, cmdline: args });
+        processes.push(ProcessInfo {
+            pid,
+            binary: args[0].clone(),
+            cmdline: args,
+        });
     }
 
     processes
+}
+
+#[cfg(windows)]
+fn parse_windows_command_line(command_line: &str) -> Vec<String> {
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::UI::Shell::CommandLineToArgvW;
+
+    let mut wide = command_line.encode_utf16().collect::<Vec<_>>();
+    wide.push(0);
+    let mut argc = 0i32;
+    let argv = unsafe { CommandLineToArgvW(wide.as_ptr(), &mut argc) };
+    if argv.is_null() || argc <= 0 {
+        return Vec::new();
+    }
+
+    let args = unsafe {
+        std::slice::from_raw_parts(argv, argc as usize)
+            .iter()
+            .map(|arg| {
+                let ptr = *arg;
+                let mut len = 0usize;
+                while *ptr.add(len) != 0 {
+                    len += 1;
+                }
+                String::from_utf16_lossy(std::slice::from_raw_parts(ptr, len))
+            })
+            .collect::<Vec<_>>()
+    };
+    unsafe {
+        let _ = LocalFree(argv.cast());
+    }
+    args
+}
+
+#[cfg(windows)]
+fn collect_processes() -> Vec<ProcessInfo> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "PascalCase")]
+    struct WindowsProcess {
+        process_id: u32,
+        name: String,
+        command_line: Option<String>,
+    }
+
+    const SCRIPT: &str = r#"
+$names = @('chrome.exe','msedge.exe','brave.exe','vivaldi.exe','opera.exe','firefox.exe')
+$rows = @(
+    Get-CimInstance Win32_Process |
+        Where-Object { $_.Name -in $names } |
+        Select-Object ProcessId, Name, CommandLine
+)
+ConvertTo-Json -InputObject $rows -Compress
+"#;
+
+    let output = std::process::Command::new("powershell.exe")
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            SCRIPT,
+        ])
+        .output();
+    let Ok(output) = output else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    let Ok(rows) = serde_json::from_slice::<Vec<WindowsProcess>>(&output.stdout) else {
+        return Vec::new();
+    };
+
+    rows.into_iter()
+        .filter_map(|row| {
+            let command_line = row.command_line?;
+            let cmdline = parse_windows_command_line(&command_line);
+            Some(ProcessInfo {
+                pid: row.process_id,
+                binary: row.name,
+                cmdline,
+            })
+        })
+        .collect()
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+fn collect_processes() -> Vec<ProcessInfo> {
+    Vec::new()
 }
 
 fn find_active_remote_debug_for_binary(
@@ -237,20 +457,31 @@ fn find_active_remote_debug_for_binary(
 }
 
 fn process_matches_binary(process: &ProcessInfo, binary: &str) -> bool {
+    if executable_name_matches(&process.binary, binary) {
+        return true;
+    }
     process
         .cmdline
         .iter()
         .any(|arg| command_matches_binary(arg, binary))
 }
 
+fn executable_name_matches(actual: &str, expected: &str) -> bool {
+    #[cfg(windows)]
+    return actual.eq_ignore_ascii_case(expected);
+
+    #[cfg(not(windows))]
+    return actual == expected;
+}
+
 fn command_matches_binary(arg: &str, binary: &str) -> bool {
-    if arg == binary {
+    if executable_name_matches(arg, binary) {
         return true;
     }
     Path::new(arg)
         .file_name()
         .and_then(|name| name.to_str())
-        .is_some_and(|name| name == binary)
+        .is_some_and(|name| executable_name_matches(name, binary))
 }
 
 fn extract_remote_debug_target(args: &[String]) -> Option<String> {
@@ -338,4 +569,108 @@ pub fn format_active_remote_debug_names(browsers: &[DetectedBrowser]) -> String 
         return "--".into();
     }
     active.join(", ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remote_debug_target_parses_port_address_and_pipe_forms() {
+        assert_eq!(
+            extract_remote_debug_target(&["chrome".into(), "--remote-debugging-port=9222".into(),]),
+            Some("127.0.0.1:9222".into())
+        );
+        assert_eq!(
+            extract_remote_debug_target(&[
+                "chrome".into(),
+                "--remote-debugging-address".into(),
+                "0.0.0.0".into(),
+                "--remote-debugging-port".into(),
+                "9333".into(),
+            ]),
+            Some("0.0.0.0:9333".into())
+        );
+        assert_eq!(
+            extract_remote_debug_target(&["chrome".into(), "--remote-debugging-pipe".into()]),
+            Some("pipe".into())
+        );
+    }
+
+    #[test]
+    fn process_matching_uses_the_recorded_executable_name() {
+        let process = ProcessInfo {
+            pid: 42,
+            binary: if cfg!(windows) {
+                "CHROME.EXE".into()
+            } else {
+                "google-chrome".into()
+            },
+            cmdline: Vec::new(),
+        };
+        let expected = if cfg!(windows) {
+            "chrome.exe"
+        } else {
+            "google-chrome"
+        };
+        assert!(process_matches_binary(&process, expected));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_command_line_parser_preserves_quoted_paths_and_unquotes_flag_values() {
+        let args = parse_windows_command_line(
+            r#""C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port="9222" --user-data-dir="C:\Temp\Moon Desk""#,
+        );
+        assert_eq!(
+            args,
+            vec![
+                r#"C:\Program Files\Google\Chrome\Application\chrome.exe"#.to_string(),
+                "--remote-debugging-port=9222".to_string(),
+                r#"--user-data-dir=C:\Temp\Moon Desk"#.to_string(),
+            ]
+        );
+        assert_eq!(
+            extract_remote_debug_target(&args),
+            Some("127.0.0.1:9222".to_string())
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_install_hints_cover_standard_chrome_edge_and_brave_locations() {
+        for (binary, suffix) in [
+            ("chrome.exe", r"Google\Chrome\Application\chrome.exe"),
+            ("msedge.exe", r"Microsoft\Edge\Application\msedge.exe"),
+            (
+                "brave.exe",
+                r"BraveSoftware\Brave-Browser\Application\brave.exe",
+            ),
+        ] {
+            let paths = windows_known_install_paths(binary);
+            assert!(
+                paths.iter().any(|path| path.ends_with(suffix)),
+                "missing standard install hint for {binary}: {paths:?}"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_process_collection_can_read_browser_command_lines() {
+        let processes = collect_processes();
+        assert!(processes.iter().all(|process| !process.binary.is_empty()));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "local Windows browser-detection smoke"]
+    fn windows_detect_browsers_finds_a_standard_chromium_install() {
+        let browsers = detect_browsers();
+        assert!(
+            browsers.iter().any(|browser| browser.mcp_supported),
+            "no supported Chromium browser detected: {}",
+            format_browser_names(&browsers)
+        );
+    }
 }

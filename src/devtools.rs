@@ -9,6 +9,8 @@ use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 
 use crate::browser::DetectedBrowser;
+#[cfg(windows)]
+use crate::process_runner::WindowsProcessTreeGuard;
 use crate::state::{ServerUiEvent, SharedState, UiEventSender};
 
 const CHROME_DEVTOOLS_MCP_VERSION: &str = "1.7.0";
@@ -16,6 +18,17 @@ const MAX_DEVTOOLS_DIAGNOSTIC_LINES: usize = 100;
 const MAX_DEVTOOLS_DIAGNOSTIC_CHARS: usize = 2_048;
 const DEVTOOLS_RESTART_COOLDOWN: Duration = Duration::from_secs(10);
 const DEVTOOLS_RESTART_INIT_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn npx_program() -> &'static str {
+    #[cfg(windows)]
+    {
+        "npx.cmd"
+    }
+    #[cfg(not(windows))]
+    {
+        "npx"
+    }
+}
 
 #[derive(Default)]
 struct InitializationState {
@@ -52,6 +65,8 @@ fn restart_cooldown_remaining(last_failure: Option<Instant>, now: Instant) -> Op
 /// A running chrome-devtools-mcp child process with stdin/stdout JSON-RPC bridge.
 pub struct DevtoolsBridge {
     child: Mutex<Child>,
+    #[cfg(windows)]
+    process_tree: Mutex<WindowsProcessTreeGuard>,
     stdin: Mutex<tokio::io::BufWriter<tokio::process::ChildStdin>>,
     pending: Arc<Mutex<std::collections::HashMap<Value, tokio::sync::oneshot::Sender<Value>>>>,
     initialization: Arc<InitializationState>,
@@ -81,7 +96,7 @@ impl DevtoolsBridge {
         generation_counter: Arc<AtomicU64>,
         generation: u64,
     ) -> Result<Arc<Self>, String> {
-        let mut command = Command::new("npx");
+        let mut command = Command::new(npx_program());
         let package = format!("chrome-devtools-mcp@{CHROME_DEVTOOLS_MCP_VERSION}");
         command.args(["-y", package.as_str()]);
 
@@ -101,12 +116,19 @@ impl DevtoolsBridge {
             }
         }
 
+        #[cfg(windows)]
+        WindowsProcessTreeGuard::prepare_command(&mut command);
+
         let mut child = command
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
             .map_err(|e| format!("Failed to spawn chrome-devtools-mcp: {e}"))?;
+
+        #[cfg(windows)]
+        let process_tree = WindowsProcessTreeGuard::attach(&mut child)
+            .map_err(|e| format!("Failed to own chrome-devtools-mcp process tree: {e}"))?;
 
         let child_stdin = child.stdin.take().ok_or("No stdin")?;
         let child_stdout = child.stdout.take().ok_or("No stdout")?;
@@ -121,6 +143,8 @@ impl DevtoolsBridge {
         let alive = Arc::new(AtomicBool::new(true));
         let bridge = Arc::new(Self {
             child: Mutex::new(child),
+            #[cfg(windows)]
+            process_tree: Mutex::new(process_tree),
             stdin: Mutex::new(stdin),
             pending: pending.clone(),
             initialization: initialization.clone(),
@@ -350,6 +374,8 @@ impl DevtoolsBridge {
         self.pending.lock().await.clear();
         let _ = self.stdin.lock().await.shutdown().await;
         let mut child = self.child.lock().await;
+        #[cfg(windows)]
+        self.process_tree.lock().await.terminate().await;
         let _ = child.start_kill();
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), child.wait()).await;
     }
@@ -590,5 +616,158 @@ mod tests {
             None
         );
         assert_eq!(restart_cooldown_remaining(None, failed_at), None);
+    }
+
+    #[test]
+    fn devtools_uses_the_platform_npx_launcher() {
+        if cfg!(windows) {
+            assert_eq!(npx_program(), "npx.cmd");
+        } else {
+            assert_eq!(npx_program(), "npx");
+        }
+    }
+
+    #[cfg(windows)]
+    fn windows_process_tree_pids(root_pid: u32) -> Option<Vec<u32>> {
+        use std::collections::{HashMap, VecDeque};
+        use std::mem::{size_of, zeroed};
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+            TH32CS_SNAPPROCESS,
+        };
+
+        unsafe {
+            let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+            if snapshot == INVALID_HANDLE_VALUE {
+                return None;
+            }
+
+            let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+            let mut root_found = false;
+            let mut entry: PROCESSENTRY32W = zeroed();
+            entry.dwSize = size_of::<PROCESSENTRY32W>() as u32;
+            let mut found = Process32FirstW(snapshot, &mut entry) != 0;
+            while found {
+                root_found |= entry.th32ProcessID == root_pid;
+                children
+                    .entry(entry.th32ParentProcessID)
+                    .or_default()
+                    .push(entry.th32ProcessID);
+                found = Process32NextW(snapshot, &mut entry) != 0;
+            }
+            CloseHandle(snapshot);
+            if !root_found {
+                return None;
+            }
+
+            let mut pids = Vec::new();
+            let mut queue = VecDeque::from([root_pid]);
+            while let Some(pid) = queue.pop_front() {
+                pids.push(pid);
+                if let Some(descendants) = children.get(&pid) {
+                    queue.extend(descendants.iter().copied());
+                }
+            }
+            Some(pids)
+        }
+    }
+
+    #[cfg(windows)]
+    fn windows_process_exists(pid: u32) -> bool {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+
+        unsafe {
+            let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if process.is_null() {
+                false
+            } else {
+                CloseHandle(process);
+                true
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    #[ignore = "local Windows chrome-devtools-mcp process-tree shutdown smoke"]
+    async fn windows_devtools_stop_terminates_npx_process_tree() {
+        use crate::state::{AppState, ui_event_channel};
+        use uuid::Uuid;
+
+        let root = std::env::temp_dir().join(format!("moondesk-devtools-stop-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("create DevTools smoke workspace");
+        let config_path = root.join("config.toml");
+        let app = AppState::new_for_test(0, root.to_string_lossy().into_owned(), config_path)
+            .expect("create DevTools smoke app state");
+        let state = Arc::new(Mutex::new(app));
+        let (ui_tx, _ui_rx) = ui_event_channel();
+        let manager = DevtoolsManager::start(None, ui_tx, state)
+            .await
+            .expect("start pinned chrome-devtools-mcp bridge");
+        let bridge = manager
+            .bridge
+            .lock()
+            .await
+            .clone()
+            .expect("DevTools bridge exists");
+        let root_pid = bridge
+            .child
+            .lock()
+            .await
+            .id()
+            .expect("npx bridge root exposes a PID");
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let tree = loop {
+            if let Some(pids) = windows_process_tree_pids(root_pid)
+                && pids.len() >= 2
+            {
+                break pids;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "pinned chrome-devtools-mcp did not create an npx descendant process"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+
+        manager.stop().await;
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let survivors = tree
+                .iter()
+                .copied()
+                .filter(|pid| windows_process_exists(*pid))
+                .collect::<Vec<_>>();
+            if survivors.is_empty() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "DevTools stop left npx/chrome-devtools-mcp processes alive: {survivors:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "local Windows npx compatibility smoke"]
+    fn windows_npx_launcher_is_spawnable() {
+        let output = std::process::Command::new(npx_program())
+            .arg("--version")
+            .output()
+            .expect("spawn npx.cmd");
+        assert!(
+            output.status.success(),
+            "npx.cmd --version failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 }

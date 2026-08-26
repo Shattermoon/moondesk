@@ -72,7 +72,11 @@ function nativeStartFailureHints(error, binaryPath, options = {}) {
   }
 
   const code = typeof error?.code === "string" ? error.code : "";
-  if (["UNKNOWN", "EPERM", "EACCES"].includes(code) || /^spawn\b/i.test(error?.message ?? "")) {
+  const message = error?.message ?? "";
+  if (
+    ["UNKNOWN", "EPERM", "EACCES"].includes(code) ||
+    /\b(?:UNKNOWN|EPERM|EACCES)\b/i.test(message)
+  ) {
     return [
       "Windows refused to launch the verified MoonDesk native binary. Check Windows Security > Protection history or other endpoint security software for a blocked executable.",
       `Native binary: ${binaryPath}`,
@@ -250,6 +254,7 @@ async function orchestrate(options = {}) {
     return await restartUpdatedWrapperImpl(wrapperPath, originalArgs, {
       cwd: originalCwd,
       env: baseEnv,
+      logger,
     });
   } catch (error) {
     logger.error(`MoonDesk updated successfully but could not restart automatically: ${error.message}`);

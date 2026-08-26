@@ -528,16 +528,39 @@ function verifyInstalledWrapperVersion(targetVersion, options = {}) {
   return true;
 }
 
-function restartUpdatedWrapper(wrapperPath, args, options = {}) {
-  const spawnImpl = options.spawnImpl ?? spawn;
-  return new Promise((resolve, reject) => {
-    const child = spawnImpl(process.execPath, [wrapperPath, ...args], {
-      cwd: options.cwd ?? process.cwd(),
-      env: options.env ?? process.env,
-      stdio: "inherit",
-    });
-    child.once("error", reject);
-    child.once("exit", (code, signal) => resolve({ code: code ?? 1, signal }));
+function moduleIsInsidePackage(packageRootPath, modulePath) {
+  const relative = path.relative(packageRootPath, modulePath);
+  return (
+    relative === "" ||
+    (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative))
+  );
+}
+
+function clearPackageRequireCache(wrapperPath) {
+  const packageRootPath = path.resolve(path.dirname(wrapperPath), "..");
+  for (const modulePath of Object.keys(require.cache)) {
+    if (moduleIsInsidePackage(packageRootPath, modulePath)) {
+      delete require.cache[modulePath];
+    }
+  }
+}
+
+async function restartUpdatedWrapper(wrapperPath, args, options = {}) {
+  const clearCacheImpl = options.clearCacheImpl ?? clearPackageRequireCache;
+  const loadWrapperImpl = options.loadWrapperImpl ?? ((targetPath) => require(targetPath));
+
+  clearCacheImpl(wrapperPath);
+  const updatedWrapper = loadWrapperImpl(wrapperPath);
+  if (typeof updatedWrapper?.orchestrate !== "function") {
+    throw new Error("updated MoonDesk wrapper does not export orchestrate()");
+  }
+
+  return updatedWrapper.orchestrate({
+    args,
+    cwd: options.cwd ?? process.cwd(),
+    env: options.env ?? process.env,
+    logger: options.logger,
+    wrapperPath,
   });
 }
 

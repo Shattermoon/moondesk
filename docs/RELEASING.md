@@ -106,9 +106,11 @@ The npm package now contains a small JS wrapper plus `npm/install-binary.js`. On
 
 Keeping the native executable outside npm's `node_modules` also avoids the common Windows failure where `npm update -g` cannot replace/delete an `.exe` that is still running from inside the package directory.
 
+After an in-app npm update succeeds, the launcher reloads MoonDesk's package-local CommonJS modules and re-enters the newly installed wrapper **inside the existing Node process**. Do not replace this with `spawn(node, [wrapper])` followed by waiting for that child: every update performed in one terminal session would leave the previous wrapper alive as an ancestor, producing `node -> node -> ... -> moondesk` chains and unnecessary process/terminal ownership complexity. The handoff must preserve the original arguments, working directory, environment, logger, signal/exit result, and updated module code while keeping a single launcher process.
+
 ## Windows binary trust and code signing
 
-MoonDesk's Windows release executable is currently unsigned. SHA-256 verification, immutable Git tags, GitHub Release assets, and npm provenance prove which bytes MoonDesk published, but they do not give Windows a durable publisher identity or transfer reputation between newly compiled executable hashes.
+MoonDesk's Windows release executable is currently unsigned. The published SHA-256 checksum identifies the expected native executable bytes. npm provenance identifies the npm package's source, build, and publisher, but it does not attest the separately downloaded native executable. These controls do not give Windows a durable publisher identity or transfer reputation between newly compiled executable hashes.
 
 If Windows Security or another endpoint product flags a published MoonDesk executable, first verify the exact release SHA-256, update security intelligence, and submit a suspected false positive to the vendor. Do not work around a detection by disabling endpoint protection or recommending broad exclusions.
 
@@ -117,9 +119,10 @@ The durable distribution improvement is Authenticode signing with one consistent
 1. build and smoke-test the unsigned Windows candidate on the normal GitHub-hosted Windows job;
 2. submit that exact build artifact to the configured trusted signing service;
 3. require the returned Windows executable to have a valid Authenticode signature from the expected publisher;
-4. generate `SHA256SUMS` from the **signed** executable, not the pre-signing bytes;
-5. publish only the signed Windows executable to the GitHub Release and npm bootstrap path;
-6. keep signing credentials/identity isolated from build jobs and preserve origin verification so arbitrary binaries cannot be signed.
+4. run the Windows help/export smoke test again against the **signed** executable so the final bytes are tested before release;
+5. generate `SHA256SUMS` from the **signed and smoke-tested** executable, not the pre-signing bytes;
+6. publish only that signed Windows executable to the GitHub Release and npm bootstrap path;
+7. keep signing credentials/identity isolated from build jobs and preserve origin verification so arbitrary binaries cannot be signed.
 
 Microsoft Artifact Signing and SignPath's open-source signing program both support GitHub Actions integrations. Enabling either requires external identity/certificate setup and should be completed as a dedicated security change rather than adding dormant credentials or an unverified signing step to the release workflow.
 

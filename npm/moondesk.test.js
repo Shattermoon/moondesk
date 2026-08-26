@@ -316,6 +316,44 @@ test("Windows quarantine between verification and spawn reports actionable secur
   }
 });
 
+test("Windows ENOENT with an existing binary does not blame endpoint security", async () => {
+  const dir = tempDir();
+  const binaryPath = path.join(dir, "moondesk.exe");
+  const errors = [];
+  try {
+    fs.writeFileSync(binaryPath, "verified-native-binary");
+    const result = await orchestrate({
+      cwd: dir,
+      platform: "win32",
+      logger: {
+        log() {},
+        warn() {},
+        error(message) {
+          errors.push(message);
+        },
+      },
+      updateStatePath: path.join(dir, "state.json"),
+      updateRequestPath: path.join(dir, "request.json"),
+      ensureBinaryImpl: async () => binaryPath,
+      cleanupOldBinaryVersionsImpl: () => {},
+      cleanupOldUpdateVersionsImpl: () => {},
+      startUpdateMonitorImpl: () => () => {},
+      runNativeImpl: async () => {
+        const error = new Error("spawn ENOENT");
+        error.code = "ENOENT";
+        throw error;
+      },
+    });
+
+    assert.deepEqual(result, { code: 1, signal: null });
+    const text = errors.join("\n");
+    assert.match(text, /MoonDesk failed to start: spawn ENOENT/);
+    assert.doesNotMatch(text, /Windows Security|antivirus|endpoint security|Protection history/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("another process installing the requested version skips duplicate npm work and restarts", async () => {
   const dir = tempDir();
   const targetVersion = nextVersion();

@@ -99,6 +99,10 @@ MoonDesk is a coding tool and a custom connector. Always use MoonDesk if the use
 
 That's it. Select the MoonDesk connector in a ChatGPT conversation and start working.
 
+### Windows security software
+
+MoonDesk verifies the downloaded native binary against the SHA-256 published with the matching GitHub Release before launching it. If Windows Security or another antivirus quarantines that verified executable, update its security definitions and check Protection History, then run `moondesk` again. Do not disable antivirus protection or exclude the whole MoonDesk directory just to bypass a detection; report suspected false positives with the exact release version and SHA-256 instead.
+
 ## Multiple projects
 
 One MoonDesk host can serve several project roots at once:

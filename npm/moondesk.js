@@ -50,6 +50,42 @@ function runNative(binaryPath, args, options = {}) {
   });
 }
 
+function nativeStartFailureHints(error, binaryPath, options = {}) {
+  const platform = options.platform ?? process.platform;
+  if (platform !== "win32") return [];
+
+  const existsSync = options.existsSync ?? fs.existsSync;
+  let binaryExists = true;
+  try {
+    binaryExists = existsSync(binaryPath);
+  } catch {
+    // If the path cannot be checked, keep the original spawn error rather than
+    // guessing that security software removed the binary.
+  }
+
+  if (!binaryExists) {
+    return [
+      "The verified MoonDesk native binary disappeared before Windows could launch it.",
+      "Windows Security or another antivirus may have quarantined the executable. Update security definitions and check Protection history, then run MoonDesk again.",
+      `Native binary: ${binaryPath}`,
+    ];
+  }
+
+  const code = typeof error?.code === "string" ? error.code : "";
+  const message = error?.message ?? "";
+  if (
+    ["UNKNOWN", "EPERM", "EACCES"].includes(code) ||
+    /\b(?:UNKNOWN|EPERM|EACCES)\b/i.test(message)
+  ) {
+    return [
+      "Windows refused to launch the verified MoonDesk native binary. Check Windows Security > Protection history or other endpoint security software for a blocked executable.",
+      `Native binary: ${binaryPath}`,
+    ];
+  }
+
+  return [];
+}
+
 async function orchestrate(options = {}) {
   const logger = options.logger ?? console;
   const originalArgs = options.args ?? process.argv.slice(2);
@@ -139,6 +175,12 @@ async function orchestrate(options = {}) {
     stopUpdateMonitor();
     cleanupEphemeralUpdateFiles(updateStatePath, updateRequestPath);
     logger.error(`MoonDesk failed to start: ${error.message}`);
+    for (const hint of nativeStartFailureHints(error, binaryPath, {
+      platform: options.platform,
+      existsSync: options.binaryExistsSyncImpl,
+    })) {
+      logger.error(hint);
+    }
     return { code: 1, signal: null };
   }
 
@@ -212,6 +254,7 @@ async function orchestrate(options = {}) {
     return await restartUpdatedWrapperImpl(wrapperPath, originalArgs, {
       cwd: originalCwd,
       env: baseEnv,
+      logger,
     });
   } catch (error) {
     logger.error(`MoonDesk updated successfully but could not restart automatically: ${error.message}`);

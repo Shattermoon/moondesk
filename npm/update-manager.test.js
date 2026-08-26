@@ -479,20 +479,61 @@ test("updated wrapper metadata must match the exact requested version", () => {
   }
 });
 
-test("restart launches the wrapper with the same arguments and working directory", async () => {
-  const calls = [];
-  const result = await restartUpdatedWrapper("/package/npm/moondesk.js", ["--example"], {
-    cwd: "/workspace",
-    env: { PATH: "/bin" },
-    spawnImpl: (command, args, options) => {
-      calls.push({ command, args, options });
-      return fakeChild(0);
-    },
-  });
+test("restart re-enters the updated wrapper in the same Node process", async () => {
+  const dir = tempDir();
+  const npmDir = path.join(dir, "npm");
+  const wrapperPath = path.join(npmDir, "moondesk.js");
+  const helperPath = path.join(npmDir, "helper.js");
+  try {
+    fs.mkdirSync(npmDir, { recursive: true });
+    fs.writeFileSync(helperPath, 'module.exports = "old";\n');
+    fs.writeFileSync(
+      wrapperPath,
+      [
+        'const helper = require("./helper");',
+        "module.exports.orchestrate = async (options) => ({",
+        "  code: helper === \"new\" ? 0 : 9,",
+        "  signal: null,",
+        "  pid: process.pid,",
+        "  args: options.args,",
+        "  cwd: options.cwd,",
+        "  pathValue: options.env.PATH,",
+        "  wrapperPath: options.wrapperPath,",
+        "});",
+        "",
+      ].join("\n"),
+    );
 
-  assert.deepEqual(result, { code: 0, signal: null });
-  assert.equal(calls.length, 1);
-  assert.equal(calls[0].command, process.execPath);
-  assert.deepEqual(calls[0].args, ["/package/npm/moondesk.js", "--example"]);
-  assert.equal(calls[0].options.cwd, "/workspace");
+    const seeded = require(wrapperPath);
+    assert.equal(
+      (
+        await seeded.orchestrate({
+          args: [],
+          cwd: dir,
+          env: { PATH: "/seed" },
+          wrapperPath,
+        })
+      ).code,
+      9,
+      "test must seed the old package cache",
+    );
+    fs.writeFileSync(helperPath, 'module.exports = "new";\n');
+
+    const result = await restartUpdatedWrapper(wrapperPath, ["--example"], {
+      cwd: "/workspace",
+      env: { PATH: "/bin" },
+    });
+
+    assert.deepEqual(result, {
+      code: 0,
+      signal: null,
+      pid: process.pid,
+      args: ["--example"],
+      cwd: "/workspace",
+      pathValue: "/bin",
+      wrapperPath,
+    });
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });

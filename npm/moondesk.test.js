@@ -274,6 +274,48 @@ test("old-cache cleanup failure is non-fatal but native startup failure is fatal
   }
 });
 
+test("Windows quarantine between verification and spawn reports actionable security guidance", async () => {
+  const dir = tempDir();
+  const binaryPath = path.join(dir, "moondesk.exe");
+  const errors = [];
+  try {
+    fs.writeFileSync(binaryPath, "verified-native-binary");
+    const result = await orchestrate({
+      cwd: dir,
+      platform: "win32",
+      logger: {
+        log() {},
+        warn() {},
+        error(message) {
+          errors.push(message);
+        },
+      },
+      updateStatePath: path.join(dir, "state.json"),
+      updateRequestPath: path.join(dir, "request.json"),
+      ensureBinaryImpl: async () => binaryPath,
+      cleanupOldBinaryVersionsImpl: () => {},
+      cleanupOldUpdateVersionsImpl: () => {},
+      startUpdateMonitorImpl: () => () => {},
+      runNativeImpl: async () => {
+        fs.rmSync(binaryPath, { force: true });
+        const error = new Error("spawn UNKNOWN");
+        error.code = "UNKNOWN";
+        throw error;
+      },
+    });
+
+    assert.deepEqual(result, { code: 1, signal: null });
+    const text = errors.join("\n");
+    assert.match(text, /MoonDesk failed to start: spawn UNKNOWN/);
+    assert.match(text, /native binary disappeared before Windows could launch it/);
+    assert.match(text, /Windows Security or another antivirus may have quarantined/);
+    assert.match(text, /Protection history/);
+    assert.match(text, new RegExp(binaryPath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("another process installing the requested version skips duplicate npm work and restarts", async () => {
   const dir = tempDir();
   const targetVersion = nextVersion();

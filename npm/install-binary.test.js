@@ -85,6 +85,39 @@ test("ensureBinary downloads, verifies, and reuses a cached binary", async () =>
   }
 });
 
+test("missing cached executable is redownloaded even when checksum metadata remains", async () => {
+  const dir = tempDir();
+  try {
+    const target = resolveTarget();
+    const binary = Buffer.from(`moondesk-redownload-${crypto.randomUUID()}\n`);
+    const { calls, fetchImpl } = makeFetch(binary, target.assetName);
+    const options = {
+      installDir: dir,
+      releaseBaseUrl: "https://example.invalid/releases/v-test",
+      fetchImpl,
+    };
+
+    const binaryPath = await ensureBinary(options);
+    const checksumPath = `${binaryPath}.sha256`;
+    const metadataPath = `${binaryPath}.metadata.json`;
+    assert.equal(calls.length, 2);
+    assert.equal(fs.existsSync(checksumPath), true);
+    assert.equal(fs.existsSync(metadataPath), true);
+
+    fs.rmSync(binaryPath, { force: true });
+    assert.equal(fs.existsSync(binaryPath), false);
+    assert.equal(fs.existsSync(checksumPath), true);
+    assert.equal(fs.existsSync(metadataPath), true);
+
+    const restoredPath = await ensureBinary(options);
+    assert.equal(restoredPath, binaryPath);
+    assert.equal(fs.readFileSync(restoredPath).compare(binary), 0);
+    assert.equal(calls.length, 4, "orphaned sidecars must not make a missing executable look cached");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("unchanged cached binaries use metadata without rehashing", async () => {
   const dir = tempDir();
   try {

@@ -138,7 +138,7 @@ In `multi-tools` mode MoonDesk exposes 12 local tools:
 | `read_command_output` | Read preserved command output |
 | `cancel_command` | Stop a job and its process tree |
 
-Use `run_command` for short work. Use `start_command` + `poll_command` for builds, tests, package installs, dev servers, and other long-running commands.
+Use `run_command` for short work. Use `start_command` + `poll_command` for builds, tests, package installs, dev servers, and other long-running commands. Polls long-wait by default and report elapsed, idle, and timeout timing so agents can avoid rapid blind polling.
 
 `read-only` mode exposes only the local guide/read tools.
 

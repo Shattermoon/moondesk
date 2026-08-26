@@ -9,8 +9,8 @@ use tiktoken_rs::o200k_base_singleton;
 
 use crate::command;
 use crate::command_jobs::{
-    CommandJobManager, CommandJobSnapshot, DEFAULT_JOB_TIMEOUT_MS, MAX_COMMAND_OUTPUT_READ_BYTES,
-    MAX_JOB_TIMEOUT_MS, MAX_POLL_WAIT_MS,
+    CommandJobManager, CommandJobSnapshot, DEFAULT_JOB_TIMEOUT_MS, DEFAULT_POLL_WAIT_MS,
+    MAX_COMMAND_OUTPUT_READ_BYTES, MAX_JOB_TIMEOUT_MS, MAX_POLL_WAIT_MS,
 };
 use crate::devtools::DevtoolsManager;
 use crate::state::{AgentsPathMode, Mode, ToolMode, load_app_config, user_home_dir};
@@ -172,6 +172,12 @@ fn local_tool_output_schema(name: &str) -> Option<Value> {
             properties.insert("jobId".to_string(), json!({ "type": "string" }));
             properties.insert("state".to_string(), json!({ "type": "string" }));
             properties.insert("reusedExisting".to_string(), json!({ "type": "boolean" }));
+            for field in ["elapsedMs", "sinceLastOutputMs", "timeoutMs"] {
+                properties.insert(
+                    field.to_string(),
+                    json!({ "type": "integer", "minimum": 0 }),
+                );
+            }
         }
         "list_commands" => {
             properties.insert(
@@ -189,6 +195,12 @@ fn local_tool_output_schema(name: &str) -> Option<Value> {
                 "nextCursor".to_string(),
                 json!({ "type": "integer", "minimum": 0 }),
             );
+            for field in ["elapsedMs", "sinceLastOutputMs", "timeoutMs"] {
+                properties.insert(
+                    field.to_string(),
+                    json!({ "type": "integer", "minimum": 0 }),
+                );
+            }
             properties.insert("hasMoreOutput".to_string(), json!({ "type": "boolean" }));
             properties.insert("outputTruncated".to_string(), json!({ "type": "boolean" }));
             properties.insert(
@@ -298,7 +310,7 @@ async fn handle_tools_list(
             tools.push(json!({
                 "name": "start_command",
                 "title": "Start command",
-                "description": "Start a long-running command in the user's normal developer shell with the workspace root as its working directory and return a job ID immediately. The shell inherits normal user environment and OS permissions and is not an OS filesystem sandbox. Prefer this for builds, compilation, dependency installation, long test suites, and development servers instead of keeping run_command open.",
+                "description": "Start a long-running command in the user's normal developer shell with the workspace root as its working directory and return a job ID immediately. The shell inherits normal user environment and OS permissions and is not an OS filesystem sandbox. Prefer this for builds, compilation, dependency installation, long test suites, and development servers instead of keeping run_command open. Exact running duplicates are reused by default; the response reports reusedExisting plus the job's current elapsed and timeout values.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -335,13 +347,13 @@ async fn handle_tools_list(
             tools.push(json!({
                 "name": "poll_command",
                 "title": "Poll command",
-                "description": "Read incremental output and current status from a command previously started with start_command. Pass the returned nextCursor as after on the next poll so output is not repeated. If hasMoreOutput is true, poll again even if the job is already terminal. If outputTruncated is true, bounded stdout/stderr archives are preserved locally; use read_command_output with output_id equal to this job_id. If outputArchiveTruncated is true, the local archive reached its safety limit and recovery is partial.",
+                "description": "Read incremental output and status from a command started with start_command. Omit wait_ms to long-poll for progress; use 0 only for an immediate status check. Pass nextCursor as after on the next poll. Stop polling when state is terminal and hasMoreOutput is false. elapsedMs, sinceLastOutputMs, and timeoutMs expose job age and silence; if an external watcher stays quiet for several polls, re-check its underlying condition instead of polling indefinitely. If outputTruncated is true, recover preserved stdout/stderr with read_command_output.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "job_id": { "type": "string", "description": "Opaque command job ID returned by start_command" },
                         "after": { "type": "integer", "minimum": 0, "description": "Required output cursor. Use 0 for the first poll, then pass the previous nextCursor so output is never repeated." },
-                        "wait_ms": { "type": "integer", "minimum": 0, "maximum": MAX_POLL_WAIT_MS, "description": "Wait briefly for new output or completion before returning (maximum 30000 ms)" }
+                        "wait_ms": { "type": "integer", "minimum": 0, "maximum": MAX_POLL_WAIT_MS, "description": format!("Wait for new output or completion before returning. Defaults to {DEFAULT_POLL_WAIT_MS} ms; maximum {MAX_POLL_WAIT_MS} ms. Use 0 only for an immediate status check.") }
                     },
                     "required": ["job_id", "after"]
                 },
@@ -762,9 +774,13 @@ fn command_poll_structured(snapshot: &CommandJobSnapshot) -> Value {
         object.insert("output".to_string(), json!(output));
     }
     object.insert("nextCursor".to_string(), json!(snapshot.next_cursor));
-    if snapshot.has_more_output {
-        object.insert("hasMoreOutput".to_string(), json!(true));
-    }
+    object.insert("elapsedMs".to_string(), json!(snapshot.elapsed_ms));
+    object.insert(
+        "sinceLastOutputMs".to_string(),
+        json!(snapshot.since_last_output_ms),
+    );
+    object.insert("timeoutMs".to_string(), json!(snapshot.timeout_ms));
+    object.insert("hasMoreOutput".to_string(), json!(snapshot.has_more_output));
     if snapshot.output_truncated {
         object.insert("outputTruncated".to_string(), json!(true));
     }
@@ -870,6 +886,9 @@ async fn handle_start_command(
                 "jobId": started.snapshot.job_id,
                 "state": started.snapshot.state.as_str(),
                 "reusedExisting": started.reused_existing,
+                "elapsedMs": started.snapshot.elapsed_ms,
+                "sinceLastOutputMs": started.snapshot.since_last_output_ms,
+                "timeoutMs": started.snapshot.timeout_ms,
             }),
         ),
         Err(error) => tool_error_response(req, error),
@@ -935,7 +954,7 @@ async fn handle_poll_command(
                 );
             }
         },
-        None => 0,
+        None => DEFAULT_POLL_WAIT_MS,
     };
     match command_jobs
         .poll_for_workspace(workspace_id, job_id, after, wait_ms)
@@ -1466,11 +1485,11 @@ Always specify the branch explicitly when using `git push`."#
                 .to_string(),
         );
         lines.push(
-            "For builds, compilation, dependency installation, long-running test suites, development servers, or commands that may take more than about one minute, use start_command instead of keeping run_command open. Before starting work that may already be running, call list_commands and reuse or poll the existing job when appropriate. start_command automatically reuses an exact running command in the same working directory; set allow_duplicate=true only when another concurrent copy is intentional."
+            "For builds, compilation, dependency installation, long-running test suites, development servers, or commands that may take more than about one minute, use start_command instead of keeping run_command open. Before starting work that may already be running, call list_commands and reuse or poll the existing job when appropriate. start_command automatically reuses an exact running command in the same working directory; set allow_duplicate=true only when another concurrent copy is intentional. For commands whose purpose is waiting on an external service such as CI, code-review bots, deployments, or package publication, set an explicit timeout appropriate to that wait instead of blindly relying on the generic 30-minute default."
                 .to_string(),
         );
         lines.push(
-            "Use poll_command to read incremental output from a background command. Pass the returned nextCursor as after on the next poll so output is not repeated, and use wait_ms when waiting briefly for new progress. If hasMoreOutput is true, keep polling even after the command reaches a terminal state. If poll_command reports outputTruncated, use read_command_output with output_id equal to the job ID to recover the bounded preserved stdout/stderr without rerunning the command. outputArchiveTruncated means the local archive reached its disk safety limit."
+            "Use poll_command to read incremental output from a background command. Omit wait_ms for the normal long-poll behavior; use wait_ms=0 only when an immediate status check is genuinely needed, and do not issue rapid back-to-back polls. Pass the returned nextCursor as after so output is not repeated. Stop polling once state is terminal and hasMoreOutput is false. Use elapsedMs, sinceLastOutputMs, and timeoutMs to judge progress. If an external-service watcher remains running without meaningful output for several polls, re-check the underlying external condition independently and cancel a stale or incorrect watcher instead of polling indefinitely. If outputTruncated is true, use read_command_output with output_id equal to the job ID to recover preserved stdout/stderr."
                 .to_string(),
         );
         lines.push(
@@ -2112,14 +2131,72 @@ mod tests {
         assert!(result_text(&response).contains("Missing required parameter: after"));
     }
 
+    #[tokio::test]
+    async fn poll_command_without_wait_ms_long_polls_until_job_changes() {
+        let workspace_root =
+            std::env::temp_dir().join(format!("moondesk-mcp-default-poll-wait-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        let workspace_root_str = workspace_root.to_string_lossy().into_owned();
+        let command_jobs = CommandJobManager::new();
+        let command = if cfg!(windows) {
+            "Start-Sleep -Milliseconds 500"
+        } else {
+            "sleep 0.5"
+        };
+
+        let start_req = tool_call_request(
+            "start_command",
+            json!({ "command": command, "timeout": 5_000 }),
+        );
+        let start_response = handle_tools_call(
+            &start_req,
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &None,
+        )
+        .await;
+        let job_id = start_response
+            .result
+            .as_ref()
+            .and_then(|result| result.get("structuredContent"))
+            .and_then(|structured| structured.get("jobId"))
+            .and_then(Value::as_str)
+            .expect("missing job id")
+            .to_string();
+
+        let poll_req = tool_call_request("poll_command", json!({ "job_id": job_id, "after": 0 }));
+        let response =
+            handle_poll_command(&poll_req, &WorkspaceId::test_default(), &command_jobs).await;
+        let structured = response
+            .result
+            .as_ref()
+            .and_then(|result| result.get("structuredContent"))
+            .expect("missing poll structured content");
+        assert_eq!(
+            structured.get("state").and_then(Value::as_str),
+            Some("succeeded"),
+            "omitted wait_ms should long-poll until the quiet job completes"
+        );
+        assert_eq!(
+            structured.get("hasMoreOutput").and_then(Value::as_bool),
+            Some(false)
+        );
+
+        let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
     #[test]
-    fn poll_result_omits_empty_output_and_internal_job_metadata() {
+    fn poll_result_exposes_progress_metadata_without_heavy_internal_fields() {
         let snapshot = CommandJobSnapshot {
             job_id: "job-1".into(),
             command: "very long command that should stay internal".into(),
             cwd: "C:/workspace".into(),
             state: crate::command_jobs::CommandJobState::Running,
             elapsed_ms: 1234,
+            since_last_output_ms: 456,
             exit_code: None,
             events: vec![],
             next_cursor: 7,
@@ -2135,16 +2212,20 @@ mod tests {
         assert_eq!(result.get("state").and_then(Value::as_str), Some("running"));
         assert_eq!(result.get("nextCursor").and_then(Value::as_u64), Some(7));
         assert!(result.get("output").is_none());
-        assert!(result.get("hasMoreOutput").is_none());
-        for internal_field in [
-            "jobId",
-            "command",
-            "cwd",
-            "events",
-            "elapsedMs",
-            "timeoutMs",
-            "commandSuccess",
-        ] {
+        assert_eq!(
+            result.get("hasMoreOutput").and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(result.get("elapsedMs").and_then(Value::as_u64), Some(1234));
+        assert_eq!(
+            result.get("sinceLastOutputMs").and_then(Value::as_u64),
+            Some(456)
+        );
+        assert_eq!(
+            result.get("timeoutMs").and_then(Value::as_u64),
+            Some(30_000)
+        );
+        for internal_field in ["jobId", "command", "cwd", "events", "commandSuccess"] {
             assert!(result.get(internal_field).is_none());
         }
     }
@@ -2191,7 +2272,29 @@ mod tests {
             start_structured.get("state").and_then(Value::as_str),
             Some("running")
         );
-        for redundant_field in ["command", "cwd", "elapsedMs", "timeoutMs", "events"] {
+        assert_eq!(
+            start_structured
+                .get("reusedExisting")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+        assert!(
+            start_structured
+                .get("elapsedMs")
+                .and_then(Value::as_u64)
+                .is_some()
+        );
+        assert!(
+            start_structured
+                .get("sinceLastOutputMs")
+                .and_then(Value::as_u64)
+                .is_some()
+        );
+        assert_eq!(
+            start_structured.get("timeoutMs").and_then(Value::as_u64),
+            Some(5_000)
+        );
+        for redundant_field in ["command", "cwd", "events"] {
             assert!(
                 start_structured.get(redundant_field).is_none(),
                 "start response should not include {redundant_field}"
@@ -2232,15 +2335,29 @@ mod tests {
             if let Some(output) = structured.get("output").and_then(Value::as_str) {
                 seen_output.push_str(output);
             }
-            for redundant_field in [
-                "jobId",
-                "command",
-                "cwd",
-                "events",
-                "elapsedMs",
-                "timeoutMs",
-                "commandSuccess",
-            ] {
+            assert!(
+                structured
+                    .get("elapsedMs")
+                    .and_then(Value::as_u64)
+                    .is_some()
+            );
+            assert!(
+                structured
+                    .get("sinceLastOutputMs")
+                    .and_then(Value::as_u64)
+                    .is_some()
+            );
+            assert_eq!(
+                structured.get("timeoutMs").and_then(Value::as_u64),
+                Some(5_000)
+            );
+            assert!(
+                structured
+                    .get("hasMoreOutput")
+                    .and_then(Value::as_bool)
+                    .is_some()
+            );
+            for redundant_field in ["jobId", "command", "cwd", "events", "commandSuccess"] {
                 assert!(
                     structured.get(redundant_field).is_none(),
                     "poll response should not repeat {redundant_field}"

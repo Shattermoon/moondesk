@@ -153,6 +153,14 @@ impl Default for JobRuntime {
     }
 }
 
+impl JobRuntime {
+    /// Preserve the newest observed output time even if asynchronous archive writes
+    /// for stdout and stderr complete in a different order than the reads occurred.
+    fn record_output_at(&mut self, output_at: Instant) {
+        self.last_output_at = self.last_output_at.max(Some(output_at));
+    }
+}
+
 #[derive(Debug)]
 struct CommandJob {
     id: String,
@@ -290,7 +298,7 @@ impl CommandJob {
         if runtime.output_archive_error.is_none() {
             runtime.output_archive_error = archive_error;
         }
-        runtime.last_output_at = Some(output_at);
+        runtime.record_output_at(output_at);
         let seq = runtime.next_seq;
         runtime.next_seq = runtime.next_seq.saturating_add(1);
         runtime
@@ -1553,6 +1561,21 @@ mod tests {
             "command never reached ready state: {}",
             path.display()
         );
+    }
+
+    #[test]
+    fn last_output_timestamp_stays_monotonic_when_writes_finish_out_of_order() {
+        let mut runtime = JobRuntime::default();
+        let first = Instant::now();
+        let newer = first + StdDuration::from_millis(20);
+        let newest = newer + StdDuration::from_millis(20);
+
+        runtime.record_output_at(newer);
+        runtime.record_output_at(first);
+        assert_eq!(runtime.last_output_at, Some(newer));
+
+        runtime.record_output_at(newest);
+        assert_eq!(runtime.last_output_at, Some(newest));
     }
 
     #[tokio::test]

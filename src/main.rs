@@ -1644,7 +1644,7 @@ async fn run_app(
         }
     }
 
-    let continue_run = run_ngrok_auth_setup(terminal, state.clone()).await?;
+    let continue_run = run_ngrok_auth_setup(terminal, state.clone(), None).await?;
     if !continue_run {
         return Ok(AppExit::Quit);
     }
@@ -1663,17 +1663,44 @@ async fn run_app(
 
     // Start services
     let (ui_event_tx, ui_event_rx) = ui_event_channel();
-    let StartedServices {
-        devtools: devtools_bridge,
-        _host_runtime,
-    } = start_services(state.clone(), ui_event_tx)
+    let mut services = start_services(state.clone(), ui_event_tx)
         .await
         .map_err(std::io::Error::other)?;
+
+    while services
+        .ngrok_start_error
+        .as_ref()
+        .is_some_and(ngrok::StartFailure::is_authentication)
+    {
+        let continue_run = run_ngrok_auth_setup(
+            terminal,
+            state.clone(),
+            Some(
+                "ngrok rejected the saved authtoken. Paste a fresh token from the ngrok dashboard."
+                    .into(),
+            ),
+        )
+        .await?;
+        if !continue_run {
+            if let Some(bridge) = services.devtools.take() {
+                bridge.stop().await;
+            }
+            return Ok(AppExit::Quit);
+        }
+
+        services.ngrok_start_error = match ngrok::start(state.clone()).await {
+            Ok(()) => None,
+            Err(error) => {
+                state.lock().await.log("ERROR", format!("ngrok: {error}"));
+                Some(error)
+            }
+        };
+    }
 
     // Phase 2: main TUI loop. Keep ownership of the shared DevTools bridge here
     // so it is explicitly stopped even if the TUI returns an error.
     let result = run_tui(terminal, state, ui_event_rx).await;
-    if let Some(bridge) = devtools_bridge {
+    if let Some(bridge) = services.devtools.take() {
         bridge.stop().await;
     }
     result
@@ -1795,15 +1822,16 @@ fn draw_mode_select(f: &mut Frame, theme: &theme::ThemeDef, tool_mode: ToolMode)
 async fn run_ngrok_auth_setup(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     state: SharedState,
+    initial_error: Option<String>,
 ) -> Result<bool, Box<dyn std::error::Error>> {
-    if state.lock().await.ngrok_authtoken().is_some() {
+    if initial_error.is_none() && state.lock().await.ngrok_authtoken().is_some() {
         return Ok(true);
     }
 
     let config_path = app_config_path()?;
     let config_path_text = config_path.to_string_lossy().into_owned();
     let mut input = String::new();
-    let mut error_message: Option<String> = None;
+    let mut error_message = initial_error;
     let mut toast: Option<(&str, (u16, u16), Instant)> = None;
 
     loop {
@@ -4377,6 +4405,7 @@ async fn ensure_selected_browser_remote_debugging(
 struct StartedServices {
     devtools: Option<Arc<DevtoolsManager>>,
     _host_runtime: HostRuntimeGuard,
+    ngrok_start_error: Option<ngrok::StartFailure>,
 }
 
 const MAX_HEALTH_PROBE_BODY_BYTES: usize = 4 * 1024;
@@ -4626,13 +4655,18 @@ async fn start_services(
     }
 
     // Start ngrok
-    if let Err(e) = ngrok::start(state.clone()).await {
-        state.lock().await.log("ERROR", format!("ngrok: {e}"));
-    }
+    let ngrok_start_error = match ngrok::start(state.clone()).await {
+        Ok(()) => None,
+        Err(error) => {
+            state.lock().await.log("ERROR", format!("ngrok: {error}"));
+            Some(error)
+        }
+    };
 
     Ok(StartedServices {
         devtools: devtools_bridge,
         _host_runtime: host_runtime,
+        ngrok_start_error,
     })
 }
 
@@ -5508,7 +5542,10 @@ fn draw_ui(f: &mut Frame, context: UiRenderContext<'_>) {
         .unwrap_or_default()
         .as_millis();
 
-    let has_url = app.ngrok_url.is_some();
+    let full_mcp_url = app.public_mcp_url();
+    // A configured static domain still has a revealable connector URL even if
+    // its tunnel is currently offline. Tunnel readiness is reported separately.
+    let has_url = full_mcp_url.is_some();
     let visible_flow_count = app
         .flows
         .iter()
@@ -5569,7 +5606,6 @@ fn draw_ui(f: &mut Frame, context: UiRenderContext<'_>) {
             "N/A"
         }
     };
-    let full_mcp_url = app.public_mcp_url();
     let mcp_url_is_revealed = full_mcp_url.is_some() && mcp_url_reveal_remaining.is_some();
     let mcp_url = match (&full_mcp_url, mcp_url_is_revealed) {
         (Some(url), true) => url.clone(),
@@ -5762,9 +5798,14 @@ fn draw_ui(f: &mut Frame, context: UiRenderContext<'_>) {
             ];
             if has_url {
                 spans.push(Span::raw("  "));
-                let security_text = mcp_url_security_status
-                    .as_deref()
-                    .unwrap_or("Click to reveal");
+                let security_text =
+                    mcp_url_security_status
+                        .as_deref()
+                        .unwrap_or(if app.ngrok_running {
+                            "Click to reveal"
+                        } else {
+                            "Offline - click to reveal"
+                        });
                 let security_color = match mcp_url_reveal_remaining {
                     Some(remaining) if mcp_url_reveal_seconds(remaining) <= 3 => palette.danger_fg,
                     Some(_) => palette.warning_fg,
@@ -6586,17 +6627,17 @@ fn draw_ui(f: &mut Frame, context: UiRenderContext<'_>) {
 #[cfg(test)]
 mod tests {
     use super::{
-        BottomPanelAreas, BottomPanelFocus, DashboardHitAreas, DashboardSecretHit,
-        DashboardSecretTarget, PanelItemHit, PanelScrollView, TimedSecretClick, WorkspaceHitAreas,
-        WorkspaceUiAction, active_reveal_remaining, dashboard_secret_target_at,
-        draw_update_confirm, item_under_cursor, key_is_clipboard_paste, log_secret_target,
-        move_panel_selection, normalize_ngrok_authtoken_input, normalize_ngrok_domain,
-        normalize_workspace_path_input, panel_under_cursor, parse_clippymoon_export_args,
-        parse_port_value, primary_mcp_url_line_index, remove_remote_browser_profile_dir,
-        scroll_panel_down, scroll_panel_up, tail_start_index, terminate_remote_browser_child,
-        timed_secret_click, truncate_with_ellipsis, update_confirm_action, user_home_dir,
-        workspace_action_from_event, workspace_detail_sections, wrap_preserving_chars,
-        wrapped_line_hit_area,
+        AppState, BottomPanelAreas, BottomPanelFocus, BottomPanelHitMaps, DashboardHitAreas,
+        DashboardSecretHit, DashboardSecretTarget, PanelItemHit, PanelScrollView, TimedSecretClick,
+        UiRenderContext, UiSnapshot, WorkspaceHitAreas, WorkspaceUiAction, active_reveal_remaining,
+        dashboard_secret_target_at, draw_ui, draw_update_confirm, item_under_cursor,
+        key_is_clipboard_paste, log_secret_target, move_panel_selection,
+        normalize_ngrok_authtoken_input, normalize_ngrok_domain, normalize_workspace_path_input,
+        panel_under_cursor, parse_clippymoon_export_args, parse_port_value,
+        primary_mcp_url_line_index, remove_remote_browser_profile_dir, scroll_panel_down,
+        scroll_panel_up, tail_start_index, terminate_remote_browser_child, timed_secret_click,
+        truncate_with_ellipsis, update_confirm_action, user_home_dir, workspace_action_from_event,
+        workspace_detail_sections, wrap_preserving_chars, wrapped_line_hit_area,
     };
     use crossterm::event::{
         Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -7043,6 +7084,100 @@ mod tests {
         assert_eq!(hit_area.height as usize, rendered_target_rows.len());
         assert_eq!(hit_area.x, content.x);
         assert_eq!(hit_area.width, content.width);
+    }
+
+    #[test]
+    fn dashboard_primary_url_remains_clickable_with_saved_domain_while_ngrok_is_offline() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let workspace = std::env::temp_dir().join(format!("moondesk-offline-url-hitbox-{unique}"));
+        std::fs::create_dir_all(&workspace).expect("create temporary workspace");
+        let config_path = workspace.join("config.toml");
+        let mut app = AppState::new_for_test(
+            3200,
+            workspace.to_string_lossy().into_owned(),
+            config_path.clone(),
+        )
+        .expect("create test app state");
+        app.set_ngrok_domain(Some("saved-domain.ngrok-free.app".into()));
+        app.ngrok_running = false;
+        app.ngrok_url = None;
+        let snapshot = UiSnapshot::from_app(&app);
+
+        assert!(snapshot.public_mcp_url().is_some());
+        assert!(!snapshot.ngrok_running);
+        assert!(snapshot.ngrok_url.is_none());
+
+        let backend = TestBackend::new(110, 42);
+        let mut terminal = Terminal::new(backend).expect("create dashboard terminal");
+        let mut log_view = PanelScrollView::default();
+        let mut command_view = PanelScrollView::default();
+        let mut bottom_panel_areas = BottomPanelAreas::default();
+        let mut bottom_panel_hits = BottomPanelHitMaps::default();
+        let mut dashboard_hit_areas = DashboardHitAreas::default();
+
+        terminal
+            .draw(|frame| {
+                draw_ui(
+                    frame,
+                    UiRenderContext {
+                        app: &snapshot,
+                        update_info: None,
+                        log_scroll: 0,
+                        log_follow_tail: true,
+                        command_scroll: 0,
+                        command_follow_tail: true,
+                        focused_bottom_panel: BottomPanelFocus::Logs,
+                        selected_log: None,
+                        selected_command: None,
+                        expanded_log: None,
+                        expanded_command: None,
+                        log_view: &mut log_view,
+                        command_view: &mut command_view,
+                        bottom_panel_areas: &mut bottom_panel_areas,
+                        bottom_panel_hits: &mut bottom_panel_hits,
+                        dashboard_hit_areas: &mut dashboard_hit_areas,
+                        toast: None,
+                        mcp_url_reveal_remaining: None,
+                        log_mcp_url_reveal_remaining: None,
+                        log_ngrok_url_reveal_remaining: None,
+                        log_ngrok_domain_reveal_remaining: None,
+                    },
+                );
+            })
+            .expect("render offline dashboard");
+
+        let hit = dashboard_hit_areas
+            .secrets
+            .iter()
+            .find(|hit| hit.target == DashboardSecretTarget::PrimaryMcpUrl)
+            .copied()
+            .expect("offline primary URL should have a reveal hit area");
+        assert!(hit.area.height > 0);
+        assert_eq!(
+            dashboard_secret_target_at(&dashboard_hit_areas, hit.area.x, hit.area.y),
+            Some(DashboardSecretTarget::PrimaryMcpUrl)
+        );
+
+        let now = std::time::Instant::now();
+        let mut revealed_until = None;
+        assert_eq!(
+            timed_secret_click(
+                snapshot.public_mcp_url().as_deref(),
+                &mut revealed_until,
+                now,
+            ),
+            Some(TimedSecretClick::Revealed)
+        );
+        assert_eq!(
+            revealed_until,
+            Some(now + std::time::Duration::from_secs(10))
+        );
+
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_dir_all(workspace);
     }
 
     #[test]

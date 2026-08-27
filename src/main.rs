@@ -72,6 +72,10 @@ const GPT_5_6_AND_EARLIER_INPUT_USD_PER_1M: f64 = 5.0;
 const GPT_5_6_AND_EARLIER_OUTPUT_USD_PER_1M: f64 = 30.0;
 const PRICE_DISPLAY_DECIMALS: usize = 6;
 const NGROK_SETUP_URL: &str = "https://dashboard.ngrok.com/get-started/setup";
+#[cfg(target_os = "windows")]
+const WORKSPACE_BROWSE_ACTION_LABEL: &str = "[b] Explorer ";
+#[cfg(not(target_os = "windows"))]
+const WORKSPACE_BROWSE_ACTION_LABEL: &str = "[b] Browse ";
 
 #[derive(Clone, Default)]
 struct InterruptState {
@@ -2741,24 +2745,98 @@ fn normalize_workspace_path_input(value: &str) -> std::io::Result<PathBuf> {
 }
 
 #[cfg(target_os = "windows")]
-fn pick_workspace_folder_blocking() -> Result<Option<PathBuf>, String> {
-    let script = r#"Add-Type -AssemblyName System.Windows.Forms; $dialog = New-Object System.Windows.Forms.FolderBrowserDialog; $dialog.Description = 'Choose a MoonDesk workspace'; $dialog.ShowNewFolderButton = $false; if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($dialog.SelectedPath) }"#;
-    let output = std::process::Command::new("powershell.exe")
-        .args(["-NoProfile", "-STA", "-Command", script])
-        .output()
-        .map_err(|error| format!("failed to open the Windows folder picker: {error}"))?;
-    if !output.status.success() {
-        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return Err(if detail.is_empty() {
-            "Windows folder picker exited unexpectedly".into()
-        } else {
-            format!("Windows folder picker failed: {detail}")
-        });
+struct WindowsComApartment;
+
+#[cfg(target_os = "windows")]
+impl WindowsComApartment {
+    fn initialize_sta() -> Result<Self, String> {
+        use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx};
+
+        let result = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+        result
+            .ok()
+            .map_err(|error| format!("failed to initialize the Windows folder picker: {error}"))?;
+        Ok(Self)
     }
-    let selected = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if selected.is_empty() {
-        Ok(None)
-    } else {
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for WindowsComApartment {
+    fn drop(&mut self) {
+        unsafe { windows::Win32::System::Com::CoUninitialize() };
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn configure_windows_workspace_folder_dialog(
+    dialog: &windows::Win32::UI::Shell::IFileOpenDialog,
+) -> Result<(), String> {
+    use windows::{
+        Win32::UI::Shell::{FOS_FORCEFILESYSTEM, FOS_PATHMUSTEXIST, FOS_PICKFOLDERS},
+        core::PCWSTR,
+    };
+
+    unsafe {
+        let options = dialog
+            .GetOptions()
+            .map_err(|error| format!("failed to read Windows folder picker options: {error}"))?;
+        dialog
+            .SetOptions(options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST)
+            .map_err(|error| format!("failed to configure the Windows folder picker: {error}"))?;
+
+        let title: Vec<u16> = "Choose a MoonDesk workspace\0".encode_utf16().collect();
+        dialog
+            .SetTitle(PCWSTR(title.as_ptr()))
+            .map_err(|error| format!("failed to title the Windows folder picker: {error}"))?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn pick_workspace_folder_blocking() -> Result<Option<PathBuf>, String> {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+    use windows::Win32::{
+        System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, CoTaskMemFree},
+        UI::Shell::{FileOpenDialog, IFileOpenDialog, SIGDN_FILESYSPATH},
+    };
+
+    const HRESULT_CANCELLED: i32 = 0x8007_04C7_u32 as i32;
+
+    let _apartment = WindowsComApartment::initialize_sta()?;
+    let dialog: IFileOpenDialog = unsafe {
+        CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER).map_err(|error| {
+            format!("failed to create the Windows Explorer folder picker: {error}")
+        })?
+    };
+    configure_windows_workspace_folder_dialog(&dialog)?;
+
+    unsafe {
+        if let Err(error) = dialog.Show(None) {
+            return if error.code().0 == HRESULT_CANCELLED {
+                Ok(None)
+            } else {
+                Err(format!("Windows Explorer folder picker failed: {error}"))
+            };
+        }
+
+        let item = dialog
+            .GetResult()
+            .map_err(|error| format!("failed to read the selected Windows folder: {error}"))?;
+        let display_name = item
+            .GetDisplayName(SIGDN_FILESYSPATH)
+            .map_err(|error| format!("failed to resolve the selected Windows folder: {error}"))?;
+        if display_name.is_null() {
+            return Err("Windows Explorer returned an empty folder selection".into());
+        }
+
+        let mut len = 0usize;
+        while *display_name.0.add(len) != 0 {
+            len += 1;
+        }
+        let selected = OsString::from_wide(std::slice::from_raw_parts(display_name.0, len));
+        CoTaskMemFree(Some(display_name.0.cast()));
+
         Ok(Some(PathBuf::from(selected)))
     }
 }
@@ -2816,6 +2894,22 @@ fn pick_workspace_folder_blocking() -> Result<Option<PathBuf>, String> {
     Err("no supported graphical folder picker was found (install zenity or kdialog)".into())
 }
 
+#[cfg(target_os = "windows")]
+async fn pick_workspace_folder() -> Result<Option<PathBuf>, String> {
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    std::thread::Builder::new()
+        .name("moondesk-explorer-picker".into())
+        .spawn(move || {
+            let _ = sender.send(pick_workspace_folder_blocking());
+        })
+        .map_err(|error| format!("failed to start the Windows Explorer picker thread: {error}"))?;
+
+    receiver
+        .await
+        .map_err(|_| "Windows Explorer picker thread exited unexpectedly".to_string())?
+}
+
+#[cfg(not(target_os = "windows"))]
 async fn pick_workspace_folder() -> Result<Option<PathBuf>, String> {
     tokio::task::spawn_blocking(pick_workspace_folder_blocking)
         .await
@@ -3367,7 +3461,7 @@ fn draw_workspaces(f: &mut Frame, view: WorkspacesView<'_>, hit_areas: &mut Work
     }
     let footer_actions = [
         (" [a] Path ", WorkspaceUiAction::AddPath),
-        ("[b] Browse ", WorkspaceUiAction::BrowseAdd),
+        (WORKSPACE_BROWSE_ACTION_LABEL, WorkspaceUiAction::BrowseAdd),
         ("[r] Name ", WorkspaceUiAction::Rename),
         ("[v] Reveal ", WorkspaceUiAction::Reveal),
         ("[c] Copy ", WorkspaceUiAction::Copy),
@@ -7014,6 +7108,47 @@ mod tests {
                 .expect("normalize quoted relative path"),
             PathBuf::from("relative/project")
         );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_workspace_picker_configures_real_explorer_folder_mode_without_showing_ui() {
+        std::thread::spawn(|| {
+            use windows::Win32::{
+                System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance},
+                UI::Shell::{
+                    FOS_FORCEFILESYSTEM, FOS_PATHMUSTEXIST, FOS_PICKFOLDERS, FileOpenDialog,
+                    IFileOpenDialog,
+                },
+            };
+
+            let _apartment = super::WindowsComApartment::initialize_sta()
+                .expect("initialize a dedicated STA thread for the Explorer picker");
+            let dialog: IFileOpenDialog = unsafe {
+                CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER)
+                    .expect("create the Windows Explorer folder picker")
+            };
+            super::configure_windows_workspace_folder_dialog(&dialog)
+                .expect("configure the Explorer picker for folders");
+            let options = unsafe { dialog.GetOptions().expect("read configured picker options") };
+
+            assert_ne!(options.0 & FOS_PICKFOLDERS.0, 0);
+            assert_ne!(options.0 & FOS_FORCEFILESYSTEM.0, 0);
+            assert_ne!(options.0 & FOS_PATHMUSTEXIST.0, 0);
+        })
+        .join()
+        .expect("Explorer picker test thread must not panic");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "opens the real Windows Explorer folder picker and requires user interaction"]
+    fn windows_workspace_picker_interactive_smoke() {
+        let selected = super::pick_workspace_folder_blocking()
+            .expect("open the Windows Explorer folder picker");
+        if let Some(path) = selected {
+            assert!(path.is_dir(), "selected workspace path must be a directory");
+        }
     }
 
     #[cfg(unix)]

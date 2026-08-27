@@ -119,7 +119,7 @@ one ngrok domain
 
 Each workspace keeps its own file boundary, command jobs, retained output, history, and secret connector URL.
 
-Use `[w] Workspaces` to add, rename, inspect, copy, rotate, or remove projects. Launching `moondesk` from another project while a host is already running can attach that directory to the existing host instead of starting another server.
+Use `[w] Workspaces` to add, rename, inspect, copy, rotate, or remove projects. On Windows, `[b] Explorer` opens the native Explorer folder picker for adding a workspace; `[a] Path` remains available for manual path entry. Launching `moondesk` from another project while a host is already running can attach that directory to the existing host instead of starting another server.
 
 Browser control is shared by the host, so workspaces using browser mode control the same selected browser/DevTools bridge.
 

@@ -2894,6 +2894,22 @@ fn pick_workspace_folder_blocking() -> Result<Option<PathBuf>, String> {
     Err("no supported graphical folder picker was found (install zenity or kdialog)".into())
 }
 
+#[cfg(target_os = "windows")]
+async fn pick_workspace_folder() -> Result<Option<PathBuf>, String> {
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    std::thread::Builder::new()
+        .name("moondesk-explorer-picker".into())
+        .spawn(move || {
+            let _ = sender.send(pick_workspace_folder_blocking());
+        })
+        .map_err(|error| format!("failed to start the Windows Explorer picker thread: {error}"))?;
+
+    receiver
+        .await
+        .map_err(|_| "Windows Explorer picker thread exited unexpectedly".to_string())?
+}
+
+#[cfg(not(target_os = "windows"))]
 async fn pick_workspace_folder() -> Result<Option<PathBuf>, String> {
     tokio::task::spawn_blocking(pick_workspace_folder_blocking)
         .await

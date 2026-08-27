@@ -1,10 +1,11 @@
 const assert = require("node:assert/strict");
+const { EventEmitter } = require("node:events");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const test = require("node:test");
 
-const { cleanManagedUpdateEnv, orchestrate } = require("./moondesk");
+const { cleanManagedUpdateEnv, orchestrate, runNative } = require("./moondesk");
 const { UPDATE_EXIT_CODE, currentVersion } = require("./update-manager");
 
 function tempDir() {
@@ -19,6 +20,42 @@ function nextVersion() {
 function quietLogger() {
   return { log() {}, warn() {}, error() {} };
 }
+
+test("native launch keeps the npm wrapper alive across parent SIGINT until the child exits", async () => {
+  const child = new EventEmitter();
+  const signalTarget = new EventEmitter();
+  let settled = false;
+  const running = runNative("/fake/moondesk", [], {
+    signalTarget,
+    spawnImpl: () => child,
+  }).then((result) => {
+    settled = true;
+    return result;
+  });
+
+  assert.equal(signalTarget.listenerCount("SIGINT"), 1);
+  signalTarget.emit("SIGINT");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(settled, false, "parent SIGINT must not terminate the wrapper while native MoonDesk owns shutdown");
+
+  child.emit("exit", 0, null);
+  assert.deepEqual(await running, { code: 0, signal: null });
+  assert.equal(signalTarget.listenerCount("SIGINT"), 0, "SIGINT listener must be removed after native exit");
+});
+
+test("native launch removes the parent SIGINT listener when spawn fails", async () => {
+  const child = new EventEmitter();
+  const signalTarget = new EventEmitter();
+  const running = runNative("/fake/moondesk", [], {
+    signalTarget,
+    spawnImpl: () => child,
+  });
+
+  assert.equal(signalTarget.listenerCount("SIGINT"), 1);
+  child.emit("error", new Error("spawn failed"));
+  await assert.rejects(running, /spawn failed/);
+  assert.equal(signalTarget.listenerCount("SIGINT"), 0);
+});
 
 test("managed update environment variables never leak into npm or the restarted wrapper", () => {
   assert.deepEqual(

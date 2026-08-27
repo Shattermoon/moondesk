@@ -123,6 +123,8 @@ Use `[w] Workspaces` to add, rename, inspect, copy, rotate, or remove projects. 
 
 Browser control is shared by the host, so workspaces using browser mode control the same selected browser/DevTools bridge.
 
+Because every workspace shares this host and public tunnel, stopping MoonDesk disconnects all active workspace connectors. Pressing `q` or `Ctrl+C` in the live dashboard therefore opens a shutdown confirmation instead of stopping the host immediately; `Enter` confirms and `Esc` keeps MoonDesk running.
+
 ## Tools
 
 In `multi-tools` mode MoonDesk exposes 12 local tools:

@@ -39,14 +39,31 @@ function cleanupEphemeralUpdateFiles(statePath, requestPath) {
 
 function runNative(binaryPath, args, options = {}) {
   const spawnImpl = options.spawnImpl ?? spawn;
+  const signalTarget = options.signalTarget ?? process;
   return new Promise((resolve, reject) => {
     const child = spawnImpl(binaryPath, args, {
       cwd: options.cwd ?? process.cwd(),
       env: options.env ?? process.env,
       stdio: "inherit",
     });
-    child.once("error", reject);
-    child.once("exit", (code, signal) => resolve({ code: code ?? 1, signal }));
+
+    // The native TUI owns Ctrl+C confirmation once the shared host is running.
+    // Without a listener, Node's default SIGINT behavior can terminate the npm
+    // wrapper before the native child restores the terminal and closes ngrok.
+    const ignoreParentSigint = () => {};
+    signalTarget.on?.("SIGINT", ignoreParentSigint);
+    const cleanupSignalHandler = () => {
+      signalTarget.off?.("SIGINT", ignoreParentSigint);
+    };
+
+    child.once("error", (error) => {
+      cleanupSignalHandler();
+      reject(error);
+    });
+    child.once("exit", (code, signal) => {
+      cleanupSignalHandler();
+      resolve({ code: code ?? 1, signal });
+    });
   });
 }
 

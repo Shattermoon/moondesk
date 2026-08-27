@@ -713,7 +713,28 @@ jobs:
           printf '%s\n' '{"name":"moondesk-release-verification","private":true}' > "$audit_dir/package.json"
           cd "$audit_dir"
           npm install --ignore-scripts --no-audit --no-fund "${package_name}@${version}"
-          npm audit signatures
+          for attempt in $(seq 1 24); do
+            if audit_output="$(npm audit signatures 2>&1)"; then
+              printf '%s\n' "$audit_output"
+              break
+            else
+              audit_status=$?
+            fi
+            printf '%s\n' "$audit_output"
+
+            if ! grep -Fq '/-/npm/v1/attestations/' <<<"$audit_output" || \
+               ! grep -Eq '404 Not Found|npm error code E404' <<<"$audit_output"; then
+              exit "$audit_status"
+            fi
+
+            if [ "$attempt" -eq 24 ]; then
+              echo "::error::npm provenance attestation for ${package_name}@${version} was not visible after two minutes."
+              exit "$audit_status"
+            fi
+
+            echo "npm provenance attestation is not visible yet; retrying signature audit in 5 seconds (${attempt}/24)."
+            sleep 5
+          done
 
       - name: Verify authenticated npm provenance points to this exact tag commit
         shell: bash

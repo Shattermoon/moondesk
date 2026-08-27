@@ -39,7 +39,10 @@ use state::{
 };
 use std::io::{Write, stdout};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -69,6 +72,97 @@ const GPT_5_6_AND_EARLIER_INPUT_USD_PER_1M: f64 = 5.0;
 const GPT_5_6_AND_EARLIER_OUTPUT_USD_PER_1M: f64 = 30.0;
 const PRICE_DISPLAY_DECIMALS: usize = 6;
 const NGROK_SETUP_URL: &str = "https://dashboard.ngrok.com/get-started/setup";
+
+#[derive(Clone, Default)]
+struct InterruptState {
+    pending: Arc<AtomicUsize>,
+}
+
+impl InterruptState {
+    fn request(&self) {
+        self.pending.fetch_add(1, Ordering::Release);
+    }
+
+    fn take_pending(&self) -> usize {
+        self.pending.swap(0, Ordering::AcqRel)
+    }
+}
+
+struct TerminalRestoreGuard {
+    raw_mode: bool,
+    alternate_screen: bool,
+    bracketed_paste: bool,
+    mouse_capture: bool,
+}
+
+impl TerminalRestoreGuard {
+    fn enter() -> std::io::Result<Self> {
+        let mut guard = Self {
+            raw_mode: false,
+            alternate_screen: false,
+            bracketed_paste: false,
+            mouse_capture: false,
+        };
+        enable_raw_mode()?;
+        guard.raw_mode = true;
+        stdout().execute(EnterAlternateScreen)?;
+        guard.alternate_screen = true;
+        stdout().execute(EnableBracketedPaste)?;
+        guard.bracketed_paste = true;
+        stdout().execute(EnableMouseCapture)?;
+        guard.mouse_capture = true;
+        Ok(guard)
+    }
+
+    fn restore(&mut self) -> std::io::Result<()> {
+        let mut first_error = None;
+        if self.bracketed_paste {
+            if let Err(error) = stdout().execute(DisableBracketedPaste) {
+                first_error.get_or_insert(error);
+            }
+            self.bracketed_paste = false;
+        }
+        if self.mouse_capture {
+            if let Err(error) = stdout().execute(DisableMouseCapture) {
+                first_error.get_or_insert(error);
+            }
+            self.mouse_capture = false;
+        }
+        if self.raw_mode {
+            if let Err(error) = disable_raw_mode() {
+                first_error.get_or_insert(error);
+            }
+            self.raw_mode = false;
+        }
+        if self.alternate_screen {
+            if let Err(error) = stdout().execute(LeaveAlternateScreen) {
+                first_error.get_or_insert(error);
+            }
+            self.alternate_screen = false;
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+}
+
+impl Drop for TerminalRestoreGuard {
+    fn drop(&mut self) {
+        let _ = self.restore();
+    }
+}
+
+fn spawn_interrupt_listener(interrupts: InterruptState) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            if tokio::signal::ctrl_c().await.is_err() {
+                break;
+            }
+            interrupts.request();
+        }
+    })
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum AppExit {
@@ -1218,6 +1312,18 @@ fn key_is_clipboard_paste(key: &crossterm::event::KeyEvent) -> bool {
             && key.modifiers.contains(KeyModifiers::CONTROL)
 }
 
+fn key_is_interrupt(key: &crossterm::event::KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char(c) if c.eq_ignore_ascii_case(&'c'))
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+}
+
+fn key_is_plain_quit(key: &crossterm::event::KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char(c) if c.eq_ignore_ascii_case(&'q'))
+        && !key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+}
+
 fn normalize_ngrok_authtoken_input(text: &str) -> String {
     let trimmed = text.trim();
     if trimmed.is_empty() {
@@ -1540,19 +1646,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let state: SharedState = Arc::new(Mutex::new(AppState::new(port, workspace_root)?));
 
-    enable_raw_mode()?;
-    stdout().execute(EnterAlternateScreen)?;
-    stdout().execute(EnableBracketedPaste)?;
-    stdout().execute(EnableMouseCapture)?;
+    let mut terminal_guard = TerminalRestoreGuard::enter()?;
     let backend = CrosstermBackend::new(stdout());
     let mut terminal = Terminal::new(backend)?;
 
     let result = run_app(&mut terminal, state.clone()).await;
 
-    stdout().execute(DisableBracketedPaste)?;
-    stdout().execute(DisableMouseCapture)?;
-    disable_raw_mode()?;
-    stdout().execute(LeaveAlternateScreen)?;
+    terminal_guard.restore()?;
 
     // Cleanup after the TUI is gone so quit never appears frozen on screen.
     // Stop accepting new MCP work first, then terminate owned command trees and
@@ -1578,7 +1678,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     state.lock().await.clear_remote_connection_state();
 
     match result {
-        Ok(AppExit::Quit) => Ok(()),
+        Ok(AppExit::Quit) => {
+            println!("MoonDesk stopped.");
+            Ok(())
+        }
         Ok(AppExit::UpdateRestart(target_version)) => {
             update::write_update_request(&target_version).map_err(|error| {
                 std::io::Error::new(
@@ -1697,9 +1800,13 @@ async fn run_app(
         };
     }
 
-    // Phase 2: main TUI loop. Keep ownership of the shared DevTools bridge here
-    // so it is explicitly stopped even if the TUI returns an error.
-    let result = run_tui(terminal, state, ui_event_rx).await;
+    // Phase 2: main TUI loop. Once the shared host is live, intercept console
+    // interrupts so an accidental Ctrl+C cannot tear down every workspace before
+    // the TUI has a chance to confirm and run its normal shutdown path.
+    let interrupts = InterruptState::default();
+    let interrupt_listener = spawn_interrupt_listener(interrupts.clone());
+    let result = run_tui(terminal, state, ui_event_rx, interrupts).await;
+    interrupt_listener.abort();
     if let Some(bridge) = services.devtools.take() {
         bridge.stop().await;
     }
@@ -4676,6 +4783,7 @@ async fn run_tui(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     state: SharedState,
     mut ui_events: UiEventReceiver,
+    interrupts: InterruptState,
 ) -> Result<AppExit, Box<dyn std::error::Error>> {
     let mut log_scroll: usize = 0;
     let mut log_follow_tail = true;
@@ -4721,6 +4829,12 @@ async fn run_tui(
             live.prune_closed_flows();
             UiSnapshot::from_app(&live)
         };
+        if interrupts.take_pending() > 0 {
+            if run_quit_confirm(terminal, &state, &interrupts).await? {
+                break;
+            }
+            continue;
+        }
         if last_config_flush.elapsed() >= CONFIG_FLUSH_INTERVAL {
             if let Err(error) = flush_config(&state, false).await {
                 state
@@ -4891,8 +5005,13 @@ async fn run_tui(
                         continue;
                     }
                     selection.clear();
+                    if key_is_interrupt(&key) || key_is_plain_quit(&key) {
+                        if run_quit_confirm(terminal, &state, &interrupts).await? {
+                            break;
+                        }
+                        continue;
+                    }
                     match key.code {
-                        KeyCode::Char('q') => break,
                         KeyCode::Char('w') => {
                             run_workspaces(terminal, state.clone()).await?;
                         }
@@ -5329,6 +5448,187 @@ async fn run_tui(
         );
     }
     Ok(exit)
+}
+
+fn quit_confirm_action(key: &crossterm::event::KeyEvent) -> Option<bool> {
+    match key.code {
+        KeyCode::Enter
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER) =>
+        {
+            Some(true)
+        }
+        KeyCode::Esc => Some(false),
+        _ => None,
+    }
+}
+
+async fn run_quit_confirm(
+    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    state: &SharedState,
+    interrupts: &InterruptState,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    // The interrupt that opened this dialog has already served its purpose. Any
+    // additional Ctrl+C events are intentionally absorbed here so shutdown always
+    // requires an explicit Enter confirmation instead of an accidental key repeat.
+    let _ = interrupts.take_pending();
+    loop {
+        let (theme, registered, connected, in_flight, active_commands) = {
+            let app = state.lock().await;
+            let connected = app
+                .workspace_runtimes
+                .values()
+                .filter(|runtime| runtime.remote_connected())
+                .count();
+            let in_flight = app
+                .workspace_runtimes
+                .values()
+                .map(|runtime| runtime.in_flight_requests())
+                .sum();
+            let active_commands = app
+                .command_activities
+                .iter()
+                .filter(|activity| activity.state == CommandActivityState::Running)
+                .count();
+            (
+                app.current_theme(),
+                app.workspaces.len(),
+                connected,
+                in_flight,
+                active_commands,
+            )
+        };
+
+        terminal.draw(|f| {
+            draw_quit_confirm(f, theme, registered, connected, in_flight, active_commands)
+        })?;
+        let _ = interrupts.take_pending();
+        if !event::poll(UI_POLL_INTERVAL)? {
+            continue;
+        }
+        if let Event::Key(key) = event::read()? {
+            if key.kind != KeyEventKind::Press {
+                continue;
+            }
+            if let Some(confirmed) = quit_confirm_action(&key) {
+                return Ok(confirmed);
+            }
+        }
+    }
+}
+
+fn draw_quit_confirm(
+    f: &mut Frame,
+    theme: &theme::ThemeDef,
+    registered: usize,
+    connected: usize,
+    in_flight: usize,
+    active_commands: usize,
+) {
+    let palette = theme.palette;
+    let area = centered_rect(78, 14, f.area());
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .title(" Stop MoonDesk? ")
+        .borders(Borders::ALL)
+        .border_type(palette.border_type)
+        .border_style(Style::default().fg(palette.danger_fg));
+    let inner = block.inner(area).inner(Margin {
+        horizontal: 2,
+        vertical: 1,
+    });
+    f.render_widget(block, area);
+
+    let compact_actions = inner.width < 48;
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(1),
+            Constraint::Length(if compact_actions { 2 } else { 1 }),
+        ])
+        .split(inner);
+
+    let mut lines = vec![
+        Line::from(Span::styled(
+            "MoonDesk is the shared host for every registered workspace.",
+            Style::default()
+                .fg(palette.warning_fg)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            format!(
+                "Current impact: {registered} registered · {connected} connected · {in_flight} in flight"
+            ),
+            Style::default().fg(palette.primary_fg),
+        )),
+    ];
+    if active_commands > 0 {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "Active commands: {active_commands} command{} will be cancelled.",
+                if active_commands == 1 { "" } else { "s" }
+            ),
+            Style::default()
+                .fg(palette.danger_fg)
+                .add_modifier(Modifier::BOLD),
+        )));
+    }
+    lines.push(Line::from(Span::styled(
+        "Stopping also closes the public tunnel and disconnects active ChatGPT sessions.",
+        Style::default().fg(palette.primary_fg),
+    )));
+    lines.push(Line::from(""));
+
+    let action_lines = if compact_actions {
+        vec![
+            Line::from(vec![
+                Span::styled(
+                    "[Enter]",
+                    Style::default()
+                        .fg(palette.danger_fg)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(" Stop MoonDesk"),
+            ]),
+            Line::from(vec![
+                Span::styled(
+                    "[Esc]",
+                    Style::default()
+                        .fg(palette.success_fg)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(" Keep running"),
+            ]),
+        ]
+    } else {
+        vec![Line::from(vec![
+            Span::styled(
+                "[Enter]",
+                Style::default()
+                    .fg(palette.danger_fg)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" Stop MoonDesk    "),
+            Span::styled(
+                "[Esc]",
+                Style::default()
+                    .fg(palette.success_fg)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" Keep running"),
+        ])]
+    };
+
+    f.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: false }),
+        sections[0],
+    );
+    f.render_widget(
+        Paragraph::new(action_lines).wrap(Wrap { trim: false }),
+        sections[1],
+    );
 }
 
 fn update_confirm_action(code: KeyCode) -> Option<bool> {
@@ -6628,16 +6928,18 @@ fn draw_ui(f: &mut Frame, context: UiRenderContext<'_>) {
 mod tests {
     use super::{
         AppState, BottomPanelAreas, BottomPanelFocus, BottomPanelHitMaps, DashboardHitAreas,
-        DashboardSecretHit, DashboardSecretTarget, PanelItemHit, PanelScrollView, TimedSecretClick,
-        UiRenderContext, UiSnapshot, WorkspaceHitAreas, WorkspaceUiAction, active_reveal_remaining,
-        dashboard_secret_target_at, draw_ui, draw_update_confirm, item_under_cursor,
-        key_is_clipboard_paste, log_secret_target, move_panel_selection,
+        DashboardSecretHit, DashboardSecretTarget, InterruptState, PanelItemHit, PanelScrollView,
+        TimedSecretClick, UiRenderContext, UiSnapshot, WorkspaceHitAreas, WorkspaceUiAction,
+        active_reveal_remaining, dashboard_secret_target_at, draw_quit_confirm, draw_ui,
+        draw_update_confirm, item_under_cursor, key_is_clipboard_paste, key_is_interrupt,
+        key_is_plain_quit, log_secret_target, move_panel_selection,
         normalize_ngrok_authtoken_input, normalize_ngrok_domain, normalize_workspace_path_input,
         panel_under_cursor, parse_clippymoon_export_args, parse_port_value,
-        primary_mcp_url_line_index, remove_remote_browser_profile_dir, scroll_panel_down,
-        scroll_panel_up, tail_start_index, terminate_remote_browser_child, timed_secret_click,
-        truncate_with_ellipsis, update_confirm_action, user_home_dir, workspace_action_from_event,
-        workspace_detail_sections, wrap_preserving_chars, wrapped_line_hit_area,
+        primary_mcp_url_line_index, quit_confirm_action, remove_remote_browser_profile_dir,
+        scroll_panel_down, scroll_panel_up, tail_start_index, terminate_remote_browser_child,
+        timed_secret_click, truncate_with_ellipsis, update_confirm_action, user_home_dir,
+        workspace_action_from_event, workspace_detail_sections, wrap_preserving_chars,
+        wrapped_line_hit_area,
     };
     use crossterm::event::{
         Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -6913,6 +7215,89 @@ mod tests {
             KeyCode::Insert,
             KeyModifiers::SHIFT
         )));
+    }
+
+    #[test]
+    fn ctrl_c_is_an_interrupt_but_plain_c_is_not() {
+        assert!(key_is_interrupt(&KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+        )));
+        assert!(!key_is_interrupt(&KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::NONE,
+        )));
+    }
+
+    #[test]
+    fn only_plain_q_is_a_quit_shortcut() {
+        assert!(key_is_plain_quit(&KeyEvent::new(
+            KeyCode::Char('q'),
+            KeyModifiers::NONE,
+        )));
+        assert!(!key_is_plain_quit(&KeyEvent::new(
+            KeyCode::Char('q'),
+            KeyModifiers::CONTROL,
+        )));
+        assert!(!key_is_plain_quit(&KeyEvent::new(
+            KeyCode::Char('q'),
+            KeyModifiers::ALT,
+        )));
+    }
+
+    #[test]
+    fn quit_confirmation_only_accepts_enter_or_escape() {
+        assert_eq!(
+            quit_confirm_action(&KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Some(true),
+        );
+        assert_eq!(
+            quit_confirm_action(&KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            Some(false),
+        );
+        assert_eq!(
+            quit_confirm_action(&KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            None,
+        );
+        assert_eq!(
+            quit_confirm_action(&KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)),
+            None,
+        );
+        assert_eq!(
+            quit_confirm_action(&KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL)),
+            None,
+        );
+    }
+
+    #[test]
+    fn interrupt_state_consumes_pending_signals_once() {
+        let interrupts = InterruptState::default();
+        interrupts.request();
+        interrupts.request();
+        assert_eq!(interrupts.take_pending(), 2);
+        assert_eq!(interrupts.take_pending(), 0);
+    }
+
+    #[test]
+    fn quit_confirmation_keeps_actions_visible_on_narrow_terminals() {
+        let backend = TestBackend::new(52, 18);
+        let mut terminal =
+            Terminal::new(backend).expect("create compact quit confirmation terminal");
+        let theme = super::theme::resolve(super::theme::DEFAULT_THEME_ID);
+
+        terminal
+            .draw(|frame| draw_quit_confirm(frame, theme, 7, 5, 2, 3))
+            .expect("render quit confirmation");
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("Stop MoonDesk"));
+        assert!(rendered.contains("Keep running"));
     }
 
     #[test]

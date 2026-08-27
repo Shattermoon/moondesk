@@ -41,7 +41,7 @@ use std::io::{Write, stdout};
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::Mutex;
@@ -76,6 +76,7 @@ const NGROK_SETUP_URL: &str = "https://dashboard.ngrok.com/get-started/setup";
 #[derive(Clone, Default)]
 struct InterruptState {
     pending: Arc<AtomicUsize>,
+    shutdown_started: Arc<AtomicBool>,
 }
 
 impl InterruptState {
@@ -85,6 +86,14 @@ impl InterruptState {
 
     fn take_pending(&self) -> usize {
         self.pending.swap(0, Ordering::AcqRel)
+    }
+
+    fn begin_shutdown(&self) {
+        self.shutdown_started.store(true, Ordering::Release);
+    }
+
+    fn shutdown_started(&self) -> bool {
+        self.shutdown_started.load(Ordering::Acquire)
     }
 }
 
@@ -158,6 +167,10 @@ fn spawn_interrupt_listener(interrupts: InterruptState) -> tokio::task::JoinHand
         loop {
             if tokio::signal::ctrl_c().await.is_err() {
                 break;
+            }
+            if interrupts.shutdown_started() {
+                eprintln!("\nMoonDesk shutdown interrupted. Forcing exit.");
+                std::process::exit(130);
             }
             interrupts.request();
         }
@@ -1645,14 +1658,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let state: SharedState = Arc::new(Mutex::new(AppState::new(port, workspace_root)?));
+    let interrupts = InterruptState::default();
+    let mut interrupt_listener = None;
 
     let mut terminal_guard = TerminalRestoreGuard::enter()?;
     let backend = CrosstermBackend::new(stdout());
     let mut terminal = Terminal::new(backend)?;
 
-    let result = run_app(&mut terminal, state.clone()).await;
+    let result = run_app(
+        &mut terminal,
+        state.clone(),
+        interrupts.clone(),
+        &mut interrupt_listener,
+    )
+    .await;
 
-    terminal_guard.restore()?;
+    interrupts.begin_shutdown();
+    let terminal_restore_result = terminal_guard.restore();
 
     // Cleanup after the TUI is gone so quit never appears frozen on screen.
     // Stop accepting new MCP work first, then terminate owned command trees and
@@ -1677,6 +1699,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     state.lock().await.clear_remote_connection_state();
 
+    if let Some(listener) = interrupt_listener.take() {
+        listener.abort();
+    }
+    if let Err(error) = terminal_restore_result {
+        return Err(error.into());
+    }
+
     match result {
         Ok(AppExit::Quit) => {
             println!("MoonDesk stopped.");
@@ -1700,6 +1729,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn run_app(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     state: SharedState,
+    interrupts: InterruptState,
+    interrupt_listener: &mut Option<tokio::task::JoinHandle<()>>,
 ) -> Result<AppExit, Box<dyn std::error::Error>> {
     // Draw mode selection screen
     loop {
@@ -1803,10 +1834,9 @@ async fn run_app(
     // Phase 2: main TUI loop. Once the shared host is live, intercept console
     // interrupts so an accidental Ctrl+C cannot tear down every workspace before
     // the TUI has a chance to confirm and run its normal shutdown path.
-    let interrupts = InterruptState::default();
-    let interrupt_listener = spawn_interrupt_listener(interrupts.clone());
-    let result = run_tui(terminal, state, ui_event_rx, interrupts).await;
-    interrupt_listener.abort();
+    *interrupt_listener = Some(spawn_interrupt_listener(interrupts.clone()));
+    let result = run_tui(terminal, state, ui_event_rx, interrupts.clone()).await;
+    interrupts.begin_shutdown();
     if let Some(bridge) = services.devtools.take() {
         bridge.stop().await;
     }
@@ -7270,12 +7300,17 @@ mod tests {
     }
 
     #[test]
-    fn interrupt_state_consumes_pending_signals_once() {
+    fn interrupt_state_tracks_running_and_shutdown_phases() {
         let interrupts = InterruptState::default();
+        assert!(!interrupts.shutdown_started());
+
         interrupts.request();
         interrupts.request();
         assert_eq!(interrupts.take_pending(), 2);
         assert_eq!(interrupts.take_pending(), 0);
+
+        interrupts.begin_shutdown();
+        assert!(interrupts.shutdown_started());
     }
 
     #[test]

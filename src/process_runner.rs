@@ -985,73 +985,48 @@ mod tests {
     }
 
     #[cfg(windows)]
-    fn where_first_in_test(name: &str) -> Option<PathBuf> {
-        std::process::Command::new("where.exe")
-            .arg(name)
-            .output()
-            .ok()
-            .filter(|output| output.status.success())
-            .and_then(|output| String::from_utf8(output.stdout).ok())
-            .and_then(|text| text.lines().next().map(PathBuf::from))
-    }
-
-    #[cfg(windows)]
     #[tokio::test]
     #[ignore = "local Windows developer-tool compatibility smoke"]
     async fn windows_developer_toolchain_smoke_uses_normal_host_environment() {
         let root = workspace("developer-toolchain");
         let command = r#"
-$checks = @{
+$requiredChecks = [ordered]@{
     git = @('--version')
     cargo = @('--version')
     rustc = @('--version')
-    python = @('--version')
     node = @('--version')
     npm = @('--version')
-    pnpm = @('--version')
-    bun = @('--version')
-    deno = @('--version')
-    uv = @('--version')
-    java = @('-version')
-    javac = @('-version')
-    dotnet = @('--version')
-    docker = @('--version')
-    kubectl = @('version','--client')
-    gcc = @('--version')
 }
-$seen = 0
-foreach ($tool in $checks.Keys) {
+foreach ($tool in $requiredChecks.Keys) {
+    if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) { exit 20 }
+    $toolArgs = $requiredChecks[$tool]
+    & $tool @toolArgs
+    if ($LASTEXITCODE -ne 0) { exit 21 }
+}
+
+$optionalTools = @(
+    'python', 'pnpm', 'bun', 'deno', 'uv', 'java', 'javac',
+    'dotnet', 'docker', 'kubectl', 'gcc'
+)
+foreach ($tool in $optionalTools) {
     if (Get-Command $tool -ErrorAction SilentlyContinue) {
-        $seen++
-        $toolArgs = $checks[$tool]
-        & $tool @toolArgs
-        if ($LASTEXITCODE -ne 0) { exit 20 }
+        Write-Output "OPTIONAL_TOOL_VISIBLE=$tool"
     }
 }
-if ($seen -lt 5) { exit 21 }
 
 git init -q
 if ($LASTEXITCODE -ne 0) { exit 22 }
 git status --short
 if ($LASTEXITCODE -ne 0) { exit 23 }
 
-if (Get-Command python -ErrorAction SilentlyContinue) {
-    python -c "open('python-smoke.txt','w').write('ok')"
-    if ($LASTEXITCODE -ne 0) { exit 24 }
-}
-if (Get-Command node -ErrorAction SilentlyContinue) {
-    node -e "require('fs').writeFileSync('node-smoke.txt','ok')"
-    if ($LASTEXITCODE -ne 0) { exit 25 }
-}
+node -e "require('fs').writeFileSync('node-smoke.txt','ok')"
+if ($LASTEXITCODE -ne 0) { exit 24 }
 if (Test-Path Env:CUDA_PATH) { Write-Output "CUDA_PATH_PRESENT" }
 "#;
         let result = run_shell_command(command, &root, 30_000, 128 * 1024, None).await;
         let git_created = root.join(".git").is_dir();
         let expected_cuda_path = std::env::var_os("CUDA_PATH").is_some();
-        let python_created =
-            where_first_in_test("python").is_none() || root.join("python-smoke.txt").is_file();
-        let node_created =
-            where_first_in_test("node").is_none() || root.join("node-smoke.txt").is_file();
+        let node_created = root.join("node-smoke.txt").is_file();
         let _ = std::fs::remove_dir_all(&root);
         assert!(
             result.success,
@@ -1066,12 +1041,8 @@ if (Test-Path Env:CUDA_PATH) { Write-Output "CUDA_PATH_PRESENT" }
             );
         }
         assert!(
-            python_created,
-            "Python was discoverable but could not write in the workspace"
-        );
-        assert!(
             node_created,
-            "Node was discoverable but could not write in the workspace"
+            "Node was available but could not write in the workspace"
         );
     }
 

@@ -83,17 +83,239 @@ fn diskutil_erase_regex() -> Result<&'static Regex, String> {
     )
 }
 
+fn raw_filesystem_delete_blocked_error() -> String {
+    "code: RAW_FILESYSTEM_DELETE_BLOCKED\nmessage: MoonDesk blocks explicit shell deletion commands because shell quoting, variable expansion, absolute paths, and nested shells can escape the workspace. Use the dedicated `delete` tool for workspace-contained deletion, and split cleanup from any remaining shell command."
+        .to_string()
+}
+
+fn destructive_disk_command_blocked_error() -> String {
+    "code: DESTRUCTIVE_DISK_COMMAND_BLOCKED\nmessage: MoonDesk blocks disk/partition destructive commands in the generic developer shell. Run disk administration manually outside MoonDesk if you intentionally need it."
+        .to_string()
+}
+
+fn safety_command_basename(word: &str) -> String {
+    word.trim_matches(['\'', '"'])
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(word)
+        .to_ascii_lowercase()
+}
+
+fn is_raw_delete_command_name(word: &str) -> bool {
+    matches!(
+        safety_command_basename(word).as_str(),
+        "remove-item" | "rm" | "ri" | "rmdir" | "rd" | "del" | "erase" | "unlink"
+    )
+}
+
+fn is_disk_destructive_command_name(word: &str) -> bool {
+    let command = safety_command_basename(word);
+    matches!(
+        command.as_str(),
+        "format"
+            | "format.com"
+            | "diskpart"
+            | "clear-disk"
+            | "initialize-disk"
+            | "remove-partition"
+            | "wipefs"
+            | "fdisk"
+            | "parted"
+    ) || command == "mkfs"
+        || command.starts_with("mkfs.")
+}
+
+fn is_opaque_shell_evaluator_name(word: &str) -> bool {
+    matches!(
+        safety_command_basename(word).as_str(),
+        "eval" | "iex" | "invoke-expression"
+    )
+}
+
+fn opaque_shell_command_blocked_error() -> String {
+    "code: OPAQUE_SHELL_COMMAND_BLOCKED\nmessage: MoonDesk blocks opaque shell evaluation because the executable payload cannot be inspected reliably. Run the intended concrete developer command directly instead."
+        .to_string()
+}
+
+fn first_non_assignment_word(words: &[ShellWord]) -> Option<usize> {
+    words
+        .iter()
+        .position(|word| !looks_like_env_assignment(&word.text))
+}
+
+fn nested_safety_shell_payload(
+    words: &[ShellWord],
+    command_idx: usize,
+) -> Result<Option<&str>, String> {
+    let Some(command_word) = words.get(command_idx) else {
+        return Ok(None);
+    };
+    let command = safety_command_basename(&command_word.text);
+    if matches!(command.as_str(), "bash" | "sh" | "zsh" | "dash") {
+        return Ok(shell_command_arg_index(words, command_idx)
+            .and_then(|idx| words.get(idx))
+            .map(|word| word.text.as_str()));
+    }
+
+    if matches!(command.as_str(), "cmd" | "cmd.exe") {
+        for idx in command_idx + 1..words.len() {
+            if matches!(words[idx].lower.as_str(), "/c" | "/k") {
+                return Ok(words.get(idx + 1).map(|word| word.text.as_str()));
+            }
+        }
+        return Ok(None);
+    }
+
+    if matches!(
+        command.as_str(),
+        "powershell" | "powershell.exe" | "pwsh" | "pwsh.exe"
+    ) {
+        for idx in command_idx + 1..words.len() {
+            match words[idx].lower.as_str() {
+                "-command" | "-c" => {
+                    return Ok(words.get(idx + 1).map(|word| word.text.as_str()));
+                }
+                "-encodedcommand" | "-enc" | "-e" => {
+                    return Err(
+                        "code: OPAQUE_SHELL_COMMAND_BLOCKED\nmessage: MoonDesk blocks encoded shell command payloads because their filesystem effects cannot be inspected safely."
+                            .to_string(),
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+fn validate_wrapped_command_tail(
+    words: &[ShellWord],
+    start: usize,
+    depth: usize,
+) -> Result<(), String> {
+    for word in words.iter().skip(start) {
+        if is_raw_delete_command_name(&word.text) {
+            return Err(raw_filesystem_delete_blocked_error());
+        }
+        if is_disk_destructive_command_name(&word.text) {
+            return Err(destructive_disk_command_blocked_error());
+        }
+    }
+
+    for idx in start..words.len() {
+        if let Some(payload) = nested_safety_shell_payload(words, idx)? {
+            validate_parsed_shell_command_contexts(payload, depth + 1)?;
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn validate_parsed_command_words(words: &[ShellWord], depth: usize) -> Result<(), String> {
+    let Some(command_idx) = first_non_assignment_word(words) else {
+        return Ok(());
+    };
+    let command = safety_command_basename(&words[command_idx].text);
+
+    if is_raw_delete_command_name(&command) {
+        return Err(raw_filesystem_delete_blocked_error());
+    }
+    if is_disk_destructive_command_name(&command) {
+        return Err(destructive_disk_command_blocked_error());
+    }
+    if is_opaque_shell_evaluator_name(&command) {
+        return Err(opaque_shell_command_blocked_error());
+    }
+
+    if command == "diskutil"
+        && words
+            .iter()
+            .skip(command_idx + 1)
+            .any(|word| word.lower.starts_with("erase"))
+    {
+        return Err(destructive_disk_command_blocked_error());
+    }
+
+    if matches!(
+        command.as_str(),
+        "sudo" | "env" | "builtin" | "exec" | "nohup"
+    ) {
+        validate_wrapped_command_tail(words, command_idx + 1, depth)?;
+    } else if command == "command" {
+        let lookup_only = words
+            .iter()
+            .skip(command_idx + 1)
+            .take_while(|word| word.text.starts_with('-'))
+            .any(|word| matches!(word.text.as_str(), "-v" | "-V"));
+        if !lookup_only {
+            validate_wrapped_command_tail(words, command_idx + 1, depth)?;
+        }
+    }
+
+    if command == "find" {
+        for idx in command_idx + 1..words.len() {
+            if matches!(
+                words[idx].lower.as_str(),
+                "-exec" | "-execdir" | "-ok" | "-okdir"
+            ) {
+                validate_wrapped_command_tail(words, idx + 1, depth)?;
+            }
+        }
+    }
+
+    if command == "xargs" {
+        validate_wrapped_command_tail(words, command_idx + 1, depth)?;
+    }
+
+    if let Some(payload) = nested_safety_shell_payload(words, command_idx)? {
+        validate_parsed_shell_command_contexts(payload, depth + 1)?;
+    }
+
+    Ok(())
+}
+
+fn validate_parsed_shell_command_contexts(command: &str, depth: usize) -> Result<(), String> {
+    if depth > 8 {
+        return Err(
+            "code: SHELL_COMMAND_NESTING_BLOCKED\nmessage: MoonDesk refused an excessively nested shell command because it could not safely establish its filesystem effects."
+                .to_string(),
+        );
+    }
+
+    let Some(tree) = parse_shell(command) else {
+        return Ok(());
+    };
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "command" {
+            let text = node
+                .utf8_text(command.as_bytes())
+                .map_err(|error| {
+                    format!(
+                        "code: COMMAND_SAFETY_PARSE_FAILED\nmessage: MoonDesk could not inspect a parsed shell command safely: {error}"
+                    )
+                })?;
+            validate_parsed_command_words(&shell_words(text), depth)?;
+        }
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            stack.push(child);
+        }
+    }
+    Ok(())
+}
+
 /// Reject destructive filesystem primitives that would bypass MoonDesk's
 /// workspace-contained file tools. Normal developer commands remain available;
 /// explicit deletion must go through the dedicated `delete` tool instead.
 pub fn validate_shell_command_safety(command: &str) -> Result<(), String> {
+    validate_parsed_shell_command_contexts(command, 0)?;
+
     let disk_destructive = disk_destructive_command_regex()?;
     let diskutil_erase = diskutil_erase_regex()?;
     if disk_destructive.is_match(command) || diskutil_erase.is_match(command) {
-        return Err(
-            "code: DESTRUCTIVE_DISK_COMMAND_BLOCKED\nmessage: MoonDesk blocks disk/partition destructive commands in the generic developer shell. Run disk administration manually outside MoonDesk if you intentionally need it."
-                .to_string(),
-        );
+        return Err(destructive_disk_command_blocked_error());
     }
 
     let raw_delete = raw_delete_command_regex()?;
@@ -105,10 +327,7 @@ pub fn validate_shell_command_safety(command: &str) -> Result<(), String> {
         || find_delete.is_match(command)
         || xargs_delete.is_match(command)
     {
-        return Err(
-            "code: RAW_FILESYSTEM_DELETE_BLOCKED\nmessage: MoonDesk blocks explicit shell deletion commands because shell quoting, variable expansion, absolute paths, and nested shells can escape the workspace. Use the dedicated `delete` tool for workspace-contained deletion, and split cleanup from any remaining shell command."
-                .to_string(),
-        );
+        return Err(raw_filesystem_delete_blocked_error());
     }
 
     Ok(())
@@ -1129,6 +1348,30 @@ mod tests {
     }
 
     #[test]
+    fn shell_safety_blocks_compound_subexpression_and_exec_bypasses() {
+        for command in [
+            "if true; then rm -rf protected; fi",
+            "find protected -exec rm -rf {} +",
+            "find protected -exec sh -c 'rm -rf \"$1\"' _ {} +",
+            "Write-Output $(Remove-Item -Recurse -Force protected)",
+            "bash -lc 'if true; then rm -rf protected; fi'",
+            "command rm -rf protected",
+            "sudo -u root rm -rf protected",
+            "powershell -EncodedCommand ZABlAGwA",
+            "eval 'rm -rf protected'",
+            "Invoke-Expression 'Remove-Item -Recurse -Force protected'",
+        ] {
+            let error = validate_shell_command_safety(command)
+                .expect_err("compound or indirect destructive command must be blocked");
+            assert!(
+                error.contains("RAW_FILESYSTEM_DELETE_BLOCKED")
+                    || error.contains("OPAQUE_SHELL_COMMAND_BLOCKED"),
+                "unexpected error for {command}: {error}"
+            );
+        }
+    }
+
+    #[test]
     fn shell_safety_blocks_disk_destructive_commands() {
         for command in [
             "format D: /Q /Y",
@@ -1153,6 +1396,8 @@ mod tests {
             "npm ci && npm test",
             "git clean -ndx",
             "Write-Output 'rm -rf is blocked by MoonDesk'",
+            "printf '%s\\n' 'rm -rf protected'",
+            "command -v rm",
         ] {
             assert!(
                 validate_shell_command_safety(command).is_ok(),

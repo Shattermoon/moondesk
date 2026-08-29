@@ -1263,6 +1263,13 @@ pub fn delete_path(workspace_root: &str, path: &str, recursive: bool) -> Result<
     let root = workspace_root_path(workspace_root)?;
     let target = resolve_target_path(workspace_root, path)?;
 
+    if target == root {
+        return Err(
+            "Refusing to delete the workspace root. Delete an explicit child path instead."
+                .to_string(),
+        );
+    }
+
     if !target.exists() {
         return Err(format!("Path not found: {}", target.display()));
     }
@@ -1326,6 +1333,13 @@ pub fn move_path(
     let root = workspace_root_path(workspace_root)?;
     let src = resolve_target_path(workspace_root, from)?;
     let dst = resolve_target_path(workspace_root, to)?;
+
+    if src == root {
+        return Err("Refusing to move the workspace root.".to_string());
+    }
+    if dst == root {
+        return Err("Refusing to overwrite the workspace root.".to_string());
+    }
 
     if !src.exists() {
         return Err(format!("Source path not found: {}", src.display()));
@@ -1449,6 +1463,43 @@ mod tests {
             "moondesk-workspace-tools-{name}-{}",
             Uuid::new_v4()
         ))
+    }
+
+    #[test]
+    fn delete_path_refuses_workspace_root() {
+        let workspace_root = test_workspace("delete-root-guard");
+        fs::create_dir_all(&workspace_root).expect("create workspace");
+        fs::write(workspace_root.join("sentinel.txt"), "keep").expect("write sentinel");
+        let workspace_root_str = workspace_root.to_string_lossy().into_owned();
+
+        let error = delete_path(&workspace_root_str, ".", true)
+            .expect_err("workspace root deletion must be refused");
+        assert!(error.contains("workspace root"));
+        assert!(workspace_root.join("sentinel.txt").exists());
+
+        let _ = fs::remove_dir_all(workspace_root);
+    }
+
+    #[test]
+    fn move_path_refuses_workspace_root_source_or_destination() {
+        let workspace_root = test_workspace("move-root-guard");
+        fs::create_dir_all(workspace_root.join("child")).expect("create workspace");
+        fs::write(workspace_root.join("child/file.txt"), "keep").expect("write sentinel");
+        let workspace_root_str = workspace_root.to_string_lossy().into_owned();
+
+        assert!(
+            move_path(&workspace_root_str, ".", "child/root", true, true)
+                .expect_err("workspace root source must be refused")
+                .contains("workspace root")
+        );
+        assert!(
+            move_path(&workspace_root_str, "child/file.txt", ".", true, false)
+                .expect_err("workspace root destination must be refused")
+                .contains("workspace root")
+        );
+        assert!(workspace_root.join("child/file.txt").exists());
+
+        let _ = fs::remove_dir_all(workspace_root);
     }
 
     #[test]

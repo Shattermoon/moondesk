@@ -1,5 +1,7 @@
+use regex::Regex;
 use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
+use std::sync::OnceLock;
 use tree_sitter::{Node, Parser};
 use tree_sitter_bash::LANGUAGE as BASH_LANGUAGE;
 
@@ -10,6 +12,89 @@ const MAX_BUFFER_BYTES: usize = 1024 * 1024;
 pub const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 pub const MAX_TIMEOUT_MS: u64 = 120_000;
 pub const MOONDESK_CO_AUTHOR_TRAILER: &str = "Co-Authored-By: MoonDesk";
+
+fn raw_delete_command_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| {
+        Regex::new(
+            r#"(?i)(?:^|[;&|{}\r\n])\s*(?:sudo\s+)?[\"']?(?:microsoft\.powershell\.management[\\/])?(?:remove-item|rm|ri|rmdir|rd|del|erase|unlink)\b"#,
+        )
+        .expect("valid raw delete command regex")
+    })
+}
+
+fn nested_destructive_shell_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| {
+        Regex::new(
+            r#"(?i)(?:^|[;&|{}\r\n])\s*(?:cmd(?:\.exe)?\s+/(?:c|k)|(?:powershell|pwsh)(?:\.exe)?\s+[^;&|\r\n]*?(?:-command|-c)|(?:bash|sh|zsh|dash)\s+[^;&|\r\n]*?-[a-z]*c[a-z]*)\b[^;&|\r\n]*\b(?:remove-item|rm|ri|rmdir|rd|del|erase|unlink)\b"#,
+        )
+        .expect("valid nested destructive shell regex")
+    })
+}
+
+fn find_delete_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| {
+        Regex::new(r"(?i)(?:^|[;&|{}\r\n])\s*(?:sudo\s+)?find\b[^;&|\r\n]*\s-delete\b")
+            .expect("valid find delete regex")
+    })
+}
+
+fn xargs_delete_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| {
+        Regex::new(r"(?i)(?:^|[;&|{}\r\n])\s*(?:sudo\s+)?xargs\b[^;&|\r\n]*\b(?:rm|rmdir|unlink)\b")
+            .expect("valid xargs delete regex")
+    })
+}
+
+fn disk_destructive_command_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| {
+        Regex::new(
+            r"(?i)(?:^|[;&|{}\r\n])\s*(?:sudo\s+)?(?:format(?:\.com)?|diskpart|clear-disk|initialize-disk|remove-partition|mkfs(?:\.[a-z0-9_-]+)?|wipefs|fdisk|parted)\b",
+        )
+        .expect("valid disk destructive command regex")
+    })
+}
+
+fn diskutil_erase_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| {
+        Regex::new(
+            r"(?i)(?:^|[;&|{}\r\n])\s*(?:sudo\s+)?diskutil\b[^;&|\r\n]*\berase(?:disk|volume)?\b",
+        )
+        .expect("valid diskutil erase regex")
+    })
+}
+
+/// Reject destructive filesystem primitives that would bypass MoonDesk's
+/// workspace-contained file tools. Normal developer commands remain available;
+/// explicit deletion must go through the dedicated `delete` tool instead.
+pub fn validate_shell_command_safety(command: &str) -> Result<(), String> {
+    if disk_destructive_command_regex().is_match(command)
+        || diskutil_erase_regex().is_match(command)
+    {
+        return Err(
+            "code: DESTRUCTIVE_DISK_COMMAND_BLOCKED\nmessage: MoonDesk blocks disk/partition destructive commands in the generic developer shell. Run disk administration manually outside MoonDesk if you intentionally need it."
+                .to_string(),
+        );
+    }
+
+    if raw_delete_command_regex().is_match(command)
+        || nested_destructive_shell_regex().is_match(command)
+        || find_delete_regex().is_match(command)
+        || xargs_delete_regex().is_match(command)
+    {
+        return Err(
+            "code: RAW_FILESYSTEM_DELETE_BLOCKED\nmessage: MoonDesk blocks explicit shell deletion commands because shell quoting, variable expansion, absolute paths, and nested shells can escape the workspace. Use the dedicated `delete` tool for workspace-contained deletion, and split cleanup from any remaining shell command."
+                .to_string(),
+        );
+    }
+
+    Ok(())
+}
 
 #[derive(Debug)]
 pub struct CommandResult {
@@ -997,6 +1082,68 @@ mod tests {
     }
 
     #[test]
+    fn shell_safety_blocks_incident_style_nested_cmd_recursive_delete() {
+        let command = r#"$ErrorActionPreference='Stop'; $boundary=(Resolve-Path '.worktrees/boundary' -ErrorAction SilentlyContinue); if($boundary){ Write-Output 'Deleting detached boundary residual'; cmd /c "rmdir /s /q \\"$($boundary.Path)\\""; if(Test-Path '.worktrees/boundary'){ Remove-Item -LiteralPath '.worktrees/boundary' -Recurse -Force -ErrorAction Stop } }; git worktree prune"#;
+        let error = validate_shell_command_safety(command)
+            .expect_err("incident-style recursive delete must be blocked");
+        assert!(error.contains("RAW_FILESYSTEM_DELETE_BLOCKED"));
+    }
+
+    #[test]
+    fn shell_safety_blocks_direct_delete_primitives_across_shells() {
+        for command in [
+            "Remove-Item -LiteralPath '.worktrees/boundary' -Recurse -Force",
+            "rm -rf .worktrees/boundary",
+            "rmdir /s /q .worktrees\\boundary",
+            "& 'Remove-Item' -LiteralPath '.worktrees/boundary' -Recurse -Force",
+            "Microsoft.PowerShell.Management\\Remove-Item -LiteralPath '.worktrees/boundary' -Recurse -Force",
+            "bash -lc 'rm -rf .worktrees/boundary'",
+            "find .worktrees -type f -delete",
+            "printf '%s\\n' stale | xargs rm -f",
+        ] {
+            let error = validate_shell_command_safety(command)
+                .expect_err("raw delete primitive must be blocked");
+            assert!(
+                error.contains("RAW_FILESYSTEM_DELETE_BLOCKED"),
+                "unexpected error for {command}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn shell_safety_blocks_disk_destructive_commands() {
+        for command in [
+            "format D: /Q /Y",
+            "Clear-Disk -Number 2 -RemoveData -Confirm:$false",
+            "sudo mkfs.ext4 /dev/sdb1",
+            "diskutil eraseDisk APFS Scratch /dev/disk4",
+        ] {
+            let error = validate_shell_command_safety(command)
+                .expect_err("disk destructive command must be blocked");
+            assert!(
+                error.contains("DESTRUCTIVE_DISK_COMMAND_BLOCKED"),
+                "unexpected error for {command}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn shell_safety_keeps_normal_developer_commands_available() {
+        for command in [
+            "git status --short --branch",
+            "cargo test --all-targets",
+            "npm ci && npm test",
+            "git clean -ndx",
+            "Write-Output 'rm -rf is blocked by MoonDesk'",
+        ] {
+            assert!(
+                validate_shell_command_safety(command).is_ok(),
+                "normal developer command should remain available: {command}"
+            );
+        }
+    }
+
+    #[test]
     fn resolve_workspace_path_defaults_to_workspace_root_for_missing_or_dot_cwd() {
         let workspace_root = test_workspace("resolve-default");
         std::fs::create_dir_all(&workspace_root).expect("create workspace");
@@ -1046,6 +1193,38 @@ mod tests {
                     .expect("canonicalize workspace")
             ))
         );
+
+        let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn resolve_workspace_path_rejects_current_drive_root_and_drive_root() {
+        let workspace_root = test_workspace("resolve-drive-root-escape");
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        let workspace_root_str = workspace_root.to_string_lossy().into_owned();
+
+        for escaped in ["\\", "\\."] {
+            let error = resolve_workspace_path(&workspace_root_str, Some(escaped))
+                .expect_err("current-drive root path must be rejected");
+            assert!(error.contains("escapes workspace root"));
+        }
+
+        let drive_root = workspace_root
+            .components()
+            .next()
+            .and_then(|component| match component {
+                Component::Prefix(prefix) => Some(PathBuf::from(format!(
+                    "{}\\",
+                    prefix.as_os_str().to_string_lossy()
+                ))),
+                _ => None,
+            })
+            .expect("test workspace should be on a Windows drive");
+        let error =
+            resolve_workspace_path(&workspace_root_str, Some(&drive_root.to_string_lossy()))
+                .expect_err("drive root path must be rejected");
+        assert!(error.contains("escapes workspace root"));
 
         let _ = std::fs::remove_dir_all(workspace_root);
     }

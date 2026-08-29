@@ -287,7 +287,7 @@ async fn handle_tools_list(
             tools.push(json!({
                 "name": "run_command",
                 "title": "Run command",
-                "description": "Execute a short command in the user's normal developer shell with the workspace root as its working directory. The shell inherits the user's normal PATH, home directory, environment, and OS permissions; it is not an OS filesystem sandbox. Prefer dedicated workspace file tools when they can complete the task. Common directory-listing commands may be compacted before execution. For commands that may produce large output, prefer start_command plus poll_command. If a one-shot command exceeds the inline capture limit, run_command returns outputId and read_command_output can retrieve the complete preserved stdout/stderr without rerunning it.",
+                "description": "Execute a short command in the user's normal developer shell with the workspace root as its working directory. The shell inherits the user's normal PATH, home directory, environment, and OS permissions; it is not an OS filesystem sandbox. Explicit shell deletion and disk/partition destructive commands are blocked; use the dedicated delete tool for workspace-contained deletion. Prefer dedicated workspace file tools when they can complete the task. Common directory-listing commands may be compacted before execution. For commands that may produce large output, prefer start_command plus poll_command. If a one-shot command exceeds the inline capture limit, run_command returns outputId and read_command_output can retrieve the complete preserved stdout/stderr without rerunning it.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -310,7 +310,7 @@ async fn handle_tools_list(
             tools.push(json!({
                 "name": "start_command",
                 "title": "Start command",
-                "description": "Start a long-running command in the user's normal developer shell with the workspace root as its working directory and return a job ID immediately. The shell inherits normal user environment and OS permissions and is not an OS filesystem sandbox. Prefer this for builds, compilation, dependency installation, long test suites, and development servers instead of keeping run_command open. Exact running duplicates are reused by default; the response reports reusedExisting plus the job's current elapsed and timeout values.",
+                "description": "Start a long-running command in the user's normal developer shell with the workspace root as its working directory and return a job ID immediately. The shell inherits normal user environment and OS permissions and is not an OS filesystem sandbox. Explicit shell deletion and disk/partition destructive commands are blocked; use the dedicated delete tool for workspace-contained deletion. Prefer this for builds, compilation, dependency installation, long test suites, and development servers instead of keeping run_command open. Exact running duplicates are reused by default; the response reports reusedExisting plus the job's current elapsed and timeout values.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -813,6 +813,9 @@ async fn handle_start_command(
         Ok(value) => value,
         Err(error) => return tool_error_response(req, error),
     };
+    if let Err(error) = command::validate_shell_command_safety(command_text) {
+        return tool_error_response(req, error);
+    }
     if command::contains_moondesk_co_author_marker(command_text) {
         let message = if set_moondesk_as_co_author {
             "Rewrite the commit message normally and remove \"Co-Authored-By: MoonDesk\". MoonDesk will add that trailer automatically."
@@ -1127,6 +1130,10 @@ async fn handle_run_command(
                 ),
             );
         }
+    }
+
+    if let Err(error) = command::validate_shell_command_safety(cmd) {
+        return tool_error_response(req, error);
     }
 
     if command::contains_moondesk_co_author_marker(cmd) {
@@ -1466,7 +1473,7 @@ Always specify the branch explicitly when using `git push`."#
         }
         if tool_mode.write_tools_enabled() {
             lines.push(
-                "Use write with create_dirs=true to create files in new directories. Use edit for targeted exact string replacements, including append-like changes by replacing the current file ending. Use plain mv commands for moves and renames. Use delete for other filesystem changes."
+                "Use write with create_dirs=true to create files in new directories. Use edit for targeted exact string replacements, including append-like changes by replacing the current file ending. Use plain mv commands for moves and renames. Use delete for filesystem deletion. Never bypass delete by using shell commands, Python, Node.js, Rust, compiled binaries, package scripts, or custom cleanup programs to recursively remove files or directories. Raw shell deletion commands are blocked so recursive cleanup cannot escape the workspace through quoting, expansion, malformed variables, absolute paths, current-drive root semantics, or nested-shell mistakes. If a higher-level operation such as git worktree remove/prune fails, do not escalate automatically to a lower-level filesystem deletion, script, custom binary, force flag, or second shell; inspect the failure and current state first. Never delete a drive root, filesystem root, workspace root, path outside the workspace, or any path derived from an empty, unresolved, malformed, or failed variable/path expression. Only use delete for an explicit workspace-contained residual path after verifying that deleting that exact path is actually the intended operation."
                     .to_string(),
             );
         }
@@ -2057,6 +2064,57 @@ mod tests {
                 && entry.get("type").and_then(Value::as_str) != Some("text")),
             "tool result content must not contain text entries: {content:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn foreground_and_background_command_tools_block_raw_shell_delete_before_spawn() {
+        let workspace_root = std::env::temp_dir().join(format!(
+            "moondesk-mcp-destructive-command-guard-{}",
+            Uuid::new_v4()
+        ));
+        let protected = workspace_root.join("protected");
+        std::fs::create_dir_all(&protected).expect("create protected directory");
+        std::fs::write(protected.join("sentinel.txt"), "keep").expect("write sentinel");
+        let workspace_root_str = workspace_root.to_string_lossy().into_owned();
+        let workspace_id = WorkspaceId::test_default();
+        let command_jobs = CommandJobManager::new();
+
+        for tool_name in ["run_command", "start_command"] {
+            let req = tool_call_request(tool_name, json!({ "command": "rm -rf protected" }));
+            let response = handle_tools_call(
+                &req,
+                &workspace_root_str,
+                Mode::Both,
+                ToolMode::MultiTools,
+                false,
+                &command_jobs,
+                &None,
+            )
+            .await;
+
+            assert_eq!(
+                response
+                    .result
+                    .as_ref()
+                    .and_then(|result| result.get("isError"))
+                    .and_then(Value::as_bool),
+                Some(true),
+                "{tool_name} should reject raw shell deletion"
+            );
+            assert!(result_text(&response).contains("RAW_FILESYSTEM_DELETE_BLOCKED"));
+            assert!(
+                protected.join("sentinel.txt").exists(),
+                "{tool_name} must reject the command before spawning a shell"
+            );
+        }
+
+        assert!(
+            command_jobs
+                .list_for_workspace(&workspace_id, true)
+                .await
+                .is_empty()
+        );
+        let _ = std::fs::remove_dir_all(workspace_root);
     }
 
     #[test]
@@ -3634,11 +3692,18 @@ mod tests {
             .and_then(|result| result.get("structuredContent"))
             .expect("missing structured content");
         assert!(structured.get("toolName").is_none());
+        let instruction_text = structured
+            .get("instructionText")
+            .and_then(Value::as_str)
+            .expect("missing instructionText");
+        assert!(instruction_text.contains("do not escalate automatically"));
+        assert!(instruction_text.contains("git worktree remove/prune"));
+        assert!(instruction_text.contains("Never bypass delete"));
+        assert!(instruction_text.contains("Python, Node.js, Rust, compiled binaries"));
+        assert!(instruction_text.contains("current-drive root semantics"));
         assert!(
-            structured
-                .get("instructionText")
-                .and_then(Value::as_str)
-                .is_some()
+            instruction_text
+                .contains("empty, unresolved, malformed, or failed variable/path expression")
         );
         assert_eq!(
             structured.as_object().map(|value| value.len()),

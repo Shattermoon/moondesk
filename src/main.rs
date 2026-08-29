@@ -4426,7 +4426,25 @@ async fn wait_remote_debug_ready(port: u16, timeout: Duration) -> bool {
     false
 }
 
+fn is_managed_remote_browser_profile_dir(profile_dir: &Path) -> bool {
+    let temp_dir = std::env::temp_dir();
+    profile_dir.parent() == Some(temp_dir.as_path())
+        && profile_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("moondesk-remote-debug-"))
+}
+
 async fn remove_remote_browser_profile_dir(profile_dir: &Path) -> std::io::Result<()> {
+    if !is_managed_remote_browser_profile_dir(profile_dir) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "refusing to recursively remove non-MoonDesk browser profile path: {}",
+                profile_dir.display()
+            ),
+        ));
+    }
     match tokio::fs::remove_dir_all(profile_dir).await {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -7245,7 +7263,7 @@ mod tests {
     #[tokio::test]
     async fn remote_browser_profile_cleanup_removes_tree_and_tolerates_missing_directory() {
         let profile_dir = std::env::temp_dir().join(format!(
-            "moondesk-profile-cleanup-test-{}",
+            "moondesk-remote-debug-cleanup-test-{}",
             uuid::Uuid::new_v4()
         ));
         let nested = profile_dir.join("Default").join("Cache");
@@ -7263,6 +7281,28 @@ mod tests {
         remove_remote_browser_profile_dir(&profile_dir)
             .await
             .expect("missing browser profile should already be clean");
+    }
+
+    #[tokio::test]
+    async fn remote_browser_profile_cleanup_refuses_unmanaged_directory() {
+        let unmanaged = std::env::temp_dir().join(format!(
+            "unmanaged-browser-profile-{}",
+            uuid::Uuid::new_v4()
+        ));
+        tokio::fs::create_dir_all(&unmanaged)
+            .await
+            .expect("create unmanaged directory");
+        tokio::fs::write(unmanaged.join("sentinel.txt"), b"keep")
+            .await
+            .expect("write unmanaged sentinel");
+
+        let error = remove_remote_browser_profile_dir(&unmanaged)
+            .await
+            .expect_err("unmanaged recursive cleanup must be refused");
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(unmanaged.join("sentinel.txt").exists());
+
+        let _ = tokio::fs::remove_dir_all(unmanaged).await;
     }
 
     #[tokio::test]

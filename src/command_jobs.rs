@@ -120,7 +120,9 @@ struct OutputRootGuard {
 
 impl Drop for OutputRootGuard {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.path);
+        if is_managed_output_root(&self.path) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
     }
 }
 
@@ -491,6 +493,10 @@ fn output_root_owner_pid(path: &Path) -> Option<u32> {
     Uuid::parse_str(instance_id).ok()?;
     let pid = pid.parse::<u32>().ok()?;
     (pid != 0).then_some(pid)
+}
+
+fn is_managed_output_root(path: &Path) -> bool {
+    path.parent() == Some(std::env::temp_dir().as_path()) && output_root_owner_pid(path).is_some()
 }
 
 #[cfg(unix)]
@@ -1530,11 +1536,25 @@ mod tests {
             std::process::id()
         ));
         assert_eq!(output_root_owner_pid(&path), Some(std::process::id()));
+        assert!(is_managed_output_root(&path));
         assert!(process_is_live(std::process::id()));
         assert_eq!(
             output_root_owner_pid(&std::env::temp_dir().join("moondesk-command-output-invalid")),
             None
         );
+    }
+
+    #[test]
+    fn output_root_guard_refuses_unmanaged_recursive_cleanup() {
+        let path =
+            std::env::temp_dir().join(format!("unmanaged-command-output-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&path).expect("create unmanaged output directory");
+        std::fs::write(path.join("sentinel.txt"), "keep").expect("write sentinel");
+
+        drop(OutputRootGuard { path: path.clone() });
+        assert!(path.join("sentinel.txt").exists());
+
+        let _ = std::fs::remove_dir_all(path);
     }
 
     async fn wait_terminal(manager: &CommandJobManager, job_id: &str) -> CommandJobSnapshot {

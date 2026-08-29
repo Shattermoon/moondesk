@@ -13,79 +13,97 @@ pub const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 pub const MAX_TIMEOUT_MS: u64 = 120_000;
 pub const MOONDESK_CO_AUTHOR_TRAILER: &str = "Co-Authored-By: MoonDesk";
 
-fn raw_delete_command_regex() -> &'static Regex {
-    static REGEX: OnceLock<Regex> = OnceLock::new();
-    REGEX.get_or_init(|| {
-        Regex::new(
-            r#"(?i)(?:^|[;&|{}\r\n])\s*(?:sudo\s+)?[\"']?(?:microsoft\.powershell\.management[\\/])?(?:remove-item|rm|ri|rmdir|rd|del|erase|unlink)\b"#,
-        )
-        .expect("valid raw delete command regex")
+fn cached_safety_regex(
+    slot: &'static OnceLock<Result<Regex, String>>,
+    pattern: &'static str,
+    name: &'static str,
+) -> Result<&'static Regex, String> {
+    slot.get_or_init(|| {
+        Regex::new(pattern).map_err(|error| {
+            format!(
+                "code: COMMAND_SAFETY_INITIALIZATION_FAILED\nmessage: MoonDesk could not initialize the {name}; refusing to run shell commands until this internal safety error is fixed: {error}"
+            )
+        })
     })
+    .as_ref()
+    .map_err(Clone::clone)
 }
 
-fn nested_destructive_shell_regex() -> &'static Regex {
-    static REGEX: OnceLock<Regex> = OnceLock::new();
-    REGEX.get_or_init(|| {
-        Regex::new(
-            r#"(?i)(?:^|[;&|{}\r\n])\s*(?:cmd(?:\.exe)?\s+/(?:c|k)|(?:powershell|pwsh)(?:\.exe)?\s+[^;&|\r\n]*?(?:-command|-c)|(?:bash|sh|zsh|dash)\s+[^;&|\r\n]*?-[a-z]*c[a-z]*)\b[^;&|\r\n]*\b(?:remove-item|rm|ri|rmdir|rd|del|erase|unlink)\b"#,
-        )
-        .expect("valid nested destructive shell regex")
-    })
+fn raw_delete_command_regex() -> Result<&'static Regex, String> {
+    static REGEX: OnceLock<Result<Regex, String>> = OnceLock::new();
+    cached_safety_regex(
+        &REGEX,
+        r#"(?i)(?:^|[;&|{}\r\n])\s*(?:sudo\s+)?[\"']?(?:microsoft\.powershell\.management[\\/])?(?:remove-item|rm|ri|rmdir|rd|del|erase|unlink)\b"#,
+        "raw delete command matcher",
+    )
 }
 
-fn find_delete_regex() -> &'static Regex {
-    static REGEX: OnceLock<Regex> = OnceLock::new();
-    REGEX.get_or_init(|| {
-        Regex::new(r"(?i)(?:^|[;&|{}\r\n])\s*(?:sudo\s+)?find\b[^;&|\r\n]*\s-delete\b")
-            .expect("valid find delete regex")
-    })
+fn nested_destructive_shell_regex() -> Result<&'static Regex, String> {
+    static REGEX: OnceLock<Result<Regex, String>> = OnceLock::new();
+    cached_safety_regex(
+        &REGEX,
+        r#"(?i)(?:^|[;&|{}\r\n])\s*(?:cmd(?:\.exe)?\s+/(?:c|k)|(?:powershell|pwsh)(?:\.exe)?\s+[^;&|\r\n]*?(?:-command|-c)|(?:bash|sh|zsh|dash)\s+[^;&|\r\n]*?-[a-z]*c[a-z]*)\b[^;&|\r\n]*\b(?:remove-item|rm|ri|rmdir|rd|del|erase|unlink)\b"#,
+        "nested destructive shell matcher",
+    )
 }
 
-fn xargs_delete_regex() -> &'static Regex {
-    static REGEX: OnceLock<Regex> = OnceLock::new();
-    REGEX.get_or_init(|| {
-        Regex::new(r"(?i)(?:^|[;&|{}\r\n])\s*(?:sudo\s+)?xargs\b[^;&|\r\n]*\b(?:rm|rmdir|unlink)\b")
-            .expect("valid xargs delete regex")
-    })
+fn find_delete_regex() -> Result<&'static Regex, String> {
+    static REGEX: OnceLock<Result<Regex, String>> = OnceLock::new();
+    cached_safety_regex(
+        &REGEX,
+        r"(?i)(?:^|[;&|{}\r\n])\s*(?:sudo\s+)?find\b[^;&|\r\n]*\s-delete\b",
+        "find delete matcher",
+    )
 }
 
-fn disk_destructive_command_regex() -> &'static Regex {
-    static REGEX: OnceLock<Regex> = OnceLock::new();
-    REGEX.get_or_init(|| {
-        Regex::new(
-            r"(?i)(?:^|[;&|{}\r\n])\s*(?:sudo\s+)?(?:format(?:\.com)?|diskpart|clear-disk|initialize-disk|remove-partition|mkfs(?:\.[a-z0-9_-]+)?|wipefs|fdisk|parted)\b",
-        )
-        .expect("valid disk destructive command regex")
-    })
+fn xargs_delete_regex() -> Result<&'static Regex, String> {
+    static REGEX: OnceLock<Result<Regex, String>> = OnceLock::new();
+    cached_safety_regex(
+        &REGEX,
+        r"(?i)(?:^|[;&|{}\r\n])\s*(?:sudo\s+)?xargs\b[^;&|\r\n]*\b(?:rm|rmdir|unlink)\b",
+        "xargs delete matcher",
+    )
 }
 
-fn diskutil_erase_regex() -> &'static Regex {
-    static REGEX: OnceLock<Regex> = OnceLock::new();
-    REGEX.get_or_init(|| {
-        Regex::new(
-            r"(?i)(?:^|[;&|{}\r\n])\s*(?:sudo\s+)?diskutil\b[^;&|\r\n]*\berase(?:disk|volume)?\b",
-        )
-        .expect("valid diskutil erase regex")
-    })
+fn disk_destructive_command_regex() -> Result<&'static Regex, String> {
+    static REGEX: OnceLock<Result<Regex, String>> = OnceLock::new();
+    cached_safety_regex(
+        &REGEX,
+        r"(?i)(?:^|[;&|{}\r\n])\s*(?:sudo\s+)?(?:format(?:\.com)?|diskpart|clear-disk|initialize-disk|remove-partition|mkfs(?:\.[a-z0-9_-]+)?|wipefs|fdisk|parted)\b",
+        "disk destructive command matcher",
+    )
+}
+
+fn diskutil_erase_regex() -> Result<&'static Regex, String> {
+    static REGEX: OnceLock<Result<Regex, String>> = OnceLock::new();
+    cached_safety_regex(
+        &REGEX,
+        r"(?i)(?:^|[;&|{}\r\n])\s*(?:sudo\s+)?diskutil\b[^;&|\r\n]*\berase(?:disk|volume)?\b",
+        "diskutil erase matcher",
+    )
 }
 
 /// Reject destructive filesystem primitives that would bypass MoonDesk's
 /// workspace-contained file tools. Normal developer commands remain available;
 /// explicit deletion must go through the dedicated `delete` tool instead.
 pub fn validate_shell_command_safety(command: &str) -> Result<(), String> {
-    if disk_destructive_command_regex().is_match(command)
-        || diskutil_erase_regex().is_match(command)
-    {
+    let disk_destructive = disk_destructive_command_regex()?;
+    let diskutil_erase = diskutil_erase_regex()?;
+    if disk_destructive.is_match(command) || diskutil_erase.is_match(command) {
         return Err(
             "code: DESTRUCTIVE_DISK_COMMAND_BLOCKED\nmessage: MoonDesk blocks disk/partition destructive commands in the generic developer shell. Run disk administration manually outside MoonDesk if you intentionally need it."
                 .to_string(),
         );
     }
 
-    if raw_delete_command_regex().is_match(command)
-        || nested_destructive_shell_regex().is_match(command)
-        || find_delete_regex().is_match(command)
-        || xargs_delete_regex().is_match(command)
+    let raw_delete = raw_delete_command_regex()?;
+    let nested_delete = nested_destructive_shell_regex()?;
+    let find_delete = find_delete_regex()?;
+    let xargs_delete = xargs_delete_regex()?;
+    if raw_delete.is_match(command)
+        || nested_delete.is_match(command)
+        || find_delete.is_match(command)
+        || xargs_delete.is_match(command)
     {
         return Err(
             "code: RAW_FILESYSTEM_DELETE_BLOCKED\nmessage: MoonDesk blocks explicit shell deletion commands because shell quoting, variable expansion, absolute paths, and nested shells can escape the workspace. Use the dedicated `delete` tool for workspace-contained deletion, and split cleanup from any remaining shell command."

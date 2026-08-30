@@ -118,25 +118,194 @@ fn nested_safety_shell_payload(
     Ok(None)
 }
 
-fn validate_wrapped_command_tail(
+fn unsupported_wrapper_syntax_error(wrapper: &str, option: &str) -> String {
+    format!(
+        "code: OPAQUE_WRAPPED_COMMAND_BLOCKED\nmessage: MoonDesk could not safely identify the executable behind `{wrapper}` option `{option}`. Run the concrete developer command directly instead."
+    )
+}
+
+fn option_has_attached_value(word: &str, short: char) -> bool {
+    word.starts_with('-')
+        && !word.starts_with("--")
+        && word.chars().nth(1) == Some(short)
+        && word.len() > 2
+}
+
+fn wrapper_command_index(
+    wrapper: &str,
     words: &[ShellWord],
     start: usize,
-    depth: usize,
-) -> Result<(), String> {
-    for word in words.iter().skip(start) {
-        if is_raw_delete_command_name(&word.text) {
-            return Err(raw_filesystem_delete_blocked_error());
-        }
-        if is_disk_destructive_command_name(&word.text) {
-            return Err(destructive_disk_command_blocked_error());
-        }
-    }
+) -> Result<Option<usize>, String> {
+    let mut idx = start;
+    while idx < words.len() {
+        let word = words[idx].text.as_str();
+        let lower = words[idx].lower.as_str();
 
-    for idx in start..words.len() {
-        if let Some(payload) = nested_safety_shell_payload(words, idx)? {
-            validate_parsed_shell_command_contexts(payload, depth + 1)?;
-            break;
+        if word == "--" {
+            return Ok(words.get(idx + 1).map(|_| idx + 1));
         }
+
+        if wrapper == "env" && looks_like_env_assignment(word) {
+            idx += 1;
+            continue;
+        }
+
+        if !word.starts_with('-') || word == "-" {
+            return Ok(Some(idx));
+        }
+
+        let short_option = word
+            .strip_prefix('-')
+            .filter(|value| !value.starts_with('-'))
+            .and_then(|value| value.chars().next());
+        let long_takes_value = |options: &[&str]| {
+            options
+                .iter()
+                .any(|option| lower == *option || lower.starts_with(&format!("{option}=")))
+        };
+        let takes_value = match wrapper {
+            "sudo" => {
+                short_option.is_some_and(|option| {
+                    ['C', 'D', 'g', 'h', 'p', 'R', 'T', 'U', 'u', 'r', 't'].contains(&option)
+                }) || long_takes_value(&[
+                    "--close-from",
+                    "--chdir",
+                    "--group",
+                    "--host",
+                    "--prompt",
+                    "--chroot",
+                    "--command-timeout",
+                    "--user",
+                    "--role",
+                    "--type",
+                ])
+            }
+            "env" => {
+                short_option.is_some_and(|option| ['C', 'S', 'u'].contains(&option))
+                    || long_takes_value(&["--chdir", "--split-string", "--unset"])
+            }
+            "exec" => short_option == Some('a'),
+            _ => false,
+        };
+
+        let known_flag = match wrapper {
+            "sudo" => matches!(
+                lower,
+                "-a" | "-b"
+                    | "-e"
+                    | "-h"
+                    | "-k"
+                    | "-n"
+                    | "-p"
+                    | "-s"
+                    | "-v"
+                    | "--askpass"
+                    | "--background"
+                    | "--preserve-env"
+                    | "--help"
+                    | "--reset-timestamp"
+                    | "--non-interactive"
+                    | "--stdin"
+                    | "--validate"
+            ),
+            "env" => matches!(
+                lower,
+                "-0" | "--null"
+                    | "-i"
+                    | "--ignore-environment"
+                    | "--debug"
+                    | "--help"
+                    | "--version"
+            ),
+            "nohup" => matches!(lower, "--help" | "--version"),
+            "exec" => matches!(lower, "-c" | "-l"),
+            "builtin" => false,
+            "command" => matches!(lower, "-p"),
+            _ => false,
+        };
+
+        if takes_value {
+            let short = lower.chars().nth(1);
+            let attached = lower.contains('=')
+                || short.is_some_and(|short| option_has_attached_value(lower, short));
+            idx += if attached { 1 } else { 2 };
+            continue;
+        }
+        if known_flag {
+            idx += 1;
+            continue;
+        }
+
+        return Err(unsupported_wrapper_syntax_error(wrapper, word));
+    }
+    Ok(None)
+}
+
+fn xargs_command_index(words: &[ShellWord], start: usize) -> Result<Option<usize>, String> {
+    let mut idx = start;
+    while idx < words.len() {
+        let word = words[idx].text.as_str();
+        let lower = words[idx].lower.as_str();
+        if word == "--" {
+            return Ok(words.get(idx + 1).map(|_| idx + 1));
+        }
+        if !word.starts_with('-') || word == "-" {
+            return Ok(Some(idx));
+        }
+
+        let value_short = ['a', 'd', 'E', 'I', 'L', 'n', 'P', 's'];
+        let takes_short_value = word
+            .chars()
+            .nth(1)
+            .is_some_and(|ch| value_short.contains(&ch));
+        let takes_long_value = [
+            "--arg-file",
+            "--delimiter",
+            "--eof",
+            "--replace",
+            "--max-lines",
+            "--max-args",
+            "--max-procs",
+            "--max-chars",
+            "--process-slot-var",
+        ]
+        .iter()
+        .any(|option| lower == *option || lower.starts_with(&format!("{option}=")));
+        if takes_short_value || takes_long_value {
+            let attached = lower.contains('=') || (takes_short_value && word.len() > 2);
+            idx += if attached { 1 } else { 2 };
+            continue;
+        }
+
+        if matches!(
+            lower,
+            "-0" | "--null"
+                | "-o"
+                | "--open-tty"
+                | "-p"
+                | "--interactive"
+                | "-r"
+                | "--no-run-if-empty"
+                | "-t"
+                | "--verbose"
+                | "-x"
+                | "--exit"
+                | "--show-limits"
+                | "--help"
+                | "--version"
+        ) {
+            idx += 1;
+            continue;
+        }
+
+        return Err(unsupported_wrapper_syntax_error("xargs", word));
+    }
+    Ok(None)
+}
+
+fn validate_command_at(words: &[ShellWord], start: usize, depth: usize) -> Result<(), String> {
+    if start < words.len() {
+        validate_parsed_command_words(&words[start..], depth)?;
     }
     Ok(())
 }
@@ -170,20 +339,25 @@ fn validate_parsed_command_words(words: &[ShellWord], depth: usize) -> Result<()
         command.as_str(),
         "sudo" | "env" | "builtin" | "exec" | "nohup"
     ) {
-        validate_wrapped_command_tail(words, command_idx + 1, depth)?;
+        if let Some(wrapped_idx) = wrapper_command_index(&command, words, command_idx + 1)? {
+            validate_command_at(words, wrapped_idx, depth)?;
+        }
     } else if command == "command" {
         let lookup_only = words
             .iter()
             .skip(command_idx + 1)
             .take_while(|word| word.text.starts_with('-'))
             .any(|word| matches!(word.text.as_str(), "-v" | "-V"));
-        if !lookup_only {
-            validate_wrapped_command_tail(words, command_idx + 1, depth)?;
+        if !lookup_only
+            && let Some(wrapped_idx) = wrapper_command_index("command", words, command_idx + 1)?
+        {
+            validate_command_at(words, wrapped_idx, depth)?;
         }
     }
 
     if command == "find" {
-        for idx in command_idx + 1..words.len() {
+        let mut idx = command_idx + 1;
+        while idx < words.len() {
             if words[idx].lower == "-delete" {
                 return Err(raw_filesystem_delete_blocked_error());
             }
@@ -191,13 +365,20 @@ fn validate_parsed_command_words(words: &[ShellWord], depth: usize) -> Result<()
                 words[idx].lower.as_str(),
                 "-exec" | "-execdir" | "-ok" | "-okdir"
             ) {
-                validate_wrapped_command_tail(words, idx + 1, depth)?;
+                validate_command_at(words, idx + 1, depth)?;
+                idx += 2;
+                while idx < words.len() && !matches!(words[idx].text.as_str(), ";" | "+") {
+                    idx += 1;
+                }
             }
+            idx += 1;
         }
     }
 
-    if command == "xargs" {
-        validate_wrapped_command_tail(words, command_idx + 1, depth)?;
+    if command == "xargs"
+        && let Some(wrapped_idx) = xargs_command_index(words, command_idx + 1)?
+    {
+        validate_command_at(words, wrapped_idx, depth)?;
     }
 
     if let Some(payload) = nested_safety_shell_payload(words, command_idx)? {
@@ -867,7 +1048,14 @@ fn shell_words(segment: &str) -> Vec<ShellWord> {
             if start.is_none() {
                 start = Some(idx);
             }
-            escaped = true;
+            let bytes = current.as_bytes();
+            let is_windows_drive_path =
+                bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':';
+            if is_windows_drive_path {
+                current.push(ch);
+            } else {
+                escaped = true;
+            }
             continue;
         }
         if ch == '\'' && !in_double {
@@ -1269,6 +1457,11 @@ mod tests {
             "bash -lc 'if true; then rm -rf protected; fi'",
             "command rm -rf protected",
             "sudo -u root rm -rf protected",
+            "sudo --user=root rm -rf protected",
+            "env TARGET=protected rm -rf protected",
+            "nohup rm -rf protected",
+            "exec rm -rf protected",
+            "command -p rm -rf protected",
             "powershell -EncodedCommand ZABlAGwA",
             "eval 'rm -rf protected'",
             "Invoke-Expression 'Remove-Item -Recurse -Force protected'",
@@ -1299,10 +1492,12 @@ mod tests {
             "if true; then rm -rf protected; fi",
             "find protected -exec rm -rf {} +",
             "find protected -exec sh -c 'rm -rf \\\"$1\\\"' _ {} +",
+            "find protected -exec cat {} + -delete",
             "Write-Output $(Remove-Item -Recurse -Force protected)",
             "powershell -EncodedCommand ZABlAGwA",
             "eval 'rm -rf protected'",
             "Invoke-Expression 'Remove-Item -Recurse -Force protected'",
+            r#"& C:\Windows\System32\cmd.exe /c "rmdir /s /q C:\outside""#,
             "format D: /Q /Y",
             "Clear-Disk -Number 2 -RemoveData -Confirm:$false",
             "sudo mkfs.ext4 /dev/sdb1",
@@ -1351,6 +1546,14 @@ mod tests {
             "find . -type f -print0 | xargs -0 cat",
             "rg --files",
             "tree /f",
+            "sudo rg -n \"rm\" src",
+            "sudo -u nobody rg -n \"rm\" src",
+            "sudo -H rg -n \"rm\" src",
+            "sudo --user=nobody rg -n \"rm\" src",
+            "env PATTERN=rm rg -n \"rm\" src",
+            "find . -type f -exec rg -n \"rm\" {} +",
+            "find . -type f -exec rg -n \"-delete\" {} +",
+            "printf '%s\\n' src | xargs rg -n \"rm\"",
         ] {
             assert!(
                 validate_shell_command_safety(command).is_ok(),

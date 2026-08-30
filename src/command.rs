@@ -124,6 +124,11 @@ fn unsupported_wrapper_syntax_error(wrapper: &str, option: &str) -> String {
     )
 }
 
+fn opaque_env_split_string_error() -> String {
+    "code: OPAQUE_WRAPPED_COMMAND_BLOCKED\nmessage: MoonDesk blocks env -S/--split-string because it turns an opaque string into a command line that cannot be classified safely. Run the concrete developer command directly instead."
+        .to_string()
+}
+
 fn option_has_attached_value(word: &str, short: char) -> bool {
     word.starts_with('-')
         && !word.starts_with("--")
@@ -148,6 +153,14 @@ fn wrapper_command_index(
         if wrapper == "env" && looks_like_env_assignment(word) {
             idx += 1;
             continue;
+        }
+
+        if wrapper == "env"
+            && (word.starts_with("-S")
+                || lower == "--split-string"
+                || lower.starts_with("--split-string="))
+        {
+            return Err(opaque_env_split_string_error());
         }
 
         if !word.starts_with('-') || word == "-" {
@@ -181,8 +194,8 @@ fn wrapper_command_index(
                 ])
             }
             "env" => {
-                short_option.is_some_and(|option| ['C', 'S', 'u'].contains(&option))
-                    || long_takes_value(&["--chdir", "--split-string", "--unset"])
+                short_option.is_some_and(|option| ['C', 'u'].contains(&option))
+                    || long_takes_value(&["--chdir", "--unset"])
             }
             "exec" => short_option == Some('a'),
             _ => false,
@@ -194,7 +207,9 @@ fn wrapper_command_index(
                 "-a" | "-b"
                     | "-e"
                     | "-h"
+                    | "-i"
                     | "-k"
+                    | "-l"
                     | "-n"
                     | "-p"
                     | "-s"
@@ -203,10 +218,13 @@ fn wrapper_command_index(
                     | "--background"
                     | "--preserve-env"
                     | "--help"
+                    | "--login"
+                    | "--list"
                     | "--reset-timestamp"
                     | "--non-interactive"
                     | "--stdin"
                     | "--validate"
+                    | "--version"
             ),
             "env" => matches!(
                 lower,
@@ -303,14 +321,23 @@ fn xargs_command_index(words: &[ShellWord], start: usize) -> Result<Option<usize
     Ok(None)
 }
 
-fn validate_command_at(words: &[ShellWord], start: usize, depth: usize) -> Result<(), String> {
+fn validate_command_at(
+    words: &[ShellWord],
+    start: usize,
+    depth: usize,
+    backslash_is_path_separator: bool,
+) -> Result<(), String> {
     if start < words.len() {
-        validate_parsed_command_words(&words[start..], depth)?;
+        validate_parsed_command_words(&words[start..], depth, backslash_is_path_separator)?;
     }
     Ok(())
 }
 
-fn validate_parsed_command_words(words: &[ShellWord], depth: usize) -> Result<(), String> {
+fn validate_parsed_command_words(
+    words: &[ShellWord],
+    depth: usize,
+    backslash_is_path_separator: bool,
+) -> Result<(), String> {
     let Some(command_idx) = first_non_assignment_word(words) else {
         return Ok(());
     };
@@ -340,7 +367,7 @@ fn validate_parsed_command_words(words: &[ShellWord], depth: usize) -> Result<()
         "sudo" | "env" | "builtin" | "exec" | "nohup"
     ) {
         if let Some(wrapped_idx) = wrapper_command_index(&command, words, command_idx + 1)? {
-            validate_command_at(words, wrapped_idx, depth)?;
+            validate_command_at(words, wrapped_idx, depth, backslash_is_path_separator)?;
         }
     } else if command == "command" {
         let lookup_only = words
@@ -351,7 +378,7 @@ fn validate_parsed_command_words(words: &[ShellWord], depth: usize) -> Result<()
         if !lookup_only
             && let Some(wrapped_idx) = wrapper_command_index("command", words, command_idx + 1)?
         {
-            validate_command_at(words, wrapped_idx, depth)?;
+            validate_command_at(words, wrapped_idx, depth, backslash_is_path_separator)?;
         }
     }
 
@@ -365,7 +392,7 @@ fn validate_parsed_command_words(words: &[ShellWord], depth: usize) -> Result<()
                 words[idx].lower.as_str(),
                 "-exec" | "-execdir" | "-ok" | "-okdir"
             ) {
-                validate_command_at(words, idx + 1, depth)?;
+                validate_command_at(words, idx + 1, depth, backslash_is_path_separator)?;
                 idx += 2;
                 while idx < words.len() && !matches!(words[idx].text.as_str(), ";" | "+") {
                     idx += 1;
@@ -378,17 +405,29 @@ fn validate_parsed_command_words(words: &[ShellWord], depth: usize) -> Result<()
     if command == "xargs"
         && let Some(wrapped_idx) = xargs_command_index(words, command_idx + 1)?
     {
-        validate_command_at(words, wrapped_idx, depth)?;
+        validate_command_at(words, wrapped_idx, depth, backslash_is_path_separator)?;
     }
 
     if let Some(payload) = nested_safety_shell_payload(words, command_idx)? {
-        validate_parsed_shell_command_contexts(payload, depth + 1)?;
+        validate_parsed_shell_command_contexts_with_backslash_policy(
+            payload,
+            depth + 1,
+            backslash_is_path_separator,
+        )?;
     }
 
     Ok(())
 }
 
 fn validate_parsed_shell_command_contexts(command: &str, depth: usize) -> Result<(), String> {
+    validate_parsed_shell_command_contexts_with_backslash_policy(command, depth, cfg!(windows))
+}
+
+fn validate_parsed_shell_command_contexts_with_backslash_policy(
+    command: &str,
+    depth: usize,
+    backslash_is_path_separator: bool,
+) -> Result<(), String> {
     if depth > 8 {
         return Err(
             "code: SHELL_COMMAND_NESTING_BLOCKED\nmessage: MoonDesk refused an excessively nested shell command because it could not safely establish its filesystem effects."
@@ -409,7 +448,8 @@ fn validate_parsed_shell_command_contexts(command: &str, depth: usize) -> Result
                         "code: COMMAND_SAFETY_PARSE_FAILED\nmessage: MoonDesk could not inspect a parsed shell command safely: {error}"
                     )
                 })?;
-            validate_parsed_command_words(&shell_words(text), depth)?;
+            let words = shell_words_with_backslash_policy(text, backslash_is_path_separator);
+            validate_parsed_command_words(&words, depth, backslash_is_path_separator)?;
         }
         let mut cursor = node.walk();
         for child in node.named_children(&mut cursor) {
@@ -1028,6 +1068,13 @@ struct NestedShellCommand {
 }
 
 fn shell_words(segment: &str) -> Vec<ShellWord> {
+    shell_words_with_backslash_policy(segment, cfg!(windows))
+}
+
+fn shell_words_with_backslash_policy(
+    segment: &str,
+    backslash_is_path_separator: bool,
+) -> Vec<ShellWord> {
     let mut words = Vec::new();
     let mut current = String::new();
     let mut start: Option<usize> = None;
@@ -1048,10 +1095,7 @@ fn shell_words(segment: &str) -> Vec<ShellWord> {
             if start.is_none() {
                 start = Some(idx);
             }
-            if cfg!(windows) {
-                // MoonDesk uses PowerShell as the host shell on Windows. In
-                // PowerShell a backslash is a path separator, not an escape
-                // character, so preserve it for executable classification.
+            if backslash_is_path_separator {
                 current.push(ch);
             } else {
                 escaped = true;
@@ -1477,6 +1521,23 @@ mod tests {
     }
 
     #[test]
+    fn shell_safety_blocks_env_split_string_execution() {
+        for command in [
+            "env -S \"rm -rf protected\"",
+            "env -Srm -rf protected",
+            "env --split-string \"rm -rf protected\"",
+            "env --split-string=\"rm -rf protected\"",
+        ] {
+            let error = validate_shell_command_safety(command)
+                .expect_err("env split-string execution must be blocked");
+            assert!(
+                error.contains("OPAQUE_WRAPPED_COMMAND_BLOCKED"),
+                "unexpected error for {command}: {error}"
+            );
+        }
+    }
+
+    #[test]
     fn parsed_context_guard_catches_existing_destructive_cases_without_raw_text_scan() {
         for command in [
             "Remove-Item -LiteralPath '.worktrees/boundary' -Recurse -Force",
@@ -1509,9 +1570,15 @@ mod tests {
         }
     }
 
-    #[cfg(windows)]
     #[test]
-    fn parsed_context_guard_blocks_windows_nested_shell_paths() {
+    fn parsed_context_guard_blocks_windows_nested_shell_paths_with_windows_policy() {
+        let windows_words =
+            shell_words_with_backslash_policy(r"C:\Windows\System32\cmd.exe /c echo ok", true);
+        let unix_words =
+            shell_words_with_backslash_policy(r"C:\Windows\System32\cmd.exe /c echo ok", false);
+        assert_eq!(windows_words[0].text, r"C:\Windows\System32\cmd.exe");
+        assert_eq!(unix_words[0].text, "C:WindowsSystem32cmd.exe");
+
         for command in [
             r#"& C:\Windows\System32\cmd.exe /c "rmdir /s /q C:\outside""#,
             r#"& "C:\Windows\System32\cmd.exe" /c "rmdir /s /q C:\outside""#,
@@ -1519,7 +1586,8 @@ mod tests {
             r#"& \\localhost\C$\Windows\System32\cmd.exe /c "rmdir /s /q C:\outside""#,
         ] {
             assert!(
-                validate_parsed_shell_command_contexts(command, 0).is_err(),
+                validate_parsed_shell_command_contexts_with_backslash_policy(command, 0, true)
+                    .is_err(),
                 "Windows parsed context guard should reject: {command}"
             );
         }
@@ -1565,6 +1633,11 @@ mod tests {
             "sudo -u nobody rg -n \"rm\" src",
             "sudo -H rg -n \"rm\" src",
             "sudo --user=nobody rg -n \"rm\" src",
+            "sudo -i cargo build",
+            "sudo --login cargo build",
+            "sudo -l",
+            "sudo --list",
+            "sudo --version",
             "env PATTERN=rm rg -n \"rm\" src",
             "find . -type f -exec rg -n \"rm\" {} +",
             "find . -type f -exec rg -n \"-delete\" {} +",

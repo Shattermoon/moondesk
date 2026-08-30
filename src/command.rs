@@ -1497,10 +1497,6 @@ mod tests {
             "powershell -EncodedCommand ZABlAGwA",
             "eval 'rm -rf protected'",
             "Invoke-Expression 'Remove-Item -Recurse -Force protected'",
-            r#"& C:\Windows\System32\cmd.exe /c "rmdir /s /q C:\outside""#,
-            r#"& "C:\Windows\System32\cmd.exe" /c "rmdir /s /q C:\outside""#,
-            r#"& $env:SystemRoot\System32\cmd.exe /c "rmdir /s /q C:\outside""#,
-            r#"& \\localhost\C$\Windows\System32\cmd.exe /c "rmdir /s /q C:\outside""#,
             "format D: /Q /Y",
             "Clear-Disk -Number 2 -RemoveData -Confirm:$false",
             "sudo mkfs.ext4 /dev/sdb1",
@@ -1509,6 +1505,22 @@ mod tests {
             assert!(
                 validate_parsed_shell_command_contexts(command, 0).is_err(),
                 "parsed context guard should reject: {command}"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn parsed_context_guard_blocks_windows_nested_shell_paths() {
+        for command in [
+            r#"& C:\Windows\System32\cmd.exe /c "rmdir /s /q C:\outside""#,
+            r#"& "C:\Windows\System32\cmd.exe" /c "rmdir /s /q C:\outside""#,
+            r#"& $env:SystemRoot\System32\cmd.exe /c "rmdir /s /q C:\outside""#,
+            r#"& \\localhost\C$\Windows\System32\cmd.exe /c "rmdir /s /q C:\outside""#,
+        ] {
+            assert!(
+                validate_parsed_shell_command_contexts(command, 0).is_err(),
+                "Windows parsed context guard should reject: {command}"
             );
         }
     }

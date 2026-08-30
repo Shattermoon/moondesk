@@ -1048,10 +1048,10 @@ fn shell_words(segment: &str) -> Vec<ShellWord> {
             if start.is_none() {
                 start = Some(idx);
             }
-            let bytes = current.as_bytes();
-            let is_windows_drive_path =
-                bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':';
-            if is_windows_drive_path {
+            if cfg!(windows) {
+                // MoonDesk uses PowerShell as the host shell on Windows. In
+                // PowerShell a backslash is a path separator, not an escape
+                // character, so preserve it for executable classification.
                 current.push(ch);
             } else {
                 escaped = true;
@@ -1498,6 +1498,9 @@ mod tests {
             "eval 'rm -rf protected'",
             "Invoke-Expression 'Remove-Item -Recurse -Force protected'",
             r#"& C:\Windows\System32\cmd.exe /c "rmdir /s /q C:\outside""#,
+            r#"& "C:\Windows\System32\cmd.exe" /c "rmdir /s /q C:\outside""#,
+            r#"& $env:SystemRoot\System32\cmd.exe /c "rmdir /s /q C:\outside""#,
+            r#"& \\localhost\C$\Windows\System32\cmd.exe /c "rmdir /s /q C:\outside""#,
             "format D: /Q /Y",
             "Clear-Disk -Number 2 -RemoveData -Confirm:$false",
             "sudo mkfs.ext4 /dev/sdb1",

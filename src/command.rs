@@ -1,7 +1,5 @@
-use regex::Regex;
 use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
-use std::sync::OnceLock;
 use tree_sitter::{Node, Parser};
 use tree_sitter_bash::LANGUAGE as BASH_LANGUAGE;
 
@@ -12,76 +10,6 @@ const MAX_BUFFER_BYTES: usize = 1024 * 1024;
 pub const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 pub const MAX_TIMEOUT_MS: u64 = 120_000;
 pub const MOONDESK_CO_AUTHOR_TRAILER: &str = "Co-Authored-By: MoonDesk";
-
-fn cached_safety_regex(
-    slot: &'static OnceLock<Result<Regex, String>>,
-    pattern: &'static str,
-    name: &'static str,
-) -> Result<&'static Regex, String> {
-    slot.get_or_init(|| {
-        Regex::new(pattern).map_err(|error| {
-            format!(
-                "code: COMMAND_SAFETY_INITIALIZATION_FAILED\nmessage: MoonDesk could not initialize the {name}; refusing to run shell commands until this internal safety error is fixed: {error}"
-            )
-        })
-    })
-    .as_ref()
-    .map_err(Clone::clone)
-}
-
-fn raw_delete_command_regex() -> Result<&'static Regex, String> {
-    static REGEX: OnceLock<Result<Regex, String>> = OnceLock::new();
-    cached_safety_regex(
-        &REGEX,
-        r#"(?i)(?:^|[;&|{}\r\n])\s*(?:sudo\s+)?[\"']?(?:microsoft\.powershell\.management[\\/])?(?:remove-item|rm|ri|rmdir|rd|del|erase|unlink)\b"#,
-        "raw delete command matcher",
-    )
-}
-
-fn nested_destructive_shell_regex() -> Result<&'static Regex, String> {
-    static REGEX: OnceLock<Result<Regex, String>> = OnceLock::new();
-    cached_safety_regex(
-        &REGEX,
-        r#"(?i)(?:^|[;&|{}\r\n])\s*(?:cmd(?:\.exe)?\s+/(?:c|k)|(?:powershell|pwsh)(?:\.exe)?\s+[^;&|\r\n]*?(?:-command|-c)|(?:bash|sh|zsh|dash)\s+[^;&|\r\n]*?-[a-z]*c[a-z]*)\b[^;&|\r\n]*\b(?:remove-item|rm|ri|rmdir|rd|del|erase|unlink)\b"#,
-        "nested destructive shell matcher",
-    )
-}
-
-fn find_delete_regex() -> Result<&'static Regex, String> {
-    static REGEX: OnceLock<Result<Regex, String>> = OnceLock::new();
-    cached_safety_regex(
-        &REGEX,
-        r"(?i)(?:^|[;&|{}\r\n])\s*(?:sudo\s+)?find\b[^;&|\r\n]*\s-delete\b",
-        "find delete matcher",
-    )
-}
-
-fn xargs_delete_regex() -> Result<&'static Regex, String> {
-    static REGEX: OnceLock<Result<Regex, String>> = OnceLock::new();
-    cached_safety_regex(
-        &REGEX,
-        r"(?i)(?:^|[;&|{}\r\n])\s*(?:sudo\s+)?xargs\b[^;&|\r\n]*\b(?:rm|rmdir|unlink)\b",
-        "xargs delete matcher",
-    )
-}
-
-fn disk_destructive_command_regex() -> Result<&'static Regex, String> {
-    static REGEX: OnceLock<Result<Regex, String>> = OnceLock::new();
-    cached_safety_regex(
-        &REGEX,
-        r"(?i)(?:^|[;&|{}\r\n])\s*(?:sudo\s+)?(?:format(?:\.com)?|diskpart|clear-disk|initialize-disk|remove-partition|mkfs(?:\.[a-z0-9_-]+)?|wipefs|fdisk|parted)\b",
-        "disk destructive command matcher",
-    )
-}
-
-fn diskutil_erase_regex() -> Result<&'static Regex, String> {
-    static REGEX: OnceLock<Result<Regex, String>> = OnceLock::new();
-    cached_safety_regex(
-        &REGEX,
-        r"(?i)(?:^|[;&|{}\r\n])\s*(?:sudo\s+)?diskutil\b[^;&|\r\n]*\berase(?:disk|volume)?\b",
-        "diskutil erase matcher",
-    )
-}
 
 fn raw_filesystem_delete_blocked_error() -> String {
     "code: RAW_FILESYSTEM_DELETE_BLOCKED\nmessage: MoonDesk blocks explicit shell deletion commands because shell quoting, variable expansion, absolute paths, and nested shells can escape the workspace. Use the dedicated `delete` tool for workspace-contained deletion, and split cleanup from any remaining shell command."
@@ -102,10 +30,11 @@ fn safety_command_basename(word: &str) -> String {
 }
 
 fn is_raw_delete_command_name(word: &str) -> bool {
+    let command = safety_command_basename(word);
     matches!(
-        safety_command_basename(word).as_str(),
+        command.as_str(),
         "remove-item" | "rm" | "ri" | "rmdir" | "rd" | "del" | "erase" | "unlink"
-    )
+    ) || command == "microsoft.powershell.managementremove-item"
 }
 
 fn is_disk_destructive_command_name(word: &str) -> bool {
@@ -255,6 +184,9 @@ fn validate_parsed_command_words(words: &[ShellWord], depth: usize) -> Result<()
 
     if command == "find" {
         for idx in command_idx + 1..words.len() {
+            if words[idx].lower == "-delete" {
+                return Err(raw_filesystem_delete_blocked_error());
+            }
             if matches!(
                 words[idx].lower.as_str(),
                 "-exec" | "-execdir" | "-ok" | "-okdir"
@@ -310,27 +242,7 @@ fn validate_parsed_shell_command_contexts(command: &str, depth: usize) -> Result
 /// workspace-contained file tools. Normal developer commands remain available;
 /// explicit deletion must go through the dedicated `delete` tool instead.
 pub fn validate_shell_command_safety(command: &str) -> Result<(), String> {
-    validate_parsed_shell_command_contexts(command, 0)?;
-
-    let disk_destructive = disk_destructive_command_regex()?;
-    let diskutil_erase = diskutil_erase_regex()?;
-    if disk_destructive.is_match(command) || diskutil_erase.is_match(command) {
-        return Err(destructive_disk_command_blocked_error());
-    }
-
-    let raw_delete = raw_delete_command_regex()?;
-    let nested_delete = nested_destructive_shell_regex()?;
-    let find_delete = find_delete_regex()?;
-    let xargs_delete = xargs_delete_regex()?;
-    if raw_delete.is_match(command)
-        || nested_delete.is_match(command)
-        || find_delete.is_match(command)
-        || xargs_delete.is_match(command)
-    {
-        return Err(raw_filesystem_delete_blocked_error());
-    }
-
-    Ok(())
+    validate_parsed_shell_command_contexts(command, 0)
 }
 
 #[derive(Debug)]
@@ -1372,6 +1284,38 @@ mod tests {
     }
 
     #[test]
+    fn parsed_context_guard_catches_existing_destructive_cases_without_raw_text_scan() {
+        for command in [
+            "Remove-Item -LiteralPath '.worktrees/boundary' -Recurse -Force",
+            "rm -rf .worktrees/boundary",
+            "rmdir /s /q .worktrees\\boundary",
+            "& 'Remove-Item' -LiteralPath '.worktrees/boundary' -Recurse -Force",
+            "Microsoft.PowerShell.Management\\Remove-Item -LiteralPath '.worktrees/boundary' -Recurse -Force",
+            "bash -lc 'rm -rf .worktrees/boundary'",
+            "cmd /c \"rmdir /s /q .worktrees\\boundary\"",
+            "powershell -Command \"Remove-Item -LiteralPath '.worktrees/boundary' -Recurse -Force\"",
+            "find .worktrees -type f -delete",
+            "printf '%s\\n' stale | xargs rm -f",
+            "if true; then rm -rf protected; fi",
+            "find protected -exec rm -rf {} +",
+            "find protected -exec sh -c 'rm -rf \\\"$1\\\"' _ {} +",
+            "Write-Output $(Remove-Item -Recurse -Force protected)",
+            "powershell -EncodedCommand ZABlAGwA",
+            "eval 'rm -rf protected'",
+            "Invoke-Expression 'Remove-Item -Recurse -Force protected'",
+            "format D: /Q /Y",
+            "Clear-Disk -Number 2 -RemoveData -Confirm:$false",
+            "sudo mkfs.ext4 /dev/sdb1",
+            "diskutil eraseDisk APFS Scratch /dev/disk4",
+        ] {
+            assert!(
+                validate_parsed_shell_command_contexts(command, 0).is_err(),
+                "parsed context guard should reject: {command}"
+            );
+        }
+    }
+
+    #[test]
     fn shell_safety_blocks_disk_destructive_commands() {
         for command in [
             "format D: /Q /Y",
@@ -1398,6 +1342,15 @@ mod tests {
             "Write-Output 'rm -rf is blocked by MoonDesk'",
             "printf '%s\\n' 'rm -rf protected'",
             "command -v rm",
+            "rg -n \"Remove-Item|rm -rf\" src",
+            "git grep -nE \"rm|rmdir|Remove-Item\" -- src",
+            "grep -R -E \"rm|rmdir|Remove-Item\" src",
+            "Get-ChildItem -Recurse -File | Select-String -Pattern 'rm|rmdir|Remove-Item'",
+            "Get-ChildItem -Recurse -File | ForEach-Object { Get-Content $_.FullName }",
+            "find . -type f -exec cat {} +",
+            "find . -type f -print0 | xargs -0 cat",
+            "rg --files",
+            "tree /f",
         ] {
             assert!(
                 validate_shell_command_safety(command).is_ok(),

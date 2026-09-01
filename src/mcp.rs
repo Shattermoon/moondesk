@@ -2721,29 +2721,57 @@ mod tests {
         ));
         std::fs::create_dir_all(&workspace_root).expect("create workspace");
         let workspace_root_str = workspace_root.to_string_lossy().into_owned();
-        let command = "Get-Process node -ErrorAction SilentlyContinue | Select-Object Id,ProcessName,Path | Format-Table -AutoSize";
-        let req = tool_call_request("run_command", json!({ "command": command }));
-        let response = handle_tools_call(
-            &req,
+        let command_jobs = CommandJobManager::new();
+
+        // Preserve the exact user-reported command as a regression. A clean CI
+        // runner may not have any `node` processes, in which case PowerShell can
+        // return a non-zero exit status. The important contract here is that
+        // MoonDesk actually executes the command instead of rejecting it before
+        // spawn; executed shell results always carry structuredContent.
+        let reported_command = "Get-Process node -ErrorAction SilentlyContinue | Select-Object Id,ProcessName,Path | Format-Table -AutoSize";
+        let reported_response = handle_tools_call(
+            &tool_call_request("run_command", json!({ "command": reported_command })),
             &workspace_root_str,
             Mode::Both,
             ToolMode::MultiTools,
             false,
-            &CommandJobManager::new(),
+            &command_jobs,
             &None,
         )
         .await;
+        assert!(
+            reported_response
+                .result
+                .as_ref()
+                .and_then(|result| result.get("structuredContent"))
+                .is_some(),
+            "reported PowerShell process-inspection pipeline must reach real shell execution"
+        );
 
+        // Use the PowerShell host itself for the success assertion so the test is
+        // independent of whichever developer processes happen to exist on CI.
+        let guaranteed_command =
+            "Get-Process -Id $PID | Select-Object Id,ProcessName,Path | Format-Table -AutoSize";
+        let guaranteed_response = handle_tools_call(
+            &tool_call_request("run_command", json!({ "command": guaranteed_command })),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &None,
+        )
+        .await;
         assert_ne!(
-            response
+            guaranteed_response
                 .result
                 .as_ref()
                 .and_then(|result| result.get("isError"))
                 .and_then(Value::as_bool),
             Some(true),
-            "normal PowerShell process inspection pipeline must not be blocked"
+            "guaranteed PowerShell process-inspection pipeline must succeed"
         );
-        let structured = response
+        let structured = guaranteed_response
             .result
             .as_ref()
             .and_then(|result| result.get("structuredContent"))

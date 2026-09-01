@@ -805,15 +805,20 @@ pub fn normalize_ngrok_domain(value: &str) -> Result<Option<String>, String> {
     Ok(Some(host))
 }
 
+fn format_hms_in_offset(now: time::OffsetDateTime, offset: time::UtcOffset) -> String {
+    let local = now.to_offset(offset);
+    format!(
+        "{:02}:{:02}:{:02}",
+        local.hour(),
+        local.minute(),
+        local.second()
+    )
+}
+
 fn now_hms() -> String {
-    let secs = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let h = (secs % 86400) / 3600;
-    let m = (secs % 3600) / 60;
-    let s = secs % 60;
-    format!("{h:02}:{m:02}:{s:02}")
+    let now = time::OffsetDateTime::now_utc();
+    let offset = time::UtcOffset::current_local_offset().unwrap_or(time::UtcOffset::UTC);
+    format_hms_in_offset(now, offset)
 }
 
 fn now_unix_millis() -> u128 {
@@ -1938,6 +1943,14 @@ mod tests {
     use super::*;
 
     const LEGACY_CONFIG_FIXTURE: &str = include_str!("../tests/fixtures/legacy_config.toml");
+
+    #[test]
+    fn wall_clock_time_applies_local_offset_across_midnight() {
+        let utc = time::macros::datetime!(2026-09-01 19:41:25 UTC);
+        let ist = time::macros::offset!(+5:30);
+
+        assert_eq!(format_hms_in_offset(utc, ist), "01:11:25");
+    }
 
     #[test]
     fn ui_event_channel_is_bounded_and_reports_drops() {

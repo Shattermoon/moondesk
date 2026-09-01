@@ -817,7 +817,7 @@ fn format_hms_in_offset(now: time::OffsetDateTime, offset: time::UtcOffset) -> S
 
 fn now_hms() -> String {
     let now = time::OffsetDateTime::now_utc();
-    let offset = time::UtcOffset::current_local_offset().unwrap_or(time::UtcOffset::UTC);
+    let offset = time::UtcOffset::local_offset_at(now).unwrap_or(time::UtcOffset::UTC);
     format_hms_in_offset(now, offset)
 }
 

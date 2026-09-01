@@ -1430,6 +1430,10 @@ fn parse_clippymoon_export_args(args: &[String]) -> Result<Option<ClippyMoonExpo
     Ok(Some(ClippyMoonExportArgs { seed, output_dir }))
 }
 
+fn cli_version_requested(args: &[String]) -> bool {
+    matches!(args, [arg] if arg == "--version" || arg == "-V")
+}
+
 fn print_clippymoon_export(export: &mascot::ClippyMoonExport) {
     println!("ClippyMoon exported");
     println!("seed: {:016x}", export.seed);
@@ -1593,6 +1597,11 @@ async fn attach_workspace_to_running_host(
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli_args = std::env::args().skip(1).collect::<Vec<_>>();
+    if cli_version_requested(&cli_args) {
+        println!("{}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+
     match parse_clippymoon_export_args(&cli_args) {
         Ok(Some(export_args)) => {
             let export = mascot::export_clippymoon(export_args.seed, &export_args.output_dir)?;
@@ -7144,6 +7153,22 @@ mod tests {
         let args = vec!["clippymoon".to_string(), "--help".to_string()];
         let error = parse_clippymoon_export_args(&args).expect_err("help should return usage text");
         assert!(error.starts_with("usage: moondesk clippymoon export"));
+    }
+
+    #[test]
+    fn version_flags_only_intercept_top_level_version_requests() {
+        for flag in ["--version", "-V"] {
+            assert!(super::cli_version_requested(&[flag.to_string()]));
+        }
+        assert!(!super::cli_version_requested(&[]));
+        assert!(!super::cli_version_requested(&[
+            "clippymoon".to_string(),
+            "--version".to_string(),
+        ]));
+        assert!(!super::cli_version_requested(&[
+            "--version".to_string(),
+            "extra".to_string(),
+        ]));
     }
 
     #[test]

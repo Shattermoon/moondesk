@@ -14,6 +14,7 @@ use crate::command_jobs::{
 };
 use crate::devtools::DevtoolsManager;
 use crate::state::{AgentsPathMode, Mode, ToolMode, load_app_config, user_home_dir};
+use crate::vision;
 use crate::workspace_tools;
 use crate::workspaces::{self, WorkspaceAvailability, WorkspaceId};
 
@@ -160,6 +161,46 @@ fn local_tool_output_schema(name: &str) -> Option<Value> {
         "search" => {
             properties.insert("text".to_string(), json!({ "type": "string" }));
             properties.insert("truncated".to_string(), json!({ "type": "boolean" }));
+        }
+        "view_image" => {
+            for field in [
+                "sourceWidth",
+                "sourceHeight",
+                "width",
+                "height",
+                "sourceBytes",
+                "encodedBytes",
+            ] {
+                properties.insert(
+                    field.to_string(),
+                    json!({ "type": "integer", "minimum": 0 }),
+                );
+            }
+            properties.insert("path".to_string(), json!({ "type": "string" }));
+            properties.insert("mimeType".to_string(), json!({ "type": "string" }));
+            properties.insert("resized".to_string(), json!({ "type": "boolean" }));
+        }
+        "view_images" => {
+            properties.insert(
+                "count".to_string(),
+                json!({ "type": "integer", "minimum": 0 }),
+            );
+            properties.insert(
+                "images".to_string(),
+                json!({ "type": "array", "items": { "type": "object" } }),
+            );
+        }
+        "view_page" => {
+            for field in ["width", "height", "encodedBytes"] {
+                properties.insert(
+                    field.to_string(),
+                    json!({ "type": "integer", "minimum": 0 }),
+                );
+            }
+            properties.insert("mimeType".to_string(), json!({ "type": "string" }));
+            properties.insert("resized".to_string(), json!({ "type": "boolean" }));
+            properties.insert("fullPage".to_string(), json!({ "type": "boolean" }));
+            properties.insert("cleanupWarning".to_string(), json!({ "type": "string" }));
         }
         "write" | "delete" => return None,
         "edit" => {
@@ -418,6 +459,36 @@ async fn handle_tools_list(
             "annotations": { "readOnlyHint": true, "openWorldHint": false, "destructiveHint": false }
         }));
         tools.push(json!({
+            "name": "view_image",
+            "title": "View image",
+            "description": "Load a local raster image and attach its pixels to the tool response so the model can actually inspect it visually. Relative paths stay inside the workspace; an explicit absolute path may point to another readable local file when the task requires it. MoonDesk automatically applies image orientation and bounds/compresses large files for the vision context.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Image path relative to workspace root, or an explicit absolute path to a readable local image" },
+                    "max_dimension": { "type": "integer", "minimum": 1, "maximum": vision::MAX_REQUESTED_DIMENSION, "description": format!("Maximum output width or height in pixels (default {}, maximum {})", vision::DEFAULT_MAX_DIMENSION, vision::MAX_REQUESTED_DIMENSION) },
+                    "quality": { "type": "integer", "minimum": vision::MIN_JPEG_QUALITY, "maximum": vision::MAX_JPEG_QUALITY, "description": format!("JPEG preview quality when lossy compression is needed (default {})", vision::DEFAULT_JPEG_QUALITY) }
+                },
+                "required": ["path"]
+            },
+            "annotations": { "readOnlyHint": true, "openWorldHint": false, "destructiveHint": false }
+        }));
+        tools.push(json!({
+            "name": "view_images",
+            "title": "View images",
+            "description": "Load several local raster images in one call and attach each image to the response for direct visual comparison. Use this for photo sets, design variants, screenshots, or other tasks where appearance matters. The order of returned images matches the paths array. Large images are automatically resized/compressed to keep the multimodal response bounded.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "paths": { "type": "array", "minItems": 1, "maxItems": vision::MAX_BATCH_IMAGES, "items": { "type": "string" }, "description": format!("Image paths to inspect together (maximum {})", vision::MAX_BATCH_IMAGES) },
+                    "max_dimension": { "type": "integer", "minimum": 1, "maximum": vision::MAX_REQUESTED_DIMENSION, "description": format!("Maximum output width or height per image (default {}, maximum {})", vision::DEFAULT_BATCH_MAX_DIMENSION, vision::MAX_REQUESTED_DIMENSION) },
+                    "quality": { "type": "integer", "minimum": vision::MIN_JPEG_QUALITY, "maximum": vision::MAX_JPEG_QUALITY, "description": format!("JPEG preview quality when lossy compression is needed (default {})", vision::DEFAULT_JPEG_QUALITY) }
+                },
+                "required": ["paths"]
+            },
+            "annotations": { "readOnlyHint": true, "openWorldHint": false, "destructiveHint": false }
+        }));
+        tools.push(json!({
             "name": "search",
             "title": "Search text",
             "description": "Search text across files in workspace. Uses rg when available, then grep, then built-in search.",
@@ -491,6 +562,23 @@ async fn handle_tools_list(
         }
     }
 
+    if mode.browser_enabled() && devtools.is_some() {
+        tools.push(json!({
+            "name": "view_page",
+            "title": "View current page",
+            "description": "Capture the currently selected browser page and attach the rendered pixels directly to the model's vision input. Use this whenever layout, styling, rendering, visual regressions, canvas output, charts, or other appearance-dependent details matter. MoonDesk captures to a managed temporary file, bounds/compresses it, attaches it as native MCP image content, and removes the temporary file before returning.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "full_page": { "type": "boolean", "description": "Capture the full page instead of only the visible viewport (default false)" },
+                    "uid": { "type": "string", "description": "Optional element uid from the latest DevTools page snapshot. When supplied, captures that element instead of the whole viewport." },
+                    "quality": { "type": "integer", "minimum": vision::MIN_JPEG_QUALITY, "maximum": vision::MAX_JPEG_QUALITY, "description": format!("JPEG quality for the attached page image (default {})", vision::DEFAULT_JPEG_QUALITY) }
+                }
+            },
+            "annotations": { "readOnlyHint": true, "openWorldHint": true, "destructiveHint": false }
+        }));
+    }
+
     // Browser tools — get from devtools bridge
     if mode.browser_enabled()
         && let Some(bridge) = devtools
@@ -558,10 +646,19 @@ async fn handle_tools_call_for_workspace(
         .unwrap_or("")
         .to_string();
 
+    if tool_name == "view_page" {
+        if !mode.browser_enabled() {
+            return tool_error_response(req, "Tool 'view_page' requires browser mode".to_string());
+        }
+        return handle_view_page(req, workspace_root, devtools).await;
+    }
+
     if matches!(
         tool_name.as_str(),
         "moondesk_instruction"
             | "read"
+            | "view_image"
+            | "view_images"
             | "search"
             | "write"
             | "edit"
@@ -636,6 +733,8 @@ async fn handle_tools_call_for_workspace(
                         handle_moondesk_instruction(req, workspace_root, mode, tool_mode)
                     }
                     "read" => handle_read_file(req, workspace_root),
+                    "view_image" => handle_view_image(req, workspace_root),
+                    "view_images" => handle_view_images(req, workspace_root),
                     "search" => handle_search_text(req, workspace_root),
                     _ => {
                         if tool_mode.write_tools_enabled() {
@@ -1323,14 +1422,15 @@ fn handle_run_command_move_path_intercept(
     }
 }
 
-fn tool_response(
+fn tool_response_with_content(
     req: &JsonRpcRequest,
     text: String,
+    content: Vec<Value>,
     structured: Option<Value>,
     is_error: bool,
 ) -> JsonRpcResponse {
     let mut result = json!({
-        "content": []
+        "content": content
     });
     if let Some(obj) = result.as_object_mut() {
         let structured = structured.unwrap_or_else(|| tool_message_structured(text));
@@ -1340,6 +1440,15 @@ fn tool_response(
         }
     }
     JsonRpcResponse::success(req.id.clone(), result)
+}
+
+fn tool_response(
+    req: &JsonRpcRequest,
+    text: String,
+    structured: Option<Value>,
+    is_error: bool,
+) -> JsonRpcResponse {
+    tool_response_with_content(req, text, Vec::new(), structured, is_error)
 }
 
 fn tool_message_structured(message: String) -> Value {
@@ -1352,6 +1461,14 @@ fn tool_success_response_with_structured(
     structured: Value,
 ) -> JsonRpcResponse {
     tool_response(req, text, Some(structured), false)
+}
+
+fn tool_success_response_with_content(
+    req: &JsonRpcRequest,
+    content: Vec<Value>,
+    structured: Value,
+) -> JsonRpcResponse {
+    tool_response_with_content(req, String::new(), content, Some(structured), false)
 }
 
 fn tool_error_response_with_structured(
@@ -1458,6 +1575,7 @@ Always specify the branch explicitly when using `git push`."#
 
     if mode.computer_enabled() {
         lines.push("Use read to read files and search to search the workspace.".to_string());
+        lines.push("When a task depends on what an image actually looks like, use view_image or view_images so the model receives the pixels through its vision input. Do not substitute filenames, dimensions, blur scores, OCR, or other image metadata for visual inspection. Relative image paths stay inside the workspace; use an explicit absolute path only when the user's task genuinely requires inspecting a local image elsewhere on the machine.".to_string());
         if tool_mode.run_command_enabled() {
             lines.push(
                 "For directory inspection, run_command can intercept plain listing commands such as find, tree, ls -R, and rg --files."
@@ -1478,7 +1596,7 @@ Always specify the branch explicitly when using `git push`."#
 
     if mode.browser_enabled() {
         lines.push(
-            "For browser tasks, prefer the dedicated browser and DevTools tools exposed by the server."
+            "For browser tasks, prefer the dedicated browser and DevTools tools exposed by the server. When visual appearance, layout, styling, rendering, canvas output, charts, or visual regressions matter, use view_page so MoonDesk captures the current rendered page and returns the actual pixels through the model's vision input. Accessibility/text snapshots are useful for structure but do not replace view_page for visual judgment. Raw take_screenshot is still available, but view_page is preferred because it guarantees MoonDesk-owned temporary capture, bounded image encoding, native MCP image content, and cleanup instead of silently degrading to a screenshot filepath when the capture is large."
                 .to_string(),
         );
     }
@@ -1675,9 +1793,50 @@ impl TokenEstimateWriter {
     }
 }
 
+fn write_value_for_token_estimate(
+    writer: &mut TokenEstimateWriter,
+    value: &Value,
+) -> Result<(), serde_json::Error> {
+    match value {
+        Value::Array(items) => {
+            writer.write_all(b"[").map_err(serde_json::Error::io)?;
+            for (index, item) in items.iter().enumerate() {
+                if index > 0 {
+                    writer.write_all(b",").map_err(serde_json::Error::io)?;
+                }
+                write_value_for_token_estimate(writer, item)?;
+            }
+            writer.write_all(b"]").map_err(serde_json::Error::io)?;
+            Ok(())
+        }
+        Value::Object(object) => {
+            let binary_content = object
+                .get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| matches!(kind, "image" | "audio"));
+            writer.write_all(b"{").map_err(serde_json::Error::io)?;
+            for (index, (key, item)) in object.iter().enumerate() {
+                if index > 0 {
+                    writer.write_all(b",").map_err(serde_json::Error::io)?;
+                }
+                serde_json::to_writer(&mut *writer, key)?;
+                writer.write_all(b":").map_err(serde_json::Error::io)?;
+                if binary_content && key == "data" {
+                    serde_json::to_writer(&mut *writer, "<binary>")?;
+                } else {
+                    write_value_for_token_estimate(writer, item)?;
+                }
+            }
+            writer.write_all(b"}").map_err(serde_json::Error::io)?;
+            Ok(())
+        }
+        _ => serde_json::to_writer(writer, value),
+    }
+}
+
 fn estimate_value_tokens_o200k(value: &Value) -> u64 {
     let mut writer = TokenEstimateWriter::default();
-    match serde_json::to_writer(&mut writer, value) {
+    match write_value_for_token_estimate(&mut writer, value) {
         Ok(()) => writer.estimate_tokens(),
         Err(_) => 0,
     }
@@ -1753,6 +1912,301 @@ async fn devtools_tool_is_read_only(
         .iter()
         .find(|tool| tool.get("name").and_then(Value::as_str) == Some(tool_name))
         .map(tool_is_read_only)
+}
+
+fn image_metadata_value(metadata: &vision::PreparedImageMetadata) -> Value {
+    json!({
+        "path": metadata.path,
+        "sourceWidth": metadata.source_width,
+        "sourceHeight": metadata.source_height,
+        "width": metadata.width,
+        "height": metadata.height,
+        "sourceBytes": metadata.source_bytes,
+        "encodedBytes": metadata.encoded_bytes,
+        "mimeType": metadata.mime_type,
+        "resized": metadata.resized,
+    })
+}
+
+fn prepared_image_content(prepared: &vision::PreparedImage) -> Value {
+    json!({
+        "type": "image",
+        "data": prepared.base64_data,
+        "mimeType": prepared.metadata.mime_type,
+    })
+}
+
+fn optional_u32_argument(arguments: &Value, name: &str, default_value: u32) -> Result<u32, String> {
+    match arguments.get(name) {
+        Some(value) => value
+            .as_u64()
+            .and_then(|value| u32::try_from(value).ok())
+            .ok_or_else(|| format!("Parameter {name} must be a non-negative integer")),
+        None => Ok(default_value),
+    }
+}
+
+fn optional_u8_argument(arguments: &Value, name: &str, default_value: u8) -> Result<u8, String> {
+    match arguments.get(name) {
+        Some(value) => value
+            .as_u64()
+            .and_then(|value| u8::try_from(value).ok())
+            .ok_or_else(|| format!("Parameter {name} must be an integer between 0 and 255")),
+        None => Ok(default_value),
+    }
+}
+
+fn handle_view_image(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcResponse {
+    let arguments = tool_arguments(req);
+    let path = match required_string_argument(&arguments, "path") {
+        Ok(value) => value,
+        Err(error) => return tool_error_response(req, error),
+    };
+    let max_dimension =
+        match optional_u32_argument(&arguments, "max_dimension", vision::DEFAULT_MAX_DIMENSION) {
+            Ok(value) => value,
+            Err(error) => return tool_error_response(req, error),
+        };
+    let quality = match optional_u8_argument(&arguments, "quality", vision::DEFAULT_JPEG_QUALITY) {
+        Ok(value) => value,
+        Err(error) => return tool_error_response(req, error),
+    };
+
+    match vision::prepare_image(
+        workspace_root,
+        path,
+        max_dimension,
+        quality,
+        vision::MAX_SINGLE_ENCODED_BYTES,
+    ) {
+        Ok(prepared) => {
+            let structured = image_metadata_value(&prepared.metadata);
+            let content = vec![prepared_image_content(&prepared)];
+            tool_success_response_with_content(req, content, structured)
+        }
+        Err(error) => tool_error_response(req, error),
+    }
+}
+
+fn handle_view_images(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcResponse {
+    let arguments = tool_arguments(req);
+    let Some(paths_value) = arguments.get("paths") else {
+        return tool_error_response(req, "Missing required parameter: paths".to_string());
+    };
+    let Some(paths) = paths_value.as_array() else {
+        return tool_error_response(
+            req,
+            "Parameter paths must be an array of strings".to_string(),
+        );
+    };
+    if paths.is_empty() || paths.len() > vision::MAX_BATCH_IMAGES {
+        return tool_error_response(
+            req,
+            format!(
+                "Parameter paths must contain between 1 and {} images",
+                vision::MAX_BATCH_IMAGES
+            ),
+        );
+    }
+
+    let max_dimension = match optional_u32_argument(
+        &arguments,
+        "max_dimension",
+        vision::DEFAULT_BATCH_MAX_DIMENSION,
+    ) {
+        Ok(value) => value,
+        Err(error) => return tool_error_response(req, error),
+    };
+    let quality = match optional_u8_argument(&arguments, "quality", vision::DEFAULT_JPEG_QUALITY) {
+        Ok(value) => value,
+        Err(error) => return tool_error_response(req, error),
+    };
+    let per_image_budget =
+        vision::MAX_BATCH_IMAGE_ENCODED_BYTES.min(vision::MAX_BATCH_ENCODED_BYTES / paths.len());
+
+    let mut prepared_images = Vec::with_capacity(paths.len());
+    for (index, path_value) in paths.iter().enumerate() {
+        let Some(path) = path_value.as_str() else {
+            return tool_error_response(req, format!("paths[{index}] must be a string"));
+        };
+        match vision::prepare_image(
+            workspace_root,
+            path,
+            max_dimension,
+            quality,
+            per_image_budget,
+        ) {
+            Ok(prepared) => prepared_images.push(prepared),
+            Err(error) => {
+                return tool_error_response(
+                    req,
+                    format!("Could not prepare paths[{index}] ({path}): {error}"),
+                );
+            }
+        }
+    }
+
+    let mut content = Vec::with_capacity(prepared_images.len() * 2);
+    let mut metadata = Vec::with_capacity(prepared_images.len());
+    for (index, prepared) in prepared_images.iter().enumerate() {
+        content.push(json!({
+            "type": "text",
+            "text": format!("Image {}: {}", index + 1, prepared.metadata.path),
+        }));
+        content.push(prepared_image_content(prepared));
+        let mut value = image_metadata_value(&prepared.metadata);
+        if let Some(object) = value.as_object_mut() {
+            object.insert("index".to_string(), json!(index + 1));
+        }
+        metadata.push(value);
+    }
+
+    tool_success_response_with_content(
+        req,
+        content,
+        json!({
+            "count": prepared_images.len(),
+            "images": metadata,
+        }),
+    )
+}
+
+fn build_view_page_devtools_request(
+    req: &JsonRpcRequest,
+    destination: &Path,
+    full_page: bool,
+    uid: Option<&str>,
+    quality: u8,
+) -> Value {
+    let mut arguments = json!({
+        "format": "jpeg",
+        "quality": quality,
+        "fullPage": full_page,
+        "filePath": destination.to_string_lossy(),
+    });
+    if let Some(uid) = uid
+        && let Some(object) = arguments.as_object_mut()
+    {
+        object.insert("uid".to_string(), json!(uid));
+    }
+    json!({
+        "jsonrpc": "2.0",
+        "id": req.id,
+        "method": "tools/call",
+        "params": {
+            "name": "take_screenshot",
+            "arguments": arguments,
+        }
+    })
+}
+
+async fn handle_view_page(
+    req: &JsonRpcRequest,
+    workspace_root: &str,
+    devtools: &Option<Arc<DevtoolsManager>>,
+) -> JsonRpcResponse {
+    let Some(bridge) = devtools else {
+        return tool_error_response(
+            req,
+            "Browser vision is not available because the DevTools bridge is not running"
+                .to_string(),
+        );
+    };
+    let arguments = tool_arguments(req);
+    let full_page = match optional_bool_argument(&arguments, "full_page", false) {
+        Ok(value) => value,
+        Err(error) => return tool_error_response(req, error),
+    };
+    let uid = match optional_string_argument(&arguments, "uid") {
+        Ok(value) => value,
+        Err(error) => return tool_error_response(req, error),
+    };
+    if full_page && uid.is_some() {
+        return tool_error_response(req, "full_page cannot be combined with uid".to_string());
+    }
+    let quality = match optional_u8_argument(&arguments, "quality", vision::DEFAULT_JPEG_QUALITY) {
+        Ok(value) if (vision::MIN_JPEG_QUALITY..=vision::MAX_JPEG_QUALITY).contains(&value) => {
+            value
+        }
+        Ok(_) => {
+            return tool_error_response(
+                req,
+                format!(
+                    "quality must be between {} and {}",
+                    vision::MIN_JPEG_QUALITY,
+                    vision::MAX_JPEG_QUALITY
+                ),
+            );
+        }
+        Err(error) => return tool_error_response(req, error),
+    };
+
+    let temp_path =
+        std::env::temp_dir().join(format!("moondesk-view-page-{}.jpeg", uuid::Uuid::new_v4()));
+    let forward_req = build_view_page_devtools_request(req, &temp_path, full_page, uid, quality);
+    let response = match bridge.request(&forward_req).await {
+        Ok(response) => response,
+        Err(error) => {
+            let _ = std::fs::remove_file(&temp_path);
+            return tool_error_response(req, format!("Browser screenshot failed: {error}"));
+        }
+    };
+    if let Some(error) = response.get("error") {
+        let code = error.get("code").and_then(Value::as_i64).unwrap_or(-32000);
+        let message = error
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("Unknown DevTools screenshot error");
+        let _ = std::fs::remove_file(&temp_path);
+        return tool_error_response(
+            req,
+            format!("Browser screenshot failed (code {code}): {message}"),
+        );
+    }
+    if !temp_path.is_file() {
+        return tool_error_response(
+            req,
+            "Browser screenshot completed without producing the managed image file".to_string(),
+        );
+    }
+
+    let prepared = vision::prepare_image(
+        workspace_root,
+        &temp_path.to_string_lossy(),
+        vision::MAX_REQUESTED_DIMENSION,
+        quality,
+        vision::MAX_SINGLE_ENCODED_BYTES,
+    );
+    let cleanup_warning = std::fs::remove_file(&temp_path)
+        .err()
+        .map(|error| format!("Could not remove MoonDesk's temporary browser screenshot: {error}"));
+
+    match prepared {
+        Ok(prepared) => {
+            let mut structured = json!({
+                "width": prepared.metadata.width,
+                "height": prepared.metadata.height,
+                "encodedBytes": prepared.metadata.encoded_bytes,
+                "mimeType": prepared.metadata.mime_type,
+                "resized": prepared.metadata.resized,
+                "fullPage": full_page,
+            });
+            if let Some(cleanup_warning) = cleanup_warning
+                && let Some(object) = structured.as_object_mut()
+            {
+                object.insert("cleanupWarning".to_string(), json!(cleanup_warning));
+            }
+            tool_success_response_with_content(
+                req,
+                vec![prepared_image_content(&prepared)],
+                structured,
+            )
+        }
+        Err(error) => tool_error_response(
+            req,
+            format!("Could not prepare browser screenshot for vision: {error}"),
+        ),
+    }
 }
 
 fn handle_read_file(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcResponse {
@@ -2903,6 +3357,8 @@ mod tests {
                 "cancel_command",
                 "moondesk_instruction",
                 "read",
+                "view_image",
+                "view_images",
                 "search",
                 "write",
                 "edit",
@@ -2961,6 +3417,8 @@ mod tests {
             ("cancel_command", "state"),
             ("moondesk_instruction", "instructionText"),
             ("read", "text"),
+            ("view_image", "path"),
+            ("view_images", "images"),
             ("search", "text"),
             ("edit", "replacements"),
         ] {
@@ -3023,7 +3481,337 @@ mod tests {
             .filter_map(|tool| tool.get("name").and_then(Value::as_str))
             .collect::<Vec<_>>();
 
-        assert_eq!(names, vec!["moondesk_instruction", "read", "search"]);
+        assert_eq!(
+            names,
+            vec![
+                "moondesk_instruction",
+                "read",
+                "view_image",
+                "view_images",
+                "search",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn view_image_returns_native_mcp_image_content_in_read_only_mode() {
+        let workspace_root =
+            std::env::temp_dir().join(format!("moondesk-mcp-view-image-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        let image_path = workspace_root.join("sample.png");
+        let image = image::RgbaImage::from_pixel(80, 40, image::Rgba([20, 90, 180, 255]));
+        image.save(&image_path).expect("write PNG image fixture");
+
+        let response = handle_tools_call(
+            &tool_call_request("view_image", json!({ "path": "sample.png" })),
+            &workspace_root.to_string_lossy(),
+            Mode::Both,
+            ToolMode::ReadOnly,
+            false,
+            &CommandJobManager::new(),
+            &None,
+        )
+        .await;
+        let result = response.result.as_ref().expect("missing view_image result");
+        assert_ne!(result.get("isError").and_then(Value::as_bool), Some(true));
+        let content = result
+            .get("content")
+            .and_then(Value::as_array)
+            .expect("missing image content");
+        assert_eq!(content.len(), 1);
+        assert_eq!(
+            content[0].get("type").and_then(Value::as_str),
+            Some("image")
+        );
+        assert_eq!(
+            content[0].get("mimeType").and_then(Value::as_str),
+            Some("image/png")
+        );
+        assert!(
+            content[0]
+                .get("data")
+                .and_then(Value::as_str)
+                .is_some_and(|data| !data.is_empty())
+        );
+        let structured = result
+            .get("structuredContent")
+            .and_then(Value::as_object)
+            .expect("missing image metadata");
+        assert_eq!(structured.get("width").and_then(Value::as_u64), Some(80));
+        assert_eq!(structured.get("height").and_then(Value::as_u64), Some(40));
+        assert_eq!(
+            structured.get("mimeType").and_then(Value::as_str),
+            Some("image/png")
+        );
+
+        let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn view_images_preserves_path_order_and_labels_each_image() {
+        let workspace_root =
+            std::env::temp_dir().join(format!("moondesk-mcp-view-images-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        for (name, color) in [
+            ("first.png", image::Rgba([220, 20, 20, 255])),
+            ("second.png", image::Rgba([20, 220, 20, 255])),
+        ] {
+            image::RgbaImage::from_pixel(32, 24, color)
+                .save(workspace_root.join(name))
+                .expect("write PNG batch fixture");
+        }
+
+        let response = handle_tools_call(
+            &tool_call_request(
+                "view_images",
+                json!({ "paths": ["first.png", "second.png"] }),
+            ),
+            &workspace_root.to_string_lossy(),
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &CommandJobManager::new(),
+            &None,
+        )
+        .await;
+        let result = response
+            .result
+            .as_ref()
+            .expect("missing view_images result");
+        assert_ne!(result.get("isError").and_then(Value::as_bool), Some(true));
+        let content = result
+            .get("content")
+            .and_then(Value::as_array)
+            .expect("missing batch image content");
+        assert_eq!(content.len(), 4);
+        assert_eq!(content[0].get("type").and_then(Value::as_str), Some("text"));
+        assert!(
+            content[0]
+                .get("text")
+                .and_then(Value::as_str)
+                .is_some_and(|text| text.contains("first.png"))
+        );
+        assert_eq!(
+            content[1].get("type").and_then(Value::as_str),
+            Some("image")
+        );
+        assert_eq!(content[2].get("type").and_then(Value::as_str), Some("text"));
+        assert!(
+            content[2]
+                .get("text")
+                .and_then(Value::as_str)
+                .is_some_and(|text| text.contains("second.png"))
+        );
+        assert_eq!(
+            content[3].get("type").and_then(Value::as_str),
+            Some("image")
+        );
+
+        let structured = result
+            .get("structuredContent")
+            .expect("missing batch metadata");
+        assert_eq!(structured.get("count").and_then(Value::as_u64), Some(2));
+        let images = structured
+            .get("images")
+            .and_then(Value::as_array)
+            .expect("missing image metadata array");
+        assert_eq!(images.len(), 2);
+        assert_eq!(images[0].get("index").and_then(Value::as_u64), Some(1));
+        assert!(
+            images[0]
+                .get("path")
+                .and_then(Value::as_str)
+                .is_some_and(|path| path.ends_with("first.png"))
+        );
+        assert_eq!(images[1].get("index").and_then(Value::as_u64), Some(2));
+        assert!(
+            images[1]
+                .get("path")
+                .and_then(Value::as_str)
+                .is_some_and(|path| path.ends_with("second.png"))
+        );
+
+        let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
+    #[test]
+    fn view_page_builds_managed_jpeg_devtools_request() {
+        let req = tool_call_request("view_page", json!({}));
+        let destination = std::env::temp_dir().join("moondesk-view-page-test.jpeg");
+        let request =
+            build_view_page_devtools_request(&req, &destination, false, Some("node-42"), 84);
+        assert_eq!(
+            request.pointer("/params/name").and_then(Value::as_str),
+            Some("take_screenshot")
+        );
+        assert_eq!(
+            request
+                .pointer("/params/arguments/format")
+                .and_then(Value::as_str),
+            Some("jpeg")
+        );
+        assert_eq!(
+            request
+                .pointer("/params/arguments/quality")
+                .and_then(Value::as_u64),
+            Some(84)
+        );
+        assert_eq!(
+            request
+                .pointer("/params/arguments/fullPage")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            request
+                .pointer("/params/arguments/uid")
+                .and_then(Value::as_str),
+            Some("node-42")
+        );
+        assert_eq!(
+            request
+                .pointer("/params/arguments/filePath")
+                .and_then(Value::as_str),
+            Some(destination.to_string_lossy().as_ref())
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    #[ignore = "serialized Windows browser vision smoke"]
+    async fn windows_view_page_returns_native_mcp_image_content() {
+        use crate::browser;
+        use crate::state::{AppState, ui_event_channel};
+        use std::collections::HashSet;
+        use tokio::sync::Mutex;
+
+        fn managed_view_page_files() -> HashSet<String> {
+            std::fs::read_dir(std::env::temp_dir())
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter_map(|entry| entry.file_name().to_str().map(str::to_owned))
+                .filter(|name| name.starts_with("moondesk-view-page-") && name.ends_with(".jpeg"))
+                .collect()
+        }
+
+        let mut selected = browser::detect_browsers()
+            .into_iter()
+            .find(|browser| browser.mcp_supported)
+            .expect("no supported Chromium browser available for vision smoke");
+        selected.remote_debug_active = false;
+        selected.remote_debug_target = None;
+        selected.remote_debug_pid = None;
+        selected.remote_debug_page_count = None;
+
+        let workspace_root =
+            std::env::temp_dir().join(format!("moondesk-browser-vision-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace_root).expect("create browser vision workspace");
+        let app = AppState::new_for_test(
+            0,
+            workspace_root.to_string_lossy().into_owned(),
+            workspace_root.join("config.toml"),
+        )
+        .expect("create browser vision app state");
+        let state = Arc::new(Mutex::new(app));
+        let (ui_tx, _ui_rx) = ui_event_channel();
+        let manager = DevtoolsManager::start(Some(&selected), ui_tx, state)
+            .await
+            .expect("start DevTools manager for vision smoke");
+        let initialize = json!({
+            "jsonrpc": "2.0",
+            "id": "vision-smoke-init",
+            "method": "initialize",
+            "params": {
+                "protocolVersion": DEVTOOLS_PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": { "name": "moondesk-vision-smoke", "version": SERVER_VERSION }
+            }
+        });
+        manager
+            .ensure_initialized(&initialize)
+            .await
+            .expect("initialize DevTools bridge for vision smoke");
+
+        let manager_option = Some(manager.clone());
+        let tools_request = JsonRpcRequest {
+            jsonrpc: "2.0".into(),
+            id: Some(json!("vision-smoke-tools")),
+            method: "tools/list".into(),
+            params: json!({}),
+        };
+        let tools_response = handle_tools_list(
+            &tools_request,
+            Mode::Browser,
+            ToolMode::ReadOnly,
+            &manager_option,
+        )
+        .await;
+        let tool_names = tools_response
+            .result
+            .as_ref()
+            .and_then(|result| result.get("tools"))
+            .and_then(Value::as_array)
+            .expect("browser vision tools list")
+            .iter()
+            .filter_map(|tool| tool.get("name").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+        assert!(tool_names.contains(&"view_page"));
+        assert!(
+            !tool_names.contains(&"take_screenshot"),
+            "raw take_screenshot writes arbitrary filePath values and should stay filtered in read-only mode"
+        );
+
+        let before = managed_view_page_files();
+        let manager_option = Some(manager.clone());
+        let request = tool_call_request("view_page", json!({}));
+        let response =
+            handle_view_page(&request, &workspace_root.to_string_lossy(), &manager_option).await;
+        let result = response.result.as_ref().expect("view_page result");
+        assert_ne!(result.get("isError").and_then(Value::as_bool), Some(true));
+        let content = result
+            .get("content")
+            .and_then(Value::as_array)
+            .expect("view_page content array");
+        assert_eq!(content.len(), 1);
+        assert_eq!(
+            content[0].get("type").and_then(Value::as_str),
+            Some("image")
+        );
+        assert_eq!(
+            content[0].get("mimeType").and_then(Value::as_str),
+            Some("image/jpeg")
+        );
+        assert!(
+            content[0]
+                .get("data")
+                .and_then(Value::as_str)
+                .is_some_and(|data| data.len() > 100)
+        );
+        let structured = result
+            .get("structuredContent")
+            .expect("view_page structured metadata");
+        assert!(
+            structured
+                .get("width")
+                .and_then(Value::as_u64)
+                .is_some_and(|v| v > 0)
+        );
+        assert!(
+            structured
+                .get("height")
+                .and_then(Value::as_u64)
+                .is_some_and(|v| v > 0)
+        );
+        assert!(structured.get("cleanupWarning").is_none());
+        assert_eq!(
+            managed_view_page_files(),
+            before,
+            "view_page must clean its managed screenshot"
+        );
+
+        manager.stop().await;
+        let _ = std::fs::remove_dir_all(workspace_root);
     }
 
     #[tokio::test]
@@ -3724,6 +4512,13 @@ mod tests {
                 .contains("empty, unresolved, malformed, or failed variable or expression")
         );
         assert!(instruction_text.contains("do not split normal reads, searches, builds, tests"));
+        assert!(instruction_text.contains("use view_image or view_images"));
+        assert!(instruction_text.contains("model receives the pixels through its vision input"));
+        assert!(instruction_text.contains("use view_page"));
+        assert!(instruction_text.contains("do not replace view_page for visual judgment"));
+        assert!(
+            instruction_text.contains("instead of silently degrading to a screenshot filepath")
+        );
         assert_eq!(
             structured.as_object().map(|value| value.len()),
             Some(1),
@@ -4031,6 +4826,45 @@ mod tests {
         assert!(input_tokens > 0);
         assert!(output_tokens > 0);
         assert!(result.get("_meta").is_none());
+    }
+
+    #[test]
+    fn image_binary_payloads_do_not_inflate_text_token_estimates() {
+        let req = tool_call_request("view_image", json!({ "path": "sample.jpg" }));
+        let binary = "A".repeat(1_000_000);
+        let result = json!({
+            "content": [{
+                "type": "image",
+                "mimeType": "image/jpeg",
+                "data": binary,
+            }],
+            "structuredContent": {
+                "path": "sample.jpg",
+                "width": 1600,
+                "height": 1200,
+            }
+        });
+
+        let (_, image_output_tokens) = estimate_turn_token_usage(&req, &result);
+        assert!(image_output_tokens > 0);
+        assert!(
+            image_output_tokens < 1_000,
+            "binary image data must not be estimated as text tokens: {image_output_tokens}"
+        );
+        assert_eq!(
+            result
+                .pointer("/content/0/data")
+                .and_then(Value::as_str)
+                .map(str::len),
+            Some(1_000_000),
+            "token estimation must not mutate the tool result"
+        );
+
+        let text_result = json!({
+            "content": [{ "type": "text", "text": "A".repeat(1_000_000) }]
+        });
+        let (_, text_output_tokens) = estimate_turn_token_usage(&req, &text_result);
+        assert!(text_output_tokens > image_output_tokens * 100);
     }
 
     #[test]

@@ -14,6 +14,10 @@ use crate::process_runner::WindowsProcessTreeGuard;
 use crate::state::{ServerUiEvent, SharedState, UiEventSender};
 
 const CHROME_DEVTOOLS_MCP_VERSION: &str = "1.7.0";
+const DEVTOOLS_SCREENSHOT_FORMAT: &str = "jpeg";
+const DEVTOOLS_SCREENSHOT_QUALITY: &str = "82";
+const DEVTOOLS_SCREENSHOT_MAX_WIDTH: &str = "1920";
+const DEVTOOLS_SCREENSHOT_MAX_HEIGHT: &str = "4096";
 const MAX_DEVTOOLS_DIAGNOSTIC_LINES: usize = 100;
 const MAX_DEVTOOLS_DIAGNOSTIC_CHARS: usize = 2_048;
 const DEVTOOLS_RESTART_COOLDOWN: Duration = Duration::from_secs(10);
@@ -28,6 +32,15 @@ fn npx_program() -> &'static str {
     {
         "npx"
     }
+}
+
+fn apply_vision_screenshot_defaults(command: &mut Command) {
+    command.args([
+        format!("--screenshot-format={DEVTOOLS_SCREENSHOT_FORMAT}"),
+        format!("--screenshot-quality={DEVTOOLS_SCREENSHOT_QUALITY}"),
+        format!("--screenshot-max-width={DEVTOOLS_SCREENSHOT_MAX_WIDTH}"),
+        format!("--screenshot-max-height={DEVTOOLS_SCREENSHOT_MAX_HEIGHT}"),
+    ]);
 }
 
 #[derive(Default)]
@@ -99,6 +112,7 @@ impl DevtoolsBridge {
         let mut command = Command::new(npx_program());
         let package = format!("chrome-devtools-mcp@{CHROME_DEVTOOLS_MCP_VERSION}");
         command.args(["-y", package.as_str()]);
+        apply_vision_screenshot_defaults(&mut command);
 
         if let Some(browser) = selected_browser {
             if browser.remote_debug_active {
@@ -625,6 +639,27 @@ mod tests {
         } else {
             assert_eq!(npx_program(), "npx");
         }
+    }
+
+    #[test]
+    fn devtools_screenshots_default_to_bounded_vision_payloads() {
+        let mut command = Command::new(npx_program());
+        apply_vision_screenshot_defaults(&mut command);
+        let args = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(args.contains(&format!("--screenshot-format={DEVTOOLS_SCREENSHOT_FORMAT}")));
+        assert!(args.contains(&format!(
+            "--screenshot-quality={DEVTOOLS_SCREENSHOT_QUALITY}"
+        )));
+        assert!(args.contains(&format!(
+            "--screenshot-max-width={DEVTOOLS_SCREENSHOT_MAX_WIDTH}"
+        )));
+        assert!(args.contains(&format!(
+            "--screenshot-max-height={DEVTOOLS_SCREENSHOT_MAX_HEIGHT}"
+        )));
     }
 
     #[cfg(windows)]

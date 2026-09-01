@@ -12,6 +12,7 @@ mod server;
 mod state;
 mod theme;
 mod update;
+mod vision;
 mod workspace_tools;
 mod workspaces;
 

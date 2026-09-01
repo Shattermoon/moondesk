@@ -411,6 +411,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          expected_version="$(node -p "require('./package.json').version")"
+          test "$("./dist/${{ matrix.asset }}" --version)" = "$expected_version"
+          test "$("./dist/${{ matrix.asset }}" -V)" = "$expected_version"
           "./dist/${{ matrix.asset }}" clippymoon --help
           "./dist/${{ matrix.asset }}" clippymoon export \
             --seed 0000000000000042 \
@@ -761,6 +764,8 @@ jobs:
           npm install --global --prefix "$prefix" --ignore-scripts "moondesk@${version}"
           test ! -e "$cache/moondesk"
 
+          test "$("$prefix/bin/moondesk" --version)" = "$version"
+          test "$("$prefix/bin/moondesk" -V)" = "$version"
           "$prefix/bin/moondesk" clippymoon --help
           "$prefix/bin/moondesk" clippymoon export \
             --seed 0000000000000042 \

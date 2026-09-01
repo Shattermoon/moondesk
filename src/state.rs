@@ -642,6 +642,8 @@ impl ToolMode {
 /// Browser process launched and owned by MoonDesk for remote debugging.
 pub struct OwnedRemoteBrowser {
     pub child: tokio::process::Child,
+    #[cfg(windows)]
+    pub process_tree: crate::process_runner::WindowsProcessTreeGuard,
     pub profile_dir: PathBuf,
 }
 

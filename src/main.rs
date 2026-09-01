@@ -4484,8 +4484,15 @@ async fn terminate_remote_browser_child(child: &mut tokio::process::Child) -> st
     }
 }
 
+async fn terminate_owned_remote_browser(browser: &mut OwnedRemoteBrowser) -> std::io::Result<()> {
+    #[cfg(windows)]
+    browser.process_tree.terminate().await;
+
+    terminate_remote_browser_child(&mut browser.child).await
+}
+
 async fn stop_owned_remote_browser(state: &SharedState, mut browser: OwnedRemoteBrowser) {
-    match terminate_remote_browser_child(&mut browser.child).await {
+    match terminate_owned_remote_browser(&mut browser).await {
         Ok(()) => cleanup_remote_browser_profile(state, browser.profile_dir).await,
         Err(error) => {
             state.lock().await.log(
@@ -4566,10 +4573,14 @@ async fn ensure_selected_browser_remote_debugging(
         .arg("--no-default-browser-check")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .kill_on_drop(true);
+        .stderr(std::process::Stdio::null());
 
-    let child = match command.spawn() {
+    #[cfg(windows)]
+    process_runner::WindowsProcessTreeGuard::prepare_command(&mut command);
+    #[cfg(not(windows))]
+    command.kill_on_drop(true);
+
+    let spawned_child = match command.spawn() {
         Ok(child) => child,
         Err(e) => {
             state.lock().await.log(
@@ -4583,6 +4594,30 @@ async fn ensure_selected_browser_remote_debugging(
             return Some(selected);
         }
     };
+
+    #[cfg(windows)]
+    let (child, process_tree) = {
+        let mut child = spawned_child;
+        let process_tree = match process_runner::WindowsProcessTreeGuard::attach(&mut child) {
+            Ok(process_tree) => process_tree,
+            Err(error) => {
+                let _ = child.wait().await;
+                state.lock().await.log(
+                    "ERROR",
+                    format!(
+                        "Failed to own {} remote browser process tree: {}",
+                        selected.name, error
+                    ),
+                );
+                cleanup_remote_browser_profile(&state, user_data_dir).await;
+                return Some(selected);
+            }
+        };
+        (child, process_tree)
+    };
+    #[cfg(not(windows))]
+    let child = spawned_child;
+
     let launched_pid = child.id();
     let launched_profile_dir = user_data_dir.clone();
 
@@ -4590,6 +4625,8 @@ async fn ensure_selected_browser_remote_debugging(
         let mut app = state.lock().await;
         let existing = app.remote_browser.replace(OwnedRemoteBrowser {
             child,
+            #[cfg(windows)]
+            process_tree,
             profile_dir: user_data_dir,
         });
         app.log(
@@ -7078,10 +7115,9 @@ mod tests {
         normalize_ngrok_authtoken_input, normalize_ngrok_domain, normalize_workspace_path_input,
         panel_under_cursor, parse_clippymoon_export_args, parse_port_value,
         primary_mcp_url_line_index, quit_confirm_action, remove_remote_browser_profile_dir,
-        scroll_panel_down, scroll_panel_up, tail_start_index, terminate_remote_browser_child,
-        timed_secret_click, truncate_with_ellipsis, update_confirm_action, user_home_dir,
-        workspace_action_from_event, workspace_detail_sections, wrap_preserving_chars,
-        wrapped_line_hit_area,
+        scroll_panel_down, scroll_panel_up, tail_start_index, timed_secret_click,
+        truncate_with_ellipsis, update_confirm_action, user_home_dir, workspace_action_from_event,
+        workspace_detail_sections, wrap_preserving_chars, wrapped_line_hit_area,
     };
     use crossterm::event::{
         Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -7305,35 +7341,112 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(unmanaged).await;
     }
 
+    #[cfg(not(windows))]
     #[tokio::test]
-    #[cfg_attr(windows, ignore = "serialized Windows remote browser lifecycle smoke")]
     async fn remote_browser_termination_confirms_child_exit() {
-        #[cfg(windows)]
-        let mut command = {
-            let mut command = tokio::process::Command::new("ping.exe");
-            command.args(["-n", "30", "127.0.0.1"]);
-            command
-        };
-        #[cfg(not(windows))]
-        let mut command = {
-            let mut command = tokio::process::Command::new("/bin/sh");
-            command.args(["-c", "sleep 30"]);
-            command
-        };
+        let mut command = tokio::process::Command::new("/bin/sh");
         command
+            .args(["-c", "sleep 30"])
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .kill_on_drop(true);
         let mut child = command.spawn().expect("spawn remote browser stand-in");
 
-        terminate_remote_browser_child(&mut child)
+        super::terminate_remote_browser_child(&mut child)
             .await
             .expect("terminate and reap remote browser stand-in");
         assert!(
             child.try_wait().expect("query terminated child").is_some(),
             "remote browser child was not reaped before cleanup"
         );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    #[ignore = "serialized Windows remote browser lifecycle smoke"]
+    async fn remote_browser_termination_confirms_child_exit() {
+        let root = std::env::temp_dir().join(format!(
+            "moondesk-remote-browser-tree-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).expect("create browser lifecycle test root");
+        let ready = root.join("ready.txt");
+        let escaped = root.join("escaped.txt");
+        let child_script = root.join("child.ps1");
+        let parent_script = root.join("parent.ps1");
+        let ps_path = |path: &std::path::Path| path.to_string_lossy().replace('\'', "''");
+
+        std::fs::write(
+            &child_script,
+            format!(
+                "Start-Sleep -Milliseconds 1500\r\nSet-Content -LiteralPath '{}' -Value 'escaped'\r\n",
+                ps_path(&escaped)
+            ),
+        )
+        .expect("write child browser stand-in script");
+        std::fs::write(
+            &parent_script,
+            format!(
+                "Start-Process powershell.exe -ArgumentList @('-NoProfile','-File','{}')\r\nSet-Content -LiteralPath '{}' -Value 'ready'\r\nStart-Sleep -Seconds 30\r\n",
+                ps_path(&child_script),
+                ps_path(&ready)
+            ),
+        )
+        .expect("write parent browser stand-in script");
+
+        let mut command = tokio::process::Command::new("powershell.exe");
+        command
+            .args(["-NoProfile", "-File"])
+            .arg(&parent_script)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        crate::process_runner::WindowsProcessTreeGuard::prepare_command(&mut command);
+        let mut child = command.spawn().expect("spawn remote browser stand-in");
+        let process_tree = crate::process_runner::WindowsProcessTreeGuard::attach(&mut child)
+            .expect("own remote browser stand-in process tree");
+        let profile_dir = std::env::temp_dir().join(format!(
+            "moondesk-remote-debug-lifecycle-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&profile_dir).expect("create managed browser profile");
+        let mut browser = super::OwnedRemoteBrowser {
+            child,
+            process_tree,
+            profile_dir: profile_dir.clone(),
+        };
+
+        for _ in 0..30 {
+            if ready.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(
+            ready.exists(),
+            "browser stand-in did not spawn its descendant"
+        );
+
+        super::terminate_owned_remote_browser(&mut browser)
+            .await
+            .expect("terminate and reap owned remote browser tree");
+        assert!(
+            browser
+                .child
+                .try_wait()
+                .expect("query terminated browser child")
+                .is_some(),
+            "remote browser root was not reaped before cleanup"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(2_000)).await;
+        assert!(
+            !escaped.exists(),
+            "remote browser descendant survived MoonDesk process-tree termination"
+        );
+
+        let _ = std::fs::remove_dir_all(profile_dir);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

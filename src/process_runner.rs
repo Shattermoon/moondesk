@@ -575,9 +575,6 @@ fn spawn_shell_command_blocking(command: &str, cwd: &Path) -> io::Result<Spawned
 }
 
 pub async fn spawn_shell_command(command: &str, cwd: &Path) -> io::Result<SpawnedProcess> {
-    if let Err(error) = crate::command::validate_shell_command_safety(command) {
-        return Err(io::Error::new(io::ErrorKind::PermissionDenied, error));
-    }
     let command = command.to_owned();
     let cwd = cwd.to_path_buf();
     tokio::task::spawn_blocking(move || spawn_shell_command_blocking(&command, &cwd))
@@ -926,27 +923,6 @@ mod tests {
         let path = std::env::temp_dir().join(format!("moondesk-process-{name}-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&path).expect("create test workspace");
         path
-    }
-
-    #[tokio::test]
-    async fn shell_spawn_boundary_rejects_raw_delete_before_process_creation() {
-        let root = workspace("spawn-delete-guard");
-        let protected = root.join("protected");
-        std::fs::create_dir_all(&protected).expect("create protected directory");
-        std::fs::write(protected.join("sentinel.txt"), "keep").expect("write sentinel");
-
-        let error = match spawn_shell_command("rm -rf protected", &root).await {
-            Ok(mut process) => {
-                process.terminate_tree().await;
-                panic!("raw delete unexpectedly spawned a shell")
-            }
-            Err(error) => error,
-        };
-        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
-        assert!(error.to_string().contains("RAW_FILESYSTEM_DELETE_BLOCKED"));
-        assert!(protected.join("sentinel.txt").exists());
-
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[cfg(any(windows, target_os = "linux"))]

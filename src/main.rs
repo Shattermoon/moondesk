@@ -4580,7 +4580,7 @@ async fn ensure_selected_browser_remote_debugging(
     #[cfg(not(windows))]
     command.kill_on_drop(true);
 
-    let mut child = match command.spawn() {
+    let spawned_child = match command.spawn() {
         Ok(child) => child,
         Err(e) => {
             state.lock().await.log(
@@ -4596,21 +4596,27 @@ async fn ensure_selected_browser_remote_debugging(
     };
 
     #[cfg(windows)]
-    let process_tree = match process_runner::WindowsProcessTreeGuard::attach(&mut child) {
-        Ok(process_tree) => process_tree,
-        Err(error) => {
-            let _ = child.wait().await;
-            state.lock().await.log(
-                "ERROR",
-                format!(
-                    "Failed to own {} remote browser process tree: {}",
-                    selected.name, error
-                ),
-            );
-            cleanup_remote_browser_profile(&state, user_data_dir).await;
-            return Some(selected);
-        }
+    let (child, process_tree) = {
+        let mut child = spawned_child;
+        let process_tree = match process_runner::WindowsProcessTreeGuard::attach(&mut child) {
+            Ok(process_tree) => process_tree,
+            Err(error) => {
+                let _ = child.wait().await;
+                state.lock().await.log(
+                    "ERROR",
+                    format!(
+                        "Failed to own {} remote browser process tree: {}",
+                        selected.name, error
+                    ),
+                );
+                cleanup_remote_browser_profile(&state, user_data_dir).await;
+                return Some(selected);
+            }
+        };
+        (child, process_tree)
     };
+    #[cfg(not(windows))]
+    let child = spawned_child;
 
     let launched_pid = child.id();
     let launched_profile_dir = user_data_dir.clone();

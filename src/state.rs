@@ -601,7 +601,7 @@ impl Mode {
 #[serde(rename_all = "camelCase")]
 pub enum ToolMode {
     MultiTools, // codex/claude-style workspace tools
-    ReadOnly,   // read-only safe tools only
+    ReadOnly,   // non-mutating tools; no developer shell or filesystem writes
 }
 
 impl ToolMode {
@@ -622,7 +622,9 @@ impl ToolMode {
             ToolMode::MultiTools => {
                 "Expose workspace tools plus the user's normal developer shell."
             }
-            ToolMode::ReadOnly => "Expose safe read-only workspace tools only.",
+            ToolMode::ReadOnly => {
+                "Expose non-mutating tools without the developer shell or filesystem writes."
+            }
         }
     }
 

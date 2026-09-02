@@ -473,13 +473,11 @@ async function fetchReleaseChangelog(fromVersion, toVersion, options = {}) {
   return { releaseNotes, releaseUrl };
 }
 
-async function checkForUpdate(options = {}) {
+async function fetchLatestPackageMetadata(options = {}) {
   const fetchImpl = options.fetchImpl ?? globalThis.fetch;
-  const statePath = options.statePath ?? createUpdateStatePath();
   const registryUrl = options.registryUrl ?? REGISTRY_LATEST_URL;
-  const managedInstall = options.managedInstall === true;
   if (typeof fetchImpl !== "function") {
-    return null;
+    throw new Error("MoonDesk update checks require a fetch implementation");
   }
 
   const metadata = await fetchJsonLimited(fetchImpl, registryUrl, options.signal);
@@ -493,7 +491,56 @@ async function checkForUpdate(options = {}) {
   if (typeof metadata?.dist?.integrity !== "string" || !metadata.dist.integrity.startsWith("sha512-")) {
     throw new Error("npm returned MoonDesk metadata without a sha512 package integrity value");
   }
+  return metadata;
+}
 
+async function refreshUpdateRequestToLatest(request, options = {}) {
+  if (
+    !request ||
+    request.currentVersion !== currentVersion ||
+    !parseStableVersion(request.targetVersion) ||
+    compareStableVersions(request.targetVersion, currentVersion) <= 0
+  ) {
+    throw new Error("Refusing to refresh an invalid MoonDesk update request");
+  }
+
+  const fetchImpl = options.fetchImpl ?? globalThis.fetch;
+  const metadata = await fetchLatestPackageMetadata({ ...options, fetchImpl });
+  const latestVersion = metadata.version;
+  if (compareStableVersions(latestVersion, request.targetVersion) <= 0) {
+    return request;
+  }
+
+  let releaseNotes = [];
+  let releaseUrl = null;
+  try {
+    ({ releaseNotes, releaseUrl } = await fetchReleaseChangelog(
+      request.currentVersion,
+      latestVersion,
+      { ...options, fetchImpl },
+    ));
+  } catch {
+    // The exact newest npm target is authoritative. GitHub notes remain optional.
+  }
+
+  return {
+    ...request,
+    targetVersion: latestVersion,
+    releaseNotes,
+    releaseUrl,
+  };
+}
+
+async function checkForUpdate(options = {}) {
+  const fetchImpl = options.fetchImpl ?? globalThis.fetch;
+  const statePath = options.statePath ?? createUpdateStatePath();
+  const managedInstall = options.managedInstall === true;
+  if (typeof fetchImpl !== "function") {
+    return null;
+  }
+
+  const metadata = await fetchLatestPackageMetadata({ ...options, fetchImpl });
+  const latestVersion = metadata.version;
   const available = managedInstall && compareStableVersions(latestVersion, currentVersion) > 0;
   let releaseNotes = [];
   let releaseUrl = null;
@@ -788,6 +835,7 @@ module.exports = {
   normalizeReleaseNotes,
   parseStableVersion,
   readUpdateRequest,
+  refreshUpdateRequestToLatest,
   resolveGlobalNpmRoot,
   restartUpdatedWrapper,
   startUpdateMonitor,

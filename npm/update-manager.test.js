@@ -21,6 +21,7 @@ const {
   normalizeReleaseNotes,
   parseStableVersion,
   readUpdateRequest,
+  refreshUpdateRequestToLatest,
   resolveGlobalNpmRoot,
   restartUpdatedWrapper,
   startUpdateMonitor,
@@ -437,6 +438,55 @@ test("post-update changelog notice is bounded and version-specific", () => {
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("refreshing a pending request jumps directly to the newest stable npm version", async () => {
+  const [major, minor, patch] = currentVersion.split(".").map(Number);
+  const staleTarget = `${major}.${minor}.${patch + 1}`;
+  const latestTarget = `${major}.${minor}.${patch + 2}`;
+  const request = {
+    schemaVersion: 1,
+    currentVersion,
+    targetVersion: staleTarget,
+    releaseNotes: ["Stale cached note"],
+    releaseUrl: `https://github.com/Shattermoon/moondesk/releases/tag/v${staleTarget}`,
+  };
+
+  const refreshed = await refreshUpdateRequestToLatest(request, {
+    registryUrl: "https://registry.example.invalid/moondesk/latest",
+    releasesApiUrl: "https://api.example.invalid/releases",
+    fetchImpl: async (url) => {
+      if (String(url).includes("registry.example.invalid")) {
+        return responseJson(npmMetadata(latestTarget));
+      }
+      return responseJson([
+        {
+          tag_name: `v${latestTarget}`,
+          draft: false,
+          prerelease: false,
+          html_url: `https://github.com/Shattermoon/moondesk/releases/tag/v${latestTarget}`,
+          body: "## What's Changed\n* fix: newest release",
+        },
+        {
+          tag_name: `v${staleTarget}`,
+          draft: false,
+          prerelease: false,
+          html_url: `https://github.com/Shattermoon/moondesk/releases/tag/v${staleTarget}`,
+          body: "## What's Changed\n* feat: intermediate release",
+        },
+      ]);
+    },
+  });
+
+  assert.equal(refreshed.targetVersion, latestTarget);
+  assert.deepEqual(refreshed.releaseNotes, [
+    `v${latestTarget}: Newest release`,
+    `v${staleTarget}: Intermediate release`,
+  ]);
+  assert.equal(
+    refreshed.releaseUrl,
+    `https://github.com/Shattermoon/moondesk/releases/tag/v${latestTarget}`,
+  );
 });
 
 test("update check writes an available exact npm latest version", async () => {

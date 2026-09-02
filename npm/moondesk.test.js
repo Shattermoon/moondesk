@@ -21,6 +21,13 @@ function quietLogger() {
   return { log() {}, warn() {}, error() {} };
 }
 
+function orchestrateWithoutRefresh(options) {
+  return orchestrate({
+    refreshUpdateRequestToLatestImpl: async (request) => request,
+    ...options,
+  });
+}
+
 test("native launch keeps the npm wrapper alive across parent SIGINT until the child exits", async () => {
   const child = new EventEmitter();
   const signalTarget = new EventEmitter();
@@ -75,7 +82,7 @@ test("normal native exit leaves npm untouched and stops the update monitor", asy
   const requestPath = path.join(dir, "request.json");
   const sequence = [];
   try {
-    const result = await orchestrate({
+    const result = await orchestrateWithoutRefresh({
       args: ["--example"],
       cwd: dir,
       env: { PATH: "/bin" },
@@ -129,7 +136,7 @@ test("validated update exit installs the exact version, verifies it, and restart
     MOONDESK_UPDATE_STATE_PATH: "stale-state",
   };
   try {
-    const result = await orchestrate({
+    const result = await orchestrateWithoutRefresh({
       args: ["arg-one"],
       cwd: dir,
       env: baseEnv,
@@ -220,12 +227,126 @@ test("validated update exit installs the exact version, verifies it, and restart
   }
 });
 
+test("a stale pending update jumps directly to a newer version before installing", async () => {
+  const dir = tempDir();
+  const staleTarget = nextVersion();
+  const [major, minor, patch] = staleTarget.split(".").map(Number);
+  const latestTarget = `${major}.${minor}.${patch + 1}`;
+  const sequence = [];
+  try {
+    const result = await orchestrate({
+      cwd: dir,
+      logger: quietLogger(),
+      updateStatePath: path.join(dir, "state.json"),
+      updateRequestPath: path.join(dir, "request.json"),
+      ensureBinaryImpl: async () => "/fake/moondesk",
+      cleanupOldBinaryVersionsImpl: () => {},
+      cleanupOldUpdateVersionsImpl: () => {},
+      startUpdateMonitorImpl: () => () => {},
+      runNativeImpl: async () => ({ code: UPDATE_EXIT_CODE, signal: null }),
+      readUpdateRequestImpl: () => ({
+        schemaVersion: 1,
+        currentVersion,
+        targetVersion: staleTarget,
+        releaseNotes: ["Cached intermediate release"],
+        releaseUrl: `https://github.com/Shattermoon/moondesk/releases/tag/v${staleTarget}`,
+      }),
+      acquireUpdateLockImpl: async () => {
+        sequence.push("lock");
+        return () => sequence.push("unlock");
+      },
+      refreshUpdateRequestToLatestImpl: async (request) => {
+        sequence.push("refresh");
+        assert.equal(request.targetVersion, staleTarget);
+        return {
+          ...request,
+          targetVersion: latestTarget,
+          releaseNotes: [
+            `v${latestTarget}: Newest release`,
+            `v${staleTarget}: Intermediate release`,
+          ],
+          releaseUrl: `https://github.com/Shattermoon/moondesk/releases/tag/v${latestTarget}`,
+        };
+      },
+      installedWrapperVersionImpl: () => currentVersion,
+      installExactVersionImpl: async (version) => {
+        sequence.push(`install:${version}`);
+        assert.equal(version, latestTarget);
+      },
+      verifyInstalledWrapperVersionImpl: (version) => {
+        sequence.push(`verify:${version}`);
+        assert.equal(version, latestTarget);
+      },
+      writePostUpdateNoticeImpl: (request, version) => {
+        sequence.push("notice");
+        assert.equal(request.targetVersion, latestTarget);
+        assert.equal(version, latestTarget);
+        assert.deepEqual(request.releaseNotes, [
+          `v${latestTarget}: Newest release`,
+          `v${staleTarget}: Intermediate release`,
+        ]);
+      },
+      restartUpdatedWrapperImpl: async () => {
+        sequence.push("restart");
+        return { code: 0, signal: null };
+      },
+    });
+
+    assert.deepEqual(result, { code: 0, signal: null });
+    assert.deepEqual(sequence, [
+      "lock",
+      "refresh",
+      `install:${latestTarget}`,
+      `verify:${latestTarget}`,
+      "unlock",
+      "notice",
+      "restart",
+    ]);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a failed last-second refresh still installs the validated cached target", async () => {
+  const dir = tempDir();
+  const targetVersion = nextVersion();
+  const installed = [];
+  try {
+    const result = await orchestrate({
+      cwd: dir,
+      logger: quietLogger(),
+      updateStatePath: path.join(dir, "state.json"),
+      updateRequestPath: path.join(dir, "request.json"),
+      ensureBinaryImpl: async () => "/fake/moondesk",
+      cleanupOldBinaryVersionsImpl: () => {},
+      cleanupOldUpdateVersionsImpl: () => {},
+      startUpdateMonitorImpl: () => () => {},
+      runNativeImpl: async () => ({ code: UPDATE_EXIT_CODE, signal: null }),
+      readUpdateRequestImpl: () => ({ schemaVersion: 1, currentVersion, targetVersion }),
+      acquireUpdateLockImpl: async () => () => {},
+      refreshUpdateRequestToLatestImpl: async () => {
+        throw new Error("simulated registry outage");
+      },
+      installedWrapperVersionImpl: () => currentVersion,
+      installExactVersionImpl: async (version) => installed.push(version),
+      verifyInstalledWrapperVersionImpl: (version) => assert.equal(version, targetVersion),
+      writePostUpdateNoticeImpl: () => {},
+      restartUpdatedWrapperImpl: async () => ({ code: 0, signal: null }),
+    });
+
+    assert.deepEqual(result, { code: 0, signal: null });
+    assert.deepEqual(installed, [targetVersion]);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("post-update notice failure never blocks a successful restart", async () => {
   const dir = tempDir();
   const targetVersion = nextVersion();
   let restartCalled = false;
   try {
-    const result = await orchestrate({
+    const result = await orchestrateWithoutRefresh({
       cwd: dir,
       logger: quietLogger(),
       updateStatePath: path.join(dir, "state.json"),
@@ -261,7 +382,7 @@ test("post-update notice is persisted before restart so manual relaunch can stil
   const targetVersion = nextVersion();
   const sequence = [];
   try {
-    const result = await orchestrate({
+    const result = await orchestrateWithoutRefresh({
       cwd: dir,
       logger: quietLogger(),
       updateStatePath: path.join(dir, "state.json"),
@@ -299,7 +420,7 @@ test("special exit without a valid request cannot trigger npm", async () => {
   const dir = tempDir();
   let installCalled = false;
   try {
-    const result = await orchestrate({
+    const result = await orchestrateWithoutRefresh({
       cwd: dir,
       logger: quietLogger(),
       updateStatePath: path.join(dir, "state.json"),
@@ -326,7 +447,7 @@ test("failed npm update never restarts MoonDesk", async () => {
   const targetVersion = nextVersion();
   let restartCalled = false;
   try {
-    const result = await orchestrate({
+    const result = await orchestrateWithoutRefresh({
       cwd: dir,
       logger: quietLogger(),
       updateStatePath: path.join(dir, "state.json"),
@@ -357,7 +478,7 @@ test("failed npm update never restarts MoonDesk", async () => {
 test("old-cache cleanup failure is non-fatal but native startup failure is fatal", async () => {
   const dir = tempDir();
   try {
-    const normal = await orchestrate({
+    const normal = await orchestrateWithoutRefresh({
       cwd: dir,
       logger: quietLogger(),
       updateStatePath: path.join(dir, "state-a.json"),
@@ -373,7 +494,7 @@ test("old-cache cleanup failure is non-fatal but native startup failure is fatal
     assert.deepEqual(normal, { code: 0, signal: null });
 
     let stopped = false;
-    const failed = await orchestrate({
+    const failed = await orchestrateWithoutRefresh({
       cwd: dir,
       logger: quietLogger(),
       updateStatePath: path.join(dir, "state-b.json"),
@@ -401,7 +522,7 @@ test("Windows quarantine between verification and spawn reports actionable secur
   const errors = [];
   try {
     fs.writeFileSync(binaryPath, "verified-native-binary");
-    const result = await orchestrate({
+    const result = await orchestrateWithoutRefresh({
       cwd: dir,
       platform: "win32",
       logger: {
@@ -443,7 +564,7 @@ test("Windows ENOENT with an existing binary does not blame endpoint security", 
   const errors = [];
   try {
     fs.writeFileSync(binaryPath, "verified-native-binary");
-    const result = await orchestrate({
+    const result = await orchestrateWithoutRefresh({
       cwd: dir,
       platform: "win32",
       logger: {
@@ -481,7 +602,7 @@ test("another process installing the requested version skips duplicate npm work 
   let installCalled = false;
   let restartCalled = false;
   try {
-    const result = await orchestrate({
+    const result = await orchestrateWithoutRefresh({
       cwd: dir,
       logger: quietLogger(),
       updateStatePath: path.join(dir, "state.json"),
@@ -518,7 +639,7 @@ test("a newer already-installed version is never downgraded by a stale updater",
   const newerVersion = `${major}.${minor}.${patch + 1}`;
   let installCalled = false;
   try {
-    const result = await orchestrate({
+    const result = await orchestrateWithoutRefresh({
       cwd: dir,
       logger: quietLogger(),
       updateStatePath: path.join(dir, "state.json"),
@@ -549,7 +670,7 @@ test("failure to acquire the npm update lock touches neither npm nor restart", a
   let installCalled = false;
   let restartCalled = false;
   try {
-    const result = await orchestrate({
+    const result = await orchestrateWithoutRefresh({
       cwd: dir,
       logger: quietLogger(),
       updateStatePath: path.join(dir, "state.json"),
@@ -585,7 +706,7 @@ test("self-update path failures disable updates without blocking MoonDesk startu
   const warnings = [];
   let monitorStarted = false;
   try {
-    const result = await orchestrate({
+    const result = await orchestrateWithoutRefresh({
       cwd: dir,
       logger: { log() {}, error() {}, warn(message) { warnings.push(message); } },
       createUpdateStatePathImpl: () => {

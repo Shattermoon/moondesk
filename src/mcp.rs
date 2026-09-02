@@ -14,6 +14,7 @@ use crate::command_jobs::{
 };
 use crate::devtools::DevtoolsManager;
 use crate::state::{AgentsPathMode, Mode, ToolMode, load_app_config, user_home_dir};
+use crate::vision;
 use crate::workspace_tools;
 use crate::workspaces::{self, WorkspaceAvailability, WorkspaceId};
 
@@ -76,6 +77,7 @@ impl JsonRpcResponse {
 pub struct McpRequestContext<'a> {
     pub workspace_id: &'a WorkspaceId,
     pub workspace_root: &'a str,
+    pub registered_workspace_roots: &'a [PathBuf],
     pub mode: Mode,
     pub tool_mode: ToolMode,
     pub set_moondesk_as_co_author: bool,
@@ -160,6 +162,50 @@ fn local_tool_output_schema(name: &str) -> Option<Value> {
         "search" => {
             properties.insert("text".to_string(), json!({ "type": "string" }));
             properties.insert("truncated".to_string(), json!({ "type": "boolean" }));
+        }
+        "view_image" => {
+            for field in [
+                "sourceWidth",
+                "sourceHeight",
+                "width",
+                "height",
+                "sourceBytes",
+                "encodedBytes",
+            ] {
+                properties.insert(
+                    field.to_string(),
+                    json!({ "type": "integer", "minimum": 0 }),
+                );
+            }
+            properties.insert("path".to_string(), json!({ "type": "string" }));
+            properties.insert("mimeType".to_string(), json!({ "type": "string" }));
+            properties.insert("resized".to_string(), json!({ "type": "boolean" }));
+            properties.insert(
+                "orientationApplied".to_string(),
+                json!({ "type": "boolean" }),
+            );
+        }
+        "view_images" => {
+            properties.insert(
+                "count".to_string(),
+                json!({ "type": "integer", "minimum": 0 }),
+            );
+            properties.insert(
+                "images".to_string(),
+                json!({ "type": "array", "items": { "type": "object" } }),
+            );
+        }
+        "view_page" => {
+            for field in ["width", "height", "encodedBytes"] {
+                properties.insert(
+                    field.to_string(),
+                    json!({ "type": "integer", "minimum": 0 }),
+                );
+            }
+            properties.insert("mimeType".to_string(), json!({ "type": "string" }));
+            properties.insert("resized".to_string(), json!({ "type": "boolean" }));
+            properties.insert("fullPage".to_string(), json!({ "type": "boolean" }));
+            properties.insert("cleanupWarning".to_string(), json!({ "type": "string" }));
         }
         "write" | "delete" => return None,
         "edit" => {
@@ -403,17 +449,47 @@ async fn handle_tools_list(
         tools.push(json!({
             "name": "read",
             "title": "Read file",
-            "description": "Read a bounded text chunk. Defaults to the first 200 lines; use start_line/max_lines for normal pagination. Very long single lines automatically expose nextStartByte, which can be continued with start_byte/max_bytes without dumping the whole file into the conversation.",
+            "description": "Read a bounded text chunk. Defaults to the first 200 lines; use start_line/max_lines for normal pagination. Very long single lines automatically expose nextStartByte, which can be continued with start_byte/max_bytes without dumping the whole file into the conversation. Relative paths stay inside the workspace. In MultiTools mode, an explicit absolute path may read one local file outside the workspace; ReadOnly mode remains workspace-contained.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string", "description": "File path relative to workspace root or absolute path within it" },
+                    "path": { "type": "string", "description": "File path relative to workspace root. MultiTools may also use an explicit absolute path to one readable local file outside the workspace; ReadOnly may not." },
                     "start_line": { "type": "integer", "minimum": 1, "description": "1-based first line to return (default 1)" },
                     "max_lines": { "type": "integer", "minimum": 1, "maximum": workspace_tools::MAX_READ_LINES, "description": format!("Maximum lines to return (default {}, max {})", workspace_tools::DEFAULT_READ_LINES, workspace_tools::MAX_READ_LINES) },
                     "start_byte": { "type": "integer", "minimum": 0, "description": "0-based byte offset for raw chunk mode. Use nextStartByte to continue a very long line or other byte-bounded text." },
                     "max_bytes": { "type": "integer", "minimum": 4, "maximum": workspace_tools::MAX_READ_BYTES, "description": format!("Maximum bytes in raw chunk mode (default/max {})", workspace_tools::MAX_READ_BYTES) }
                 },
                 "required": ["path"]
+            },
+            "annotations": { "readOnlyHint": true, "openWorldHint": false, "destructiveHint": false }
+        }));
+        tools.push(json!({
+            "name": "view_image",
+            "title": "View image",
+            "description": "Load a local raster image and attach its pixels to the tool response so the model can actually inspect it visually. Relative paths stay inside the workspace. In normal tool modes, an explicit absolute path may point to another readable local file when the task requires it; ReadOnly mode remains workspace-contained. MoonDesk automatically applies image orientation and bounds/compresses large files for the vision context.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Image path relative to workspace root. Normal tool modes also permit an explicit absolute path to another readable local image; ReadOnly mode remains workspace-contained." },
+                    "max_dimension": { "type": "integer", "minimum": 1, "maximum": vision::MAX_REQUESTED_DIMENSION, "description": format!("Maximum output width or height in pixels (default {}, maximum {})", vision::DEFAULT_MAX_DIMENSION, vision::MAX_REQUESTED_DIMENSION) },
+                    "quality": { "type": "integer", "minimum": vision::MIN_JPEG_QUALITY, "maximum": vision::MAX_JPEG_QUALITY, "description": format!("JPEG preview quality when lossy compression is needed (default {})", vision::DEFAULT_JPEG_QUALITY) }
+                },
+                "required": ["path"]
+            },
+            "annotations": { "readOnlyHint": true, "openWorldHint": false, "destructiveHint": false }
+        }));
+        tools.push(json!({
+            "name": "view_images",
+            "title": "View images",
+            "description": "Load several local raster images in one call and attach each image to the response for direct visual comparison. Use this for photo sets, design variants, screenshots, or other tasks where appearance matters. The order of returned images matches the paths array. Large images are automatically resized/compressed to keep the multimodal response bounded.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "paths": { "type": "array", "minItems": 1, "maxItems": vision::MAX_BATCH_IMAGES, "items": { "type": "string" }, "description": format!("Image paths to inspect together (maximum {})", vision::MAX_BATCH_IMAGES) },
+                    "max_dimension": { "type": "integer", "minimum": 1, "maximum": vision::MAX_REQUESTED_DIMENSION, "description": format!("Maximum output width or height per image (default {}, maximum {})", vision::DEFAULT_BATCH_MAX_DIMENSION, vision::MAX_REQUESTED_DIMENSION) },
+                    "quality": { "type": "integer", "minimum": vision::MIN_JPEG_QUALITY, "maximum": vision::MAX_JPEG_QUALITY, "description": format!("JPEG preview quality when lossy compression is needed (default {})", vision::DEFAULT_JPEG_QUALITY) }
+                },
+                "required": ["paths"]
             },
             "annotations": { "readOnlyHint": true, "openWorldHint": false, "destructiveHint": false }
         }));
@@ -491,6 +567,23 @@ async fn handle_tools_list(
         }
     }
 
+    if mode.browser_enabled() && devtools.is_some() {
+        tools.push(json!({
+            "name": "view_page",
+            "title": "View current page",
+            "description": "Capture the currently selected browser page and attach the rendered pixels directly to the model's vision input. Use this whenever layout, styling, rendering, visual regressions, canvas output, charts, or other appearance-dependent details matter. MoonDesk captures to a managed temporary file, bounds/compresses it, attaches it as native MCP image content, and removes the temporary file before returning.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "full_page": { "type": "boolean", "description": "Capture the full page instead of only the visible viewport (default false)" },
+                    "uid": { "type": "string", "description": "Optional element uid from the latest DevTools page snapshot. When supplied, captures that element instead of the whole viewport." },
+                    "quality": { "type": "integer", "minimum": vision::MIN_JPEG_QUALITY, "maximum": vision::MAX_JPEG_QUALITY, "description": format!("JPEG quality for the attached page image (default {})", vision::DEFAULT_JPEG_QUALITY) }
+                }
+            },
+            "annotations": { "readOnlyHint": true, "openWorldHint": true, "destructiveHint": false }
+        }));
+    }
+
     // Browser tools — get from devtools bridge
     if mode.browser_enabled()
         && let Some(bridge) = devtools
@@ -528,6 +621,7 @@ async fn handle_tools_call(
         McpRequestContext {
             workspace_id: &workspace_id,
             workspace_root,
+            registered_workspace_roots: &[],
             mode,
             tool_mode,
             set_moondesk_as_co_author,
@@ -538,6 +632,107 @@ async fn handle_tools_call(
     .await
 }
 
+fn read_call_requires_workspace(
+    req: &JsonRpcRequest,
+    tool_name: &str,
+    tool_mode: ToolMode,
+) -> bool {
+    if tool_mode.read_only() {
+        return matches!(tool_name, "read" | "view_image" | "view_images");
+    }
+    let arguments = tool_arguments(req);
+    match tool_name {
+        "read" | "view_image" => arguments
+            .get("path")
+            .and_then(Value::as_str)
+            .is_none_or(|path| !Path::new(path).is_absolute()),
+        "view_images" => arguments
+            .get("paths")
+            .and_then(Value::as_array)
+            .is_none_or(|paths| {
+                paths.iter().any(|path| {
+                    path.as_str()
+                        .is_none_or(|path| !Path::new(path).is_absolute())
+                })
+            }),
+        _ => false,
+    }
+}
+
+fn ensure_external_read_path_is_not_another_workspace(
+    path: &str,
+    workspace_root: &str,
+    registered_workspace_roots: &[PathBuf],
+) -> Result<(), String> {
+    let requested = Path::new(path);
+    if !requested.is_absolute() {
+        return Ok(());
+    }
+    let target = requested
+        .canonicalize()
+        .map(command::normalize_windows_verbatim_path)
+        .map_err(|error| {
+            format!(
+                "Cannot resolve external read path {}: {error}",
+                requested.display()
+            )
+        })?;
+    let current_root = Path::new(workspace_root)
+        .canonicalize()
+        .map(command::normalize_windows_verbatim_path)
+        .ok();
+
+    for registered_root in registered_workspace_roots {
+        let Ok(registered_root) = registered_root.canonicalize() else {
+            continue;
+        };
+        let registered_root = command::normalize_windows_verbatim_path(registered_root);
+        if current_root.as_ref() == Some(&registered_root) {
+            continue;
+        }
+        if target.starts_with(&registered_root) {
+            return Err(format!(
+                "Refusing to read through another registered MoonDesk workspace: {}. Use that workspace's connector instead.",
+                registered_root.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn enforce_external_read_workspace_isolation(
+    req: &JsonRpcRequest,
+    tool_name: &str,
+    workspace_root: &str,
+    registered_workspace_roots: &[PathBuf],
+) -> Result<(), String> {
+    let arguments = tool_arguments(req);
+    match tool_name {
+        "read" | "view_image" => {
+            if let Some(path) = arguments.get("path").and_then(Value::as_str) {
+                ensure_external_read_path_is_not_another_workspace(
+                    path,
+                    workspace_root,
+                    registered_workspace_roots,
+                )?;
+            }
+        }
+        "view_images" => {
+            if let Some(paths) = arguments.get("paths").and_then(Value::as_array) {
+                for path in paths.iter().filter_map(Value::as_str) {
+                    ensure_external_read_path_is_not_another_workspace(
+                        path,
+                        workspace_root,
+                        registered_workspace_roots,
+                    )?;
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 async fn handle_tools_call_for_workspace(
     req: &JsonRpcRequest,
     context: McpRequestContext<'_>,
@@ -545,6 +740,7 @@ async fn handle_tools_call_for_workspace(
     let McpRequestContext {
         workspace_id,
         workspace_root,
+        registered_workspace_roots,
         mode,
         tool_mode,
         set_moondesk_as_co_author,
@@ -558,23 +754,43 @@ async fn handle_tools_call_for_workspace(
         .unwrap_or("")
         .to_string();
 
-    if matches!(
+    if tool_name == "view_page" {
+        if !mode.browser_enabled() {
+            return tool_error_response(req, "Tool 'view_page' requires browser mode".to_string());
+        }
+        return handle_view_page(req, workspace_root, devtools).await;
+    }
+
+    let workspace_dependent = matches!(
         tool_name.as_str(),
         "moondesk_instruction"
-            | "read"
             | "search"
             | "write"
             | "edit"
             | "delete"
             | "run_command"
             | "start_command"
-    ) && workspaces::workspace_availability(Path::new(workspace_root))
-        == WorkspaceAvailability::Unavailable
+    ) || read_call_requires_workspace(req, &tool_name, tool_mode);
+    if workspace_dependent
+        && workspaces::workspace_availability(Path::new(workspace_root))
+            == WorkspaceAvailability::Unavailable
     {
         return tool_error_response(
             req,
             format!("Workspace is currently unavailable: {workspace_root}"),
         );
+    }
+
+    if !tool_mode.read_only()
+        && matches!(tool_name.as_str(), "read" | "view_image" | "view_images")
+        && let Err(error) = enforce_external_read_workspace_isolation(
+            req,
+            &tool_name,
+            workspace_root,
+            registered_workspace_roots,
+        )
+    {
+        return tool_error_response(req, error);
     }
 
     {
@@ -635,7 +851,11 @@ async fn handle_tools_call_for_workspace(
                     "moondesk_instruction" => {
                         handle_moondesk_instruction(req, workspace_root, mode, tool_mode)
                     }
-                    "read" => handle_read_file(req, workspace_root),
+                    "read" => handle_read_file(req, workspace_root, !tool_mode.read_only()),
+                    "view_image" => handle_view_image(req, workspace_root, !tool_mode.read_only()),
+                    "view_images" => {
+                        handle_view_images(req, workspace_root, !tool_mode.read_only())
+                    }
                     "search" => handle_search_text(req, workspace_root),
                     _ => {
                         if tool_mode.write_tools_enabled() {
@@ -1323,14 +1543,15 @@ fn handle_run_command_move_path_intercept(
     }
 }
 
-fn tool_response(
+fn tool_response_with_content(
     req: &JsonRpcRequest,
     text: String,
+    content: Vec<Value>,
     structured: Option<Value>,
     is_error: bool,
 ) -> JsonRpcResponse {
     let mut result = json!({
-        "content": []
+        "content": content
     });
     if let Some(obj) = result.as_object_mut() {
         let structured = structured.unwrap_or_else(|| tool_message_structured(text));
@@ -1340,6 +1561,15 @@ fn tool_response(
         }
     }
     JsonRpcResponse::success(req.id.clone(), result)
+}
+
+fn tool_response(
+    req: &JsonRpcRequest,
+    text: String,
+    structured: Option<Value>,
+    is_error: bool,
+) -> JsonRpcResponse {
+    tool_response_with_content(req, text, Vec::new(), structured, is_error)
 }
 
 fn tool_message_structured(message: String) -> Value {
@@ -1352,6 +1582,14 @@ fn tool_success_response_with_structured(
     structured: Value,
 ) -> JsonRpcResponse {
     tool_response(req, text, Some(structured), false)
+}
+
+fn tool_success_response_with_content(
+    req: &JsonRpcRequest,
+    content: Vec<Value>,
+    structured: Value,
+) -> JsonRpcResponse {
+    tool_response_with_content(req, String::new(), content, Some(structured), false)
 }
 
 fn tool_error_response_with_structured(
@@ -1457,7 +1695,8 @@ Always specify the branch explicitly when using `git push`."#
         .collect();
 
     if mode.computer_enabled() {
-        lines.push("Use read to read files and search to search the workspace.".to_string());
+        lines.push("Use read to read files and search to search the workspace. Relative file paths stay workspace-contained. In MultiTools mode, read may inspect one explicitly addressed absolute local file outside the workspace when the task requires it; ReadOnly remains workspace-contained. Keep search/write/edit/delete workspace-scoped rather than using external absolute paths with them.".to_string());
+        lines.push("When a task depends on what an image actually looks like, use view_image or view_images so the model receives the pixels through its vision input. Do not substitute filenames, dimensions, blur scores, OCR, or other image metadata for visual inspection. Relative image paths stay inside the workspace. In normal tool modes, use an explicit absolute path only when the user's task genuinely requires inspecting a local image elsewhere on the machine; ReadOnly mode remains workspace-contained.".to_string());
         if tool_mode.run_command_enabled() {
             lines.push(
                 "For directory inspection, run_command can intercept plain listing commands such as find, tree, ls -R, and rg --files."
@@ -1478,7 +1717,7 @@ Always specify the branch explicitly when using `git push`."#
 
     if mode.browser_enabled() {
         lines.push(
-            "For browser tasks, prefer the dedicated browser and DevTools tools exposed by the server."
+            "For browser tasks, prefer the dedicated browser and DevTools tools exposed by the server. When visual appearance, layout, styling, rendering, canvas output, charts, or visual regressions matter, use view_page so MoonDesk captures the current rendered page and returns the actual pixels through the model's vision input. Accessibility/text snapshots are useful for structure but do not replace view_page for visual judgment. Raw take_screenshot is still available, but view_page is preferred because it guarantees MoonDesk-owned temporary capture, bounded image encoding, native MCP image content, and cleanup instead of silently degrading to a screenshot filepath when the capture is large."
                 .to_string(),
         );
     }
@@ -1675,9 +1914,50 @@ impl TokenEstimateWriter {
     }
 }
 
+fn write_value_for_token_estimate(
+    writer: &mut TokenEstimateWriter,
+    value: &Value,
+) -> Result<(), serde_json::Error> {
+    match value {
+        Value::Array(items) => {
+            writer.write_all(b"[").map_err(serde_json::Error::io)?;
+            for (index, item) in items.iter().enumerate() {
+                if index > 0 {
+                    writer.write_all(b",").map_err(serde_json::Error::io)?;
+                }
+                write_value_for_token_estimate(writer, item)?;
+            }
+            writer.write_all(b"]").map_err(serde_json::Error::io)?;
+            Ok(())
+        }
+        Value::Object(object) => {
+            let binary_content = object
+                .get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| matches!(kind, "image" | "audio"));
+            writer.write_all(b"{").map_err(serde_json::Error::io)?;
+            for (index, (key, item)) in object.iter().enumerate() {
+                if index > 0 {
+                    writer.write_all(b",").map_err(serde_json::Error::io)?;
+                }
+                serde_json::to_writer(&mut *writer, key)?;
+                writer.write_all(b":").map_err(serde_json::Error::io)?;
+                if binary_content && key == "data" {
+                    serde_json::to_writer(&mut *writer, "<binary>")?;
+                } else {
+                    write_value_for_token_estimate(writer, item)?;
+                }
+            }
+            writer.write_all(b"}").map_err(serde_json::Error::io)?;
+            Ok(())
+        }
+        _ => serde_json::to_writer(writer, value),
+    }
+}
+
 fn estimate_value_tokens_o200k(value: &Value) -> u64 {
     let mut writer = TokenEstimateWriter::default();
-    match serde_json::to_writer(&mut writer, value) {
+    match write_value_for_token_estimate(&mut writer, value) {
         Ok(()) => writer.estimate_tokens(),
         Err(_) => 0,
     }
@@ -1755,7 +2035,345 @@ async fn devtools_tool_is_read_only(
         .map(tool_is_read_only)
 }
 
-fn handle_read_file(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcResponse {
+fn image_metadata_value(metadata: &vision::PreparedImageMetadata) -> Value {
+    json!({
+        "path": metadata.path,
+        "sourceWidth": metadata.source_width,
+        "sourceHeight": metadata.source_height,
+        "width": metadata.width,
+        "height": metadata.height,
+        "sourceBytes": metadata.source_bytes,
+        "encodedBytes": metadata.encoded_bytes,
+        "mimeType": metadata.mime_type,
+        "resized": metadata.resized,
+        "orientationApplied": metadata.orientation_applied,
+    })
+}
+
+fn prepared_image_content(prepared: &vision::PreparedImage) -> Value {
+    json!({
+        "type": "image",
+        "data": prepared.base64_data,
+        "mimeType": prepared.metadata.mime_type,
+    })
+}
+
+fn optional_u32_argument(arguments: &Value, name: &str, default_value: u32) -> Result<u32, String> {
+    match arguments.get(name) {
+        Some(value) => value
+            .as_u64()
+            .and_then(|value| u32::try_from(value).ok())
+            .ok_or_else(|| format!("Parameter {name} must be a non-negative integer")),
+        None => Ok(default_value),
+    }
+}
+
+fn optional_u8_argument(arguments: &Value, name: &str, default_value: u8) -> Result<u8, String> {
+    match arguments.get(name) {
+        Some(value) => value
+            .as_u64()
+            .and_then(|value| u8::try_from(value).ok())
+            .ok_or_else(|| format!("Parameter {name} must be an integer between 0 and 255")),
+        None => Ok(default_value),
+    }
+}
+
+fn handle_view_image(
+    req: &JsonRpcRequest,
+    workspace_root: &str,
+    allow_external_absolute: bool,
+) -> JsonRpcResponse {
+    let arguments = tool_arguments(req);
+    let path = match required_string_argument(&arguments, "path") {
+        Ok(value) => value,
+        Err(error) => return tool_error_response(req, error),
+    };
+    let max_dimension =
+        match optional_u32_argument(&arguments, "max_dimension", vision::DEFAULT_MAX_DIMENSION) {
+            Ok(value) => value,
+            Err(error) => return tool_error_response(req, error),
+        };
+    let quality = match optional_u8_argument(&arguments, "quality", vision::DEFAULT_JPEG_QUALITY) {
+        Ok(value) => value,
+        Err(error) => return tool_error_response(req, error),
+    };
+
+    match vision::prepare_image(
+        workspace_root,
+        path,
+        max_dimension,
+        quality,
+        vision::MAX_SINGLE_ENCODED_BYTES,
+        allow_external_absolute,
+    ) {
+        Ok(prepared) => {
+            let structured = image_metadata_value(&prepared.metadata);
+            let content = vec![prepared_image_content(&prepared)];
+            tool_success_response_with_content(req, content, structured)
+        }
+        Err(error) => tool_error_response(req, error),
+    }
+}
+
+fn handle_view_images(
+    req: &JsonRpcRequest,
+    workspace_root: &str,
+    allow_external_absolute: bool,
+) -> JsonRpcResponse {
+    let arguments = tool_arguments(req);
+    let Some(paths_value) = arguments.get("paths") else {
+        return tool_error_response(req, "Missing required parameter: paths".to_string());
+    };
+    let Some(paths) = paths_value.as_array() else {
+        return tool_error_response(
+            req,
+            "Parameter paths must be an array of strings".to_string(),
+        );
+    };
+    if paths.is_empty() || paths.len() > vision::MAX_BATCH_IMAGES {
+        return tool_error_response(
+            req,
+            format!(
+                "Parameter paths must contain between 1 and {} images",
+                vision::MAX_BATCH_IMAGES
+            ),
+        );
+    }
+
+    let max_dimension = match optional_u32_argument(
+        &arguments,
+        "max_dimension",
+        vision::DEFAULT_BATCH_MAX_DIMENSION,
+    ) {
+        Ok(value) => value,
+        Err(error) => return tool_error_response(req, error),
+    };
+    let quality = match optional_u8_argument(&arguments, "quality", vision::DEFAULT_JPEG_QUALITY) {
+        Ok(value) => value,
+        Err(error) => return tool_error_response(req, error),
+    };
+    let per_image_budget =
+        vision::MAX_BATCH_IMAGE_ENCODED_BYTES.min(vision::MAX_BATCH_ENCODED_BYTES / paths.len());
+
+    let mut prepared_images = Vec::with_capacity(paths.len());
+    for (index, path_value) in paths.iter().enumerate() {
+        let Some(path) = path_value.as_str() else {
+            return tool_error_response(req, format!("paths[{index}] must be a string"));
+        };
+        match vision::prepare_image(
+            workspace_root,
+            path,
+            max_dimension,
+            quality,
+            per_image_budget,
+            allow_external_absolute,
+        ) {
+            Ok(prepared) => prepared_images.push(prepared),
+            Err(error) => {
+                return tool_error_response(
+                    req,
+                    format!("Could not prepare paths[{index}] ({path}): {error}"),
+                );
+            }
+        }
+    }
+
+    let mut content = Vec::with_capacity(prepared_images.len() * 2);
+    let mut metadata = Vec::with_capacity(prepared_images.len());
+    for (index, prepared) in prepared_images.iter().enumerate() {
+        content.push(json!({
+            "type": "text",
+            "text": format!("Image {}: {}", index + 1, prepared.metadata.path),
+        }));
+        content.push(prepared_image_content(prepared));
+        let mut value = image_metadata_value(&prepared.metadata);
+        if let Some(object) = value.as_object_mut() {
+            object.insert("index".to_string(), json!(index + 1));
+        }
+        metadata.push(value);
+    }
+
+    tool_success_response_with_content(
+        req,
+        content,
+        json!({
+            "count": prepared_images.len(),
+            "images": metadata,
+        }),
+    )
+}
+
+fn devtools_tool_error_message(response: &Value) -> Option<String> {
+    if response.pointer("/result/isError").and_then(Value::as_bool) != Some(true) {
+        return None;
+    }
+    let message = response
+        .pointer("/result/content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| {
+            (item.get("type").and_then(Value::as_str) == Some("text"))
+                .then(|| item.get("text").and_then(Value::as_str))
+                .flatten()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    Some(if message.trim().is_empty() {
+        "DevTools screenshot tool reported an error".to_string()
+    } else {
+        message
+    })
+}
+
+fn build_view_page_devtools_request(
+    req: &JsonRpcRequest,
+    destination: &Path,
+    full_page: bool,
+    uid: Option<&str>,
+    quality: u8,
+) -> Value {
+    let mut arguments = json!({
+        "format": "jpeg",
+        "quality": quality,
+        "fullPage": full_page,
+        "filePath": destination.to_string_lossy(),
+    });
+    if let Some(uid) = uid
+        && let Some(object) = arguments.as_object_mut()
+    {
+        object.insert("uid".to_string(), json!(uid));
+    }
+    json!({
+        "jsonrpc": "2.0",
+        "id": req.id,
+        "method": "tools/call",
+        "params": {
+            "name": "take_screenshot",
+            "arguments": arguments,
+        }
+    })
+}
+
+async fn handle_view_page(
+    req: &JsonRpcRequest,
+    workspace_root: &str,
+    devtools: &Option<Arc<DevtoolsManager>>,
+) -> JsonRpcResponse {
+    let Some(bridge) = devtools else {
+        return tool_error_response(
+            req,
+            "Browser vision is not available because the DevTools bridge is not running"
+                .to_string(),
+        );
+    };
+    let arguments = tool_arguments(req);
+    let full_page = match optional_bool_argument(&arguments, "full_page", false) {
+        Ok(value) => value,
+        Err(error) => return tool_error_response(req, error),
+    };
+    let uid = match optional_string_argument(&arguments, "uid") {
+        Ok(value) => value,
+        Err(error) => return tool_error_response(req, error),
+    };
+    if full_page && uid.is_some() {
+        return tool_error_response(req, "full_page cannot be combined with uid".to_string());
+    }
+    let quality = match optional_u8_argument(&arguments, "quality", vision::DEFAULT_JPEG_QUALITY) {
+        Ok(value) if (vision::MIN_JPEG_QUALITY..=vision::MAX_JPEG_QUALITY).contains(&value) => {
+            value
+        }
+        Ok(_) => {
+            return tool_error_response(
+                req,
+                format!(
+                    "quality must be between {} and {}",
+                    vision::MIN_JPEG_QUALITY,
+                    vision::MAX_JPEG_QUALITY
+                ),
+            );
+        }
+        Err(error) => return tool_error_response(req, error),
+    };
+
+    let temp_path =
+        std::env::temp_dir().join(format!("moondesk-view-page-{}.jpeg", uuid::Uuid::new_v4()));
+    let forward_req = build_view_page_devtools_request(req, &temp_path, full_page, uid, quality);
+    let response = match bridge.request(&forward_req).await {
+        Ok(response) => response,
+        Err(error) => {
+            let _ = std::fs::remove_file(&temp_path);
+            return tool_error_response(req, format!("Browser screenshot failed: {error}"));
+        }
+    };
+    if let Some(error) = response.get("error") {
+        let code = error.get("code").and_then(Value::as_i64).unwrap_or(-32000);
+        let message = error
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("Unknown DevTools screenshot error");
+        let _ = std::fs::remove_file(&temp_path);
+        return tool_error_response(
+            req,
+            format!("Browser screenshot failed (code {code}): {message}"),
+        );
+    }
+    if let Some(message) = devtools_tool_error_message(&response) {
+        let _ = std::fs::remove_file(&temp_path);
+        return tool_error_response(req, format!("Browser screenshot failed: {message}"));
+    }
+    if !temp_path.is_file() {
+        return tool_error_response(
+            req,
+            "Browser screenshot completed without producing the managed image file".to_string(),
+        );
+    }
+
+    let prepared = vision::prepare_image(
+        workspace_root,
+        &temp_path.to_string_lossy(),
+        vision::MAX_REQUESTED_DIMENSION,
+        quality,
+        vision::MAX_SINGLE_ENCODED_BYTES,
+        true,
+    );
+    let cleanup_warning = std::fs::remove_file(&temp_path)
+        .err()
+        .map(|error| format!("Could not remove MoonDesk's temporary browser screenshot: {error}"));
+
+    match prepared {
+        Ok(prepared) => {
+            let mut structured = json!({
+                "width": prepared.metadata.width,
+                "height": prepared.metadata.height,
+                "encodedBytes": prepared.metadata.encoded_bytes,
+                "mimeType": prepared.metadata.mime_type,
+                "resized": prepared.metadata.resized,
+                "fullPage": full_page,
+            });
+            if let Some(cleanup_warning) = cleanup_warning
+                && let Some(object) = structured.as_object_mut()
+            {
+                object.insert("cleanupWarning".to_string(), json!(cleanup_warning));
+            }
+            tool_success_response_with_content(
+                req,
+                vec![prepared_image_content(&prepared)],
+                structured,
+            )
+        }
+        Err(error) => tool_error_response(
+            req,
+            format!("Could not prepare browser screenshot for vision: {error}"),
+        ),
+    }
+}
+
+fn handle_read_file(
+    req: &JsonRpcRequest,
+    workspace_root: &str,
+    allow_external_absolute: bool,
+) -> JsonRpcResponse {
     let arguments = tool_arguments(req);
     let path = match arguments.get("path").and_then(|v| v.as_str()) {
         Some(v) => v,
@@ -1785,7 +2403,13 @@ fn handle_read_file(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcRespon
             Ok(value) => value.unwrap_or(workspace_tools::MAX_READ_BYTES),
             Err(e) => return tool_error_response(req, e),
         };
-        workspace_tools::read_file_bytes(workspace_root, path, start_byte, max_bytes)
+        workspace_tools::read_file_bytes_with_policy(
+            workspace_root,
+            path,
+            start_byte,
+            max_bytes,
+            allow_external_absolute,
+        )
     } else {
         if arguments.get("max_bytes").is_some() {
             return tool_error_response(req, "max_bytes requires start_byte".into());
@@ -1798,7 +2422,13 @@ fn handle_read_file(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcRespon
             Ok(value) => value.unwrap_or(workspace_tools::DEFAULT_READ_LINES),
             Err(e) => return tool_error_response(req, e),
         };
-        workspace_tools::read_file(workspace_root, path, start_line, max_lines)
+        workspace_tools::read_file_with_policy(
+            workspace_root,
+            path,
+            start_line,
+            max_lines,
+            allow_external_absolute,
+        )
     };
 
     match output {
@@ -2782,6 +3412,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_command_keeps_normal_host_access_to_explicit_external_files() {
+        let workspace_root = std::env::temp_dir().join(format!(
+            "moondesk-mcp-shell-external-workspace-{}",
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        let outside = std::env::temp_dir().join(format!(
+            "moondesk-mcp-shell-external-{}.txt",
+            Uuid::new_v4()
+        ));
+        std::fs::write(&outside, "external-shell-ok\n").expect("write external shell fixture");
+        let external = outside.to_string_lossy();
+        let command = if cfg!(windows) {
+            format!(
+                "Get-Content -LiteralPath '{}'",
+                external.replace('\'', "''")
+            )
+        } else {
+            format!("cat '{}'", external.replace('\'', "'\\''"))
+        };
+        let response = handle_tools_call(
+            &tool_call_request("run_command", json!({ "command": command })),
+            &workspace_root.to_string_lossy(),
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &CommandJobManager::new(),
+            &None,
+        )
+        .await;
+        let structured = response
+            .result
+            .as_ref()
+            .and_then(|result| result.get("structuredContent"))
+            .expect("external shell read must reach normal host shell execution");
+        assert!(
+            structured
+                .get("stdout")
+                .and_then(Value::as_str)
+                .is_some_and(|stdout| stdout.contains("external-shell-ok")),
+            "structured external-read policy must not sandbox or filter run_command"
+        );
+
+        let _ = std::fs::remove_file(outside);
+        let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
     async fn run_command_large_output_remains_recoverable_after_inline_truncation() {
         let workspace_root =
             std::env::temp_dir().join(format!("moondesk-mcp-run-archive-{}", Uuid::new_v4()));
@@ -2903,6 +3581,8 @@ mod tests {
                 "cancel_command",
                 "moondesk_instruction",
                 "read",
+                "view_image",
+                "view_images",
                 "search",
                 "write",
                 "edit",
@@ -2961,6 +3641,8 @@ mod tests {
             ("cancel_command", "state"),
             ("moondesk_instruction", "instructionText"),
             ("read", "text"),
+            ("view_image", "path"),
+            ("view_images", "images"),
             ("search", "text"),
             ("edit", "replacements"),
         ] {
@@ -3023,7 +3705,745 @@ mod tests {
             .filter_map(|tool| tool.get("name").and_then(Value::as_str))
             .collect::<Vec<_>>();
 
-        assert_eq!(names, vec!["moondesk_instruction", "read", "search"]);
+        assert_eq!(
+            names,
+            vec![
+                "moondesk_instruction",
+                "read",
+                "view_image",
+                "view_images",
+                "search",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn view_image_returns_native_mcp_image_content_in_read_only_mode() {
+        let workspace_root =
+            std::env::temp_dir().join(format!("moondesk-mcp-view-image-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        let image_path = workspace_root.join("sample.png");
+        let image = image::RgbaImage::from_pixel(80, 40, image::Rgba([20, 90, 180, 255]));
+        image.save(&image_path).expect("write PNG image fixture");
+
+        let response = handle_tools_call(
+            &tool_call_request("view_image", json!({ "path": "sample.png" })),
+            &workspace_root.to_string_lossy(),
+            Mode::Both,
+            ToolMode::ReadOnly,
+            false,
+            &CommandJobManager::new(),
+            &None,
+        )
+        .await;
+        let result = response.result.as_ref().expect("missing view_image result");
+        assert_ne!(result.get("isError").and_then(Value::as_bool), Some(true));
+        let content = result
+            .get("content")
+            .and_then(Value::as_array)
+            .expect("missing image content");
+        assert_eq!(content.len(), 1);
+        assert_eq!(
+            content[0].get("type").and_then(Value::as_str),
+            Some("image")
+        );
+        assert_eq!(
+            content[0].get("mimeType").and_then(Value::as_str),
+            Some("image/png")
+        );
+        assert!(
+            content[0]
+                .get("data")
+                .and_then(Value::as_str)
+                .is_some_and(|data| !data.is_empty())
+        );
+        let structured = result
+            .get("structuredContent")
+            .and_then(Value::as_object)
+            .expect("missing image metadata");
+        assert_eq!(structured.get("width").and_then(Value::as_u64), Some(80));
+        assert_eq!(structured.get("height").and_then(Value::as_u64), Some(40));
+        assert_eq!(
+            structured.get("mimeType").and_then(Value::as_str),
+            Some("image/png")
+        );
+
+        let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn view_image_external_absolute_path_requires_non_read_only_mode() {
+        let workspace_root =
+            std::env::temp_dir().join(format!("moondesk-mcp-view-image-policy-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        let outside = std::env::temp_dir().join(format!("moondesk-outside-{}.png", Uuid::new_v4()));
+        image::RgbaImage::from_pixel(24, 24, image::Rgba([100, 120, 140, 255]))
+            .save(&outside)
+            .expect("write outside image fixture");
+        let absolute = outside.to_string_lossy().into_owned();
+
+        let read_only = handle_tools_call(
+            &tool_call_request("view_image", json!({ "path": absolute })),
+            &workspace_root.to_string_lossy(),
+            Mode::Both,
+            ToolMode::ReadOnly,
+            false,
+            &CommandJobManager::new(),
+            &None,
+        )
+        .await;
+        assert_eq!(
+            read_only
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(result_text(&read_only).contains("outside the workspace in read-only mode"));
+
+        let normal = handle_tools_call(
+            &tool_call_request(
+                "view_image",
+                json!({ "path": outside.to_string_lossy().into_owned() }),
+            ),
+            &workspace_root.to_string_lossy(),
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &CommandJobManager::new(),
+            &None,
+        )
+        .await;
+        let normal_result = normal.result.as_ref().expect("normal view_image result");
+        assert_ne!(
+            normal_result.get("isError").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            normal_result
+                .pointer("/content/0/type")
+                .and_then(Value::as_str),
+            Some("image")
+        );
+
+        std::fs::remove_dir_all(&workspace_root)
+            .expect("remove workspace before absolute-path retry");
+        let unavailable_workspace = handle_tools_call(
+            &tool_call_request(
+                "view_image",
+                json!({ "path": outside.to_string_lossy().into_owned() }),
+            ),
+            &workspace_root.to_string_lossy(),
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &CommandJobManager::new(),
+            &None,
+        )
+        .await;
+        assert_ne!(
+            unavailable_workspace
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true),
+            "explicit absolute image should not depend on workspace availability in normal mode"
+        );
+
+        let _ = std::fs::remove_file(outside);
+    }
+
+    #[tokio::test]
+    async fn view_images_external_absolute_paths_follow_tool_mode_policy() {
+        let workspace_root = std::env::temp_dir().join(format!(
+            "moondesk-mcp-view-images-policy-{}",
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        let outside_a =
+            std::env::temp_dir().join(format!("moondesk-outside-a-{}.png", Uuid::new_v4()));
+        let outside_b =
+            std::env::temp_dir().join(format!("moondesk-outside-b-{}.jpg", Uuid::new_v4()));
+        image::RgbaImage::from_pixel(24, 24, image::Rgba([30, 80, 130, 255]))
+            .save(&outside_a)
+            .expect("write outside image A");
+        image::RgbImage::from_pixel(24, 24, image::Rgb([180, 90, 30]))
+            .save(&outside_b)
+            .expect("write outside image B");
+        let paths = vec![
+            outside_a.to_string_lossy().into_owned(),
+            outside_b.to_string_lossy().into_owned(),
+        ];
+
+        let read_only = handle_tools_call(
+            &tool_call_request("view_images", json!({ "paths": paths.clone() })),
+            &workspace_root.to_string_lossy(),
+            Mode::Both,
+            ToolMode::ReadOnly,
+            false,
+            &CommandJobManager::new(),
+            &None,
+        )
+        .await;
+        assert_eq!(
+            read_only
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+
+        let normal = handle_tools_call(
+            &tool_call_request("view_images", json!({ "paths": paths })),
+            &workspace_root.to_string_lossy(),
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &CommandJobManager::new(),
+            &None,
+        )
+        .await;
+        let result = normal.result.as_ref().expect("normal view_images result");
+        assert_ne!(result.get("isError").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            result
+                .get("content")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(4)
+        );
+        assert_eq!(
+            result
+                .pointer("/structuredContent/count")
+                .and_then(Value::as_u64),
+            Some(2)
+        );
+
+        let _ = std::fs::remove_file(outside_a);
+        let _ = std::fs::remove_file(outside_b);
+        let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn view_images_preserves_path_order_and_labels_each_image() {
+        let workspace_root =
+            std::env::temp_dir().join(format!("moondesk-mcp-view-images-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        for (name, color) in [
+            ("first.png", image::Rgba([220, 20, 20, 255])),
+            ("second.png", image::Rgba([20, 220, 20, 255])),
+        ] {
+            image::RgbaImage::from_pixel(32, 24, color)
+                .save(workspace_root.join(name))
+                .expect("write PNG batch fixture");
+        }
+
+        let response = handle_tools_call(
+            &tool_call_request(
+                "view_images",
+                json!({ "paths": ["first.png", "second.png"] }),
+            ),
+            &workspace_root.to_string_lossy(),
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &CommandJobManager::new(),
+            &None,
+        )
+        .await;
+        let result = response
+            .result
+            .as_ref()
+            .expect("missing view_images result");
+        assert_ne!(result.get("isError").and_then(Value::as_bool), Some(true));
+        let content = result
+            .get("content")
+            .and_then(Value::as_array)
+            .expect("missing batch image content");
+        assert_eq!(content.len(), 4);
+        assert_eq!(content[0].get("type").and_then(Value::as_str), Some("text"));
+        assert!(
+            content[0]
+                .get("text")
+                .and_then(Value::as_str)
+                .is_some_and(|text| text.contains("first.png"))
+        );
+        assert_eq!(
+            content[1].get("type").and_then(Value::as_str),
+            Some("image")
+        );
+        assert_eq!(content[2].get("type").and_then(Value::as_str), Some("text"));
+        assert!(
+            content[2]
+                .get("text")
+                .and_then(Value::as_str)
+                .is_some_and(|text| text.contains("second.png"))
+        );
+        assert_eq!(
+            content[3].get("type").and_then(Value::as_str),
+            Some("image")
+        );
+
+        let structured = result
+            .get("structuredContent")
+            .expect("missing batch metadata");
+        assert_eq!(structured.get("count").and_then(Value::as_u64), Some(2));
+        let images = structured
+            .get("images")
+            .and_then(Value::as_array)
+            .expect("missing image metadata array");
+        assert_eq!(images.len(), 2);
+        assert_eq!(images[0].get("index").and_then(Value::as_u64), Some(1));
+        assert!(
+            images[0]
+                .get("path")
+                .and_then(Value::as_str)
+                .is_some_and(|path| path.ends_with("first.png"))
+        );
+        assert_eq!(images[1].get("index").and_then(Value::as_u64), Some(2));
+        assert!(
+            images[1]
+                .get("path")
+                .and_then(Value::as_str)
+                .is_some_and(|path| path.ends_with("second.png"))
+        );
+
+        let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn view_images_rejects_oversized_batches_before_reading_files() {
+        let workspace_root =
+            std::env::temp_dir().join(format!("moondesk-mcp-view-images-limit-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        let paths = (0..=vision::MAX_BATCH_IMAGES)
+            .map(|index| format!("missing-{index}.jpg"))
+            .collect::<Vec<_>>();
+        let response = handle_tools_call(
+            &tool_call_request("view_images", json!({ "paths": paths })),
+            &workspace_root.to_string_lossy(),
+            Mode::Both,
+            ToolMode::ReadOnly,
+            false,
+            &CommandJobManager::new(),
+            &None,
+        )
+        .await;
+        let result = response.result.as_ref().expect("view_images limit result");
+        assert_eq!(result.get("isError").and_then(Value::as_bool), Some(true));
+        assert!(
+            result_text(&response).contains("must contain between 1 and"),
+            "batch limit should fail before attempting to resolve missing image paths"
+        );
+        assert_eq!(
+            result
+                .get("content")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(0)
+        );
+        let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn view_images_fails_atomically_when_any_image_is_invalid() {
+        let workspace_root = std::env::temp_dir().join(format!(
+            "moondesk-mcp-view-images-atomic-{}",
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        image::RgbaImage::from_pixel(32, 24, image::Rgba([20, 40, 60, 255]))
+            .save(workspace_root.join("valid.png"))
+            .expect("write valid batch fixture");
+
+        let response = handle_tools_call(
+            &tool_call_request(
+                "view_images",
+                json!({ "paths": ["valid.png", "missing.png"] }),
+            ),
+            &workspace_root.to_string_lossy(),
+            Mode::Both,
+            ToolMode::ReadOnly,
+            false,
+            &CommandJobManager::new(),
+            &None,
+        )
+        .await;
+        let result = response.result.as_ref().expect("view_images atomic result");
+        assert_eq!(result.get("isError").and_then(Value::as_bool), Some(true));
+        assert!(result_text(&response).contains("paths[1] (missing.png)"));
+        assert_eq!(
+            result
+                .get("content")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(0),
+            "a failed batch must not return only the earlier successfully prepared images"
+        );
+        let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
+    #[test]
+    fn devtools_tool_error_message_extracts_mcp_tool_errors() {
+        let response = json!({
+            "result": {
+                "isError": true,
+                "content": [
+                    { "type": "text", "text": "first failure line" },
+                    { "type": "text", "text": "second failure line" }
+                ]
+            }
+        });
+        assert_eq!(
+            devtools_tool_error_message(&response).as_deref(),
+            Some("first failure line\nsecond failure line")
+        );
+        assert!(devtools_tool_error_message(&json!({ "result": { "isError": false } })).is_none());
+    }
+
+    #[test]
+    fn view_page_builds_managed_jpeg_devtools_request() {
+        let req = tool_call_request("view_page", json!({}));
+        let destination = std::env::temp_dir().join("moondesk-view-page-test.jpeg");
+        let request =
+            build_view_page_devtools_request(&req, &destination, false, Some("node-42"), 84);
+        assert_eq!(
+            request.pointer("/params/name").and_then(Value::as_str),
+            Some("take_screenshot")
+        );
+        assert_eq!(
+            request
+                .pointer("/params/arguments/format")
+                .and_then(Value::as_str),
+            Some("jpeg")
+        );
+        assert_eq!(
+            request
+                .pointer("/params/arguments/quality")
+                .and_then(Value::as_u64),
+            Some(84)
+        );
+        assert_eq!(
+            request
+                .pointer("/params/arguments/fullPage")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            request
+                .pointer("/params/arguments/uid")
+                .and_then(Value::as_str),
+            Some("node-42")
+        );
+        assert_eq!(
+            request
+                .pointer("/params/arguments/filePath")
+                .and_then(Value::as_str),
+            Some(destination.to_string_lossy().as_ref())
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    #[ignore = "serialized Windows browser vision smoke"]
+    async fn windows_view_page_returns_native_mcp_image_content() {
+        use crate::browser;
+        use crate::state::{AppState, ui_event_channel};
+        use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+        use image::GenericImageView;
+        use std::collections::HashSet;
+        use tokio::sync::Mutex;
+
+        fn managed_view_page_files() -> HashSet<String> {
+            std::fs::read_dir(std::env::temp_dir())
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter_map(|entry| entry.file_name().to_str().map(str::to_owned))
+                .filter(|name| name.starts_with("moondesk-view-page-") && name.ends_with(".jpeg"))
+                .collect()
+        }
+
+        fn decode_tool_image(content: &Value) -> image::DynamicImage {
+            let data = content
+                .get("data")
+                .and_then(Value::as_str)
+                .expect("native MCP image data");
+            let bytes = BASE64_STANDARD.decode(data).expect("decode MCP image data");
+            image::load_from_memory(&bytes).expect("decode browser screenshot image")
+        }
+
+        fn assert_rgb_near(actual: image::Rgba<u8>, expected: [u8; 3], tolerance: i16) {
+            for (channel, expected_channel) in actual.0[..3].iter().zip(expected) {
+                let delta = i16::from(*channel) - i16::from(expected_channel);
+                assert!(
+                    delta.abs() <= tolerance,
+                    "pixel {:?} is not within {tolerance} per channel of expected {expected:?}",
+                    actual.0
+                );
+            }
+        }
+
+        let Some(mut selected) = browser::detect_browsers()
+            .into_iter()
+            .find(|browser| browser.mcp_supported)
+        else {
+            eprintln!("skipping browser vision smoke: no supported Chromium browser is installed");
+            return;
+        };
+        selected.remote_debug_active = false;
+        selected.remote_debug_target = None;
+        selected.remote_debug_pid = None;
+        selected.remote_debug_page_count = None;
+
+        let workspace_root =
+            std::env::temp_dir().join(format!("moondesk-browser-vision-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace_root).expect("create browser vision workspace");
+        let app = AppState::new_for_test(
+            0,
+            workspace_root.to_string_lossy().into_owned(),
+            workspace_root.join("config.toml"),
+        )
+        .expect("create browser vision app state");
+        let state = Arc::new(Mutex::new(app));
+        let (ui_tx, _ui_rx) = ui_event_channel();
+        let manager = DevtoolsManager::start(Some(&selected), ui_tx, state)
+            .await
+            .expect("start DevTools manager for vision smoke");
+        let initialize = json!({
+            "jsonrpc": "2.0",
+            "id": "vision-smoke-init",
+            "method": "initialize",
+            "params": {
+                "protocolVersion": DEVTOOLS_PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": { "name": "moondesk-vision-smoke", "version": SERVER_VERSION }
+            }
+        });
+        manager
+            .ensure_initialized(&initialize)
+            .await
+            .expect("initialize DevTools bridge for vision smoke");
+
+        let navigate = json!({
+            "jsonrpc": "2.0",
+            "id": "vision-smoke-navigate",
+            "method": "tools/call",
+            "params": {
+                "name": "navigate_page",
+                "arguments": {
+                    "type": "url",
+                    "url": "data:text/html,<body style='margin:0;background:rgb(12,34,56);height:2400px'><div style='height:1200px'></div><div style='height:1200px;background:rgb(210,60,40)'></div></body>"
+                }
+            }
+        });
+        let navigate_response = manager
+            .request(&navigate)
+            .await
+            .expect("navigate deterministic browser vision page");
+        assert!(navigate_response.get("error").is_none());
+        assert_ne!(
+            navigate_response
+                .pointer("/result/isError")
+                .and_then(Value::as_bool),
+            Some(true),
+            "deterministic browser vision page navigation failed: {navigate_response}"
+        );
+
+        let manager_option = Some(manager.clone());
+        let tools_request = JsonRpcRequest {
+            jsonrpc: "2.0".into(),
+            id: Some(json!("vision-smoke-tools")),
+            method: "tools/list".into(),
+            params: json!({}),
+        };
+        let tools_response = handle_tools_list(
+            &tools_request,
+            Mode::Browser,
+            ToolMode::ReadOnly,
+            &manager_option,
+        )
+        .await;
+        let tool_names = tools_response
+            .result
+            .as_ref()
+            .and_then(|result| result.get("tools"))
+            .and_then(Value::as_array)
+            .expect("browser vision tools list")
+            .iter()
+            .filter_map(|tool| tool.get("name").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+        assert!(tool_names.contains(&"view_page"));
+        assert!(
+            !tool_names.contains(&"take_screenshot"),
+            "raw take_screenshot writes arbitrary filePath values and should stay filtered in read-only mode"
+        );
+
+        let invalid_scope = handle_view_page(
+            &tool_call_request(
+                "view_page",
+                json!({ "full_page": true, "uid": "node-does-not-matter" }),
+            ),
+            &workspace_root.to_string_lossy(),
+            &manager_option,
+        )
+        .await;
+        assert_eq!(
+            invalid_scope
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(result_text(&invalid_scope).contains("full_page cannot be combined with uid"));
+
+        let invalid_quality = handle_view_page(
+            &tool_call_request(
+                "view_page",
+                json!({ "quality": u64::from(vision::MIN_JPEG_QUALITY - 1) }),
+            ),
+            &workspace_root.to_string_lossy(),
+            &manager_option,
+        )
+        .await;
+        assert_eq!(
+            invalid_quality
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(result_text(&invalid_quality).contains("quality must be between"));
+
+        let before = managed_view_page_files();
+        let invalid_uid = handle_view_page(
+            &tool_call_request("view_page", json!({ "uid": "missing-vision-smoke-uid" })),
+            &workspace_root.to_string_lossy(),
+            &manager_option,
+        )
+        .await;
+        assert_eq!(
+            invalid_uid
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(result_text(&invalid_uid).contains("Browser screenshot failed"));
+        assert_eq!(
+            managed_view_page_files(),
+            before,
+            "failed element capture must clean its managed screenshot"
+        );
+
+        let manager_option = Some(manager.clone());
+        let request = tool_call_request("view_page", json!({}));
+        let response =
+            handle_view_page(&request, &workspace_root.to_string_lossy(), &manager_option).await;
+        let result = response.result.as_ref().expect("view_page result");
+        assert_ne!(result.get("isError").and_then(Value::as_bool), Some(true));
+        let content = result
+            .get("content")
+            .and_then(Value::as_array)
+            .expect("view_page content array");
+        assert_eq!(content.len(), 1);
+        assert_eq!(
+            content[0].get("type").and_then(Value::as_str),
+            Some("image")
+        );
+        assert_eq!(
+            content[0].get("mimeType").and_then(Value::as_str),
+            Some("image/jpeg")
+        );
+        assert!(
+            content[0]
+                .get("data")
+                .and_then(Value::as_str)
+                .is_some_and(|data| data.len() > 100)
+        );
+        let viewport_image = decode_tool_image(&content[0]);
+        let (viewport_width, viewport_height) = viewport_image.dimensions();
+        assert!(viewport_width > 0 && viewport_height > 0);
+        assert_rgb_near(
+            viewport_image.get_pixel(viewport_width / 2, viewport_height / 2),
+            [12, 34, 56],
+            18,
+        );
+        let structured = result
+            .get("structuredContent")
+            .expect("view_page structured metadata");
+        assert!(
+            structured
+                .get("width")
+                .and_then(Value::as_u64)
+                .is_some_and(|v| v > 0)
+        );
+        assert!(
+            structured
+                .get("height")
+                .and_then(Value::as_u64)
+                .is_some_and(|v| v > 0)
+        );
+        assert!(structured.get("cleanupWarning").is_none());
+        assert_eq!(
+            managed_view_page_files(),
+            before,
+            "view_page must clean its managed screenshot"
+        );
+
+        let full_page_response = handle_view_page(
+            &tool_call_request("view_page", json!({ "full_page": true })),
+            &workspace_root.to_string_lossy(),
+            &manager_option,
+        )
+        .await;
+        let full_page_result = full_page_response
+            .result
+            .as_ref()
+            .expect("full-page view_page result");
+        assert_ne!(
+            full_page_result.get("isError").and_then(Value::as_bool),
+            Some(true)
+        );
+        let full_page_content = full_page_result
+            .get("content")
+            .and_then(Value::as_array)
+            .expect("full-page image content");
+        assert_eq!(full_page_content.len(), 1);
+        let full_page_image = decode_tool_image(&full_page_content[0]);
+        let (full_width, full_height) = full_page_image.dimensions();
+        assert!(full_width > 0);
+        assert!(
+            full_height > viewport_height.saturating_mul(2),
+            "full-page capture height {full_height} should substantially exceed viewport height {viewport_height}"
+        );
+        assert_rgb_near(
+            full_page_image.get_pixel(full_width / 2, full_height.saturating_sub(50)),
+            [210, 60, 40],
+            20,
+        );
+        let full_structured = full_page_result
+            .get("structuredContent")
+            .expect("full-page structured metadata");
+        assert_eq!(
+            full_structured.get("fullPage").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(full_structured.get("cleanupWarning").is_none());
+        assert_eq!(
+            managed_view_page_files(),
+            before,
+            "full-page view_page must clean its managed screenshot"
+        );
+
+        manager.stop().await;
+        let _ = std::fs::remove_dir_all(workspace_root);
     }
 
     #[tokio::test]
@@ -3724,6 +5144,17 @@ mod tests {
                 .contains("empty, unresolved, malformed, or failed variable or expression")
         );
         assert!(instruction_text.contains("do not split normal reads, searches, builds, tests"));
+        assert!(instruction_text.contains(
+            "read may inspect one explicitly addressed absolute local file outside the workspace"
+        ));
+        assert!(instruction_text.contains("Keep search/write/edit/delete workspace-scoped"));
+        assert!(instruction_text.contains("use view_image or view_images"));
+        assert!(instruction_text.contains("model receives the pixels through its vision input"));
+        assert!(instruction_text.contains("use view_page"));
+        assert!(instruction_text.contains("do not replace view_page for visual judgment"));
+        assert!(
+            instruction_text.contains("instead of silently degrading to a screenshot filepath")
+        );
         assert_eq!(
             structured.as_object().map(|value| value.len()),
             Some(1),
@@ -3788,6 +5219,192 @@ mod tests {
         let _ = std::fs::remove_dir_all(workspace_root);
     }
 
+    #[tokio::test]
+    async fn read_external_absolute_path_requires_non_read_only_mode() {
+        let workspace_root =
+            std::env::temp_dir().join(format!("moondesk-mcp-read-policy-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        let outside = std::env::temp_dir().join(format!("moondesk-outside-{}.txt", Uuid::new_v4()));
+        std::fs::write(&outside, "outside file\nsecond line\n")
+            .expect("write outside text fixture");
+        let absolute = outside.to_string_lossy().into_owned();
+
+        let read_only = handle_tools_call(
+            &tool_call_request("read", json!({ "path": absolute })),
+            &workspace_root.to_string_lossy(),
+            Mode::Both,
+            ToolMode::ReadOnly,
+            false,
+            &CommandJobManager::new(),
+            &None,
+        )
+        .await;
+        assert_eq!(
+            read_only
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+
+        let normal = handle_tools_call(
+            &tool_call_request(
+                "read",
+                json!({ "path": outside.to_string_lossy().into_owned() }),
+            ),
+            &workspace_root.to_string_lossy(),
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &CommandJobManager::new(),
+            &None,
+        )
+        .await;
+        assert_eq!(
+            normal
+                .result
+                .as_ref()
+                .and_then(|result| result.pointer("/structuredContent/text"))
+                .and_then(Value::as_str),
+            Some("outside file\nsecond line\n")
+        );
+
+        std::fs::remove_dir_all(&workspace_root)
+            .expect("remove workspace before absolute read retry");
+        let unavailable_workspace = handle_tools_call(
+            &tool_call_request(
+                "read",
+                json!({
+                    "path": outside.to_string_lossy().into_owned(),
+                    "start_byte": 0,
+                    "max_bytes": 8
+                }),
+            ),
+            &workspace_root.to_string_lossy(),
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &CommandJobManager::new(),
+            &None,
+        )
+        .await;
+        assert_eq!(
+            unavailable_workspace
+                .result
+                .as_ref()
+                .and_then(|result| result.pointer("/structuredContent/text"))
+                .and_then(Value::as_str),
+            Some("outside ")
+        );
+
+        let _ = std::fs::remove_file(outside);
+    }
+
+    #[tokio::test]
+    async fn external_absolute_read_scope_does_not_expand_search_write_or_delete() {
+        let workspace_root =
+            std::env::temp_dir().join(format!("moondesk-mcp-external-scope-{}", Uuid::new_v4()));
+        let outside_root =
+            std::env::temp_dir().join(format!("moondesk-outside-scope-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        std::fs::create_dir_all(&outside_root).expect("create outside root");
+        let outside_file = outside_root.join("keep.txt");
+        std::fs::write(&outside_file, "KEEP needle\n").expect("write outside sentinel");
+        let workspace_root_str = workspace_root.to_string_lossy().into_owned();
+        let outside_file_str = outside_file.to_string_lossy().into_owned();
+        let outside_root_str = outside_root.to_string_lossy().into_owned();
+
+        let read = handle_tools_call(
+            &tool_call_request("read", json!({ "path": outside_file_str.clone() })),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &CommandJobManager::new(),
+            &None,
+        )
+        .await;
+        assert_eq!(
+            read.result
+                .as_ref()
+                .and_then(|result| result.pointer("/structuredContent/text"))
+                .and_then(Value::as_str),
+            Some("KEEP needle\n")
+        );
+
+        let search = handle_tools_call(
+            &tool_call_request(
+                "search",
+                json!({ "pattern": "needle", "path": outside_root_str }),
+            ),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &CommandJobManager::new(),
+            &None,
+        )
+        .await;
+        assert_eq!(
+            search
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+
+        let write = handle_tools_call(
+            &tool_call_request(
+                "write",
+                json!({ "path": outside_file_str.clone(), "content": "MUTATED\n" }),
+            ),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &CommandJobManager::new(),
+            &None,
+        )
+        .await;
+        assert_eq!(
+            write
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+
+        let delete = handle_tools_call(
+            &tool_call_request("delete", json!({ "path": outside_file_str })),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &CommandJobManager::new(),
+            &None,
+        )
+        .await;
+        assert_eq!(
+            delete
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            std::fs::read_to_string(&outside_file)
+                .expect("read outside sentinel after blocked calls"),
+            "KEEP needle\n"
+        );
+
+        let _ = std::fs::remove_dir_all(outside_root);
+        let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
     #[test]
     fn read_tool_pages_large_file_by_lines() {
         let workspace_root =
@@ -3802,6 +5419,7 @@ mod tests {
         let first = handle_read_file(
             &tool_call_request("read", json!({ "path": "large.txt" })),
             &workspace_root_str,
+            false,
         );
         let first = first
             .result
@@ -3827,6 +5445,7 @@ mod tests {
                 json!({ "path": "large.txt", "start_line": 201, "max_lines": 30 }),
             ),
             &workspace_root_str,
+            false,
         );
         let second = second
             .result
@@ -3861,6 +5480,7 @@ mod tests {
         let first = handle_read_file(
             &tool_call_request("read", json!({ "path": "minified.js" })),
             &workspace_root_str,
+            false,
         );
         let first = first
             .result
@@ -3894,6 +5514,7 @@ mod tests {
                 }),
             ),
             &workspace_root_str,
+            false,
         );
         let second = second
             .result
@@ -4031,6 +5652,45 @@ mod tests {
         assert!(input_tokens > 0);
         assert!(output_tokens > 0);
         assert!(result.get("_meta").is_none());
+    }
+
+    #[test]
+    fn image_binary_payloads_do_not_inflate_text_token_estimates() {
+        let req = tool_call_request("view_image", json!({ "path": "sample.jpg" }));
+        let binary = "A".repeat(1_000_000);
+        let result = json!({
+            "content": [{
+                "type": "image",
+                "mimeType": "image/jpeg",
+                "data": binary,
+            }],
+            "structuredContent": {
+                "path": "sample.jpg",
+                "width": 1600,
+                "height": 1200,
+            }
+        });
+
+        let (_, image_output_tokens) = estimate_turn_token_usage(&req, &result);
+        assert!(image_output_tokens > 0);
+        assert!(
+            image_output_tokens < 1_000,
+            "binary image data must not be estimated as text tokens: {image_output_tokens}"
+        );
+        assert_eq!(
+            result
+                .pointer("/content/0/data")
+                .and_then(Value::as_str)
+                .map(str::len),
+            Some(1_000_000),
+            "token estimation must not mutate the tool result"
+        );
+
+        let text_result = json!({
+            "content": [{ "type": "text", "text": "A".repeat(1_000_000) }]
+        });
+        let (_, text_output_tokens) = estimate_turn_token_usage(&req, &text_result);
+        assert!(text_output_tokens > image_output_tokens * 100);
     }
 
     #[test]

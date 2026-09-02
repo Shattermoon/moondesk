@@ -9,7 +9,7 @@ npm install -g moondesk
 ```
 
 > [!IMPORTANT]
-> MoonDesk runs tools on your computer with your user account's permissions. Use a VM or container when you need strong isolation.
+> MoonDesk runs tools locally on your computer. Review commands before running them, and use an isolated environment for untrusted projects or code.
 
 ## Why MoonDesk?
 

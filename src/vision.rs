@@ -36,6 +36,7 @@ pub struct PreparedImageMetadata {
     pub encoded_bytes: usize,
     pub mime_type: &'static str,
     pub resized: bool,
+    pub orientation_applied: bool,
 }
 
 #[derive(Debug)]
@@ -52,21 +53,36 @@ fn canonicalize(path: &Path) -> Result<PathBuf, String> {
 
 /// Resolve a local image path. Relative paths stay contained in the workspace;
 /// an explicit absolute path may point anywhere readable by the MoonDesk user.
-pub fn resolve_image_path(workspace_root: &str, requested: &str) -> Result<PathBuf, String> {
+pub fn resolve_image_path(
+    workspace_root: &str,
+    requested: &str,
+    allow_external_absolute: bool,
+) -> Result<PathBuf, String> {
     let requested = requested.trim();
     if requested.is_empty() {
         return Err("Image path must not be empty".to_string());
     }
 
-    let root = canonicalize(Path::new(workspace_root))?;
     let requested_path = Path::new(requested);
     let resolved = if requested_path.is_absolute() {
-        canonicalize(requested_path)?
+        let candidate = canonicalize(requested_path)?;
+        if allow_external_absolute {
+            candidate
+        } else {
+            let root = canonicalize(Path::new(workspace_root))?;
+            if !candidate.starts_with(&root) {
+                return Err(format!(
+                    "Absolute image path is outside the workspace in read-only mode: {requested}"
+                ));
+            }
+            candidate
+        }
     } else {
+        let root = canonicalize(Path::new(workspace_root))?;
         let candidate = canonicalize(&root.join(requested_path))?;
         if !candidate.starts_with(&root) {
             return Err(format!(
-                "Relative image path escapes the workspace: {requested}. Use an explicit absolute path when the task genuinely requires reading an image outside the workspace."
+                "Relative image path escapes the workspace: {requested}. Use an explicit absolute path only when MoonDesk is not in read-only mode and the task genuinely requires reading an image outside the workspace."
             ));
         }
         candidate
@@ -224,6 +240,7 @@ pub fn prepare_image(
     max_dimension: u32,
     jpeg_quality: u8,
     target_bytes: usize,
+    allow_external_absolute: bool,
 ) -> Result<PreparedImage, String> {
     if !(1..=MAX_REQUESTED_DIMENSION).contains(&max_dimension) {
         return Err(format!(
@@ -236,7 +253,7 @@ pub fn prepare_image(
         ));
     }
 
-    let path = resolve_image_path(workspace_root, requested_path)?;
+    let path = resolve_image_path(workspace_root, requested_path, allow_external_absolute)?;
     let source_bytes = validate_source_size(&path)?;
     let (decoded, format, source_width, source_height, needs_orientation) = decode_oriented(&path)?;
     let oriented_source_dimensions = decoded.dimensions();
@@ -265,6 +282,7 @@ pub fn prepare_image(
             encoded_bytes: encoded.len(),
             mime_type,
             resized: false,
+            orientation_applied: false,
         };
         return Ok(PreparedImage {
             metadata,
@@ -304,6 +322,7 @@ pub fn prepare_image(
         encoded_bytes: encoded.len(),
         mime_type,
         resized: oriented_source_dimensions != (width, height),
+        orientation_applied: needs_orientation,
     };
     Ok(PreparedImage {
         metadata,
@@ -336,7 +355,7 @@ mod tests {
             .join(outside.file_name().expect("outside fixture name"))
             .to_string_lossy()
             .into_owned();
-        let error = resolve_image_path(&root.to_string_lossy(), &relative)
+        let error = resolve_image_path(&root.to_string_lossy(), &relative, false)
             .expect_err("relative escape must be rejected");
         assert!(error.contains("escapes the workspace"));
         let _ = std::fs::remove_file(outside);
@@ -348,9 +367,38 @@ mod tests {
         let root = temp_workspace();
         let outside = std::env::temp_dir().join(format!("outside-{}.png", Uuid::new_v4()));
         std::fs::write(&outside, b"not-an-image").expect("write outside fixture");
-        let resolved = resolve_image_path(&root.to_string_lossy(), &outside.to_string_lossy())
-            .expect("explicit absolute path should resolve");
+        let resolved =
+            resolve_image_path(&root.to_string_lossy(), &outside.to_string_lossy(), true)
+                .expect("explicit absolute path should resolve");
         assert_eq!(resolved, canonicalize(&outside).expect("canonical outside"));
+        let _ = std::fs::remove_file(outside);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn explicit_absolute_path_does_not_require_workspace_root_to_exist() {
+        let missing_root =
+            std::env::temp_dir().join(format!("missing-workspace-{}", Uuid::new_v4()));
+        let outside = std::env::temp_dir().join(format!("outside-{}.png", Uuid::new_v4()));
+        std::fs::write(&outside, b"not-an-image").expect("write outside fixture");
+        let resolved = resolve_image_path(
+            &missing_root.to_string_lossy(),
+            &outside.to_string_lossy(),
+            true,
+        )
+        .expect("explicit absolute path must not depend on workspace availability");
+        assert_eq!(resolved, canonicalize(&outside).expect("canonical outside"));
+        let _ = std::fs::remove_file(outside);
+    }
+
+    #[test]
+    fn read_only_path_policy_rejects_absolute_path_outside_workspace() {
+        let root = temp_workspace();
+        let outside = std::env::temp_dir().join(format!("outside-{}.png", Uuid::new_v4()));
+        std::fs::write(&outside, b"not-an-image").expect("write outside fixture");
+        let error = resolve_image_path(&root.to_string_lossy(), &outside.to_string_lossy(), false)
+            .expect_err("read-only path policy must reject external absolute image paths");
+        assert!(error.contains("outside the workspace in read-only mode"));
         let _ = std::fs::remove_file(outside);
         let _ = std::fs::remove_dir_all(root);
     }
@@ -377,6 +425,7 @@ mod tests {
             DEFAULT_MAX_DIMENSION,
             DEFAULT_JPEG_QUALITY,
             MAX_SINGLE_ENCODED_BYTES,
+            true,
         )
         .expect("prepare direct jpeg");
         let attached = BASE64_STANDARD
@@ -421,6 +470,7 @@ mod tests {
             1_200,
             DEFAULT_JPEG_QUALITY,
             350_000,
+            true,
         )
         .expect("prepare image");
         assert_eq!(prepared.metadata.mime_type, "image/jpeg");
@@ -428,7 +478,188 @@ mod tests {
         assert!(prepared.metadata.height <= 1_200);
         assert!(prepared.metadata.encoded_bytes <= 350_000);
         assert!(prepared.metadata.resized);
+        assert!(!prepared.metadata.orientation_applied);
         assert!(!prepared.base64_data.is_empty());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn common_formats_are_attached_directly_or_converted_safely() {
+        let root = temp_workspace();
+        let pixels = RgbImage::from_pixel(48, 36, Rgb([33, 144, 211]));
+        for (name, format, expected_mime, passthrough) in [
+            ("sample.png", ImageFormat::Png, "image/png", true),
+            ("sample.webp", ImageFormat::WebP, "image/webp", true),
+            ("sample.bmp", ImageFormat::Bmp, "image/jpeg", false),
+            ("sample.gif", ImageFormat::Gif, "image/jpeg", false),
+        ] {
+            let path = root.join(name);
+            DynamicImage::ImageRgb8(pixels.clone())
+                .save_with_format(&path, format)
+                .unwrap_or_else(|error| panic!("write {name} fixture: {error}"));
+            let original = std::fs::read(&path).expect("read image fixture");
+            let prepared = prepare_image(
+                &root.to_string_lossy(),
+                name,
+                DEFAULT_MAX_DIMENSION,
+                DEFAULT_JPEG_QUALITY,
+                MAX_SINGLE_ENCODED_BYTES,
+                true,
+            )
+            .unwrap_or_else(|error| panic!("prepare {name}: {error}"));
+            let attached = BASE64_STANDARD
+                .decode(&prepared.base64_data)
+                .expect("decode attached image");
+            assert_eq!(prepared.metadata.mime_type, expected_mime, "{name}");
+            assert!(!prepared.metadata.resized, "{name}");
+            assert!(!prepared.metadata.orientation_applied, "{name}");
+            if passthrough {
+                assert_eq!(attached, original, "{name} should pass through unchanged");
+            } else {
+                assert!(
+                    attached.starts_with(&[0xFF, 0xD8]),
+                    "{name} should be converted to a JPEG vision payload"
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn add_exif_orientation(jpeg: &[u8], orientation: u16) -> Vec<u8> {
+        assert!(jpeg.starts_with(&[0xFF, 0xD8]));
+        let mut payload = b"Exif\0\0".to_vec();
+        payload.extend_from_slice(b"II");
+        payload.extend_from_slice(&42u16.to_le_bytes());
+        payload.extend_from_slice(&8u32.to_le_bytes());
+        payload.extend_from_slice(&1u16.to_le_bytes());
+        payload.extend_from_slice(&0x0112u16.to_le_bytes());
+        payload.extend_from_slice(&3u16.to_le_bytes());
+        payload.extend_from_slice(&1u32.to_le_bytes());
+        payload.extend_from_slice(&orientation.to_le_bytes());
+        payload.extend_from_slice(&0u16.to_le_bytes());
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        let segment_len = u16::try_from(payload.len() + 2).expect("EXIF fixture length");
+
+        let mut output = Vec::with_capacity(jpeg.len() + payload.len() + 4);
+        output.extend_from_slice(&jpeg[..2]);
+        output.extend_from_slice(&[0xFF, 0xE1]);
+        output.extend_from_slice(&segment_len.to_be_bytes());
+        output.extend_from_slice(&payload);
+        output.extend_from_slice(&jpeg[2..]);
+        output
+    }
+
+    #[test]
+    fn exif_orientation_is_applied_before_attaching_pixels() {
+        let root = temp_workspace();
+        let path = root.join("rotated.jpg");
+        let pixels = RgbImage::from_pixel(40, 20, Rgb([210, 70, 30]));
+        let mut jpeg = Vec::new();
+        JpegEncoder::new_with_quality(Cursor::new(&mut jpeg), 90)
+            .write_image(
+                pixels.as_raw(),
+                pixels.width(),
+                pixels.height(),
+                ExtendedColorType::Rgb8,
+            )
+            .expect("encode oriented JPEG fixture");
+        let oriented = add_exif_orientation(&jpeg, 6);
+        std::fs::write(&path, oriented).expect("write oriented JPEG fixture");
+
+        let prepared = prepare_image(
+            &root.to_string_lossy(),
+            "rotated.jpg",
+            DEFAULT_MAX_DIMENSION,
+            DEFAULT_JPEG_QUALITY,
+            MAX_SINGLE_ENCODED_BYTES,
+            true,
+        )
+        .expect("prepare oriented JPEG");
+        assert_eq!(prepared.metadata.source_width, 40);
+        assert_eq!(prepared.metadata.source_height, 20);
+        assert_eq!(prepared.metadata.width, 20);
+        assert_eq!(prepared.metadata.height, 40);
+        assert!(prepared.metadata.orientation_applied);
+        assert!(!prepared.metadata.resized);
+        let attached = BASE64_STANDARD
+            .decode(&prepared.base64_data)
+            .expect("decode oriented attachment");
+        let decoded = image::load_from_memory(&attached).expect("decode oriented result");
+        assert_eq!(decoded.dimensions(), (20, 40));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn corrupt_images_fail_without_panicking() {
+        let root = temp_workspace();
+        std::fs::write(root.join("broken.jpg"), b"this is not actually a jpeg")
+            .expect("write corrupt fixture");
+        let error = prepare_image(
+            &root.to_string_lossy(),
+            "broken.jpg",
+            DEFAULT_MAX_DIMENSION,
+            DEFAULT_JPEG_QUALITY,
+            MAX_SINGLE_ENCODED_BYTES,
+            true,
+        )
+        .expect_err("corrupt image must fail");
+        assert!(
+            error.contains("Cannot decode image") || error.contains("Unsupported or unknown image")
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn oversized_source_file_is_rejected_before_decode() {
+        let root = temp_workspace();
+        let path = root.join("too-large.jpg");
+        let file = std::fs::File::create(&path).expect("create sparse oversized fixture");
+        file.set_len(MAX_INPUT_BYTES + 1)
+            .expect("size sparse oversized fixture");
+        let error = prepare_image(
+            &root.to_string_lossy(),
+            "too-large.jpg",
+            DEFAULT_MAX_DIMENSION,
+            DEFAULT_JPEG_QUALITY,
+            MAX_SINGLE_ENCODED_BYTES,
+            true,
+        )
+        .expect_err("oversized source must be rejected");
+        assert!(error.contains("Image is too large to inspect safely"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn invalid_preview_bounds_are_rejected() {
+        let root = temp_workspace();
+        let path = root.join("small.jpg");
+        DynamicImage::ImageRgb8(RgbImage::from_pixel(16, 16, Rgb([1, 2, 3])))
+            .save_with_format(&path, ImageFormat::Jpeg)
+            .expect("write small JPEG fixture");
+
+        let dimension_error = prepare_image(
+            &root.to_string_lossy(),
+            "small.jpg",
+            0,
+            DEFAULT_JPEG_QUALITY,
+            MAX_SINGLE_ENCODED_BYTES,
+            true,
+        )
+        .expect_err("zero max dimension must fail");
+        assert!(dimension_error.contains("max_dimension must be between"));
+
+        let quality_error = prepare_image(
+            &root.to_string_lossy(),
+            "small.jpg",
+            DEFAULT_MAX_DIMENSION,
+            MIN_JPEG_QUALITY - 1,
+            MAX_SINGLE_ENCODED_BYTES,
+            true,
+        )
+        .expect_err("too-low quality must fail");
+        assert!(quality_error.contains("quality must be between"));
 
         let _ = std::fs::remove_dir_all(root);
     }

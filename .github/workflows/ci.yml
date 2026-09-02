@@ -90,6 +90,7 @@ jobs:
       - name: Run Windows remote browser lifecycle smoke
         run: cargo +stable test --locked remote_browser_termination_confirms_child_exit -- --ignored
       - name: Run Windows browser vision smoke
+        timeout-minutes: 10
         run: cargo +stable test --locked windows_view_page_returns_native_mcp_image_content -- --ignored --test-threads 1
       - name: Run Windows DevTools process-tree shutdown smoke
         run: cargo +stable test --locked windows_devtools_stop_terminates_npx_process_tree -- --ignored

@@ -721,9 +721,17 @@ async fn post_mcp(
     }
 
     let workspace_root = workspace.root.to_string_lossy().into_owned();
-    let (mode, tool_mode, set_moondesk_as_co_author) = {
+    let (mode, tool_mode, set_moondesk_as_co_author, registered_workspace_roots) = {
         let app = s.app.lock().await;
-        (app.mode, app.tool_mode, app.set_moondesk_as_co_author)
+        (
+            app.mode,
+            app.tool_mode,
+            app.set_moondesk_as_co_author,
+            app.workspaces
+                .iter()
+                .map(|workspace| workspace.root.clone())
+                .collect::<Vec<_>>(),
+        )
     };
 
     let mut response_json: Option<Value> = None;
@@ -732,6 +740,7 @@ async fn post_mcp(
         mcp::McpRequestContext {
             workspace_id: &workspace.workspace_id,
             workspace_root: &workspace_root,
+            registered_workspace_roots: &registered_workspace_roots,
             mode,
             tool_mode,
             set_moondesk_as_co_author,
@@ -1593,6 +1602,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn post_mcp_preserves_native_image_content() {
+        use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+
+        let workspace_root = unique_temp_path("moondesk-post-mcp-image-workspace");
+        let config_root = unique_temp_path("moondesk-post-mcp-image-config");
+        let config_path = config_root.join("config.toml");
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        std::fs::create_dir_all(&config_root).expect("create config dir");
+        let image_path = workspace_root.join("sample.png");
+        image::RgbaImage::from_pixel(32, 24, image::Rgba([25, 100, 210, 255]))
+            .save(&image_path)
+            .expect("write PNG fixture");
+        let original = std::fs::read(&image_path).expect("read original PNG fixture");
+
+        let app = AppState::new_for_test(
+            8787,
+            workspace_root.to_string_lossy().into_owned(),
+            config_path.clone(),
+        )
+        .expect("create app state");
+        let mcp_slug = app.mcp_slug.clone();
+        let app_state = Arc::new(Mutex::new(app));
+        let (ui_tx, _ui_rx) = ui_event_channel();
+        let server_state = ServerState {
+            app: app_state,
+            devtools: None,
+            command_jobs: CommandJobManager::new(),
+            ui_events: ui_tx,
+            host_control_token: Arc::from("test-host-control-token"),
+        };
+
+        let response = post_mcp(
+            AxumPath(mcp_slug),
+            State(server_state),
+            tool_call_body("view_image", json!({ "path": "sample.png" })),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read image response body");
+        let payload: Value = serde_json::from_slice(&body).expect("parse image response JSON");
+        assert_eq!(
+            payload
+                .pointer("/result/content/0/type")
+                .and_then(Value::as_str),
+            Some("image")
+        );
+        assert_eq!(
+            payload
+                .pointer("/result/content/0/mimeType")
+                .and_then(Value::as_str),
+            Some("image/png")
+        );
+        let attached = payload
+            .pointer("/result/content/0/data")
+            .and_then(Value::as_str)
+            .and_then(|data| BASE64_STANDARD.decode(data).ok())
+            .expect("decode native MCP image payload");
+        assert_eq!(
+            attached, original,
+            "HTTP MCP transport must preserve image bytes"
+        );
+        assert_eq!(
+            payload
+                .pointer("/result/structuredContent/width")
+                .and_then(Value::as_u64),
+            Some(32)
+        );
+        assert_eq!(
+            payload
+                .pointer("/result/structuredContent/height")
+                .and_then(Value::as_u64),
+            Some(24)
+        );
+
+        let _ = std::fs::remove_file(image_path);
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_dir_all(workspace_root);
+        let _ = std::fs::remove_dir_all(config_root);
+    }
+
+    #[tokio::test]
     async fn different_slugs_route_to_different_workspace_roots() {
         let workspace_a = unique_temp_path("moondesk-routing-a");
         let workspace_b = unique_temp_path("moondesk-routing-b");
@@ -1657,6 +1749,28 @@ mod tests {
             );
         }
 
+        let external_file = unique_temp_path("moondesk-routing-external-file");
+        std::fs::write(&external_file, "external-readable\n")
+            .expect("write external readable file");
+        let external_read = post_mcp(
+            AxumPath(slug_a.clone()),
+            State(server_state.clone()),
+            tool_call_body("read", json!({ "path": external_file.to_string_lossy() })),
+        )
+        .await;
+        assert_eq!(external_read.status(), StatusCode::OK);
+        let external_body = to_bytes(external_read.into_body(), usize::MAX)
+            .await
+            .expect("read external-file response");
+        let external_payload: Value =
+            serde_json::from_slice(&external_body).expect("parse external-file response");
+        assert_eq!(
+            external_payload
+                .pointer("/result/structuredContent/text")
+                .and_then(Value::as_str),
+            Some("external-readable\n")
+        );
+
         let cross_root = post_mcp(
             AxumPath(slug_a.clone()),
             State(server_state.clone()),
@@ -1678,6 +1792,34 @@ mod tests {
                 .and_then(Value::as_bool),
             Some(true)
         );
+
+        let workspace_b_image = workspace_b.join("private.png");
+        image::RgbaImage::from_pixel(20, 16, image::Rgba([90, 120, 150, 255]))
+            .save(&workspace_b_image)
+            .expect("write workspace B private image");
+        let cross_root_vision = post_mcp(
+            AxumPath(slug_a.clone()),
+            State(server_state.clone()),
+            tool_call_body(
+                "view_image",
+                json!({ "path": workspace_b_image.to_string_lossy() }),
+            ),
+        )
+        .await;
+        assert_eq!(cross_root_vision.status(), StatusCode::OK);
+        let cross_vision_body = to_bytes(cross_root_vision.into_body(), usize::MAX)
+            .await
+            .expect("read cross-root vision response");
+        let cross_vision_payload: Value =
+            serde_json::from_slice(&cross_vision_body).expect("parse cross-root vision response");
+        assert_eq!(
+            cross_vision_payload
+                .pointer("/result/isError")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+
+        let _ = std::fs::remove_file(external_file);
 
         // ngrok restart clears host connection state but must not mutate the
         // workspace registry or endpoint routing table.

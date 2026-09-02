@@ -77,6 +77,7 @@ impl JsonRpcResponse {
 pub struct McpRequestContext<'a> {
     pub workspace_id: &'a WorkspaceId,
     pub workspace_root: &'a str,
+    pub registered_workspace_roots: &'a [PathBuf],
     pub mode: Mode,
     pub tool_mode: ToolMode,
     pub set_moondesk_as_co_author: bool,
@@ -179,6 +180,10 @@ fn local_tool_output_schema(name: &str) -> Option<Value> {
             properties.insert("path".to_string(), json!({ "type": "string" }));
             properties.insert("mimeType".to_string(), json!({ "type": "string" }));
             properties.insert("resized".to_string(), json!({ "type": "boolean" }));
+            properties.insert(
+                "orientationApplied".to_string(),
+                json!({ "type": "boolean" }),
+            );
         }
         "view_images" => {
             properties.insert(
@@ -444,11 +449,11 @@ async fn handle_tools_list(
         tools.push(json!({
             "name": "read",
             "title": "Read file",
-            "description": "Read a bounded text chunk. Defaults to the first 200 lines; use start_line/max_lines for normal pagination. Very long single lines automatically expose nextStartByte, which can be continued with start_byte/max_bytes without dumping the whole file into the conversation.",
+            "description": "Read a bounded text chunk. Defaults to the first 200 lines; use start_line/max_lines for normal pagination. Very long single lines automatically expose nextStartByte, which can be continued with start_byte/max_bytes without dumping the whole file into the conversation. Relative paths stay inside the workspace. In MultiTools mode, an explicit absolute path may read one local file outside the workspace; ReadOnly mode remains workspace-contained.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string", "description": "File path relative to workspace root or absolute path within it" },
+                    "path": { "type": "string", "description": "File path relative to workspace root. MultiTools may also use an explicit absolute path to one readable local file outside the workspace; ReadOnly may not." },
                     "start_line": { "type": "integer", "minimum": 1, "description": "1-based first line to return (default 1)" },
                     "max_lines": { "type": "integer", "minimum": 1, "maximum": workspace_tools::MAX_READ_LINES, "description": format!("Maximum lines to return (default {}, max {})", workspace_tools::DEFAULT_READ_LINES, workspace_tools::MAX_READ_LINES) },
                     "start_byte": { "type": "integer", "minimum": 0, "description": "0-based byte offset for raw chunk mode. Use nextStartByte to continue a very long line or other byte-bounded text." },
@@ -461,11 +466,11 @@ async fn handle_tools_list(
         tools.push(json!({
             "name": "view_image",
             "title": "View image",
-            "description": "Load a local raster image and attach its pixels to the tool response so the model can actually inspect it visually. Relative paths stay inside the workspace; an explicit absolute path may point to another readable local file when the task requires it. MoonDesk automatically applies image orientation and bounds/compresses large files for the vision context.",
+            "description": "Load a local raster image and attach its pixels to the tool response so the model can actually inspect it visually. Relative paths stay inside the workspace. In normal tool modes, an explicit absolute path may point to another readable local file when the task requires it; ReadOnly mode remains workspace-contained. MoonDesk automatically applies image orientation and bounds/compresses large files for the vision context.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string", "description": "Image path relative to workspace root, or an explicit absolute path to a readable local image" },
+                    "path": { "type": "string", "description": "Image path relative to workspace root. Normal tool modes also permit an explicit absolute path to another readable local image; ReadOnly mode remains workspace-contained." },
                     "max_dimension": { "type": "integer", "minimum": 1, "maximum": vision::MAX_REQUESTED_DIMENSION, "description": format!("Maximum output width or height in pixels (default {}, maximum {})", vision::DEFAULT_MAX_DIMENSION, vision::MAX_REQUESTED_DIMENSION) },
                     "quality": { "type": "integer", "minimum": vision::MIN_JPEG_QUALITY, "maximum": vision::MAX_JPEG_QUALITY, "description": format!("JPEG preview quality when lossy compression is needed (default {})", vision::DEFAULT_JPEG_QUALITY) }
                 },
@@ -616,6 +621,7 @@ async fn handle_tools_call(
         McpRequestContext {
             workspace_id: &workspace_id,
             workspace_root,
+            registered_workspace_roots: &[],
             mode,
             tool_mode,
             set_moondesk_as_co_author,
@@ -626,6 +632,107 @@ async fn handle_tools_call(
     .await
 }
 
+fn read_call_requires_workspace(
+    req: &JsonRpcRequest,
+    tool_name: &str,
+    tool_mode: ToolMode,
+) -> bool {
+    if tool_mode.read_only() {
+        return matches!(tool_name, "read" | "view_image" | "view_images");
+    }
+    let arguments = tool_arguments(req);
+    match tool_name {
+        "read" | "view_image" => arguments
+            .get("path")
+            .and_then(Value::as_str)
+            .is_none_or(|path| !Path::new(path).is_absolute()),
+        "view_images" => arguments
+            .get("paths")
+            .and_then(Value::as_array)
+            .is_none_or(|paths| {
+                paths.iter().any(|path| {
+                    path.as_str()
+                        .is_none_or(|path| !Path::new(path).is_absolute())
+                })
+            }),
+        _ => false,
+    }
+}
+
+fn ensure_external_read_path_is_not_another_workspace(
+    path: &str,
+    workspace_root: &str,
+    registered_workspace_roots: &[PathBuf],
+) -> Result<(), String> {
+    let requested = Path::new(path);
+    if !requested.is_absolute() {
+        return Ok(());
+    }
+    let target = requested
+        .canonicalize()
+        .map(command::normalize_windows_verbatim_path)
+        .map_err(|error| {
+            format!(
+                "Cannot resolve external read path {}: {error}",
+                requested.display()
+            )
+        })?;
+    let current_root = Path::new(workspace_root)
+        .canonicalize()
+        .map(command::normalize_windows_verbatim_path)
+        .ok();
+
+    for registered_root in registered_workspace_roots {
+        let Ok(registered_root) = registered_root.canonicalize() else {
+            continue;
+        };
+        let registered_root = command::normalize_windows_verbatim_path(registered_root);
+        if current_root.as_ref() == Some(&registered_root) {
+            continue;
+        }
+        if target.starts_with(&registered_root) {
+            return Err(format!(
+                "Refusing to read through another registered MoonDesk workspace: {}. Use that workspace's connector instead.",
+                registered_root.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn enforce_external_read_workspace_isolation(
+    req: &JsonRpcRequest,
+    tool_name: &str,
+    workspace_root: &str,
+    registered_workspace_roots: &[PathBuf],
+) -> Result<(), String> {
+    let arguments = tool_arguments(req);
+    match tool_name {
+        "read" | "view_image" => {
+            if let Some(path) = arguments.get("path").and_then(Value::as_str) {
+                ensure_external_read_path_is_not_another_workspace(
+                    path,
+                    workspace_root,
+                    registered_workspace_roots,
+                )?;
+            }
+        }
+        "view_images" => {
+            if let Some(paths) = arguments.get("paths").and_then(Value::as_array) {
+                for path in paths.iter().filter_map(Value::as_str) {
+                    ensure_external_read_path_is_not_another_workspace(
+                        path,
+                        workspace_root,
+                        registered_workspace_roots,
+                    )?;
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 async fn handle_tools_call_for_workspace(
     req: &JsonRpcRequest,
     context: McpRequestContext<'_>,
@@ -633,6 +740,7 @@ async fn handle_tools_call_for_workspace(
     let McpRequestContext {
         workspace_id,
         workspace_root,
+        registered_workspace_roots,
         mode,
         tool_mode,
         set_moondesk_as_co_author,
@@ -653,25 +761,36 @@ async fn handle_tools_call_for_workspace(
         return handle_view_page(req, workspace_root, devtools).await;
     }
 
-    if matches!(
+    let workspace_dependent = matches!(
         tool_name.as_str(),
         "moondesk_instruction"
-            | "read"
-            | "view_image"
-            | "view_images"
             | "search"
             | "write"
             | "edit"
             | "delete"
             | "run_command"
             | "start_command"
-    ) && workspaces::workspace_availability(Path::new(workspace_root))
-        == WorkspaceAvailability::Unavailable
+    ) || read_call_requires_workspace(req, &tool_name, tool_mode);
+    if workspace_dependent
+        && workspaces::workspace_availability(Path::new(workspace_root))
+            == WorkspaceAvailability::Unavailable
     {
         return tool_error_response(
             req,
             format!("Workspace is currently unavailable: {workspace_root}"),
         );
+    }
+
+    if !tool_mode.read_only()
+        && matches!(tool_name.as_str(), "read" | "view_image" | "view_images")
+        && let Err(error) = enforce_external_read_workspace_isolation(
+            req,
+            &tool_name,
+            workspace_root,
+            registered_workspace_roots,
+        )
+    {
+        return tool_error_response(req, error);
     }
 
     {
@@ -732,9 +851,11 @@ async fn handle_tools_call_for_workspace(
                     "moondesk_instruction" => {
                         handle_moondesk_instruction(req, workspace_root, mode, tool_mode)
                     }
-                    "read" => handle_read_file(req, workspace_root),
-                    "view_image" => handle_view_image(req, workspace_root),
-                    "view_images" => handle_view_images(req, workspace_root),
+                    "read" => handle_read_file(req, workspace_root, !tool_mode.read_only()),
+                    "view_image" => handle_view_image(req, workspace_root, !tool_mode.read_only()),
+                    "view_images" => {
+                        handle_view_images(req, workspace_root, !tool_mode.read_only())
+                    }
                     "search" => handle_search_text(req, workspace_root),
                     _ => {
                         if tool_mode.write_tools_enabled() {
@@ -1574,8 +1695,8 @@ Always specify the branch explicitly when using `git push`."#
         .collect();
 
     if mode.computer_enabled() {
-        lines.push("Use read to read files and search to search the workspace.".to_string());
-        lines.push("When a task depends on what an image actually looks like, use view_image or view_images so the model receives the pixels through its vision input. Do not substitute filenames, dimensions, blur scores, OCR, or other image metadata for visual inspection. Relative image paths stay inside the workspace; use an explicit absolute path only when the user's task genuinely requires inspecting a local image elsewhere on the machine.".to_string());
+        lines.push("Use read to read files and search to search the workspace. Relative file paths stay workspace-contained. In MultiTools mode, read may inspect one explicitly addressed absolute local file outside the workspace when the task requires it; ReadOnly remains workspace-contained. Keep search/write/edit/delete workspace-scoped rather than using external absolute paths with them.".to_string());
+        lines.push("When a task depends on what an image actually looks like, use view_image or view_images so the model receives the pixels through its vision input. Do not substitute filenames, dimensions, blur scores, OCR, or other image metadata for visual inspection. Relative image paths stay inside the workspace. In normal tool modes, use an explicit absolute path only when the user's task genuinely requires inspecting a local image elsewhere on the machine; ReadOnly mode remains workspace-contained.".to_string());
         if tool_mode.run_command_enabled() {
             lines.push(
                 "For directory inspection, run_command can intercept plain listing commands such as find, tree, ls -R, and rg --files."
@@ -1925,6 +2046,7 @@ fn image_metadata_value(metadata: &vision::PreparedImageMetadata) -> Value {
         "encodedBytes": metadata.encoded_bytes,
         "mimeType": metadata.mime_type,
         "resized": metadata.resized,
+        "orientationApplied": metadata.orientation_applied,
     })
 }
 
@@ -1956,7 +2078,11 @@ fn optional_u8_argument(arguments: &Value, name: &str, default_value: u8) -> Res
     }
 }
 
-fn handle_view_image(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcResponse {
+fn handle_view_image(
+    req: &JsonRpcRequest,
+    workspace_root: &str,
+    allow_external_absolute: bool,
+) -> JsonRpcResponse {
     let arguments = tool_arguments(req);
     let path = match required_string_argument(&arguments, "path") {
         Ok(value) => value,
@@ -1978,6 +2104,7 @@ fn handle_view_image(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcRespo
         max_dimension,
         quality,
         vision::MAX_SINGLE_ENCODED_BYTES,
+        allow_external_absolute,
     ) {
         Ok(prepared) => {
             let structured = image_metadata_value(&prepared.metadata);
@@ -1988,7 +2115,11 @@ fn handle_view_image(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcRespo
     }
 }
 
-fn handle_view_images(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcResponse {
+fn handle_view_images(
+    req: &JsonRpcRequest,
+    workspace_root: &str,
+    allow_external_absolute: bool,
+) -> JsonRpcResponse {
     let arguments = tool_arguments(req);
     let Some(paths_value) = arguments.get("paths") else {
         return tool_error_response(req, "Missing required parameter: paths".to_string());
@@ -2035,6 +2166,7 @@ fn handle_view_images(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcResp
             max_dimension,
             quality,
             per_image_budget,
+            allow_external_absolute,
         ) {
             Ok(prepared) => prepared_images.push(prepared),
             Err(error) => {
@@ -2069,6 +2201,29 @@ fn handle_view_images(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcResp
             "images": metadata,
         }),
     )
+}
+
+fn devtools_tool_error_message(response: &Value) -> Option<String> {
+    if response.pointer("/result/isError").and_then(Value::as_bool) != Some(true) {
+        return None;
+    }
+    let message = response
+        .pointer("/result/content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| {
+            (item.get("type").and_then(Value::as_str) == Some("text"))
+                .then(|| item.get("text").and_then(Value::as_str))
+                .flatten()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    Some(if message.trim().is_empty() {
+        "DevTools screenshot tool reported an error".to_string()
+    } else {
+        message
+    })
 }
 
 fn build_view_page_devtools_request(
@@ -2163,6 +2318,10 @@ async fn handle_view_page(
             format!("Browser screenshot failed (code {code}): {message}"),
         );
     }
+    if let Some(message) = devtools_tool_error_message(&response) {
+        let _ = std::fs::remove_file(&temp_path);
+        return tool_error_response(req, format!("Browser screenshot failed: {message}"));
+    }
     if !temp_path.is_file() {
         return tool_error_response(
             req,
@@ -2176,6 +2335,7 @@ async fn handle_view_page(
         vision::MAX_REQUESTED_DIMENSION,
         quality,
         vision::MAX_SINGLE_ENCODED_BYTES,
+        true,
     );
     let cleanup_warning = std::fs::remove_file(&temp_path)
         .err()
@@ -2209,7 +2369,11 @@ async fn handle_view_page(
     }
 }
 
-fn handle_read_file(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcResponse {
+fn handle_read_file(
+    req: &JsonRpcRequest,
+    workspace_root: &str,
+    allow_external_absolute: bool,
+) -> JsonRpcResponse {
     let arguments = tool_arguments(req);
     let path = match arguments.get("path").and_then(|v| v.as_str()) {
         Some(v) => v,
@@ -2239,7 +2403,13 @@ fn handle_read_file(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcRespon
             Ok(value) => value.unwrap_or(workspace_tools::MAX_READ_BYTES),
             Err(e) => return tool_error_response(req, e),
         };
-        workspace_tools::read_file_bytes(workspace_root, path, start_byte, max_bytes)
+        workspace_tools::read_file_bytes_with_policy(
+            workspace_root,
+            path,
+            start_byte,
+            max_bytes,
+            allow_external_absolute,
+        )
     } else {
         if arguments.get("max_bytes").is_some() {
             return tool_error_response(req, "max_bytes requires start_byte".into());
@@ -2252,7 +2422,13 @@ fn handle_read_file(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcRespon
             Ok(value) => value.unwrap_or(workspace_tools::DEFAULT_READ_LINES),
             Err(e) => return tool_error_response(req, e),
         };
-        workspace_tools::read_file(workspace_root, path, start_line, max_lines)
+        workspace_tools::read_file_with_policy(
+            workspace_root,
+            path,
+            start_line,
+            max_lines,
+            allow_external_absolute,
+        )
     };
 
     match output {
@@ -3236,6 +3412,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_command_keeps_normal_host_access_to_explicit_external_files() {
+        let workspace_root = std::env::temp_dir().join(format!(
+            "moondesk-mcp-shell-external-workspace-{}",
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        let outside = std::env::temp_dir().join(format!(
+            "moondesk-mcp-shell-external-{}.txt",
+            Uuid::new_v4()
+        ));
+        std::fs::write(&outside, "external-shell-ok\n").expect("write external shell fixture");
+        let external = outside.to_string_lossy();
+        let command = if cfg!(windows) {
+            format!(
+                "Get-Content -LiteralPath '{}'",
+                external.replace('\'', "''")
+            )
+        } else {
+            format!("cat '{}'", external.replace('\'', "'\\''"))
+        };
+        let response = handle_tools_call(
+            &tool_call_request("run_command", json!({ "command": command })),
+            &workspace_root.to_string_lossy(),
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &CommandJobManager::new(),
+            &None,
+        )
+        .await;
+        let structured = response
+            .result
+            .as_ref()
+            .and_then(|result| result.get("structuredContent"))
+            .expect("external shell read must reach normal host shell execution");
+        assert!(
+            structured
+                .get("stdout")
+                .and_then(Value::as_str)
+                .is_some_and(|stdout| stdout.contains("external-shell-ok")),
+            "structured external-read policy must not sandbox or filter run_command"
+        );
+
+        let _ = std::fs::remove_file(outside);
+        let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
     async fn run_command_large_output_remains_recoverable_after_inline_truncation() {
         let workspace_root =
             std::env::temp_dir().join(format!("moondesk-mcp-run-archive-{}", Uuid::new_v4()));
@@ -3548,6 +3772,162 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn view_image_external_absolute_path_requires_non_read_only_mode() {
+        let workspace_root =
+            std::env::temp_dir().join(format!("moondesk-mcp-view-image-policy-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        let outside = std::env::temp_dir().join(format!("moondesk-outside-{}.png", Uuid::new_v4()));
+        image::RgbaImage::from_pixel(24, 24, image::Rgba([100, 120, 140, 255]))
+            .save(&outside)
+            .expect("write outside image fixture");
+        let absolute = outside.to_string_lossy().into_owned();
+
+        let read_only = handle_tools_call(
+            &tool_call_request("view_image", json!({ "path": absolute })),
+            &workspace_root.to_string_lossy(),
+            Mode::Both,
+            ToolMode::ReadOnly,
+            false,
+            &CommandJobManager::new(),
+            &None,
+        )
+        .await;
+        assert_eq!(
+            read_only
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(result_text(&read_only).contains("outside the workspace in read-only mode"));
+
+        let normal = handle_tools_call(
+            &tool_call_request(
+                "view_image",
+                json!({ "path": outside.to_string_lossy().into_owned() }),
+            ),
+            &workspace_root.to_string_lossy(),
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &CommandJobManager::new(),
+            &None,
+        )
+        .await;
+        let normal_result = normal.result.as_ref().expect("normal view_image result");
+        assert_ne!(
+            normal_result.get("isError").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            normal_result
+                .pointer("/content/0/type")
+                .and_then(Value::as_str),
+            Some("image")
+        );
+
+        std::fs::remove_dir_all(&workspace_root)
+            .expect("remove workspace before absolute-path retry");
+        let unavailable_workspace = handle_tools_call(
+            &tool_call_request(
+                "view_image",
+                json!({ "path": outside.to_string_lossy().into_owned() }),
+            ),
+            &workspace_root.to_string_lossy(),
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &CommandJobManager::new(),
+            &None,
+        )
+        .await;
+        assert_ne!(
+            unavailable_workspace
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true),
+            "explicit absolute image should not depend on workspace availability in normal mode"
+        );
+
+        let _ = std::fs::remove_file(outside);
+    }
+
+    #[tokio::test]
+    async fn view_images_external_absolute_paths_follow_tool_mode_policy() {
+        let workspace_root = std::env::temp_dir().join(format!(
+            "moondesk-mcp-view-images-policy-{}",
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        let outside_a =
+            std::env::temp_dir().join(format!("moondesk-outside-a-{}.png", Uuid::new_v4()));
+        let outside_b =
+            std::env::temp_dir().join(format!("moondesk-outside-b-{}.jpg", Uuid::new_v4()));
+        image::RgbaImage::from_pixel(24, 24, image::Rgba([30, 80, 130, 255]))
+            .save(&outside_a)
+            .expect("write outside image A");
+        image::RgbImage::from_pixel(24, 24, image::Rgb([180, 90, 30]))
+            .save(&outside_b)
+            .expect("write outside image B");
+        let paths = vec![
+            outside_a.to_string_lossy().into_owned(),
+            outside_b.to_string_lossy().into_owned(),
+        ];
+
+        let read_only = handle_tools_call(
+            &tool_call_request("view_images", json!({ "paths": paths.clone() })),
+            &workspace_root.to_string_lossy(),
+            Mode::Both,
+            ToolMode::ReadOnly,
+            false,
+            &CommandJobManager::new(),
+            &None,
+        )
+        .await;
+        assert_eq!(
+            read_only
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+
+        let normal = handle_tools_call(
+            &tool_call_request("view_images", json!({ "paths": paths })),
+            &workspace_root.to_string_lossy(),
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &CommandJobManager::new(),
+            &None,
+        )
+        .await;
+        let result = normal.result.as_ref().expect("normal view_images result");
+        assert_ne!(result.get("isError").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            result
+                .get("content")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(4)
+        );
+        assert_eq!(
+            result
+                .pointer("/structuredContent/count")
+                .and_then(Value::as_u64),
+            Some(2)
+        );
+
+        let _ = std::fs::remove_file(outside_a);
+        let _ = std::fs::remove_file(outside_b);
+        let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
     async fn view_images_preserves_path_order_and_labels_each_image() {
         let workspace_root =
             std::env::temp_dir().join(format!("moondesk-mcp-view-images-{}", Uuid::new_v4()));
@@ -3634,6 +4014,96 @@ mod tests {
         let _ = std::fs::remove_dir_all(workspace_root);
     }
 
+    #[tokio::test]
+    async fn view_images_rejects_oversized_batches_before_reading_files() {
+        let workspace_root =
+            std::env::temp_dir().join(format!("moondesk-mcp-view-images-limit-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        let paths = (0..=vision::MAX_BATCH_IMAGES)
+            .map(|index| format!("missing-{index}.jpg"))
+            .collect::<Vec<_>>();
+        let response = handle_tools_call(
+            &tool_call_request("view_images", json!({ "paths": paths })),
+            &workspace_root.to_string_lossy(),
+            Mode::Both,
+            ToolMode::ReadOnly,
+            false,
+            &CommandJobManager::new(),
+            &None,
+        )
+        .await;
+        let result = response.result.as_ref().expect("view_images limit result");
+        assert_eq!(result.get("isError").and_then(Value::as_bool), Some(true));
+        assert!(
+            result_text(&response).contains("must contain between 1 and"),
+            "batch limit should fail before attempting to resolve missing image paths"
+        );
+        assert_eq!(
+            result
+                .get("content")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(0)
+        );
+        let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn view_images_fails_atomically_when_any_image_is_invalid() {
+        let workspace_root = std::env::temp_dir().join(format!(
+            "moondesk-mcp-view-images-atomic-{}",
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        image::RgbaImage::from_pixel(32, 24, image::Rgba([20, 40, 60, 255]))
+            .save(workspace_root.join("valid.png"))
+            .expect("write valid batch fixture");
+
+        let response = handle_tools_call(
+            &tool_call_request(
+                "view_images",
+                json!({ "paths": ["valid.png", "missing.png"] }),
+            ),
+            &workspace_root.to_string_lossy(),
+            Mode::Both,
+            ToolMode::ReadOnly,
+            false,
+            &CommandJobManager::new(),
+            &None,
+        )
+        .await;
+        let result = response.result.as_ref().expect("view_images atomic result");
+        assert_eq!(result.get("isError").and_then(Value::as_bool), Some(true));
+        assert!(result_text(&response).contains("paths[1] (missing.png)"));
+        assert_eq!(
+            result
+                .get("content")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(0),
+            "a failed batch must not return only the earlier successfully prepared images"
+        );
+        let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
+    #[test]
+    fn devtools_tool_error_message_extracts_mcp_tool_errors() {
+        let response = json!({
+            "result": {
+                "isError": true,
+                "content": [
+                    { "type": "text", "text": "first failure line" },
+                    { "type": "text", "text": "second failure line" }
+                ]
+            }
+        });
+        assert_eq!(
+            devtools_tool_error_message(&response).as_deref(),
+            Some("first failure line\nsecond failure line")
+        );
+        assert!(devtools_tool_error_message(&json!({ "result": { "isError": false } })).is_none());
+    }
+
     #[test]
     fn view_page_builds_managed_jpeg_devtools_request() {
         let req = tool_call_request("view_page", json!({}));
@@ -3682,6 +4152,8 @@ mod tests {
     async fn windows_view_page_returns_native_mcp_image_content() {
         use crate::browser;
         use crate::state::{AppState, ui_event_channel};
+        use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+        use image::GenericImageView;
         use std::collections::HashSet;
         use tokio::sync::Mutex;
 
@@ -3695,10 +4167,33 @@ mod tests {
                 .collect()
         }
 
-        let mut selected = browser::detect_browsers()
+        fn decode_tool_image(content: &Value) -> image::DynamicImage {
+            let data = content
+                .get("data")
+                .and_then(Value::as_str)
+                .expect("native MCP image data");
+            let bytes = BASE64_STANDARD.decode(data).expect("decode MCP image data");
+            image::load_from_memory(&bytes).expect("decode browser screenshot image")
+        }
+
+        fn assert_rgb_near(actual: image::Rgba<u8>, expected: [u8; 3], tolerance: i16) {
+            for (channel, expected_channel) in actual.0[..3].iter().zip(expected) {
+                let delta = i16::from(*channel) - i16::from(expected_channel);
+                assert!(
+                    delta.abs() <= tolerance,
+                    "pixel {:?} is not within {tolerance} per channel of expected {expected:?}",
+                    actual.0
+                );
+            }
+        }
+
+        let Some(mut selected) = browser::detect_browsers()
             .into_iter()
             .find(|browser| browser.mcp_supported)
-            .expect("no supported Chromium browser available for vision smoke");
+        else {
+            eprintln!("skipping browser vision smoke: no supported Chromium browser is installed");
+            return;
+        };
         selected.remote_debug_active = false;
         selected.remote_debug_target = None;
         selected.remote_debug_pid = None;
@@ -3733,6 +4228,31 @@ mod tests {
             .await
             .expect("initialize DevTools bridge for vision smoke");
 
+        let navigate = json!({
+            "jsonrpc": "2.0",
+            "id": "vision-smoke-navigate",
+            "method": "tools/call",
+            "params": {
+                "name": "navigate_page",
+                "arguments": {
+                    "type": "url",
+                    "url": "data:text/html,<body style='margin:0;background:rgb(12,34,56);height:2400px'><div style='height:1200px'></div><div style='height:1200px;background:rgb(210,60,40)'></div></body>"
+                }
+            }
+        });
+        let navigate_response = manager
+            .request(&navigate)
+            .await
+            .expect("navigate deterministic browser vision page");
+        assert!(navigate_response.get("error").is_none());
+        assert_ne!(
+            navigate_response
+                .pointer("/result/isError")
+                .and_then(Value::as_bool),
+            Some(true),
+            "deterministic browser vision page navigation failed: {navigate_response}"
+        );
+
         let manager_option = Some(manager.clone());
         let tools_request = JsonRpcRequest {
             jsonrpc: "2.0".into(),
@@ -3762,7 +4282,66 @@ mod tests {
             "raw take_screenshot writes arbitrary filePath values and should stay filtered in read-only mode"
         );
 
+        let invalid_scope = handle_view_page(
+            &tool_call_request(
+                "view_page",
+                json!({ "full_page": true, "uid": "node-does-not-matter" }),
+            ),
+            &workspace_root.to_string_lossy(),
+            &manager_option,
+        )
+        .await;
+        assert_eq!(
+            invalid_scope
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(result_text(&invalid_scope).contains("full_page cannot be combined with uid"));
+
+        let invalid_quality = handle_view_page(
+            &tool_call_request(
+                "view_page",
+                json!({ "quality": u64::from(vision::MIN_JPEG_QUALITY - 1) }),
+            ),
+            &workspace_root.to_string_lossy(),
+            &manager_option,
+        )
+        .await;
+        assert_eq!(
+            invalid_quality
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(result_text(&invalid_quality).contains("quality must be between"));
+
         let before = managed_view_page_files();
+        let invalid_uid = handle_view_page(
+            &tool_call_request("view_page", json!({ "uid": "missing-vision-smoke-uid" })),
+            &workspace_root.to_string_lossy(),
+            &manager_option,
+        )
+        .await;
+        assert_eq!(
+            invalid_uid
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(result_text(&invalid_uid).contains("Browser screenshot failed"));
+        assert_eq!(
+            managed_view_page_files(),
+            before,
+            "failed element capture must clean its managed screenshot"
+        );
+
         let manager_option = Some(manager.clone());
         let request = tool_call_request("view_page", json!({}));
         let response =
@@ -3788,6 +4367,14 @@ mod tests {
                 .and_then(Value::as_str)
                 .is_some_and(|data| data.len() > 100)
         );
+        let viewport_image = decode_tool_image(&content[0]);
+        let (viewport_width, viewport_height) = viewport_image.dimensions();
+        assert!(viewport_width > 0 && viewport_height > 0);
+        assert_rgb_near(
+            viewport_image.get_pixel(viewport_width / 2, viewport_height / 2),
+            [12, 34, 56],
+            18,
+        );
         let structured = result
             .get("structuredContent")
             .expect("view_page structured metadata");
@@ -3808,6 +4395,51 @@ mod tests {
             managed_view_page_files(),
             before,
             "view_page must clean its managed screenshot"
+        );
+
+        let full_page_response = handle_view_page(
+            &tool_call_request("view_page", json!({ "full_page": true })),
+            &workspace_root.to_string_lossy(),
+            &manager_option,
+        )
+        .await;
+        let full_page_result = full_page_response
+            .result
+            .as_ref()
+            .expect("full-page view_page result");
+        assert_ne!(
+            full_page_result.get("isError").and_then(Value::as_bool),
+            Some(true)
+        );
+        let full_page_content = full_page_result
+            .get("content")
+            .and_then(Value::as_array)
+            .expect("full-page image content");
+        assert_eq!(full_page_content.len(), 1);
+        let full_page_image = decode_tool_image(&full_page_content[0]);
+        let (full_width, full_height) = full_page_image.dimensions();
+        assert!(full_width > 0);
+        assert!(
+            full_height > viewport_height.saturating_mul(2),
+            "full-page capture height {full_height} should substantially exceed viewport height {viewport_height}"
+        );
+        assert_rgb_near(
+            full_page_image.get_pixel(full_width / 2, full_height.saturating_sub(50)),
+            [210, 60, 40],
+            20,
+        );
+        let full_structured = full_page_result
+            .get("structuredContent")
+            .expect("full-page structured metadata");
+        assert_eq!(
+            full_structured.get("fullPage").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(full_structured.get("cleanupWarning").is_none());
+        assert_eq!(
+            managed_view_page_files(),
+            before,
+            "full-page view_page must clean its managed screenshot"
         );
 
         manager.stop().await;
@@ -4512,6 +5144,10 @@ mod tests {
                 .contains("empty, unresolved, malformed, or failed variable or expression")
         );
         assert!(instruction_text.contains("do not split normal reads, searches, builds, tests"));
+        assert!(instruction_text.contains(
+            "read may inspect one explicitly addressed absolute local file outside the workspace"
+        ));
+        assert!(instruction_text.contains("Keep search/write/edit/delete workspace-scoped"));
         assert!(instruction_text.contains("use view_image or view_images"));
         assert!(instruction_text.contains("model receives the pixels through its vision input"));
         assert!(instruction_text.contains("use view_page"));
@@ -4583,6 +5219,192 @@ mod tests {
         let _ = std::fs::remove_dir_all(workspace_root);
     }
 
+    #[tokio::test]
+    async fn read_external_absolute_path_requires_non_read_only_mode() {
+        let workspace_root =
+            std::env::temp_dir().join(format!("moondesk-mcp-read-policy-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        let outside = std::env::temp_dir().join(format!("moondesk-outside-{}.txt", Uuid::new_v4()));
+        std::fs::write(&outside, "outside file\nsecond line\n")
+            .expect("write outside text fixture");
+        let absolute = outside.to_string_lossy().into_owned();
+
+        let read_only = handle_tools_call(
+            &tool_call_request("read", json!({ "path": absolute })),
+            &workspace_root.to_string_lossy(),
+            Mode::Both,
+            ToolMode::ReadOnly,
+            false,
+            &CommandJobManager::new(),
+            &None,
+        )
+        .await;
+        assert_eq!(
+            read_only
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+
+        let normal = handle_tools_call(
+            &tool_call_request(
+                "read",
+                json!({ "path": outside.to_string_lossy().into_owned() }),
+            ),
+            &workspace_root.to_string_lossy(),
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &CommandJobManager::new(),
+            &None,
+        )
+        .await;
+        assert_eq!(
+            normal
+                .result
+                .as_ref()
+                .and_then(|result| result.pointer("/structuredContent/text"))
+                .and_then(Value::as_str),
+            Some("outside file\nsecond line\n")
+        );
+
+        std::fs::remove_dir_all(&workspace_root)
+            .expect("remove workspace before absolute read retry");
+        let unavailable_workspace = handle_tools_call(
+            &tool_call_request(
+                "read",
+                json!({
+                    "path": outside.to_string_lossy().into_owned(),
+                    "start_byte": 0,
+                    "max_bytes": 8
+                }),
+            ),
+            &workspace_root.to_string_lossy(),
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &CommandJobManager::new(),
+            &None,
+        )
+        .await;
+        assert_eq!(
+            unavailable_workspace
+                .result
+                .as_ref()
+                .and_then(|result| result.pointer("/structuredContent/text"))
+                .and_then(Value::as_str),
+            Some("outside ")
+        );
+
+        let _ = std::fs::remove_file(outside);
+    }
+
+    #[tokio::test]
+    async fn external_absolute_read_scope_does_not_expand_search_write_or_delete() {
+        let workspace_root =
+            std::env::temp_dir().join(format!("moondesk-mcp-external-scope-{}", Uuid::new_v4()));
+        let outside_root =
+            std::env::temp_dir().join(format!("moondesk-outside-scope-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        std::fs::create_dir_all(&outside_root).expect("create outside root");
+        let outside_file = outside_root.join("keep.txt");
+        std::fs::write(&outside_file, "KEEP needle\n").expect("write outside sentinel");
+        let workspace_root_str = workspace_root.to_string_lossy().into_owned();
+        let outside_file_str = outside_file.to_string_lossy().into_owned();
+        let outside_root_str = outside_root.to_string_lossy().into_owned();
+
+        let read = handle_tools_call(
+            &tool_call_request("read", json!({ "path": outside_file_str.clone() })),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &CommandJobManager::new(),
+            &None,
+        )
+        .await;
+        assert_eq!(
+            read.result
+                .as_ref()
+                .and_then(|result| result.pointer("/structuredContent/text"))
+                .and_then(Value::as_str),
+            Some("KEEP needle\n")
+        );
+
+        let search = handle_tools_call(
+            &tool_call_request(
+                "search",
+                json!({ "pattern": "needle", "path": outside_root_str }),
+            ),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &CommandJobManager::new(),
+            &None,
+        )
+        .await;
+        assert_eq!(
+            search
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+
+        let write = handle_tools_call(
+            &tool_call_request(
+                "write",
+                json!({ "path": outside_file_str.clone(), "content": "MUTATED\n" }),
+            ),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &CommandJobManager::new(),
+            &None,
+        )
+        .await;
+        assert_eq!(
+            write
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+
+        let delete = handle_tools_call(
+            &tool_call_request("delete", json!({ "path": outside_file_str })),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &CommandJobManager::new(),
+            &None,
+        )
+        .await;
+        assert_eq!(
+            delete
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            std::fs::read_to_string(&outside_file)
+                .expect("read outside sentinel after blocked calls"),
+            "KEEP needle\n"
+        );
+
+        let _ = std::fs::remove_dir_all(outside_root);
+        let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
     #[test]
     fn read_tool_pages_large_file_by_lines() {
         let workspace_root =
@@ -4597,6 +5419,7 @@ mod tests {
         let first = handle_read_file(
             &tool_call_request("read", json!({ "path": "large.txt" })),
             &workspace_root_str,
+            false,
         );
         let first = first
             .result
@@ -4622,6 +5445,7 @@ mod tests {
                 json!({ "path": "large.txt", "start_line": 201, "max_lines": 30 }),
             ),
             &workspace_root_str,
+            false,
         );
         let second = second
             .result
@@ -4656,6 +5480,7 @@ mod tests {
         let first = handle_read_file(
             &tool_call_request("read", json!({ "path": "minified.js" })),
             &workspace_root_str,
+            false,
         );
         let first = first
             .result
@@ -4689,6 +5514,7 @@ mod tests {
                 }),
             ),
             &workspace_root_str,
+            false,
         );
         let second = second
             .result

@@ -277,11 +277,27 @@ fn resolve_target_path(workspace_root: &str, path: &str) -> Result<PathBuf, Stri
     command::resolve_workspace_path(workspace_root, Some(path))
 }
 
-pub fn read_file(
+fn resolve_read_target_path(
+    workspace_root: &str,
+    path: &str,
+    allow_external_absolute: bool,
+) -> Result<PathBuf, String> {
+    let requested = Path::new(path);
+    if requested.is_absolute() && allow_external_absolute {
+        return requested
+            .canonicalize()
+            .map(command::normalize_windows_verbatim_path)
+            .map_err(|e| e.to_string());
+    }
+    resolve_target_path(workspace_root, path)
+}
+
+pub fn read_file_with_policy(
     workspace_root: &str,
     path: &str,
     start_line: usize,
     max_lines: usize,
+    allow_external_absolute: bool,
 ) -> Result<ReadFileOutput, String> {
     if start_line == 0 {
         return Err("start_line must be at least 1".into());
@@ -290,7 +306,7 @@ pub fn read_file(
         return Err(format!("max_lines must be between 1 and {MAX_READ_LINES}"));
     }
 
-    let target = resolve_target_path(workspace_root, path)?;
+    let target = resolve_read_target_path(workspace_root, path, allow_external_absolute)?;
     if !target.exists() {
         return Err(format!("File not found: {}", target.display()));
     }
@@ -359,17 +375,28 @@ pub fn read_file(
     })
 }
 
+#[cfg(test)]
 pub fn read_file_bytes(
     workspace_root: &str,
     path: &str,
     start_byte: u64,
     max_bytes: usize,
 ) -> Result<ReadFileOutput, String> {
+    read_file_bytes_with_policy(workspace_root, path, start_byte, max_bytes, false)
+}
+
+pub fn read_file_bytes_with_policy(
+    workspace_root: &str,
+    path: &str,
+    start_byte: u64,
+    max_bytes: usize,
+    allow_external_absolute: bool,
+) -> Result<ReadFileOutput, String> {
     if !(4..=MAX_READ_BYTES).contains(&max_bytes) {
         return Err(format!("max_bytes must be between 4 and {MAX_READ_BYTES}"));
     }
 
-    let target = resolve_target_path(workspace_root, path)?;
+    let target = resolve_read_target_path(workspace_root, path, allow_external_absolute)?;
     if !target.exists() {
         return Err(format!("File not found: {}", target.display()));
     }

@@ -20,6 +20,7 @@ use crate::workspaces::{self, WorkspaceConfig, WorkspaceId, WorkspaceRuntime};
 /// Log entry displayed in the TUI.
 #[derive(Clone)]
 pub struct LogEntry {
+    pub sequence: u64,
     pub workspace_id: Option<WorkspaceId>,
     pub time: String,
     pub level: &'static str,
@@ -38,6 +39,7 @@ pub enum CommandActivityState {
 
 #[derive(Clone, Debug)]
 pub struct CommandActivity {
+    pub sequence: u64,
     pub workspace_id: WorkspaceId,
     pub id: String,
     pub time: String,
@@ -675,6 +677,8 @@ pub struct AppState {
     pub mascot: MascotPack,
     pub detected_browsers: Vec<DetectedBrowser>,
     pub selected_browser: Option<DetectedBrowser>,
+    next_log_sequence: u64,
+    next_command_sequence: u64,
     pub logs: Vec<LogEntry>,
     pub command_activities: VecDeque<CommandActivity>,
     pub flows: Vec<FlowLane>,
@@ -1097,6 +1101,8 @@ impl AppState {
             workspace_root,
             detected_browsers: Vec::new(),
             selected_browser: config.selected_browser,
+            next_log_sequence: 0,
+            next_command_sequence: 0,
             logs: Vec::new(),
             command_activities: VecDeque::new(),
             flows: Vec::new(),
@@ -1183,7 +1189,9 @@ impl AppState {
         level: &'static str,
         message: String,
     ) {
+        self.next_log_sequence = self.next_log_sequence.saturating_add(1);
         self.logs.push(LogEntry {
+            sequence: self.next_log_sequence,
             workspace_id: workspace_id.clone(),
             time: now_hms(),
             level,
@@ -1211,7 +1219,9 @@ impl AppState {
         command: String,
         background: bool,
     ) {
+        self.next_command_sequence = self.next_command_sequence.saturating_add(1);
         self.command_activities.push_back(CommandActivity {
+            sequence: self.next_command_sequence,
             workspace_id: workspace_id.clone(),
             id: activity_id,
             time: now_hms(),
@@ -2793,6 +2803,71 @@ toolMode = "multiTools"
             job_id: "job-1".into(),
         });
         assert_eq!(app.command_activities.len(), 1);
+
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn observability_sequence_ids_are_monotonic_and_updates_preserve_command_sequence() {
+        let (mut app, workspace, config_path) = test_app("moondesk-observability-sequences");
+        let workspace_id = app.workspaces[0].id.clone();
+        let initial_log_sequence = app.logs.last().map(|entry| entry.sequence).unwrap_or(0);
+
+        app.log_workspace(workspace_id.clone(), "INFO", "first workspace log".into());
+        app.log("INFO", "global log".into());
+        let sequences = app
+            .logs
+            .iter()
+            .rev()
+            .take(2)
+            .map(|entry| entry.sequence)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            sequences,
+            vec![initial_log_sequence + 2, initial_log_sequence + 1]
+        );
+
+        app.apply_server_ui_event(ServerUiEvent::CommandStarted {
+            workspace_id: workspace_id.clone(),
+            activity_id: "activity-a".into(),
+            command: "cargo test".into(),
+            background: false,
+        });
+        let first_sequence = app
+            .command_activities
+            .back()
+            .expect("first command activity")
+            .sequence;
+        app.apply_server_ui_event(ServerUiEvent::CommandUpdated {
+            workspace_id: workspace_id.clone(),
+            activity_id: Some("activity-a".into()),
+            job_id: None,
+            state: CommandActivityState::Succeeded,
+            exit_code: Some(0),
+            preview: Some("done".into()),
+        });
+        assert_eq!(
+            app.command_activities
+                .back()
+                .expect("updated command activity")
+                .sequence,
+            first_sequence
+        );
+
+        app.apply_server_ui_event(ServerUiEvent::CommandStarted {
+            workspace_id,
+            activity_id: "activity-b".into(),
+            command: "cargo fmt --check".into(),
+            background: false,
+        });
+        assert_eq!(
+            app.command_activities
+                .back()
+                .expect("second command activity")
+                .sequence,
+            first_sequence + 1
+        );
 
         let _ = std::fs::remove_file(config_path);
         let _ = std::fs::remove_dir_all(workspace);

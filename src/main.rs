@@ -66,12 +66,15 @@ const NGROK_DOMAIN_MASK: &str = "▓▓▓▓▓▓▓▓";
 const MCP_URL_REVEAL_BAR_CELLS: usize = 10;
 // Reserve one extra row for Version without removing the normal live-flow slot.
 const STATUS_PANEL_HEIGHT: u16 = TUI_MASCOT_BLOCK_HEIGHT + 5;
-const STATUS_LABEL_WIDTH: usize = 19;
+const STATUS_LABEL_WIDTH: usize = 10;
+const DASHBOARD_THREE_COLUMN_MIN_WIDTH: u16 = 120;
+const DASHBOARD_WORKSPACE_COLUMN_WIDTH: u16 = 32;
 const STATUS_PRIMARY_MCP_URL_LINE: usize = 6;
+const STATUS_WORKSPACES_INSERT_INDEX: usize = STATUS_PRIMARY_MCP_URL_LINE + 1;
 const CONNECT_GUIDE_PRIMARY_MCP_URL_LINE: usize = 7;
 const GPT_5_6_AND_EARLIER_INPUT_USD_PER_1M: f64 = 5.0;
 const GPT_5_6_AND_EARLIER_OUTPUT_USD_PER_1M: f64 = 30.0;
-const PRICE_DISPLAY_DECIMALS: usize = 6;
+const PRICE_DISPLAY_DECIMALS: usize = 2;
 const NGROK_SETUP_URL: &str = "https://dashboard.ngrok.com/get-started/setup";
 #[cfg(target_os = "windows")]
 const WORKSPACE_BROWSE_ACTION_LABEL: &str = "[b] Explorer ";
@@ -190,6 +193,13 @@ enum AppExit {
 
 // ── Selection ───────────────────────────────────────────────
 
+#[derive(Clone, Debug)]
+struct DashboardWorkspaceRow {
+    id: WorkspaceId,
+    name: String,
+    connected: bool,
+}
+
 #[derive(Clone)]
 struct UiSnapshot {
     theme: String,
@@ -207,6 +217,7 @@ struct UiSnapshot {
     port: u16,
     workspace_count: usize,
     connected_workspace_count: usize,
+    workspaces: Vec<DashboardWorkspaceRow>,
     workspace_names: std::collections::HashMap<WorkspaceId, String>,
     mascot: mascot::MascotPack,
     detected_browsers: Vec<browser::DetectedBrowser>,
@@ -241,6 +252,18 @@ impl UiSnapshot {
                 .values()
                 .filter(|runtime| runtime.remote_connected())
                 .count(),
+            workspaces: app
+                .workspaces
+                .iter()
+                .map(|workspace| DashboardWorkspaceRow {
+                    id: workspace.id.clone(),
+                    name: workspace.name.clone(),
+                    connected: app
+                        .workspace_runtimes
+                        .get(&workspace.id)
+                        .is_some_and(|runtime| runtime.remote_connected()),
+                })
+                .collect(),
             workspace_names: app
                 .workspaces
                 .iter()
@@ -310,25 +333,148 @@ impl Selection {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum BottomPanelFocus {
+enum DashboardFocus {
+    Workspaces,
     Logs,
     ShellCommands,
 }
 
-impl BottomPanelFocus {
+impl DashboardFocus {
     fn label(self) -> &'static str {
         match self {
+            Self::Workspaces => "Workspaces",
             Self::Logs => "Logs",
             Self::ShellCommands => "Shell Commands",
         }
     }
+}
 
-    fn toggled(self) -> Self {
-        match self {
-            Self::Logs => Self::ShellCommands,
-            Self::ShellCommands => Self::Logs,
-        }
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+enum WorkspaceFilter {
+    #[default]
+    All,
+    Workspace(WorkspaceId),
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ObservabilityCutoff {
+    logs: u64,
+    commands: u64,
+}
+
+fn workspace_filter_index(filter: &WorkspaceFilter, workspaces: &[DashboardWorkspaceRow]) -> usize {
+    match filter {
+        WorkspaceFilter::All => 0,
+        WorkspaceFilter::Workspace(workspace_id) => workspaces
+            .iter()
+            .position(|workspace| &workspace.id == workspace_id)
+            .map(|index| index + 1)
+            .unwrap_or(0),
     }
+}
+
+fn workspace_filter_from_index(
+    index: usize,
+    workspaces: &[DashboardWorkspaceRow],
+) -> WorkspaceFilter {
+    if index == 0 {
+        WorkspaceFilter::All
+    } else {
+        workspaces
+            .get(index - 1)
+            .map(|workspace| WorkspaceFilter::Workspace(workspace.id.clone()))
+            .unwrap_or(WorkspaceFilter::All)
+    }
+}
+
+fn workspace_filter_exists(filter: &WorkspaceFilter, workspaces: &[DashboardWorkspaceRow]) -> bool {
+    match filter {
+        WorkspaceFilter::All => true,
+        WorkspaceFilter::Workspace(workspace_id) => workspaces
+            .iter()
+            .any(|workspace| &workspace.id == workspace_id),
+    }
+}
+
+fn reconcile_workspace_filter(
+    filter: &mut WorkspaceFilter,
+    workspaces: &[DashboardWorkspaceRow],
+) -> bool {
+    if workspace_filter_exists(filter, workspaces) {
+        false
+    } else {
+        *filter = WorkspaceFilter::All;
+        true
+    }
+}
+
+fn apply_workspace_observability_filter(
+    app: &mut UiSnapshot,
+    filter: &WorkspaceFilter,
+    cutoffs: &std::collections::HashMap<WorkspaceFilter, ObservabilityCutoff>,
+) {
+    let cutoff = cutoffs.get(filter).copied().unwrap_or_default();
+    app.logs.retain(|entry| {
+        let in_scope = match filter {
+            WorkspaceFilter::All => true,
+            WorkspaceFilter::Workspace(workspace_id) => {
+                entry.workspace_id.as_ref() == Some(workspace_id)
+            }
+        };
+        in_scope && entry.sequence > cutoff.logs
+    });
+    app.command_activities.retain(|activity| {
+        let in_scope = match filter {
+            WorkspaceFilter::All => true,
+            WorkspaceFilter::Workspace(workspace_id) => &activity.workspace_id == workspace_id,
+        };
+        in_scope && activity.sequence > cutoff.commands
+    });
+}
+
+fn record_clear_view(
+    app: &UiSnapshot,
+    filter: &WorkspaceFilter,
+    cutoffs: &mut std::collections::HashMap<WorkspaceFilter, ObservabilityCutoff>,
+) {
+    let cutoff = cutoffs.entry(filter.clone()).or_default();
+    if let Some(sequence) = app.logs.iter().map(|entry| entry.sequence).max() {
+        cutoff.logs = cutoff.logs.max(sequence);
+    }
+    if let Some(sequence) = app
+        .command_activities
+        .iter()
+        .map(|activity| activity.sequence)
+        .max()
+    {
+        cutoff.commands = cutoff.commands.max(sequence);
+    }
+}
+
+fn cycle_dashboard_focus(
+    current: DashboardFocus,
+    workspace_available: bool,
+    command_available: bool,
+    reverse: bool,
+) -> DashboardFocus {
+    let mut available = Vec::with_capacity(3);
+    if workspace_available {
+        available.push(DashboardFocus::Workspaces);
+    }
+    available.push(DashboardFocus::Logs);
+    if command_available {
+        available.push(DashboardFocus::ShellCommands);
+    }
+    let current_index = available
+        .iter()
+        .position(|focus| *focus == current)
+        .unwrap_or(0);
+    let next_index = if reverse {
+        current_index.checked_sub(1).unwrap_or(available.len() - 1)
+    } else {
+        (current_index + 1) % available.len()
+    };
+    available[next_index]
 }
 
 #[derive(Clone, Copy, Default)]
@@ -359,6 +505,8 @@ struct BottomPanelHitMaps {
 #[derive(Default)]
 struct DashboardHitAreas {
     secrets: Vec<DashboardSecretHit>,
+    workspaces: Option<Rect>,
+    workspace_rows: Vec<PanelItemHit>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -543,15 +691,35 @@ fn follow_panel_latest(scroll: &mut usize, follow_tail: &mut bool, view: PanelSc
     *scroll = view.max_scroll;
 }
 
-fn panel_under_cursor(areas: BottomPanelAreas, column: u16, row: u16) -> Option<BottomPanelFocus> {
+fn reset_filtered_navigation(
+    log: (&mut usize, &mut bool),
+    command: (&mut usize, &mut bool),
+    selected: (&mut Option<usize>, &mut Option<usize>),
+    expanded: (&mut Option<usize>, &mut Option<usize>),
+) {
+    let (log_scroll, log_follow_tail) = log;
+    let (command_scroll, command_follow_tail) = command;
+    let (selected_log, selected_command) = selected;
+    let (expanded_log, expanded_command) = expanded;
+    *log_scroll = 0;
+    *log_follow_tail = true;
+    *command_scroll = 0;
+    *command_follow_tail = true;
+    *selected_log = None;
+    *selected_command = None;
+    *expanded_log = None;
+    *expanded_command = None;
+}
+
+fn panel_under_cursor(areas: BottomPanelAreas, column: u16, row: u16) -> Option<DashboardFocus> {
     if areas
         .shell_commands
         .is_some_and(|area| rect_contains(area, column, row))
     {
-        return Some(BottomPanelFocus::ShellCommands);
+        return Some(DashboardFocus::ShellCommands);
     }
     if rect_contains(areas.logs, column, row) {
-        return Some(BottomPanelFocus::Logs);
+        return Some(DashboardFocus::Logs);
     }
     None
 }
@@ -644,7 +812,17 @@ fn flow_lane_spans(
     palette: &theme::Palette,
     now_millis: u128,
 ) -> Vec<Span<'static>> {
-    const CELLS: usize = FLOW_ROW_CELLS;
+    flow_lane_spans_with_cells(active, flow, palette, now_millis, FLOW_ROW_CELLS)
+}
+
+fn flow_lane_spans_with_cells(
+    active: bool,
+    flow: Option<&FlowLane>,
+    palette: &theme::Palette,
+    now_millis: u128,
+    cells: usize,
+) -> Vec<Span<'static>> {
+    let cells = cells.clamp(1, FLOW_ROW_CELLS);
     let unlit = Style::default().fg(palette.muted_fg);
     let lit = Style::default()
         .fg(palette.info_fg)
@@ -652,21 +830,23 @@ fn flow_lane_spans(
 
     let direction = flow.map(|flow| flow_direction(Some(flow), now_millis));
     let lit_count = if active {
-        flow_lit_count(flow, now_millis, CELLS)
+        flow_lit_count(flow, now_millis, FLOW_ROW_CELLS)
+            .saturating_mul(cells)
+            .div_ceil(FLOW_ROW_CELLS)
     } else {
         0
     };
 
     if lit_count == 0 || direction.is_none() {
-        return vec![Span::styled("-".repeat(CELLS), unlit), Span::raw(" ")];
+        return vec![Span::styled("-".repeat(cells), unlit), Span::raw(" ")];
     }
 
     let direction = direction.unwrap_or(FlowDirection::Forward);
-    let mut spans = Vec::with_capacity(CELLS + 1);
-    for i in 0..CELLS {
+    let mut spans = Vec::with_capacity(cells + 1);
+    for i in 0..cells {
         let lit_here = match direction {
             FlowDirection::Forward => i < lit_count,
-            FlowDirection::Backward => i >= CELLS.saturating_sub(lit_count),
+            FlowDirection::Backward => i >= cells.saturating_sub(lit_count),
         };
         let style = if lit_here { lit } else { unlit };
         spans.push(Span::styled("-".to_string(), style));
@@ -819,8 +999,7 @@ fn usage_line(
             format!("{:<width$}", values[0], width = value_widths[0]),
             value_style,
         ),
-        Span::styled(" (tool input, llm output)", label_style),
-        Span::raw("  "),
+        Span::raw(" "),
         Span::styled("↑", label_style),
         Span::styled(
             format!("{:<width$}", values[1], width = value_widths[1]),
@@ -838,7 +1017,7 @@ fn usage_line(
             format!("{:<width$}", values[3], width = value_widths[3]),
             value_style,
         ),
-        Span::raw("  "),
+        Span::raw(" "),
         Span::styled("$", label_style),
         Span::styled(
             format!("{:<width$}", values[4], width = value_widths[4]),
@@ -4983,7 +5162,12 @@ async fn run_tui(
     let mut bottom_panel_areas = BottomPanelAreas::default();
     let mut bottom_panel_hits = BottomPanelHitMaps::default();
     let mut dashboard_hit_areas = DashboardHitAreas::default();
-    let mut focused_bottom_panel = BottomPanelFocus::ShellCommands;
+    let mut focused_bottom_panel = DashboardFocus::ShellCommands;
+    let mut workspace_filter = WorkspaceFilter::All;
+    let mut workspace_scroll: usize = 0;
+    let mut workspace_visible_count: usize = 1;
+    let mut clear_cutoffs: std::collections::HashMap<WorkspaceFilter, ObservabilityCutoff> =
+        std::collections::HashMap::new();
     let mut selected_log: Option<usize> = None;
     let mut selected_command: Option<usize> = None;
     let mut expanded_log: Option<usize> = None;
@@ -5012,12 +5196,22 @@ async fn run_tui(
     let mut exit = AppExit::Quit;
 
     loop {
-        let app = {
+        let mut app = {
             let mut live = state.lock().await;
             let _ = drain_server_ui_events(&mut live, &mut ui_events);
             live.prune_closed_flows();
             UiSnapshot::from_app(&live)
         };
+        if reconcile_workspace_filter(&mut workspace_filter, &app.workspaces) {
+            workspace_scroll = 0;
+            reset_filtered_navigation(
+                (&mut log_scroll, &mut log_follow_tail),
+                (&mut command_scroll, &mut command_follow_tail),
+                (&mut selected_log, &mut selected_command),
+                (&mut expanded_log, &mut expanded_command),
+            );
+        }
+        apply_workspace_observability_filter(&mut app, &workspace_filter, &clear_cutoffs);
         if interrupts.take_pending() > 0 {
             if run_quit_confirm(terminal, &state, &interrupts).await? {
                 break;
@@ -5091,6 +5285,9 @@ async fn run_tui(
                         log_follow_tail,
                         command_scroll,
                         command_follow_tail,
+                        workspace_filter: &workspace_filter,
+                        workspace_scroll: &mut workspace_scroll,
+                        workspace_visible_count: &mut workspace_visible_count,
                         focused_bottom_panel,
                         selected_log,
                         selected_command,
@@ -5155,8 +5352,15 @@ async fn run_tui(
             if !command_follow_tail && command_scroll > last_command_view.max_scroll {
                 command_scroll = last_command_view.max_scroll;
             }
-            if bottom_panel_areas.shell_commands.is_none() {
-                focused_bottom_panel = BottomPanelFocus::Logs;
+            if focused_bottom_panel == DashboardFocus::ShellCommands
+                && bottom_panel_areas.shell_commands.is_none()
+            {
+                focused_bottom_panel = DashboardFocus::Logs;
+            }
+            if focused_bottom_panel == DashboardFocus::Workspaces
+                && dashboard_hit_areas.workspaces.is_none()
+            {
+                focused_bottom_panel = DashboardFocus::Logs;
             }
             screen_lines = new_lines;
         }
@@ -5214,14 +5418,26 @@ async fn run_tui(
                             }
                         }
                         KeyCode::Tab | KeyCode::BackTab => {
-                            if bottom_panel_areas.shell_commands.is_some() {
-                                focused_bottom_panel = focused_bottom_panel.toggled();
-                            } else {
-                                focused_bottom_panel = BottomPanelFocus::Logs;
-                            }
+                            focused_bottom_panel = cycle_dashboard_focus(
+                                focused_bottom_panel,
+                                dashboard_hit_areas.workspaces.is_some(),
+                                bottom_panel_areas.shell_commands.is_some(),
+                                key.code == KeyCode::BackTab,
+                            );
+                        }
+                        KeyCode::Char('c') => {
+                            record_clear_view(&app, &workspace_filter, &mut clear_cutoffs);
+                            reset_filtered_navigation(
+                                (&mut log_scroll, &mut log_follow_tail),
+                                (&mut command_scroll, &mut command_follow_tail),
+                                (&mut selected_log, &mut selected_command),
+                                (&mut expanded_log, &mut expanded_command),
+                            );
+                            toast = Some(("View cleared", (2, 2), Instant::now()));
                         }
                         KeyCode::Enter | KeyCode::Char(' ') => match focused_bottom_panel {
-                            BottomPanelFocus::Logs => {
+                            DashboardFocus::Workspaces => {}
+                            DashboardFocus::Logs => {
                                 if let Some(index) = selected_log {
                                     expanded_log = if expanded_log == Some(index) {
                                         None
@@ -5233,7 +5449,7 @@ async fn run_tui(
                                     };
                                 }
                             }
-                            BottomPanelFocus::ShellCommands => {
+                            DashboardFocus::ShellCommands => {
                                 if let Some(index) = selected_command {
                                     expanded_command = if expanded_command == Some(index) {
                                         None
@@ -5247,11 +5463,28 @@ async fn run_tui(
                             }
                         },
                         KeyCode::Esc => match focused_bottom_panel {
-                            BottomPanelFocus::Logs => expanded_log = None,
-                            BottomPanelFocus::ShellCommands => expanded_command = None,
+                            DashboardFocus::Workspaces => {}
+                            DashboardFocus::Logs => expanded_log = None,
+                            DashboardFocus::ShellCommands => expanded_command = None,
                         },
                         KeyCode::Up => match focused_bottom_panel {
-                            BottomPanelFocus::Logs => {
+                            DashboardFocus::Workspaces => {
+                                let current =
+                                    workspace_filter_index(&workspace_filter, &app.workspaces);
+                                let next = current.saturating_sub(1);
+                                let next_filter =
+                                    workspace_filter_from_index(next, &app.workspaces);
+                                if next_filter != workspace_filter {
+                                    workspace_filter = next_filter;
+                                    reset_filtered_navigation(
+                                        (&mut log_scroll, &mut log_follow_tail),
+                                        (&mut command_scroll, &mut command_follow_tail),
+                                        (&mut selected_log, &mut selected_command),
+                                        (&mut expanded_log, &mut expanded_command),
+                                    );
+                                }
+                            }
+                            DashboardFocus::Logs => {
                                 expanded_log = None;
                                 move_panel_selection(&mut selected_log, last_log_count, -1);
                                 scroll_panel_up(
@@ -5261,7 +5494,7 @@ async fn run_tui(
                                     1,
                                 );
                             }
-                            BottomPanelFocus::ShellCommands => {
+                            DashboardFocus::ShellCommands => {
                                 expanded_command = None;
                                 move_panel_selection(&mut selected_command, last_command_count, -1);
                                 scroll_panel_up(
@@ -5273,7 +5506,24 @@ async fn run_tui(
                             }
                         },
                         KeyCode::Down => match focused_bottom_panel {
-                            BottomPanelFocus::Logs => {
+                            DashboardFocus::Workspaces => {
+                                let current =
+                                    workspace_filter_index(&workspace_filter, &app.workspaces);
+                                let last = app.workspaces.len();
+                                let next = current.saturating_add(1).min(last);
+                                let next_filter =
+                                    workspace_filter_from_index(next, &app.workspaces);
+                                if next_filter != workspace_filter {
+                                    workspace_filter = next_filter;
+                                    reset_filtered_navigation(
+                                        (&mut log_scroll, &mut log_follow_tail),
+                                        (&mut command_scroll, &mut command_follow_tail),
+                                        (&mut selected_log, &mut selected_command),
+                                        (&mut expanded_log, &mut expanded_command),
+                                    );
+                                }
+                            }
+                            DashboardFocus::Logs => {
                                 expanded_log = None;
                                 move_panel_selection(&mut selected_log, last_log_count, 1);
                                 if selected_log == last_log_count.checked_sub(1) {
@@ -5291,7 +5541,7 @@ async fn run_tui(
                                     );
                                 }
                             }
-                            BottomPanelFocus::ShellCommands => {
+                            DashboardFocus::ShellCommands => {
                                 expanded_command = None;
                                 move_panel_selection(&mut selected_command, last_command_count, 1);
                                 if selected_command == last_command_count.checked_sub(1) {
@@ -5311,7 +5561,23 @@ async fn run_tui(
                             }
                         },
                         KeyCode::PageUp => match focused_bottom_panel {
-                            BottomPanelFocus::Logs => {
+                            DashboardFocus::Workspaces => {
+                                let current =
+                                    workspace_filter_index(&workspace_filter, &app.workspaces);
+                                let next = current.saturating_sub(workspace_visible_count.max(1));
+                                let next_filter =
+                                    workspace_filter_from_index(next, &app.workspaces);
+                                if next_filter != workspace_filter {
+                                    workspace_filter = next_filter;
+                                    reset_filtered_navigation(
+                                        (&mut log_scroll, &mut log_follow_tail),
+                                        (&mut command_scroll, &mut command_follow_tail),
+                                        (&mut selected_log, &mut selected_command),
+                                        (&mut expanded_log, &mut expanded_command),
+                                    );
+                                }
+                            }
+                            DashboardFocus::Logs => {
                                 expanded_log = None;
                                 move_panel_selection(&mut selected_log, last_log_count, -5);
                                 scroll_panel_up(
@@ -5321,7 +5587,7 @@ async fn run_tui(
                                     5,
                                 );
                             }
-                            BottomPanelFocus::ShellCommands => {
+                            DashboardFocus::ShellCommands => {
                                 expanded_command = None;
                                 move_panel_selection(&mut selected_command, last_command_count, -5);
                                 scroll_panel_up(
@@ -5333,7 +5599,26 @@ async fn run_tui(
                             }
                         },
                         KeyCode::PageDown => match focused_bottom_panel {
-                            BottomPanelFocus::Logs => {
+                            DashboardFocus::Workspaces => {
+                                let current =
+                                    workspace_filter_index(&workspace_filter, &app.workspaces);
+                                let last = app.workspaces.len();
+                                let next = current
+                                    .saturating_add(workspace_visible_count.max(1))
+                                    .min(last);
+                                let next_filter =
+                                    workspace_filter_from_index(next, &app.workspaces);
+                                if next_filter != workspace_filter {
+                                    workspace_filter = next_filter;
+                                    reset_filtered_navigation(
+                                        (&mut log_scroll, &mut log_follow_tail),
+                                        (&mut command_scroll, &mut command_follow_tail),
+                                        (&mut selected_log, &mut selected_command),
+                                        (&mut expanded_log, &mut expanded_command),
+                                    );
+                                }
+                            }
+                            DashboardFocus::Logs => {
                                 expanded_log = None;
                                 move_panel_selection(&mut selected_log, last_log_count, 5);
                                 if selected_log == last_log_count.checked_sub(1) {
@@ -5351,7 +5636,7 @@ async fn run_tui(
                                     );
                                 }
                             }
-                            BottomPanelFocus::ShellCommands => {
+                            DashboardFocus::ShellCommands => {
                                 expanded_command = None;
                                 move_panel_selection(&mut selected_command, last_command_count, 5);
                                 if selected_command == last_command_count.checked_sub(1) {
@@ -5371,13 +5656,25 @@ async fn run_tui(
                             }
                         },
                         KeyCode::Home => match focused_bottom_panel {
-                            BottomPanelFocus::Logs => {
+                            DashboardFocus::Workspaces => {
+                                if workspace_filter != WorkspaceFilter::All {
+                                    workspace_filter = WorkspaceFilter::All;
+                                    workspace_scroll = 0;
+                                    reset_filtered_navigation(
+                                        (&mut log_scroll, &mut log_follow_tail),
+                                        (&mut command_scroll, &mut command_follow_tail),
+                                        (&mut selected_log, &mut selected_command),
+                                        (&mut expanded_log, &mut expanded_command),
+                                    );
+                                }
+                            }
+                            DashboardFocus::Logs => {
                                 expanded_log = None;
                                 selected_log = (last_log_count > 0).then_some(0);
                                 log_follow_tail = false;
                                 log_scroll = 0;
                             }
-                            BottomPanelFocus::ShellCommands => {
+                            DashboardFocus::ShellCommands => {
                                 expanded_command = None;
                                 selected_command = (last_command_count > 0).then_some(0);
                                 command_follow_tail = false;
@@ -5385,7 +5682,22 @@ async fn run_tui(
                             }
                         },
                         KeyCode::End => match focused_bottom_panel {
-                            BottomPanelFocus::Logs => {
+                            DashboardFocus::Workspaces => {
+                                let next_filter = workspace_filter_from_index(
+                                    app.workspaces.len(),
+                                    &app.workspaces,
+                                );
+                                if next_filter != workspace_filter {
+                                    workspace_filter = next_filter;
+                                    reset_filtered_navigation(
+                                        (&mut log_scroll, &mut log_follow_tail),
+                                        (&mut command_scroll, &mut command_follow_tail),
+                                        (&mut selected_log, &mut selected_command),
+                                        (&mut expanded_log, &mut expanded_command),
+                                    );
+                                }
+                            }
+                            DashboardFocus::Logs => {
                                 expanded_log = None;
                                 selected_log = last_log_count.checked_sub(1);
                                 follow_panel_latest(
@@ -5394,7 +5706,7 @@ async fn run_tui(
                                     last_log_view,
                                 );
                             }
-                            BottomPanelFocus::ShellCommands => {
+                            DashboardFocus::ShellCommands => {
                                 expanded_command = None;
                                 selected_command = last_command_count.checked_sub(1);
                                 follow_panel_latest(
@@ -5409,12 +5721,33 @@ async fn run_tui(
                 }
                 Event::Mouse(mouse) => match mouse.kind {
                     MouseEventKind::Down(MouseButton::Left) => {
-                        if let Some(panel) =
+                        if dashboard_hit_areas
+                            .workspaces
+                            .is_some_and(|area| rect_contains(area, mouse.column, mouse.row))
+                        {
+                            focused_bottom_panel = DashboardFocus::Workspaces;
+                            if let Some(index) =
+                                item_under_cursor(&dashboard_hit_areas.workspace_rows, mouse.row)
+                            {
+                                let next_filter =
+                                    workspace_filter_from_index(index, &app.workspaces);
+                                if next_filter != workspace_filter {
+                                    workspace_filter = next_filter;
+                                    reset_filtered_navigation(
+                                        (&mut log_scroll, &mut log_follow_tail),
+                                        (&mut command_scroll, &mut command_follow_tail),
+                                        (&mut selected_log, &mut selected_command),
+                                        (&mut expanded_log, &mut expanded_command),
+                                    );
+                                }
+                            }
+                        } else if let Some(panel) =
                             panel_under_cursor(bottom_panel_areas, mouse.column, mouse.row)
                         {
                             focused_bottom_panel = panel;
                             match panel {
-                                BottomPanelFocus::Logs => {
+                                DashboardFocus::Workspaces => {}
+                                DashboardFocus::Logs => {
                                     if let Some(index) =
                                         item_under_cursor(&bottom_panel_hits.logs, mouse.row)
                                     {
@@ -5425,7 +5758,7 @@ async fn run_tui(
                                         log_follow_tail = index + 1 == last_log_count;
                                     }
                                 }
-                                BottomPanelFocus::ShellCommands => {
+                                DashboardFocus::ShellCommands => {
                                     if let Some(index) = item_under_cursor(
                                         &bottom_panel_hits.shell_commands,
                                         mouse.row,
@@ -5552,12 +5885,35 @@ async fn run_tui(
                         }
                     }
                     MouseEventKind::ScrollUp => {
-                        let target =
+                        let target = if dashboard_hit_areas
+                            .workspaces
+                            .is_some_and(|area| rect_contains(area, mouse.column, mouse.row))
+                        {
+                            DashboardFocus::Workspaces
+                        } else {
                             panel_under_cursor(bottom_panel_areas, mouse.column, mouse.row)
-                                .unwrap_or(focused_bottom_panel);
+                                .unwrap_or(focused_bottom_panel)
+                        };
                         focused_bottom_panel = target;
                         match target {
-                            BottomPanelFocus::Logs => {
+                            DashboardFocus::Workspaces => {
+                                let current =
+                                    workspace_filter_index(&workspace_filter, &app.workspaces);
+                                let next_filter = workspace_filter_from_index(
+                                    current.saturating_sub(1),
+                                    &app.workspaces,
+                                );
+                                if next_filter != workspace_filter {
+                                    workspace_filter = next_filter;
+                                    reset_filtered_navigation(
+                                        (&mut log_scroll, &mut log_follow_tail),
+                                        (&mut command_scroll, &mut command_follow_tail),
+                                        (&mut selected_log, &mut selected_command),
+                                        (&mut expanded_log, &mut expanded_command),
+                                    );
+                                }
+                            }
+                            DashboardFocus::Logs => {
                                 expanded_log = None;
                                 move_panel_selection(&mut selected_log, last_log_count, -1);
                                 scroll_panel_up(
@@ -5567,7 +5923,7 @@ async fn run_tui(
                                     1,
                                 );
                             }
-                            BottomPanelFocus::ShellCommands => {
+                            DashboardFocus::ShellCommands => {
                                 expanded_command = None;
                                 move_panel_selection(&mut selected_command, last_command_count, -1);
                                 scroll_panel_up(
@@ -5580,12 +5936,36 @@ async fn run_tui(
                         }
                     }
                     MouseEventKind::ScrollDown => {
-                        let target =
+                        let target = if dashboard_hit_areas
+                            .workspaces
+                            .is_some_and(|area| rect_contains(area, mouse.column, mouse.row))
+                        {
+                            DashboardFocus::Workspaces
+                        } else {
                             panel_under_cursor(bottom_panel_areas, mouse.column, mouse.row)
-                                .unwrap_or(focused_bottom_panel);
+                                .unwrap_or(focused_bottom_panel)
+                        };
                         focused_bottom_panel = target;
                         match target {
-                            BottomPanelFocus::Logs => {
+                            DashboardFocus::Workspaces => {
+                                let current =
+                                    workspace_filter_index(&workspace_filter, &app.workspaces);
+                                let last = app.workspaces.len();
+                                let next_filter = workspace_filter_from_index(
+                                    current.saturating_add(1).min(last),
+                                    &app.workspaces,
+                                );
+                                if next_filter != workspace_filter {
+                                    workspace_filter = next_filter;
+                                    reset_filtered_navigation(
+                                        (&mut log_scroll, &mut log_follow_tail),
+                                        (&mut command_scroll, &mut command_follow_tail),
+                                        (&mut selected_log, &mut selected_command),
+                                        (&mut expanded_log, &mut expanded_command),
+                                    );
+                                }
+                            }
+                            DashboardFocus::Logs => {
                                 expanded_log = None;
                                 move_panel_selection(&mut selected_log, last_log_count, 1);
                                 if selected_log == last_log_count.checked_sub(1) {
@@ -5603,7 +5983,7 @@ async fn run_tui(
                                     );
                                 }
                             }
-                            BottomPanelFocus::ShellCommands => {
+                            DashboardFocus::ShellCommands => {
                                 expanded_command = None;
                                 move_panel_selection(&mut selected_command, last_command_count, 1);
                                 if selected_command == last_command_count.checked_sub(1) {
@@ -5975,6 +6355,127 @@ fn draw_update_confirm(
 
 // ── Draw main UI ────────────────────────────────────────────
 
+fn draw_inline_workspaces(
+    f: &mut Frame,
+    app: &UiSnapshot,
+    area: Rect,
+    workspace_filter: &WorkspaceFilter,
+    focused: bool,
+    workspace_view: (&mut usize, &mut usize),
+    dashboard_hit_areas: &mut DashboardHitAreas,
+) {
+    let (workspace_scroll, workspace_visible_count) = workspace_view;
+    let palette = app.current_theme().palette;
+    let block = Block::default()
+        .title(if focused {
+            " Workspaces [focused] "
+        } else {
+            " Workspaces "
+        })
+        .borders(Borders::ALL)
+        .border_type(palette.border_type)
+        .border_style(Style::default().fg(if focused {
+            palette.key_fg
+        } else {
+            palette.border_fg
+        }));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    dashboard_hit_areas.workspaces = Some(area);
+    dashboard_hit_areas.workspace_rows.clear();
+
+    let total = app.workspaces.len() + 1;
+    if inner.height == 0 {
+        *workspace_visible_count = 0;
+        return;
+    }
+    let needs_range = total > inner.height as usize;
+    let list_height = if needs_range {
+        inner.height.saturating_sub(1)
+    } else {
+        inner.height
+    } as usize;
+    *workspace_visible_count = list_height.max(1);
+
+    let selected_index = workspace_filter_index(workspace_filter, &app.workspaces);
+    let max_start = total.saturating_sub(*workspace_visible_count);
+    let mut start = (*workspace_scroll).min(max_start);
+    if selected_index < start {
+        start = selected_index;
+    } else if selected_index >= start.saturating_add(*workspace_visible_count) {
+        start = selected_index
+            .saturating_add(1)
+            .saturating_sub(*workspace_visible_count);
+    }
+    start = start.min(max_start);
+    *workspace_scroll = start;
+    let end = start.saturating_add(*workspace_visible_count).min(total);
+
+    let row_width = inner.width.saturating_sub(1) as usize;
+    let mut items = Vec::with_capacity(end.saturating_sub(start));
+    for (visual_row, index) in (start..end).enumerate() {
+        let selected = index == selected_index;
+        let marker = if selected { ">" } else { " " };
+        let (state_symbol, state_style, label) = if index == 0 {
+            (
+                "◆",
+                Style::default().fg(palette.info_fg),
+                "All Workspaces".to_string(),
+            )
+        } else {
+            let workspace = &app.workspaces[index - 1];
+            let symbol = if workspace.connected { "●" } else { "○" };
+            let status = if workspace.connected {
+                " connected"
+            } else {
+                " idle"
+            };
+            let style = Style::default().fg(if workspace.connected {
+                palette.success_fg
+            } else {
+                palette.muted_fg
+            });
+            let available_width = row_width.saturating_sub(4 + status.chars().count());
+            let (name, _) = truncate_with_ellipsis(&workspace.name, available_width.max(1), false);
+            (symbol, style, format!("{name}{status}"))
+        };
+        let label_style = if selected {
+            Style::default()
+                .fg(palette.primary_fg)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(palette.secondary_fg)
+        };
+        items.push(ListItem::new(Line::from(vec![
+            Span::styled(format!("{marker} "), Style::default().fg(palette.key_fg)),
+            Span::styled(format!("{state_symbol} "), state_style),
+            Span::styled(label, label_style),
+        ])));
+        let row = inner.y.saturating_add(visual_row as u16);
+        dashboard_hit_areas.workspace_rows.push(PanelItemHit {
+            top: row,
+            bottom: row,
+            index,
+        });
+    }
+
+    let list_area = Rect::new(inner.x, inner.y, inner.width, list_height as u16);
+    f.render_widget(List::new(items), list_area);
+    if needs_range {
+        let range_area = Rect::new(
+            inner.x,
+            inner.y.saturating_add(inner.height.saturating_sub(1)),
+            inner.width,
+            1,
+        );
+        f.render_widget(
+            Paragraph::new(format!("  {}-{} / {}", start + 1, end, total))
+                .style(Style::default().fg(palette.muted_fg)),
+            range_area,
+        );
+    }
+}
+
 struct UiRenderContext<'a> {
     app: &'a UiSnapshot,
     update_info: Option<&'a update::UpdateInfo>,
@@ -5982,7 +6483,10 @@ struct UiRenderContext<'a> {
     log_follow_tail: bool,
     command_scroll: usize,
     command_follow_tail: bool,
-    focused_bottom_panel: BottomPanelFocus,
+    workspace_filter: &'a WorkspaceFilter,
+    workspace_scroll: &'a mut usize,
+    workspace_visible_count: &'a mut usize,
+    focused_bottom_panel: DashboardFocus,
     selected_log: Option<usize>,
     selected_command: Option<usize>,
     expanded_log: Option<usize>,
@@ -6007,6 +6511,9 @@ fn draw_ui(f: &mut Frame, context: UiRenderContext<'_>) {
         log_follow_tail,
         command_scroll,
         command_follow_tail,
+        workspace_filter,
+        workspace_scroll,
+        workspace_visible_count,
         focused_bottom_panel,
         selected_log,
         selected_command,
@@ -6041,8 +6548,19 @@ fn draw_ui(f: &mut Frame, context: UiRenderContext<'_>) {
         .filter(|flow| should_display_flow_row(flow, app.remote_connected))
         .count() as u16;
     let show_guide = should_show_connect_guide(app, now_millis);
-    let show_flow_panel = !show_guide;
     let bootstrap_status_flow = active_bootstrap_status_flow(app, now_millis);
+    let show_workspace_pane = !show_guide
+        && bootstrap_status_flow.is_none()
+        && area.width >= DASHBOARD_THREE_COLUMN_MIN_WIDTH;
+    let show_flow_panel = !show_guide;
+    let compact_flow_layout = show_workspace_pane;
+    let compact_status_content_width = area
+        .width
+        .saturating_sub(DASHBOARD_WORKSPACE_COLUMN_WIDTH + TUI_MASCOT_BLOCK_WIDTH)
+        .saturating_sub(6) as usize;
+    let compact_flow_lane_cells = compact_status_content_width
+        .saturating_sub(25)
+        .clamp(8, FLOW_ROW_CELLS);
     let logs_min_height = if show_guide { 3 } else { 5 };
     let max_status_height = area.height.saturating_sub(6 + logs_min_height).max(17);
     // Keep the main panel deterministic: mascot size must not drive layout.
@@ -6121,23 +6639,24 @@ fn draw_ui(f: &mut Frame, context: UiRenderContext<'_>) {
     };
     let mcp_url_security_status = mcp_url_reveal_remaining
         .map(|remaining| format!("[ EXPOSED {:>2}s ]", mcp_url_reveal_seconds(remaining)));
-    let browser_summary = browser::format_browser_names(&app.detected_browsers);
-    let remote_support_summary = browser::format_remote_debug_names(&app.detected_browsers);
-    let remote_active_summary = browser::format_active_remote_debug_names(&app.detected_browsers);
-    let selected_browser_summary = app
+    let compact_browser_summary = app
         .selected_browser
         .as_ref()
-        .map(|b| format!("{} ({})", b.name, b.binary))
-        .unwrap_or_else(|| "--".into());
-    let selected_target_summary = app
-        .selected_browser
-        .as_ref()
-        .map(|b| {
-            b.remote_debug_target
-                .clone()
-                .unwrap_or_else(|| "launch new browser instance".into())
+        .map(|browser| {
+            let target = browser
+                .remote_debug_target
+                .as_deref()
+                .unwrap_or("launch on demand");
+            format!("{} · CDP {target}", browser.name)
         })
-        .unwrap_or_else(|| "--".into());
+        .unwrap_or_else(|| {
+            let detected = browser::format_browser_names(&app.detected_browsers);
+            if detected == "--" {
+                "No browser detected".to_string()
+            } else {
+                format!("{detected} · CDP idle")
+            }
+        });
     let computer_role_style = Style::default()
         .fg(if app.server_running {
             palette.success_fg
@@ -6156,16 +6675,33 @@ fn draw_ui(f: &mut Frame, context: UiRenderContext<'_>) {
         .fg(palette.info_fg)
         .add_modifier(Modifier::BOLD);
     let lane_for = |active: bool, flow: Option<&FlowLane>| -> Vec<Span<'static>> {
-        flow_lane_spans(active, flow, &palette, now_millis)
+        if compact_flow_layout {
+            flow_lane_spans_with_cells(active, flow, &palette, now_millis, compact_flow_lane_cells)
+        } else {
+            flow_lane_spans(active, flow, &palette, now_millis)
+        }
     };
     let request_stats_for = |app: &UiSnapshot| -> Vec<Span<'static>> {
+        let request_count = if compact_flow_layout {
+            format_token_compact(app.request_count)
+        } else {
+            app.request_count.to_string()
+        };
         vec![
             Span::styled("  Requests ", Style::default().fg(palette.muted_fg)),
-            Span::styled(
-                app.request_count.to_string(),
-                Style::default().fg(palette.title_fg),
-            ),
+            Span::styled(request_count, Style::default().fg(palette.title_fg)),
         ]
+    };
+    let flow_row_prefix = if compact_flow_layout { "  " } else { "    " };
+    let flow_left_label = if compact_flow_layout {
+        "PC "
+    } else {
+        FLOW_LANE_LEFT_LABEL
+    };
+    let flow_right_label = if compact_flow_layout {
+        "Web"
+    } else {
+        "ChatGPT Web"
     };
     let status_label_style = Style::default()
         .fg(palette.primary_fg)
@@ -6271,7 +6807,7 @@ fn draw_ui(f: &mut Frame, context: UiRenderContext<'_>) {
         ]),
         {
             let mut spans = vec![
-                status_label("Primary MCP URL"),
+                status_label("MCP URL"),
                 Span::styled(
                     &mcp_url,
                     Style::default().fg(if has_url {
@@ -6323,18 +6859,8 @@ fn draw_ui(f: &mut Frame, context: UiRenderContext<'_>) {
             }
             Line::from(spans)
         },
-        Line::from(vec![
-            status_label("Workspaces"),
-            Span::styled(
-                format!(
-                    "{} registered · {} connected · [w] manage",
-                    app.workspace_count, app.connected_workspace_count
-                ),
-                Style::default().fg(palette.secondary_fg),
-            ),
-        ]),
         {
-            let mut spans = vec![status_label("Remote connected")];
+            let mut spans = vec![status_label("Remote")];
             if app.remote_connected {
                 spans.push(Span::styled(
                     "V",
@@ -6368,34 +6894,28 @@ fn draw_ui(f: &mut Frame, context: UiRenderContext<'_>) {
         ),
     ];
 
-    if !show_guide {
+    if !show_workspace_pane && !show_guide {
+        status_lines.insert(
+            STATUS_WORKSPACES_INSERT_INDEX,
+            Line::from(vec![
+                status_label("Workspaces"),
+                Span::styled(
+                    format!(
+                        "{} registered · {} connected · [w] manage",
+                        app.workspace_count, app.connected_workspace_count
+                    ),
+                    Style::default().fg(palette.secondary_fg),
+                ),
+            ]),
+        );
+    }
+
+    if !show_guide && app.mode.browser_enabled() {
         status_lines.push(Line::from(vec![
-            status_label("Local browsers"),
-            Span::styled(browser_summary, Style::default().fg(palette.title_fg)),
-        ]));
-        status_lines.push(Line::from(vec![
-            status_label("Remote dbg support"),
-            Span::styled(remote_support_summary, Style::default().fg(palette.info_fg)),
-        ]));
-        status_lines.push(Line::from(vec![
-            status_label("Remote dbg active"),
+            status_label("Browser"),
             Span::styled(
-                remote_active_summary,
-                Style::default().fg(palette.success_fg),
-            ),
-        ]));
-        status_lines.push(Line::from(vec![
-            status_label("Selected browser"),
-            Span::styled(
-                selected_browser_summary,
+                compact_browser_summary,
                 Style::default().fg(palette.secondary_fg),
-            ),
-        ]));
-        status_lines.push(Line::from(vec![
-            status_label("Selected target"),
-            Span::styled(
-                selected_target_summary,
-                Style::default().fg(palette.info_fg),
             ),
         ]));
     }
@@ -6414,20 +6934,38 @@ fn draw_ui(f: &mut Frame, context: UiRenderContext<'_>) {
             } else {
                 "awaiting connection"
             };
-            let call_offset = flow_call_offset(call_text);
-            status_lines.push(Line::from(vec![
-                Span::styled("    ", Style::default().fg(palette.muted_fg)),
-                Span::styled(call_offset, Style::default().fg(palette.muted_fg)),
-                Span::styled(call_text, flow_meta_style),
-            ]));
+            let call_line = if compact_flow_layout {
+                vec![
+                    Span::styled(flow_row_prefix, Style::default().fg(palette.muted_fg)),
+                    Span::styled(
+                        trim_line(
+                            call_text,
+                            compact_status_content_width.saturating_sub(flow_row_prefix.len()),
+                        ),
+                        flow_meta_style,
+                    ),
+                ]
+            } else {
+                vec![
+                    Span::styled(flow_row_prefix, Style::default().fg(palette.muted_fg)),
+                    Span::styled(
+                        flow_call_offset(call_text),
+                        Style::default().fg(palette.muted_fg),
+                    ),
+                    Span::styled(call_text.to_string(), flow_meta_style),
+                ]
+            };
+            status_lines.push(Line::from(call_line));
             let lane = lane_for(false, None);
             let mut row = vec![
-                Span::styled("    ", Style::default().fg(palette.muted_fg)),
-                Span::styled(FLOW_LANE_LEFT_LABEL, computer_role_style),
+                Span::styled(flow_row_prefix, Style::default().fg(palette.muted_fg)),
+                Span::styled(flow_left_label, computer_role_style),
             ];
             row.extend(lane);
-            row.push(Span::styled("ChatGPT Web", chatgpt_role_style));
-            row.push(Span::styled("  ", Style::default().fg(palette.muted_fg)));
+            row.push(Span::styled(flow_right_label, chatgpt_role_style));
+            if !compact_flow_layout {
+                row.push(Span::styled("  ", Style::default().fg(palette.muted_fg)));
+            }
             row.extend(request_stats_for(app));
             status_lines.push(Line::from(row));
         } else {
@@ -6438,25 +6976,44 @@ fn draw_ui(f: &mut Frame, context: UiRenderContext<'_>) {
                 .take(visible_flow_slots)
             {
                 let latest_action = latest_flow_action(flow);
-                let call_text = trim_line(&format!("call {latest_action}"), FLOW_ROW_CELLS);
-                let call_offset = flow_call_offset(&call_text);
-                status_lines.push(Line::from(vec![
-                    Span::styled("    ", Style::default().fg(palette.muted_fg)),
-                    Span::styled(call_offset, Style::default().fg(palette.muted_fg)),
-                    Span::styled(call_text, flow_meta_style),
-                ]));
+                let call_text = trim_line(
+                    &format!("call {latest_action}"),
+                    if compact_flow_layout {
+                        compact_status_content_width.saturating_sub(flow_row_prefix.len())
+                    } else {
+                        FLOW_ROW_CELLS
+                    },
+                );
+                let call_line = if compact_flow_layout {
+                    vec![
+                        Span::styled(flow_row_prefix, Style::default().fg(palette.muted_fg)),
+                        Span::styled(call_text.clone(), flow_meta_style),
+                    ]
+                } else {
+                    vec![
+                        Span::styled(flow_row_prefix, Style::default().fg(palette.muted_fg)),
+                        Span::styled(
+                            flow_call_offset(&call_text),
+                            Style::default().fg(palette.muted_fg),
+                        ),
+                        Span::styled(call_text, flow_meta_style),
+                    ]
+                };
+                status_lines.push(Line::from(call_line));
                 let closing = flow.closing_started_ms.is_some();
                 let lane_active = closing
                     || !flow.anim_queue.is_empty()
                     || (app.server_running && app.ngrok_running && app.remote_connected);
                 let lane = lane_for(lane_active, Some(flow));
                 let mut row = vec![
-                    Span::styled("    ", Style::default().fg(palette.muted_fg)),
-                    Span::styled(FLOW_LANE_LEFT_LABEL, computer_role_style),
+                    Span::styled(flow_row_prefix, Style::default().fg(palette.muted_fg)),
+                    Span::styled(flow_left_label, computer_role_style),
                 ];
                 row.extend(lane);
-                row.push(Span::styled("ChatGPT Web", chatgpt_role_style));
-                row.push(Span::styled("  ", Style::default().fg(palette.muted_fg)));
+                row.push(Span::styled(flow_right_label, chatgpt_role_style));
+                if !compact_flow_layout {
+                    row.push(Span::styled("  ", Style::default().fg(palette.muted_fg)));
+                }
                 row.extend(request_stats_for(app));
                 status_lines.push(Line::from(row));
             }
@@ -6613,8 +7170,17 @@ fn draw_ui(f: &mut Frame, context: UiRenderContext<'_>) {
         bootstrap_status_flow.is_some(),
     );
 
-    let show_mascot = area.width >= 120;
-    let status_columns = if show_mascot {
+    let show_mascot = area.width >= DASHBOARD_THREE_COLUMN_MIN_WIDTH;
+    let status_columns = if show_workspace_pane {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Min(44),
+                Constraint::Length(DASHBOARD_WORKSPACE_COLUMN_WIDTH),
+                Constraint::Length(TUI_MASCOT_BLOCK_WIDTH),
+            ])
+            .split(chunks[1])
+    } else if show_mascot {
         Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
@@ -6642,14 +7208,38 @@ fn draw_ui(f: &mut Frame, context: UiRenderContext<'_>) {
         .border_style(Style::default().fg(palette.border_fg));
     let status_inner = status_block.inner(status_columns[0]);
     f.render_widget(status_block, status_columns[0]);
-    if show_mascot {
+
+    if show_workspace_pane {
+        draw_inline_workspaces(
+            f,
+            app,
+            status_columns[1],
+            workspace_filter,
+            focused_bottom_panel == DashboardFocus::Workspaces,
+            (workspace_scroll, workspace_visible_count),
+            dashboard_hit_areas,
+        );
+    } else {
+        dashboard_hit_areas.workspaces = None;
+        dashboard_hit_areas.workspace_rows.clear();
+        *workspace_visible_count = 0;
+    }
+
+    let mascot_area = if show_workspace_pane {
+        Some(status_columns[2])
+    } else if show_mascot {
+        Some(status_columns[1])
+    } else {
+        None
+    };
+    if let Some(mascot_area) = mascot_area {
         let mascot_block = Block::default()
             .title(" ClippyMoon ")
             .borders(Borders::ALL)
             .border_type(palette.border_type)
             .border_style(Style::default().fg(palette.border_fg));
-        let mascot_inner = mascot_block.inner(status_columns[1]);
-        f.render_widget(mascot_block, status_columns[1]);
+        let mascot_inner = mascot_block.inner(mascot_area);
+        f.render_widget(mascot_block, mascot_area);
         let mascot = Paragraph::new(render_tui_lines(
             app.mascot.current_tui_frame(now_millis),
             mascot_inner.height,
@@ -6675,10 +7265,10 @@ fn draw_ui(f: &mut Frame, context: UiRenderContext<'_>) {
     f.render_widget(status, status_content);
 
     let show_command_panel = chunks[3].width >= 100 && chunks[3].height >= 5;
-    let effective_bottom_focus = if show_command_panel {
-        focused_bottom_panel
-    } else {
-        BottomPanelFocus::Logs
+    let effective_bottom_focus = match focused_bottom_panel {
+        DashboardFocus::Workspaces if !show_workspace_pane => DashboardFocus::Logs,
+        DashboardFocus::ShellCommands if !show_command_panel => DashboardFocus::Logs,
+        focus => focus,
     };
 
     // ── Keys / bottom-pane focus ──
@@ -6686,22 +7276,17 @@ fn draw_ui(f: &mut Frame, context: UiRenderContext<'_>) {
         Span::styled("  [q]", Style::default().fg(palette.danger_fg)),
         Span::raw(" Quit  "),
         Span::styled("[w]", Style::default().fg(palette.key_fg)),
-        Span::raw(" Workspaces  "),
-        Span::styled(
-            if show_command_panel { "[Tab]" } else { "" },
-            Style::default().fg(palette.key_fg),
-        ),
-        Span::raw(if show_command_panel { " Switch  " } else { "" }),
-        Span::styled("[↑/↓/Wheel]", Style::default().fg(palette.key_fg)),
-        Span::raw(" Select/Scroll  "),
+        Span::raw(" Manage  "),
+        Span::styled("[Tab]", Style::default().fg(palette.key_fg)),
+        Span::raw(" Focus  "),
+        Span::styled("[↑/↓]", Style::default().fg(palette.key_fg)),
+        Span::raw(" Navigate  "),
         Span::styled("[PgUp/PgDn]", Style::default().fg(palette.key_fg)),
         Span::raw(" Page  "),
         Span::styled("[Enter/Space]", Style::default().fg(palette.key_fg)),
-        Span::raw(" Expand  "),
-        Span::styled("[Esc]", Style::default().fg(palette.key_fg)),
-        Span::raw(" Collapse  "),
-        Span::styled("[Home/End]", Style::default().fg(palette.key_fg)),
-        Span::raw(" First/Latest"),
+        Span::raw(" Open/Select  "),
+        Span::styled("[c]", Style::default().fg(palette.key_fg)),
+        Span::raw(" Clear View"),
     ];
     if update_info.is_some() {
         key_spans.push(Span::raw("  "));
@@ -6907,7 +7492,7 @@ fn draw_ui(f: &mut Frame, context: UiRenderContext<'_>) {
         used_log_lines = used_log_lines.saturating_add(height);
     }
 
-    let log_focused = effective_bottom_focus == BottomPanelFocus::Logs;
+    let log_focused = effective_bottom_focus == DashboardFocus::Logs;
     let logs = List::new(visible_log_items).block(
         Block::default()
             .title(if log_focused {
@@ -7086,7 +7671,7 @@ fn draw_ui(f: &mut Frame, context: UiRenderContext<'_>) {
             used_command_lines = used_command_lines.saturating_add(height);
         }
 
-        let command_focused = effective_bottom_focus == BottomPanelFocus::ShellCommands;
+        let command_focused = effective_bottom_focus == DashboardFocus::ShellCommands;
         let commands = List::new(visible_command_items).block(
             Block::default()
                 .title(if command_focused {
@@ -7115,19 +7700,24 @@ fn draw_ui(f: &mut Frame, context: UiRenderContext<'_>) {
 
 #[cfg(test)]
 mod tests {
+    use super::state::{CommandActivity, LogEntry};
     use super::{
-        AppState, BottomPanelAreas, BottomPanelFocus, BottomPanelHitMaps, DashboardHitAreas,
-        DashboardSecretHit, DashboardSecretTarget, InterruptState, PanelItemHit, PanelScrollView,
-        TimedSecretClick, UiRenderContext, UiSnapshot, WorkspaceHitAreas, WorkspaceUiAction,
-        active_reveal_remaining, dashboard_secret_target_at, draw_quit_confirm, draw_ui,
-        draw_update_confirm, item_under_cursor, key_is_clipboard_paste, key_is_interrupt,
-        key_is_plain_quit, log_secret_target, move_panel_selection,
-        normalize_ngrok_authtoken_input, normalize_ngrok_domain, normalize_workspace_path_input,
-        panel_under_cursor, parse_clippymoon_export_args, parse_port_value,
-        primary_mcp_url_line_index, quit_confirm_action, remove_remote_browser_profile_dir,
-        scroll_panel_down, scroll_panel_up, tail_start_index, timed_secret_click,
-        truncate_with_ellipsis, update_confirm_action, user_home_dir, workspace_action_from_event,
-        workspace_detail_sections, wrap_preserving_chars, wrapped_line_hit_area,
+        AppState, BottomPanelAreas, BottomPanelHitMaps, DashboardFocus, DashboardHitAreas,
+        DashboardSecretHit, DashboardSecretTarget, DashboardWorkspaceRow, InterruptState,
+        ObservabilityCutoff, PanelItemHit, PanelScrollView, TimedSecretClick, UiRenderContext,
+        UiSnapshot, WorkspaceFilter, WorkspaceHitAreas, WorkspaceId, WorkspaceUiAction,
+        active_reveal_remaining, apply_workspace_observability_filter, cycle_dashboard_focus,
+        dashboard_secret_target_at, draw_quit_confirm, draw_ui, draw_update_confirm,
+        item_under_cursor, key_is_clipboard_paste, key_is_interrupt, key_is_plain_quit,
+        log_secret_target, move_panel_selection, normalize_ngrok_authtoken_input,
+        normalize_ngrok_domain, normalize_workspace_path_input, panel_under_cursor,
+        parse_clippymoon_export_args, parse_port_value, primary_mcp_url_line_index,
+        quit_confirm_action, reconcile_workspace_filter, record_clear_view,
+        remove_remote_browser_profile_dir, reset_filtered_navigation, scroll_panel_down,
+        scroll_panel_up, tail_start_index, timed_secret_click, truncate_with_ellipsis,
+        update_confirm_action, user_home_dir, workspace_action_from_event,
+        workspace_detail_sections, workspace_filter_from_index, workspace_filter_index,
+        wrap_preserving_chars, wrapped_line_hit_area,
     };
     use crossterm::event::{
         Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -7140,7 +7730,164 @@ mod tests {
         text::{Line, Span},
         widgets::{Paragraph, Wrap},
     };
-    use std::path::PathBuf;
+    use std::{collections::HashMap, path::PathBuf};
+
+    struct RenderedDashboard {
+        text: String,
+        dashboard_hits: DashboardHitAreas,
+        bottom_hits: BottomPanelHitMaps,
+        bottom_areas: BottomPanelAreas,
+        workspace_scroll: usize,
+        workspace_visible_count: usize,
+    }
+
+    fn test_workspace_id(index: u64) -> WorkspaceId {
+        WorkspaceId::parse(format!("00000000-0000-0000-0000-{index:012}"))
+            .expect("valid test workspace id")
+    }
+
+    fn test_dashboard_snapshot(tag: &str) -> UiSnapshot {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let workspace = std::env::temp_dir().join(format!("{tag}-{unique}"));
+        std::fs::create_dir_all(&workspace).expect("create temporary dashboard workspace");
+        let config_path = workspace.join("config.toml");
+        let app = AppState::new_for_test(
+            3200,
+            workspace.to_string_lossy().into_owned(),
+            config_path.clone(),
+        )
+        .expect("create test dashboard app");
+        let mut snapshot = UiSnapshot::from_app(&app);
+        snapshot.logs.clear();
+        snapshot.command_activities.clear();
+        snapshot.flows.clear();
+        snapshot.is_returning_user = true;
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_dir_all(workspace);
+        snapshot
+    }
+
+    fn configure_dashboard_workspaces(
+        snapshot: &mut UiSnapshot,
+        rows: &[(WorkspaceId, &str, bool)],
+    ) {
+        snapshot.workspaces = rows
+            .iter()
+            .map(|(id, name, connected)| DashboardWorkspaceRow {
+                id: id.clone(),
+                name: (*name).to_string(),
+                connected: *connected,
+            })
+            .collect();
+        snapshot.workspace_names = rows
+            .iter()
+            .map(|(id, name, _)| (id.clone(), (*name).to_string()))
+            .collect();
+        snapshot.workspace_count = rows.len();
+        snapshot.connected_workspace_count =
+            rows.iter().filter(|(_, _, connected)| *connected).count();
+        snapshot.remote_connected = snapshot.connected_workspace_count > 0;
+    }
+
+    fn test_log(sequence: u64, workspace_id: Option<WorkspaceId>, message: &str) -> LogEntry {
+        LogEntry {
+            sequence,
+            workspace_id,
+            time: "12:34:56".into(),
+            level: "INFO",
+            message: message.into(),
+        }
+    }
+
+    fn test_command(sequence: u64, workspace_id: WorkspaceId, command: &str) -> CommandActivity {
+        CommandActivity {
+            sequence,
+            workspace_id,
+            id: format!("activity-{sequence}"),
+            time: "12:34:56".into(),
+            command: command.into(),
+            background: false,
+            job_id: None,
+            state: super::CommandActivityState::Succeeded,
+            exit_code: Some(0),
+            preview: None,
+        }
+    }
+
+    fn render_dashboard(
+        snapshot: &UiSnapshot,
+        width: u16,
+        height: u16,
+        focus: DashboardFocus,
+        workspace_filter: &WorkspaceFilter,
+        selected_log: Option<usize>,
+        expanded_log: Option<usize>,
+    ) -> RenderedDashboard {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("create dashboard terminal");
+        let mut log_view = PanelScrollView::default();
+        let mut command_view = PanelScrollView::default();
+        let mut bottom_areas = BottomPanelAreas::default();
+        let mut bottom_hits = BottomPanelHitMaps::default();
+        let mut dashboard_hits = DashboardHitAreas::default();
+        let mut workspace_scroll = 0usize;
+        let mut workspace_visible_count = 0usize;
+
+        terminal
+            .draw(|frame| {
+                draw_ui(
+                    frame,
+                    UiRenderContext {
+                        app: snapshot,
+                        update_info: None,
+                        log_scroll: 0,
+                        log_follow_tail: true,
+                        command_scroll: 0,
+                        command_follow_tail: true,
+                        workspace_filter,
+                        workspace_scroll: &mut workspace_scroll,
+                        workspace_visible_count: &mut workspace_visible_count,
+                        focused_bottom_panel: focus,
+                        selected_log,
+                        selected_command: None,
+                        expanded_log,
+                        expanded_command: None,
+                        log_view: &mut log_view,
+                        command_view: &mut command_view,
+                        bottom_panel_areas: &mut bottom_areas,
+                        bottom_panel_hits: &mut bottom_hits,
+                        dashboard_hit_areas: &mut dashboard_hits,
+                        toast: None,
+                        mcp_url_reveal_remaining: None,
+                        log_mcp_url_reveal_remaining: None,
+                        log_ngrok_url_reveal_remaining: None,
+                        log_ngrok_domain_reveal_remaining: None,
+                    },
+                );
+            })
+            .expect("render dashboard");
+
+        let buffer = terminal.backend().buffer();
+        let mut text = String::new();
+        for row in 0..height {
+            for column in 0..width {
+                text.push_str(buffer[(column, row)].symbol());
+            }
+            text.push('\n');
+        }
+
+        RenderedDashboard {
+            text,
+            dashboard_hits,
+            bottom_hits,
+            bottom_areas,
+            workspace_scroll,
+            workspace_visible_count,
+        }
+    }
 
     #[test]
     fn clippymoon_without_export_subcommand_returns_usage() {
@@ -7707,6 +8454,7 @@ mod tests {
                     area: Rect::new(2, 20, 70, 2),
                 },
             ],
+            ..DashboardHitAreas::default()
         };
 
         assert_eq!(
@@ -7863,7 +8611,10 @@ mod tests {
                         log_follow_tail: true,
                         command_scroll: 0,
                         command_follow_tail: true,
-                        focused_bottom_panel: BottomPanelFocus::Logs,
+                        workspace_filter: &super::WorkspaceFilter::All,
+                        workspace_scroll: &mut 0,
+                        workspace_visible_count: &mut 0,
+                        focused_bottom_panel: DashboardFocus::Logs,
                         selected_log: None,
                         selected_command: None,
                         expanded_log: None,
@@ -7957,11 +8708,11 @@ mod tests {
         };
         assert_eq!(
             panel_under_cursor(areas, 10, 24),
-            Some(BottomPanelFocus::Logs)
+            Some(DashboardFocus::Logs)
         );
         assert_eq!(
             panel_under_cursor(areas, 70, 24),
-            Some(BottomPanelFocus::ShellCommands)
+            Some(DashboardFocus::ShellCommands)
         );
         assert_eq!(panel_under_cursor(areas, 10, 5), None);
     }
@@ -8023,6 +8774,444 @@ mod tests {
         move_panel_selection(&mut selected, 0, -1);
         assert_eq!(selected, None);
     }
+    #[test]
+    fn workspace_observability_filter_scopes_logs_commands_and_global_rows() {
+        let mut snapshot = test_dashboard_snapshot("moondesk-dashboard-filter-test");
+        let workspace_a = test_workspace_id(10);
+        let workspace_b = test_workspace_id(11);
+        configure_dashboard_workspaces(
+            &mut snapshot,
+            &[
+                (workspace_a.clone(), "SiteGPT", true),
+                (workspace_b.clone(), "KUBA", false),
+            ],
+        );
+        snapshot.logs = vec![
+            test_log(1, None, "global-log"),
+            test_log(2, Some(workspace_b.clone()), "kuba-log"),
+            test_log(3, Some(workspace_a.clone()), "sitegpt-log"),
+        ];
+        snapshot.command_activities = [
+            test_command(1, workspace_b.clone(), "kuba-command"),
+            test_command(2, workspace_a.clone(), "sitegpt-command"),
+        ]
+        .into_iter()
+        .collect();
+        let cutoffs = HashMap::new();
+
+        let mut all = snapshot.clone();
+        apply_workspace_observability_filter(&mut all, &WorkspaceFilter::All, &cutoffs);
+        assert_eq!(all.logs.len(), 3);
+        assert_eq!(all.command_activities.len(), 2);
+        assert!(all.logs.iter().any(|entry| entry.workspace_id.is_none()));
+
+        let focus = WorkspaceFilter::Workspace(workspace_a.clone());
+        let mut selected = snapshot.clone();
+        apply_workspace_observability_filter(&mut selected, &focus, &cutoffs);
+        assert_eq!(
+            selected
+                .logs
+                .iter()
+                .map(|entry| entry.message.as_str())
+                .collect::<Vec<_>>(),
+            vec!["sitegpt-log"]
+        );
+        assert_eq!(
+            selected
+                .command_activities
+                .iter()
+                .map(|activity| activity.command.as_str())
+                .collect::<Vec<_>>(),
+            vec!["sitegpt-command"]
+        );
+        assert!(
+            selected
+                .logs
+                .iter()
+                .all(|entry| entry.workspace_id.is_some())
+        );
+    }
+
+    #[test]
+    fn clear_view_uses_sequence_cutoffs_without_mutating_or_cross_clearing_views() {
+        let mut snapshot = test_dashboard_snapshot("moondesk-dashboard-clear-test");
+        let workspace_a = test_workspace_id(20);
+        let workspace_b = test_workspace_id(21);
+        configure_dashboard_workspaces(
+            &mut snapshot,
+            &[
+                (workspace_a.clone(), "SiteGPT", true),
+                (workspace_b.clone(), "KUBA", true),
+            ],
+        );
+        snapshot.logs = vec![
+            test_log(1, None, "global-old"),
+            test_log(2, Some(workspace_a.clone()), "a-old"),
+            test_log(3, Some(workspace_b.clone()), "b-old"),
+        ];
+        snapshot.command_activities = [
+            test_command(1, workspace_a.clone(), "a-old-command"),
+            test_command(2, workspace_b.clone(), "b-old-command"),
+        ]
+        .into_iter()
+        .collect();
+        let backing_log_count = snapshot.logs.len();
+        let backing_command_count = snapshot.command_activities.len();
+        let filter_a = WorkspaceFilter::Workspace(workspace_a.clone());
+        let filter_b = WorkspaceFilter::Workspace(workspace_b.clone());
+        let mut cutoffs: HashMap<WorkspaceFilter, ObservabilityCutoff> = HashMap::new();
+
+        let mut visible_a = snapshot.clone();
+        apply_workspace_observability_filter(&mut visible_a, &filter_a, &cutoffs);
+        record_clear_view(&visible_a, &filter_a, &mut cutoffs);
+        assert_eq!(snapshot.logs.len(), backing_log_count);
+        assert_eq!(snapshot.command_activities.len(), backing_command_count);
+
+        let mut cleared_a = snapshot.clone();
+        apply_workspace_observability_filter(&mut cleared_a, &filter_a, &cutoffs);
+        assert!(cleared_a.logs.is_empty());
+        assert!(cleared_a.command_activities.is_empty());
+
+        let mut unaffected_b = snapshot.clone();
+        apply_workspace_observability_filter(&mut unaffected_b, &filter_b, &cutoffs);
+        assert_eq!(unaffected_b.logs.len(), 1);
+        assert_eq!(unaffected_b.command_activities.len(), 1);
+
+        let mut unaffected_all = snapshot.clone();
+        apply_workspace_observability_filter(&mut unaffected_all, &WorkspaceFilter::All, &cutoffs);
+        assert_eq!(unaffected_all.logs.len(), 3);
+        assert_eq!(unaffected_all.command_activities.len(), 2);
+
+        snapshot
+            .logs
+            .push(test_log(4, Some(workspace_a.clone()), "a-new"));
+        snapshot.command_activities.push_back(test_command(
+            3,
+            workspace_a.clone(),
+            "a-new-command",
+        ));
+        let mut new_a = snapshot.clone();
+        apply_workspace_observability_filter(&mut new_a, &filter_a, &cutoffs);
+        assert_eq!(new_a.logs.len(), 1);
+        assert_eq!(new_a.logs[0].message, "a-new");
+        assert_eq!(new_a.command_activities.len(), 1);
+        assert_eq!(new_a.command_activities[0].command, "a-new-command");
+
+        let mut aggregate_now = snapshot.clone();
+        apply_workspace_observability_filter(&mut aggregate_now, &WorkspaceFilter::All, &cutoffs);
+        record_clear_view(&aggregate_now, &WorkspaceFilter::All, &mut cutoffs);
+        let mut cleared_all = snapshot.clone();
+        apply_workspace_observability_filter(&mut cleared_all, &WorkspaceFilter::All, &cutoffs);
+        assert!(cleared_all.logs.is_empty());
+        assert!(cleared_all.command_activities.is_empty());
+    }
+
+    #[test]
+    fn removed_selected_workspace_falls_back_to_all_workspaces() {
+        let workspace = test_workspace_id(30);
+        let mut filter = WorkspaceFilter::Workspace(workspace.clone());
+        let present = vec![DashboardWorkspaceRow {
+            id: workspace,
+            name: "SiteGPT".into(),
+            connected: true,
+        }];
+        assert!(!reconcile_workspace_filter(&mut filter, &present));
+        assert!(reconcile_workspace_filter(&mut filter, &[]));
+        assert_eq!(filter, WorkspaceFilter::All);
+    }
+
+    #[test]
+    fn dashboard_focus_cycles_available_panes_in_both_directions() {
+        assert_eq!(
+            cycle_dashboard_focus(DashboardFocus::Workspaces, true, true, false),
+            DashboardFocus::Logs
+        );
+        assert_eq!(
+            cycle_dashboard_focus(DashboardFocus::Logs, true, true, false),
+            DashboardFocus::ShellCommands
+        );
+        assert_eq!(
+            cycle_dashboard_focus(DashboardFocus::ShellCommands, true, true, false),
+            DashboardFocus::Workspaces
+        );
+        assert_eq!(
+            cycle_dashboard_focus(DashboardFocus::Workspaces, true, true, true),
+            DashboardFocus::ShellCommands
+        );
+        assert_eq!(
+            cycle_dashboard_focus(DashboardFocus::Logs, false, true, true),
+            DashboardFocus::ShellCommands
+        );
+        assert_eq!(
+            cycle_dashboard_focus(DashboardFocus::Logs, false, false, false),
+            DashboardFocus::Logs
+        );
+    }
+
+    #[test]
+    fn filter_change_reset_restores_tail_and_collapses_expanded_rows() {
+        let mut log_scroll = 8;
+        let mut log_follow_tail = false;
+        let mut command_scroll = 6;
+        let mut command_follow_tail = false;
+        let mut selected_log = Some(7);
+        let mut selected_command = Some(4);
+        let mut expanded_log = Some(7);
+        let mut expanded_command = Some(4);
+        reset_filtered_navigation(
+            (&mut log_scroll, &mut log_follow_tail),
+            (&mut command_scroll, &mut command_follow_tail),
+            (&mut selected_log, &mut selected_command),
+            (&mut expanded_log, &mut expanded_command),
+        );
+        assert_eq!(log_scroll, 0);
+        assert!(log_follow_tail);
+        assert_eq!(command_scroll, 0);
+        assert!(command_follow_tail);
+        assert_eq!(selected_log, None);
+        assert_eq!(selected_command, None);
+        assert_eq!(expanded_log, None);
+        assert_eq!(expanded_command, None);
+    }
+
+    #[test]
+    fn compact_status_labels_fit_the_shared_alignment_width() {
+        for label in [
+            "Version",
+            "Mode",
+            "Tool mode",
+            "Server",
+            "ngrok",
+            "DevTools",
+            "MCP URL",
+            "Remote",
+            "Session",
+            "All-time",
+            "Workspaces",
+            "Browser",
+        ] {
+            assert!(label.len() <= super::STATUS_LABEL_WIDTH, "{label}");
+        }
+        assert_eq!("Workspaces".len(), super::STATUS_LABEL_WIDTH);
+        assert_eq!(
+            super::STATUS_WORKSPACES_INSERT_INDEX,
+            super::STATUS_PRIMARY_MCP_URL_LINE + 1
+        );
+    }
+
+    #[test]
+    fn wide_dashboard_renders_status_workspaces_and_clippymoon_without_shrinking_bottom() {
+        let mut snapshot = test_dashboard_snapshot("moondesk-dashboard-wide-test");
+        let workspace_a = test_workspace_id(40);
+        let workspace_b = test_workspace_id(41);
+        configure_dashboard_workspaces(
+            &mut snapshot,
+            &[(workspace_a, "SiteGPT", true), (workspace_b, "KUBA", false)],
+        );
+        snapshot.request_count = 1_234;
+        snapshot.flows.push(super::FlowLane {
+            flow_id: "flow-1".into(),
+            short_id: "f1".into(),
+            events: vec!["tools/call:run_command".into()],
+            bootstrap_status_active: false,
+            bootstrap_completed_steps: 0,
+            bootstrap_pending_steps: Default::default(),
+            bootstrap_status_close_deadline_ms: None,
+            anim_queue: Default::default(),
+            last_direction: super::FlowDirection::Forward,
+            closing_started_ms: None,
+            closing_step_ms: 0,
+        });
+        let rendered = render_dashboard(
+            &snapshot,
+            120,
+            44,
+            DashboardFocus::Workspaces,
+            &WorkspaceFilter::All,
+            None,
+            None,
+        );
+        assert!(rendered.text.contains("Status"));
+        assert!(rendered.text.contains("Workspaces [focused]"));
+        assert!(rendered.text.contains("ClippyMoon"));
+        assert!(rendered.text.contains("● SiteGPT connected"));
+        assert!(rendered.text.contains("○ KUBA idle"));
+        assert!(rendered.dashboard_hits.workspaces.is_some());
+        assert_eq!(rendered.dashboard_hits.workspace_rows.len(), 3);
+        assert!(rendered.bottom_areas.shell_commands.is_some());
+        assert!(rendered.bottom_areas.logs.height >= 15);
+        assert!(!rendered.text.contains("tool input, llm output"));
+        assert!(rendered.text.contains("PC "));
+        assert!(rendered.text.contains("Web  Requests 1.2K"));
+        assert!(rendered.text.contains("[c] Clear View"));
+    }
+
+    #[test]
+    fn narrow_dashboard_hides_inline_workspace_pane_and_keeps_status_summary() {
+        let mut snapshot = test_dashboard_snapshot("moondesk-dashboard-narrow-test");
+        let workspace_a = test_workspace_id(50);
+        let workspace_b = test_workspace_id(51);
+        configure_dashboard_workspaces(
+            &mut snapshot,
+            &[(workspace_a, "SiteGPT", true), (workspace_b, "KUBA", false)],
+        );
+        let rendered = render_dashboard(
+            &snapshot,
+            110,
+            44,
+            DashboardFocus::Logs,
+            &WorkspaceFilter::All,
+            None,
+            None,
+        );
+        assert!(rendered.dashboard_hits.workspaces.is_none());
+        assert_eq!(rendered.workspace_visible_count, 0);
+        assert!(
+            rendered
+                .text
+                .contains("2 registered · 1 connected · [w] manage")
+        );
+        assert!(!rendered.text.contains("Workspaces [focused]"));
+        assert!(rendered.bottom_areas.shell_commands.is_some());
+        assert!(rendered.bottom_areas.logs.height >= 15);
+    }
+
+    #[test]
+    fn inline_workspace_pane_scrolls_many_rows_and_hit_map_keeps_stable_workspace_ids() {
+        let mut snapshot = test_dashboard_snapshot("moondesk-dashboard-workspace-scroll-test");
+        let rows = (1..=25)
+            .map(|index| {
+                (
+                    test_workspace_id(100 + index),
+                    format!("workspace-{index:02}"),
+                    index % 2 == 0,
+                )
+            })
+            .collect::<Vec<_>>();
+        snapshot.workspaces = rows
+            .iter()
+            .map(|(id, name, connected)| DashboardWorkspaceRow {
+                id: id.clone(),
+                name: name.clone(),
+                connected: *connected,
+            })
+            .collect();
+        snapshot.workspace_names = rows
+            .iter()
+            .map(|(id, name, _)| (id.clone(), name.clone()))
+            .collect();
+        snapshot.workspace_count = rows.len();
+        snapshot.connected_workspace_count =
+            rows.iter().filter(|(_, _, connected)| *connected).count();
+        let last_id = rows.last().expect("last workspace").0.clone();
+        let filter = WorkspaceFilter::Workspace(last_id.clone());
+        let rendered = render_dashboard(
+            &snapshot,
+            140,
+            44,
+            DashboardFocus::Workspaces,
+            &filter,
+            None,
+            None,
+        );
+        assert!(rendered.workspace_scroll > 0);
+        assert!(rendered.workspace_visible_count < rows.len() + 1);
+        assert!(rendered.text.contains("/ 26"));
+        let last_hit = rendered
+            .dashboard_hits
+            .workspace_rows
+            .last()
+            .expect("visible workspace hit");
+        assert_eq!(
+            workspace_filter_from_index(last_hit.index, &snapshot.workspaces),
+            WorkspaceFilter::Workspace(last_id)
+        );
+        assert_eq!(workspace_filter_index(&filter, &snapshot.workspaces), 25);
+    }
+
+    #[test]
+    fn filtered_rendering_uses_filtered_indexes_for_selection_expansion_and_mouse_hits() {
+        let mut snapshot = test_dashboard_snapshot("moondesk-dashboard-filtered-hit-test");
+        let workspace_a = test_workspace_id(60);
+        let workspace_b = test_workspace_id(61);
+        configure_dashboard_workspaces(
+            &mut snapshot,
+            &[
+                (workspace_a.clone(), "SiteGPT", true),
+                (workspace_b.clone(), "KUBA", true),
+            ],
+        );
+        snapshot.logs = vec![
+            test_log(1, None, "global-hidden"),
+            test_log(2, Some(workspace_b), "kuba-hidden"),
+            test_log(
+                3,
+                Some(workspace_a.clone()),
+                "sitegpt-visible-entry-that-wraps-when-expanded-for-index-testing",
+            ),
+            test_log(4, Some(workspace_a.clone()), "sitegpt-visible-second"),
+        ];
+        let filter = WorkspaceFilter::Workspace(workspace_a);
+        apply_workspace_observability_filter(&mut snapshot, &filter, &HashMap::new());
+        let rendered = render_dashboard(
+            &snapshot,
+            140,
+            44,
+            DashboardFocus::Logs,
+            &filter,
+            Some(0),
+            Some(0),
+        );
+        assert_eq!(snapshot.logs.len(), 2);
+        assert_eq!(rendered.bottom_hits.logs.len(), 2);
+        assert_eq!(rendered.bottom_hits.logs[0].index, 0);
+        assert_eq!(rendered.bottom_hits.logs[1].index, 1);
+        assert_eq!(
+            item_under_cursor(&rendered.bottom_hits.logs, rendered.bottom_hits.logs[0].top),
+            Some(0)
+        );
+        assert!(rendered.text.contains("sitegpt-visible-entry"));
+        assert!(rendered.text.contains("sitegpt-visible-second"));
+        assert!(!rendered.text.contains("global-hidden"));
+        assert!(!rendered.text.contains("kuba-hidden"));
+    }
+
+    #[test]
+    fn browser_status_is_hidden_in_computer_mode_and_compact_in_browser_mode() {
+        let mut snapshot = test_dashboard_snapshot("moondesk-dashboard-browser-status-test");
+        snapshot.mode = super::Mode::Computer;
+        let computer = render_dashboard(
+            &snapshot,
+            140,
+            44,
+            DashboardFocus::Logs,
+            &WorkspaceFilter::All,
+            None,
+            None,
+        );
+        assert!(!computer.text.contains("Local browsers"));
+        assert!(!computer.text.contains("Remote dbg support"));
+        assert!(!computer.text.contains("Remote dbg active"));
+        assert!(!computer.text.contains("Selected browser"));
+        assert!(!computer.text.contains("Selected target"));
+        assert!(!computer.text.contains("No browser detected"));
+
+        snapshot.mode = super::Mode::Browser;
+        let browser = render_dashboard(
+            &snapshot,
+            140,
+            44,
+            DashboardFocus::Logs,
+            &WorkspaceFilter::All,
+            None,
+            None,
+        );
+        assert!(browser.text.contains("Browser"));
+        assert!(browser.text.contains("No browser detected"));
+        assert!(!browser.text.contains("Local browsers"));
+        assert!(!browser.text.contains("Remote dbg support"));
+    }
+
     #[test]
     fn update_confirmation_only_accepts_enter_or_escape() {
         assert_eq!(update_confirm_action(KeyCode::Enter), Some(true));

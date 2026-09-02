@@ -155,6 +155,7 @@ test("validated update exit installs the exact version, verifies it, and restart
         assert.equal(options.env.MOONDESK_NPM_MANAGED, "1");
         assert.equal(options.env.MOONDESK_UPDATE_STATE_PATH, statePath);
         assert.equal(options.env.MOONDESK_UPDATE_REQUEST_PATH, requestPath);
+        assert.equal(options.env.MOONDESK_CHANGELOG_NOTICE_PATH, undefined);
         return { code: UPDATE_EXIT_CODE, signal: null };
       },
       readUpdateRequestImpl: (seenPath) => {
@@ -180,6 +181,12 @@ test("validated update exit installs the exact version, verifies it, and restart
         sequence.push("verify");
         assert.equal(version, targetVersion);
       },
+      writePostUpdateNoticeImpl: (request, version, options) => {
+        sequence.push("changelog");
+        assert.equal(request.targetVersion, targetVersion);
+        assert.equal(version, targetVersion);
+        assert.equal(options, undefined);
+      },
       restartUpdatedWrapperImpl: async (wrapperPath, args, options) => {
         sequence.push("restart");
         assert.equal(wrapperPath, "/global/node_modules/moondesk/npm/moondesk.js");
@@ -204,8 +211,84 @@ test("validated update exit installs the exact version, verifies it, and restart
       "install",
       "verify",
       "unlock",
+      "changelog",
       "restart",
     ]);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("post-update notice failure never blocks a successful restart", async () => {
+  const dir = tempDir();
+  const targetVersion = nextVersion();
+  let restartCalled = false;
+  try {
+    const result = await orchestrate({
+      cwd: dir,
+      logger: quietLogger(),
+      updateStatePath: path.join(dir, "state.json"),
+      updateRequestPath: path.join(dir, "request.json"),
+      ensureBinaryImpl: async () => "/fake/moondesk",
+      cleanupOldBinaryVersionsImpl: () => {},
+      cleanupOldUpdateVersionsImpl: () => {},
+      startUpdateMonitorImpl: () => () => {},
+      runNativeImpl: async () => ({ code: UPDATE_EXIT_CODE, signal: null }),
+      readUpdateRequestImpl: () => ({ schemaVersion: 1, currentVersion, targetVersion }),
+      acquireUpdateLockImpl: async () => () => {},
+      installedWrapperVersionImpl: () => currentVersion,
+      installExactVersionImpl: async () => {},
+      verifyInstalledWrapperVersionImpl: () => {},
+      writePostUpdateNoticeImpl: () => {
+        throw new Error("simulated notice write failure");
+      },
+      restartUpdatedWrapperImpl: async () => {
+        restartCalled = true;
+        return { code: 0, signal: null };
+      },
+    });
+
+    assert.deepEqual(result, { code: 0, signal: null });
+    assert.equal(restartCalled, true);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("post-update notice is persisted before restart so manual relaunch can still show it", async () => {
+  const dir = tempDir();
+  const targetVersion = nextVersion();
+  const sequence = [];
+  try {
+    const result = await orchestrate({
+      cwd: dir,
+      logger: quietLogger(),
+      updateStatePath: path.join(dir, "state.json"),
+      updateRequestPath: path.join(dir, "request.json"),
+      ensureBinaryImpl: async () => "/fake/moondesk",
+      cleanupOldBinaryVersionsImpl: () => {},
+      cleanupOldUpdateVersionsImpl: () => {},
+      startUpdateMonitorImpl: () => () => {},
+      runNativeImpl: async () => ({ code: UPDATE_EXIT_CODE, signal: null }),
+      readUpdateRequestImpl: () => ({
+        schemaVersion: 1,
+        currentVersion,
+        targetVersion,
+        releaseNotes: ["Persistent changelog"],
+      }),
+      acquireUpdateLockImpl: async () => () => {},
+      installedWrapperVersionImpl: () => currentVersion,
+      installExactVersionImpl: async () => {},
+      verifyInstalledWrapperVersionImpl: () => {},
+      writePostUpdateNoticeImpl: () => sequence.push("notice"),
+      restartUpdatedWrapperImpl: async () => {
+        sequence.push("restart");
+        throw new Error("simulated restart failure");
+      },
+    });
+
+    assert.deepEqual(result, { code: 1, signal: null });
+    assert.deepEqual(sequence, ["notice", "restart"]);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
@@ -413,6 +496,7 @@ test("another process installing the requested version skips duplicate npm work 
       installExactVersionImpl: async () => {
         installCalled = true;
       },
+      writePostUpdateNoticeImpl: () => {},
       restartUpdatedWrapperImpl: async () => {
         restartCalled = true;
         return { code: 0, signal: null };
@@ -522,6 +606,7 @@ test("self-update path failures disable updates without blocking MoonDesk startu
         assert.equal(options.env.MOONDESK_NPM_MANAGED, undefined);
         assert.equal(options.env.MOONDESK_UPDATE_STATE_PATH, undefined);
         assert.equal(options.env.MOONDESK_UPDATE_REQUEST_PATH, undefined);
+        assert.equal(options.env.MOONDESK_CHANGELOG_NOTICE_PATH, undefined);
         return { code: 0, signal: null };
       },
     });

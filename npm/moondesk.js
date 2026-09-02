@@ -16,6 +16,7 @@ const {
   restartUpdatedWrapper,
   startUpdateMonitor,
   verifyInstalledWrapperVersion,
+  writePostUpdateNotice,
 } = require("./update-manager");
 
 function cleanManagedUpdateEnv(source = process.env) {
@@ -137,6 +138,7 @@ async function orchestrate(options = {}) {
   const installExactVersionImpl = options.installExactVersionImpl ?? installExactVersion;
   const verifyInstalledWrapperVersionImpl =
     options.verifyInstalledWrapperVersionImpl ?? verifyInstalledWrapperVersion;
+  const writePostUpdateNoticeImpl = options.writePostUpdateNoticeImpl ?? writePostUpdateNotice;
   const restartUpdatedWrapperImpl = options.restartUpdatedWrapperImpl ?? restartUpdatedWrapper;
   const wrapperPath = options.wrapperPath ?? __filename;
 
@@ -263,6 +265,14 @@ async function orchestrate(options = {}) {
       releaseUpdateLock?.();
     } catch (error) {
       logger.warn?.(`MoonDesk could not remove its npm update lock yet: ${error.message}`);
+    }
+  }
+
+  if (restartVersion === request.targetVersion) {
+    try {
+      writePostUpdateNoticeImpl(request, restartVersion);
+    } catch (error) {
+      logger.warn?.(`MoonDesk updated, but could not persist its one-time changelog notice: ${error.message}`);
     }
   }
 

@@ -14,10 +14,17 @@ const currentVersion = packageJson.version;
 const UPDATE_EXIT_CODE = 75;
 const UPDATE_STATE_SCHEMA_VERSION = 1;
 const UPDATE_REQUEST_SCHEMA_VERSION = 1;
+const CHANGELOG_NOTICE_SCHEMA_VERSION = 1;
 const REGISTRY_LATEST_URL = "https://registry.npmjs.org/moondesk/latest";
+const GITHUB_RELEASES_API_URL = "https://api.github.com/repos/Shattermoon/moondesk/releases?per_page=20";
+const GITHUB_RELEASE_TAG_API_BASE = "https://api.github.com/repos/Shattermoon/moondesk/releases/tags";
+const GITHUB_RELEASE_WEB_BASE = "https://github.com/Shattermoon/moondesk/releases/tag";
 const UPDATE_CHECK_INTERVAL_MS = 15 * 60_000;
 const UPDATE_CHECK_TIMEOUT_MS = 15_000;
 const MAX_UPDATE_METADATA_BYTES = 64 * 1024;
+const MAX_CHANGELOG_METADATA_BYTES = 512 * 1024;
+const MAX_CHANGELOG_ITEMS = 12;
+const MAX_CHANGELOG_ITEM_CHARS = 180;
 const MAX_UPDATE_REQUEST_BYTES = 16 * 1024;
 const MAX_NPM_ROOT_BYTES = 16 * 1024;
 const NPM_ROOT_TIMEOUT_MS = 10_000;
@@ -99,6 +106,49 @@ function cleanupOldUpdateVersions(options = {}) {
     }
   }
   return { removed, skipped };
+}
+
+function changelogNoticePath(version = currentVersion) {
+  if (!parseStableVersion(version)) {
+    throw new Error(`MoonDesk changelog version must be a stable semantic version: ${version}`);
+  }
+  return path.join(updateRootDir(), `v${version}`, "post-update.json");
+}
+
+function normalizePersistedReleaseNotes(value) {
+  if (!Array.isArray(value)) return [];
+  const notes = [];
+  for (const item of value) {
+    if (typeof item !== "string") continue;
+    const trimmed = item.trim();
+    if (!trimmed || trimmed.length > MAX_CHANGELOG_ITEM_CHARS) continue;
+    notes.push(trimmed);
+    if (notes.length >= MAX_CHANGELOG_ITEMS) break;
+  }
+  return notes;
+}
+
+function normalizeReleaseUrl(value, version) {
+  const expected = `${GITHUB_RELEASE_WEB_BASE}/v${version}`;
+  return typeof value === "string" && value === expected ? value : null;
+}
+
+function writePostUpdateNotice(request, installedVersion, options = {}) {
+  if (!request || request.targetVersion !== installedVersion || !parseStableVersion(installedVersion)) {
+    return null;
+  }
+  const filePath = options.noticePath ?? changelogNoticePath(installedVersion);
+  const notice = {
+    schemaVersion: CHANGELOG_NOTICE_SCHEMA_VERSION,
+    packageName: "moondesk",
+    fromVersion: request.currentVersion,
+    toVersion: installedVersion,
+    releaseNotes: normalizePersistedReleaseNotes(request.releaseNotes),
+    releaseUrl: normalizeReleaseUrl(request.releaseUrl, installedVersion),
+    createdAt: new Date().toISOString(),
+  };
+  atomicWriteJson(filePath, notice, options);
+  return filePath;
 }
 
 function updateRequestDir() {
@@ -234,7 +284,7 @@ function atomicWriteJson(filePath, value, options = {}) {
   }
 }
 
-async function fetchJsonLimited(fetchImpl, url, externalSignal) {
+async function fetchJsonLimited(fetchImpl, url, externalSignal, maxBytes = MAX_UPDATE_METADATA_BYTES) {
   const controller = new AbortController();
   const abortFromParent = () => controller.abort();
   if (externalSignal) {
@@ -259,7 +309,7 @@ async function fetchJsonLimited(fetchImpl, url, externalSignal) {
       throw new Error(`${url} returned HTTP ${response.status}`);
     }
     const contentLength = Number(response.headers.get("content-length"));
-    if (Number.isFinite(contentLength) && contentLength > MAX_UPDATE_METADATA_BYTES) {
+    if (Number.isFinite(contentLength) && contentLength > maxBytes) {
       controller.abort();
       throw new Error(`MoonDesk update metadata is unexpectedly large (${contentLength} bytes)`);
     }
@@ -272,7 +322,7 @@ async function fetchJsonLimited(fetchImpl, url, externalSignal) {
     for await (const chunk of response.body) {
       const buffer = Buffer.from(chunk);
       totalBytes += buffer.length;
-      if (totalBytes > MAX_UPDATE_METADATA_BYTES) {
+      if (totalBytes > maxBytes) {
         controller.abort();
         throw new Error("MoonDesk update metadata exceeded the download limit");
       }
@@ -283,6 +333,135 @@ async function fetchJsonLimited(fetchImpl, url, externalSignal) {
     clearTimeout(timeout);
     externalSignal?.removeEventListener("abort", abortFromParent);
   }
+}
+
+function normalizeChangelogLine(line) {
+  if (typeof line !== "string") return null;
+  let value = line.trim();
+  if (!value || value.startsWith("#") || /^\*\*Full Changelog\*\*/i.test(value)) return null;
+  value = value.replace(/^[-*+]\s+/, "");
+  value = value.replace(/\s+by\s+@[A-Za-z0-9_-]+\s+in\s+https:\/\/github\.com\/Shattermoon\/moondesk\/pull\/\d+\s*$/i, "");
+  value = value.replace(/^\[(.+?)\]\([^)]*\)$/, "$1");
+  value = value.replace(/`([^`]+)`/g, "$1");
+  value = value.replace(/^(?:feat|fix|chore|refactor|perf|docs|test|build|ci|style)(?:\([^)]*\))?!?:\s*/i, "");
+  value = value.trim();
+  if (!value || /^https?:\/\//i.test(value)) return null;
+  value = `${value.charAt(0).toUpperCase()}${value.slice(1)}`;
+  if (value.length > MAX_CHANGELOG_ITEM_CHARS) {
+    value = `${value.slice(0, MAX_CHANGELOG_ITEM_CHARS - 3).trimEnd()}...`;
+  }
+  return value;
+}
+
+function normalizeReleaseNotes(body) {
+  if (typeof body !== "string") return [];
+  const notes = [];
+  const seen = new Set();
+  for (const line of body.split(/\r?\n/)) {
+    const note = normalizeChangelogLine(line);
+    if (!note || seen.has(note)) continue;
+    seen.add(note);
+    notes.push(note);
+    if (notes.length >= MAX_CHANGELOG_ITEMS) break;
+  }
+  return notes;
+}
+
+function boundedChangelogItem(value) {
+  const trimmed = String(value ?? "").trim();
+  if (!trimmed) return null;
+  if (trimmed.length <= MAX_CHANGELOG_ITEM_CHARS) return trimmed;
+  return `${trimmed.slice(0, MAX_CHANGELOG_ITEM_CHARS - 3).trimEnd()}...`;
+}
+
+function stableReleaseVersion(release) {
+  if (!release || release.draft === true || release.prerelease === true) return null;
+  if (typeof release.tag_name !== "string" || !release.tag_name.startsWith("v")) return null;
+  const version = release.tag_name.slice(1);
+  return parseStableVersion(version) ? version : null;
+}
+
+async function fetchReleaseChangelog(fromVersion, toVersion, options = {}) {
+  if (
+    !parseStableVersion(fromVersion) ||
+    !parseStableVersion(toVersion) ||
+    compareStableVersions(toVersion, fromVersion) <= 0
+  ) {
+    return { releaseNotes: [], releaseUrl: null };
+  }
+  const fetchImpl = options.fetchImpl ?? globalThis.fetch;
+  if (typeof fetchImpl !== "function") return { releaseNotes: [], releaseUrl: null };
+
+  const releasesUrl = options.releasesApiUrl ?? GITHUB_RELEASES_API_URL;
+  const releases = await fetchJsonLimited(
+    fetchImpl,
+    releasesUrl,
+    options.signal,
+    MAX_CHANGELOG_METADATA_BYTES,
+  );
+  if (!Array.isArray(releases)) {
+    throw new Error("GitHub returned invalid MoonDesk releases metadata");
+  }
+
+  const selected = [];
+  for (const release of releases) {
+    const version = stableReleaseVersion(release);
+    if (!version) continue;
+    if (
+      compareStableVersions(version, fromVersion) > 0 &&
+      compareStableVersions(version, toVersion) <= 0
+    ) {
+      selected.push({ release, version });
+    }
+  }
+
+  if (!selected.some((item) => item.version === toVersion)) {
+    const tagApiBase = options.releaseTagApiBase ?? GITHUB_RELEASE_TAG_API_BASE;
+    try {
+      const release = await fetchJsonLimited(
+        fetchImpl,
+        `${tagApiBase}/v${toVersion}`,
+        options.signal,
+        MAX_CHANGELOG_METADATA_BYTES,
+      );
+      if (stableReleaseVersion(release) === toVersion) {
+        selected.push({ release, version: toVersion });
+      }
+    } catch {
+      // The recent releases list may briefly lag the just-published npm tag.
+      // Missing notes must never block a valid npm update.
+    }
+  }
+
+  selected.sort((left, right) => compareStableVersions(right.version, left.version));
+  const uniqueReleases = [];
+  const seenVersions = new Set();
+  for (const item of selected) {
+    if (seenVersions.has(item.version)) continue;
+    seenVersions.add(item.version);
+    uniqueReleases.push(item);
+  }
+
+  const includeVersion = uniqueReleases.length > 1;
+  const releaseNotes = [];
+  const seenNotes = new Set();
+  for (const { release, version } of uniqueReleases) {
+    for (const note of normalizeReleaseNotes(release.body)) {
+      const rendered = boundedChangelogItem(includeVersion ? `v${version}: ${note}` : note);
+      if (!rendered || seenNotes.has(rendered)) continue;
+      seenNotes.add(rendered);
+      releaseNotes.push(rendered);
+      if (releaseNotes.length >= MAX_CHANGELOG_ITEMS) break;
+    }
+    if (releaseNotes.length >= MAX_CHANGELOG_ITEMS) break;
+  }
+
+  const expectedUrl = `${GITHUB_RELEASE_WEB_BASE}/v${toVersion}`;
+  const target = uniqueReleases.find((item) => item.version === toVersion)?.release;
+  const releaseUrl = target
+    ? (target.html_url === expectedUrl ? target.html_url : expectedUrl)
+    : null;
+  return { releaseNotes, releaseUrl };
 }
 
 async function checkForUpdate(options = {}) {
@@ -307,6 +486,18 @@ async function checkForUpdate(options = {}) {
   }
 
   const available = managedInstall && compareStableVersions(latestVersion, currentVersion) > 0;
+  let releaseNotes = [];
+  let releaseUrl = null;
+  if (available) {
+    try {
+      ({ releaseNotes, releaseUrl } = await fetchReleaseChangelog(currentVersion, latestVersion, {
+        ...options,
+        fetchImpl,
+      }));
+    } catch {
+      // Release notes are optional metadata. A GitHub outage must never hide a valid npm update.
+    }
+  }
   const state = {
     schemaVersion: UPDATE_STATE_SCHEMA_VERSION,
     packageName: "moondesk",
@@ -314,6 +505,8 @@ async function checkForUpdate(options = {}) {
     latestVersion,
     managedInstall,
     available,
+    releaseNotes,
+    releaseUrl,
     checkedAt: new Date().toISOString(),
   };
   atomicWriteJson(statePath, state, options);
@@ -396,7 +589,11 @@ function readUpdateRequest(requestPath) {
   ) {
     return null;
   }
-  return parsed;
+  return {
+    ...parsed,
+    releaseNotes: normalizePersistedReleaseNotes(parsed.releaseNotes),
+    releaseUrl: normalizeReleaseUrl(parsed.releaseUrl, parsed.targetVersion),
+  };
 }
 
 function updateLockPath() {
@@ -570,17 +767,21 @@ module.exports = {
   atomicWriteJson,
   checkForUpdate,
   cleanupOldUpdateVersions,
+  changelogNoticePath,
   compareStableVersions,
   createUpdateRequestPath,
   createUpdateStatePath,
   currentVersion,
+  fetchReleaseChangelog,
   installExactVersion,
   installedWrapperVersion,
   isGlobalPackageInstall,
+  normalizeReleaseNotes,
   parseStableVersion,
   readUpdateRequest,
   resolveGlobalNpmRoot,
   restartUpdatedWrapper,
   startUpdateMonitor,
   verifyInstalledWrapperVersion,
+  writePostUpdateNotice,
 };

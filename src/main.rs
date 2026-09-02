@@ -5193,6 +5193,7 @@ async fn run_tui(
     let mut last_config_flush = Instant::now();
     let mut update_info = update::available_update();
     let mut last_update_refresh = Instant::now();
+    let mut pending_changelog_notice = update::pending_changelog_notice();
     let mut exit = AppExit::Quit;
 
     loop {
@@ -5363,6 +5364,17 @@ async fn run_tui(
                 focused_bottom_panel = DashboardFocus::Logs;
             }
             screen_lines = new_lines;
+        }
+
+        if let Some(notice) = pending_changelog_notice.clone() {
+            run_changelog_notice(terminal, &state, &notice).await?;
+            pending_changelog_notice = None;
+            if let Err(error) = update::dismiss_pending_changelog_notice() {
+                state.lock().await.log(
+                    "WARN",
+                    format!("Could not dismiss update changelog notice: {error}"),
+                );
+            }
         }
 
         let snapshots = build_animation_snapshot(&app);
@@ -6208,6 +6220,58 @@ fn update_confirm_action(code: KeyCode) -> Option<bool> {
     }
 }
 
+fn changelog_preview_lines(
+    notes: &[String],
+    line_budget: usize,
+    content_width: usize,
+    palette: theme::Palette,
+) -> Vec<Line<'static>> {
+    if line_budget == 0 || content_width == 0 {
+        return Vec::new();
+    }
+    if notes.is_empty() {
+        let (text, _) = truncate_with_ellipsis(
+            "Release notes are unavailable for this update.",
+            content_width,
+            false,
+        );
+        return vec![Line::from(Span::styled(
+            text,
+            Style::default().fg(palette.muted_fg),
+        ))];
+    }
+
+    let show_summary = notes.len() > line_budget && line_budget > 1;
+    let note_budget = if show_summary {
+        line_budget.saturating_sub(1)
+    } else {
+        line_budget
+    };
+    let bullet = if content_width >= 4 { "• " } else { "" };
+    let note_width = content_width.saturating_sub(bullet.chars().count()).max(1);
+    let mut lines = Vec::with_capacity(line_budget.min(notes.len().saturating_add(1)));
+    for note in notes.iter().take(note_budget) {
+        let (text, _) = truncate_with_ellipsis(note, note_width, false);
+        lines.push(Line::from(vec![
+            Span::styled(bullet.to_string(), Style::default().fg(palette.success_fg)),
+            Span::styled(text, Style::default().fg(palette.primary_fg)),
+        ]));
+    }
+    if show_summary {
+        let remaining = notes.len().saturating_sub(note_budget);
+        let summary = format!(
+            "… {remaining} more change{}",
+            if remaining == 1 { "" } else { "s" }
+        );
+        let (summary, _) = truncate_with_ellipsis(&summary, content_width, false);
+        lines.push(Line::from(Span::styled(
+            summary,
+            Style::default().fg(palette.muted_fg),
+        )));
+    }
+    lines
+}
+
 async fn run_update_confirm(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     state: &SharedState,
@@ -6246,7 +6310,7 @@ fn draw_update_confirm(
     active_commands: usize,
 ) {
     let palette = theme.palette;
-    let area = centered_rect(78, 13, f.area());
+    let area = centered_rect(82, 21, f.area());
     f.render_widget(Clear, area);
     let block = Block::default()
         .title(" Update MoonDesk ")
@@ -6267,45 +6331,101 @@ fn draw_update_confirm(
         ])
         .split(inner);
 
-    let mut lines = vec![
-        Line::from(Span::styled(
-            format!(
-                "MoonDesk {}  →  {}",
-                update_info.current_version, update_info.latest_version
-            ),
-            Style::default()
-                .fg(palette.title_fg)
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
-        Line::from(Span::styled(
-            UPDATE_CONFIRM_SESSION_WARNING,
+    let content_width = sections[0].width as usize;
+    let compact_height = sections[0].height < 12;
+    let active_command_lines = usize::from(active_commands > 0);
+    let fixed_lines = if compact_height {
+        4 + active_command_lines
+    } else {
+        7 + active_command_lines + usize::from(update_info.release_url.is_some())
+    };
+    let changelog_line_budget = (sections[0].height as usize)
+        .saturating_sub(fixed_lines)
+        .min(6);
+
+    let mut lines = vec![Line::from(Span::styled(
+        format!(
+            "MoonDesk {}  →  {}",
+            update_info.current_version, update_info.latest_version
+        ),
+        Style::default()
+            .fg(palette.title_fg)
+            .add_modifier(Modifier::BOLD),
+    ))];
+    if !compact_height {
+        lines.push(Line::from(""));
+    }
+    lines.push(Line::from(Span::styled(
+        "What's new",
+        Style::default()
+            .fg(palette.secondary_fg)
+            .add_modifier(Modifier::BOLD),
+    )));
+    lines.extend(changelog_preview_lines(
+        &update_info.release_notes,
+        changelog_line_budget,
+        content_width,
+        palette,
+    ));
+
+    if compact_height {
+        lines.push(Line::from(Span::styled(
+            "Finish active work before updating.",
             Style::default()
                 .fg(palette.warning_fg)
                 .add_modifier(Modifier::BOLD),
-        )),
-        Line::from(Span::styled(
-            UPDATE_CONFIRM_CONNECTION_WARNING,
-            Style::default().fg(palette.primary_fg),
-        )),
-        Line::from(Span::styled(
-            "After the exact new version is installed, MoonDesk will restart here.",
-            Style::default().fg(palette.primary_fg),
-        )),
-        Line::from(""),
-    ];
-    if active_commands > 0 {
+        )));
         lines.push(Line::from(Span::styled(
+            "Restart disconnects MCP.",
+            Style::default().fg(palette.primary_fg),
+        )));
+    } else {
+        if let Some(url) = &update_info.release_url {
+            let release = format!("Release: {url}");
+            let (release, _) = truncate_with_ellipsis(&release, content_width, false);
+            lines.push(Line::from(Span::styled(
+                release,
+                Style::default().fg(palette.muted_fg),
+            )));
+        }
+        lines.extend([
+            Line::from(""),
+            Line::from(Span::styled(
+                UPDATE_CONFIRM_SESSION_WARNING,
+                Style::default()
+                    .fg(palette.warning_fg)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(
+                UPDATE_CONFIRM_CONNECTION_WARNING,
+                Style::default().fg(palette.primary_fg),
+            )),
+            Line::from(Span::styled(
+                "After the exact new version is installed, MoonDesk will restart here.",
+                Style::default().fg(palette.primary_fg),
+            )),
+        ]);
+    }
+    if active_commands > 0 {
+        let message = if compact_height {
+            format!(
+                "{active_commands} active command{} will stop.",
+                if active_commands == 1 { "" } else { "s" }
+            )
+        } else {
             format!(
                 "Detected now: {active_commands} active command{} will be stopped.",
                 if active_commands == 1 { "" } else { "s" }
-            ),
+            )
+        };
+        lines.push(Line::from(Span::styled(
+            message,
             Style::default()
                 .fg(palette.danger_fg)
                 .add_modifier(Modifier::BOLD),
         )));
-        lines.push(Line::from(""));
     }
+
     let action_lines = if compact_actions {
         vec![
             Line::from(vec![
@@ -6353,7 +6473,135 @@ fn draw_update_confirm(
     f.render_widget(Paragraph::new(action_lines), sections[1]);
 }
 
-// ── Draw main UI ────────────────────────────────────────────
+async fn run_changelog_notice(
+    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    state: &SharedState,
+    notice: &update::ChangelogNotice,
+) -> Result<(), Box<dyn std::error::Error>> {
+    loop {
+        let theme = { state.lock().await.current_theme() };
+        terminal.draw(|f| draw_changelog_notice(f, theme, notice))?;
+        if !event::poll(UI_POLL_INTERVAL)? {
+            continue;
+        }
+        if let Event::Key(key) = event::read()? {
+            if key.kind != KeyEventKind::Press {
+                continue;
+            }
+            if matches!(key.code, KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q')) {
+                return Ok(());
+            }
+        }
+    }
+}
+
+fn draw_changelog_notice(f: &mut Frame, theme: &theme::ThemeDef, notice: &update::ChangelogNotice) {
+    let palette = theme.palette;
+    let area = centered_rect(82, 20, f.area());
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .title(" MoonDesk Updated ")
+        .borders(Borders::ALL)
+        .border_type(palette.border_type)
+        .border_style(Style::default().fg(palette.success_fg));
+    let inner = block.inner(area).inner(Margin {
+        horizontal: 2,
+        vertical: 1,
+    });
+    f.render_widget(block, area);
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+
+    let content_width = sections[0].width as usize;
+    let compact_height = sections[0].height < 10;
+    let show_release_link = !compact_height && notice.release_url.is_some();
+    let fixed_lines = if compact_height {
+        2
+    } else {
+        3 + if show_release_link { 2 } else { 0 }
+    };
+    let changelog_line_budget = (sections[0].height as usize)
+        .saturating_sub(fixed_lines)
+        .min(9);
+
+    let mut lines = vec![Line::from(Span::styled(
+        format!(
+            "Updated successfully  {}  →  {}",
+            notice.from_version, notice.to_version
+        ),
+        Style::default()
+            .fg(palette.title_fg)
+            .add_modifier(Modifier::BOLD),
+    ))];
+    if !compact_height {
+        lines.push(Line::from(""));
+    }
+    lines.push(Line::from(Span::styled(
+        "What's new",
+        Style::default()
+            .fg(palette.secondary_fg)
+            .add_modifier(Modifier::BOLD),
+    )));
+    lines.extend(changelog_preview_lines(
+        &notice.release_notes,
+        changelog_line_budget,
+        content_width,
+        palette,
+    ));
+    if show_release_link && let Some(url) = &notice.release_url {
+        let release = format!("Release: {url}");
+        let (release, _) = truncate_with_ellipsis(&release, content_width, false);
+        lines.extend([
+            Line::from(""),
+            Line::from(Span::styled(release, Style::default().fg(palette.muted_fg))),
+        ]);
+    }
+
+    f.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: false }),
+        sections[0],
+    );
+    let actions = if sections[1].width < 34 {
+        Line::from(vec![
+            Span::styled(
+                "[Enter]",
+                Style::default()
+                    .fg(palette.success_fg)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" Got it  "),
+            Span::styled(
+                "[Esc]",
+                Style::default()
+                    .fg(palette.key_fg)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" Close"),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled(
+                "[Enter]",
+                Style::default()
+                    .fg(palette.success_fg)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" Got it    "),
+            Span::styled(
+                "[Esc]",
+                Style::default()
+                    .fg(palette.key_fg)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" Close"),
+        ])
+    };
+    f.render_widget(Paragraph::new(actions), sections[1]);
+}
+
+// -- Draw main UI -------------------------------------------------------------
 
 fn draw_inline_workspaces(
     f: &mut Frame,
@@ -7707,15 +7955,15 @@ mod tests {
         ObservabilityCutoff, PanelItemHit, PanelScrollView, TimedSecretClick, UiRenderContext,
         UiSnapshot, WorkspaceFilter, WorkspaceHitAreas, WorkspaceId, WorkspaceUiAction,
         active_reveal_remaining, apply_workspace_observability_filter, cycle_dashboard_focus,
-        dashboard_secret_target_at, draw_quit_confirm, draw_ui, draw_update_confirm,
-        item_under_cursor, key_is_clipboard_paste, key_is_interrupt, key_is_plain_quit,
-        log_secret_target, move_panel_selection, normalize_ngrok_authtoken_input,
-        normalize_ngrok_domain, normalize_workspace_path_input, panel_under_cursor,
-        parse_clippymoon_export_args, parse_port_value, primary_mcp_url_line_index,
-        quit_confirm_action, reconcile_workspace_filter, record_clear_view,
-        remove_remote_browser_profile_dir, reset_filtered_navigation, scroll_panel_down,
-        scroll_panel_up, tail_start_index, timed_secret_click, truncate_with_ellipsis,
-        update_confirm_action, user_home_dir, workspace_action_from_event,
+        dashboard_secret_target_at, draw_changelog_notice, draw_quit_confirm, draw_ui,
+        draw_update_confirm, item_under_cursor, key_is_clipboard_paste, key_is_interrupt,
+        key_is_plain_quit, log_secret_target, move_panel_selection,
+        normalize_ngrok_authtoken_input, normalize_ngrok_domain, normalize_workspace_path_input,
+        panel_under_cursor, parse_clippymoon_export_args, parse_port_value,
+        primary_mcp_url_line_index, quit_confirm_action, reconcile_workspace_filter,
+        record_clear_view, remove_remote_browser_profile_dir, reset_filtered_navigation,
+        scroll_panel_down, scroll_panel_up, tail_start_index, timed_secret_click,
+        truncate_with_ellipsis, update_confirm_action, user_home_dir, workspace_action_from_event,
         workspace_detail_sections, workspace_filter_from_index, workspace_filter_index,
         wrap_preserving_chars, wrapped_line_hit_area,
     };
@@ -9229,6 +9477,8 @@ mod tests {
         let update_info = super::update::UpdateInfo {
             current_version: "1.2.3".into(),
             latest_version: "1.2.4".into(),
+            release_notes: vec!["Add a neat update changelog".into()],
+            release_url: Some("https://github.com/Shattermoon/moondesk/releases/tag/v1.2.4".into()),
         };
 
         terminal
@@ -9243,6 +9493,11 @@ mod tests {
             }
             rendered.push('\n');
         }
+        assert!(rendered.contains("What's new"));
+        assert!(rendered.contains("Add a neat update changelog"));
+        assert!(rendered.contains("Finish active work before updating."));
+        assert!(rendered.contains("Restart disconnects MCP."));
+        assert!(rendered.contains("2 active commands will stop."));
         assert!(rendered.contains("[Enter] Update & Restart"));
         assert!(rendered.contains("[Esc] Abort"));
     }
@@ -9255,6 +9510,8 @@ mod tests {
         let update_info = super::update::UpdateInfo {
             current_version: "1.2.3".into(),
             latest_version: "1.2.4".into(),
+            release_notes: vec!["Add a neat update changelog".into()],
+            release_url: Some("https://github.com/Shattermoon/moondesk/releases/tag/v1.2.4".into()),
         };
 
         terminal
@@ -9270,6 +9527,12 @@ mod tests {
             rendered.push('\n');
         }
 
+        assert!(rendered.contains("What's new"));
+        assert!(rendered.contains("Add a neat update changelog"));
+        assert!(
+            rendered
+                .contains("Release: https://github.com/Shattermoon/moondesk/releases/tag/v1.2.4")
+        );
         assert!(rendered.contains("Make sure no ChatGPT/MCP session or command is currently"));
         assert!(
             rendered
@@ -9278,5 +9541,98 @@ mod tests {
         assert!(rendered.contains("Detected now: 2 active commands will be stopped."));
         assert!(rendered.contains("[Enter] Continue with Update & Restart"));
         assert!(rendered.contains("[Esc] Abort"));
+    }
+
+    #[test]
+    fn update_and_changelog_controls_stay_visible_at_standard_compact_size() {
+        let theme = super::theme::resolve(super::theme::DEFAULT_THEME_ID);
+        let update_info = super::update::UpdateInfo {
+            current_version: "1.2.3".into(),
+            latest_version: "1.2.4".into(),
+            release_notes: vec![],
+            release_url: None,
+        };
+        let notice = super::update::ChangelogNotice {
+            from_version: "1.2.3".into(),
+            to_version: "1.2.4".into(),
+            release_notes: vec![],
+            release_url: None,
+        };
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).expect("create standard compact terminal");
+        terminal
+            .draw(|frame| draw_update_confirm(frame, theme, &update_info, 0))
+            .expect("render standard compact update confirmation");
+        let mut update_rendered = String::new();
+        for row in 0..24 {
+            for column in 0..80 {
+                update_rendered.push_str(terminal.backend().buffer()[(column, row)].symbol());
+            }
+            update_rendered.push('\n');
+        }
+        assert!(update_rendered.contains("MoonDesk 1.2.3  →  1.2.4"));
+        assert!(update_rendered.contains("Release notes are unavailable for this update."));
+        assert!(update_rendered.contains("[Enter] Continue with Update & Restart"));
+        assert!(update_rendered.contains("[Esc] Abort"));
+
+        terminal
+            .draw(|frame| draw_changelog_notice(frame, theme, &notice))
+            .expect("render standard compact post-update changelog");
+        let mut notice_rendered = String::new();
+        for row in 0..24 {
+            for column in 0..80 {
+                notice_rendered.push_str(terminal.backend().buffer()[(column, row)].symbol());
+            }
+            notice_rendered.push('\n');
+        }
+        assert!(notice_rendered.contains("Updated successfully  1.2.3  →  1.2.4"));
+        assert!(notice_rendered.contains("Release notes are unavailable for this update."));
+        assert!(notice_rendered.contains("[Enter] Got it"));
+        assert!(notice_rendered.contains("[Esc] Close"));
+    }
+
+    #[test]
+    fn post_update_changelog_stays_readable_and_closeable_on_narrow_terminals() {
+        let backend = TestBackend::new(52, 16);
+        let mut terminal = Terminal::new(backend).expect("create compact changelog terminal");
+        let theme = super::theme::resolve(super::theme::DEFAULT_THEME_ID);
+        let notice = super::update::ChangelogNotice {
+            from_version: "1.2.3".into(),
+            to_version: "1.3.0".into(),
+            release_notes: vec![
+                "Add a polished changelog before and after updates".into(),
+                "Preserve the new workspace-focused dashboard".into(),
+                "Keep update failures non-fatal".into(),
+                "Fourth change".into(),
+                "Fifth change".into(),
+                "Sixth change".into(),
+                "Seventh change".into(),
+                "Eighth change".into(),
+                "Ninth change".into(),
+            ],
+            release_url: Some("https://github.com/Shattermoon/moondesk/releases/tag/v1.3.0".into()),
+        };
+
+        terminal
+            .draw(|frame| draw_changelog_notice(frame, theme, &notice))
+            .expect("render compact post-update changelog");
+
+        let buffer = terminal.backend().buffer();
+        let mut rendered = String::new();
+        for row in 0..16 {
+            for column in 0..52 {
+                rendered.push_str(buffer[(column, row)].symbol());
+            }
+            rendered.push('\n');
+        }
+
+        assert!(rendered.contains("MoonDesk Updated"));
+        assert!(rendered.contains("Updated successfully"));
+        assert!(rendered.contains("What's new"));
+        assert!(rendered.contains("Add a polished changelog"));
+        assert!(rendered.contains("more change"));
+        assert!(rendered.contains("[Enter] Got it"));
+        assert!(rendered.contains("[Esc] Close"));
     }
 }

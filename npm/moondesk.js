@@ -7,15 +7,18 @@ const {
   UPDATE_EXIT_CODE,
   acquireUpdateLock,
   cleanupOldUpdateVersions,
+  changelogNoticePath,
   compareStableVersions,
   createUpdateRequestPath,
   createUpdateStatePath,
   installExactVersion,
   installedWrapperVersion,
   readUpdateRequest,
+  refreshUpdateRequestToLatest,
   restartUpdatedWrapper,
   startUpdateMonitor,
   verifyInstalledWrapperVersion,
+  writePostUpdateNotice,
 } = require("./update-manager");
 
 function cleanManagedUpdateEnv(source = process.env) {
@@ -23,6 +26,7 @@ function cleanManagedUpdateEnv(source = process.env) {
   delete env.MOONDESK_NPM_MANAGED;
   delete env.MOONDESK_UPDATE_REQUEST_PATH;
   delete env.MOONDESK_UPDATE_STATE_PATH;
+  delete env.MOONDESK_CHANGELOG_NOTICE_PATH;
   return env;
 }
 
@@ -132,11 +136,14 @@ async function orchestrate(options = {}) {
   const startUpdateMonitorImpl = options.startUpdateMonitorImpl ?? startUpdateMonitor;
   const runNativeImpl = options.runNativeImpl ?? runNative;
   const readUpdateRequestImpl = options.readUpdateRequestImpl ?? readUpdateRequest;
+  const refreshUpdateRequestToLatestImpl =
+    options.refreshUpdateRequestToLatestImpl ?? refreshUpdateRequestToLatest;
   const acquireUpdateLockImpl = options.acquireUpdateLockImpl ?? acquireUpdateLock;
   const installedWrapperVersionImpl = options.installedWrapperVersionImpl ?? installedWrapperVersion;
   const installExactVersionImpl = options.installExactVersionImpl ?? installExactVersion;
   const verifyInstalledWrapperVersionImpl =
     options.verifyInstalledWrapperVersionImpl ?? verifyInstalledWrapperVersion;
+  const writePostUpdateNoticeImpl = options.writePostUpdateNoticeImpl ?? writePostUpdateNotice;
   const restartUpdatedWrapperImpl = options.restartUpdatedWrapperImpl ?? restartUpdatedWrapper;
   const wrapperPath = options.wrapperPath ?? __filename;
 
@@ -180,6 +187,11 @@ async function orchestrate(options = {}) {
       MOONDESK_UPDATE_REQUEST_PATH: updateRequestPath,
       MOONDESK_UPDATE_STATE_PATH: updateStatePath,
     });
+    try {
+      childEnv.MOONDESK_CHANGELOG_NOTICE_PATH = changelogNoticePath();
+    } catch (error) {
+      logger.warn?.(`MoonDesk could not prepare its optional changelog notice path: ${error.message}`);
+    }
   }
 
   let result;
@@ -227,7 +239,7 @@ async function orchestrate(options = {}) {
     return { code: 1, signal: null };
   }
 
-  logger.log(`Updating MoonDesk ${request.currentVersion} -> ${request.targetVersion}...`);
+  let effectiveRequest = request;
   let releaseUpdateLock = null;
   let restartVersion = request.targetVersion;
   try {
@@ -236,26 +248,44 @@ async function orchestrate(options = {}) {
       env: baseEnv,
     });
 
+    try {
+      const refreshedRequest = await refreshUpdateRequestToLatestImpl(effectiveRequest);
+      if (compareStableVersions(refreshedRequest.targetVersion, effectiveRequest.targetVersion) > 0) {
+        logger.log(
+          `MoonDesk ${refreshedRequest.targetVersion} became available while this update was pending; updating directly to the newest version.`,
+        );
+        effectiveRequest = refreshedRequest;
+        restartVersion = effectiveRequest.targetVersion;
+      }
+    } catch (error) {
+      logger.warn?.(
+        `MoonDesk could not refresh the latest version before updating; continuing with ${effectiveRequest.targetVersion}: ${error.message}`,
+      );
+    }
+
+    logger.log(
+      `Updating MoonDesk ${effectiveRequest.currentVersion} -> ${effectiveRequest.targetVersion}...`,
+    );
     const alreadyInstalled = installedWrapperVersionImpl();
-    const comparison = compareStableVersions(alreadyInstalled, request.targetVersion);
+    const comparison = compareStableVersions(alreadyInstalled, effectiveRequest.targetVersion);
     if (comparison < 0) {
-      await installExactVersionImpl(request.targetVersion, {
+      await installExactVersionImpl(effectiveRequest.targetVersion, {
         cwd: originalCwd,
         env: baseEnv,
       });
-      verifyInstalledWrapperVersionImpl(request.targetVersion);
+      verifyInstalledWrapperVersionImpl(effectiveRequest.targetVersion);
     } else if (comparison === 0) {
-      logger.log(`MoonDesk ${request.targetVersion} was already installed by another process.`);
+      logger.log(`MoonDesk ${effectiveRequest.targetVersion} was already installed by another process.`);
     } else {
       restartVersion = alreadyInstalled;
       logger.log(
-        `MoonDesk ${alreadyInstalled} is already installed, so the updater will not downgrade it to ${request.targetVersion}.`,
+        `MoonDesk ${alreadyInstalled} is already installed, so the updater will not downgrade it to ${effectiveRequest.targetVersion}.`,
       );
     }
   } catch (error) {
     logger.error(`MoonDesk update failed: ${error.message}`);
     logger.error(
-      `Run 'npm install -g moondesk@${request.targetVersion}' manually to retry this exact version.`,
+      `Run 'npm install -g moondesk@${effectiveRequest.targetVersion}' manually to retry this exact version.`,
     );
     return { code: 1, signal: null };
   } finally {
@@ -263,6 +293,14 @@ async function orchestrate(options = {}) {
       releaseUpdateLock?.();
     } catch (error) {
       logger.warn?.(`MoonDesk could not remove its npm update lock yet: ${error.message}`);
+    }
+  }
+
+  if (restartVersion === effectiveRequest.targetVersion) {
+    try {
+      writePostUpdateNoticeImpl(effectiveRequest, restartVersion);
+    } catch (error) {
+      logger.warn?.(`MoonDesk updated, but could not persist its one-time changelog notice: ${error.message}`);
     }
   }
 

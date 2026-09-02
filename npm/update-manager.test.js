@@ -11,17 +11,22 @@ const {
   atomicWriteJson,
   checkForUpdate,
   cleanupOldUpdateVersions,
+  changelogNoticePath,
   compareStableVersions,
   createUpdateStatePath,
   currentVersion,
+  fetchReleaseChangelog,
   installExactVersion,
   isGlobalPackageInstall,
+  normalizeReleaseNotes,
   parseStableVersion,
   readUpdateRequest,
+  refreshUpdateRequestToLatest,
   resolveGlobalNpmRoot,
   restartUpdatedWrapper,
   startUpdateMonitor,
   verifyInstalledWrapperVersion,
+  writePostUpdateNotice,
 } = require("./update-manager");
 
 function tempDir() {
@@ -194,6 +199,294 @@ test("atomic update state replacement overwrites an existing file", () => {
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("GitHub release notes normalize into concise terminal changelog items", () => {
+  const notes = normalizeReleaseNotes(`## What's Changed
+* feat: add native model vision tools by @nkcbuilds in https://github.com/Shattermoon/moondesk/pull/35
+* fix(update): keep read-only path semantics consistent by @nkcbuilds in https://github.com/Shattermoon/moondesk/pull/37
+
+**Full Changelog**: https://github.com/Shattermoon/moondesk/compare/v0.7.0...v0.7.1`);
+  assert.deepEqual(notes, [
+    "Add native model vision tools",
+    "Keep read-only path semantics consistent",
+  ]);
+});
+
+test("release-note normalization is bounded, de-duplicated, and ignores markdown noise", () => {
+  assert.deepEqual(normalizeReleaseNotes(""), []);
+  assert.deepEqual(normalizeReleaseNotes(null), []);
+
+  const oversized = `feat: ${"x".repeat(300)}`;
+  const body = [
+    "# Release heading",
+    "## What's Changed",
+    "* feat: same change",
+    "- feat: same change",
+    `* ${oversized}`,
+    "**Full Changelog**: https://github.com/Shattermoon/moondesk/compare/v1.0.0...v1.0.1",
+    "https://example.invalid/raw-url",
+    ...Array.from({ length: 20 }, (_, index) => `* fix: change ${index}`),
+  ].join("\n");
+
+  const notes = normalizeReleaseNotes(body);
+  assert.equal(notes[0], "Same change");
+  assert.equal(notes.filter((note) => note === "Same change").length, 1);
+  assert.ok(notes[1].length <= 180);
+  assert.equal(notes.length, 12);
+  assert.equal(notes.some((note) => note.includes("Full Changelog")), false);
+  assert.equal(notes.some((note) => note.startsWith("http")), false);
+});
+
+test("release selection ignores draft prerelease and wrong tags and canonicalizes the target URL", async () => {
+  const fromVersion = "1.2.3";
+  const toVersion = "1.2.4";
+  const changelog = await fetchReleaseChangelog(fromVersion, toVersion, {
+    releasesApiUrl: "https://api.example.invalid/releases",
+    fetchImpl: async () => responseJson([
+      {
+        tag_name: `v${toVersion}`,
+        draft: true,
+        prerelease: false,
+        html_url: `https://github.com/Shattermoon/moondesk/releases/tag/v${toVersion}`,
+        body: "* draft change",
+      },
+      {
+        tag_name: `v${toVersion}`,
+        draft: false,
+        prerelease: true,
+        html_url: `https://github.com/Shattermoon/moondesk/releases/tag/v${toVersion}`,
+        body: "* prerelease change",
+      },
+      {
+        tag_name: "v9.9.9",
+        draft: false,
+        prerelease: false,
+        html_url: "https://github.com/Shattermoon/moondesk/releases/tag/v9.9.9",
+        body: "* wrong tag",
+      },
+      {
+        tag_name: `v${toVersion}`,
+        draft: false,
+        prerelease: false,
+        html_url: "https://example.invalid/not-the-release",
+        body: "## What's Changed\n* fix: valid target release",
+      },
+    ]),
+  });
+
+  assert.deepEqual(changelog.releaseNotes, ["Valid target release"]);
+  assert.equal(
+    changelog.releaseUrl,
+    `https://github.com/Shattermoon/moondesk/releases/tag/v${toVersion}`,
+  );
+});
+
+test("skipped releases are folded into one bounded changelog", async () => {
+  const fromVersion = "0.8.0";
+  const toVersion = "0.9.1";
+  const releases = [
+    {
+      tag_name: "v0.9.1",
+      draft: false,
+      prerelease: false,
+      html_url: "https://github.com/Shattermoon/moondesk/releases/tag/v0.9.1",
+      body: "## What's Changed\n* fix: polish updater behavior by @nkcbuilds in https://github.com/Shattermoon/moondesk/pull/102",
+    },
+    {
+      tag_name: "v0.9.0",
+      draft: false,
+      prerelease: false,
+      html_url: "https://github.com/Shattermoon/moondesk/releases/tag/v0.9.0",
+      body: "## What's Changed\n* feat: add changelog UI by @nkcbuilds in https://github.com/Shattermoon/moondesk/pull/101",
+    },
+    {
+      tag_name: "v0.8.0",
+      draft: false,
+      prerelease: false,
+      html_url: "https://github.com/Shattermoon/moondesk/releases/tag/v0.8.0",
+      body: "## What's Changed\n* old release that should not be repeated",
+    },
+  ];
+
+  const changelog = await fetchReleaseChangelog(fromVersion, toVersion, {
+    releasesApiUrl: "https://api.example.invalid/releases",
+    fetchImpl: async () => responseJson(releases),
+  });
+
+  assert.deepEqual(changelog.releaseNotes, [
+    "v0.9.1: Polish updater behavior",
+    "v0.9.0: Add changelog UI",
+  ]);
+  assert.equal(
+    changelog.releaseUrl,
+    "https://github.com/Shattermoon/moondesk/releases/tag/v0.9.1",
+  );
+});
+
+test("target release tag is used when the recent release list lags", async () => {
+  const fromVersion = "0.8.0";
+  const toVersion = "0.8.1";
+  const changelog = await fetchReleaseChangelog(fromVersion, toVersion, {
+    releasesApiUrl: "https://api.example.invalid/releases",
+    releaseTagApiBase: "https://api.example.invalid/releases/tags",
+    fetchImpl: async (url) => {
+      if (String(url).endsWith("/releases")) return responseJson([]);
+      return responseJson({
+        tag_name: `v${toVersion}`,
+        draft: false,
+        prerelease: false,
+        html_url: `https://github.com/Shattermoon/moondesk/releases/tag/v${toVersion}`,
+        body: "## What's Changed\n* fix: target release fallback",
+      });
+    },
+  });
+  assert.deepEqual(changelog.releaseNotes, ["Target release fallback"]);
+  assert.equal(
+    changelog.releaseUrl,
+    `https://github.com/Shattermoon/moondesk/releases/tag/v${toVersion}`,
+  );
+});
+
+test("available update carries GitHub changelog but survives release API failure", async () => {
+  const dir = tempDir();
+  const latest = nextVersion();
+  try {
+    const statePath = path.join(dir, "with-notes.json");
+    const state = await checkForUpdate({
+      statePath,
+      managedInstall: true,
+      registryUrl: "https://registry.example.invalid/moondesk/latest",
+      releasesApiUrl: "https://api.example.invalid/releases",
+      fetchImpl: async (url) => {
+        if (String(url).includes("registry.example.invalid")) {
+          return responseJson(npmMetadata(latest));
+        }
+        return responseJson([{
+          tag_name: `v${latest}`,
+          draft: false,
+          prerelease: false,
+          html_url: `https://github.com/Shattermoon/moondesk/releases/tag/v${latest}`,
+          body: "## What's Changed\n* feat: polished update changelog by @nkcbuilds in https://github.com/Shattermoon/moondesk/pull/99",
+        }]);
+      },
+    });
+    assert.equal(state.available, true);
+    assert.deepEqual(state.releaseNotes, ["Polished update changelog"]);
+    assert.equal(
+      state.releaseUrl,
+      `https://github.com/Shattermoon/moondesk/releases/tag/v${latest}`,
+    );
+
+    const fallback = await checkForUpdate({
+      statePath: path.join(dir, "without-notes.json"),
+      managedInstall: true,
+      registryUrl: "https://registry.example.invalid/moondesk/latest",
+      releasesApiUrl: "https://api.example.invalid/releases",
+      fetchImpl: async (url) => {
+        if (String(url).includes("registry.example.invalid")) {
+          return responseJson(npmMetadata(latest));
+        }
+        throw new Error("GitHub unavailable");
+      },
+    });
+    assert.equal(fallback.available, true);
+    assert.deepEqual(fallback.releaseNotes, []);
+    assert.equal(fallback.releaseUrl, null);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("post-update changelog notice is bounded and version-specific", () => {
+  const dir = tempDir();
+  const latest = nextVersion();
+  const noticePath = path.join(dir, "post-update.json");
+  try {
+    assert.ok(
+      changelogNoticePath("1.2.4").endsWith(path.join("updates", "v1.2.4", "post-update.json")),
+    );
+    assert.throws(() => changelogNoticePath("1.2.4-beta.1"), /stable semantic version/);
+    assert.equal(
+      writePostUpdateNotice(
+        { currentVersion: "1.2.3", targetVersion: "1.2.4", releaseNotes: [] },
+        "1.2.5",
+        { noticePath },
+      ),
+      null,
+    );
+    writePostUpdateNotice(
+      {
+        currentVersion,
+        targetVersion: latest,
+        releaseNotes: ["First change", "Second change"],
+        releaseUrl: `https://github.com/Shattermoon/moondesk/releases/tag/v${latest}`,
+      },
+      latest,
+      { noticePath },
+    );
+    const notice = JSON.parse(fs.readFileSync(noticePath, "utf8"));
+    assert.equal(notice.schemaVersion, 1);
+    assert.equal(notice.packageName, "moondesk");
+    assert.equal(notice.fromVersion, currentVersion);
+    assert.equal(notice.toVersion, latest);
+    assert.deepEqual(notice.releaseNotes, ["First change", "Second change"]);
+    assert.equal(
+      notice.releaseUrl,
+      `https://github.com/Shattermoon/moondesk/releases/tag/v${latest}`,
+    );
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("refreshing a pending request jumps directly to the newest stable npm version", async () => {
+  const [major, minor, patch] = currentVersion.split(".").map(Number);
+  const staleTarget = `${major}.${minor}.${patch + 1}`;
+  const latestTarget = `${major}.${minor}.${patch + 2}`;
+  const request = {
+    schemaVersion: 1,
+    currentVersion,
+    targetVersion: staleTarget,
+    releaseNotes: ["Stale cached note"],
+    releaseUrl: `https://github.com/Shattermoon/moondesk/releases/tag/v${staleTarget}`,
+  };
+
+  const refreshed = await refreshUpdateRequestToLatest(request, {
+    registryUrl: "https://registry.example.invalid/moondesk/latest",
+    releasesApiUrl: "https://api.example.invalid/releases",
+    fetchImpl: async (url) => {
+      if (String(url).includes("registry.example.invalid")) {
+        return responseJson(npmMetadata(latestTarget));
+      }
+      return responseJson([
+        {
+          tag_name: `v${latestTarget}`,
+          draft: false,
+          prerelease: false,
+          html_url: `https://github.com/Shattermoon/moondesk/releases/tag/v${latestTarget}`,
+          body: "## What's Changed\n* fix: newest release",
+        },
+        {
+          tag_name: `v${staleTarget}`,
+          draft: false,
+          prerelease: false,
+          html_url: `https://github.com/Shattermoon/moondesk/releases/tag/v${staleTarget}`,
+          body: "## What's Changed\n* feat: intermediate release",
+        },
+      ]);
+    },
+  });
+
+  assert.equal(refreshed.targetVersion, latestTarget);
+  assert.deepEqual(refreshed.releaseNotes, [
+    `v${latestTarget}: Newest release`,
+    `v${staleTarget}: Intermediate release`,
+  ]);
+  assert.equal(
+    refreshed.releaseUrl,
+    `https://github.com/Shattermoon/moondesk/releases/tag/v${latestTarget}`,
+  );
 });
 
 test("update check writes an available exact npm latest version", async () => {
@@ -384,6 +677,8 @@ test("update requests require the current package version and a newer target", (
       schemaVersion: 1,
       currentVersion,
       targetVersion,
+      releaseNotes: [],
+      releaseUrl: null,
     });
     assert.equal(fs.existsSync(requestPath), false, "request is consumed exactly once");
 

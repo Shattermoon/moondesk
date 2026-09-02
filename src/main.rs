@@ -66,9 +66,11 @@ const NGROK_DOMAIN_MASK: &str = "▓▓▓▓▓▓▓▓";
 const MCP_URL_REVEAL_BAR_CELLS: usize = 10;
 // Reserve one extra row for Version without removing the normal live-flow slot.
 const STATUS_PANEL_HEIGHT: u16 = TUI_MASCOT_BLOCK_HEIGHT + 5;
-const STATUS_LABEL_WIDTH: usize = 14;
+const STATUS_LABEL_WIDTH: usize = 10;
 const DASHBOARD_THREE_COLUMN_MIN_WIDTH: u16 = 120;
+const DASHBOARD_WORKSPACE_COLUMN_WIDTH: u16 = 32;
 const STATUS_PRIMARY_MCP_URL_LINE: usize = 6;
+const STATUS_WORKSPACES_INSERT_INDEX: usize = STATUS_PRIMARY_MCP_URL_LINE + 1;
 const CONNECT_GUIDE_PRIMARY_MCP_URL_LINE: usize = 7;
 const GPT_5_6_AND_EARLIER_INPUT_USD_PER_1M: f64 = 5.0;
 const GPT_5_6_AND_EARLIER_OUTPUT_USD_PER_1M: f64 = 30.0;
@@ -810,7 +812,17 @@ fn flow_lane_spans(
     palette: &theme::Palette,
     now_millis: u128,
 ) -> Vec<Span<'static>> {
-    const CELLS: usize = FLOW_ROW_CELLS;
+    flow_lane_spans_with_cells(active, flow, palette, now_millis, FLOW_ROW_CELLS)
+}
+
+fn flow_lane_spans_with_cells(
+    active: bool,
+    flow: Option<&FlowLane>,
+    palette: &theme::Palette,
+    now_millis: u128,
+    cells: usize,
+) -> Vec<Span<'static>> {
+    let cells = cells.clamp(1, FLOW_ROW_CELLS);
     let unlit = Style::default().fg(palette.muted_fg);
     let lit = Style::default()
         .fg(palette.info_fg)
@@ -818,21 +830,23 @@ fn flow_lane_spans(
 
     let direction = flow.map(|flow| flow_direction(Some(flow), now_millis));
     let lit_count = if active {
-        flow_lit_count(flow, now_millis, CELLS)
+        flow_lit_count(flow, now_millis, FLOW_ROW_CELLS)
+            .saturating_mul(cells)
+            .div_ceil(FLOW_ROW_CELLS)
     } else {
         0
     };
 
     if lit_count == 0 || direction.is_none() {
-        return vec![Span::styled("-".repeat(CELLS), unlit), Span::raw(" ")];
+        return vec![Span::styled("-".repeat(cells), unlit), Span::raw(" ")];
     }
 
     let direction = direction.unwrap_or(FlowDirection::Forward);
-    let mut spans = Vec::with_capacity(CELLS + 1);
-    for i in 0..CELLS {
+    let mut spans = Vec::with_capacity(cells + 1);
+    for i in 0..cells {
         let lit_here = match direction {
             FlowDirection::Forward => i < lit_count,
-            FlowDirection::Backward => i >= CELLS.saturating_sub(lit_count),
+            FlowDirection::Backward => i >= cells.saturating_sub(lit_count),
         };
         let style = if lit_here { lit } else { unlit };
         spans.push(Span::styled("-".to_string(), style));
@@ -6538,7 +6552,15 @@ fn draw_ui(f: &mut Frame, context: UiRenderContext<'_>) {
     let show_workspace_pane = !show_guide
         && bootstrap_status_flow.is_none()
         && area.width >= DASHBOARD_THREE_COLUMN_MIN_WIDTH;
-    let show_flow_panel = !show_guide && !show_workspace_pane;
+    let show_flow_panel = !show_guide;
+    let compact_flow_layout = show_workspace_pane;
+    let compact_status_content_width = area
+        .width
+        .saturating_sub(DASHBOARD_WORKSPACE_COLUMN_WIDTH + TUI_MASCOT_BLOCK_WIDTH)
+        .saturating_sub(6) as usize;
+    let compact_flow_lane_cells = compact_status_content_width
+        .saturating_sub(25)
+        .clamp(8, FLOW_ROW_CELLS);
     let logs_min_height = if show_guide { 3 } else { 5 };
     let max_status_height = area.height.saturating_sub(6 + logs_min_height).max(17);
     // Keep the main panel deterministic: mascot size must not drive layout.
@@ -6653,16 +6675,33 @@ fn draw_ui(f: &mut Frame, context: UiRenderContext<'_>) {
         .fg(palette.info_fg)
         .add_modifier(Modifier::BOLD);
     let lane_for = |active: bool, flow: Option<&FlowLane>| -> Vec<Span<'static>> {
-        flow_lane_spans(active, flow, &palette, now_millis)
+        if compact_flow_layout {
+            flow_lane_spans_with_cells(active, flow, &palette, now_millis, compact_flow_lane_cells)
+        } else {
+            flow_lane_spans(active, flow, &palette, now_millis)
+        }
     };
     let request_stats_for = |app: &UiSnapshot| -> Vec<Span<'static>> {
+        let request_count = if compact_flow_layout {
+            format_token_compact(app.request_count)
+        } else {
+            app.request_count.to_string()
+        };
         vec![
             Span::styled("  Requests ", Style::default().fg(palette.muted_fg)),
-            Span::styled(
-                app.request_count.to_string(),
-                Style::default().fg(palette.title_fg),
-            ),
+            Span::styled(request_count, Style::default().fg(palette.title_fg)),
         ]
+    };
+    let flow_row_prefix = if compact_flow_layout { "  " } else { "    " };
+    let flow_left_label = if compact_flow_layout {
+        "PC "
+    } else {
+        FLOW_LANE_LEFT_LABEL
+    };
+    let flow_right_label = if compact_flow_layout {
+        "Web"
+    } else {
+        "ChatGPT Web"
     };
     let status_label_style = Style::default()
         .fg(palette.primary_fg)
@@ -6768,7 +6807,7 @@ fn draw_ui(f: &mut Frame, context: UiRenderContext<'_>) {
         ]),
         {
             let mut spans = vec![
-                status_label("Primary MCP URL"),
+                status_label("MCP URL"),
                 Span::styled(
                     &mcp_url,
                     Style::default().fg(if has_url {
@@ -6821,7 +6860,7 @@ fn draw_ui(f: &mut Frame, context: UiRenderContext<'_>) {
             Line::from(spans)
         },
         {
-            let mut spans = vec![status_label("Remote connected")];
+            let mut spans = vec![status_label("Remote")];
             if app.remote_connected {
                 spans.push(Span::styled(
                     "V",
@@ -6857,7 +6896,7 @@ fn draw_ui(f: &mut Frame, context: UiRenderContext<'_>) {
 
     if !show_workspace_pane && !show_guide {
         status_lines.insert(
-            7,
+            STATUS_WORKSPACES_INSERT_INDEX,
             Line::from(vec![
                 status_label("Workspaces"),
                 Span::styled(
@@ -6895,20 +6934,38 @@ fn draw_ui(f: &mut Frame, context: UiRenderContext<'_>) {
             } else {
                 "awaiting connection"
             };
-            let call_offset = flow_call_offset(call_text);
-            status_lines.push(Line::from(vec![
-                Span::styled("    ", Style::default().fg(palette.muted_fg)),
-                Span::styled(call_offset, Style::default().fg(palette.muted_fg)),
-                Span::styled(call_text, flow_meta_style),
-            ]));
+            let call_line = if compact_flow_layout {
+                vec![
+                    Span::styled(flow_row_prefix, Style::default().fg(palette.muted_fg)),
+                    Span::styled(
+                        trim_line(
+                            call_text,
+                            compact_status_content_width.saturating_sub(flow_row_prefix.len()),
+                        ),
+                        flow_meta_style,
+                    ),
+                ]
+            } else {
+                vec![
+                    Span::styled(flow_row_prefix, Style::default().fg(palette.muted_fg)),
+                    Span::styled(
+                        flow_call_offset(call_text),
+                        Style::default().fg(palette.muted_fg),
+                    ),
+                    Span::styled(call_text.to_string(), flow_meta_style),
+                ]
+            };
+            status_lines.push(Line::from(call_line));
             let lane = lane_for(false, None);
             let mut row = vec![
-                Span::styled("    ", Style::default().fg(palette.muted_fg)),
-                Span::styled(FLOW_LANE_LEFT_LABEL, computer_role_style),
+                Span::styled(flow_row_prefix, Style::default().fg(palette.muted_fg)),
+                Span::styled(flow_left_label, computer_role_style),
             ];
             row.extend(lane);
-            row.push(Span::styled("ChatGPT Web", chatgpt_role_style));
-            row.push(Span::styled("  ", Style::default().fg(palette.muted_fg)));
+            row.push(Span::styled(flow_right_label, chatgpt_role_style));
+            if !compact_flow_layout {
+                row.push(Span::styled("  ", Style::default().fg(palette.muted_fg)));
+            }
             row.extend(request_stats_for(app));
             status_lines.push(Line::from(row));
         } else {
@@ -6919,25 +6976,44 @@ fn draw_ui(f: &mut Frame, context: UiRenderContext<'_>) {
                 .take(visible_flow_slots)
             {
                 let latest_action = latest_flow_action(flow);
-                let call_text = trim_line(&format!("call {latest_action}"), FLOW_ROW_CELLS);
-                let call_offset = flow_call_offset(&call_text);
-                status_lines.push(Line::from(vec![
-                    Span::styled("    ", Style::default().fg(palette.muted_fg)),
-                    Span::styled(call_offset, Style::default().fg(palette.muted_fg)),
-                    Span::styled(call_text, flow_meta_style),
-                ]));
+                let call_text = trim_line(
+                    &format!("call {latest_action}"),
+                    if compact_flow_layout {
+                        compact_status_content_width.saturating_sub(flow_row_prefix.len())
+                    } else {
+                        FLOW_ROW_CELLS
+                    },
+                );
+                let call_line = if compact_flow_layout {
+                    vec![
+                        Span::styled(flow_row_prefix, Style::default().fg(palette.muted_fg)),
+                        Span::styled(call_text.clone(), flow_meta_style),
+                    ]
+                } else {
+                    vec![
+                        Span::styled(flow_row_prefix, Style::default().fg(palette.muted_fg)),
+                        Span::styled(
+                            flow_call_offset(&call_text),
+                            Style::default().fg(palette.muted_fg),
+                        ),
+                        Span::styled(call_text, flow_meta_style),
+                    ]
+                };
+                status_lines.push(Line::from(call_line));
                 let closing = flow.closing_started_ms.is_some();
                 let lane_active = closing
                     || !flow.anim_queue.is_empty()
                     || (app.server_running && app.ngrok_running && app.remote_connected);
                 let lane = lane_for(lane_active, Some(flow));
                 let mut row = vec![
-                    Span::styled("    ", Style::default().fg(palette.muted_fg)),
-                    Span::styled(FLOW_LANE_LEFT_LABEL, computer_role_style),
+                    Span::styled(flow_row_prefix, Style::default().fg(palette.muted_fg)),
+                    Span::styled(flow_left_label, computer_role_style),
                 ];
                 row.extend(lane);
-                row.push(Span::styled("ChatGPT Web", chatgpt_role_style));
-                row.push(Span::styled("  ", Style::default().fg(palette.muted_fg)));
+                row.push(Span::styled(flow_right_label, chatgpt_role_style));
+                if !compact_flow_layout {
+                    row.push(Span::styled("  ", Style::default().fg(palette.muted_fg)));
+                }
                 row.extend(request_stats_for(app));
                 status_lines.push(Line::from(row));
             }
@@ -7100,7 +7176,7 @@ fn draw_ui(f: &mut Frame, context: UiRenderContext<'_>) {
             .direction(Direction::Horizontal)
             .constraints([
                 Constraint::Min(44),
-                Constraint::Length(32),
+                Constraint::Length(DASHBOARD_WORKSPACE_COLUMN_WIDTH),
                 Constraint::Length(TUI_MASCOT_BLOCK_WIDTH),
             ])
             .split(chunks[1])
@@ -8899,6 +8975,31 @@ mod tests {
     }
 
     #[test]
+    fn compact_status_labels_fit_the_shared_alignment_width() {
+        for label in [
+            "Version",
+            "Mode",
+            "Tool mode",
+            "Server",
+            "ngrok",
+            "DevTools",
+            "MCP URL",
+            "Remote",
+            "Session",
+            "All-time",
+            "Workspaces",
+            "Browser",
+        ] {
+            assert!(label.len() <= super::STATUS_LABEL_WIDTH, "{label}");
+        }
+        assert_eq!("Workspaces".len(), super::STATUS_LABEL_WIDTH);
+        assert_eq!(
+            super::STATUS_WORKSPACES_INSERT_INDEX,
+            super::STATUS_PRIMARY_MCP_URL_LINE + 1
+        );
+    }
+
+    #[test]
     fn wide_dashboard_renders_status_workspaces_and_clippymoon_without_shrinking_bottom() {
         let mut snapshot = test_dashboard_snapshot("moondesk-dashboard-wide-test");
         let workspace_a = test_workspace_id(40);
@@ -8907,9 +9008,23 @@ mod tests {
             &mut snapshot,
             &[(workspace_a, "SiteGPT", true), (workspace_b, "KUBA", false)],
         );
+        snapshot.request_count = 1_234;
+        snapshot.flows.push(super::FlowLane {
+            flow_id: "flow-1".into(),
+            short_id: "f1".into(),
+            events: vec!["tools/call:run_command".into()],
+            bootstrap_status_active: false,
+            bootstrap_completed_steps: 0,
+            bootstrap_pending_steps: Default::default(),
+            bootstrap_status_close_deadline_ms: None,
+            anim_queue: Default::default(),
+            last_direction: super::FlowDirection::Forward,
+            closing_started_ms: None,
+            closing_step_ms: 0,
+        });
         let rendered = render_dashboard(
             &snapshot,
-            140,
+            120,
             44,
             DashboardFocus::Workspaces,
             &WorkspaceFilter::All,
@@ -8926,6 +9041,8 @@ mod tests {
         assert!(rendered.bottom_areas.shell_commands.is_some());
         assert!(rendered.bottom_areas.logs.height >= 15);
         assert!(!rendered.text.contains("tool input, llm output"));
+        assert!(rendered.text.contains("PC "));
+        assert!(rendered.text.contains("Web  Requests 1.2K"));
         assert!(rendered.text.contains("[c] Clear View"));
     }
 

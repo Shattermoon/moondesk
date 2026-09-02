@@ -77,7 +77,6 @@ impl JsonRpcResponse {
 pub struct McpRequestContext<'a> {
     pub workspace_id: &'a WorkspaceId,
     pub workspace_root: &'a str,
-    pub registered_workspace_roots: &'a [PathBuf],
     pub mode: Mode,
     pub tool_mode: ToolMode,
     pub set_moondesk_as_co_author: bool,
@@ -621,7 +620,6 @@ async fn handle_tools_call(
         McpRequestContext {
             workspace_id: &workspace_id,
             workspace_root,
-            registered_workspace_roots: &[],
             mode,
             tool_mode,
             set_moondesk_as_co_author,
@@ -659,80 +657,6 @@ fn read_call_requires_workspace(
     }
 }
 
-fn ensure_external_read_path_is_not_another_workspace(
-    path: &str,
-    workspace_root: &str,
-    registered_workspace_roots: &[PathBuf],
-) -> Result<(), String> {
-    let requested = Path::new(path);
-    if !requested.is_absolute() {
-        return Ok(());
-    }
-    let target = requested
-        .canonicalize()
-        .map(command::normalize_windows_verbatim_path)
-        .map_err(|error| {
-            format!(
-                "Cannot resolve external read path {}: {error}",
-                requested.display()
-            )
-        })?;
-    let current_root = Path::new(workspace_root)
-        .canonicalize()
-        .map(command::normalize_windows_verbatim_path)
-        .ok();
-
-    for registered_root in registered_workspace_roots {
-        let Ok(registered_root) = registered_root.canonicalize() else {
-            continue;
-        };
-        let registered_root = command::normalize_windows_verbatim_path(registered_root);
-        if current_root.as_ref() == Some(&registered_root) {
-            continue;
-        }
-        if target.starts_with(&registered_root) {
-            return Err(format!(
-                "Refusing to read through another registered MoonDesk workspace: {}. Use that workspace's connector instead.",
-                registered_root.display()
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn enforce_external_read_workspace_isolation(
-    req: &JsonRpcRequest,
-    tool_name: &str,
-    workspace_root: &str,
-    registered_workspace_roots: &[PathBuf],
-) -> Result<(), String> {
-    let arguments = tool_arguments(req);
-    match tool_name {
-        "read" | "view_image" => {
-            if let Some(path) = arguments.get("path").and_then(Value::as_str) {
-                ensure_external_read_path_is_not_another_workspace(
-                    path,
-                    workspace_root,
-                    registered_workspace_roots,
-                )?;
-            }
-        }
-        "view_images" => {
-            if let Some(paths) = arguments.get("paths").and_then(Value::as_array) {
-                for path in paths.iter().filter_map(Value::as_str) {
-                    ensure_external_read_path_is_not_another_workspace(
-                        path,
-                        workspace_root,
-                        registered_workspace_roots,
-                    )?;
-                }
-            }
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
 async fn handle_tools_call_for_workspace(
     req: &JsonRpcRequest,
     context: McpRequestContext<'_>,
@@ -740,7 +664,6 @@ async fn handle_tools_call_for_workspace(
     let McpRequestContext {
         workspace_id,
         workspace_root,
-        registered_workspace_roots,
         mode,
         tool_mode,
         set_moondesk_as_co_author,
@@ -779,18 +702,6 @@ async fn handle_tools_call_for_workspace(
             req,
             format!("Workspace is currently unavailable: {workspace_root}"),
         );
-    }
-
-    if !tool_mode.read_only()
-        && matches!(tool_name.as_str(), "read" | "view_image" | "view_images")
-        && let Err(error) = enforce_external_read_workspace_isolation(
-            req,
-            &tool_name,
-            workspace_root,
-            registered_workspace_roots,
-        )
-    {
-        return tool_error_response(req, error);
     }
 
     {

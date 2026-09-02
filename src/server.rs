@@ -721,17 +721,9 @@ async fn post_mcp(
     }
 
     let workspace_root = workspace.root.to_string_lossy().into_owned();
-    let (mode, tool_mode, set_moondesk_as_co_author, registered_workspace_roots) = {
+    let (mode, tool_mode, set_moondesk_as_co_author) = {
         let app = s.app.lock().await;
-        (
-            app.mode,
-            app.tool_mode,
-            app.set_moondesk_as_co_author,
-            app.workspaces
-                .iter()
-                .map(|workspace| workspace.root.clone())
-                .collect::<Vec<_>>(),
-        )
+        (app.mode, app.tool_mode, app.set_moondesk_as_co_author)
     };
 
     let mut response_json: Option<Value> = None;
@@ -740,7 +732,6 @@ async fn post_mcp(
         mcp::McpRequestContext {
             workspace_id: &workspace.workspace_id,
             workspace_root: &workspace_root,
-            registered_workspace_roots: &registered_workspace_roots,
             mode,
             tool_mode,
             set_moondesk_as_co_author,
@@ -1788,15 +1779,16 @@ mod tests {
             serde_json::from_slice(&cross_body).expect("parse cross-root response");
         assert_eq!(
             cross_payload
-                .pointer("/result/isError")
-                .and_then(Value::as_bool),
-            Some(true)
+                .pointer("/result/structuredContent/text")
+                .and_then(Value::as_str),
+            Some("workspace-b\n"),
+            "MultiTools explicit absolute reads must not gain special-case restrictions just because the target is another registered workspace"
         );
 
-        let workspace_b_image = workspace_b.join("private.png");
+        let workspace_b_image = workspace_b.join("other-workspace.png");
         image::RgbaImage::from_pixel(20, 16, image::Rgba([90, 120, 150, 255]))
             .save(&workspace_b_image)
-            .expect("write workspace B private image");
+            .expect("write workspace B image");
         let cross_root_vision = post_mcp(
             AxumPath(slug_a.clone()),
             State(server_state.clone()),
@@ -1812,11 +1804,18 @@ mod tests {
             .expect("read cross-root vision response");
         let cross_vision_payload: Value =
             serde_json::from_slice(&cross_vision_body).expect("parse cross-root vision response");
-        assert_eq!(
+        assert_ne!(
             cross_vision_payload
                 .pointer("/result/isError")
                 .and_then(Value::as_bool),
-            Some(true)
+            Some(true),
+            "MultiTools explicit absolute image reads must stay usable across project roots"
+        );
+        assert_eq!(
+            cross_vision_payload
+                .pointer("/result/content/0/type")
+                .and_then(Value::as_str),
+            Some("image")
         );
 
         let _ = std::fs::remove_file(external_file);

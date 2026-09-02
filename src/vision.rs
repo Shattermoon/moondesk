@@ -53,11 +53,7 @@ fn canonicalize(path: &Path) -> Result<PathBuf, String> {
 
 /// Resolve a local image path. Relative paths stay contained in the workspace;
 /// an explicit absolute path may point anywhere readable by the MoonDesk user.
-pub fn resolve_image_path(
-    workspace_root: &str,
-    requested: &str,
-    allow_external_absolute: bool,
-) -> Result<PathBuf, String> {
+pub fn resolve_image_path(workspace_root: &str, requested: &str) -> Result<PathBuf, String> {
     let requested = requested.trim();
     if requested.is_empty() {
         return Err("Image path must not be empty".to_string());
@@ -65,24 +61,13 @@ pub fn resolve_image_path(
 
     let requested_path = Path::new(requested);
     let resolved = if requested_path.is_absolute() {
-        let candidate = canonicalize(requested_path)?;
-        if allow_external_absolute {
-            candidate
-        } else {
-            let root = canonicalize(Path::new(workspace_root))?;
-            if !candidate.starts_with(&root) {
-                return Err(format!(
-                    "Absolute image path is outside the workspace in read-only mode: {requested}"
-                ));
-            }
-            candidate
-        }
+        canonicalize(requested_path)?
     } else {
         let root = canonicalize(Path::new(workspace_root))?;
         let candidate = canonicalize(&root.join(requested_path))?;
         if !candidate.starts_with(&root) {
             return Err(format!(
-                "Relative image path escapes the workspace: {requested}. Use an explicit absolute path only when MoonDesk is not in read-only mode and the task genuinely requires reading an image outside the workspace."
+                "Relative image path escapes the workspace: {requested}. Use an explicit absolute path when the task genuinely requires reading an image elsewhere on the machine."
             ));
         }
         candidate
@@ -240,7 +225,6 @@ pub fn prepare_image(
     max_dimension: u32,
     jpeg_quality: u8,
     target_bytes: usize,
-    allow_external_absolute: bool,
 ) -> Result<PreparedImage, String> {
     if !(1..=MAX_REQUESTED_DIMENSION).contains(&max_dimension) {
         return Err(format!(
@@ -253,7 +237,7 @@ pub fn prepare_image(
         ));
     }
 
-    let path = resolve_image_path(workspace_root, requested_path, allow_external_absolute)?;
+    let path = resolve_image_path(workspace_root, requested_path)?;
     let source_bytes = validate_source_size(&path)?;
     let (decoded, format, source_width, source_height, needs_orientation) = decode_oriented(&path)?;
     let oriented_source_dimensions = decoded.dimensions();
@@ -355,7 +339,7 @@ mod tests {
             .join(outside.file_name().expect("outside fixture name"))
             .to_string_lossy()
             .into_owned();
-        let error = resolve_image_path(&root.to_string_lossy(), &relative, false)
+        let error = resolve_image_path(&root.to_string_lossy(), &relative)
             .expect_err("relative escape must be rejected");
         assert!(error.contains("escapes the workspace"));
         let _ = std::fs::remove_file(outside);
@@ -367,9 +351,8 @@ mod tests {
         let root = temp_workspace();
         let outside = std::env::temp_dir().join(format!("outside-{}.png", Uuid::new_v4()));
         std::fs::write(&outside, b"not-an-image").expect("write outside fixture");
-        let resolved =
-            resolve_image_path(&root.to_string_lossy(), &outside.to_string_lossy(), true)
-                .expect("explicit absolute path should resolve");
+        let resolved = resolve_image_path(&root.to_string_lossy(), &outside.to_string_lossy())
+            .expect("explicit absolute path should resolve");
         assert_eq!(resolved, canonicalize(&outside).expect("canonical outside"));
         let _ = std::fs::remove_file(outside);
         let _ = std::fs::remove_dir_all(root);
@@ -381,26 +364,11 @@ mod tests {
             std::env::temp_dir().join(format!("missing-workspace-{}", Uuid::new_v4()));
         let outside = std::env::temp_dir().join(format!("outside-{}.png", Uuid::new_v4()));
         std::fs::write(&outside, b"not-an-image").expect("write outside fixture");
-        let resolved = resolve_image_path(
-            &missing_root.to_string_lossy(),
-            &outside.to_string_lossy(),
-            true,
-        )
-        .expect("explicit absolute path must not depend on workspace availability");
+        let resolved =
+            resolve_image_path(&missing_root.to_string_lossy(), &outside.to_string_lossy())
+                .expect("explicit absolute path must not depend on workspace availability");
         assert_eq!(resolved, canonicalize(&outside).expect("canonical outside"));
         let _ = std::fs::remove_file(outside);
-    }
-
-    #[test]
-    fn read_only_path_policy_rejects_absolute_path_outside_workspace() {
-        let root = temp_workspace();
-        let outside = std::env::temp_dir().join(format!("outside-{}.png", Uuid::new_v4()));
-        std::fs::write(&outside, b"not-an-image").expect("write outside fixture");
-        let error = resolve_image_path(&root.to_string_lossy(), &outside.to_string_lossy(), false)
-            .expect_err("read-only path policy must reject external absolute image paths");
-        assert!(error.contains("outside the workspace in read-only mode"));
-        let _ = std::fs::remove_file(outside);
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -425,7 +393,6 @@ mod tests {
             DEFAULT_MAX_DIMENSION,
             DEFAULT_JPEG_QUALITY,
             MAX_SINGLE_ENCODED_BYTES,
-            true,
         )
         .expect("prepare direct jpeg");
         let attached = BASE64_STANDARD
@@ -470,7 +437,6 @@ mod tests {
             1_200,
             DEFAULT_JPEG_QUALITY,
             350_000,
-            true,
         )
         .expect("prepare image");
         assert_eq!(prepared.metadata.mime_type, "image/jpeg");
@@ -505,7 +471,6 @@ mod tests {
                 DEFAULT_MAX_DIMENSION,
                 DEFAULT_JPEG_QUALITY,
                 MAX_SINGLE_ENCODED_BYTES,
-                true,
             )
             .unwrap_or_else(|error| panic!("prepare {name}: {error}"));
             let attached = BASE64_STANDARD
@@ -573,7 +538,6 @@ mod tests {
             DEFAULT_MAX_DIMENSION,
             DEFAULT_JPEG_QUALITY,
             MAX_SINGLE_ENCODED_BYTES,
-            true,
         )
         .expect("prepare oriented JPEG");
         assert_eq!(prepared.metadata.source_width, 40);
@@ -602,7 +566,6 @@ mod tests {
             DEFAULT_MAX_DIMENSION,
             DEFAULT_JPEG_QUALITY,
             MAX_SINGLE_ENCODED_BYTES,
-            true,
         )
         .expect_err("corrupt image must fail");
         assert!(
@@ -624,7 +587,6 @@ mod tests {
             DEFAULT_MAX_DIMENSION,
             DEFAULT_JPEG_QUALITY,
             MAX_SINGLE_ENCODED_BYTES,
-            true,
         )
         .expect_err("oversized source must be rejected");
         assert!(error.contains("Image is too large to inspect safely"));
@@ -645,7 +607,6 @@ mod tests {
             0,
             DEFAULT_JPEG_QUALITY,
             MAX_SINGLE_ENCODED_BYTES,
-            true,
         )
         .expect_err("zero max dimension must fail");
         assert!(dimension_error.contains("max_dimension must be between"));
@@ -656,7 +617,6 @@ mod tests {
             DEFAULT_MAX_DIMENSION,
             MIN_JPEG_QUALITY - 1,
             MAX_SINGLE_ENCODED_BYTES,
-            true,
         )
         .expect_err("too-low quality must fail");
         assert!(quality_error.contains("quality must be between"));

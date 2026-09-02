@@ -448,11 +448,11 @@ async fn handle_tools_list(
         tools.push(json!({
             "name": "read",
             "title": "Read file",
-            "description": "Read a bounded text chunk. Defaults to the first 200 lines; use start_line/max_lines for normal pagination. Very long single lines automatically expose nextStartByte, which can be continued with start_byte/max_bytes without dumping the whole file into the conversation. Relative paths stay inside the workspace. In MultiTools mode, an explicit absolute path may read one local file outside the workspace; ReadOnly mode remains workspace-contained.",
+            "description": "Read a bounded text chunk. Defaults to the first 200 lines; use start_line/max_lines for normal pagination. Very long single lines automatically expose nextStartByte, which can be continued with start_byte/max_bytes without dumping the whole file into the conversation. Relative paths resolve inside the workspace; an explicit absolute path reads that exact local file when the MoonDesk user can read it.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string", "description": "File path relative to workspace root. MultiTools may also use an explicit absolute path to one readable local file outside the workspace; ReadOnly may not." },
+                    "path": { "type": "string", "description": "File path relative to workspace root, or an explicit absolute path to one readable local file." },
                     "start_line": { "type": "integer", "minimum": 1, "description": "1-based first line to return (default 1)" },
                     "max_lines": { "type": "integer", "minimum": 1, "maximum": workspace_tools::MAX_READ_LINES, "description": format!("Maximum lines to return (default {}, max {})", workspace_tools::DEFAULT_READ_LINES, workspace_tools::MAX_READ_LINES) },
                     "start_byte": { "type": "integer", "minimum": 0, "description": "0-based byte offset for raw chunk mode. Use nextStartByte to continue a very long line or other byte-bounded text." },
@@ -465,11 +465,11 @@ async fn handle_tools_list(
         tools.push(json!({
             "name": "view_image",
             "title": "View image",
-            "description": "Load a local raster image and attach its pixels to the tool response so the model can actually inspect it visually. Relative paths stay inside the workspace. In normal tool modes, an explicit absolute path may point to another readable local file when the task requires it; ReadOnly mode remains workspace-contained. MoonDesk automatically applies image orientation and bounds/compresses large files for the vision context.",
+            "description": "Load a local raster image and attach its pixels to the tool response so the model can actually inspect it visually. Relative paths resolve inside the workspace; an explicit absolute path may point to another readable local image. MoonDesk automatically applies image orientation and bounds/compresses large files for the vision context.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string", "description": "Image path relative to workspace root. Normal tool modes also permit an explicit absolute path to another readable local image; ReadOnly mode remains workspace-contained." },
+                    "path": { "type": "string", "description": "Image path relative to workspace root, or an explicit absolute path to another readable local image." },
                     "max_dimension": { "type": "integer", "minimum": 1, "maximum": vision::MAX_REQUESTED_DIMENSION, "description": format!("Maximum output width or height in pixels (default {}, maximum {})", vision::DEFAULT_MAX_DIMENSION, vision::MAX_REQUESTED_DIMENSION) },
                     "quality": { "type": "integer", "minimum": vision::MIN_JPEG_QUALITY, "maximum": vision::MAX_JPEG_QUALITY, "description": format!("JPEG preview quality when lossy compression is needed (default {})", vision::DEFAULT_JPEG_QUALITY) }
                 },
@@ -480,7 +480,7 @@ async fn handle_tools_list(
         tools.push(json!({
             "name": "view_images",
             "title": "View images",
-            "description": "Load several local raster images in one call and attach each image to the response for direct visual comparison. Use this for photo sets, design variants, screenshots, or other tasks where appearance matters. The order of returned images matches the paths array. Large images are automatically resized/compressed to keep the multimodal response bounded.",
+            "description": "Load several local raster images in one call and attach each image to the response for direct visual comparison. Use this for photo sets, design variants, screenshots, or other tasks where appearance matters. Relative paths resolve inside the workspace; explicit absolute paths may point to readable local images elsewhere on the machine. The order of returned images matches the paths array. Large images are automatically resized/compressed to keep the multimodal response bounded.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -630,14 +630,7 @@ async fn handle_tools_call(
     .await
 }
 
-fn read_call_requires_workspace(
-    req: &JsonRpcRequest,
-    tool_name: &str,
-    tool_mode: ToolMode,
-) -> bool {
-    if tool_mode.read_only() {
-        return matches!(tool_name, "read" | "view_image" | "view_images");
-    }
+fn read_call_requires_workspace(req: &JsonRpcRequest, tool_name: &str) -> bool {
     let arguments = tool_arguments(req);
     match tool_name {
         "read" | "view_image" => arguments
@@ -693,7 +686,7 @@ async fn handle_tools_call_for_workspace(
             | "delete"
             | "run_command"
             | "start_command"
-    ) || read_call_requires_workspace(req, &tool_name, tool_mode);
+    ) || read_call_requires_workspace(req, &tool_name);
     if workspace_dependent
         && workspaces::workspace_availability(Path::new(workspace_root))
             == WorkspaceAvailability::Unavailable
@@ -762,11 +755,9 @@ async fn handle_tools_call_for_workspace(
                     "moondesk_instruction" => {
                         handle_moondesk_instruction(req, workspace_root, mode, tool_mode)
                     }
-                    "read" => handle_read_file(req, workspace_root, !tool_mode.read_only()),
-                    "view_image" => handle_view_image(req, workspace_root, !tool_mode.read_only()),
-                    "view_images" => {
-                        handle_view_images(req, workspace_root, !tool_mode.read_only())
-                    }
+                    "read" => handle_read_file(req, workspace_root),
+                    "view_image" => handle_view_image(req, workspace_root),
+                    "view_images" => handle_view_images(req, workspace_root),
                     "search" => handle_search_text(req, workspace_root),
                     _ => {
                         if tool_mode.write_tools_enabled() {
@@ -1606,8 +1597,8 @@ Always specify the branch explicitly when using `git push`."#
         .collect();
 
     if mode.computer_enabled() {
-        lines.push("Use read to read files and search to search the workspace. Relative file paths stay workspace-contained. In MultiTools mode, read may inspect one explicitly addressed absolute local file outside the workspace when the task requires it; ReadOnly remains workspace-contained. Keep search/write/edit/delete workspace-scoped rather than using external absolute paths with them.".to_string());
-        lines.push("When a task depends on what an image actually looks like, use view_image or view_images so the model receives the pixels through its vision input. Do not substitute filenames, dimensions, blur scores, OCR, or other image metadata for visual inspection. Relative image paths stay inside the workspace. In normal tool modes, use an explicit absolute path only when the user's task genuinely requires inspecting a local image elsewhere on the machine; ReadOnly mode remains workspace-contained.".to_string());
+        lines.push("Use read to read files and search to search the workspace. Relative read paths resolve inside the selected workspace, while an explicitly addressed absolute file may be read in either tool mode when the MoonDesk user can read it. Keep search/write/edit/delete workspace-scoped; ReadOnly controls mutation and execution capabilities rather than changing read-path semantics.".to_string());
+        lines.push("When a task depends on what an image actually looks like, use view_image or view_images so the model receives the pixels through its vision input. Do not substitute filenames, dimensions, blur scores, OCR, or other image metadata for visual inspection. Relative image paths resolve inside the selected workspace, while explicitly addressed absolute images may be inspected in either tool mode when the MoonDesk user can read them.".to_string());
         if tool_mode.run_command_enabled() {
             lines.push(
                 "For directory inspection, run_command can intercept plain listing commands such as find, tree, ls -R, and rg --files."
@@ -1989,11 +1980,7 @@ fn optional_u8_argument(arguments: &Value, name: &str, default_value: u8) -> Res
     }
 }
 
-fn handle_view_image(
-    req: &JsonRpcRequest,
-    workspace_root: &str,
-    allow_external_absolute: bool,
-) -> JsonRpcResponse {
+fn handle_view_image(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcResponse {
     let arguments = tool_arguments(req);
     let path = match required_string_argument(&arguments, "path") {
         Ok(value) => value,
@@ -2015,7 +2002,6 @@ fn handle_view_image(
         max_dimension,
         quality,
         vision::MAX_SINGLE_ENCODED_BYTES,
-        allow_external_absolute,
     ) {
         Ok(prepared) => {
             let structured = image_metadata_value(&prepared.metadata);
@@ -2026,11 +2012,7 @@ fn handle_view_image(
     }
 }
 
-fn handle_view_images(
-    req: &JsonRpcRequest,
-    workspace_root: &str,
-    allow_external_absolute: bool,
-) -> JsonRpcResponse {
+fn handle_view_images(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcResponse {
     let arguments = tool_arguments(req);
     let Some(paths_value) = arguments.get("paths") else {
         return tool_error_response(req, "Missing required parameter: paths".to_string());
@@ -2077,7 +2059,6 @@ fn handle_view_images(
             max_dimension,
             quality,
             per_image_budget,
-            allow_external_absolute,
         ) {
             Ok(prepared) => prepared_images.push(prepared),
             Err(error) => {
@@ -2246,7 +2227,6 @@ async fn handle_view_page(
         vision::MAX_REQUESTED_DIMENSION,
         quality,
         vision::MAX_SINGLE_ENCODED_BYTES,
-        true,
     );
     let cleanup_warning = std::fs::remove_file(&temp_path)
         .err()
@@ -2280,11 +2260,7 @@ async fn handle_view_page(
     }
 }
 
-fn handle_read_file(
-    req: &JsonRpcRequest,
-    workspace_root: &str,
-    allow_external_absolute: bool,
-) -> JsonRpcResponse {
+fn handle_read_file(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcResponse {
     let arguments = tool_arguments(req);
     let path = match arguments.get("path").and_then(|v| v.as_str()) {
         Some(v) => v,
@@ -2314,13 +2290,7 @@ fn handle_read_file(
             Ok(value) => value.unwrap_or(workspace_tools::MAX_READ_BYTES),
             Err(e) => return tool_error_response(req, e),
         };
-        workspace_tools::read_file_bytes_with_policy(
-            workspace_root,
-            path,
-            start_byte,
-            max_bytes,
-            allow_external_absolute,
-        )
+        workspace_tools::read_file_bytes(workspace_root, path, start_byte, max_bytes)
     } else {
         if arguments.get("max_bytes").is_some() {
             return tool_error_response(req, "max_bytes requires start_byte".into());
@@ -2333,13 +2303,7 @@ fn handle_read_file(
             Ok(value) => value.unwrap_or(workspace_tools::DEFAULT_READ_LINES),
             Err(e) => return tool_error_response(req, e),
         };
-        workspace_tools::read_file_with_policy(
-            workspace_root,
-            path,
-            start_line,
-            max_lines,
-            allow_external_absolute,
-        )
+        workspace_tools::read_file(workspace_root, path, start_line, max_lines)
     };
 
     match output {
@@ -3683,7 +3647,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn view_image_external_absolute_path_requires_non_read_only_mode() {
+    async fn view_image_external_absolute_path_is_available_in_both_tool_modes() {
         let workspace_root =
             std::env::temp_dir().join(format!("moondesk-mcp-view-image-policy-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&workspace_root).expect("create workspace");
@@ -3703,15 +3667,20 @@ mod tests {
             &None,
         )
         .await;
-        assert_eq!(
-            read_only
-                .result
-                .as_ref()
-                .and_then(|result| result.get("isError"))
-                .and_then(Value::as_bool),
+        let read_only_result = read_only
+            .result
+            .as_ref()
+            .expect("read-only view_image result");
+        assert_ne!(
+            read_only_result.get("isError").and_then(Value::as_bool),
             Some(true)
         );
-        assert!(result_text(&read_only).contains("outside the workspace in read-only mode"));
+        assert_eq!(
+            read_only_result
+                .pointer("/content/0/type")
+                .and_then(Value::as_str),
+            Some("image")
+        );
 
         let normal = handle_tools_call(
             &tool_call_request(
@@ -3747,7 +3716,7 @@ mod tests {
             ),
             &workspace_root.to_string_lossy(),
             Mode::Both,
-            ToolMode::MultiTools,
+            ToolMode::ReadOnly,
             false,
             &CommandJobManager::new(),
             &None,
@@ -3760,14 +3729,14 @@ mod tests {
                 .and_then(|result| result.get("isError"))
                 .and_then(Value::as_bool),
             Some(true),
-            "explicit absolute image should not depend on workspace availability in normal mode"
+            "explicit absolute image should not depend on workspace availability in either tool mode"
         );
 
         let _ = std::fs::remove_file(outside);
     }
 
     #[tokio::test]
-    async fn view_images_external_absolute_paths_follow_tool_mode_policy() {
+    async fn view_images_external_absolute_paths_are_available_in_both_tool_modes() {
         let workspace_root = std::env::temp_dir().join(format!(
             "moondesk-mcp-view-images-policy-{}",
             Uuid::new_v4()
@@ -3798,13 +3767,20 @@ mod tests {
             &None,
         )
         .await;
-        assert_eq!(
-            read_only
-                .result
-                .as_ref()
-                .and_then(|result| result.get("isError"))
-                .and_then(Value::as_bool),
+        let read_only_result = read_only
+            .result
+            .as_ref()
+            .expect("read-only view_images result");
+        assert_ne!(
+            read_only_result.get("isError").and_then(Value::as_bool),
             Some(true)
+        );
+        assert_eq!(
+            read_only_result
+                .get("content")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(4)
         );
 
         let normal = handle_tools_call(
@@ -5055,9 +5031,10 @@ mod tests {
                 .contains("empty, unresolved, malformed, or failed variable or expression")
         );
         assert!(instruction_text.contains("do not split normal reads, searches, builds, tests"));
-        assert!(instruction_text.contains(
-            "read may inspect one explicitly addressed absolute local file outside the workspace"
-        ));
+        assert!(
+            instruction_text
+                .contains("an explicitly addressed absolute file may be read in either tool mode")
+        );
         assert!(instruction_text.contains("Keep search/write/edit/delete workspace-scoped"));
         assert!(instruction_text.contains("use view_image or view_images"));
         assert!(instruction_text.contains("model receives the pixels through its vision input"));
@@ -5131,7 +5108,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_external_absolute_path_requires_non_read_only_mode() {
+    async fn read_external_absolute_path_is_available_in_both_tool_modes() {
         let workspace_root =
             std::env::temp_dir().join(format!("moondesk-mcp-read-policy-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&workspace_root).expect("create workspace");
@@ -5154,9 +5131,9 @@ mod tests {
             read_only
                 .result
                 .as_ref()
-                .and_then(|result| result.get("isError"))
-                .and_then(Value::as_bool),
-            Some(true)
+                .and_then(|result| result.pointer("/structuredContent/text"))
+                .and_then(Value::as_str),
+            Some("outside file\nsecond line\n")
         );
 
         let normal = handle_tools_call(
@@ -5194,7 +5171,7 @@ mod tests {
             ),
             &workspace_root.to_string_lossy(),
             Mode::Both,
-            ToolMode::MultiTools,
+            ToolMode::ReadOnly,
             false,
             &CommandJobManager::new(),
             &None,
@@ -5330,7 +5307,6 @@ mod tests {
         let first = handle_read_file(
             &tool_call_request("read", json!({ "path": "large.txt" })),
             &workspace_root_str,
-            false,
         );
         let first = first
             .result
@@ -5356,7 +5332,6 @@ mod tests {
                 json!({ "path": "large.txt", "start_line": 201, "max_lines": 30 }),
             ),
             &workspace_root_str,
-            false,
         );
         let second = second
             .result
@@ -5391,7 +5366,6 @@ mod tests {
         let first = handle_read_file(
             &tool_call_request("read", json!({ "path": "minified.js" })),
             &workspace_root_str,
-            false,
         );
         let first = first
             .result
@@ -5425,7 +5399,6 @@ mod tests {
                 }),
             ),
             &workspace_root_str,
-            false,
         );
         let second = second
             .result

@@ -1818,6 +1818,35 @@ mod tests {
             Some("image")
         );
 
+        let cross_root_batch_vision = post_mcp(
+            AxumPath(slug_a.clone()),
+            State(server_state.clone()),
+            tool_call_body(
+                "view_images",
+                json!({ "paths": [workspace_b_image.to_string_lossy()] }),
+            ),
+        )
+        .await;
+        assert_eq!(cross_root_batch_vision.status(), StatusCode::OK);
+        let cross_batch_body = to_bytes(cross_root_batch_vision.into_body(), usize::MAX)
+            .await
+            .expect("read cross-root batch vision response");
+        let cross_batch_payload: Value = serde_json::from_slice(&cross_batch_body)
+            .expect("parse cross-root batch vision response");
+        assert_ne!(
+            cross_batch_payload
+                .pointer("/result/isError")
+                .and_then(Value::as_bool),
+            Some(true),
+            "MultiTools explicit absolute image batches must stay usable across project roots"
+        );
+        assert_eq!(
+            cross_batch_payload
+                .pointer("/result/content/1/type")
+                .and_then(Value::as_str),
+            Some("image")
+        );
+
         let _ = std::fs::remove_file(external_file);
 
         // ngrok restart clears host connection state but must not mutate the

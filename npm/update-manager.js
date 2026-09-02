@@ -16,9 +16,11 @@ const UPDATE_STATE_SCHEMA_VERSION = 1;
 const UPDATE_REQUEST_SCHEMA_VERSION = 1;
 const CHANGELOG_NOTICE_SCHEMA_VERSION = 1;
 const REGISTRY_LATEST_URL = "https://registry.npmjs.org/moondesk/latest";
-const GITHUB_RELEASES_API_URL = "https://api.github.com/repos/Shattermoon/moondesk/releases?per_page=20";
-const GITHUB_RELEASE_TAG_API_BASE = "https://api.github.com/repos/Shattermoon/moondesk/releases/tags";
-const GITHUB_RELEASE_WEB_BASE = "https://github.com/Shattermoon/moondesk/releases/tag";
+const GITHUB_REPOSITORY = "Shattermoon/moondesk";
+const GITHUB_RELEASES_API_URL = `https://api.github.com/repos/${GITHUB_REPOSITORY}/releases?per_page=20`;
+const GITHUB_RELEASE_TAG_API_BASE = `https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags`;
+const GITHUB_RELEASE_WEB_BASE = `https://github.com/${GITHUB_REPOSITORY}/releases/tag`;
+const GITHUB_PULL_WEB_BASE = `https://github.com/${GITHUB_REPOSITORY}/pull`;
 const UPDATE_CHECK_INTERVAL_MS = 15 * 60_000;
 const UPDATE_CHECK_TIMEOUT_MS = 15_000;
 const MAX_UPDATE_METADATA_BYTES = 64 * 1024;
@@ -30,6 +32,15 @@ const MAX_NPM_ROOT_BYTES = 16 * 1024;
 const NPM_ROOT_TIMEOUT_MS = 10_000;
 const UPDATE_LOCK_WAIT_MS = 60_000;
 const UPDATE_LOCK_POLL_MS = 200;
+
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+const GITHUB_PULL_ATTRIBUTION_RE = new RegExp(
+  `\\s+by\\s+@[A-Za-z0-9_-]+\\s+in\\s+${escapeRegExp(GITHUB_PULL_WEB_BASE)}\\/\\d+\\s*$`,
+  "i",
+);
 
 function parseStableVersion(input) {
   if (typeof input !== "string") {
@@ -340,7 +351,7 @@ function normalizeChangelogLine(line) {
   let value = line.trim();
   if (!value || value.startsWith("#") || /^\*\*Full Changelog\*\*/i.test(value)) return null;
   value = value.replace(/^[-*+]\s+/, "");
-  value = value.replace(/\s+by\s+@[A-Za-z0-9_-]+\s+in\s+https:\/\/github\.com\/Shattermoon\/moondesk\/pull\/\d+\s*$/i, "");
+  value = value.replace(GITHUB_PULL_ATTRIBUTION_RE, "");
   value = value.replace(/^\[(.+?)\]\([^)]*\)$/, "$1");
   value = value.replace(/`([^`]+)`/g, "$1");
   value = value.replace(/^(?:feat|fix|chore|refactor|perf|docs|test|build|ci|style)(?:\([^)]*\))?!?:\s*/i, "");
@@ -458,9 +469,7 @@ async function fetchReleaseChangelog(fromVersion, toVersion, options = {}) {
 
   const expectedUrl = `${GITHUB_RELEASE_WEB_BASE}/v${toVersion}`;
   const target = uniqueReleases.find((item) => item.version === toVersion)?.release;
-  const releaseUrl = target
-    ? (target.html_url === expectedUrl ? target.html_url : expectedUrl)
-    : null;
+  const releaseUrl = target ? expectedUrl : null;
   return { releaseNotes, releaseUrl };
 }
 

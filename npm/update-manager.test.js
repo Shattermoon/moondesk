@@ -11,6 +11,7 @@ const {
   atomicWriteJson,
   checkForUpdate,
   cleanupOldUpdateVersions,
+  changelogNoticePath,
   compareStableVersions,
   createUpdateStatePath,
   currentVersion,
@@ -401,6 +402,18 @@ test("post-update changelog notice is bounded and version-specific", () => {
   const latest = nextVersion();
   const noticePath = path.join(dir, "post-update.json");
   try {
+    assert.ok(
+      changelogNoticePath("1.2.4").endsWith(path.join("updates", "v1.2.4", "post-update.json")),
+    );
+    assert.throws(() => changelogNoticePath("1.2.4-beta.1"), /stable semantic version/);
+    assert.equal(
+      writePostUpdateNotice(
+        { currentVersion: "1.2.3", targetVersion: "1.2.4", releaseNotes: [] },
+        "1.2.5",
+        { noticePath },
+      ),
+      null,
+    );
     writePostUpdateNotice(
       {
         currentVersion,

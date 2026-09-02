@@ -262,13 +262,28 @@ fn changelog_notice_path(current_version: &str) -> std::io::Result<PathBuf> {
         .join("post-update.json"))
 }
 
+fn changelog_notice_path_with_override(
+    current_version: &str,
+    override_path: Option<PathBuf>,
+) -> std::io::Result<PathBuf> {
+    if let Some(path) = override_path.filter(|path| !path.as_os_str().is_empty()) {
+        return Ok(path);
+    }
+    changelog_notice_path(current_version)
+}
+
+fn active_changelog_notice_path() -> std::io::Result<PathBuf> {
+    let override_path = std::env::var_os("MOONDESK_CHANGELOG_NOTICE_PATH").map(PathBuf::from);
+    changelog_notice_path_with_override(CURRENT_VERSION, override_path)
+}
+
 pub fn pending_changelog_notice() -> Option<ChangelogNotice> {
-    let path = changelog_notice_path(CURRENT_VERSION).ok()?;
+    let path = active_changelog_notice_path().ok()?;
     pending_changelog_notice_from_path(&path, CURRENT_VERSION)
 }
 
 pub fn dismiss_pending_changelog_notice() -> std::io::Result<()> {
-    let path = changelog_notice_path(CURRENT_VERSION)?;
+    let path = active_changelog_notice_path()?;
     match fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -308,8 +323,9 @@ fn write_private_create_new(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 mod tests {
     use super::{
         ChangelogNotice, UpdateInfo, available_update_from_path, changelog_notice_path,
-        compare_stable_versions, parse_stable_version, pending_changelog_notice_from_path,
-        write_update_request_to_path, write_validated_update_request,
+        changelog_notice_path_with_override, compare_stable_versions, parse_stable_version,
+        pending_changelog_notice_from_path, write_update_request_to_path,
+        write_validated_update_request,
     };
     use std::cmp::Ordering;
     use std::fs;
@@ -342,6 +358,16 @@ mod tests {
             )
         );
         assert!(changelog_notice_path("1.2.4-beta.1").is_err());
+    }
+
+    #[test]
+    fn changelog_notice_path_override_wins_over_home_derived_path() {
+        let override_path = std::path::PathBuf::from("C:/custom/moondesk/post-update.json");
+        assert_eq!(
+            changelog_notice_path_with_override("1.2.4", Some(override_path.clone()))
+                .expect("resolve explicit changelog notice path"),
+            override_path
+        );
     }
 
     #[test]

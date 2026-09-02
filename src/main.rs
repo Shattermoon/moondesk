@@ -6388,20 +6388,29 @@ fn draw_update_confirm(
                 Style::default().fg(palette.muted_fg),
             )));
         }
+        let (session_warning, _) =
+            truncate_with_ellipsis(UPDATE_CONFIRM_SESSION_WARNING, content_width, false);
+        let (connection_warning, _) =
+            truncate_with_ellipsis(UPDATE_CONFIRM_CONNECTION_WARNING, content_width, false);
+        let (restart_note, _) = truncate_with_ellipsis(
+            "After the exact new version is installed, MoonDesk will restart here.",
+            content_width,
+            false,
+        );
         lines.extend([
             Line::from(""),
             Line::from(Span::styled(
-                UPDATE_CONFIRM_SESSION_WARNING,
+                session_warning,
                 Style::default()
                     .fg(palette.warning_fg)
                     .add_modifier(Modifier::BOLD),
             )),
             Line::from(Span::styled(
-                UPDATE_CONFIRM_CONNECTION_WARNING,
+                connection_warning,
                 Style::default().fg(palette.primary_fg),
             )),
             Line::from(Span::styled(
-                "After the exact new version is installed, MoonDesk will restart here.",
+                restart_note,
                 Style::default().fg(palette.primary_fg),
             )),
         ]);
@@ -9549,8 +9558,10 @@ mod tests {
         let update_info = super::update::UpdateInfo {
             current_version: "1.2.3".into(),
             latest_version: "1.2.4".into(),
-            release_notes: vec![],
-            release_url: None,
+            release_notes: (1..=6)
+                .map(|index| format!("Release change {index}"))
+                .collect(),
+            release_url: Some("https://github.com/Shattermoon/moondesk/releases/tag/v1.2.4".into()),
         };
         let notice = super::update::ChangelogNotice {
             from_version: "1.2.3".into(),
@@ -9562,7 +9573,7 @@ mod tests {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).expect("create standard compact terminal");
         terminal
-            .draw(|frame| draw_update_confirm(frame, theme, &update_info, 0))
+            .draw(|frame| draw_update_confirm(frame, theme, &update_info, 1))
             .expect("render standard compact update confirmation");
         let mut update_rendered = String::new();
         for row in 0..24 {
@@ -9572,7 +9583,11 @@ mod tests {
             update_rendered.push('\n');
         }
         assert!(update_rendered.contains("MoonDesk 1.2.3  →  1.2.4"));
-        assert!(update_rendered.contains("Release notes are unavailable for this update."));
+        assert!(update_rendered.contains("Release change 1"));
+        assert!(update_rendered.contains("Make sure no ChatGPT/MCP session"));
+        assert!(update_rendered.contains("Updating restarts MoonDesk"));
+        assert!(update_rendered.contains("After the exact new version"));
+        assert!(update_rendered.contains("Detected now: 1 active command will be stopped."));
         assert!(update_rendered.contains("[Enter] Continue with Update & Restart"));
         assert!(update_rendered.contains("[Esc] Abort"));
 

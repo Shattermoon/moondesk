@@ -6,7 +6,7 @@ const path = require("node:path");
 const test = require("node:test");
 
 const { cleanManagedUpdateEnv, orchestrate, runNative } = require("./moondesk");
-const { UPDATE_EXIT_CODE, currentVersion } = require("./update-manager");
+const { UPDATE_EXIT_CODE, changelogNoticePath, currentVersion } = require("./update-manager");
 
 function tempDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), "moondesk-wrapper-test-"));
@@ -64,6 +64,7 @@ test("managed update environment variables never leak into npm or the restarted 
       MOONDESK_NPM_MANAGED: "stale",
       MOONDESK_UPDATE_REQUEST_PATH: "stale-request",
       MOONDESK_UPDATE_STATE_PATH: "stale-state",
+      MOONDESK_CHANGELOG_NOTICE_PATH: "stale-changelog",
     }),
     { PATH: "/bin" },
   );
@@ -155,7 +156,7 @@ test("validated update exit installs the exact version, verifies it, and restart
         assert.equal(options.env.MOONDESK_NPM_MANAGED, "1");
         assert.equal(options.env.MOONDESK_UPDATE_STATE_PATH, statePath);
         assert.equal(options.env.MOONDESK_UPDATE_REQUEST_PATH, requestPath);
-        assert.equal(options.env.MOONDESK_CHANGELOG_NOTICE_PATH, undefined);
+        assert.equal(options.env.MOONDESK_CHANGELOG_NOTICE_PATH, changelogNoticePath());
         return { code: UPDATE_EXIT_CODE, signal: null };
       },
       readUpdateRequestImpl: (seenPath) => {

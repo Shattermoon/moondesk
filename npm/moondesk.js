@@ -7,6 +7,7 @@ const {
   UPDATE_EXIT_CODE,
   acquireUpdateLock,
   cleanupOldUpdateVersions,
+  changelogNoticePath,
   compareStableVersions,
   createUpdateRequestPath,
   createUpdateStatePath,
@@ -24,6 +25,7 @@ function cleanManagedUpdateEnv(source = process.env) {
   delete env.MOONDESK_NPM_MANAGED;
   delete env.MOONDESK_UPDATE_REQUEST_PATH;
   delete env.MOONDESK_UPDATE_STATE_PATH;
+  delete env.MOONDESK_CHANGELOG_NOTICE_PATH;
   return env;
 }
 
@@ -182,6 +184,11 @@ async function orchestrate(options = {}) {
       MOONDESK_UPDATE_REQUEST_PATH: updateRequestPath,
       MOONDESK_UPDATE_STATE_PATH: updateStatePath,
     });
+    try {
+      childEnv.MOONDESK_CHANGELOG_NOTICE_PATH = changelogNoticePath();
+    } catch (error) {
+      logger.warn?.(`MoonDesk could not prepare its optional changelog notice path: ${error.message}`);
+    }
   }
 
   let result;

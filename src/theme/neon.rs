@@ -24,5 +24,7 @@ pub const THEME: ThemeDef = ThemeDef {
         selection_fg: Color::White,
         toast_bg: Color::LightMagenta,
         toast_fg: Color::Black,
+        modal_bg: Color::Rgb(30, 16, 36),
+        modal_fg: Color::Rgb(245, 238, 255),
     },
 };

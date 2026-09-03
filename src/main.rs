@@ -2510,8 +2510,8 @@ fn draw_ngrok_domain_setup(
     error_message: Option<&str>,
 ) {
     let palette = theme.palette;
-    let modal_bg = Color::Rgb(34, 38, 47);
-    let modal_fg = Color::Rgb(232, 236, 242);
+    let modal_bg = palette.modal_bg;
+    let modal_fg = palette.modal_fg;
 
     let modal_area = centered_rect(90, 12, anchor_area);
     f.render_widget(Clear, modal_area);
@@ -2710,8 +2710,8 @@ fn draw_ngrok_auth_setup(
     error_message: Option<&str>,
 ) {
     let palette = theme.palette;
-    let modal_bg = Color::Rgb(34, 38, 47);
-    let modal_fg = Color::Rgb(232, 236, 242);
+    let modal_bg = palette.modal_bg;
+    let modal_fg = palette.modal_fg;
 
     let modal_area = ngrok_auth_setup_modal_area(anchor_area);
     f.render_widget(Clear, modal_area);
@@ -2830,6 +2830,7 @@ fn centered_rect(percent_x: u16, height: u16, area: Rect) -> Rect {
 
 async fn run_prompt(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    palette: theme::Palette,
     prompt_title: &str,
     initial_value: &str,
 ) -> Result<Option<String>, Box<dyn std::error::Error>> {
@@ -2840,10 +2841,12 @@ async fn run_prompt(
             let block = Block::default()
                 .title(prompt_title)
                 .borders(Borders::ALL)
-                .border_type(ratatui::widgets::BorderType::Rounded)
-                .style(Style::default().fg(Color::Yellow));
+                .border_type(palette.border_type)
+                .border_style(Style::default().fg(palette.border_fg))
+                .style(Style::default().fg(palette.modal_fg).bg(palette.modal_bg));
 
             let text = Paragraph::new(format!("> {}_", input))
+                .style(Style::default().fg(palette.primary_fg).bg(palette.modal_bg))
                 .block(block)
                 .wrap(ratatui::widgets::Wrap { trim: true });
             f.render_widget(ratatui::widgets::Clear, area);
@@ -3291,7 +3294,13 @@ async fn run_workspaces(
             WorkspaceUiAction::AddPath => {
                 confirm_rotate = None;
                 confirm_remove = None;
-                let Some(path_input) = run_prompt(terminal, "Workspace folder path:", "").await?
+                let Some(path_input) = run_prompt(
+                    terminal,
+                    current_theme.palette,
+                    "Workspace folder path:",
+                    "",
+                )
+                .await?
                 else {
                     continue;
                 };
@@ -3303,7 +3312,13 @@ async fn run_workspaces(
                     }
                 };
                 let default_name = workspaces::derive_workspace_name(&root);
-                let Some(name) = run_prompt(terminal, "Workspace name:", &default_name).await?
+                let Some(name) = run_prompt(
+                    terminal,
+                    current_theme.palette,
+                    "Workspace name:",
+                    &default_name,
+                )
+                .await?
                 else {
                     continue;
                 };
@@ -3334,7 +3349,13 @@ async fn run_workspaces(
                     }
                 };
                 let default_name = workspaces::derive_workspace_name(&root);
-                let Some(name) = run_prompt(terminal, "Workspace name:", &default_name).await?
+                let Some(name) = run_prompt(
+                    terminal,
+                    current_theme.palette,
+                    "Workspace name:",
+                    &default_name,
+                )
+                .await?
                 else {
                     continue;
                 };
@@ -3353,8 +3374,13 @@ async fn run_workspaces(
             WorkspaceUiAction::Rename => {
                 confirm_rotate = None;
                 confirm_remove = None;
-                if let Some(name) =
-                    run_prompt(terminal, "Rename workspace:", &selected_row.config.name).await?
+                if let Some(name) = run_prompt(
+                    terminal,
+                    current_theme.palette,
+                    "Rename workspace:",
+                    &selected_row.config.name,
+                )
+                .await?
                 {
                     match rename_workspace(&state, &selected_row.config.id, name).await {
                         Ok(()) => message = Some("Workspace renamed".into()),
@@ -3835,6 +3861,7 @@ async fn run_settings(
                             drop(app);
                             if let Some(new_domain) = run_prompt(
                                 terminal,
+                                current_theme.palette,
                                 "Enter ngrok static domain (with/without https://, empty to clear):",
                                 &current_domain,
                             )
@@ -9799,5 +9826,32 @@ mod tests {
         assert!(rendered.contains("more change"));
         assert!(rendered.contains("[Enter] Got it"));
         assert!(rendered.contains("[Esc] Close"));
+    }
+
+    #[test]
+    fn settings_renders_every_registered_theme() {
+        let usage = super::UsageTotals::default();
+        let tool_mode = super::ToolMode::all()[0];
+
+        for (selected_row, theme) in super::theme::all().iter().enumerate() {
+            let backend = TestBackend::new(100, 32);
+            let mut terminal = Terminal::new(backend).expect("create theme settings terminal");
+            terminal
+                .draw(|frame| {
+                    super::draw_settings(
+                        frame,
+                        super::SettingsView {
+                            current_theme: theme,
+                            current_tool_mode: tool_mode,
+                            set_moondesk_as_co_author: false,
+                            ngrok_domain: None,
+                            usage_totals: &usage,
+                            selected_row,
+                            confirm_reset_token_billing: false,
+                        },
+                    )
+                })
+                .unwrap_or_else(|error| panic!("render theme {}: {error}", theme.id));
+        }
     }
 }

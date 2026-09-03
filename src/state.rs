@@ -56,6 +56,7 @@ const MAX_COMMAND_ACTIVITIES: usize = 300;
 /// MCP request flow rendered as a single timeline line.
 #[derive(Clone)]
 pub struct FlowLane {
+    pub workspace_id: WorkspaceId,
     pub flow_id: String,
     pub short_id: String,
     pub events: Vec<String>,
@@ -1434,7 +1435,7 @@ impl AppState {
                 direction,
             } => {
                 let flow_id = format!("{}:{flow_id}", workspace_id.as_str());
-                self.record_flow(&flow_id, &events, direction);
+                self.record_flow_scoped(workspace_id, &flow_id, &events, direction);
             }
             ServerUiEvent::BeginFlowClose {
                 workspace_id,
@@ -1486,7 +1487,19 @@ impl AppState {
         }
     }
 
-    pub fn record_flow(&mut self, flow_id: &str, events: &[String], direction: FlowDirection) {
+    #[cfg(test)]
+    fn record_flow(&mut self, flow_id: &str, events: &[String], direction: FlowDirection) {
+        let workspace_id = self.workspaces[0].id.clone();
+        self.record_flow_scoped(workspace_id, flow_id, events, direction);
+    }
+
+    fn record_flow_scoped(
+        &mut self,
+        workspace_id: WorkspaceId,
+        flow_id: &str,
+        events: &[String],
+        direction: FlowDirection,
+    ) {
         if events.is_empty() {
             return;
         }
@@ -1543,6 +1556,7 @@ impl AppState {
         self.flows.insert(
             0,
             FlowLane {
+                workspace_id,
                 flow_id: flow_id.to_string(),
                 short_id: short_flow_id(flow_id),
                 events: trimmed,
@@ -2595,6 +2609,26 @@ toolMode = "multiTools"
         assert!(queue[1].direction == FlowDirection::Backward);
         assert_eq!(queue[1].start_cells, 0);
         assert_eq!(queue[1].end_cells, FLOW_ANIM_CELLS);
+    }
+
+    #[test]
+    fn server_flow_records_owning_workspace() {
+        let (mut app, workspace, config_path) = test_app("moondesk-flow-workspace-owner");
+        let workspace_id = app.workspaces[0].id.clone();
+
+        app.apply_server_ui_event(ServerUiEvent::RecordFlow {
+            workspace_id: workspace_id.clone(),
+            flow_id: "stateless".to_string(),
+            events: vec!["tools/call:run_command".to_string()],
+            direction: FlowDirection::Forward,
+        });
+
+        let flow = app.flows.first().expect("missing flow");
+        assert_eq!(&flow.workspace_id, &workspace_id);
+        assert_eq!(flow.flow_id, format!("{}:stateless", workspace_id.as_str()));
+
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_dir_all(workspace);
     }
 
     #[test]

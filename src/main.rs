@@ -71,6 +71,8 @@ const DASHBOARD_THREE_COLUMN_MIN_WIDTH: u16 = 120;
 const DASHBOARD_WORKSPACE_COLUMN_WIDTH: u16 = 32;
 const STATUS_PRIMARY_MCP_URL_LINE: usize = 6;
 const STATUS_WORKSPACES_INSERT_INDEX: usize = STATUS_PRIMARY_MCP_URL_LINE + 1;
+// Status is a single live-activity lane; workspace filtering chooses its scope.
+const STATUS_VISIBLE_FLOW_ROWS: usize = 1;
 const CONNECT_GUIDE_PRIMARY_MCP_URL_LINE: usize = 7;
 const GPT_5_6_AND_EARLIER_INPUT_USD_PER_1M: f64 = 5.0;
 const GPT_5_6_AND_EARLIER_OUTPUT_USD_PER_1M: f64 = 30.0;
@@ -430,6 +432,10 @@ fn apply_workspace_observability_filter(
         };
         in_scope && activity.sequence > cutoff.commands
     });
+    app.flows.retain(|flow| match filter {
+        WorkspaceFilter::All => true,
+        WorkspaceFilter::Workspace(workspace_id) => &flow.workspace_id == workspace_id,
+    });
 }
 
 fn record_clear_view(
@@ -767,8 +773,8 @@ fn current_anim_segment(flow: &FlowLane, now_millis: u128) -> Option<FlowAnimSeg
     flow.anim_queue.front().copied()
 }
 
-fn should_display_flow_row(flow: &FlowLane, remote_connected: bool) -> bool {
-    remote_connected || flow.closing_started_ms.is_some() || !flow.anim_queue.is_empty()
+fn should_display_flow_row(flow: &FlowLane) -> bool {
+    flow.bootstrap_status_active || flow.closing_started_ms.is_some() || !flow.anim_queue.is_empty()
 }
 
 fn flow_direction(flow: Option<&FlowLane>, now_millis: u128) -> FlowDirection {
@@ -1225,7 +1231,7 @@ fn flow_bootstrap_countdown_remaining_seconds(flow: &FlowLane, now_millis: u128)
 
 fn active_bootstrap_status_flow(app: &UiSnapshot, now_millis: u128) -> Option<&FlowLane> {
     app.flows.iter().find(|flow| {
-        should_display_flow_row(flow, app.remote_connected)
+        should_display_flow_row(flow)
             && flow.bootstrap_status_active
             && flow.closing_started_ms.is_none()
             && flow_bootstrap_status_visible(flow, now_millis)
@@ -1238,7 +1244,7 @@ fn should_show_connect_guide(app: &UiSnapshot, now_millis: u128) -> bool {
     let visible_flow_count = app
         .flows
         .iter()
-        .filter(|flow| should_display_flow_row(flow, app.remote_connected))
+        .filter(|flow| should_display_flow_row(flow))
         .count() as u16;
     let within_connect_grace = app
         .last_remote_activity_ms
@@ -1348,7 +1354,7 @@ fn build_animation_snapshot(app: &UiSnapshot) -> Vec<String> {
     for flow in app
         .flows
         .iter()
-        .filter(|flow| should_display_flow_row(flow, app.remote_connected))
+        .filter(|flow| should_display_flow_row(flow))
     {
         let latest_action = latest_flow_action(flow);
         let closing = flow.closing_started_ms.is_some();
@@ -6802,7 +6808,7 @@ fn draw_ui(f: &mut Frame, context: UiRenderContext<'_>) {
     let visible_flow_count = app
         .flows
         .iter()
-        .filter(|flow| should_display_flow_row(flow, app.remote_connected))
+        .filter(|flow| should_display_flow_row(flow))
         .count() as u16;
     let show_guide = should_show_connect_guide(app, now_millis);
     let bootstrap_status_flow = active_bootstrap_status_flow(app, now_millis);
@@ -7178,7 +7184,8 @@ fn draw_ui(f: &mut Frame, context: UiRenderContext<'_>) {
     }
 
     let visible_flow_slots = if show_flow_panel {
-        status_content_height.saturating_sub(status_lines.len() + 1) / flow_block_lines.max(1)
+        (status_content_height.saturating_sub(status_lines.len() + 1) / flow_block_lines.max(1))
+            .min(STATUS_VISIBLE_FLOW_ROWS)
     } else {
         0
     };
@@ -7229,7 +7236,7 @@ fn draw_ui(f: &mut Frame, context: UiRenderContext<'_>) {
             for flow in app
                 .flows
                 .iter()
-                .filter(|flow| should_display_flow_row(flow, app.remote_connected))
+                .filter(|flow| should_display_flow_row(flow))
                 .take(visible_flow_slots)
             {
                 let latest_action = latest_flow_action(flow);
@@ -8071,6 +8078,40 @@ mod tests {
             state: super::CommandActivityState::Succeeded,
             exit_code: Some(0),
             preview: None,
+        }
+    }
+
+    fn test_flow(
+        workspace_id: WorkspaceId,
+        flow_id: &str,
+        event: &str,
+        active: bool,
+    ) -> super::FlowLane {
+        let mut anim_queue = std::collections::VecDeque::new();
+        if active {
+            anim_queue.push_back(super::FlowAnimSegment {
+                kind: super::FlowAnimKind::Move,
+                direction: super::FlowDirection::Forward,
+                started_ms: 0,
+                ends_ms: u128::MAX,
+                step_ms: 1,
+                start_cells: 0,
+                end_cells: super::FLOW_ANIM_CELLS,
+            });
+        }
+        super::FlowLane {
+            workspace_id,
+            flow_id: flow_id.into(),
+            short_id: flow_id.into(),
+            events: vec![event.into()],
+            bootstrap_status_active: false,
+            bootstrap_completed_steps: 0,
+            bootstrap_pending_steps: Default::default(),
+            bootstrap_status_close_deadline_ms: None,
+            anim_queue,
+            last_direction: super::FlowDirection::Forward,
+            closing_started_ms: None,
+            closing_step_ms: 0,
         }
     }
 
@@ -9032,7 +9073,7 @@ mod tests {
         assert_eq!(selected, None);
     }
     #[test]
-    fn workspace_observability_filter_scopes_logs_commands_and_global_rows() {
+    fn workspace_observability_filter_scopes_logs_commands_flows_and_global_rows() {
         let mut snapshot = test_dashboard_snapshot("moondesk-dashboard-filter-test");
         let workspace_a = test_workspace_id(10);
         let workspace_b = test_workspace_id(11);
@@ -9054,12 +9095,27 @@ mod tests {
         ]
         .into_iter()
         .collect();
+        snapshot.flows = vec![
+            test_flow(
+                workspace_b.clone(),
+                "workspace-b:stateless",
+                "tools/call:poll_command",
+                true,
+            ),
+            test_flow(
+                workspace_a.clone(),
+                "workspace-a:stateless",
+                "tools/call:run_command",
+                true,
+            ),
+        ];
         let cutoffs = HashMap::new();
 
         let mut all = snapshot.clone();
         apply_workspace_observability_filter(&mut all, &WorkspaceFilter::All, &cutoffs);
         assert_eq!(all.logs.len(), 3);
         assert_eq!(all.command_activities.len(), 2);
+        assert_eq!(all.flows.len(), 2);
         assert!(all.logs.iter().any(|entry| entry.workspace_id.is_none()));
 
         let focus = WorkspaceFilter::Workspace(workspace_a.clone());
@@ -9081,6 +9137,8 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["sitegpt-command"]
         );
+        assert_eq!(selected.flows.len(), 1);
+        assert_eq!(&selected.flows[0].workspace_id, &workspace_a);
         assert!(
             selected
                 .logs
@@ -9263,22 +9321,26 @@ mod tests {
         let workspace_b = test_workspace_id(41);
         configure_dashboard_workspaces(
             &mut snapshot,
-            &[(workspace_a, "SiteGPT", true), (workspace_b, "KUBA", false)],
+            &[
+                (workspace_a.clone(), "SiteGPT", true),
+                (workspace_b.clone(), "KUBA", false),
+            ],
         );
         snapshot.request_count = 1_234;
-        snapshot.flows.push(super::FlowLane {
-            flow_id: "flow-1".into(),
-            short_id: "f1".into(),
-            events: vec!["tools/call:run_command".into()],
-            bootstrap_status_active: false,
-            bootstrap_completed_steps: 0,
-            bootstrap_pending_steps: Default::default(),
-            bootstrap_status_close_deadline_ms: None,
-            anim_queue: Default::default(),
-            last_direction: super::FlowDirection::Forward,
-            closing_started_ms: None,
-            closing_step_ms: 0,
-        });
+        snapshot.flows = vec![
+            test_flow(
+                workspace_a.clone(),
+                "workspace-a:stateless",
+                "tools/call:run_command",
+                true,
+            ),
+            test_flow(
+                workspace_b.clone(),
+                "workspace-b:stateless",
+                "tools/call:poll_command",
+                true,
+            ),
+        ];
         let rendered = render_dashboard(
             &snapshot,
             120,
@@ -9299,8 +9361,36 @@ mod tests {
         assert!(rendered.bottom_areas.logs.height >= 15);
         assert!(!rendered.text.contains("tool input, llm output"));
         assert!(rendered.text.contains("PC "));
-        assert!(rendered.text.contains("Web  Requests 1.2K"));
+        assert!(rendered.text.contains("call run_command"));
+        assert!(!rendered.text.contains("call poll_command"));
+        assert_eq!(rendered.text.matches("Web  Requests 1.2K").count(), 1);
         assert!(rendered.text.contains("[c] Clear View"));
+    }
+
+    #[test]
+    fn remote_connection_does_not_keep_idle_flow_visible() {
+        let mut snapshot = test_dashboard_snapshot("moondesk-dashboard-idle-flow-test");
+        let workspace = test_workspace_id(45);
+        configure_dashboard_workspaces(&mut snapshot, &[(workspace.clone(), "SiteGPT", true)]);
+        snapshot.flows = vec![test_flow(
+            workspace,
+            "workspace:stateless",
+            "tools/call:stale_tool",
+            false,
+        )];
+
+        let rendered = render_dashboard(
+            &snapshot,
+            120,
+            44,
+            DashboardFocus::Workspaces,
+            &WorkspaceFilter::All,
+            None,
+            None,
+        );
+
+        assert!(rendered.text.contains("awaiting request"));
+        assert!(!rendered.text.contains("call stale_tool"));
     }
 
     #[test]

@@ -2521,7 +2521,7 @@ fn draw_ngrok_domain_setup(
         .borders(Borders::ALL)
         .border_type(palette.border_type)
         .border_style(Style::default().fg(palette.border_fg))
-        .style(Style::default().bg(modal_bg));
+        .style(Style::default().fg(modal_fg).bg(modal_bg));
     f.render_widget(modal_block, modal_area);
 
     let inner = Rect::new(
@@ -2574,7 +2574,7 @@ fn draw_ngrok_domain_setup(
                 .borders(Borders::ALL)
                 .border_type(palette.border_type)
                 .border_style(Style::default().fg(palette.border_fg))
-                .style(Style::default().bg(modal_bg)),
+                .style(Style::default().fg(modal_fg).bg(modal_bg)),
         );
     f.render_widget(input_widget, modal_chunks[1]);
 
@@ -2721,7 +2721,7 @@ fn draw_ngrok_auth_setup(
         .borders(Borders::ALL)
         .border_type(palette.border_type)
         .border_style(Style::default().fg(palette.border_fg))
-        .style(Style::default().bg(modal_bg));
+        .style(Style::default().fg(modal_fg).bg(modal_bg));
     f.render_widget(modal_block, modal_area);
     let content_area = ngrok_auth_setup_content_area(anchor_area);
 
@@ -2781,7 +2781,7 @@ fn draw_ngrok_auth_setup(
                 .borders(Borders::ALL)
                 .border_type(palette.border_type)
                 .border_style(Style::default().fg(palette.border_fg))
-                .style(Style::default().bg(modal_bg)),
+                .style(Style::default().fg(modal_fg).bg(modal_bg)),
         );
     f.render_widget(input, modal_chunks[1]);
 
@@ -2800,10 +2800,11 @@ fn draw_ngrok_auth_setup(
 }
 
 fn render_theme_background(f: &mut Frame, palette: theme::Palette) {
-    f.render_widget(
-        Block::default().style(Style::default().bg(palette.background_bg)),
-        f.area(),
-    );
+    let mut style = Style::default().bg(palette.background_bg);
+    if palette.background_bg != Color::Reset {
+        style = style.fg(palette.primary_fg);
+    }
+    f.render_widget(Block::default().style(style), f.area());
 }
 
 fn render_toast(f: &mut Frame, palette: theme::Palette, msg: &str, pos: (u16, u16)) {
@@ -2836,6 +2837,24 @@ fn centered_rect(percent_x: u16, height: u16, area: Rect) -> Rect {
     Rect::new(x, y, width, popup_height)
 }
 
+fn draw_prompt(f: &mut Frame, palette: theme::Palette, prompt_title: &str, input: &str) {
+    render_theme_background(f, palette);
+    let area = centered_rect(60, 20, f.area());
+    let block = Block::default()
+        .title(prompt_title)
+        .borders(Borders::ALL)
+        .border_type(palette.border_type)
+        .border_style(Style::default().fg(palette.border_fg))
+        .style(Style::default().fg(palette.modal_fg).bg(palette.modal_bg));
+
+    let text = Paragraph::new(format!("> {input}_"))
+        .style(Style::default().fg(palette.primary_fg).bg(palette.modal_bg))
+        .block(block)
+        .wrap(ratatui::widgets::Wrap { trim: true });
+    f.render_widget(ratatui::widgets::Clear, area);
+    f.render_widget(text, area);
+}
+
 async fn run_prompt(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     palette: theme::Palette,
@@ -2844,22 +2863,7 @@ async fn run_prompt(
 ) -> Result<Option<String>, Box<dyn std::error::Error>> {
     let mut input = initial_value.to_string();
     loop {
-        terminal.draw(|f| {
-            let area = centered_rect(60, 20, f.area());
-            let block = Block::default()
-                .title(prompt_title)
-                .borders(Borders::ALL)
-                .border_type(palette.border_type)
-                .border_style(Style::default().fg(palette.border_fg))
-                .style(Style::default().fg(palette.modal_fg).bg(palette.modal_bg));
-
-            let text = Paragraph::new(format!("> {}_", input))
-                .style(Style::default().fg(palette.primary_fg).bg(palette.modal_bg))
-                .block(block)
-                .wrap(ratatui::widgets::Wrap { trim: true });
-            f.render_widget(ratatui::widgets::Clear, area);
-            f.render_widget(text, area);
-        })?;
+        terminal.draw(|f| draw_prompt(f, palette, prompt_title, &input))?;
 
         if crossterm::event::poll(std::time::Duration::from_millis(100))? {
             let event = crossterm::event::read()?;
@@ -6197,6 +6201,7 @@ fn draw_quit_confirm(
     active_commands: usize,
 ) {
     let palette = theme.palette;
+    render_theme_background(f, palette);
     let area = centered_rect(78, 14, f.area());
     f.render_widget(Clear, area);
     let block = Block::default()
@@ -6204,7 +6209,7 @@ fn draw_quit_confirm(
         .borders(Borders::ALL)
         .border_type(palette.border_type)
         .border_style(Style::default().fg(palette.danger_fg))
-        .style(Style::default().bg(palette.modal_bg));
+        .style(Style::default().fg(palette.modal_fg).bg(palette.modal_bg));
     let inner = block.inner(area).inner(Margin {
         horizontal: 2,
         vertical: 1,
@@ -6400,6 +6405,7 @@ fn draw_update_confirm(
     active_commands: usize,
 ) {
     let palette = theme.palette;
+    render_theme_background(f, palette);
     let area = centered_rect(82, 21, f.area());
     f.render_widget(Clear, area);
     let block = Block::default()
@@ -6407,7 +6413,7 @@ fn draw_update_confirm(
         .borders(Borders::ALL)
         .border_type(palette.border_type)
         .border_style(Style::default().fg(palette.warning_fg))
-        .style(Style::default().bg(palette.modal_bg));
+        .style(Style::default().fg(palette.modal_fg).bg(palette.modal_bg));
     let inner = block.inner(area).inner(Margin {
         horizontal: 2,
         vertical: 1,
@@ -6597,6 +6603,7 @@ async fn run_changelog_notice(
 
 fn draw_changelog_notice(f: &mut Frame, theme: &theme::ThemeDef, notice: &update::ChangelogNotice) {
     let palette = theme.palette;
+    render_theme_background(f, palette);
     let area = centered_rect(82, 20, f.area());
     f.render_widget(Clear, area);
     let block = Block::default()
@@ -6604,7 +6611,7 @@ fn draw_changelog_notice(f: &mut Frame, theme: &theme::ThemeDef, notice: &update
         .borders(Borders::ALL)
         .border_type(palette.border_type)
         .border_style(Style::default().fg(palette.success_fg))
-        .style(Style::default().bg(palette.modal_bg));
+        .style(Style::default().fg(palette.modal_fg).bg(palette.modal_bg));
     let inner = block.inner(area).inner(Margin {
         horizontal: 2,
         vertical: 1,
@@ -8057,7 +8064,7 @@ mod tests {
         ObservabilityCutoff, PanelItemHit, PanelScrollView, TimedSecretClick, UiRenderContext,
         UiSnapshot, WorkspaceFilter, WorkspaceHitAreas, WorkspaceId, WorkspaceUiAction,
         active_reveal_remaining, apply_workspace_observability_filter, cycle_dashboard_focus,
-        dashboard_secret_target_at, draw_changelog_notice, draw_quit_confirm, draw_ui,
+        dashboard_secret_target_at, draw_changelog_notice, draw_prompt, draw_quit_confirm, draw_ui,
         draw_update_confirm, item_under_cursor, key_is_clipboard_paste, key_is_interrupt,
         key_is_plain_quit, log_secret_target, move_panel_selection,
         normalize_ngrok_authtoken_input, normalize_ngrok_domain, normalize_workspace_path_input,
@@ -8075,6 +8082,7 @@ mod tests {
     use ratatui::{
         Terminal,
         backend::TestBackend,
+        buffer::Buffer,
         layout::Rect,
         style::{Color, Style},
         text::{Line, Span},
@@ -8089,6 +8097,28 @@ mod tests {
         bottom_areas: BottomPanelAreas,
         workspace_scroll: usize,
         workspace_visible_count: usize,
+    }
+
+    fn assert_paper_frame_has_no_reset_colors(buffer: &Buffer) {
+        for row in buffer.area.y..buffer.area.bottom() {
+            for column in buffer.area.x..buffer.area.right() {
+                let cell = &buffer[(column, row)];
+                assert_ne!(
+                    cell.bg,
+                    Color::Reset,
+                    "paper frame left reset background at ({column}, {row}) for {:?}",
+                    cell.symbol()
+                );
+                if !cell.symbol().trim().is_empty() {
+                    assert_ne!(
+                        cell.fg,
+                        Color::Reset,
+                        "paper frame left visible reset foreground at ({column}, {row}) for {:?}",
+                        cell.symbol()
+                    );
+                }
+            }
+        }
     }
 
     fn test_workspace_id(index: u64) -> WorkspaceId {
@@ -9871,6 +9901,37 @@ mod tests {
     }
 
     #[test]
+    fn full_background_theme_sets_readable_default_without_changing_reset_themes() {
+        for theme in super::theme::all() {
+            let backend = TestBackend::new(8, 3);
+            let mut terminal = Terminal::new(backend).expect("create theme background terminal");
+            terminal
+                .draw(|frame| {
+                    super::render_theme_background(frame, theme.palette);
+                    frame.render_widget(Paragraph::new("X"), Rect::new(0, 0, 1, 1));
+                })
+                .unwrap_or_else(|error| panic!("render theme background {}: {error}", theme.id));
+
+            let cell = &terminal.backend().buffer()[(0, 0)];
+            if theme.palette.background_bg == Color::Reset {
+                assert_eq!(cell.bg, Color::Reset, "theme {} background", theme.id);
+                assert_eq!(cell.fg, Color::Reset, "theme {} foreground", theme.id);
+            } else {
+                assert_eq!(
+                    cell.bg, theme.palette.background_bg,
+                    "theme {} background",
+                    theme.id
+                );
+                assert_eq!(
+                    cell.fg, theme.palette.primary_fg,
+                    "theme {} foreground",
+                    theme.id
+                );
+            }
+        }
+    }
+
+    #[test]
     fn paper_settings_render_keeps_background_under_borders_and_text() {
         let usage = super::UsageTotals::default();
         let tool_mode = super::ToolMode::all()[0];
@@ -9899,5 +9960,51 @@ mod tests {
         assert_eq!(buffer[(0, 0)].bg, theme.palette.background_bg);
         assert_eq!(buffer[(5, 1)].bg, theme.palette.background_bg);
         assert_eq!(buffer[(99, 31)].bg, theme.palette.background_bg);
+        assert_paper_frame_has_no_reset_colors(buffer);
+    }
+
+    #[test]
+    fn paper_standalone_dialogs_keep_full_frame_and_visible_text_themed() {
+        let theme = super::theme::resolve("paper");
+        let update_info = super::update::UpdateInfo {
+            current_version: "1.2.3".into(),
+            latest_version: "1.2.4".into(),
+            release_notes: vec!["Keep Paper readable everywhere".into()],
+            release_url: Some("https://github.com/Shattermoon/moondesk/releases/tag/v1.2.4".into()),
+        };
+        let notice = super::update::ChangelogNotice {
+            from_version: "1.2.3".into(),
+            to_version: "1.2.4".into(),
+            release_notes: vec!["Keep Paper readable everywhere".into()],
+            release_url: None,
+        };
+
+        let backend = TestBackend::new(100, 32);
+        let mut terminal = Terminal::new(backend).expect("create paper prompt terminal");
+        terminal
+            .draw(|frame| draw_prompt(frame, theme.palette, "Rename workspace:", "MoonDesk"))
+            .expect("render paper prompt");
+        assert_paper_frame_has_no_reset_colors(terminal.backend().buffer());
+
+        let backend = TestBackend::new(100, 32);
+        let mut terminal = Terminal::new(backend).expect("create paper quit terminal");
+        terminal
+            .draw(|frame| draw_quit_confirm(frame, theme, 2, 1, 0, 0))
+            .expect("render paper quit confirmation");
+        assert_paper_frame_has_no_reset_colors(terminal.backend().buffer());
+
+        let backend = TestBackend::new(100, 32);
+        let mut terminal = Terminal::new(backend).expect("create paper update terminal");
+        terminal
+            .draw(|frame| draw_update_confirm(frame, theme, &update_info, 0))
+            .expect("render paper update confirmation");
+        assert_paper_frame_has_no_reset_colors(terminal.backend().buffer());
+
+        let backend = TestBackend::new(100, 32);
+        let mut terminal = Terminal::new(backend).expect("create paper changelog terminal");
+        terminal
+            .draw(|frame| draw_changelog_notice(frame, theme, &notice))
+            .expect("render paper changelog");
+        assert_paper_frame_has_no_reset_colors(terminal.backend().buffer());
     }
 }

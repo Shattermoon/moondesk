@@ -918,10 +918,6 @@ fn estimate_gpt_5_6_sol_tool_cost(usage: &UsageTotals) -> ToolCostEstimate {
     }
 }
 
-fn estimate_all_time_gpt_5_6_sol_tool_cost(app: &UiSnapshot) -> ToolCostEstimate {
-    estimate_gpt_5_6_sol_tool_cost(&app.all_time_usage_totals())
-}
-
 fn format_usd_compact(usd: f64) -> String {
     let formatted = format!("{usd:.prec$}", prec = PRICE_DISPLAY_DECIMALS);
     let trimmed = formatted.trim_end_matches('0').trim_end_matches('.');
@@ -7029,7 +7025,7 @@ fn draw_ui(f: &mut Frame, context: UiRenderContext<'_>) {
 
     let all_time_usage_totals = app.all_time_usage_totals();
     let session_usage_cost = estimate_gpt_5_6_sol_tool_cost(&app.session_usage_totals);
-    let all_time_usage_cost = estimate_all_time_gpt_5_6_sol_tool_cost(app);
+    let all_time_usage_cost = estimate_gpt_5_6_sol_tool_cost(&all_time_usage_totals);
     let usage_widths = usage_value_widths(
         &app.session_usage_totals,
         session_usage_cost.standard_usd,

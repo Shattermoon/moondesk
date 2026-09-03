@@ -8,6 +8,7 @@ pub const THEME: ThemeDef = ThemeDef {
     label: "gruvbox",
     description: "Warm retro browns with orange, yellow, and green accents.",
     palette: Palette {
+        background_bg: Color::Reset,
         header_fg: Color::Rgb(250, 189, 47),
         border_fg: Color::Rgb(146, 131, 116),
         border_type: BorderType::Plain,

@@ -2056,6 +2056,7 @@ async fn run_app(
 
 fn draw_mode_select(f: &mut Frame, theme: &theme::ThemeDef, tool_mode: ToolMode) {
     let palette = theme.palette;
+    render_theme_background(f, palette);
     let area = f.area();
 
     let chunks = Layout::default()
@@ -2798,6 +2799,13 @@ fn draw_ngrok_auth_setup(
     f.render_widget(footer, modal_chunks[2]);
 }
 
+fn render_theme_background(f: &mut Frame, palette: theme::Palette) {
+    f.render_widget(
+        Block::default().style(Style::default().bg(palette.background_bg)),
+        f.area(),
+    );
+}
+
 fn render_toast(f: &mut Frame, palette: theme::Palette, msg: &str, pos: (u16, u16)) {
     let area = f.area();
     let (col, row) = pos;
@@ -3488,6 +3496,7 @@ fn draw_workspaces(f: &mut Frame, view: WorkspacesView<'_>, hit_areas: &mut Work
         confirm_remove,
     } = view;
     let palette = current_theme.palette;
+    render_theme_background(f, palette);
     let area = f.area();
     let outer = Layout::default()
         .direction(Direction::Vertical)
@@ -3956,6 +3965,7 @@ fn draw_settings(f: &mut Frame, view: SettingsView<'_>) {
     let tool_modes = ToolMode::all();
     let palette = current_theme.palette;
     let cost_estimate = estimate_gpt_5_6_sol_tool_cost(usage_totals);
+    render_theme_background(f, palette);
     let area = f.area();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -4456,6 +4466,7 @@ fn draw_browser_select(
     theme: &theme::ThemeDef,
 ) {
     let palette = theme.palette;
+    render_theme_background(f, palette);
     let area = f.area();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -6192,7 +6203,8 @@ fn draw_quit_confirm(
         .title(" Stop MoonDesk? ")
         .borders(Borders::ALL)
         .border_type(palette.border_type)
-        .border_style(Style::default().fg(palette.danger_fg));
+        .border_style(Style::default().fg(palette.danger_fg))
+        .style(Style::default().bg(palette.modal_bg));
     let inner = block.inner(area).inner(Margin {
         horizontal: 2,
         vertical: 1,
@@ -6394,7 +6406,8 @@ fn draw_update_confirm(
         .title(" Update MoonDesk ")
         .borders(Borders::ALL)
         .border_type(palette.border_type)
-        .border_style(Style::default().fg(palette.warning_fg));
+        .border_style(Style::default().fg(palette.warning_fg))
+        .style(Style::default().bg(palette.modal_bg));
     let inner = block.inner(area).inner(Margin {
         horizontal: 2,
         vertical: 1,
@@ -6590,7 +6603,8 @@ fn draw_changelog_notice(f: &mut Frame, theme: &theme::ThemeDef, notice: &update
         .title(" MoonDesk Updated ")
         .borders(Borders::ALL)
         .border_type(palette.border_type)
-        .border_style(Style::default().fg(palette.success_fg));
+        .border_style(Style::default().fg(palette.success_fg))
+        .style(Style::default().bg(palette.modal_bg));
     let inner = block.inner(area).inner(Margin {
         horizontal: 2,
         vertical: 1,
@@ -6867,6 +6881,7 @@ fn draw_ui(f: &mut Frame, context: UiRenderContext<'_>) {
     } = context;
     *dashboard_hit_areas = DashboardHitAreas::default();
     let palette = app.current_theme().palette;
+    render_theme_background(f, palette);
     let area = f.area();
     let now_millis = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -9853,5 +9868,36 @@ mod tests {
                 })
                 .unwrap_or_else(|error| panic!("render theme {}: {error}", theme.id));
         }
+    }
+
+    #[test]
+    fn paper_settings_render_keeps_background_under_borders_and_text() {
+        let usage = super::UsageTotals::default();
+        let tool_mode = super::ToolMode::all()[0];
+        let theme = super::theme::resolve("paper");
+        let backend = TestBackend::new(100, 32);
+        let mut terminal = Terminal::new(backend).expect("create paper settings terminal");
+
+        terminal
+            .draw(|frame| {
+                super::draw_settings(
+                    frame,
+                    super::SettingsView {
+                        current_theme: theme,
+                        current_tool_mode: tool_mode,
+                        set_moondesk_as_co_author: false,
+                        ngrok_domain: None,
+                        usage_totals: &usage,
+                        selected_row: super::theme::all().len() - 1,
+                        confirm_reset_token_billing: false,
+                    },
+                )
+            })
+            .expect("render paper settings");
+
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(0, 0)].bg, theme.palette.background_bg);
+        assert_eq!(buffer[(5, 1)].bg, theme.palette.background_bg);
+        assert_eq!(buffer[(99, 31)].bg, theme.palette.background_bg);
     }
 }

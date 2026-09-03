@@ -8,6 +8,7 @@ pub const THEME: ThemeDef = ThemeDef {
     label: "matrix",
     description: "Near-black terminal look with layered green accents.",
     palette: Palette {
+        background_bg: Color::Reset,
         header_fg: Color::Rgb(0, 255, 102),
         border_fg: Color::Rgb(0, 128, 64),
         border_type: BorderType::Double,

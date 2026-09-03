@@ -8,6 +8,7 @@ pub const THEME: ThemeDef = ThemeDef {
     label: "concise",
     description: "Black/gray/white minimal UI with low color usage.",
     palette: Palette {
+        background_bg: Color::Reset,
         header_fg: Color::White,
         border_fg: Color::DarkGray,
         border_type: BorderType::Plain,

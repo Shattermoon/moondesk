@@ -8,6 +8,7 @@ pub const THEME: ThemeDef = ThemeDef {
     label: "dracula",
     description: "Dark purple with vivid pink, cyan, and green accents.",
     palette: Palette {
+        background_bg: Color::Reset,
         header_fg: Color::Rgb(189, 147, 249),
         border_fg: Color::Rgb(98, 114, 164),
         border_type: BorderType::Rounded,

@@ -3,7 +3,7 @@ mod dracula;
 mod gruvbox;
 mod matrix;
 mod neon;
-mod nord;
+mod paper;
 mod tokyo_night;
 
 use ratatui::style::Color;
@@ -11,6 +11,7 @@ use ratatui::widgets::BorderType;
 
 #[derive(Clone, Copy)]
 pub struct Palette {
+    pub background_bg: Color,
     pub header_fg: Color,
     pub border_fg: Color,
     pub border_type: BorderType,
@@ -47,8 +48,8 @@ const THEMES: [ThemeDef; 7] = [
     tokyo_night::THEME,
     dracula::THEME,
     gruvbox::THEME,
-    nord::THEME,
     matrix::THEME,
+    paper::THEME,
 ];
 
 pub fn all() -> &'static [ThemeDef] {
@@ -88,5 +89,19 @@ mod tests {
     #[test]
     fn unknown_theme_falls_back_to_default() {
         assert_eq!(resolve("not-a-theme").id, DEFAULT_THEME_ID);
+    }
+
+    #[test]
+    fn paper_is_the_only_full_background_theme_and_stays_last() {
+        let themes = all();
+        let paper = themes.last().expect("paper theme is registered last");
+        assert_eq!(paper.id, "paper");
+        assert_ne!(paper.palette.background_bg, Color::Reset);
+        assert_eq!(paper.palette.border_type, BorderType::Thick);
+        assert!(
+            themes[..themes.len() - 1]
+                .iter()
+                .all(|theme| theme.palette.background_bg == Color::Reset)
+        );
     }
 }

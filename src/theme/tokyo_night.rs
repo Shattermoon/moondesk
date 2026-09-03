@@ -8,6 +8,7 @@ pub const THEME: ThemeDef = ThemeDef {
     label: "tokyo night",
     description: "Deep navy with cool blue, violet, and cyan accents.",
     palette: Palette {
+        background_bg: Color::Reset,
         header_fg: Color::Rgb(122, 162, 247),
         border_fg: Color::Rgb(86, 95, 137),
         border_type: BorderType::Rounded,

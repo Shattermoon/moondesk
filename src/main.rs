@@ -4244,7 +4244,7 @@ fn draw_settings(f: &mut Frame, view: SettingsView<'_>) {
         Span::raw(if confirm_reset_token_billing {
             " Confirm reset  "
         } else {
-            " Reset token billing  "
+            " Reset tool token totals  "
         }),
         Span::styled("[q/Esc]", Style::default().fg(palette.danger_fg)),
         Span::raw(" Back"),

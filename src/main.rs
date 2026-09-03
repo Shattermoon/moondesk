@@ -9964,6 +9964,44 @@ mod tests {
     }
 
     #[test]
+    fn paper_ngrok_overlays_keep_modal_colors_after_clear() {
+        let theme = super::theme::resolve("paper");
+
+        let backend = TestBackend::new(100, 32);
+        let mut terminal = Terminal::new(backend).expect("create paper ngrok domain terminal");
+        terminal
+            .draw(|frame| {
+                super::draw_mode_select(frame, theme, super::ToolMode::MultiTools);
+                super::draw_ngrok_domain_setup(
+                    frame,
+                    theme,
+                    frame.area(),
+                    "example.ngrok-free.app",
+                    None,
+                );
+            })
+            .expect("render paper ngrok domain overlay");
+        assert_paper_frame_has_no_reset_colors(terminal.backend().buffer());
+
+        let backend = TestBackend::new(100, 32);
+        let mut terminal = Terminal::new(backend).expect("create paper ngrok auth terminal");
+        terminal
+            .draw(|frame| {
+                super::draw_mode_select(frame, theme, super::ToolMode::MultiTools);
+                super::draw_ngrok_auth_setup(
+                    frame,
+                    theme,
+                    frame.area(),
+                    "unused-config-path",
+                    "ngrok_••••••••",
+                    None,
+                );
+            })
+            .expect("render paper ngrok auth overlay");
+        assert_paper_frame_has_no_reset_colors(terminal.backend().buffer());
+    }
+
+    #[test]
     fn paper_standalone_dialogs_keep_full_frame_and_visible_text_themed() {
         let theme = super::theme::resolve("paper");
         let update_info = super::update::UpdateInfo {

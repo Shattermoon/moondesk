@@ -8,6 +8,7 @@ pub const THEME: ThemeDef = ThemeDef {
     label: "neon",
     description: "Cyberpunk pink accents with neon highlights.",
     palette: Palette {
+        background_bg: Color::Reset,
         header_fg: Color::LightMagenta,
         border_fg: Color::Magenta,
         border_type: BorderType::Rounded,
@@ -24,5 +25,7 @@ pub const THEME: ThemeDef = ThemeDef {
         selection_fg: Color::White,
         toast_bg: Color::LightMagenta,
         toast_fg: Color::Black,
+        modal_bg: Color::Rgb(30, 16, 36),
+        modal_fg: Color::Rgb(245, 238, 255),
     },
 };

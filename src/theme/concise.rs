@@ -8,6 +8,7 @@ pub const THEME: ThemeDef = ThemeDef {
     label: "concise",
     description: "Black/gray/white minimal UI with low color usage.",
     palette: Palette {
+        background_bg: Color::Reset,
         header_fg: Color::White,
         border_fg: Color::DarkGray,
         border_type: BorderType::Plain,
@@ -24,5 +25,7 @@ pub const THEME: ThemeDef = ThemeDef {
         selection_fg: Color::White,
         toast_bg: Color::White,
         toast_fg: Color::Black,
+        modal_bg: Color::Rgb(24, 24, 24),
+        modal_fg: Color::Rgb(232, 232, 232),
     },
 };

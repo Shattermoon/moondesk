@@ -1850,22 +1850,26 @@ pub(crate) async fn send_browser_cli_request_to_host(
         .bytes()
         .await
         .map_err(|error| format!("Could not read MoonDesk browser host response: {error}"))?;
-    let payload: serde_json::Value = serde_json::from_slice(&bytes)
-        .map_err(|error| format!("MoonDesk browser host returned invalid JSON: {error}"))?;
+    if status == reqwest::StatusCode::NOT_FOUND {
+        return Err(
+            "The running MoonDesk host does not expose the browser command route. Update and restart MoonDesk so the host and `moondesk browser` client use the same version."
+                .to_string(),
+        );
+    }
+    let payload = serde_json::from_slice::<serde_json::Value>(&bytes);
     if !status.is_success() {
         let message = payload
-            .get("error")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("browser command was rejected");
-        if status == reqwest::StatusCode::NOT_FOUND {
-            return Err(
-                "The running MoonDesk host does not expose the browser command route. Update and restart MoonDesk so the host and `moondesk browser` client use the same version."
-                    .to_string(),
-            );
-        }
+            .ok()
+            .and_then(|payload| {
+                payload
+                    .get("error")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| "browser command was rejected with a non-JSON response".to_string());
         return Err(format!("{message} (HTTP {status})"));
     }
-    Ok(payload)
+    payload.map_err(|error| format!("MoonDesk browser host returned invalid JSON: {error}"))
 }
 
 async fn run_browser_cli(command: String, args: Vec<String>) -> Result<i32, String> {
@@ -7627,6 +7631,53 @@ mod tests {
         );
         assert!(super::browser_cli_usage().contains("moondesk browser emulate"));
         assert!(super::BROWSER_SKILL.contains("# MoonDesk Browser"));
+    }
+
+    #[tokio::test]
+    async fn browser_cli_reports_old_host_route_before_parsing_an_empty_response() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake old MoonDesk host");
+        let port = listener.local_addr().expect("fake host address").port();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept browser CLI request");
+            let mut request = vec![0u8; 4096];
+            let _ = stream
+                .read(&mut request)
+                .await
+                .expect("read browser CLI request");
+            stream
+                .write_all(
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .expect("write old-host response");
+        });
+
+        let error = super::send_browser_cli_request_to_host(
+            port,
+            "test-token",
+            std::path::Path::new("."),
+            "take_snapshot",
+            &[],
+        )
+        .await
+        .expect_err("old host without browser route must be rejected");
+        assert!(
+            error.contains("does not expose the browser command route"),
+            "unexpected old-host error: {error}"
+        );
+        assert!(
+            error.contains("same version"),
+            "unexpected old-host error: {error}"
+        );
+        assert!(
+            !error.contains("invalid JSON"),
+            "unexpected old-host error: {error}"
+        );
+        server.await.expect("fake host task");
     }
 
     #[test]

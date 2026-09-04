@@ -8,6 +8,9 @@ use tokio::sync::Mutex;
 use crate::command_jobs::process_is_live;
 use crate::state::SharedState;
 
+// Keep this exact pin until MoonDesk's browser command contract is deliberately migrated and
+// re-tested. chrome-devtools-mcp 1.8.0 changed required CLI argument shapes (including commands
+// MoonDesk currently invokes with 1.7-style optional flags), so it is not a drop-in upgrade.
 pub const CHROME_DEVTOOLS_PACKAGE_VERSION: &str = "1.7.0";
 pub const CHROME_DEVTOOLS_SESSION_ID: &str = "6d6f6f6e6465736b";
 pub const DEFAULT_BROWSER_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);

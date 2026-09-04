@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use subtle::ConstantTimeEq;
 
-use crate::browser_runtime::BrowserRuntime;
+use crate::browser_runtime::{BrowserRuntime, DEFAULT_BROWSER_COMMAND_TIMEOUT};
 use crate::command_jobs::CommandJobManager;
 use crate::mcp::{self, JsonRpcRequest};
 use crate::state::{
@@ -30,7 +30,12 @@ use uuid::Uuid;
 const STATELESS_FLOW_ID: &str = "stateless";
 const STATELESS_FLOW_LABEL: &str = "stateless";
 const MAX_HOST_CONTROL_BODY_BYTES: usize = 16 * 1024;
+const MAX_HOST_BROWSER_CONTROL_BODY_BYTES: usize = 128 * 1024;
+const MAX_HOST_BROWSER_COMMAND_BYTES: usize = 128;
+const MAX_HOST_BROWSER_ARGS: usize = 64;
+const MAX_HOST_BROWSER_ARG_BYTES: usize = 8 * 1024;
 pub const HOST_CONTROL_ROUTE: &str = "/__moondesk/workspaces";
+pub const HOST_BROWSER_CONTROL_ROUTE: &str = "/__moondesk/browser";
 pub const HOST_CONTROL_HEADER: &str = "x-moondesk-host-token";
 
 #[derive(Clone)]
@@ -150,6 +155,11 @@ pub fn router(
             HOST_CONTROL_ROUTE,
             post(register_workspace_from_local_host)
                 .layer(DefaultBodyLimit::max(MAX_HOST_CONTROL_BODY_BYTES)),
+        )
+        .route(
+            HOST_BROWSER_CONTROL_ROUTE,
+            post(run_browser_command_from_local_host)
+                .layer(DefaultBodyLimit::max(MAX_HOST_BROWSER_CONTROL_BODY_BYTES)),
         )
         .merge(mcp_routes)
         .with_state(state)
@@ -495,6 +505,16 @@ struct HostWorkspaceRegistrationRequest {
     name: Option<String>,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HostBrowserControlRequest {
+    cwd: String,
+    command: String,
+    #[serde(default)]
+    args: Vec<String>,
+    timeout_ms: Option<u64>,
+}
+
 fn host_control_authorized(headers: &HeaderMap, expected_token: &str) -> bool {
     let Some(candidate) = headers
         .get(HOST_CONTROL_HEADER)
@@ -503,6 +523,116 @@ fn host_control_authorized(headers: &HeaderMap, expected_token: &str) -> bool {
         return false;
     };
     candidate.as_bytes().ct_eq(expected_token.as_bytes()).into()
+}
+
+async fn run_browser_command_from_local_host(
+    State(s): State<ServerState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response<Body> {
+    if !host_control_authorized(&headers, &s.host_control_token) {
+        return not_found_response();
+    }
+    if body.len() > MAX_HOST_BROWSER_CONTROL_BODY_BYTES {
+        return response_with_body(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "application/json",
+            Body::from(r#"{"error":"request too large"}"#),
+        );
+    }
+
+    let request: HostBrowserControlRequest = match serde_json::from_slice(&body) {
+        Ok(request) => request,
+        Err(_) => {
+            return response_with_body(
+                StatusCode::BAD_REQUEST,
+                "application/json",
+                Body::from(r#"{"error":"invalid request"}"#),
+            );
+        }
+    };
+    let command = request.command.trim();
+    if command.is_empty() || command.len() > MAX_HOST_BROWSER_COMMAND_BYTES {
+        return response_with_body(
+            StatusCode::BAD_REQUEST,
+            "application/json",
+            Body::from(r#"{"error":"command must be between 1 and 128 bytes"}"#),
+        );
+    }
+    if request.args.len() > MAX_HOST_BROWSER_ARGS
+        || request
+            .args
+            .iter()
+            .any(|arg| arg.len() > MAX_HOST_BROWSER_ARG_BYTES)
+    {
+        return response_with_body(
+            StatusCode::BAD_REQUEST,
+            "application/json",
+            Body::from(r#"{"error":"browser command arguments exceed the allowed bounds"}"#),
+        );
+    }
+    let timeout_ms = request
+        .timeout_ms
+        .unwrap_or(DEFAULT_BROWSER_COMMAND_TIMEOUT.as_millis() as u64);
+    if !(1..=120_000).contains(&timeout_ms) {
+        return response_with_body(
+            StatusCode::BAD_REQUEST,
+            "application/json",
+            Body::from(r#"{"error":"timeoutMs must be between 1 and 120000"}"#),
+        );
+    }
+    let cwd = PathBuf::from(request.cwd);
+    if !cwd.is_absolute() || !cwd.is_dir() {
+        return response_with_body(
+            StatusCode::BAD_REQUEST,
+            "application/json",
+            Body::from(r#"{"error":"cwd must be an existing absolute directory"}"#),
+        );
+    }
+    let Some(runtime) = s.browser_runtime.as_ref() else {
+        return response_with_body(
+            StatusCode::CONFLICT,
+            "application/json",
+            Body::from(
+                r#"{"error":"browser runtime is unavailable; restart MoonDesk in Browser or Both mode"}"#,
+            ),
+        );
+    };
+
+    match runtime
+        .run(
+            &cwd.to_string_lossy(),
+            command,
+            &request.args,
+            Duration::from_millis(timeout_ms),
+        )
+        .await
+    {
+        Ok(output) => {
+            let success = output.success();
+            let exit_code = if success { 0 } else { output.exit_code.max(1) };
+            response_with_body(
+                StatusCode::OK,
+                "application/json",
+                Body::from(
+                    json!({
+                        "success": success,
+                        "stdout": output.stdout,
+                        "stderr": output.stderr,
+                        "exitCode": exit_code,
+                        "restarted": output.restarted,
+                        "failureDetails": (!success).then(|| output.failure_details())
+                    })
+                    .to_string(),
+                ),
+            )
+        }
+        Err(error) => response_with_body(
+            StatusCode::BAD_GATEWAY,
+            "application/json",
+            Body::from(json!({"error": error}).to_string()),
+        ),
+    }
 }
 
 fn host_workspace_add_error_status(error: &AddWorkspaceError) -> StatusCode {
@@ -1033,6 +1163,39 @@ mod tests {
         )
     }
 
+    async fn host_browser_request(
+        address: std::net::SocketAddr,
+        cwd: &std::path::Path,
+        command: &str,
+        args: &[&str],
+    ) -> Value {
+        let owned_args = args
+            .iter()
+            .map(|value| (*value).to_string())
+            .collect::<Vec<_>>();
+        crate::send_browser_cli_request_to_host(
+            address.port(),
+            "test-host-control-token",
+            cwd,
+            command,
+            &owned_args,
+        )
+        .await
+        .unwrap_or_else(|error| panic!("host browser request {command} failed: {error}"))
+    }
+
+    fn snapshot_uid(snapshot: &str, needle: &str) -> String {
+        let line = snapshot
+            .lines()
+            .find(|line| line.contains(needle))
+            .unwrap_or_else(|| panic!("snapshot did not contain {needle:?}:\n{snapshot}"));
+        line.trim_start()
+            .strip_prefix("uid=")
+            .and_then(|value| value.split_whitespace().next())
+            .unwrap_or_else(|| panic!("snapshot line did not start with uid=: {line}"))
+            .to_string()
+    }
+
     #[test]
     fn host_workspace_registration_maps_internal_persistence_failures_to_500() {
         let validation = AddWorkspaceError::Validation("bad workspace".into());
@@ -1087,6 +1250,72 @@ mod tests {
             .await
             .expect("send oversized host-control request");
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        server.abort();
+        let _ = server.await;
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_dir_all(config_root);
+        let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn host_browser_route_requires_host_token_and_browser_mode() {
+        let workspace_root = unique_temp_path("moondesk-host-browser-auth-workspace");
+        let config_root = unique_temp_path("moondesk-host-browser-auth-config");
+        let config_path = config_root.join("config.toml");
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        std::fs::create_dir_all(&config_root).expect("create config dir");
+
+        let app = AppState::new_for_test(
+            8787,
+            workspace_root.to_string_lossy().into_owned(),
+            config_path.clone(),
+        )
+        .expect("create app state");
+        let app_state = Arc::new(Mutex::new(app));
+        let (ui_tx, _ui_rx) = ui_event_channel();
+        let app = router(
+            app_state,
+            None,
+            CommandJobManager::new(),
+            ui_tx,
+            Arc::from("test-host-control-token"),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let address = listener.local_addr().expect("test server address");
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let body = json!({
+            "cwd": workspace_root.to_string_lossy(),
+            "command": "list_pages",
+            "args": []
+        });
+        let client = reqwest::Client::new();
+
+        let denied_body = serde_json::to_vec(&body).expect("serialize denied browser request");
+        let denied = client
+            .post(format!("http://{address}{HOST_BROWSER_CONTROL_ROUTE}"))
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(denied_body)
+            .send()
+            .await
+            .expect("send unauthenticated browser request");
+        assert_eq!(denied.status(), StatusCode::NOT_FOUND);
+
+        let unavailable_body =
+            serde_json::to_vec(&body).expect("serialize unavailable browser request");
+        let unavailable = client
+            .post(format!("http://{address}{HOST_BROWSER_CONTROL_ROUTE}"))
+            .header(HOST_CONTROL_HEADER, "test-host-control-token")
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(unavailable_body)
+            .send()
+            .await
+            .expect("send authenticated browser request");
+        assert_eq!(unavailable.status(), StatusCode::CONFLICT);
 
         server.abort();
         let _ = server.await;
@@ -1673,6 +1902,310 @@ mod tests {
         let _ = std::fs::remove_file(config_path);
         let _ = std::fs::remove_dir_all(workspace_root);
         let _ = std::fs::remove_dir_all(config_root);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    #[ignore = "serialized Windows host browser CLI/session/vision smoke"]
+    async fn windows_host_browser_cli_and_mcp_view_page_share_one_session() {
+        use axum::response::Html;
+        use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+
+        let workspace_root = unique_temp_path("moondesk-host-browser-e2e-workspace");
+        let config_root = unique_temp_path("moondesk-host-browser-e2e-config");
+        let config_path = config_root.join("config.toml");
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        std::fs::create_dir_all(&config_root).expect("create config dir");
+
+        let mut app = AppState::new_for_test(
+            8787,
+            workspace_root.to_string_lossy().into_owned(),
+            config_path.clone(),
+        )
+        .expect("create app state");
+        app.mode = Mode::Both;
+        app.tool_mode = ToolMode::MultiTools;
+        let mcp_slug = app.mcp_slug.clone();
+        let app_state = Arc::new(Mutex::new(app));
+        let runtime = Arc::new(BrowserRuntime::new(app_state.clone()));
+        let (ui_tx, _ui_rx) = ui_event_channel();
+        let host_app = router(
+            app_state,
+            Some(runtime.clone()),
+            CommandJobManager::new(),
+            ui_tx,
+            Arc::from("test-host-control-token"),
+        );
+        let host_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind MoonDesk host");
+        let host_address = host_listener.local_addr().expect("MoonDesk host address");
+        let host_server = tokio::spawn(async move {
+            let _ = axum::serve(host_listener, host_app).await;
+        });
+
+        const SITE_HTML: &str = r#"<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>MoonDesk Host Browser E2E</title>
+<style>body{font-family:sans-serif;margin:0;background:rgb(24,52,80);color:white}header{position:sticky;top:0;background:rgb(24,52,80);padding:12px}.spacer{height:1800px}main{padding:16px}</style></head>
+<body><header>MoonDesk Host Browser E2E</header><main>
+<label>Name <input id="name" placeholder="Type here"></label>
+<button id="toggle" type="button">Toggle state</button><strong id="state">OFF</strong>
+<div class="spacer"></div><div id="bottom">BOTTOM MARKER</div></main>
+<script>
+console.log('MOONDESK_E2E_READY');
+fetch('/ping').then(r=>r.text()).then(value=>console.log('MOONDESK_E2E_PING:'+value));
+document.getElementById('toggle').addEventListener('click',()=>{const s=document.getElementById('state');s.textContent=s.textContent==='OFF'?'ON':'OFF';});
+</script>
+</body></html>"#;
+        let site_app = Router::new()
+            .route("/", get(|| async { Html(SITE_HTML) }))
+            .route("/ping", get(|| async { "pong" }));
+        let site_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local test site");
+        let site_address = site_listener.local_addr().expect("local test site address");
+        let site_server = tokio::spawn(async move {
+            let _ = axum::serve(site_listener, site_app).await;
+        });
+        let site_url = format!("http://{site_address}/");
+        let navigation_arg = format!("--url={site_url}");
+
+        let navigate = host_browser_request(
+            host_address,
+            &workspace_root,
+            "navigate_page",
+            &[navigation_arg.as_str()],
+        )
+        .await;
+        assert_eq!(navigate.get("success").and_then(Value::as_bool), Some(true));
+
+        // This is intentionally a second independent request. The previous standalone CLI
+        // architecture lost the page here because each shell command owned its own daemon tree.
+        let snapshot =
+            host_browser_request(host_address, &workspace_root, "take_snapshot", &[]).await;
+        assert_eq!(snapshot.get("success").and_then(Value::as_bool), Some(true));
+        let snapshot_text = snapshot
+            .get("stdout")
+            .and_then(Value::as_str)
+            .expect("snapshot stdout");
+        assert!(snapshot_text.contains("MoonDesk Host Browser E2E"));
+        assert!(snapshot_text.contains(&site_url));
+        assert!(!snapshot_text.contains("url=\"about:blank\""));
+
+        // resize_page changes the desktop browser window; Chromium may clamp very narrow window
+        // sizes. Use it for a desktop viewport, then use DevTools viewport emulation for exact
+        // tablet/mobile responsive checks.
+        let desktop_resize = host_browser_request(
+            host_address,
+            &workspace_root,
+            "resize_page",
+            &["1280", "800"],
+        )
+        .await;
+        assert_eq!(
+            desktop_resize.get("success").and_then(Value::as_bool),
+            Some(true)
+        );
+        let desktop_inspection = host_browser_request(
+            host_address,
+            &workspace_root,
+            "evaluate_script",
+            &["() => ({width: innerWidth, height: innerHeight})"],
+        )
+        .await;
+        let desktop_text = desktop_inspection
+            .get("stdout")
+            .and_then(Value::as_str)
+            .expect("desktop inspection stdout");
+        assert!(
+            desktop_text.contains("1280"),
+            "unexpected desktop viewport: {desktop_text}"
+        );
+
+        let tablet = host_browser_request(
+            host_address,
+            &workspace_root,
+            "emulate",
+            &["--viewport=768x1024x1,touch"],
+        )
+        .await;
+        assert_eq!(tablet.get("success").and_then(Value::as_bool), Some(true));
+        let tablet_inspection = host_browser_request(
+            host_address,
+            &workspace_root,
+            "evaluate_script",
+            &["() => ({width: innerWidth, height: innerHeight})"],
+        )
+        .await;
+        let tablet_text = tablet_inspection
+            .get("stdout")
+            .and_then(Value::as_str)
+            .expect("tablet inspection stdout");
+        for expected in ["768", "1024"] {
+            assert!(
+                tablet_text.contains(expected),
+                "unexpected tablet viewport: {tablet_text}"
+            );
+        }
+
+        let mobile = host_browser_request(
+            host_address,
+            &workspace_root,
+            "emulate",
+            &["--viewport=390x844x1,mobile,touch"],
+        )
+        .await;
+        assert_eq!(mobile.get("success").and_then(Value::as_bool), Some(true));
+
+        // Viewport emulation can recreate the page context. Treat it like navigation: take a
+        // fresh snapshot before using DOM UIDs, then perform interactions in the final viewport.
+        let mobile_snapshot =
+            host_browser_request(host_address, &workspace_root, "take_snapshot", &[]).await;
+        assert_eq!(
+            mobile_snapshot.get("success").and_then(Value::as_bool),
+            Some(true)
+        );
+        let mobile_snapshot_text = mobile_snapshot
+            .get("stdout")
+            .and_then(Value::as_str)
+            .expect("mobile snapshot stdout");
+        assert!(mobile_snapshot_text.contains("MoonDesk Host Browser E2E"));
+        let input_uid = snapshot_uid(mobile_snapshot_text, "textbox");
+        let button_uid = snapshot_uid(mobile_snapshot_text, "button \"Toggle state\"");
+        let fill = host_browser_request(
+            host_address,
+            &workspace_root,
+            "fill",
+            &[input_uid.as_str(), "agent-check"],
+        )
+        .await;
+        assert_eq!(fill.get("success").and_then(Value::as_bool), Some(true));
+        let click = host_browser_request(
+            host_address,
+            &workspace_root,
+            "click",
+            &[button_uid.as_str()],
+        )
+        .await;
+        assert_eq!(click.get("success").and_then(Value::as_bool), Some(true));
+
+        let end = host_browser_request(host_address, &workspace_root, "press_key", &["End"]).await;
+        assert_eq!(end.get("success").and_then(Value::as_bool), Some(true));
+
+        let inspect_script = "() => ({width: innerWidth, height: innerHeight, value: document.querySelector('#name').value, state: document.querySelector('#state').textContent, scrolled: scrollY > 500})";
+        let inspection = host_browser_request(
+            host_address,
+            &workspace_root,
+            "evaluate_script",
+            &[inspect_script],
+        )
+        .await;
+        assert_eq!(
+            inspection.get("success").and_then(Value::as_bool),
+            Some(true)
+        );
+        let inspection_text = inspection
+            .get("stdout")
+            .and_then(Value::as_str)
+            .expect("inspection stdout");
+        for expected in ["390", "844", "agent-check", "ON", "true"] {
+            assert!(
+                inspection_text.contains(expected),
+                "inspection did not contain {expected:?}: {inspection_text}"
+            );
+        }
+
+        let console =
+            host_browser_request(host_address, &workspace_root, "list_console_messages", &[]).await;
+        assert_eq!(console.get("success").and_then(Value::as_bool), Some(true));
+        let console_text = console
+            .get("stdout")
+            .and_then(Value::as_str)
+            .expect("console inspection stdout");
+        assert!(
+            console_text.contains("MOONDESK_E2E_READY"),
+            "browser console inspection missed page logs: {console_text}"
+        );
+
+        let network =
+            host_browser_request(host_address, &workspace_root, "list_network_requests", &[]).await;
+        assert_eq!(network.get("success").and_then(Value::as_bool), Some(true));
+        let network_text = network
+            .get("stdout")
+            .and_then(Value::as_str)
+            .expect("network inspection stdout");
+        assert!(
+            network_text.contains("/ping"),
+            "browser network inspection missed the local project request: {network_text}"
+        );
+
+        let mcp_body = serde_json::to_vec(&json!({
+            "jsonrpc": "2.0",
+            "id": "view-after-cli",
+            "method": "tools/call",
+            "params": {
+                "name": "view_page",
+                "arguments": { "full_page": false, "quality": 82 }
+            }
+        }))
+        .expect("serialize MCP view_page request");
+        let mcp_response = reqwest::Client::new()
+            .post(format!("http://{host_address}/{mcp_slug}/mcp"))
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(mcp_body)
+            .send()
+            .await
+            .expect("send MCP view_page after CLI actions");
+        assert_eq!(mcp_response.status(), StatusCode::OK);
+        let mcp_bytes = mcp_response
+            .bytes()
+            .await
+            .expect("read MCP view_page response body");
+        let payload: Value =
+            serde_json::from_slice(&mcp_bytes).expect("parse MCP view_page response");
+        assert_eq!(
+            payload
+                .pointer("/result/content/0/type")
+                .and_then(Value::as_str),
+            Some("image")
+        );
+        let image_bytes = payload
+            .pointer("/result/content/0/data")
+            .and_then(Value::as_str)
+            .and_then(|data| BASE64_STANDARD.decode(data).ok())
+            .expect("decode MCP page image");
+        let image = image::load_from_memory(&image_bytes).expect("decode MCP page image pixels");
+        assert_eq!(image.width(), 390);
+        assert!(
+            image.height() >= 800 && image.height() <= 900,
+            "unexpected mobile viewport screenshot height: {}",
+            image.height()
+        );
+        let rgb = image.to_rgb8();
+        let pixel = rgb.get_pixel(380, 700).0;
+        for (actual, expected) in pixel.into_iter().zip([24u8, 52, 80]) {
+            assert!(
+                actual.abs_diff(expected) <= 24,
+                "view_page did not show the manipulated local page background: pixel={pixel:?}"
+            );
+        }
+        assert_eq!(
+            payload
+                .pointer("/result/structuredContent/width")
+                .and_then(Value::as_u64),
+            Some(390)
+        );
+
+        runtime
+            .stop_if_owned(&workspace_root.to_string_lossy())
+            .await;
+        host_server.abort();
+        site_server.abort();
+        let _ = host_server.await;
+        let _ = site_server.await;
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_dir_all(config_root);
+        let _ = std::fs::remove_dir_all(workspace_root);
     }
 
     #[tokio::test]

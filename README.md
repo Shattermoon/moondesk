@@ -155,18 +155,19 @@ Browser mode has a stable tool catalog instead of forwarding the full Chrome Dev
 | `browser_command` | Run one browser/DevTools CLI operation in the shared lazy session |
 | `view_page` | Attach the current rendered page directly to the model as bounded image content |
 
-For one-off actions, use `browser_command`. Start with `take_snapshot` before element interactions and use UIDs from the latest snapshot. For visual layout/rendering checks, use `view_page`; text/accessibility snapshots do not replace pixel inspection.
+For one-off actions, use `browser_command`. Navigate first, set the target viewport, then run `take_snapshot` before element interactions and use UIDs from the latest snapshot. Use `resize_page` for ordinary desktop window sizes. For exact tablet/mobile QA, use `emulate --viewport=390x844x1,mobile,touch` (or another target size); Chromium can clamp very narrow desktop windows, and viewport emulation can recreate the page context, so take a fresh snapshot afterward. For visual layout/rendering checks, use `view_page`; text/accessibility snapshots do not replace pixel inspection.
 
-When MoonDesk is installed globally, it also provides `moondesk-browser` for deterministic scripted flows in `Both` mode:
+The same `moondesk` CLI also has a `browser` subcommand for deterministic scripted flows in `Both` mode:
 
 ```bash
-moondesk-browser skill
-moondesk-browser navigate_page --url=http://localhost:3000
-moondesk-browser take_snapshot
-moondesk-browser list_console_messages
+moondesk browser skill
+moondesk browser navigate_page --url=http://localhost:3000
+moondesk browser emulate --viewport=390x844x1,mobile,touch
+moondesk browser take_snapshot
+moondesk browser list_console_messages
 ```
 
-The CLI invokes the verified MoonDesk native binary and therefore uses the same pinned browser runtime/session as MCP; it does not expose another DevTools implementation. MoonDesk scopes that daemon to its own Chrome DevTools CLI session so unrelated `chrome-devtools` users are not reused or stopped. Each agent-browser session uses an isolated temporary profile, so personal cookies/logins are never inherited and browser state is discarded when that session ends. Sensitive network headers are redacted, CrUX URL lookups and usage statistics are disabled, and a dead browser/daemon is recreated automatically with the same safe isolated settings.
+The `browser` subcommand is handled by MoonDesk itself and acts as a lightweight authenticated localhost client to the **running MoonDesk host**. There is no second browser executable. It does not start or own another browser daemon, so separate shell commands, MCP `browser_command`, and MCP `view_page` all operate on the same host-owned agent-browser session. MoonDesk scopes the underlying DevTools daemon to its own session so unrelated `chrome-devtools` users are not reused or stopped. Each agent-browser session uses an isolated temporary profile, so personal cookies/logins are never inherited and browser state is discarded when that session ends. Sensitive network headers are redacted, CrUX URL lookups and usage statistics are disabled, and a dead browser/daemon is recreated automatically with the same safe isolated settings.
 
 ## Workspace security
 

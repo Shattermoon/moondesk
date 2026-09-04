@@ -566,11 +566,11 @@ async fn handle_tools_list(
         tools.push(json!({
             "name": "browser_command",
             "title": "Run browser command",
-            "description": "Run one Chrome DevTools CLI browser operation against MoonDesk's shared lazy browser session. The browser starts only on the first browser operation and is reused across commands. Use command names such as list_pages, new_page, navigate_page, take_snapshot, click, fill, type_text, press_key, hover, drag, resize_page, emulate, evaluate_script, list_console_messages, list_network_requests, lighthouse_audit, or performance_start_trace. In read-only mode MoonDesk permits only bounded inspection commands and rejects state-changing actions or browser file-output flags. MoonDesk manages start/status/stop automatically.",
+            "description": "Run one Chrome DevTools CLI browser operation against MoonDesk's shared lazy agent-browser session. The browser starts only on the first browser operation and is reused across commands. Use resize_page for normal desktop window sizes; use emulate with --viewport=<width>x<height>x<dpr>[,mobile][,touch] for exact tablet/mobile responsive testing, then take a fresh snapshot before using UIDs. Other useful commands include list_pages, new_page, navigate_page, take_snapshot, click, fill, type_text, press_key, hover, drag, evaluate_script, list_console_messages, list_network_requests, lighthouse_audit, and performance_start_trace. In read-only mode MoonDesk permits only bounded inspection commands and rejects state-changing actions or browser file-output flags. MoonDesk manages start/status/stop automatically.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "command": { "type": "string", "description": "chrome-devtools CLI command name, for example take_snapshot or resize_page" },
+                    "command": { "type": "string", "minLength": 1, "maxLength": 128, "description": "chrome-devtools CLI command name, for example take_snapshot, emulate, or resize_page" },
                     "args": { "type": "array", "maxItems": 64, "items": { "type": "string", "maxLength": 8192 }, "description": "Command arguments in CLI order. Use --flag=value for optional flags when convenient." },
                     "timeout_ms": { "type": "integer", "minimum": 1, "maximum": 120000, "description": "Maximum command runtime in milliseconds (default 120000)" }
                 },
@@ -1565,12 +1565,12 @@ Always specify the branch explicitly when using `git push`."#
 
     if mode.browser_enabled() {
         lines.push(
-            "Browser mode exposes a stable browser surface instead of forwarding the full Chrome DevTools MCP catalog. Use browser_command for browser actions and view_page for actual rendered pixels. The browser starts lazily on the first browser operation in an isolated temporary agent profile that never inherits the user's personal cookies or logged-in browser state. The same live agent session is reused across browser_command, view_page, and moondesk-browser until that session ends. Start with take_snapshot before element interactions, use only UIDs from the latest snapshot, and take a new snapshot after navigation or substantial DOM changes. Accessibility/text snapshots are useful for structure but do not replace view_page for visual judgment. MoonDesk manages browser start/status/stop automatically; do not invoke lifecycle commands through browser_command or call npx chrome-devtools-mcp directly."
+            "Browser mode exposes a stable browser surface instead of forwarding the full Chrome DevTools MCP catalog. Use browser_command for browser actions and view_page for actual rendered pixels. The browser starts lazily in an isolated temporary agent profile that never inherits the user's personal cookies or logged-in browser state. The same live agent session is reused across browser_command, view_page, and `moondesk browser` until that session ends. For local web-app verification, navigate to the dev server, set the target viewport before taking interaction UIDs, use resize_page for normal desktop sizes and emulate --viewport=<width>x<height>x<dpr>[,mobile][,touch] for exact tablet/mobile QA, then take_snapshot. Navigation, viewport emulation, and substantial DOM changes can invalidate UIDs, so take a fresh snapshot before further element interactions. Accessibility/text snapshots are useful for structure but do not replace view_page for visual judgment. MoonDesk manages browser start/status/stop automatically; do not invoke lifecycle commands through browser_command or call npx chrome-devtools-mcp directly."
                 .to_string(),
         );
         if mode.computer_enabled() && tool_mode.run_command_enabled() {
             lines.push(
-                "For repetitive deterministic browser flows in Both mode, the packaged moondesk-browser CLI uses the same MoonDesk native browser runtime and shared session without adding browser schemas to the MCP tool catalog. Run `moondesk-browser skill` once when you need the workflow reference, then use `moondesk-browser <command> ...` from scripts or loops. Prefer browser_command for one-off actions and return to view_page whenever appearance matters."
+                "For repetitive deterministic browser flows in Both mode, use the `moondesk browser <command> ...` subcommand from scripts or loops; it is a lightweight client to the same running MoonDesk host/session rather than a second browser executable. Run `moondesk browser skill` when you need the workflow reference. Prefer browser_command for one-off actions and return to view_page whenever appearance matters."
                     .to_string(),
             );
         }
@@ -2047,6 +2047,9 @@ async fn handle_browser_command(
         Some(value) if !value.trim().is_empty() => value.trim(),
         _ => return tool_error_response(req, "Missing required parameter: command".to_string()),
     };
+    if command.len() > 128 {
+        return tool_error_response(req, "command exceeds the 128-byte limit".to_string());
+    }
     let args = match arguments.get("args") {
         None => Vec::new(),
         Some(Value::Array(values)) if values.len() <= 64 => {
@@ -4158,7 +4161,7 @@ mod tests {
         }
 
         let workspace_root =
-            std::env::temp_dir().join(format!("moondesk-browser-vision-{}", Uuid::new_v4()));
+            std::env::temp_dir().join(format!("moondesk browser-vision-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&workspace_root).expect("create browser vision workspace");
         let app = AppState::new_for_test(
             0,
@@ -5060,15 +5063,19 @@ mod tests {
         assert!(instruction_text.contains("model receives the pixels through its vision input"));
         assert!(instruction_text.contains("view_page for actual rendered pixels"));
         assert!(instruction_text.contains("do not replace view_page for visual judgment"));
-        assert!(instruction_text.contains("browser starts lazily on the first browser operation"));
+        assert!(
+            instruction_text
+                .contains("browser starts lazily in an isolated temporary agent profile")
+        );
         assert!(instruction_text.contains("same live agent session is reused"));
         assert!(instruction_text.contains("never inherits the user's personal cookies"));
+        assert!(instruction_text.contains("emulate --viewport=<width>x<height>x<dpr>"));
         assert!(
             instruction_text.contains("do not invoke lifecycle commands through browser_command")
         );
         assert!(
             instruction_text
-                .contains("moondesk-browser CLI uses the same MoonDesk native browser runtime")
+                .contains("lightweight client to the same running MoonDesk host/session")
         );
         assert_eq!(
             structured.as_object().map(|value| value.len()),

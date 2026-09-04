@@ -60,9 +60,9 @@ impl BrowserRuntime {
         Self::with_optional_state(Some(state))
     }
 
-    /// Create the same lazy runtime for the packaged `moondesk-browser` CLI.
-    /// The standalone CLI intentionally has no TUI state to mutate, but it uses
-    /// the same daemon namespace and therefore joins the same isolated agent-browser session.
+    /// Create a runtime without TUI state for command-help and isolated integration tests.
+    /// Normal `moondesk browser` commands do not use this path: they are lightweight clients
+    /// to the running MoonDesk host so shell invocations cannot accidentally own browser state.
     pub fn standalone() -> Self {
         Self::with_optional_state(None)
     }

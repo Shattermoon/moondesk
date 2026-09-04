@@ -28,6 +28,28 @@ function orchestrateWithoutRefresh(options) {
   });
 }
 
+test("package exposes one MoonDesk CLI and keeps browser as a subcommand", () => {
+  const pkg = require("../package.json");
+  assert.deepEqual(pkg.bin, { moondesk: "npm/moondesk.js" });
+  assert.equal(pkg.files.includes("npm/moondesk-browser.js"), false);
+  assert.equal(pkg.files.includes("skills/browser/SKILL.md"), true);
+});
+
+test("browser subcommand arguments are forwarded unchanged to native MoonDesk", async () => {
+  const child = new EventEmitter();
+  const expected = ["browser", "emulate", "--viewport=390x844x1,mobile,touch"];
+  const running = runNative("/fake/moondesk", expected, {
+    signalTarget: new EventEmitter(),
+    spawnImpl: (binary, args) => {
+      assert.equal(binary, "/fake/moondesk");
+      assert.deepEqual(args, expected);
+      return child;
+    },
+  });
+  child.emit("exit", 0, null);
+  assert.deepEqual(await running, { code: 0, signal: null });
+});
+
 test("native launch keeps the npm wrapper alive across parent SIGINT until the child exits", async () => {
   const child = new EventEmitter();
   const signalTarget = new EventEmitter();

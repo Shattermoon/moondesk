@@ -298,14 +298,13 @@ jobs:
           cargo +stable test --locked
           node --check .github/scripts/npm-oidc-preflight.mjs
           node --check npm/moondesk.js
-          node --check npm/moondesk-browser.js
           node --check npm/install-binary.js
           node --check npm/update-manager.js
           node --check .github/scripts/verify-npm-package.mjs
-          node --test npm/install-binary.test.js npm/update-manager.test.js npm/moondesk.test.js npm/moondesk-browser.test.js
+          node --test npm/install-binary.test.js npm/update-manager.test.js npm/moondesk.test.js
           test "$(node -p "require('./package.json').repository.url")" = "git+https://github.com/Shattermoon/moondesk.git"
           node -e "const p=require('./package.json'); const s=p.scripts||{}; if (s.preinstall||s.install||s.postinstall) process.exit(1)"
-          node -e "const p=require('./package.json'); for (const f of ['npm/moondesk.js','npm/moondesk-browser.js','npm/install-binary.js','npm/update-manager.js','skills/browser/SKILL.md']) if (!p.files?.includes(f)) throw new Error('missing packaged runtime file: '+f)"
+          node -e "const p=require('./package.json'); if (Object.keys(p.bin||{}).length !== 1 || p.bin.moondesk !== 'npm/moondesk.js') throw new Error('MoonDesk must expose exactly one CLI bin'); for (const f of ['npm/moondesk.js','npm/install-binary.js','npm/update-manager.js','skills/browser/SKILL.md']) if (!p.files?.includes(f)) throw new Error('missing packaged runtime file: '+f)"
           node .github/scripts/verify-npm-package.mjs
 
       - name: Plan and apply new release version
@@ -328,7 +327,7 @@ jobs:
           test "$(node -p "require('./package.json').version")" = "$expected"
           grep -q "^version = \"$expected\"$" Cargo.toml
           cargo +stable check --locked
-          node --test npm/install-binary.test.js npm/update-manager.test.js npm/moondesk.test.js npm/moondesk-browser.test.js
+          node --test npm/install-binary.test.js npm/update-manager.test.js npm/moondesk.test.js
           node .github/scripts/verify-npm-package.mjs
 
       - name: Create tested release candidate
@@ -421,6 +420,68 @@ jobs:
             --out smoke-export
           test -s smoke-export/clippymoon.png
           test -s smoke-export/clippymoon.gif
+
+      - name: Scan Windows release candidate and record trust metadata
+        if: matrix.runner == 'windows-2022'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $binary = (Resolve-Path 'dist/${{ matrix.asset }}').Path
+          $sha256 = (Get-FileHash -LiteralPath $binary -Algorithm SHA256).Hash.ToLowerInvariant()
+          $authenticode = Get-AuthenticodeSignature -LiteralPath $binary
+          $defender = Join-Path $env:ProgramFiles 'Windows Defender\MpCmdRun.exe'
+          if (-not (Test-Path -LiteralPath $defender -PathType Leaf)) {
+            throw "Microsoft Defender command-line scanner was not found at $defender"
+          }
+
+          $defenderStatus = $null
+          if (Get-Command Get-MpComputerStatus -ErrorAction SilentlyContinue) {
+            $status = Get-MpComputerStatus
+            $defenderStatus = [ordered]@{
+              engineVersion = $status.AMEngineVersion
+              productVersion = $status.AMProductVersion
+              signatureVersion = $status.AntivirusSignatureVersion
+              signatureLastUpdated = $status.AntivirusSignatureLastUpdated
+            }
+          }
+
+          $report = [ordered]@{
+            asset = '${{ matrix.asset }}'
+            candidateSha = '${{ needs.prepare.outputs.candidate_sha }}'
+            sha256 = $sha256
+            size = (Get-Item -LiteralPath $binary).Length
+            authenticodeStatus = [string]$authenticode.Status
+            signerSubject = $authenticode.SignerCertificate.Subject
+            defender = $defenderStatus
+          }
+          $report | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath 'windows-release-security.json' -Encoding utf8
+          "### Windows release candidate security gate" >> $env:GITHUB_STEP_SUMMARY
+          "- SHA-256: ``$sha256``" >> $env:GITHUB_STEP_SUMMARY
+          "- Authenticode: ``$($authenticode.Status)``" >> $env:GITHUB_STEP_SUMMARY
+          if ($defenderStatus) {
+            "- Defender signatures: ``$($defenderStatus.signatureVersion)``" >> $env:GITHUB_STEP_SUMMARY
+          }
+
+          & $defender -Scan -ScanType 3 -File $binary
+          if ($LASTEXITCODE -ne 0) {
+            throw "Microsoft Defender rejected the Windows release candidate (exit code $LASTEXITCODE)"
+          }
+          if (-not (Test-Path -LiteralPath $binary -PathType Leaf)) {
+            throw 'The Windows release candidate disappeared during the Defender gate'
+          }
+          $afterSha256 = (Get-FileHash -LiteralPath $binary -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($afterSha256 -ne $sha256) {
+            throw "The Windows release candidate changed during the Defender gate: $sha256 -> $afterSha256"
+          }
+
+      - name: Upload Windows release security record
+        if: matrix.runner == 'windows-2022'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: windows-release-security
+          path: windows-release-security.json
+          if-no-files-found: error
+          retention-days: 30
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -630,7 +691,7 @@ jobs:
           test -f npm/update-manager.js
           test ! -e npm/postinstall.js
           node -e "const p=require('./package.json'); const s=p.scripts||{}; if (s.preinstall||s.install||s.postinstall) process.exit(1)"
-          node -e "const p=require('./package.json'); for (const f of ['npm/moondesk.js','npm/moondesk-browser.js','npm/install-binary.js','npm/update-manager.js','skills/browser/SKILL.md']) if (!p.files?.includes(f)) throw new Error('missing packaged runtime file: '+f)"
+          node -e "const p=require('./package.json'); if (Object.keys(p.bin||{}).length !== 1 || p.bin.moondesk !== 'npm/moondesk.js') throw new Error('MoonDesk must expose exactly one CLI bin'); for (const f of ['npm/moondesk.js','npm/install-binary.js','npm/update-manager.js','skills/browser/SKILL.md']) if (!p.files?.includes(f)) throw new Error('missing packaged runtime file: '+f)"
           test "$(node -p "require('./package.json').repository.url")" = "git+https://github.com/Shattermoon/moondesk.git"
 
           git fetch origin --tags "refs/heads/main:refs/remotes/origin/main"

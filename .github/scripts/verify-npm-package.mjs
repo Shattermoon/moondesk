@@ -6,7 +6,6 @@ const expected = [
   "LICENSE",
   "README.md",
   "npm/install-binary.js",
-  "npm/moondesk-browser.js",
   "npm/moondesk.js",
   "npm/update-manager.js",
   "package.json",

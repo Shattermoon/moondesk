@@ -90,10 +90,12 @@ If your change touches process execution, Windows environment handling, browser 
 ```bash
 cargo test --locked windows_developer_toolchain_smoke_uses_normal_host_environment -- --ignored
 cargo test --locked windows_browser_runtime_is_lazy_and_recovers_after_daemon_exit -- --ignored --test-threads 1
+cargo test --locked windows_browser_runtime_recovers_after_agent_browser_process_exit -- --ignored --test-threads 1
+cargo test --locked windows_host_browser_cli_and_mcp_view_page_share_one_session -- --ignored --test-threads 1
 cargo test --locked windows_view_page_returns_native_mcp_image_content -- --ignored --test-threads 1
 ```
 
-The browser smokes verify that help/configuration does not launch Chrome, the namespaced daemon starts only on first use, every session uses an isolated non-personal browser profile, daemon/browser loss is recovered with the same safe runtime settings, and `view_page` exercises the real rendered-pixel path. Do not weaken or delete environment-specific tests merely to make them run where their stated prerequisites are missing.
+The browser smokes verify that help/configuration does not launch Chrome, the namespaced daemon starts only on first use, every session uses an isolated non-personal browser profile, daemon/browser loss is recovered with the same safe runtime settings, separate `moondesk browser` requests share the host-owned session with MCP, responsive viewport emulation works, and `view_page` exercises the real rendered-pixel path. Do not weaken or delete environment-specific tests merely to make them run where their stated prerequisites are missing.
 
 ## npm wrapper and distribution checks
 
@@ -103,11 +105,10 @@ If you touch `npm/`, `package.json`, release scripts, update behavior, binary bo
 node --check .github/scripts/npm-oidc-preflight.mjs
 node --check .github/scripts/verify-npm-provenance.mjs
 node --check npm/moondesk.js
-node --check npm/moondesk-browser.js
 node --check npm/install-binary.js
 node --check npm/update-manager.js
 node --check .github/scripts/verify-npm-package.mjs
-node --test npm/install-binary.test.js npm/update-manager.test.js npm/moondesk.test.js npm/moondesk-browser.test.js
+node --test npm/install-binary.test.js npm/update-manager.test.js npm/moondesk.test.js
 node .github/scripts/verify-npm-package.mjs
 ```
 

@@ -1789,49 +1789,162 @@ async fn attach_workspace_to_running_host(
     })
 }
 
-const BROWSER_CLI_FLAG: &str = "--browser-cli";
+const BROWSER_SUBCOMMAND: &str = "browser";
+const BROWSER_SKILL: &str = include_str!("../skills/browser/SKILL.md");
+
+fn browser_cli_usage() -> &'static str {
+    "MoonDesk browser commands\n\nUsage:\n  moondesk browser <chrome-devtools command> [...args]\n  moondesk browser skill\n  moondesk browser --help\n\nExamples:\n  moondesk browser navigate_page --url=http://localhost:3000\n  moondesk browser take_snapshot\n  moondesk browser emulate --viewport=390x844x1,mobile,touch\n  moondesk browser list_console_messages\n"
+}
 
 fn parse_browser_cli_args(cli_args: &[String]) -> Option<Result<(String, Vec<String>), String>> {
-    if cli_args.first().map(String::as_str) != Some(BROWSER_CLI_FLAG) {
+    if cli_args.first().map(String::as_str) != Some(BROWSER_SUBCOMMAND) {
         return None;
     }
-    let Some(command) = cli_args
+    let command = cli_args
         .get(1)
         .map(|value| value.trim())
         .filter(|value| !value.is_empty())
-    else {
-        return Some(Err("MoonDesk browser CLI requires a command".to_string()));
-    };
-    Some(Ok((command.to_string(), cli_args[2..].to_vec())))
+        .unwrap_or("--help");
+    Some(Ok((
+        command.to_string(),
+        cli_args.get(2..).unwrap_or_default().to_vec(),
+    )))
+}
+
+pub(crate) async fn send_browser_cli_request_to_host(
+    port: u16,
+    token: &str,
+    cwd: &std::path::Path,
+    command: &str,
+    args: &[String],
+) -> Result<serde_json::Value, String> {
+    let body = serde_json::to_vec(&serde_json::json!({
+        "cwd": cwd.to_string_lossy(),
+        "command": command,
+        "args": args,
+        "timeoutMs": browser_runtime::DEFAULT_BROWSER_COMMAND_TIMEOUT.as_millis() as u64,
+    }))
+    .map_err(|error| format!("Could not encode browser command request: {error}"))?;
+    let client = reqwest::Client::builder()
+        .timeout(browser_runtime::DEFAULT_BROWSER_COMMAND_TIMEOUT + Duration::from_secs(10))
+        .build()
+        .map_err(|error| format!("Could not create browser CLI client: {error}"))?;
+    let endpoint = format!(
+        "http://127.0.0.1:{port}{}",
+        server::HOST_BROWSER_CONTROL_ROUTE
+    );
+    let response = client
+        .post(endpoint)
+        .header(server::HOST_CONTROL_HEADER, token)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(body)
+        .send()
+        .await
+        .map_err(|error| {
+            format!(
+                "Could not contact the running MoonDesk browser host on port {port}: {error}. Restart MoonDesk in Browser or Both mode and retry."
+            )
+        })?;
+    let status = response.status();
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|error| format!("Could not read MoonDesk browser host response: {error}"))?;
+    let payload: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("MoonDesk browser host returned invalid JSON: {error}"))?;
+    if !status.is_success() {
+        let message = payload
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("browser command was rejected");
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Err(
+                "The running MoonDesk host does not expose the browser command route. Update and restart MoonDesk so the host and `moondesk browser` client use the same version."
+                    .to_string(),
+            );
+        }
+        return Err(format!("{message} (HTTP {status})"));
+    }
+    Ok(payload)
 }
 
 async fn run_browser_cli(command: String, args: Vec<String>) -> Result<i32, String> {
-    let workspace_root = std::env::current_dir()
-        .map_err(|error| format!("Could not resolve browser CLI working directory: {error}"))?
-        .to_string_lossy()
-        .into_owned();
-    let runtime = BrowserRuntime::standalone();
-    let output = runtime
-        .run(
-            &workspace_root,
-            &command,
-            &args,
-            browser_runtime::DEFAULT_BROWSER_COMMAND_TIMEOUT,
+    if matches!(command.as_str(), "help" | "-h" | "--help") {
+        print!("{}", browser_cli_usage());
+        let _ = std::io::stdout().flush();
+        return Ok(0);
+    }
+    if command == "skill" {
+        print!("{}", BROWSER_SKILL);
+        if !BROWSER_SKILL.ends_with('\n') {
+            println!();
+        }
+        let _ = std::io::stdout().flush();
+        return Ok(0);
+    }
+
+    let cwd = std::env::current_dir()
+        .map_err(|error| format!("Could not resolve browser CLI working directory: {error}"))?;
+
+    // Command-specific help is intentionally host-independent and cannot launch Chrome. This keeps
+    // `moondesk browser <command> --help` useful even before MoonDesk is running.
+    if args
+        .iter()
+        .any(|arg| matches!(arg.as_str(), "--help" | "-h"))
+    {
+        let runtime = BrowserRuntime::standalone();
+        let output = runtime
+            .run(
+                &cwd.to_string_lossy(),
+                &command,
+                &args,
+                browser_runtime::DEFAULT_BROWSER_COMMAND_TIMEOUT,
+            )
+            .await?;
+        if !output.stdout.is_empty() {
+            print!("{}", output.stdout);
+            let _ = std::io::stdout().flush();
+        }
+        if !output.stderr.is_empty() {
+            eprint!("{}", output.stderr);
+            let _ = std::io::stderr().flush();
+        }
+        return Ok(if output.success() {
+            0
+        } else {
+            output.exit_code.max(1)
+        });
+    }
+
+    let port_value = std::env::var("PORT")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    let port = parse_port_value(port_value.as_deref())?;
+    let registration = read_host_runtime_registration(port).map_err(|error| {
+        format!(
+            "`moondesk browser` requires a running MoonDesk host in Browser or Both mode on port {port}: {error}"
         )
-        .await?;
-    if !output.stdout.is_empty() {
-        print!("{}", output.stdout);
+    })?;
+    let payload =
+        send_browser_cli_request_to_host(port, &registration.token, &cwd, &command, &args).await?;
+
+    if let Some(stdout) = payload.get("stdout").and_then(serde_json::Value::as_str)
+        && !stdout.is_empty()
+    {
+        print!("{stdout}");
         let _ = std::io::stdout().flush();
     }
-    if !output.stderr.is_empty() {
-        eprint!("{}", output.stderr);
+    if let Some(stderr) = payload.get("stderr").and_then(serde_json::Value::as_str)
+        && !stderr.is_empty()
+    {
+        eprint!("{stderr}");
         let _ = std::io::stderr().flush();
     }
-    Ok(if output.success() {
-        0
-    } else {
-        output.exit_code.max(1)
-    })
+    Ok(payload
+        .get("exitCode")
+        .and_then(serde_json::Value::as_i64)
+        .and_then(|value| i32::try_from(value).ok())
+        .unwrap_or(1))
 }
 
 #[tokio::main]
@@ -7485,22 +7598,24 @@ mod tests {
     }
 
     #[test]
-    fn browser_cli_parser_is_hidden_and_preserves_argument_boundaries() {
+    fn browser_subcommand_preserves_argument_boundaries_and_defaults_to_help() {
         assert!(super::parse_browser_cli_args(&[]).is_none());
         assert!(super::parse_browser_cli_args(&["something-else".to_string()]).is_none());
 
-        let missing = super::parse_browser_cli_args(&[super::BROWSER_CLI_FLAG.to_string()])
-            .expect("browser flag should intercept")
-            .expect_err("missing browser command should fail");
-        assert!(missing.contains("requires a command"));
+        let (command, args) =
+            super::parse_browser_cli_args(&[super::BROWSER_SUBCOMMAND.to_string()])
+                .expect("browser subcommand should intercept")
+                .expect("browser without a command should show help");
+        assert_eq!(command, "--help");
+        assert!(args.is_empty());
 
         let (command, args) = super::parse_browser_cli_args(&[
-            super::BROWSER_CLI_FLAG.to_string(),
+            super::BROWSER_SUBCOMMAND.to_string(),
             "evaluate_script".to_string(),
             "() => location.href.includes('&x=1')".to_string(),
             "--filePath=C:\\Temp\\Moon Desk\\out.json".to_string(),
         ])
-        .expect("browser flag should intercept")
+        .expect("browser subcommand should intercept")
         .expect("valid browser CLI arguments");
         assert_eq!(command, "evaluate_script");
         assert_eq!(
@@ -7510,6 +7625,8 @@ mod tests {
                 "--filePath=C:\\Temp\\Moon Desk\\out.json".to_string(),
             ]
         );
+        assert!(super::browser_cli_usage().contains("moondesk browser emulate"));
+        assert!(super::BROWSER_SKILL.contains("# MoonDesk Browser"));
     }
 
     #[test]

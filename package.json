@@ -13,12 +13,10 @@
     "url": "https://github.com/Shattermoon/moondesk/issues"
   },
   "bin": {
-    "moondesk": "npm/moondesk.js",
-    "moondesk-browser": "npm/moondesk-browser.js"
+    "moondesk": "npm/moondesk.js"
   },
   "files": [
     "npm/moondesk.js",
-    "npm/moondesk-browser.js",
     "npm/install-binary.js",
     "npm/update-manager.js",
     "skills/browser/SKILL.md",

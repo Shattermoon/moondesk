@@ -29,8 +29,8 @@ For the closest match to CI, use the current stable Rust toolchain with `rustfmt
 Some optional integration tests require platform-specific software:
 
 - Windows tests may require PowerShell and standard developer tools.
-- Browser/DevTools tests require a locally installed supported Chromium browser.
-- Browser control itself uses `chrome-devtools-mcp` through `npx`.
+- Browser tests require a locally installed supported Chromium browser.
+- Browser control uses the pinned `chrome-devtools-mcp@1.7.0` CLI daemon through `npx`, but MoonDesk starts it lazily on the first browser operation rather than during host startup.
 - Running MoonDesk end-to-end through a public MCP endpoint requires ngrok configuration.
 
 ## Getting the repository running
@@ -85,15 +85,15 @@ On Windows, run the test suite serially to match CI's process-heavy validation:
 cargo test --locked -- --test-threads 1
 ```
 
-If your change touches process execution, Windows environment handling, browser launching/detection, or DevTools lifecycle code, run the relevant ignored integration smokes when your machine supports them:
+If your change touches process execution, Windows environment handling, browser detection, or the lazy browser runtime, run the relevant ignored integration smokes when your machine supports them:
 
 ```bash
 cargo test --locked windows_developer_toolchain_smoke_uses_normal_host_environment -- --ignored
-cargo test --locked remote_browser_termination_confirms_child_exit -- --ignored
-cargo test --locked windows_devtools_stop_terminates_npx_process_tree -- --ignored
+cargo test --locked windows_browser_runtime_is_lazy_and_recovers_after_daemon_exit -- --ignored --test-threads 1
+cargo test --locked windows_view_page_returns_native_mcp_image_content -- --ignored --test-threads 1
 ```
 
-Additional ignored tests may require a live Chromium remote-debug endpoint. Do not weaken or delete environment-specific tests merely to make them run in an environment that does not satisfy their stated prerequisites.
+The browser smokes verify that help/configuration does not launch Chrome, the namespaced daemon starts only on first use, every session uses an isolated non-personal browser profile, daemon/browser loss is recovered with the same safe runtime settings, and `view_page` exercises the real rendered-pixel path. Do not weaken or delete environment-specific tests merely to make them run where their stated prerequisites are missing.
 
 ## npm wrapper and distribution checks
 
@@ -103,10 +103,11 @@ If you touch `npm/`, `package.json`, release scripts, update behavior, binary bo
 node --check .github/scripts/npm-oidc-preflight.mjs
 node --check .github/scripts/verify-npm-provenance.mjs
 node --check npm/moondesk.js
+node --check npm/moondesk-browser.js
 node --check npm/install-binary.js
 node --check npm/update-manager.js
 node --check .github/scripts/verify-npm-package.mjs
-node --test npm/install-binary.test.js npm/update-manager.test.js npm/moondesk.test.js
+node --test npm/install-binary.test.js npm/update-manager.test.js npm/moondesk.test.js npm/moondesk-browser.test.js
 node .github/scripts/verify-npm-package.mjs
 ```
 
@@ -165,11 +166,11 @@ A single MoonDesk host can serve multiple workspace endpoints. A change in one w
 - connection/runtime state;
 - normal per-workspace quotas/history.
 
-Browser/DevTools control is intentionally shared by the host and should remain clearly distinguished from workspace-local state.
+Browser control is intentionally shared by the host and should remain clearly distinguished from workspace-local state. Keep its MCP surface stable: browser availability or daemon state must not dynamically add/remove raw DevTools tool schemas.
 
 ### Process lifecycle
 
-Process handling is cross-platform and easy to get subtly wrong. Changes to commands, background jobs, browser launching, or DevTools launching should account for:
+Process handling is cross-platform and easy to get subtly wrong. Changes to commands, background jobs, or the lazy browser runtime should account for:
 
 - cancellation before spawn;
 - cancellation during execution;
@@ -208,8 +209,8 @@ When responding to automated review feedback, verify the finding against the cur
 MoonDesk uses conventional-style commit subjects. Keep commits concise and consistent with nearby history, for example:
 
 ```text
-feat: surface DevTools page count
-fix: own DevTools process tree on Windows
+feat: add browser inspection workflow
+fix: recover lazy browser sessions after disconnects
 ci: add RustSec dependency audit
 docs: update contribution guide
 ```

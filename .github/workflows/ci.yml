@@ -51,12 +51,13 @@ jobs:
           node --check .github/scripts/npm-oidc-preflight.mjs
           node --check .github/scripts/verify-npm-provenance.mjs
           node --check npm/moondesk.js
+          node --check npm/moondesk-browser.js
           node --check npm/install-binary.js
           node --check npm/update-manager.js
           node --check .github/scripts/verify-npm-package.mjs
-          node --test npm/install-binary.test.js npm/update-manager.test.js npm/moondesk.test.js
+          node --test npm/install-binary.test.js npm/update-manager.test.js npm/moondesk.test.js npm/moondesk-browser.test.js
           node -e "const p=require('./package.json'); const s=p.scripts||{}; if (s.preinstall||s.install||s.postinstall) process.exit(1)"
-          node -e "const p=require('./package.json'); for (const f of ['npm/moondesk.js','npm/install-binary.js','npm/update-manager.js']) if (!p.files?.includes(f)) throw new Error('missing packaged runtime file: '+f)"
+          node -e "const p=require('./package.json'); for (const f of ['npm/moondesk.js','npm/moondesk-browser.js','npm/install-binary.js','npm/update-manager.js','skills/browser/SKILL.md']) if (!p.files?.includes(f)) throw new Error('missing packaged runtime file: '+f)"
           node .github/scripts/verify-npm-package.mjs
 
   windows-rust:
@@ -87,13 +88,13 @@ jobs:
       - name: Run Windows developer toolchain smoke
         run: cargo +stable test --locked windows_developer_toolchain_smoke_uses_normal_host_environment -- --ignored
 
-      - name: Run Windows remote browser lifecycle smoke
-        run: cargo +stable test --locked remote_browser_termination_confirms_child_exit -- --ignored
-      - name: Run Windows browser vision smoke
+      - name: Run Windows lazy browser lifecycle smoke
+        timeout-minutes: 10
+        run: cargo +stable test --locked windows_browser_runtime_is_lazy_and_recovers_after_daemon_exit -- --ignored --test-threads 1
+
+      - name: Run Windows lazy browser vision smoke
         timeout-minutes: 10
         run: cargo +stable test --locked windows_view_page_returns_native_mcp_image_content -- --ignored --test-threads 1
-      - name: Run Windows DevTools process-tree shutdown smoke
-        run: cargo +stable test --locked windows_devtools_stop_terminates_npx_process_tree -- --ignored
 
   npm-runtime:
     if: github.event_name == 'workflow_dispatch' || github.event.pull_request.draft == false
@@ -118,6 +119,7 @@ jobs:
         run: |
           set -euo pipefail
           node --check npm/moondesk.js
+          node --check npm/moondesk-browser.js
           node --check npm/install-binary.js
           node --check npm/update-manager.js
-          node --test npm/install-binary.test.js npm/update-manager.test.js npm/moondesk.test.js
+          node --test npm/install-binary.test.js npm/update-manager.test.js npm/moondesk.test.js npm/moondesk-browser.test.js

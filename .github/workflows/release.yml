@@ -298,13 +298,14 @@ jobs:
           cargo +stable test --locked
           node --check .github/scripts/npm-oidc-preflight.mjs
           node --check npm/moondesk.js
+          node --check npm/moondesk-browser.js
           node --check npm/install-binary.js
           node --check npm/update-manager.js
           node --check .github/scripts/verify-npm-package.mjs
-          node --test npm/install-binary.test.js npm/update-manager.test.js npm/moondesk.test.js
+          node --test npm/install-binary.test.js npm/update-manager.test.js npm/moondesk.test.js npm/moondesk-browser.test.js
           test "$(node -p "require('./package.json').repository.url")" = "git+https://github.com/Shattermoon/moondesk.git"
           node -e "const p=require('./package.json'); const s=p.scripts||{}; if (s.preinstall||s.install||s.postinstall) process.exit(1)"
-          node -e "const p=require('./package.json'); for (const f of ['npm/moondesk.js','npm/install-binary.js','npm/update-manager.js']) if (!p.files?.includes(f)) throw new Error('missing packaged runtime file: '+f)"
+          node -e "const p=require('./package.json'); for (const f of ['npm/moondesk.js','npm/moondesk-browser.js','npm/install-binary.js','npm/update-manager.js','skills/browser/SKILL.md']) if (!p.files?.includes(f)) throw new Error('missing packaged runtime file: '+f)"
           node .github/scripts/verify-npm-package.mjs
 
       - name: Plan and apply new release version
@@ -327,7 +328,7 @@ jobs:
           test "$(node -p "require('./package.json').version")" = "$expected"
           grep -q "^version = \"$expected\"$" Cargo.toml
           cargo +stable check --locked
-          node --test npm/install-binary.test.js npm/update-manager.test.js npm/moondesk.test.js
+          node --test npm/install-binary.test.js npm/update-manager.test.js npm/moondesk.test.js npm/moondesk-browser.test.js
           node .github/scripts/verify-npm-package.mjs
 
       - name: Create tested release candidate
@@ -629,7 +630,7 @@ jobs:
           test -f npm/update-manager.js
           test ! -e npm/postinstall.js
           node -e "const p=require('./package.json'); const s=p.scripts||{}; if (s.preinstall||s.install||s.postinstall) process.exit(1)"
-          node -e "const p=require('./package.json'); for (const f of ['npm/moondesk.js','npm/install-binary.js','npm/update-manager.js']) if (!p.files?.includes(f)) throw new Error('missing packaged runtime file: '+f)"
+          node -e "const p=require('./package.json'); for (const f of ['npm/moondesk.js','npm/moondesk-browser.js','npm/install-binary.js','npm/update-manager.js','skills/browser/SKILL.md']) if (!p.files?.includes(f)) throw new Error('missing packaged runtime file: '+f)"
           test "$(node -p "require('./package.json').repository.url")" = "git+https://github.com/Shattermoon/moondesk.git"
 
           git fetch origin --tags "refs/heads/main:refs/remotes/origin/main"

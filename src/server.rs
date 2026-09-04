@@ -15,8 +15,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use subtle::ConstantTimeEq;
 
+use crate::browser_runtime::BrowserRuntime;
 use crate::command_jobs::CommandJobManager;
-use crate::devtools::DevtoolsManager;
 use crate::mcp::{self, JsonRpcRequest};
 use crate::state::{
     AddWorkspaceError, CommandActivityState, FlowDirection, ServerUiEvent, SharedState,
@@ -36,7 +36,7 @@ pub const HOST_CONTROL_HEADER: &str = "x-moondesk-host-token";
 #[derive(Clone)]
 struct ServerState {
     app: SharedState,
-    devtools: Option<Arc<DevtoolsManager>>,
+    browser_runtime: Option<Arc<BrowserRuntime>>,
     command_jobs: CommandJobManager,
     ui_events: UiEventSender,
     host_control_token: Arc<str>,
@@ -123,14 +123,14 @@ async fn validate_request_origin(
 /// Build the axum router.
 pub fn router(
     app_state: SharedState,
-    devtools: Option<Arc<DevtoolsManager>>,
+    browser_runtime: Option<Arc<BrowserRuntime>>,
     command_jobs: CommandJobManager,
     ui_events: UiEventSender,
     host_control_token: Arc<str>,
 ) -> Router {
     let state = ServerState {
         app: app_state,
-        devtools,
+        browser_runtime,
         command_jobs,
         ui_events,
         host_control_token,
@@ -736,7 +736,7 @@ async fn post_mcp(
             tool_mode,
             set_moondesk_as_co_author,
             command_jobs: &s.command_jobs,
-            devtools: &s.devtools,
+            browser_runtime: &s.browser_runtime,
         },
     )
     .await
@@ -1285,7 +1285,7 @@ mod tests {
         let (ui_tx, _ui_rx) = ui_event_channel();
         let server_state = ServerState {
             app: app_state.clone(),
-            devtools: None,
+            browser_runtime: None,
             command_jobs: CommandJobManager::new(),
             ui_events: ui_tx,
             host_control_token: Arc::from("test-host-control-token"),
@@ -1381,7 +1381,7 @@ mod tests {
         let (ui_tx, _ui_rx) = ui_event_channel();
         let server_state = ServerState {
             app: app_state,
-            devtools: None,
+            browser_runtime: None,
             command_jobs: CommandJobManager::new(),
             ui_events: ui_tx,
             host_control_token: Arc::from("test-host-control-token"),
@@ -1437,7 +1437,7 @@ mod tests {
         let command_jobs = CommandJobManager::new();
         let server_state = ServerState {
             app: app_state,
-            devtools: None,
+            browser_runtime: None,
             command_jobs: command_jobs.clone(),
             ui_events: ui_tx,
             host_control_token: Arc::from("test-host-control-token"),
@@ -1551,7 +1551,7 @@ mod tests {
         let (ui_tx, _ui_rx) = ui_event_channel();
         let server_state = ServerState {
             app: app_state.clone(),
-            devtools: None,
+            browser_runtime: None,
             command_jobs: CommandJobManager::new(),
             ui_events: ui_tx,
             host_control_token: Arc::from("test-host-control-token"),
@@ -1618,7 +1618,7 @@ mod tests {
         let (ui_tx, _ui_rx) = ui_event_channel();
         let server_state = ServerState {
             app: app_state,
-            devtools: None,
+            browser_runtime: None,
             command_jobs: CommandJobManager::new(),
             ui_events: ui_tx,
             host_control_token: Arc::from("test-host-control-token"),
@@ -1711,7 +1711,7 @@ mod tests {
         let (ui_tx, _ui_rx) = ui_event_channel();
         let server_state = ServerState {
             app: app_state,
-            devtools: None,
+            browser_runtime: None,
             command_jobs: CommandJobManager::new(),
             ui_events: ui_tx,
             host_control_token: Arc::from("test-host-control-token"),
@@ -1917,7 +1917,7 @@ mod tests {
         let (ui_tx, _ui_rx) = ui_event_channel();
         let server_state = ServerState {
             app: app_state,
-            devtools: None,
+            browser_runtime: None,
             command_jobs: CommandJobManager::new(),
             ui_events: ui_tx,
             host_control_token: Arc::from("test-host-control-token"),
@@ -2029,7 +2029,7 @@ mod tests {
         let (ui_tx, _ui_rx) = ui_event_channel();
         let server_state = ServerState {
             app: app_state.clone(),
-            devtools: None,
+            browser_runtime: None,
             command_jobs: CommandJobManager::new(),
             ui_events: ui_tx,
             host_control_token: Arc::from("test-host-control-token"),
@@ -2088,7 +2088,7 @@ mod tests {
 
         let server_state = ServerState {
             app: app_state.clone(),
-            devtools: None,
+            browser_runtime: None,
             command_jobs: CommandJobManager::new(),
             ui_events: ui_tx,
             host_control_token: Arc::from("test-host-control-token"),
@@ -2139,7 +2139,7 @@ mod tests {
         let (ui_tx, mut ui_rx) = ui_event_channel();
         let server_state = ServerState {
             app: app_state,
-            devtools: None,
+            browser_runtime: None,
             command_jobs: CommandJobManager::new(),
             ui_events: ui_tx,
             host_control_token: Arc::from("test-host-control-token"),
@@ -2227,7 +2227,7 @@ mod tests {
         let (ui_tx, _ui_rx) = ui_event_channel();
         let server_state = ServerState {
             app: app_state.clone(),
-            devtools: None,
+            browser_runtime: None,
             command_jobs: CommandJobManager::new(),
             ui_events: ui_tx,
             host_control_token: Arc::from("test-host-control-token"),

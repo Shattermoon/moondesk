@@ -500,7 +500,7 @@ fn is_managed_output_root(path: &Path) -> bool {
 }
 
 #[cfg(unix)]
-fn process_is_live(pid: u32) -> bool {
+pub(crate) fn process_is_live(pid: u32) -> bool {
     if pid == std::process::id() {
         return true;
     }
@@ -515,7 +515,7 @@ fn process_is_live(pid: u32) -> bool {
 }
 
 #[cfg(windows)]
-fn process_is_live(pid: u32) -> bool {
+pub(crate) fn process_is_live(pid: u32) -> bool {
     use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::System::Threading::{
         GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,

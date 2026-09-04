@@ -1,8 +1,9 @@
 mod browser;
+mod browser_runtime;
 mod clippymoon_gen;
 mod command;
 mod command_jobs;
-mod devtools;
+
 mod macos_terminal;
 mod mascot;
 mod mcp;
@@ -16,6 +17,7 @@ mod vision;
 mod workspace_tools;
 mod workspaces;
 
+use browser_runtime::BrowserRuntime;
 use crossterm::{
     ExecutableCommand,
     event::{
@@ -24,7 +26,6 @@ use crossterm::{
     },
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use devtools::DevtoolsManager;
 use mascot::{TUI_MASCOT_BLOCK_HEIGHT, TUI_MASCOT_BLOCK_WIDTH, render_tui_lines};
 use ratatui::{
     prelude::*,
@@ -33,13 +34,13 @@ use ratatui::{
 use serde::{Deserialize, Serialize};
 use state::{
     AppState, CommandActivityState, FLOW_ANIM_CELLS, FLOW_BOOTSTRAP_PHASES, FlowAnimKind,
-    FlowAnimSegment, FlowDirection, FlowLane, Mode, OwnedRemoteBrowser, SharedState, ToolMode,
-    UiEventReceiver, UiEventSender, UsageTotals, add_workspace, app_config_path,
-    flow_anim_lit_count, flush_config, normalize_ngrok_domain, remove_workspace, rename_workspace,
-    rotate_workspace_secret, ui_event_channel, user_home_dir,
+    FlowAnimSegment, FlowDirection, FlowLane, Mode, SharedState, ToolMode, UiEventReceiver,
+    UiEventSender, UsageTotals, add_workspace, app_config_path, flow_anim_lit_count, flush_config,
+    normalize_ngrok_domain, remove_workspace, rename_workspace, rotate_workspace_secret,
+    ui_event_channel, user_home_dir,
 };
 use std::io::{Write, stdout};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -220,15 +221,13 @@ struct UiSnapshot {
     ngrok_running: bool,
     remote_connected: bool,
     last_remote_activity_ms: Option<u128>,
-    devtools_running: bool,
+    browser_runtime_running: bool,
     port: u16,
     workspace_count: usize,
     connected_workspace_count: usize,
     workspaces: Vec<DashboardWorkspaceRow>,
     workspace_names: std::collections::HashMap<WorkspaceId, String>,
     mascot: mascot::MascotPack,
-    detected_browsers: Vec<browser::DetectedBrowser>,
-    selected_browser: Option<browser::DetectedBrowser>,
     logs: Vec<state::LogEntry>,
     command_activities: std::collections::VecDeque<state::CommandActivity>,
     flows: Vec<FlowLane>,
@@ -251,7 +250,7 @@ impl UiSnapshot {
             ngrok_running: app.ngrok_running,
             remote_connected: app.remote_connected,
             last_remote_activity_ms: app.last_remote_activity_ms,
-            devtools_running: app.devtools_running,
+            browser_runtime_running: app.browser_runtime_running,
             port: app.port,
             workspace_count: app.workspaces.len(),
             connected_workspace_count: app
@@ -277,8 +276,6 @@ impl UiSnapshot {
                 .map(|workspace| (workspace.id.clone(), workspace.name.clone()))
                 .collect(),
             mascot: app.mascot.clone(),
-            detected_browsers: app.detected_browsers.clone(),
-            selected_browser: app.selected_browser.clone(),
             logs: app.logs.clone(),
             command_activities: app.command_activities.clone(),
             flows: app.flows.clone(),
@@ -1792,11 +1789,66 @@ async fn attach_workspace_to_running_host(
     })
 }
 
+const BROWSER_CLI_FLAG: &str = "--browser-cli";
+
+fn parse_browser_cli_args(cli_args: &[String]) -> Option<Result<(String, Vec<String>), String>> {
+    if cli_args.first().map(String::as_str) != Some(BROWSER_CLI_FLAG) {
+        return None;
+    }
+    let Some(command) = cli_args
+        .get(1)
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+    else {
+        return Some(Err("MoonDesk browser CLI requires a command".to_string()));
+    };
+    Some(Ok((command.to_string(), cli_args[2..].to_vec())))
+}
+
+async fn run_browser_cli(command: String, args: Vec<String>) -> Result<i32, String> {
+    let workspace_root = std::env::current_dir()
+        .map_err(|error| format!("Could not resolve browser CLI working directory: {error}"))?
+        .to_string_lossy()
+        .into_owned();
+    let runtime = BrowserRuntime::standalone();
+    let output = runtime
+        .run(
+            &workspace_root,
+            &command,
+            &args,
+            browser_runtime::DEFAULT_BROWSER_COMMAND_TIMEOUT,
+        )
+        .await?;
+    if !output.stdout.is_empty() {
+        print!("{}", output.stdout);
+        let _ = std::io::stdout().flush();
+    }
+    if !output.stderr.is_empty() {
+        eprint!("{}", output.stderr);
+        let _ = std::io::stderr().flush();
+    }
+    Ok(if output.success() {
+        0
+    } else {
+        output.exit_code.max(1)
+    })
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli_args = std::env::args().skip(1).collect::<Vec<_>>();
     if cli_version_requested(&cli_args) {
         println!("{}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+    if let Some(parsed) = parse_browser_cli_args(&cli_args) {
+        let (command, args) = parsed.map_err(std::io::Error::other)?;
+        let exit_code = run_browser_cli(command, args)
+            .await
+            .map_err(std::io::Error::other)?;
+        if exit_code != 0 {
+            std::process::exit(exit_code);
+        }
         return Ok(());
     }
 
@@ -1890,14 +1942,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Cleanup after the TUI is gone so quit never appears frozen on screen.
     // Stop accepting new MCP work first, then terminate owned command trees and
     // shared host services before finally clearing local runtime status.
-    let (server_handle, command_jobs, remote_browser) = {
+    let (server_handle, command_jobs) = {
         let mut app = state.lock().await;
         app.server_running = false;
-        (
-            app.server_handle.take(),
-            app.command_jobs.clone(),
-            app.remote_browser.take(),
-        )
+        (app.server_handle.take(), app.command_jobs.clone())
     };
     if let Some(handle) = server_handle {
         handle.abort();
@@ -1905,9 +1953,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     command_jobs.cancel_all().await;
     ngrok::stop(state.clone()).await;
-    if let Some(browser) = remote_browser {
-        stop_owned_remote_browser(&state, browser).await;
-    }
     state.lock().await.clear_remote_connection_state();
 
     if let Some(listener) = interrupt_listener.take() {
@@ -1982,13 +2027,6 @@ async fn run_app(
         }
     }
 
-    if mode_is_browser_enabled(state.clone()).await {
-        let continue_run = run_browser_select(terminal, state.clone()).await?;
-        if !continue_run {
-            return Ok(AppExit::Quit);
-        }
-    }
-
     let continue_run = run_ngrok_auth_setup(terminal, state.clone(), None).await?;
     if !continue_run {
         return Ok(AppExit::Quit);
@@ -2011,6 +2049,7 @@ async fn run_app(
     let mut services = start_services(state.clone(), ui_event_tx)
         .await
         .map_err(std::io::Error::other)?;
+    let browser_workspace_root = { state.lock().await.workspace_root.clone() };
 
     while services
         .ngrok_start_error
@@ -2027,8 +2066,8 @@ async fn run_app(
         )
         .await?;
         if !continue_run {
-            if let Some(bridge) = services.devtools.take() {
-                bridge.stop().await;
+            if let Some(runtime) = services.browser_runtime.take() {
+                runtime.stop_if_owned(&browser_workspace_root).await;
             }
             return Ok(AppExit::Quit);
         }
@@ -2048,8 +2087,8 @@ async fn run_app(
     *interrupt_listener = Some(spawn_interrupt_listener(interrupts.clone()));
     let result = run_tui(terminal, state, ui_event_rx, interrupts.clone()).await;
     interrupts.begin_shutdown();
-    if let Some(bridge) = services.devtools.take() {
-        bridge.stop().await;
+    if let Some(runtime) = services.browser_runtime.take() {
+        runtime.stop_if_owned(&browser_workspace_root).await;
     }
     result
 }
@@ -2116,7 +2155,7 @@ fn draw_mode_select(f: &mut Frame, theme: &theme::ThemeDef, tool_mode: ToolMode)
                 Style::default().fg(palette.primary_fg),
             ),
             Span::styled(
-                "(chrome-devtools-mcp)",
+                "(isolated agent browser)",
                 Style::default().fg(palette.muted_fg),
             ),
         ]),
@@ -2190,61 +2229,26 @@ async fn run_ngrok_auth_setup(
             toast = None;
         }
 
-        let (current_theme, current_tool_mode, current_mode, browsers, selected_browser) = {
+        let (current_theme, current_tool_mode) = {
             let app = state.lock().await;
-            (
-                app.current_theme(),
-                app.tool_mode,
-                app.mode,
-                app.detected_browsers.clone(),
-                app.selected_browser.clone(),
-            )
+            (app.current_theme(), app.tool_mode)
         };
-        let supported_indices: Vec<usize> = browsers
-            .iter()
-            .enumerate()
-            .filter(|(_, browser)| browser.mcp_supported)
-            .map(|(idx, _)| idx)
-            .collect();
-        let selected_supported_idx =
-            selected_supported_browser_idx(&browsers, selected_browser.as_ref());
         let toast_ref = toast
             .as_ref()
             .filter(|(_, _, t)| t.elapsed().as_secs() < 2)
             .map(|(m, pos, _)| (*m, *pos));
         let mut ngrok_setup_copy_area = Rect::default();
         terminal.draw(|f| {
-            let anchor_area = if current_mode.browser_enabled() {
-                Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([
-                        Constraint::Length(3),
-                        Constraint::Min(10),
-                        Constraint::Length(3),
-                    ])
-                    .split(f.area())[1]
-            } else {
-                Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([
-                        Constraint::Length(3),
-                        Constraint::Length(16),
-                        Constraint::Min(0),
-                    ])
-                    .split(f.area())[1]
-            };
+            let anchor_area = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(3),
+                    Constraint::Length(16),
+                    Constraint::Min(0),
+                ])
+                .split(f.area())[1];
             ngrok_setup_copy_area = ngrok_auth_setup_copy_area(anchor_area);
-            if current_mode.browser_enabled() {
-                draw_browser_select(
-                    f,
-                    &browsers,
-                    &supported_indices,
-                    selected_supported_idx,
-                    current_theme,
-                );
-            } else {
-                draw_mode_select(f, current_theme, current_tool_mode);
-            }
+            draw_mode_select(f, current_theme, current_tool_mode);
             draw_ngrok_auth_setup(
                 f,
                 current_theme,
@@ -2354,55 +2358,20 @@ async fn run_ngrok_domain_setup(
     let mut error_message: Option<String> = None;
 
     loop {
-        let (current_theme, current_tool_mode, current_mode, browsers, selected_browser) = {
+        let (current_theme, current_tool_mode) = {
             let app = state.lock().await;
-            (
-                app.current_theme(),
-                app.tool_mode,
-                app.mode,
-                app.detected_browsers.clone(),
-                app.selected_browser.clone(),
-            )
+            (app.current_theme(), app.tool_mode)
         };
-        let supported_indices: Vec<usize> = browsers
-            .iter()
-            .enumerate()
-            .filter(|(_, browser)| browser.mcp_supported)
-            .map(|(idx, _)| idx)
-            .collect();
-        let selected_supported_idx =
-            selected_supported_browser_idx(&browsers, selected_browser.as_ref());
         terminal.draw(|f| {
-            let anchor_area = if current_mode.browser_enabled() {
-                Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([
-                        Constraint::Length(3),
-                        Constraint::Min(10),
-                        Constraint::Length(3),
-                    ])
-                    .split(f.area())[1]
-            } else {
-                Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([
-                        Constraint::Length(3),
-                        Constraint::Length(16),
-                        Constraint::Min(0),
-                    ])
-                    .split(f.area())[1]
-            };
-            if current_mode.browser_enabled() {
-                draw_browser_select(
-                    f,
-                    &browsers,
-                    &supported_indices,
-                    selected_supported_idx,
-                    current_theme,
-                );
-            } else {
-                draw_mode_select(f, current_theme, current_tool_mode);
-            }
+            let anchor_area = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(3),
+                    Constraint::Length(16),
+                    Constraint::Min(0),
+                ])
+                .split(f.area())[1];
+            draw_mode_select(f, current_theme, current_tool_mode);
             draw_ngrok_domain_setup(
                 f,
                 current_theme,
@@ -3689,7 +3658,7 @@ fn draw_workspaces(f: &mut Frame, view: WorkspacesView<'_>, hit_areas: &mut Work
             ),
         ]),
         Line::from(Span::styled(
-            "  Browser/DevTools is shared by the MoonDesk host.",
+            "  Browser runtime/session is shared by the MoonDesk host.",
             Style::default().fg(palette.muted_fg),
         )),
     ])
@@ -4300,678 +4269,10 @@ fn draw_settings(f: &mut Frame, view: SettingsView<'_>) {
     f.render_widget(keys, chunks[2]);
 }
 
-async fn mode_is_browser_enabled(state: SharedState) -> bool {
-    state.lock().await.mode.browser_enabled()
-}
-
-fn browser_identity_matches(
-    browser: &browser::DetectedBrowser,
-    selected: &browser::DetectedBrowser,
-) -> bool {
-    browser.path == selected.path && browser.binary == selected.binary
-}
-
-fn selected_supported_browser_idx(
-    browsers: &[browser::DetectedBrowser],
-    selected_browser: Option<&browser::DetectedBrowser>,
-) -> usize {
-    let supported_indices: Vec<usize> = browsers
-        .iter()
-        .enumerate()
-        .filter(|(_, browser)| browser.mcp_supported)
-        .map(|(idx, _)| idx)
-        .collect();
-    if supported_indices.is_empty() {
-        return 0;
-    }
-    let Some(selected_browser) = selected_browser else {
-        return 0;
-    };
-    let Some(browser_idx) = browsers
-        .iter()
-        .position(|browser| browser_identity_matches(browser, selected_browser))
-    else {
-        return 0;
-    };
-    supported_indices
-        .iter()
-        .position(|idx| *idx == browser_idx)
-        .unwrap_or(0)
-}
-
-async fn run_browser_select(
-    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
-    state: SharedState,
-) -> Result<bool, Box<dyn std::error::Error>> {
-    let mut browsers = browser::detect_browsers();
-    let mut selected_supported_idx = {
-        let mut app = state.lock().await;
-        app.detected_browsers = browsers.clone();
-        let selected_missing = app.selected_browser.as_ref().is_some_and(|selected| {
-            !browsers
-                .iter()
-                .any(|browser| browser_identity_matches(browser, selected))
-        });
-        if selected_missing {
-            app.selected_browser = None;
-            app.mark_config_dirty();
-        }
-        selected_supported_browser_idx(&browsers, app.selected_browser.as_ref())
-    };
-    loop {
-        let supported_indices: Vec<usize> = browsers
-            .iter()
-            .enumerate()
-            .filter(|(_, b)| b.mcp_supported)
-            .map(|(idx, _)| idx)
-            .collect();
-        if !supported_indices.is_empty() {
-            selected_supported_idx =
-                selected_supported_idx.min(supported_indices.len().saturating_sub(1));
-        } else {
-            selected_supported_idx = 0;
-        }
-
-        let current_theme = {
-            let app = state.lock().await;
-            app.current_theme()
-        };
-        terminal.draw(|f| {
-            draw_browser_select(
-                f,
-                &browsers,
-                &supported_indices,
-                selected_supported_idx,
-                current_theme,
-            )
-        })?;
-
-        if event::poll(UI_POLL_INTERVAL)?
-            && let Event::Key(key) = event::read()?
-        {
-            if key.kind != KeyEventKind::Press {
-                continue;
-            }
-            match key.code {
-                KeyCode::Char('q') => return Ok(false),
-                KeyCode::Char('r') => {
-                    browsers = browser::detect_browsers();
-                    let mut app = state.lock().await;
-                    app.detected_browsers = browsers.clone();
-                    let selected_missing = app.selected_browser.as_ref().is_some_and(|selected| {
-                        !browsers
-                            .iter()
-                            .any(|browser| browser_identity_matches(browser, selected))
-                    });
-                    if selected_missing {
-                        app.selected_browser = None;
-                        app.mark_config_dirty();
-                    }
-                    selected_supported_idx =
-                        selected_supported_browser_idx(&browsers, app.selected_browser.as_ref());
-                }
-                KeyCode::Up => selected_supported_idx = selected_supported_idx.saturating_sub(1),
-                KeyCode::Down if selected_supported_idx + 1 < supported_indices.len() => {
-                    selected_supported_idx += 1;
-                }
-                KeyCode::Enter => {
-                    if let Some(selected_idx) = supported_indices.get(selected_supported_idx)
-                        && let Some(selected) = browsers.get(*selected_idx).cloned()
-                    {
-                        persist_selected_browser(state.clone(), selected).await;
-                        return Ok(true);
-                    }
-                }
-                KeyCode::Char(c) if c.is_ascii_digit() => {
-                    let index = c.to_digit(10).unwrap_or(0) as usize;
-                    if index == 0 {
-                        continue;
-                    }
-                    let target_idx = index - 1;
-                    if let Some(browser_idx) = supported_indices.get(target_idx)
-                        && let Some(selected) = browsers.get(*browser_idx).cloned()
-                    {
-                        persist_selected_browser(state.clone(), selected).await;
-                        return Ok(true);
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-}
-
-async fn persist_selected_browser(state: SharedState, selected: browser::DetectedBrowser) {
-    let remote_info = selected
-        .remote_debug_target
-        .as_deref()
-        .unwrap_or("not active");
-    let mut app = state.lock().await;
-    app.selected_browser = Some(selected.clone());
-    app.log(
-        "INFO",
-        format!(
-            "Selected browser: {} ({}, {})",
-            selected.name, selected.binary, selected.path
-        ),
-    );
-    app.log(
-        "INFO",
-        format!("Selected browser remote debugging: {remote_info}"),
-    );
-    app.mark_config_dirty();
-}
-
-fn draw_browser_select(
-    f: &mut Frame,
-    browsers: &[browser::DetectedBrowser],
-    supported_indices: &[usize],
-    selected_supported_idx: usize,
-    theme: &theme::ThemeDef,
-) {
-    let palette = theme.palette;
-    render_theme_background(f, palette);
-    let area = f.area();
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Min(10),
-            Constraint::Length(3),
-        ])
-        .split(area);
-
-    let header = Paragraph::new("  Select Browser - Installed and Remote Debugging Status")
-        .style(
-            Style::default()
-                .fg(palette.header_fg)
-                .add_modifier(Modifier::BOLD),
-        )
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(palette.border_type)
-                .border_style(Style::default().fg(palette.border_fg)),
-        );
-    f.render_widget(header, chunks[0]);
-
-    let active_summary = browser::format_active_remote_debug_names(browsers);
-    let mut lines: Vec<Line> = vec![
-        Line::from(vec![
-            Span::styled(
-                "  Installed browsers ",
-                Style::default().fg(palette.muted_fg),
-            ),
-            Span::styled(
-                browsers.len().to_string(),
-                Style::default()
-                    .fg(palette.title_fg)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled(
-                "  Remote debugging active ",
-                Style::default().fg(palette.muted_fg),
-            ),
-            Span::styled(active_summary, Style::default().fg(palette.success_fg)),
-        ]),
-        Line::from(vec![
-            Span::styled(
-                "  Selectable (Chromium) ",
-                Style::default().fg(palette.muted_fg),
-            ),
-            Span::styled(
-                supported_indices.len().to_string(),
-                Style::default()
-                    .fg(palette.key_fg)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]),
-        Line::from(""),
-    ];
-
-    if browsers.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "  No browser found in PATH. Press [r] to rescan, [q] to quit.",
-            Style::default().fg(palette.danger_fg),
-        )));
-    } else if supported_indices.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "  Only unsupported browsers found (e.g. Firefox). Chromium browsers are required.",
-            Style::default().fg(palette.danger_fg),
-        )));
-        lines.push(Line::from(""));
-        for browser in browsers {
-            lines.push(Line::from(vec![Span::styled(
-                format!("   [x] {} ({})", browser.name, browser.binary),
-                Style::default().fg(palette.muted_fg),
-            )]));
-            lines.push(Line::from(vec![Span::styled(
-                format!("     status {}", browser.support_note),
-                Style::default().fg(palette.warning_fg),
-            )]));
-            lines.push(Line::from(""));
-        }
-    } else {
-        let selected_browser_index = supported_indices
-            .get(selected_supported_idx)
-            .copied()
-            .unwrap_or(supported_indices[0]);
-        for (idx, browser) in browsers.iter().enumerate() {
-            let selected = idx == selected_browser_index;
-            let prefix = if selected { ">" } else { " " };
-            let quick_pick_num = supported_indices
-                .iter()
-                .position(|candidate_idx| *candidate_idx == idx)
-                .map(|v| v + 1);
-            let title_style = if !browser.mcp_supported {
-                Style::default().fg(palette.muted_fg)
-            } else if selected {
-                Style::default()
-                    .fg(palette.key_fg)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(palette.primary_fg)
-            };
-            if let Some(num) = quick_pick_num {
-                lines.push(Line::from(vec![Span::styled(
-                    format!(
-                        " {} [{}] {} ({})",
-                        prefix, num, browser.name, browser.binary
-                    ),
-                    title_style,
-                )]));
-            } else {
-                lines.push(Line::from(vec![Span::styled(
-                    format!("   [x] {} ({})", browser.name, browser.binary),
-                    title_style,
-                )]));
-            }
-            lines.push(Line::from(vec![Span::styled(
-                format!("     path {}", browser.path),
-                Style::default().fg(palette.muted_fg),
-            )]));
-            lines.push(Line::from(vec![Span::styled(
-                format!("     status {}", browser.support_note),
-                Style::default().fg(if browser.mcp_supported {
-                    palette.success_fg
-                } else {
-                    palette.warning_fg
-                }),
-            )]));
-            if !browser.mcp_supported {
-                lines.push(Line::from(vec![Span::styled(
-                    "     remote debugging integration not supported yet",
-                    Style::default().fg(palette.warning_fg),
-                )]));
-            } else if browser.remote_debug_active {
-                let target = browser.remote_debug_target.as_deref().unwrap_or("unknown");
-                let pid = browser
-                    .remote_debug_pid
-                    .map(|v| v.to_string())
-                    .unwrap_or_else(|| "--".into());
-                let pages = browser
-                    .remote_debug_page_count
-                    .map(|count| format!(", {count} pages"))
-                    .unwrap_or_default();
-                lines.push(Line::from(vec![Span::styled(
-                    format!("     remote debugging ACTIVE at {target} (pid {pid}{pages})"),
-                    Style::default().fg(palette.success_fg),
-                )]));
-                if browser
-                    .remote_debug_page_count
-                    .is_some_and(|count| count >= browser::LARGE_REMOTE_DEBUG_PAGE_COUNT)
-                {
-                    lines.push(Line::from(vec![Span::styled(
-                        "     WARNING large debug session: DevTools may wake many tabs and use high CPU",
-                        Style::default().fg(palette.warning_fg),
-                    )]));
-                }
-            } else {
-                lines.push(Line::from(vec![Span::styled(
-                    format!(
-                        "     remote debugging not active (supported flag {})",
-                        browser.remote_debug_hint
-                    ),
-                    Style::default().fg(palette.warning_fg),
-                )]));
-            }
-            lines.push(Line::from(""));
-        }
-    }
-
-    let body = Paragraph::new(lines).block(
-        Block::default()
-            .title(" Browser List ")
-            .borders(Borders::ALL)
-            .border_type(palette.border_type)
-            .border_style(Style::default().fg(palette.border_fg)),
-    );
-    f.render_widget(body, chunks[1]);
-
-    let keys = Paragraph::new(Line::from(vec![
-        Span::styled("  [Up/Down]", Style::default().fg(palette.key_fg)),
-        Span::raw(" Select  "),
-        Span::styled("[1-9]", Style::default().fg(palette.key_fg)),
-        Span::raw(" Quick select (Chromium only)  "),
-        Span::styled("[Enter]", Style::default().fg(palette.success_fg)),
-        Span::raw(" Confirm  "),
-        Span::styled("[r]", Style::default().fg(palette.warning_fg)),
-        Span::raw(" Rescan  "),
-        Span::styled("[q]", Style::default().fg(palette.danger_fg)),
-        Span::raw(" Quit"),
-    ]))
-    .block(
-        Block::default()
-            .title(" Keys ")
-            .borders(Borders::ALL)
-            .border_type(palette.border_type)
-            .border_style(Style::default().fg(palette.border_fg)),
-    );
-    f.render_widget(keys, chunks[2]);
-}
-
-fn find_available_remote_debug_port(start: u16, end: u16) -> Option<u16> {
-    (start..=end).find(|port| std::net::TcpListener::bind(("127.0.0.1", *port)).is_ok())
-}
-
-fn sanitize_for_filename(input: &str) -> String {
-    let sanitized: String = input
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-        .collect();
-    if sanitized.is_empty() {
-        "browser".into()
-    } else {
-        sanitized
-    }
-}
-
-async fn wait_remote_debug_ready(port: u16, timeout: Duration) -> bool {
-    let client = reqwest::Client::new();
-    let endpoint = format!("http://127.0.0.1:{port}/json/version");
-    let started = Instant::now();
-    while started.elapsed() < timeout {
-        let result = client
-            .get(&endpoint)
-            .timeout(Duration::from_millis(600))
-            .send()
-            .await;
-        if let Ok(response) = result
-            && response.status().is_success()
-        {
-            return true;
-        }
-        tokio::time::sleep(Duration::from_millis(250)).await;
-    }
-    false
-}
-
-fn is_managed_remote_browser_profile_dir(profile_dir: &Path) -> bool {
-    let temp_dir = std::env::temp_dir();
-    profile_dir.parent() == Some(temp_dir.as_path())
-        && profile_dir
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.starts_with("moondesk-remote-debug-"))
-}
-
-async fn remove_remote_browser_profile_dir(profile_dir: &Path) -> std::io::Result<()> {
-    if !is_managed_remote_browser_profile_dir(profile_dir) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            format!(
-                "refusing to recursively remove non-MoonDesk browser profile path: {}",
-                profile_dir.display()
-            ),
-        ));
-    }
-    match tokio::fs::remove_dir_all(profile_dir).await {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error),
-    }
-}
-
-async fn cleanup_remote_browser_profile(state: &SharedState, profile_dir: PathBuf) {
-    if let Err(error) = remove_remote_browser_profile_dir(&profile_dir).await {
-        state.lock().await.log(
-            "WARN",
-            format!(
-                "Failed to remove remote browser profile {}: {error}",
-                profile_dir.display()
-            ),
-        );
-    }
-}
-
-async fn terminate_remote_browser_child(child: &mut tokio::process::Child) -> std::io::Result<()> {
-    if child.try_wait()?.is_some() {
-        return Ok(());
-    }
-
-    match child.kill().await {
-        Ok(()) => Ok(()),
-        Err(kill_error) => match child.try_wait() {
-            Ok(Some(_)) => Ok(()),
-            Ok(None) => Err(kill_error),
-            Err(wait_error) => Err(std::io::Error::new(
-                wait_error.kind(),
-                format!(
-                    "failed to terminate remote browser ({kill_error}); failed to confirm exit: {wait_error}"
-                ),
-            )),
-        },
-    }
-}
-
-async fn terminate_owned_remote_browser(browser: &mut OwnedRemoteBrowser) -> std::io::Result<()> {
-    #[cfg(windows)]
-    browser.process_tree.terminate().await;
-
-    terminate_remote_browser_child(&mut browser.child).await
-}
-
-async fn stop_owned_remote_browser(state: &SharedState, mut browser: OwnedRemoteBrowser) {
-    match terminate_owned_remote_browser(&mut browser).await {
-        Ok(()) => cleanup_remote_browser_profile(state, browser.profile_dir).await,
-        Err(error) => {
-            state.lock().await.log(
-                "WARN",
-                format!(
-                    "Could not confirm remote browser exit; retaining profile {}: {error}",
-                    browser.profile_dir.display()
-                ),
-            );
-        }
-    }
-}
-async fn ensure_selected_browser_remote_debugging(
-    state: SharedState,
-    selected_browser: Option<browser::DetectedBrowser>,
-) -> Option<browser::DetectedBrowser> {
-    let mut selected = selected_browser?;
-    if !selected.mcp_supported {
-        state.lock().await.log(
-            "ERROR",
-            format!(
-                "Selected browser {} is not supported yet for chrome-devtools-mcp",
-                selected.name
-            ),
-        );
-        return None;
-    }
-    if selected.remote_debug_active && selected.remote_debug_target.is_some() {
-        let replaced_browser = {
-            let mut app = state.lock().await;
-            let owned_pid = app
-                .remote_browser
-                .as_ref()
-                .and_then(|browser| browser.child.id());
-            if app.remote_browser.is_some() && owned_pid != selected.remote_debug_pid {
-                app.remote_browser.take()
-            } else {
-                None
-            }
-        };
-        if let Some(browser) = replaced_browser {
-            stop_owned_remote_browser(&state, browser).await;
-        }
-        return Some(selected);
-    }
-
-    let Some(port) = find_available_remote_debug_port(9222, 9322) else {
-        state.lock().await.log(
-            "ERROR",
-            "No available local port in range 9222-9322 for remote debugging".into(),
-        );
-        return Some(selected);
-    };
-
-    let user_data_dir = std::env::temp_dir().join(format!(
-        "moondesk-remote-debug-{}-{}-{}-{}",
-        sanitize_for_filename(&selected.binary),
-        std::process::id(),
-        port,
-        Uuid::new_v4()
-    ));
-    if let Err(e) = std::fs::create_dir_all(&user_data_dir) {
-        state.lock().await.log(
-            "WARN",
-            format!(
-                "Failed to create user data dir {}: {e}",
-                user_data_dir.display()
-            ),
-        );
-    }
-
-    let mut command = tokio::process::Command::new(&selected.path);
-    command
-        .arg(format!("--remote-debugging-port={port}"))
-        .arg("--remote-debugging-address=127.0.0.1")
-        .arg(format!("--user-data-dir={}", user_data_dir.display()))
-        .arg("--no-first-run")
-        .arg("--no-default-browser-check")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-
-    #[cfg(windows)]
-    process_runner::WindowsProcessTreeGuard::prepare_command(&mut command);
-    #[cfg(not(windows))]
-    command.kill_on_drop(true);
-
-    let spawned_child = match command.spawn() {
-        Ok(child) => child,
-        Err(e) => {
-            state.lock().await.log(
-                "ERROR",
-                format!(
-                    "Failed to launch {} with remote debugging: {}",
-                    selected.name, e
-                ),
-            );
-            cleanup_remote_browser_profile(&state, user_data_dir).await;
-            return Some(selected);
-        }
-    };
-
-    #[cfg(windows)]
-    let (child, process_tree) = {
-        let mut child = spawned_child;
-        let process_tree = match process_runner::WindowsProcessTreeGuard::attach(&mut child) {
-            Ok(process_tree) => process_tree,
-            Err(error) => {
-                let _ = child.wait().await;
-                state.lock().await.log(
-                    "ERROR",
-                    format!(
-                        "Failed to own {} remote browser process tree: {}",
-                        selected.name, error
-                    ),
-                );
-                cleanup_remote_browser_profile(&state, user_data_dir).await;
-                return Some(selected);
-            }
-        };
-        (child, process_tree)
-    };
-    #[cfg(not(windows))]
-    let child = spawned_child;
-
-    let launched_pid = child.id();
-    let launched_profile_dir = user_data_dir.clone();
-
-    let existing_browser = {
-        let mut app = state.lock().await;
-        let existing = app.remote_browser.replace(OwnedRemoteBrowser {
-            child,
-            #[cfg(windows)]
-            process_tree,
-            profile_dir: user_data_dir,
-        });
-        app.log(
-            "INFO",
-            format!(
-                "Launched {} with remote debugging on 127.0.0.1:{}",
-                selected.name, port
-            ),
-        );
-        existing
-    };
-    if let Some(old_browser) = existing_browser {
-        stop_owned_remote_browser(&state, old_browser).await;
-    }
-
-    if wait_remote_debug_ready(port, Duration::from_secs(10)).await {
-        selected.remote_debug_active = true;
-        selected.remote_debug_target = Some(format!("127.0.0.1:{port}"));
-        selected.remote_debug_pid = launched_pid;
-        {
-            let mut app = state.lock().await;
-            app.selected_browser = Some(selected.clone());
-            app.log(
-                "INFO",
-                format!(
-                    "Remote debugging ready for {} at 127.0.0.1:{}",
-                    selected.name, port
-                ),
-            );
-            app.mark_config_dirty();
-        }
-        Some(selected)
-    } else {
-        state.lock().await.log(
-            "WARN",
-            format!(
-                "Remote debugging endpoint for {} did not become ready in time",
-                selected.name
-            ),
-        );
-        let failed_browser = {
-            let mut app = state.lock().await;
-            if app
-                .remote_browser
-                .as_ref()
-                .is_some_and(|browser| browser.profile_dir == launched_profile_dir)
-            {
-                app.remote_browser.take()
-            } else {
-                None
-            }
-        };
-        if let Some(browser) = failed_browser {
-            stop_owned_remote_browser(&state, browser).await;
-        }
-        Some(selected)
-    }
-}
-
 // ── Start services ──────────────────────────────────────────
 
 struct StartedServices {
-    devtools: Option<Arc<DevtoolsManager>>,
+    browser_runtime: Option<Arc<BrowserRuntime>>,
     _host_runtime: HostRuntimeGuard,
     ngrok_start_error: Option<ngrok::StartFailure>,
 }
@@ -5022,19 +4323,13 @@ async fn start_services(
     state: SharedState,
     ui_events: UiEventSender,
 ) -> Result<StartedServices, String> {
-    let (port, mode, mut detected_browsers, mut selected_browser) = {
+    let (port, mode) = {
         let app = state.lock().await;
-        (
-            app.port,
-            app.mode,
-            app.detected_browsers.clone(),
-            app.selected_browser.clone(),
-        )
+        (app.port, app.mode)
     };
 
-    // Reserve the HTTP port before launching browser/devtools processes. A second
-    // MoonDesk instance should fail cheaply instead of creating duplicate host
-    // services and only discovering the collision afterwards.
+    // Reserve the HTTP port before creating host services. A second MoonDesk instance should
+    // fail cheaply without touching browser state or creating duplicate host services.
     let listener = match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
         Ok(listener) => listener,
         Err(error) => {
@@ -5050,148 +4345,19 @@ async fn start_services(
         }
     };
 
-    if mode.browser_enabled() && detected_browsers.is_empty() {
-        detected_browsers = browser::detect_browsers();
-    }
     if mode.browser_enabled() {
-        selected_browser =
-            ensure_selected_browser_remote_debugging(state.clone(), selected_browser).await;
-        detected_browsers = browser::detect_browsers();
-        if let Some(selected) = &selected_browser
-            && let Some(refreshed) = detected_browsers
-                .iter()
-                .find(|b| b.path == selected.path && b.binary == selected.binary)
-                .cloned()
-        {
-            selected_browser = Some(refreshed);
-        }
-        let mut app = state.lock().await;
-        app.detected_browsers = detected_browsers.clone();
-        app.selected_browser = selected_browser.clone();
-        app.mark_config_dirty();
+        state.lock().await.log(
+            "INFO",
+            "Isolated agent-browser runtime ready; no browser process starts until the first browser operation"
+                .into(),
+        );
     }
 
-    let browser_summary = browser::format_browser_names(&detected_browsers);
-    let remote_support_summary = browser::format_remote_debug_names(&detected_browsers);
-    let remote_active_summary = browser::format_active_remote_debug_names(&detected_browsers);
-    let browser_details: Vec<String> = detected_browsers
-        .iter()
-        .map(|b| {
-            format!(
-                "Browser: {} (binary: {}, path: {}, support: {}, remote debug flag: {}, remote debug active: {}, pid: {}, pages: {})",
-                b.name,
-                b.binary,
-                b.path,
-                b.support_note,
-                b.remote_debug_hint,
-                b.remote_debug_target.as_deref().unwrap_or("no"),
-                b.remote_debug_pid
-                    .map(|pid| pid.to_string())
-                    .unwrap_or_else(|| "--".into()),
-                b.remote_debug_page_count
-                    .map(|count| count.to_string())
-                    .unwrap_or_else(|| "--".into())
-            )
-        })
-        .collect();
-    {
-        let mut app = state.lock().await;
-        app.detected_browsers = detected_browsers;
-        if browser_summary == "--" {
-            app.log("WARN", "No local browser found in PATH".into());
-        } else {
-            app.log("INFO", format!("Local browsers: {browser_summary}"));
-        }
-        if remote_support_summary == "--" {
-            app.log(
-                "WARN",
-                "No detected browser supports remote debugging".into(),
-            );
-        } else {
-            app.log(
-                "INFO",
-                format!("Remote debugging supported: {remote_support_summary}"),
-            );
-        }
-        if remote_active_summary == "--" {
-            app.log(
-                "WARN",
-                "No browser currently runs with remote debugging".into(),
-            );
-        } else {
-            app.log(
-                "INFO",
-                format!("Remote debugging active: {remote_active_summary}"),
-            );
-        }
-        if mode.browser_enabled() {
-            if let Some(selected) = &selected_browser {
-                let target = selected
-                    .remote_debug_target
-                    .as_deref()
-                    .unwrap_or("launch new browser instance");
-                app.log(
-                    "INFO",
-                    format!(
-                        "Using browser: {} ({}) -> {}",
-                        selected.name, selected.path, target
-                    ),
-                );
-                if let Some(page_count) = selected.remote_debug_page_count
-                    && page_count >= browser::LARGE_REMOTE_DEBUG_PAGE_COUNT
-                {
-                    app.log(
-                        "WARN",
-                        format!(
-                            "Selected remote-debug browser exposes {page_count} pages; chrome-devtools-mcp may wake many tabs and use high CPU"
-                        ),
-                    );
-                }
-            } else {
-                app.log("WARN", "No browser was selected before startup".into());
-            }
-        }
-        for detail in browser_details {
-            app.log("INFO", detail);
-        }
-    }
-
-    // Start MCP HTTP server
-    let devtools_bridge = if mode.browser_enabled() {
-        if selected_browser.is_none() {
-            state.lock().await.log(
-                "ERROR",
-                "Browser mode requires selecting a supported Chromium browser".into(),
-            );
-            None
-        } else {
-            state
-                .lock()
-                .await
-                .log("INFO", "Starting chrome-devtools-mcp...".into());
-            match DevtoolsManager::start(
-                selected_browser.as_ref(),
-                ui_events.clone(),
-                state.clone(),
-            )
-            .await
-            {
-                Ok(bridge) => {
-                    let mut app = state.lock().await;
-                    app.devtools_running = true;
-                    app.log("INFO", "chrome-devtools-mcp started".into());
-                    Some(bridge)
-                }
-                Err(e) => {
-                    let mut app = state.lock().await;
-                    app.log("ERROR", format!("chrome-devtools-mcp: {e}"));
-                    None
-                }
-            }
-        }
-    } else {
-        None
-    };
+    // Browser mode creates only a lightweight runtime handle. The first browser_command/view_page
+    // request starts a clean isolated agent browser; no personal browser profile is ever attached.
+    let browser_runtime = mode
+        .browser_enabled()
+        .then(|| Arc::new(BrowserRuntime::new(state.clone())));
 
     let host_control_token: Arc<str> = Arc::from(format!("{}{}", Uuid::new_v4(), Uuid::new_v4()));
     let host_runtime = write_host_runtime_registration(port, &host_control_token)
@@ -5199,7 +4365,7 @@ async fn start_services(
     let command_jobs = { state.lock().await.command_jobs.clone() };
     let router = server::router(
         state.clone(),
-        devtools_bridge.clone(),
+        browser_runtime.clone(),
         command_jobs,
         ui_events,
         host_control_token,
@@ -5232,7 +4398,7 @@ async fn start_services(
     };
 
     Ok(StartedServices {
-        devtools: devtools_bridge,
+        browser_runtime,
         _host_runtime: host_runtime,
         ngrok_start_error,
     })
@@ -6961,14 +6127,12 @@ fn draw_ui(f: &mut Frame, context: UiRenderContext<'_>) {
     } else {
         "STOPPED"
     };
-    let devtools_status: &str = if app.devtools_running {
+    let browser_runtime_status: &str = if app.browser_runtime_running {
         "RUNNING"
+    } else if app.mode.browser_enabled() {
+        "IDLE"
     } else {
-        if app.mode.browser_enabled() {
-            "STOPPED"
-        } else {
-            "N/A"
-        }
+        "N/A"
     };
     let mcp_url_is_revealed = full_mcp_url.is_some() && mcp_url_reveal_remaining.is_some();
     let mcp_url = match (&full_mcp_url, mcp_url_is_revealed) {
@@ -6996,24 +6160,11 @@ fn draw_ui(f: &mut Frame, context: UiRenderContext<'_>) {
     };
     let mcp_url_security_status = mcp_url_reveal_remaining
         .map(|remaining| format!("[ EXPOSED {:>2}s ]", mcp_url_reveal_seconds(remaining)));
-    let compact_browser_summary = app
-        .selected_browser
-        .as_ref()
-        .map(|browser| {
-            let target = browser
-                .remote_debug_target
-                .as_deref()
-                .unwrap_or("launch on demand");
-            format!("{} · CDP {target}", browser.name)
-        })
-        .unwrap_or_else(|| {
-            let detected = browser::format_browser_names(&app.detected_browsers);
-            if detected == "--" {
-                "No browser detected".to_string()
-            } else {
-                format!("{detected} · CDP idle")
-            }
-        });
+    let compact_browser_summary = if app.browser_runtime_running {
+        "Isolated agent browser · running".to_string()
+    } else {
+        "Isolated agent browser · starts on demand".to_string()
+    };
     let computer_role_style = Style::default()
         .fg(if app.server_running {
             palette.success_fg
@@ -7151,10 +6302,10 @@ fn draw_ui(f: &mut Frame, context: UiRenderContext<'_>) {
             ),
         ]),
         Line::from(vec![
-            status_label("DevTools"),
+            status_label("Browser"),
             Span::styled(
-                devtools_status,
-                Style::default().fg(if app.devtools_running {
+                browser_runtime_status,
+                Style::default().fg(if app.browser_runtime_running {
                     palette.success_fg
                 } else {
                     palette.muted_fg
@@ -8070,11 +7221,11 @@ mod tests {
         normalize_ngrok_authtoken_input, normalize_ngrok_domain, normalize_workspace_path_input,
         panel_under_cursor, parse_clippymoon_export_args, parse_port_value,
         primary_mcp_url_line_index, quit_confirm_action, reconcile_workspace_filter,
-        record_clear_view, remove_remote_browser_profile_dir, reset_filtered_navigation,
-        scroll_panel_down, scroll_panel_up, tail_start_index, timed_secret_click,
-        truncate_with_ellipsis, update_confirm_action, user_home_dir, workspace_action_from_event,
-        workspace_detail_sections, workspace_filter_from_index, workspace_filter_index,
-        wrap_preserving_chars, wrapped_line_hit_area,
+        record_clear_view, reset_filtered_navigation, scroll_panel_down, scroll_panel_up,
+        tail_start_index, timed_secret_click, truncate_with_ellipsis, update_confirm_action,
+        user_home_dir, workspace_action_from_event, workspace_detail_sections,
+        workspace_filter_from_index, workspace_filter_index, wrap_preserving_chars,
+        wrapped_line_hit_area,
     };
     use crossterm::event::{
         Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -8334,6 +7485,34 @@ mod tests {
     }
 
     #[test]
+    fn browser_cli_parser_is_hidden_and_preserves_argument_boundaries() {
+        assert!(super::parse_browser_cli_args(&[]).is_none());
+        assert!(super::parse_browser_cli_args(&["something-else".to_string()]).is_none());
+
+        let missing = super::parse_browser_cli_args(&[super::BROWSER_CLI_FLAG.to_string()])
+            .expect("browser flag should intercept")
+            .expect_err("missing browser command should fail");
+        assert!(missing.contains("requires a command"));
+
+        let (command, args) = super::parse_browser_cli_args(&[
+            super::BROWSER_CLI_FLAG.to_string(),
+            "evaluate_script".to_string(),
+            "() => location.href.includes('&x=1')".to_string(),
+            "--filePath=C:\\Temp\\Moon Desk\\out.json".to_string(),
+        ])
+        .expect("browser flag should intercept")
+        .expect("valid browser CLI arguments");
+        assert_eq!(command, "evaluate_script");
+        assert_eq!(
+            args,
+            vec![
+                "() => location.href.includes('&x=1')".to_string(),
+                "--filePath=C:\\Temp\\Moon Desk\\out.json".to_string(),
+            ]
+        );
+    }
+
+    #[test]
     fn workspace_path_input_expands_home_tilde() {
         let home = user_home_dir().expect("resolve user home directory");
         assert_eq!(
@@ -8480,159 +7659,6 @@ mod tests {
         server.abort();
         let _ = server.await;
         drop(runtime_guard);
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[tokio::test]
-    async fn remote_browser_profile_cleanup_removes_tree_and_tolerates_missing_directory() {
-        let profile_dir = std::env::temp_dir().join(format!(
-            "moondesk-remote-debug-cleanup-test-{}",
-            uuid::Uuid::new_v4()
-        ));
-        let nested = profile_dir.join("Default").join("Cache");
-        tokio::fs::create_dir_all(&nested)
-            .await
-            .expect("create nested browser profile");
-        tokio::fs::write(nested.join("cache.bin"), b"temporary browser data")
-            .await
-            .expect("write browser profile data");
-
-        remove_remote_browser_profile_dir(&profile_dir)
-            .await
-            .expect("remove browser profile tree");
-        assert!(!profile_dir.exists());
-        remove_remote_browser_profile_dir(&profile_dir)
-            .await
-            .expect("missing browser profile should already be clean");
-    }
-
-    #[tokio::test]
-    async fn remote_browser_profile_cleanup_refuses_unmanaged_directory() {
-        let unmanaged = std::env::temp_dir().join(format!(
-            "unmanaged-browser-profile-{}",
-            uuid::Uuid::new_v4()
-        ));
-        tokio::fs::create_dir_all(&unmanaged)
-            .await
-            .expect("create unmanaged directory");
-        tokio::fs::write(unmanaged.join("sentinel.txt"), b"keep")
-            .await
-            .expect("write unmanaged sentinel");
-
-        let error = remove_remote_browser_profile_dir(&unmanaged)
-            .await
-            .expect_err("unmanaged recursive cleanup must be refused");
-        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
-        assert!(unmanaged.join("sentinel.txt").exists());
-
-        let _ = tokio::fs::remove_dir_all(unmanaged).await;
-    }
-
-    #[cfg(not(windows))]
-    #[tokio::test]
-    async fn remote_browser_termination_confirms_child_exit() {
-        let mut command = tokio::process::Command::new("/bin/sh");
-        command
-            .args(["-c", "sleep 30"])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .kill_on_drop(true);
-        let mut child = command.spawn().expect("spawn remote browser stand-in");
-
-        super::terminate_remote_browser_child(&mut child)
-            .await
-            .expect("terminate and reap remote browser stand-in");
-        assert!(
-            child.try_wait().expect("query terminated child").is_some(),
-            "remote browser child was not reaped before cleanup"
-        );
-    }
-
-    #[cfg(windows)]
-    #[tokio::test]
-    #[ignore = "serialized Windows remote browser lifecycle smoke"]
-    async fn remote_browser_termination_confirms_child_exit() {
-        let root = std::env::temp_dir().join(format!(
-            "moondesk-remote-browser-tree-test-{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&root).expect("create browser lifecycle test root");
-        let ready = root.join("ready.txt");
-        let escaped = root.join("escaped.txt");
-        let child_script = root.join("child.ps1");
-        let parent_script = root.join("parent.ps1");
-        let ps_path = |path: &std::path::Path| path.to_string_lossy().replace('\'', "''");
-
-        std::fs::write(
-            &child_script,
-            format!(
-                "Start-Sleep -Milliseconds 1500\r\nSet-Content -LiteralPath '{}' -Value 'escaped'\r\n",
-                ps_path(&escaped)
-            ),
-        )
-        .expect("write child browser stand-in script");
-        std::fs::write(
-            &parent_script,
-            format!(
-                "Start-Process powershell.exe -ArgumentList @('-NoProfile','-File','{}')\r\nSet-Content -LiteralPath '{}' -Value 'ready'\r\nStart-Sleep -Seconds 30\r\n",
-                ps_path(&child_script),
-                ps_path(&ready)
-            ),
-        )
-        .expect("write parent browser stand-in script");
-
-        let mut command = tokio::process::Command::new("powershell.exe");
-        command
-            .args(["-NoProfile", "-File"])
-            .arg(&parent_script)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-        crate::process_runner::WindowsProcessTreeGuard::prepare_command(&mut command);
-        let mut child = command.spawn().expect("spawn remote browser stand-in");
-        let process_tree = crate::process_runner::WindowsProcessTreeGuard::attach(&mut child)
-            .expect("own remote browser stand-in process tree");
-        let profile_dir = std::env::temp_dir().join(format!(
-            "moondesk-remote-debug-lifecycle-test-{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&profile_dir).expect("create managed browser profile");
-        let mut browser = super::OwnedRemoteBrowser {
-            child,
-            process_tree,
-            profile_dir: profile_dir.clone(),
-        };
-
-        for _ in 0..30 {
-            if ready.exists() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        }
-        assert!(
-            ready.exists(),
-            "browser stand-in did not spawn its descendant"
-        );
-
-        super::terminate_owned_remote_browser(&mut browser)
-            .await
-            .expect("terminate and reap owned remote browser tree");
-        assert!(
-            browser
-                .child
-                .try_wait()
-                .expect("query terminated browser child")
-                .is_some(),
-            "remote browser root was not reaped before cleanup"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(2_000)).await;
-        assert!(
-            !escaped.exists(),
-            "remote browser descendant survived MoonDesk process-tree termination"
-        );
-
-        let _ = std::fs::remove_dir_all(profile_dir);
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -9428,7 +8454,6 @@ mod tests {
             "Tool mode",
             "Server",
             "ngrok",
-            "DevTools",
             "MCP URL",
             "Remote",
             "Session",
@@ -9673,7 +8698,7 @@ mod tests {
         assert!(!computer.text.contains("Remote dbg active"));
         assert!(!computer.text.contains("Selected browser"));
         assert!(!computer.text.contains("Selected target"));
-        assert!(!computer.text.contains("No browser detected"));
+        assert!(!computer.text.contains("Isolated agent browser"));
 
         snapshot.mode = super::Mode::Browser;
         let browser = render_dashboard(
@@ -9686,7 +8711,8 @@ mod tests {
             None,
         );
         assert!(browser.text.contains("Browser"));
-        assert!(browser.text.contains("No browser detected"));
+        assert!(browser.text.contains("Isolated agent browser"));
+        assert!(browser.text.contains("starts on demand"));
         assert!(!browser.text.contains("Local browsers"));
         assert!(!browser.text.contains("Remote dbg support"));
     }

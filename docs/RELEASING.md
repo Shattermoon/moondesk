@@ -94,7 +94,7 @@ The obsolete GitHub Actions `NPM_TOKEN` secret has been removed. Any old npm acc
 
 MoonDesk no longer uses `preinstall`, `install`, or `postinstall` lifecycle scripts. npm 12 blocks dependency install scripts by default, so relying on `postinstall` would make a normal `npm install -g moondesk` incomplete unless the user explicitly approved scripts.
 
-The npm package now contains a small JS wrapper plus `npm/install-binary.js`. On first CLI invocation it:
+The npm package now contains the `moondesk` and `moondesk-browser` JS wrappers plus `npm/install-binary.js` and the packaged browser skill. On first CLI invocation it:
 
 1. chooses the platform/architecture-specific release asset;
 2. downloads `SHA256SUMS` and the matching native binary over HTTPS;

@@ -7,12 +7,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tiktoken_rs::o200k_base_singleton;
 
+use crate::browser_runtime::{BrowserRuntime, DEFAULT_BROWSER_COMMAND_TIMEOUT};
 use crate::command;
 use crate::command_jobs::{
     CommandJobManager, CommandJobSnapshot, DEFAULT_JOB_TIMEOUT_MS, DEFAULT_POLL_WAIT_MS,
     MAX_COMMAND_OUTPUT_READ_BYTES, MAX_JOB_TIMEOUT_MS, MAX_POLL_WAIT_MS,
 };
-use crate::devtools::DevtoolsManager;
 use crate::state::{AgentsPathMode, Mode, ToolMode, load_app_config, user_home_dir};
 use crate::vision;
 use crate::workspace_tools;
@@ -21,7 +21,6 @@ use crate::workspaces::{self, WorkspaceAvailability, WorkspaceId};
 const SERVER_NAME: &str = "moondesk";
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 const MCP_PROTOCOL_VERSION: &str = "2025-11-25";
-const DEVTOOLS_PROTOCOL_VERSION: &str = "2025-03-26";
 
 // ── JSON-RPC types ──────────────────────────────────────────
 
@@ -81,7 +80,7 @@ pub struct McpRequestContext<'a> {
     pub tool_mode: ToolMode,
     pub set_moondesk_as_co_author: bool,
     pub command_jobs: &'a CommandJobManager,
-    pub devtools: &'a Option<Arc<DevtoolsManager>>,
+    pub browser_runtime: &'a Option<Arc<BrowserRuntime>>,
 }
 
 pub async fn handle_request(
@@ -89,27 +88,9 @@ pub async fn handle_request(
     context: McpRequestContext<'_>,
 ) -> Option<JsonRpcResponse> {
     match req.method.as_str() {
-        "initialize" => {
-            // Also initialize devtools bridge if available
-            if let Some(bridge) = context.devtools {
-                let init_req = json!({
-                    "jsonrpc": "2.0",
-                    "id": "dt-init",
-                    "method": "initialize",
-                    "params": {
-                        "protocolVersion": DEVTOOLS_PROTOCOL_VERSION,
-                        "capabilities": {},
-                        "clientInfo": {"name": "moondesk-bridge", "version": SERVER_VERSION}
-                    }
-                });
-                let _ = bridge.ensure_initialized(&init_req).await;
-            }
-            Some(handle_initialize(req))
-        }
+        "initialize" => Some(handle_initialize(req)),
         m if m.starts_with("notifications/") => None,
-        "tools/list" => {
-            Some(handle_tools_list(req, context.mode, context.tool_mode, context.devtools).await)
-        }
+        "tools/list" => Some(handle_tools_list(req, context.mode, context.tool_mode).await),
         "tools/call" => Some(handle_tools_call_for_workspace(req, context).await),
         "ping" => Some(JsonRpcResponse::success(req.id.clone(), json!({}))),
         _ => Some(JsonRpcResponse::error(
@@ -193,6 +174,12 @@ fn local_tool_output_schema(name: &str) -> Option<Value> {
                 "images".to_string(),
                 json!({ "type": "array", "items": { "type": "object" } }),
             );
+        }
+        "browser_command" => {
+            properties.insert("stdout".to_string(), json!({ "type": "string" }));
+            properties.insert("stderr".to_string(), json!({ "type": "string" }));
+            properties.insert("exitCode".to_string(), json!({ "type": "integer" }));
+            properties.insert("restarted".to_string(), json!({ "type": "boolean" }));
         }
         "view_page" => {
             for field in ["width", "height", "encodedBytes"] {
@@ -322,7 +309,6 @@ async fn handle_tools_list(
     req: &JsonRpcRequest,
     mode: Mode,
     tool_mode: ToolMode,
-    devtools: &Option<Arc<DevtoolsManager>>,
 ) -> JsonRpcResponse {
     let mut tools: Vec<Value> = Vec::new();
 
@@ -566,33 +552,46 @@ async fn handle_tools_list(
         }
     }
 
-    if mode.browser_enabled() && devtools.is_some() {
+    if mode.browser_enabled() {
+        if !mode.computer_enabled() {
+            tools.push(json!({
+                "name": "moondesk_instruction",
+                "title": "Get usage instructions",
+                "description": "Read MoonDesk operating guidance, including the browser skill workflow.",
+                "inputSchema": { "type": "object", "properties": {} },
+                "annotations": { "readOnlyHint": true, "openWorldHint": false, "destructiveHint": false }
+            }));
+        }
+        let browser_read_only = tool_mode.read_only();
+        tools.push(json!({
+            "name": "browser_command",
+            "title": "Run browser command",
+            "description": "Run one Chrome DevTools CLI browser operation against MoonDesk's shared lazy browser session. The browser starts only on the first browser operation and is reused across commands. Use command names such as list_pages, new_page, navigate_page, take_snapshot, click, fill, type_text, press_key, hover, drag, resize_page, emulate, evaluate_script, list_console_messages, list_network_requests, lighthouse_audit, or performance_start_trace. In read-only mode MoonDesk permits only bounded inspection commands and rejects state-changing actions or browser file-output flags. MoonDesk manages start/status/stop automatically.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "command": { "type": "string", "description": "chrome-devtools CLI command name, for example take_snapshot or resize_page" },
+                    "args": { "type": "array", "maxItems": 64, "items": { "type": "string", "maxLength": 8192 }, "description": "Command arguments in CLI order. Use --flag=value for optional flags when convenient." },
+                    "timeout_ms": { "type": "integer", "minimum": 1, "maximum": 120000, "description": "Maximum command runtime in milliseconds (default 120000)" }
+                },
+                "required": ["command"]
+            },
+            "annotations": { "readOnlyHint": browser_read_only, "openWorldHint": true, "destructiveHint": !browser_read_only }
+        }));
         tools.push(json!({
             "name": "view_page",
             "title": "View current page",
-            "description": "Capture the currently selected browser page and attach the rendered pixels directly to the model's vision input. Use this whenever layout, styling, rendering, visual regressions, canvas output, charts, or other appearance-dependent details matter. MoonDesk captures to a managed temporary file, bounds/compresses it, attaches it as native MCP image content, and removes the temporary file before returning.",
+            "description": "Capture the current MoonDesk browser page and attach its rendered pixels directly to the model's vision input. This uses the same live isolated agent-browser session as browser_command, so visual inspection always reflects the page the agent actually manipulated.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "full_page": { "type": "boolean", "description": "Capture the full page instead of only the visible viewport (default false)" },
-                    "uid": { "type": "string", "description": "Optional element uid from the latest DevTools page snapshot. When supplied, captures that element instead of the whole viewport." },
+                    "uid": { "type": "string", "description": "Optional element uid from the latest browser snapshot. When supplied, captures that element instead of the whole viewport." },
                     "quality": { "type": "integer", "minimum": vision::MIN_JPEG_QUALITY, "maximum": vision::MAX_JPEG_QUALITY, "description": format!("JPEG quality for the attached page image (default {})", vision::DEFAULT_JPEG_QUALITY) }
                 }
             },
             "annotations": { "readOnlyHint": true, "openWorldHint": true, "destructiveHint": false }
         }));
-    }
-
-    // Browser tools — get from devtools bridge
-    if mode.browser_enabled()
-        && let Some(bridge) = devtools
-        && let Some(dt_tools) = fetch_devtools_tools(bridge).await
-    {
-        if tool_mode.read_only() {
-            tools.extend(dt_tools.into_iter().filter(tool_is_read_only));
-        } else {
-            tools.extend(dt_tools);
-        }
     }
 
     for tool in &mut tools {
@@ -612,7 +611,7 @@ async fn handle_tools_call(
     tool_mode: ToolMode,
     set_moondesk_as_co_author: bool,
     command_jobs: &CommandJobManager,
-    devtools: &Option<Arc<DevtoolsManager>>,
+    browser_runtime: &Option<Arc<BrowserRuntime>>,
 ) -> JsonRpcResponse {
     let workspace_id = WorkspaceId::test_default();
     handle_tools_call_for_workspace(
@@ -624,7 +623,7 @@ async fn handle_tools_call(
             tool_mode,
             set_moondesk_as_co_author,
             command_jobs,
-            devtools,
+            browser_runtime,
         },
     )
     .await
@@ -661,7 +660,7 @@ async fn handle_tools_call_for_workspace(
         tool_mode,
         set_moondesk_as_co_author,
         command_jobs,
-        devtools,
+        browser_runtime,
     } = context;
     let params = &req.params;
     let tool_name = params
@@ -670,11 +669,25 @@ async fn handle_tools_call_for_workspace(
         .unwrap_or("")
         .to_string();
 
-    if tool_name == "view_page" {
-        if !mode.browser_enabled() {
-            return tool_error_response(req, "Tool 'view_page' requires browser mode".to_string());
+    if matches!(tool_name.as_str(), "browser_command" | "view_page") {
+        if workspaces::workspace_availability(Path::new(workspace_root))
+            == WorkspaceAvailability::Unavailable
+        {
+            return tool_error_response(
+                req,
+                format!("Workspace is currently unavailable: {workspace_root}"),
+            );
         }
-        return handle_view_page(req, workspace_root, devtools).await;
+        if !mode.browser_enabled() {
+            return tool_error_response(
+                req,
+                format!("Tool '{tool_name}' requires Browser or Both mode"),
+            );
+        }
+        if tool_name == "browser_command" {
+            return handle_browser_command(req, workspace_root, tool_mode, browser_runtime).await;
+        }
+        return handle_view_page(req, workspace_root, browser_runtime).await;
     }
 
     let workspace_dependent = matches!(
@@ -765,88 +778,21 @@ async fn handle_tools_call_for_workspace(
                                 "write" => handle_write_file(req, workspace_root),
                                 "edit" => handle_edit_file(req, workspace_root),
                                 "delete" => handle_delete_path(req, workspace_root),
-                                _ => {
-                                    if mode.browser_enabled() {
-                                        forward_to_devtools(req, &tool_name, tool_mode, devtools)
-                                            .await
-                                    } else {
-                                        tool_error_response(
-                                            req,
-                                            format!("Unknown tool: {tool_name}"),
-                                        )
-                                    }
-                                }
+                                _ => tool_error_response(req, format!("Unknown tool: {tool_name}")),
                             }
                         } else if tool_mode.read_only() && is_local_destructive_tool(&tool_name) {
                             read_only_blocked_response(req, &tool_name)
-                        } else if mode.browser_enabled() {
-                            forward_to_devtools(req, &tool_name, tool_mode, devtools).await
                         } else {
                             tool_error_response(req, format!("Unknown tool: {tool_name}"))
                         }
                     }
                 }
             }
-        } else if mode.browser_enabled() {
-            forward_to_devtools(req, &tool_name, tool_mode, devtools).await
+        } else if mode.browser_enabled() && tool_name == "moondesk_instruction" {
+            handle_moondesk_instruction(req, workspace_root, mode, tool_mode)
         } else {
             tool_error_response(req, format!("Unknown tool: {tool_name}"))
         }
-    }
-}
-
-async fn forward_to_devtools(
-    req: &JsonRpcRequest,
-    tool_name: &str,
-    tool_mode: ToolMode,
-    devtools: &Option<Arc<DevtoolsManager>>,
-) -> JsonRpcResponse {
-    let params = &req.params;
-    let Some(bridge) = devtools else {
-        return tool_error_response(req, format!("Unknown tool: {tool_name}"));
-    };
-
-    if tool_mode.read_only() {
-        match devtools_tool_is_read_only(bridge, tool_name).await {
-            Some(true) => {}
-            Some(false) => return read_only_blocked_response(req, tool_name),
-            None => {
-                return tool_error_response(
-                    req,
-                    format!(
-                        "Tool '{tool_name}' is blocked in read-only mode (cannot verify readOnlyHint)"
-                    ),
-                );
-            }
-        }
-    }
-
-    let forward_req = json!({
-        "jsonrpc": "2.0",
-        "id": req.id,
-        "method": "tools/call",
-        "params": params
-    });
-
-    match bridge.request(&forward_req).await {
-        Ok(resp) => {
-            if let Some(result) = resp.get("result") {
-                return JsonRpcResponse::success(req.id.clone(), result.clone());
-            }
-            if let Some(error) = resp.get("error") {
-                let code = error.get("code").and_then(|c| c.as_i64()).unwrap_or(-32000);
-                let msg = error
-                    .get("message")
-                    .and_then(|m| m.as_str())
-                    .unwrap_or("Unknown error");
-                return tool_error_response(
-                    req,
-                    format!("DevTools tool error (code {code}): {msg}"),
-                );
-            }
-            tool_error_response(req, "DevTools bridge returned empty response".into())
-        }
-        Err(e) => tool_error_response(req, format!("DevTools bridge error: {e}")),
     }
 }
 
@@ -1619,9 +1565,15 @@ Always specify the branch explicitly when using `git push`."#
 
     if mode.browser_enabled() {
         lines.push(
-            "For browser tasks, prefer the dedicated browser and DevTools tools exposed by the server. When visual appearance, layout, styling, rendering, canvas output, charts, or visual regressions matter, use view_page so MoonDesk captures the current rendered page and returns the actual pixels through the model's vision input. Accessibility/text snapshots are useful for structure but do not replace view_page for visual judgment. Raw take_screenshot is still available, but view_page is preferred because it guarantees MoonDesk-owned temporary capture, bounded image encoding, native MCP image content, and cleanup instead of silently degrading to a screenshot filepath when the capture is large."
+            "Browser mode exposes a stable browser surface instead of forwarding the full Chrome DevTools MCP catalog. Use browser_command for browser actions and view_page for actual rendered pixels. The browser starts lazily on the first browser operation in an isolated temporary agent profile that never inherits the user's personal cookies or logged-in browser state. The same live agent session is reused across browser_command, view_page, and moondesk-browser until that session ends. Start with take_snapshot before element interactions, use only UIDs from the latest snapshot, and take a new snapshot after navigation or substantial DOM changes. Accessibility/text snapshots are useful for structure but do not replace view_page for visual judgment. MoonDesk manages browser start/status/stop automatically; do not invoke lifecycle commands through browser_command or call npx chrome-devtools-mcp directly."
                 .to_string(),
         );
+        if mode.computer_enabled() && tool_mode.run_command_enabled() {
+            lines.push(
+                "For repetitive deterministic browser flows in Both mode, the packaged moondesk-browser CLI uses the same MoonDesk native browser runtime and shared session without adding browser schemas to the MCP tool catalog. Run `moondesk-browser skill` once when you need the workflow reference, then use `moondesk-browser <command> ...` from scripts or loops. Prefer browser_command for one-off actions and return to view_page whenever appearance matters."
+                    .to_string(),
+            );
+        }
     }
 
     if mode.computer_enabled() && tool_mode.run_command_enabled() {
@@ -1903,40 +1855,6 @@ fn is_local_destructive_tool(tool_name: &str) -> bool {
     )
 }
 
-fn tool_is_read_only(tool: &Value) -> bool {
-    tool.get("annotations")
-        .and_then(|v| v.get("readOnlyHint"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-}
-
-async fn fetch_devtools_tools(bridge: &Arc<DevtoolsManager>) -> Option<Vec<Value>> {
-    let list_req = json!({
-        "jsonrpc": "2.0",
-        "id": "dt-tools-list",
-        "method": "tools/list",
-        "params": {}
-    });
-    let resp = bridge.request(&list_req).await.ok()?;
-    let dt_tools = resp
-        .get("result")
-        .and_then(|r| r.get("tools"))
-        .and_then(Value::as_array)?
-        .to_vec();
-    Some(dt_tools)
-}
-
-async fn devtools_tool_is_read_only(
-    bridge: &Arc<DevtoolsManager>,
-    tool_name: &str,
-) -> Option<bool> {
-    let dt_tools = fetch_devtools_tools(bridge).await?;
-    dt_tools
-        .iter()
-        .find(|tool| tool.get("name").and_then(Value::as_str) == Some(tool_name))
-        .map(tool_is_read_only)
-}
-
 fn image_metadata_value(metadata: &vision::PreparedImageMetadata) -> Value {
     json!({
         "path": metadata.path,
@@ -2095,68 +2013,140 @@ fn handle_view_images(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcResp
     )
 }
 
-fn devtools_tool_error_message(response: &Value) -> Option<String> {
-    if response.pointer("/result/isError").and_then(Value::as_bool) != Some(true) {
-        return None;
-    }
-    let message = response
-        .pointer("/result/content")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|item| {
-            (item.get("type").and_then(Value::as_str) == Some("text"))
-                .then(|| item.get("text").and_then(Value::as_str))
-                .flatten()
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    Some(if message.trim().is_empty() {
-        "DevTools screenshot tool reported an error".to_string()
-    } else {
-        message
-    })
+fn browser_arg_uses_flag(args: &[String], flag: &str) -> bool {
+    let with_equals = format!("{flag}=");
+    args.iter()
+        .any(|arg| arg == flag || arg.starts_with(&with_equals))
 }
 
-fn build_view_page_devtools_request(
-    req: &JsonRpcRequest,
-    destination: &Path,
-    full_page: bool,
-    uid: Option<&str>,
-    quality: u8,
-) -> Value {
-    let mut arguments = json!({
-        "format": "jpeg",
-        "quality": quality,
-        "fullPage": full_page,
-        "filePath": destination.to_string_lossy(),
-    });
-    if let Some(uid) = uid
-        && let Some(object) = arguments.as_object_mut()
-    {
-        object.insert("uid".to_string(), json!(uid));
-    }
-    json!({
-        "jsonrpc": "2.0",
-        "id": req.id,
-        "method": "tools/call",
-        "params": {
-            "name": "take_screenshot",
-            "arguments": arguments,
+fn browser_command_allowed_read_only(command: &str, args: &[String]) -> bool {
+    match command {
+        "list_pages"
+        | "get_console_message"
+        | "list_console_messages"
+        | "list_network_requests"
+        | "performance_analyze_insight" => true,
+        "take_snapshot" => !browser_arg_uses_flag(args, "--filePath"),
+        "get_network_request" => {
+            !browser_arg_uses_flag(args, "--requestFilePath")
+                && !browser_arg_uses_flag(args, "--responseFilePath")
         }
-    })
+        "lighthouse_audit" => !browser_arg_uses_flag(args, "--outputDirPath"),
+        _ => false,
+    }
+}
+
+async fn handle_browser_command(
+    req: &JsonRpcRequest,
+    workspace_root: &str,
+    tool_mode: ToolMode,
+    browser_runtime: &Option<Arc<BrowserRuntime>>,
+) -> JsonRpcResponse {
+    let arguments = tool_arguments(req);
+    let command = match arguments.get("command").and_then(Value::as_str) {
+        Some(value) if !value.trim().is_empty() => value.trim(),
+        _ => return tool_error_response(req, "Missing required parameter: command".to_string()),
+    };
+    let args = match arguments.get("args") {
+        None => Vec::new(),
+        Some(Value::Array(values)) if values.len() <= 64 => {
+            let mut args = Vec::with_capacity(values.len());
+            for (index, value) in values.iter().enumerate() {
+                let Some(value) = value.as_str() else {
+                    return tool_error_response(req, format!("args[{index}] must be a string"));
+                };
+                if value.len() > 8192 {
+                    return tool_error_response(
+                        req,
+                        format!("args[{index}] exceeds the 8192-byte limit"),
+                    );
+                }
+                args.push(value.to_string());
+            }
+            args
+        }
+        Some(Value::Array(_)) => {
+            return tool_error_response(req, "args may contain at most 64 values".to_string());
+        }
+        Some(_) => return tool_error_response(req, "args must be an array of strings".to_string()),
+    };
+    if tool_mode.read_only() && !browser_command_allowed_read_only(command, &args) {
+        return tool_error_response(
+            req,
+            format!("Browser command '{command}' is blocked in read-only mode"),
+        );
+    }
+
+    let timeout_ms = match arguments.get("timeout_ms") {
+        None => DEFAULT_BROWSER_COMMAND_TIMEOUT.as_millis() as u64,
+        Some(value) => match value.as_u64() {
+            Some(value @ 1..=120_000) => value,
+            _ => {
+                return tool_error_response(
+                    req,
+                    "timeout_ms must be an integer between 1 and 120000".to_string(),
+                );
+            }
+        },
+    };
+
+    let Some(runtime) = browser_runtime else {
+        return tool_error_response(
+            req,
+            "Browser runtime is unavailable. Restart MoonDesk in Browser or Both mode.".to_string(),
+        );
+    };
+    let output = match runtime
+        .run(
+            workspace_root,
+            command,
+            &args,
+            std::time::Duration::from_millis(timeout_ms),
+        )
+        .await
+    {
+        Ok(output) => output,
+        Err(error) => return tool_error_response(req, format!("Browser command failed: {error}")),
+    };
+
+    if !output.success() {
+        let details = output.failure_details();
+        return tool_error_response(
+            req,
+            if details.is_empty() {
+                format!("Browser command '{command}' failed")
+            } else {
+                format!("Browser command '{command}' failed:\n{details}")
+            },
+        );
+    }
+
+    let text = [output.stdout.trim(), output.stderr.trim()]
+        .into_iter()
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    tool_success_response_with_structured(
+        req,
+        text,
+        json!({
+            "stdout": output.stdout,
+            "stderr": output.stderr,
+            "exitCode": output.exit_code,
+            "restarted": output.restarted,
+        }),
+    )
 }
 
 async fn handle_view_page(
     req: &JsonRpcRequest,
     workspace_root: &str,
-    devtools: &Option<Arc<DevtoolsManager>>,
+    browser_runtime: &Option<Arc<BrowserRuntime>>,
 ) -> JsonRpcResponse {
-    let Some(bridge) = devtools else {
+    let Some(runtime) = browser_runtime else {
         return tool_error_response(
             req,
-            "Browser vision is not available because the DevTools bridge is not running"
-                .to_string(),
+            "Browser vision is unavailable. Restart MoonDesk in Browser or Both mode.".to_string(),
         );
     };
     let arguments = tool_arguments(req);
@@ -2190,29 +2180,42 @@ async fn handle_view_page(
 
     let temp_path =
         std::env::temp_dir().join(format!("moondesk-view-page-{}.jpeg", uuid::Uuid::new_v4()));
-    let forward_req = build_view_page_devtools_request(req, &temp_path, full_page, uid, quality);
-    let response = match bridge.request(&forward_req).await {
-        Ok(response) => response,
+    let mut cli_args = vec![
+        "--format=jpeg".to_string(),
+        format!("--quality={quality}"),
+        format!("--fullPage={full_page}"),
+        format!("--filePath={}", temp_path.display()),
+    ];
+    if let Some(uid) = uid {
+        cli_args.push(format!("--uid={uid}"));
+    }
+
+    let output = match runtime
+        .run(
+            workspace_root,
+            "take_screenshot",
+            &cli_args,
+            DEFAULT_BROWSER_COMMAND_TIMEOUT,
+        )
+        .await
+    {
+        Ok(output) => output,
         Err(error) => {
             let _ = std::fs::remove_file(&temp_path);
             return tool_error_response(req, format!("Browser screenshot failed: {error}"));
         }
     };
-    if let Some(error) = response.get("error") {
-        let code = error.get("code").and_then(Value::as_i64).unwrap_or(-32000);
-        let message = error
-            .get("message")
-            .and_then(Value::as_str)
-            .unwrap_or("Unknown DevTools screenshot error");
+    if !output.success() {
         let _ = std::fs::remove_file(&temp_path);
+        let details = output.failure_details();
         return tool_error_response(
             req,
-            format!("Browser screenshot failed (code {code}): {message}"),
+            if details.is_empty() {
+                "Browser screenshot failed".to_string()
+            } else {
+                format!("Browser screenshot failed: {details}")
+            },
         );
-    }
-    if let Some(message) = devtools_tool_error_message(&response) {
-        let _ = std::fs::remove_file(&temp_path);
-        return tool_error_response(req, format!("Browser screenshot failed: {message}"));
     }
     if !temp_path.is_file() {
         return tool_error_response(
@@ -2569,7 +2572,7 @@ mod tests {
     }
 
     #[test]
-    fn initialize_negotiates_2025_11_25_without_changing_devtools_protocol() {
+    fn initialize_negotiates_2025_11_25_with_stable_tool_catalog() {
         let req = JsonRpcRequest {
             jsonrpc: "2.0".into(),
             id: Some(json!("req-initialize")),
@@ -2617,7 +2620,14 @@ mod tests {
         );
         assert_eq!(SERVER_VERSION, env!("CARGO_PKG_VERSION"));
         assert_eq!(MCP_PROTOCOL_VERSION, "2025-11-25");
-        assert_eq!(DEVTOOLS_PROTOCOL_VERSION, "2025-03-26");
+        assert_eq!(
+            capabilities
+                .get("tools")
+                .and_then(|tools| tools.get("listChanged"))
+                .and_then(Value::as_bool),
+            Some(false),
+            "MoonDesk now exposes a stable browser tool surface within a running host"
+        );
     }
 
     #[tokio::test]
@@ -3434,7 +3444,7 @@ mod tests {
             params: json!({}),
         };
 
-        let response = handle_tools_list(&req, Mode::Both, ToolMode::MultiTools, &None).await;
+        let response = handle_tools_list(&req, Mode::Both, ToolMode::MultiTools).await;
         let names = response
             .result
             .as_ref()
@@ -3462,6 +3472,8 @@ mod tests {
                 "write",
                 "edit",
                 "delete",
+                "browser_command",
+                "view_page",
             ]
         );
     }
@@ -3475,7 +3487,7 @@ mod tests {
             params: json!({}),
         };
 
-        let response = handle_tools_list(&req, Mode::Both, ToolMode::MultiTools, &None).await;
+        let response = handle_tools_list(&req, Mode::Both, ToolMode::MultiTools).await;
         let tools = response
             .result
             .as_ref()
@@ -3520,6 +3532,8 @@ mod tests {
             ("view_images", "images"),
             ("search", "text"),
             ("edit", "replacements"),
+            ("browser_command", "stdout"),
+            ("view_page", "width"),
         ] {
             let properties = tools
                 .iter()
@@ -3544,7 +3558,7 @@ mod tests {
             params: json!({}),
         };
 
-        let response = handle_tools_list(&req, Mode::Both, ToolMode::MultiTools, &None).await;
+        let response = handle_tools_list(&req, Mode::Both, ToolMode::MultiTools).await;
         let tools = response
             .result
             .as_ref()
@@ -3569,7 +3583,7 @@ mod tests {
             params: json!({}),
         };
 
-        let response = handle_tools_list(&req, Mode::Both, ToolMode::ReadOnly, &None).await;
+        let response = handle_tools_list(&req, Mode::Both, ToolMode::ReadOnly).await;
         let names = response
             .result
             .as_ref()
@@ -3588,6 +3602,8 @@ mod tests {
                 "view_image",
                 "view_images",
                 "search",
+                "browser_command",
+                "view_page",
             ]
         );
     }
@@ -3974,62 +3990,121 @@ mod tests {
     }
 
     #[test]
-    fn devtools_tool_error_message_extracts_mcp_tool_errors() {
-        let response = json!({
-            "result": {
-                "isError": true,
-                "content": [
-                    { "type": "text", "text": "first failure line" },
-                    { "type": "text", "text": "second failure line" }
-                ]
-            }
-        });
-        assert_eq!(
-            devtools_tool_error_message(&response).as_deref(),
-            Some("first failure line\nsecond failure line")
-        );
-        assert!(devtools_tool_error_message(&json!({ "result": { "isError": false } })).is_none());
+    fn browser_read_only_policy_allows_inspection_but_blocks_actions_and_file_writes() {
+        let no_args = Vec::new();
+        for command in [
+            "list_pages",
+            "take_snapshot",
+            "list_console_messages",
+            "list_network_requests",
+            "lighthouse_audit",
+        ] {
+            assert!(
+                browser_command_allowed_read_only(command, &no_args),
+                "{command}"
+            );
+        }
+        for command in [
+            "take_screenshot",
+            "new_page",
+            "navigate_page",
+            "click",
+            "fill",
+            "type_text",
+            "resize_page",
+            "evaluate_script",
+        ] {
+            assert!(
+                !browser_command_allowed_read_only(command, &no_args),
+                "{command}"
+            );
+        }
+        assert!(!browser_command_allowed_read_only(
+            "take_snapshot",
+            &["--filePath=outside.txt".to_string()]
+        ));
+        assert!(!browser_command_allowed_read_only(
+            "get_network_request",
+            &["--responseFilePath".to_string(), "outside.bin".to_string()]
+        ));
+        assert!(!browser_command_allowed_read_only(
+            "lighthouse_audit",
+            &["--outputDirPath=reports".to_string()]
+        ));
     }
 
-    #[test]
-    fn view_page_builds_managed_jpeg_devtools_request() {
-        let req = tool_call_request("view_page", json!({}));
-        let destination = std::env::temp_dir().join("moondesk-view-page-test.jpeg");
-        let request =
-            build_view_page_devtools_request(&req, &destination, false, Some("node-42"), 84);
+    #[tokio::test]
+    async fn browser_tool_catalog_is_stable_and_does_not_proxy_raw_devtools_tools() {
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0".into(),
+            id: Some(json!("browser-tools")),
+            method: "tools/list".into(),
+            params: json!({}),
+        };
+        let response = handle_tools_list(&req, Mode::Browser, ToolMode::ReadOnly).await;
+        let names = response
+            .result
+            .as_ref()
+            .and_then(|result| result.get("tools"))
+            .and_then(Value::as_array)
+            .expect("browser tools")
+            .iter()
+            .filter_map(|tool| tool.get("name").and_then(Value::as_str))
+            .collect::<Vec<_>>();
         assert_eq!(
-            request.pointer("/params/name").and_then(Value::as_str),
-            Some("take_screenshot")
+            names,
+            vec!["moondesk_instruction", "browser_command", "view_page"]
+        );
+        for removed_raw_tool in ["click", "navigate_page", "resize_page", "take_screenshot"] {
+            assert!(!names.contains(&removed_raw_tool));
+        }
+        let browser_command = response
+            .result
+            .as_ref()
+            .and_then(|result| result.get("tools"))
+            .and_then(Value::as_array)
+            .and_then(|tools| {
+                tools.iter().find(|tool| {
+                    tool.get("name").and_then(Value::as_str) == Some("browser_command")
+                })
+            })
+            .expect("browser_command descriptor");
+        assert_eq!(
+            browser_command
+                .pointer("/annotations/readOnlyHint")
+                .and_then(Value::as_bool),
+            Some(true)
         );
         assert_eq!(
-            request
-                .pointer("/params/arguments/format")
-                .and_then(Value::as_str),
-            Some("jpeg")
+            browser_command
+                .pointer("/annotations/destructiveHint")
+                .and_then(Value::as_bool),
+            Some(false)
         );
+
+        let writable = handle_tools_list(&req, Mode::Browser, ToolMode::MultiTools).await;
+        let writable_browser_command = writable
+            .result
+            .as_ref()
+            .and_then(|result| result.get("tools"))
+            .and_then(Value::as_array)
+            .and_then(|tools| {
+                tools.iter().find(|tool| {
+                    tool.get("name").and_then(Value::as_str) == Some("browser_command")
+                })
+            })
+            .expect("writable browser_command descriptor");
         assert_eq!(
-            request
-                .pointer("/params/arguments/quality")
-                .and_then(Value::as_u64),
-            Some(84)
-        );
-        assert_eq!(
-            request
-                .pointer("/params/arguments/fullPage")
+            writable_browser_command
+                .pointer("/annotations/readOnlyHint")
                 .and_then(Value::as_bool),
             Some(false)
         );
         assert_eq!(
-            request
-                .pointer("/params/arguments/uid")
-                .and_then(Value::as_str),
-            Some("node-42")
-        );
-        assert_eq!(
-            request
-                .pointer("/params/arguments/filePath")
-                .and_then(Value::as_str),
-            Some(destination.to_string_lossy().as_ref())
+            writable_browser_command
+                .pointer("/annotations/destructiveHint")
+                .and_then(Value::as_bool),
+            Some(true)
         );
     }
 
@@ -4038,7 +4113,7 @@ mod tests {
     #[ignore = "serialized Windows browser vision smoke"]
     async fn windows_view_page_returns_native_mcp_image_content() {
         use crate::browser;
-        use crate::state::{AppState, ui_event_channel};
+        use crate::state::AppState;
         use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
         use image::GenericImageView;
         use std::collections::HashSet;
@@ -4074,17 +4149,13 @@ mod tests {
             }
         }
 
-        let Some(mut selected) = browser::detect_browsers()
+        if !browser::detect_browsers()
             .into_iter()
-            .find(|browser| browser.mcp_supported)
-        else {
+            .any(|browser| browser.mcp_supported)
+        {
             eprintln!("skipping browser vision smoke: no supported Chromium browser is installed");
             return;
-        };
-        selected.remote_debug_active = false;
-        selected.remote_debug_target = None;
-        selected.remote_debug_pid = None;
-        selected.remote_debug_page_count = None;
+        }
 
         let workspace_root =
             std::env::temp_dir().join(format!("moondesk-browser-vision-{}", Uuid::new_v4()));
@@ -4096,77 +4167,24 @@ mod tests {
         )
         .expect("create browser vision app state");
         let state = Arc::new(Mutex::new(app));
-        let (ui_tx, _ui_rx) = ui_event_channel();
-        let manager = DevtoolsManager::start(Some(&selected), ui_tx, state)
-            .await
-            .expect("start DevTools manager for vision smoke");
-        let initialize = json!({
-            "jsonrpc": "2.0",
-            "id": "vision-smoke-init",
-            "method": "initialize",
-            "params": {
-                "protocolVersion": DEVTOOLS_PROTOCOL_VERSION,
-                "capabilities": {},
-                "clientInfo": { "name": "moondesk-vision-smoke", "version": SERVER_VERSION }
-            }
-        });
-        manager
-            .ensure_initialized(&initialize)
-            .await
-            .expect("initialize DevTools bridge for vision smoke");
+        let runtime = Arc::new(BrowserRuntime::new(state));
+        let runtime_option = Some(runtime.clone());
+        let workspace_root_str = workspace_root.to_string_lossy().into_owned();
 
-        let navigate = json!({
-            "jsonrpc": "2.0",
-            "id": "vision-smoke-navigate",
-            "method": "tools/call",
-            "params": {
-                "name": "navigate_page",
-                "arguments": {
-                    "type": "url",
-                    "url": "data:text/html,<body style='margin:0;background:rgb(12,34,56);height:2400px'><div style='height:1200px'></div><div style='height:1200px;background:rgb(210,60,40)'></div></body>"
-                }
-            }
-        });
-        let navigate_response = manager
-            .request(&navigate)
+        let navigate = runtime
+            .run(
+                &workspace_root_str,
+                "navigate_page",
+                &["--url=data:text/html,<body style='margin:0;background:rgb(12,34,56);height:2400px'><div style='height:1200px'></div><div style='height:1200px;background:rgb(210,60,40)'></div></body>".to_string()],
+                DEFAULT_BROWSER_COMMAND_TIMEOUT,
+            )
             .await
             .expect("navigate deterministic browser vision page");
-        assert!(navigate_response.get("error").is_none());
-        assert_ne!(
-            navigate_response
-                .pointer("/result/isError")
-                .and_then(Value::as_bool),
-            Some(true),
-            "deterministic browser vision page navigation failed: {navigate_response}"
-        );
-
-        let manager_option = Some(manager.clone());
-        let tools_request = JsonRpcRequest {
-            jsonrpc: "2.0".into(),
-            id: Some(json!("vision-smoke-tools")),
-            method: "tools/list".into(),
-            params: json!({}),
-        };
-        let tools_response = handle_tools_list(
-            &tools_request,
-            Mode::Browser,
-            ToolMode::ReadOnly,
-            &manager_option,
-        )
-        .await;
-        let tool_names = tools_response
-            .result
-            .as_ref()
-            .and_then(|result| result.get("tools"))
-            .and_then(Value::as_array)
-            .expect("browser vision tools list")
-            .iter()
-            .filter_map(|tool| tool.get("name").and_then(Value::as_str))
-            .collect::<Vec<_>>();
-        assert!(tool_names.contains(&"view_page"));
         assert!(
-            !tool_names.contains(&"take_screenshot"),
-            "raw take_screenshot writes arbitrary filePath values and should stay filtered in read-only mode"
+            navigate.success(),
+            "browser navigation failed: stdout={} stderr={}",
+            navigate.stdout,
+            navigate.stderr
         );
 
         let invalid_scope = handle_view_page(
@@ -4174,8 +4192,8 @@ mod tests {
                 "view_page",
                 json!({ "full_page": true, "uid": "node-does-not-matter" }),
             ),
-            &workspace_root.to_string_lossy(),
-            &manager_option,
+            &workspace_root_str,
+            &runtime_option,
         )
         .await;
         assert_eq!(
@@ -4193,8 +4211,8 @@ mod tests {
                 "view_page",
                 json!({ "quality": u64::from(vision::MIN_JPEG_QUALITY - 1) }),
             ),
-            &workspace_root.to_string_lossy(),
-            &manager_option,
+            &workspace_root_str,
+            &runtime_option,
         )
         .await;
         assert_eq!(
@@ -4210,8 +4228,8 @@ mod tests {
         let before = managed_view_page_files();
         let invalid_uid = handle_view_page(
             &tool_call_request("view_page", json!({ "uid": "missing-vision-smoke-uid" })),
-            &workspace_root.to_string_lossy(),
-            &manager_option,
+            &workspace_root_str,
+            &runtime_option,
         )
         .await;
         assert_eq!(
@@ -4229,10 +4247,8 @@ mod tests {
             "failed element capture must clean its managed screenshot"
         );
 
-        let manager_option = Some(manager.clone());
         let request = tool_call_request("view_page", json!({}));
-        let response =
-            handle_view_page(&request, &workspace_root.to_string_lossy(), &manager_option).await;
+        let response = handle_view_page(&request, &workspace_root_str, &runtime_option).await;
         let result = response.result.as_ref().expect("view_page result");
         assert_ne!(result.get("isError").and_then(Value::as_bool), Some(true));
         let content = result
@@ -4269,13 +4285,17 @@ mod tests {
             structured
                 .get("width")
                 .and_then(Value::as_u64)
-                .is_some_and(|v| v > 0)
+                .is_some_and(|value| value > 0)
         );
         assert!(
             structured
                 .get("height")
                 .and_then(Value::as_u64)
-                .is_some_and(|v| v > 0)
+                .is_some_and(|value| value > 0)
+        );
+        assert_eq!(
+            structured.get("fullPage").and_then(Value::as_bool),
+            Some(false)
         );
         assert!(structured.get("cleanupWarning").is_none());
         assert_eq!(
@@ -4286,8 +4306,8 @@ mod tests {
 
         let full_page_response = handle_view_page(
             &tool_call_request("view_page", json!({ "full_page": true })),
-            &workspace_root.to_string_lossy(),
-            &manager_option,
+            &workspace_root_str,
+            &runtime_option,
         )
         .await;
         let full_page_result = full_page_response
@@ -4329,7 +4349,7 @@ mod tests {
             "full-page view_page must clean its managed screenshot"
         );
 
-        manager.stop().await;
+        runtime.stop_if_owned(&workspace_root_str).await;
         let _ = std::fs::remove_dir_all(workspace_root);
     }
 
@@ -4342,7 +4362,7 @@ mod tests {
             params: json!({}),
         };
 
-        let response = handle_tools_list(&req, Mode::Both, ToolMode::MultiTools, &None).await;
+        let response = handle_tools_list(&req, Mode::Both, ToolMode::MultiTools).await;
         let search_tool = response
             .result
             .as_ref()
@@ -5038,10 +5058,17 @@ mod tests {
         assert!(instruction_text.contains("Keep search/write/edit/delete workspace-scoped"));
         assert!(instruction_text.contains("use view_image or view_images"));
         assert!(instruction_text.contains("model receives the pixels through its vision input"));
-        assert!(instruction_text.contains("use view_page"));
+        assert!(instruction_text.contains("view_page for actual rendered pixels"));
         assert!(instruction_text.contains("do not replace view_page for visual judgment"));
+        assert!(instruction_text.contains("browser starts lazily on the first browser operation"));
+        assert!(instruction_text.contains("same live agent session is reused"));
+        assert!(instruction_text.contains("never inherits the user's personal cookies"));
         assert!(
-            instruction_text.contains("instead of silently degrading to a screenshot filepath")
+            instruction_text.contains("do not invoke lifecycle commands through browser_command")
+        );
+        assert!(
+            instruction_text
+                .contains("moondesk-browser CLI uses the same MoonDesk native browser runtime")
         );
         assert_eq!(
             structured.as_object().map(|value| value.len()),

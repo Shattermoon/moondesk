@@ -94,7 +94,7 @@ The obsolete GitHub Actions `NPM_TOKEN` secret has been removed. Any old npm acc
 
 MoonDesk no longer uses `preinstall`, `install`, or `postinstall` lifecycle scripts. npm 12 blocks dependency install scripts by default, so relying on `postinstall` would make a normal `npm install -g moondesk` incomplete unless the user explicitly approved scripts.
 
-The npm package now contains a small JS wrapper plus `npm/install-binary.js`. On first CLI invocation it:
+The npm package exposes one `moondesk` JS wrapper plus `npm/install-binary.js`, the update runtime, and the packaged browser skill. Browser scripting is part of the same CLI under `moondesk browser ...`; there is no second browser executable. On first CLI invocation it:
 
 1. chooses the platform/architecture-specific release asset;
 2. downloads `SHA256SUMS` and the matching native binary over HTTPS;
@@ -111,6 +111,8 @@ After an in-app npm update succeeds, the launcher reloads MoonDesk's package-loc
 ## Windows binary trust and code signing
 
 MoonDesk's Windows release executable is currently unsigned. The published SHA-256 checksum identifies the expected native executable bytes. npm provenance identifies the npm package's source, build, and publisher, but it does not attest the separately downloaded native executable. These controls do not give Windows a durable publisher identity or transfer reputation between newly compiled executable hashes.
+
+Every Windows release candidate is now scanned by Microsoft Defender **after** the normal release smoke test and **before** it is uploaded as a build artifact. The gate records the candidate commit, SHA-256, file size, Authenticode status, and available Defender engine/signature versions as a retained `windows-release-security` CI artifact. It also re-hashes the executable after the scan and fails if Defender rejects/removes it or the bytes change. This is a release gate, not a substitute for code signing: a clean scan only describes the security intelligence on that runner at that moment.
 
 If Windows Security or another endpoint product flags a published MoonDesk executable, first verify the exact release SHA-256, update security intelligence, and submit a suspected false positive to the vendor. Do not work around a detection by disabling endpoint protection or recommending broad exclusions.
 

@@ -11,7 +11,6 @@ use tokio::sync::{
 };
 use uuid::Uuid;
 
-use crate::browser::DetectedBrowser;
 use crate::command_jobs::CommandJobManager;
 use crate::mascot::{self, MascotPack};
 use crate::theme;
@@ -172,7 +171,6 @@ pub struct AppConfig {
     pub tool_mode: ToolMode,
     #[serde(default)]
     pub usage_by_model: BTreeMap<String, UsageTotals>,
-    pub selected_browser: Option<DetectedBrowser>,
 }
 
 impl Default for AppConfig {
@@ -189,7 +187,6 @@ impl Default for AppConfig {
             mode: Mode::Both,
             tool_mode: ToolMode::MultiTools,
             usage_by_model: BTreeMap::new(),
-            selected_browser: None,
         }
     }
 }
@@ -578,9 +575,9 @@ pub const FLOW_BOOTSTRAP_PHASES: &[FlowBootstrapPhase] = &[FlowBootstrapPhase {
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Mode {
-    Computer, // run_command only
-    Browser,  // chrome-devtools-mcp only
-    Both,     // both
+    Computer, // local computer tools only
+    Browser,  // stable lazy browser tools only
+    Both,     // computer + browser
 }
 
 impl Mode {
@@ -644,14 +641,6 @@ impl ToolMode {
     }
 }
 
-/// Browser process launched and owned by MoonDesk for remote debugging.
-pub struct OwnedRemoteBrowser {
-    pub child: tokio::process::Child,
-    #[cfg(windows)]
-    pub process_tree: crate::process_runner::WindowsProcessTreeGuard,
-    pub profile_dir: PathBuf,
-}
-
 /// Shared application state across server, ngrok, and TUI.
 pub struct AppState {
     pub theme: String,
@@ -671,13 +660,11 @@ pub struct AppState {
     pub ngrok_url: Option<String>,
     pub remote_connected: bool,
     pub last_remote_activity_ms: Option<u128>,
-    pub devtools_running: bool,
+    pub browser_runtime_running: bool,
     pub port: u16,
     pub workspace_root: String,
     pub set_moondesk_as_co_author: bool,
     pub mascot: MascotPack,
-    pub detected_browsers: Vec<DetectedBrowser>,
-    pub selected_browser: Option<DetectedBrowser>,
     next_log_sequence: u64,
     next_command_sequence: u64,
     pub logs: Vec<LogEntry>,
@@ -691,7 +678,6 @@ pub struct AppState {
     config_path: PathBuf,
     pub server_handle: Option<tokio::task::JoinHandle<()>>,
     pub ngrok_task: Option<tokio::task::JoinHandle<()>>,
-    pub remote_browser: Option<OwnedRemoteBrowser>,
 }
 
 pub type SharedState = Arc<Mutex<AppState>>;
@@ -1095,13 +1081,11 @@ impl AppState {
             ngrok_url: None,
             remote_connected: false,
             last_remote_activity_ms: None,
-            devtools_running: false,
+            browser_runtime_running: false,
             port,
             set_moondesk_as_co_author: config.set_moondesk_as_co_author,
             mascot,
             workspace_root,
-            detected_browsers: Vec::new(),
-            selected_browser: config.selected_browser,
             next_log_sequence: 0,
             next_command_sequence: 0,
             logs: Vec::new(),
@@ -1115,7 +1099,6 @@ impl AppState {
             config_path,
             server_handle: None,
             ngrok_task: None,
-            remote_browser: None,
         };
         app.log("INFO", format!("ClippyMoon seed: {mascot_seed:016x}"));
         Ok(app)
@@ -1313,7 +1296,6 @@ impl AppState {
             mode: self.mode,
             tool_mode: self.tool_mode,
             usage_by_model: self.usage_by_model.clone(),
-            selected_browser: self.selected_browser.clone(),
         }
         .normalized()
     }

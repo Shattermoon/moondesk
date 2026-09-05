@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
-use tokio::process::{Child, ChildStderr, ChildStdout, Command};
+use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 use tokio::time::{Duration, timeout};
 
 const READ_CHUNK_BYTES: usize = 8 * 1024;
@@ -45,6 +45,10 @@ pub struct SpawnedProcess {
 impl SpawnedProcess {
     pub fn pid(&self) -> Option<u32> {
         self.child.id()
+    }
+
+    pub fn take_stdin(&mut self) -> Option<ChildStdin> {
+        self.child.stdin.take()
     }
 
     pub fn take_stdout(&mut self) -> Option<ChildStdout> {
@@ -165,66 +169,6 @@ impl Drop for ProcessTreeGuard {
     }
 }
 
-/// Windows-only ownership guard for direct child processes that need the same
-/// descendant cleanup guarantees as MoonDesk shell commands.
-#[cfg(windows)]
-pub(crate) struct WindowsProcessTreeGuard {
-    inner: ProcessTreeGuard,
-}
-
-#[cfg(windows)]
-impl WindowsProcessTreeGuard {
-    /// Suspend the initial process so it cannot spawn descendants before MoonDesk
-    /// assigns it to the Job Object. `kill_on_drop` is a root-process fallback for
-    /// failures that happen before the Job Object ownership is established.
-    pub(crate) fn prepare_command(command: &mut Command) {
-        use std::os::windows::process::CommandExt;
-        use windows_sys::Win32::System::Threading::CREATE_SUSPENDED;
-
-        command.kill_on_drop(true);
-        command.as_std_mut().creation_flags(CREATE_SUSPENDED);
-    }
-
-    /// Assign a freshly spawned, suspended child to a kill-on-close Job Object and
-    /// only then resume it, so all subsequently-created descendants inherit the job.
-    pub(crate) fn attach(child: &mut Child) -> io::Result<Self> {
-        let Some(pid) = child.id() else {
-            let _ = child.start_kill();
-            return Err(io::Error::other(
-                "spawned process did not expose a process id",
-            ));
-        };
-
-        let job_handle = match create_windows_job_for_process(pid) {
-            Ok(handle) => handle,
-            Err(error) => {
-                let _ = child.start_kill();
-                return Err(io::Error::new(
-                    error.kind(),
-                    format!("failed to assign process to Windows Job Object: {error}"),
-                ));
-            }
-        };
-
-        if let Err(error) = resume_windows_process(pid) {
-            let mut job_handle = Some(job_handle);
-            close_windows_job(&mut job_handle);
-            let _ = child.start_kill();
-            return Err(io::Error::new(
-                error.kind(),
-                format!("failed to resume suspended process: {error}"),
-            ));
-        }
-
-        Ok(Self {
-            inner: ProcessTreeGuard::with_windows_job(pid, job_handle),
-        })
-    }
-
-    pub(crate) async fn terminate(&mut self) {
-        self.inner.terminate().await;
-    }
-}
 #[cfg(windows)]
 fn create_windows_job_for_process(pid: u32) -> io::Result<usize> {
     use std::ffi::c_void;
@@ -506,11 +450,9 @@ fn shell_command(command: &str) -> Command {
     }
 }
 
-fn spawn_shell_command_blocking(command: &str, cwd: &Path) -> io::Result<SpawnedProcess> {
-    let mut shell = shell_command(command);
-    shell
-        .current_dir(cwd)
-        .stdin(Stdio::null())
+fn spawn_owned_command_blocking(mut command: Command, stdin: Stdio) -> io::Result<SpawnedProcess> {
+    command
+        .stdin(stdin)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
@@ -518,17 +460,17 @@ fn spawn_shell_command_blocking(command: &str, cwd: &Path) -> io::Result<Spawned
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
-        shell.as_std_mut().process_group(0);
+        command.as_std_mut().process_group(0);
     }
 
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         use windows_sys::Win32::System::Threading::CREATE_SUSPENDED;
-        shell.as_std_mut().creation_flags(CREATE_SUSPENDED);
+        command.as_std_mut().creation_flags(CREATE_SUSPENDED);
     }
 
-    let mut child = shell.spawn()?;
+    let mut child = command.spawn()?;
     let Some(pid) = child.id() else {
         let _ = child.start_kill();
         return Err(io::Error::other(
@@ -572,6 +514,16 @@ fn spawn_shell_command_blocking(command: &str, cwd: &Path) -> io::Result<Spawned
         stderr,
         tree,
     })
+}
+
+pub fn spawn_owned_program(command: Command) -> io::Result<SpawnedProcess> {
+    spawn_owned_command_blocking(command, Stdio::piped())
+}
+
+fn spawn_shell_command_blocking(command: &str, cwd: &Path) -> io::Result<SpawnedProcess> {
+    let mut shell = shell_command(command);
+    shell.current_dir(cwd);
+    spawn_owned_command_blocking(shell, Stdio::null())
 }
 
 pub async fn spawn_shell_command(command: &str, cwd: &Path) -> io::Result<SpawnedProcess> {

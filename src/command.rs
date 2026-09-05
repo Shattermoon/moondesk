@@ -1123,7 +1123,11 @@ mod tests {
             "basename \"$PWD\""
         };
 
-        let result = run_command(command, &workspace_root, 10_000).await;
+        // Windows hosted CI can take noticeably longer to cold-start PowerShell under
+        // endpoint protection. This test validates shell selection and cwd, not the
+        // production timeout budget, so give the platform shell enough startup headroom.
+        let timeout_ms = if cfg!(windows) { 30_000 } else { 10_000 };
+        let result = run_command(command, &workspace_root, timeout_ms).await;
 
         assert!(result.success, "stderr: {}", result.stderr);
         assert_eq!(result.stdout.trim(), leaf);

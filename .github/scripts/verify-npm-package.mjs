@@ -9,6 +9,7 @@ const expected = [
   "npm/moondesk.js",
   "npm/update-manager.js",
   "package.json",
+  "skills/browser/SKILL.md",
 ].sort();
 
 const output = execFileSync(

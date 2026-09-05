@@ -12,9 +12,16 @@ use crate::state::SharedState;
 // re-tested. chrome-devtools-mcp 1.8.0 changed required CLI argument shapes (including commands
 // MoonDesk currently invokes with 1.7-style optional flags), so it is not a drop-in upgrade.
 pub const CHROME_DEVTOOLS_PACKAGE_VERSION: &str = "1.7.0";
-pub const CHROME_DEVTOOLS_SESSION_ID: &str = "6d6f6f6e6465736b";
 pub const DEFAULT_BROWSER_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
+pub const MAX_BROWSER_TIMEOUT_MS: u64 = 120_000;
+pub const MAX_BROWSER_COMMAND_BYTES: usize = 128;
+pub const MAX_BROWSER_ARGS: usize = 64;
+pub const MAX_BROWSER_ARG_BYTES: usize = 8 * 1024;
+pub const MAX_BROWSER_CONTROL_BODY_BYTES: usize = 128 * 1024;
 const MAX_CAPTURED_OUTPUT_BYTES: usize = 256 * 1024;
+const BROWSER_STATUS_TIMEOUT: Duration = Duration::from_secs(20);
+const BROWSER_START_TIMEOUT: Duration = Duration::from_secs(60);
+const BROWSER_STOP_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[derive(Clone, Debug)]
 pub struct BrowserCommandOutput {
@@ -44,7 +51,7 @@ impl BrowserCommandOutput {
 #[derive(Default)]
 struct BrowserRuntimeState {
     ready: bool,
-    started_by_moondesk: bool,
+    owned_daemon_pid: Option<u32>,
 }
 
 /// Shared, lazy Chrome DevTools CLI runtime.
@@ -54,6 +61,7 @@ struct BrowserRuntimeState {
 /// isolated agent-browser profile, and both MCP browser_command and view_page share that session.
 pub struct BrowserRuntime {
     state: Option<SharedState>,
+    session_id: String,
     runtime: Mutex<BrowserRuntimeState>,
     operation: Mutex<()>,
 }
@@ -73,6 +81,7 @@ impl BrowserRuntime {
     fn with_optional_state(state: Option<SharedState>) -> Self {
         Self {
             state,
+            session_id: uuid::Uuid::new_v4().simple().to_string(),
             runtime: Mutex::new(BrowserRuntimeState::default()),
             operation: Mutex::new(()),
         }
@@ -85,6 +94,43 @@ impl BrowserRuntime {
         args: &[String],
         timeout: Duration,
     ) -> Result<BrowserCommandOutput, String> {
+        self.run_internal(workspace_root, command, args, timeout, None)
+            .await
+    }
+
+    pub(crate) async fn run_managed_temp_output(
+        &self,
+        workspace_root: &str,
+        command: &str,
+        args: &[String],
+        managed_temp_output: &Path,
+        timeout: Duration,
+    ) -> Result<BrowserCommandOutput, String> {
+        if command.trim() != "take_screenshot" || !managed_browser_temp_output(managed_temp_output)
+        {
+            return Err(
+                "Managed browser output is reserved for MoonDesk's internal view_page screenshot"
+                    .to_string(),
+            );
+        }
+        self.run_internal(
+            workspace_root,
+            command,
+            args,
+            timeout,
+            Some(managed_temp_output),
+        )
+        .await
+    }
+
+    async fn run_internal(
+        &self,
+        workspace_root: &str,
+        command: &str,
+        args: &[String],
+        timeout: Duration,
+        managed_temp_output: Option<&Path>,
+    ) -> Result<BrowserCommandOutput, String> {
         let command = command.trim();
         if command.is_empty() {
             return Err("Browser command cannot be empty".to_string());
@@ -95,49 +141,112 @@ impl BrowserRuntime {
                     .to_string(),
             );
         }
+        if timeout.is_zero() {
+            return Err("Browser command timeout must be at least 1 ms".to_string());
+        }
+
+        let started_at = tokio::time::Instant::now();
+        let deadline = started_at + timeout;
+        let result = tokio::time::timeout(
+            timeout,
+            self.run_with_deadline(workspace_root, command, args, deadline, managed_temp_output),
+        )
+        .await;
+        match result {
+            Ok(result) => result,
+            Err(_) => Err(format!(
+                "Browser command timed out after {} ms total",
+                timeout.as_millis()
+            )),
+        }
+    }
+
+    async fn run_with_deadline(
+        &self,
+        workspace_root: &str,
+        command: &str,
+        args: &[String],
+        deadline: tokio::time::Instant,
+        managed_temp_output: Option<&Path>,
+    ) -> Result<BrowserCommandOutput, String> {
         if args
             .iter()
             .any(|arg| matches!(arg.as_str(), "--help" | "-h"))
         {
-            return self.run_cli(workspace_root, command, args, timeout).await;
+            let budget = remaining_timeout(deadline, DEFAULT_BROWSER_COMMAND_TIMEOUT)?;
+            return self.run_cli(workspace_root, command, args, budget).await;
         }
 
+        let mut prepared = prepare_browser_invocation_with_managed_temp(
+            workspace_root,
+            command,
+            args,
+            managed_temp_output,
+        )?;
+
         // Latest-snapshot UIDs and page state are shared. Keep browser operations ordered so
-        // simultaneous MCP/CLI requests cannot race the selected page or DOM.
+        // simultaneous MCP/CLI requests cannot race the selected page or DOM. Waiting for this
+        // lock is part of the caller's total timeout budget.
         let _operation = self.operation.lock().await;
-        self.ensure_started(workspace_root).await?;
-        let first = self.run_cli(workspace_root, command, args, timeout).await?;
-        if first.success() || !browser_connectivity_failure(&first.stdout, &first.stderr) {
+        self.ensure_started(workspace_root, deadline).await?;
+        let first_budget = remaining_timeout(deadline, DEFAULT_BROWSER_COMMAND_TIMEOUT)?;
+        let mut first = self
+            .run_cli(workspace_root, command, &prepared.args, first_budget)
+            .await?;
+        if first.success() {
+            prepared.commit_outputs()?;
+            prepared.rewrite_output_paths(&mut first);
+            return Ok(first);
+        }
+        if !browser_connectivity_failure(&first.stdout, &first.stderr) {
+            prepared.rewrite_output_paths(&mut first);
             return Ok(first);
         }
 
-        self.restart(workspace_root).await?;
-        let mut retry = self.run_cli(workspace_root, command, args, timeout).await?;
+        prepared.reset_outputs()?;
+        self.restart(workspace_root, deadline).await?;
+        let retry_budget = remaining_timeout(deadline, DEFAULT_BROWSER_COMMAND_TIMEOUT)?;
+        let mut retry = self
+            .run_cli(workspace_root, command, &prepared.args, retry_budget)
+            .await?;
         retry.restarted = true;
+        if retry.success() {
+            prepared.commit_outputs()?;
+        }
+        prepared.rewrite_output_paths(&mut retry);
         Ok(retry)
     }
 
     pub async fn stop_if_owned(&self, workspace_root: &str) {
         let _operation = self.operation.lock().await;
-        let owned = {
+        let owned_pid = {
             let mut runtime = self.runtime.lock().await;
-            let owned = runtime.started_by_moondesk;
             runtime.ready = false;
-            runtime.started_by_moondesk = false;
-            owned
+            runtime.owned_daemon_pid.take()
         };
-        if !owned {
-            return;
-        }
         if let Some(state) = &self.state {
             state.lock().await.browser_runtime_running = false;
         }
+        let Some(owned_pid) = owned_pid else {
+            return;
+        };
+
+        // Never send `stop` unless the daemon currently occupying this runtime's private
+        // namespace is the exact process MoonDesk started. This prevents a stale ownership bit
+        // from terminating a replacement daemon after a crash/restart race.
+        if daemon_pid(&self.session_id) != Some(owned_pid) || !process_is_live(owned_pid) {
+            if let Some(state) = &self.state {
+                state.lock().await.log(
+                    "WARN",
+                    "MoonDesk browser daemon ownership changed before shutdown; leaving the unknown process untouched"
+                        .to_string(),
+                );
+            }
+            return;
+        }
+
         if let Err(error) = self
-            .run_cli_raw(
-                workspace_root,
-                &["stop".to_string()],
-                Duration::from_secs(20),
-            )
+            .run_cli_raw(workspace_root, &["stop".to_string()], BROWSER_STOP_TIMEOUT)
             .await
             && let Some(state) = &self.state
         {
@@ -148,74 +257,78 @@ impl BrowserRuntime {
         }
     }
 
-    async fn ensure_started(&self, workspace_root: &str) -> Result<(), String> {
+    async fn ensure_started(
+        &self,
+        workspace_root: &str,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), String> {
         let mut runtime = self.runtime.lock().await;
         if runtime.ready {
-            if daemon_process_is_alive() {
+            if runtime.owned_daemon_pid.is_some_and(|pid| {
+                daemon_pid(&self.session_id) == Some(pid) && process_is_live(pid)
+            }) {
                 return Ok(());
             }
             runtime.ready = false;
-            runtime.started_by_moondesk = false;
+            runtime.owned_daemon_pid = None;
             if let Some(state) = &self.state {
                 let mut app = state.lock().await;
                 app.browser_runtime_running = false;
                 app.log(
                     "WARN",
-                    "MoonDesk browser daemon exited; restarting it before the next browser operation"
+                    "MoonDesk browser daemon exited or changed identity; starting a fresh private runtime before the next browser operation"
                         .to_string(),
                 );
             }
         }
 
+        // A BrowserRuntime gets a cryptographically random upstream session namespace. Seeing a
+        // live daemon in that namespace without a matching owned PID is therefore an ownership
+        // violation, not something to adopt or terminate.
+        if let Some(pid) = daemon_pid(&self.session_id).filter(|pid| process_is_live(*pid)) {
+            return Err(format!(
+                "Browser runtime namespace is unexpectedly occupied by daemon pid {pid}; refusing to reuse or stop an unowned browser daemon"
+            ));
+        }
+
+        let status_budget = remaining_timeout(deadline, BROWSER_STATUS_TIMEOUT)?;
         let status = self
-            .run_cli_raw(
-                workspace_root,
-                &["status".to_string()],
-                Duration::from_secs(20),
-            )
+            .run_cli_raw(workspace_root, &["status".to_string()], status_budget)
             .await?;
         if status.exit_code == 0 && daemon_is_running(&status.stdout, &status.stderr) {
-            if self.daemon_status_matches_expected_configuration(&status.stdout) {
-                runtime.ready = true;
-                runtime.started_by_moondesk = true;
-                if let Some(state) = &self.state {
-                    let mut app = state.lock().await;
-                    app.browser_runtime_running = true;
-                    app.log(
-                        "INFO",
-                        "Reusing the existing MoonDesk browser runtime".to_string(),
-                    );
-                }
-                return Ok(());
-            }
-            if let Some(state) = &self.state {
-                state.lock().await.log(
-                    "INFO",
-                    "Existing MoonDesk browser daemon uses stale settings; restarting it with the current isolated agent-browser configuration"
-                        .to_string(),
-                );
-            }
+            return Err(
+                "Browser runtime reported an unexpected daemon in MoonDesk's private session namespace; refusing unsafe reuse"
+                    .to_string(),
+            );
         }
 
-        self.start_locked(workspace_root, &mut runtime).await
+        self.start_locked(workspace_root, &mut runtime, deadline)
+            .await
     }
 
-    async fn restart(&self, workspace_root: &str) -> Result<(), String> {
+    async fn restart(
+        &self,
+        workspace_root: &str,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), String> {
         let mut runtime = self.runtime.lock().await;
-        let _ = self
-            .run_cli_raw(
-                workspace_root,
-                &["stop".to_string()],
-                Duration::from_secs(20),
-            )
-            .await;
+        if let Some(owned_pid) = runtime.owned_daemon_pid
+            && daemon_pid(&self.session_id) == Some(owned_pid)
+            && process_is_live(owned_pid)
+        {
+            let stop_budget = remaining_timeout(deadline, BROWSER_STOP_TIMEOUT)?;
+            let _ = self
+                .run_cli_raw(workspace_root, &["stop".to_string()], stop_budget)
+                .await;
+        }
         runtime.ready = false;
-        runtime.started_by_moondesk = false;
-        self.start_locked(workspace_root, &mut runtime).await?;
+        runtime.owned_daemon_pid = None;
+        self.start_locked(workspace_root, &mut runtime, deadline)
+            .await?;
         if let Some(state) = &self.state {
             state.lock().await.log(
                 "INFO",
-                "Browser session was unavailable, so MoonDesk restarted it and will retry the request"
+                "Browser session was unavailable, so MoonDesk restarted its private runtime and will retry the request"
                     .to_string(),
             );
         }
@@ -226,13 +339,21 @@ impl BrowserRuntime {
         &self,
         workspace_root: &str,
         runtime: &mut BrowserRuntimeState,
+        deadline: tokio::time::Instant,
     ) -> Result<(), String> {
+        if let Some(pid) = daemon_pid(&self.session_id).filter(|pid| process_is_live(*pid)) {
+            return Err(format!(
+                "Browser runtime namespace is occupied by unowned daemon pid {pid}; refusing to restart over another process"
+            ));
+        }
+
         // Prefer chrome-devtools-mcp's normal supported-browser resolution. MoonDesk never
         // attaches to the user's everyday browser profile: every daemon starts an isolated
         // temporary agent profile that is discarded when the browser session ends.
         let start_args = self.start_args(None);
+        let start_budget = remaining_timeout(deadline, BROWSER_START_TIMEOUT)?;
         let mut output = self
-            .run_cli_raw(workspace_root, &start_args, Duration::from_secs(60))
+            .run_cli_raw(workspace_root, &start_args, start_budget)
             .await?;
         let mut browser_name = "default Chromium browser".to_string();
 
@@ -247,8 +368,9 @@ impl BrowserRuntime {
             let fallback_path = Path::new(&fallback.path);
             if fallback_path.is_file() {
                 let fallback_args = self.start_args(Some(fallback_path));
+                let fallback_budget = remaining_timeout(deadline, BROWSER_START_TIMEOUT)?;
                 output = self
-                    .run_cli_raw(workspace_root, &fallback_args, Duration::from_secs(60))
+                    .run_cli_raw(workspace_root, &fallback_args, fallback_budget)
                     .await?;
                 browser_name = fallback.name;
             }
@@ -266,8 +388,36 @@ impl BrowserRuntime {
                 format!("Could not start the isolated MoonDesk agent browser: {details}")
             });
         }
+        let Some(owned_pid) = daemon_pid(&self.session_id).filter(|pid| process_is_live(*pid))
+        else {
+            return Err(
+                "Isolated MoonDesk agent browser started without a live owned daemon PID"
+                    .to_string(),
+            );
+        };
+        let status_budget = remaining_timeout(deadline, BROWSER_STATUS_TIMEOUT)?;
+        let status = self
+            .run_cli_raw(workspace_root, &["status".to_string()], status_budget)
+            .await?;
+        if !daemon_is_running(&status.stdout, &status.stderr)
+            || !self.daemon_status_matches_expected_configuration(&status.stdout)
+        {
+            // This PID is ours, so it is safe to tear it down if startup somehow produced a
+            // daemon with different settings. Never expose a non-isolated or otherwise stale
+            // runtime even transiently as MoonDesk-ready.
+            if daemon_pid(&self.session_id) == Some(owned_pid) && process_is_live(owned_pid) {
+                let stop_budget = remaining_timeout(deadline, BROWSER_STOP_TIMEOUT)?;
+                let _ = self
+                    .run_cli_raw(workspace_root, &["stop".to_string()], stop_budget)
+                    .await;
+            }
+            return Err(
+                "Isolated MoonDesk agent browser did not start with the expected pinned safety configuration"
+                    .to_string(),
+            );
+        }
         runtime.ready = true;
-        runtime.started_by_moondesk = true;
+        runtime.owned_daemon_pid = Some(owned_pid);
         if let Some(state) = &self.state {
             let mut app = state.lock().await;
             app.browser_runtime_running = true;
@@ -291,6 +441,7 @@ impl BrowserRuntime {
             "--usageStatistics=false".to_string(),
             "--performanceCrux=false".to_string(),
             "--redactNetworkHeaders=true".to_string(),
+            "--allowUnrestrictedPaths=false".to_string(),
         ];
         if let Some(path) = executable.filter(|path| path.is_file()) {
             args.push(format!("--executablePath={}", path.display()));
@@ -364,7 +515,7 @@ impl BrowserRuntime {
         command
             .args(["-y", "-p", package.as_str(), "chrome-devtools"])
             .args(cli_args)
-            .arg(format!("--sessionId={CHROME_DEVTOOLS_SESSION_ID}"))
+            .arg(format!("--sessionId={}", self.session_id))
             .env("CHROME_DEVTOOLS_MCP_NO_UPDATE_CHECKS", "1")
             .current_dir(workspace_root)
             .stdin(Stdio::null())
@@ -391,8 +542,848 @@ impl BrowserRuntime {
     }
 }
 
-fn daemon_pid_file_path() -> PathBuf {
-    let app_name = format!("chrome-devtools-mcp-{CHROME_DEVTOOLS_SESSION_ID}");
+fn remaining_timeout(
+    deadline: tokio::time::Instant,
+    per_step_cap: Duration,
+) -> Result<Duration, String> {
+    let now = tokio::time::Instant::now();
+    if now >= deadline {
+        return Err("Browser command total timeout budget was exhausted".to_string());
+    }
+    Ok((deadline - now).min(per_step_cap))
+}
+
+pub fn validate_browser_request_bounds(
+    command: &str,
+    args: &[String],
+    timeout_ms: u64,
+) -> Result<(), String> {
+    let command = command.trim();
+    if command.is_empty() || command.len() > MAX_BROWSER_COMMAND_BYTES {
+        return Err(format!(
+            "command must be between 1 and {MAX_BROWSER_COMMAND_BYTES} bytes"
+        ));
+    }
+    if args.len() > MAX_BROWSER_ARGS {
+        return Err(format!(
+            "args may contain at most {MAX_BROWSER_ARGS} values"
+        ));
+    }
+    if let Some((index, _)) = args
+        .iter()
+        .enumerate()
+        .find(|(_, arg)| arg.len() > MAX_BROWSER_ARG_BYTES)
+    {
+        return Err(format!(
+            "args[{index}] exceeds the {MAX_BROWSER_ARG_BYTES}-byte limit"
+        ));
+    }
+    if !(1..=MAX_BROWSER_TIMEOUT_MS).contains(&timeout_ms) {
+        return Err(format!(
+            "timeout must be between 1 and {MAX_BROWSER_TIMEOUT_MS} ms"
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BrowserPathKind {
+    InputFile,
+    InputDirectory,
+    OutputFile,
+    OutputDirectory,
+}
+
+#[derive(Clone, Debug)]
+struct BrowserPathRewrite {
+    staged: PathBuf,
+    visible: PathBuf,
+}
+
+#[derive(Clone, Debug)]
+struct BrowserOutputStage {
+    stage_dir: PathBuf,
+    staged_requested_path: PathBuf,
+    destination: PathBuf,
+    kind: BrowserPathKind,
+}
+
+#[derive(Debug, Default)]
+struct BrowserStagingRoot {
+    path: Option<PathBuf>,
+}
+
+impl Drop for BrowserStagingRoot {
+    fn drop(&mut self) {
+        if let Some(root) = self.path.take() {
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+}
+
+#[derive(Debug)]
+struct PreparedBrowserInvocation {
+    args: Vec<String>,
+    workspace_root: PathBuf,
+    _staging_root: BrowserStagingRoot,
+    outputs: Vec<BrowserOutputStage>,
+    rewrites: Vec<BrowserPathRewrite>,
+}
+
+impl PreparedBrowserInvocation {
+    fn reset_outputs(&self) -> Result<(), String> {
+        for output in &self.outputs {
+            if output.stage_dir.exists() {
+                std::fs::remove_dir_all(&output.stage_dir).map_err(|error| {
+                    format!(
+                        "Could not reset temporary browser output staging directory {}: {error}",
+                        output.stage_dir.display()
+                    )
+                })?;
+            }
+            std::fs::create_dir_all(&output.stage_dir).map_err(|error| {
+                format!(
+                    "Could not recreate temporary browser output staging directory {}: {error}",
+                    output.stage_dir.display()
+                )
+            })?;
+            if matches!(output.kind, BrowserPathKind::OutputDirectory) {
+                std::fs::create_dir_all(&output.staged_requested_path).map_err(|error| {
+                    format!(
+                        "Could not recreate temporary browser output directory {}: {error}",
+                        output.staged_requested_path.display()
+                    )
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    fn commit_outputs(&mut self) -> Result<(), String> {
+        let outputs = self.outputs.clone();
+        for output in outputs {
+            match output.kind {
+                BrowserPathKind::OutputFile => {
+                    let actual_staged = resolve_staged_output_file(&output)?;
+                    let actual_destination = destination_for_staged_output(
+                        &self.workspace_root,
+                        &output,
+                        &actual_staged,
+                    )?;
+                    std::fs::copy(&actual_staged, &actual_destination).map_err(|error| {
+                        format!(
+                            "Could not copy browser output from {} to {}: {error}",
+                            actual_staged.display(),
+                            actual_destination.display()
+                        )
+                    })?;
+                    self.rewrites.push(BrowserPathRewrite {
+                        staged: actual_staged,
+                        visible: actual_destination,
+                    });
+                }
+                BrowserPathKind::OutputDirectory => {
+                    if !output.staged_requested_path.is_dir() {
+                        return Err(format!(
+                            "Browser command completed without producing the staged output directory {}",
+                            output.staged_requested_path.display()
+                        ));
+                    }
+                    let destination = validate_workspace_output_destination(
+                        &self.workspace_root,
+                        &output.destination,
+                        BrowserPathKind::OutputDirectory,
+                    )?;
+                    std::fs::create_dir_all(&destination).map_err(|error| {
+                        format!(
+                            "Could not create browser output directory {}: {error}",
+                            destination.display()
+                        )
+                    })?;
+                    copy_directory_contents_strict(
+                        &output.staged_requested_path,
+                        &destination,
+                        &self.workspace_root,
+                    )?;
+                    self.rewrites.push(BrowserPathRewrite {
+                        staged: output.staged_requested_path,
+                        visible: destination,
+                    });
+                }
+                BrowserPathKind::InputFile | BrowserPathKind::InputDirectory => {
+                    return Err(
+                        "Internal browser staging error: input registered as output".to_string()
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn rewrite_output_paths(&self, output: &mut BrowserCommandOutput) {
+        for rewrite in &self.rewrites {
+            let staged = rewrite.staged.to_string_lossy();
+            let visible = rewrite.visible.to_string_lossy();
+            output.stdout = output.stdout.replace(staged.as_ref(), visible.as_ref());
+            output.stderr = output.stderr.replace(staged.as_ref(), visible.as_ref());
+        }
+    }
+}
+
+pub(crate) fn canonical_browser_flag_name(raw: &str) -> Option<String> {
+    let flag = raw.strip_prefix('-')?.trim_start_matches('-');
+    if flag.is_empty() {
+        return None;
+    }
+    let flag = flag.split_once('=').map_or(flag, |(name, _)| name);
+    Some(
+        flag.chars()
+            .filter(|ch| !matches!(ch, '-' | '_'))
+            .flat_map(char::to_lowercase)
+            .collect(),
+    )
+}
+
+fn browser_path_flag_kind(command: &str, flag: &str) -> Option<BrowserPathKind> {
+    match (command, flag) {
+        ("evaluate_script", "filepath")
+        | ("performance_start_trace", "filepath")
+        | ("performance_stop_trace", "filepath")
+        | ("screencast_start", "filepath")
+        | ("take_screenshot", "filepath")
+        | ("take_snapshot", "filepath")
+        | ("take_heapsnapshot", "filepath") => Some(BrowserPathKind::OutputFile),
+        ("close_heapsnapshot", "filepath")
+        | ("get_heapsnapshot_class_nodes", "filepath")
+        | ("get_heapsnapshot_details", "filepath")
+        | ("get_heapsnapshot_dominators", "filepath")
+        | ("get_heapsnapshot_duplicate_strings", "filepath")
+        | ("get_heapsnapshot_edges", "filepath")
+        | ("get_heapsnapshot_object_details", "filepath")
+        | ("get_heapsnapshot_retainers", "filepath")
+        | ("get_heapsnapshot_retaining_paths", "filepath")
+        | ("get_heapsnapshot_summary", "filepath")
+        | ("upload_file", "filepath")
+        | ("compare_heapsnapshots", "basefilepath")
+        | ("compare_heapsnapshots", "currentfilepath") => Some(BrowserPathKind::InputFile),
+        ("get_network_request", "requestfilepath")
+        | ("get_network_request", "responsefilepath") => Some(BrowserPathKind::OutputFile),
+        ("lighthouse_audit", "outputdirpath") => Some(BrowserPathKind::OutputDirectory),
+        ("install_extension", "path") => Some(BrowserPathKind::InputDirectory),
+        _ => None,
+    }
+}
+
+fn positional_browser_paths(command: &str) -> &'static [(usize, BrowserPathKind)] {
+    use BrowserPathKind::{InputDirectory, InputFile, OutputFile};
+    match command {
+        "close_heapsnapshot"
+        | "get_heapsnapshot_class_nodes"
+        | "get_heapsnapshot_details"
+        | "get_heapsnapshot_dominators"
+        | "get_heapsnapshot_duplicate_strings"
+        | "get_heapsnapshot_edges"
+        | "get_heapsnapshot_object_details"
+        | "get_heapsnapshot_retainers"
+        | "get_heapsnapshot_retaining_paths"
+        | "get_heapsnapshot_summary" => &[(0, InputFile)],
+        "compare_heapsnapshots" => &[(0, InputFile), (1, InputFile)],
+        "install_extension" => &[(0, InputDirectory)],
+        "take_heapsnapshot" => &[(0, OutputFile)],
+        "upload_file" => &[(1, InputFile)],
+        _ => &[],
+    }
+}
+
+fn managed_browser_temp_output(path: &Path) -> bool {
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    parent == std::env::temp_dir()
+        && name.starts_with("moondesk-view-page-")
+        && name.ends_with(".jpeg")
+}
+
+fn path_within(root: &Path, candidate: &Path) -> bool {
+    candidate == root || candidate.starts_with(root)
+}
+
+fn metadata_is_link_like(metadata: &std::fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return true;
+        }
+    }
+    false
+}
+
+fn validate_workspace_input(
+    workspace_root: &Path,
+    raw_path: &str,
+    kind: BrowserPathKind,
+) -> Result<PathBuf, String> {
+    if raw_path.trim().is_empty() {
+        return Err("Browser file path cannot be empty".to_string());
+    }
+    let raw = PathBuf::from(raw_path);
+    let candidate = if raw.is_absolute() {
+        raw
+    } else {
+        workspace_root.join(raw)
+    };
+    let metadata = std::fs::symlink_metadata(&candidate).map_err(|error| {
+        format!(
+            "Could not inspect browser input path {}: {error}",
+            candidate.display()
+        )
+    })?;
+    if metadata_is_link_like(&metadata) {
+        return Err(format!(
+            "Browser input path may not be a symlink or reparse point: {}",
+            candidate.display()
+        ));
+    }
+    let canonical = candidate.canonicalize().map_err(|error| {
+        format!(
+            "Could not resolve browser input path {}: {error}",
+            candidate.display()
+        )
+    })?;
+    let canonical = crate::command::normalize_windows_verbatim_path(canonical);
+    let expects_directory = matches!(kind, BrowserPathKind::InputDirectory);
+    if (expects_directory && !canonical.is_dir()) || (!expects_directory && !canonical.is_file()) {
+        return Err(format!(
+            "Browser input path has the wrong type: {}",
+            candidate.display()
+        ));
+    }
+    if !path_within(workspace_root, &canonical) {
+        return Err(format!(
+            "Browser path is outside the active workspace: {}",
+            candidate.display()
+        ));
+    }
+    Ok(canonical)
+}
+
+fn validate_workspace_output_destination(
+    workspace_root: &Path,
+    requested: &Path,
+    kind: BrowserPathKind,
+) -> Result<PathBuf, String> {
+    let candidate = if requested.is_absolute() {
+        requested.to_path_buf()
+    } else {
+        workspace_root.join(requested)
+    };
+    if candidate.exists() {
+        let metadata = std::fs::symlink_metadata(&candidate).map_err(|error| {
+            format!(
+                "Could not inspect browser output path {}: {error}",
+                candidate.display()
+            )
+        })?;
+        if metadata_is_link_like(&metadata) {
+            return Err(format!(
+                "Browser output path may not be a symlink or reparse point: {}",
+                candidate.display()
+            ));
+        }
+        let canonical = candidate.canonicalize().map_err(|error| {
+            format!(
+                "Could not resolve browser output path {}: {error}",
+                candidate.display()
+            )
+        })?;
+        let canonical = crate::command::normalize_windows_verbatim_path(canonical);
+        let expects_directory = matches!(kind, BrowserPathKind::OutputDirectory);
+        if (expects_directory && !canonical.is_dir())
+            || (!expects_directory && !canonical.is_file())
+        {
+            return Err(format!(
+                "Browser output path has the wrong type: {}",
+                candidate.display()
+            ));
+        }
+        if !path_within(workspace_root, &canonical) {
+            return Err(format!(
+                "Browser output path is outside the active workspace: {}",
+                candidate.display()
+            ));
+        }
+        return Ok(canonical);
+    }
+
+    let parent = candidate
+        .parent()
+        .ok_or_else(|| format!("Browser output path has no parent: {}", candidate.display()))?;
+    let canonical_parent = parent.canonicalize().map_err(|error| {
+        format!(
+            "Browser output parent must already exist ({}): {error}",
+            parent.display()
+        )
+    })?;
+    let canonical_parent = crate::command::normalize_windows_verbatim_path(canonical_parent);
+    if !path_within(workspace_root, &canonical_parent) {
+        return Err(format!(
+            "Browser output path is outside the active workspace: {}",
+            candidate.display()
+        ));
+    }
+    let name = candidate
+        .file_name()
+        .ok_or_else(|| format!("Browser output path is invalid: {}", candidate.display()))?;
+    Ok(canonical_parent.join(name))
+}
+
+fn ensure_browser_staging_root(staging_root: &mut BrowserStagingRoot) -> Result<PathBuf, String> {
+    if let Some(root) = staging_root.path.as_ref() {
+        return Ok(root.clone());
+    }
+    let root = std::env::temp_dir().join(format!(
+        "moondesk-browser-files-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::create_dir(&root).map_err(|error| {
+        format!(
+            "Could not create temporary browser file staging directory {}: {error}",
+            root.display()
+        )
+    })?;
+    staging_root.path = Some(root.clone());
+    Ok(root)
+}
+
+fn copy_directory_tree_strict(
+    source: &Path,
+    destination: &Path,
+    workspace_root: &Path,
+) -> Result<(), String> {
+    fn copy_one(
+        source: &Path,
+        destination: &Path,
+        workspace_root: &Path,
+        source_root: &Path,
+        visited: &mut std::collections::HashSet<PathBuf>,
+    ) -> Result<(), String> {
+        let metadata = std::fs::symlink_metadata(source).map_err(|error| {
+            format!(
+                "Could not inspect staged browser input {}: {error}",
+                source.display()
+            )
+        })?;
+        if metadata_is_link_like(&metadata) {
+            return Err(format!(
+                "Browser input directory contains a symlink or reparse point: {}",
+                source.display()
+            ));
+        }
+        let canonical = source.canonicalize().map_err(|error| {
+            format!(
+                "Could not resolve browser input {}: {error}",
+                source.display()
+            )
+        })?;
+        let canonical = crate::command::normalize_windows_verbatim_path(canonical);
+        if !path_within(workspace_root, &canonical) || !path_within(source_root, &canonical) {
+            return Err(format!(
+                "Browser input directory traversal escaped its validated root: {}",
+                source.display()
+            ));
+        }
+        if metadata.is_dir() {
+            if !visited.insert(canonical.clone()) {
+                return Err(format!(
+                    "Browser input directory contains a filesystem cycle: {}",
+                    source.display()
+                ));
+            }
+            std::fs::create_dir_all(destination).map_err(|error| {
+                format!(
+                    "Could not create staged browser input directory {}: {error}",
+                    destination.display()
+                )
+            })?;
+            for entry in std::fs::read_dir(source).map_err(|error| {
+                format!(
+                    "Could not read browser input directory {}: {error}",
+                    source.display()
+                )
+            })? {
+                let entry = entry.map_err(|error| {
+                    format!("Could not read browser input directory entry: {error}")
+                })?;
+                copy_one(
+                    &entry.path(),
+                    &destination.join(entry.file_name()),
+                    workspace_root,
+                    source_root,
+                    visited,
+                )?;
+            }
+            visited.remove(&canonical);
+            return Ok(());
+        }
+        if !metadata.is_file() {
+            return Err(format!(
+                "Browser input directory contains an unsupported filesystem entry: {}",
+                source.display()
+            ));
+        }
+        std::fs::copy(source, destination).map_err(|error| {
+            format!(
+                "Could not stage browser input file {}: {error}",
+                source.display()
+            )
+        })?;
+        Ok(())
+    }
+
+    let source_root = source.to_path_buf();
+    let mut visited = std::collections::HashSet::new();
+    copy_one(
+        source,
+        destination,
+        workspace_root,
+        &source_root,
+        &mut visited,
+    )
+}
+
+fn copy_directory_contents_strict(
+    source: &Path,
+    destination: &Path,
+    workspace_root: &Path,
+) -> Result<(), String> {
+    for entry in std::fs::read_dir(source).map_err(|error| {
+        format!(
+            "Could not read staged browser output directory {}: {error}",
+            source.display()
+        )
+    })? {
+        let entry =
+            entry.map_err(|error| format!("Could not read staged browser output: {error}"))?;
+        let source_path = entry.path();
+        let destination_path = destination.join(entry.file_name());
+        let metadata = std::fs::symlink_metadata(&source_path).map_err(|error| {
+            format!(
+                "Could not inspect staged browser output {}: {error}",
+                source_path.display()
+            )
+        })?;
+        if metadata_is_link_like(&metadata) {
+            return Err(format!(
+                "Browser output contained an unexpected symlink or reparse point: {}",
+                source_path.display()
+            ));
+        }
+        if metadata.is_dir() {
+            let validated = validate_workspace_output_destination(
+                workspace_root,
+                &destination_path,
+                BrowserPathKind::OutputDirectory,
+            )?;
+            std::fs::create_dir_all(&validated).map_err(|error| {
+                format!(
+                    "Could not create browser output directory {}: {error}",
+                    validated.display()
+                )
+            })?;
+            copy_directory_contents_strict(&source_path, &validated, workspace_root)?;
+        } else if metadata.is_file() {
+            let validated = validate_workspace_output_destination(
+                workspace_root,
+                &destination_path,
+                BrowserPathKind::OutputFile,
+            )?;
+            std::fs::copy(&source_path, &validated).map_err(|error| {
+                format!(
+                    "Could not copy browser output from {} to {}: {error}",
+                    source_path.display(),
+                    validated.display()
+                )
+            })?;
+        } else {
+            return Err(format!(
+                "Browser output contained an unsupported filesystem entry: {}",
+                source_path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn resolve_staged_output_file(output: &BrowserOutputStage) -> Result<PathBuf, String> {
+    if output.staged_requested_path.is_file() {
+        return Ok(output.staged_requested_path.clone());
+    }
+    let files = std::fs::read_dir(&output.stage_dir)
+        .map_err(|error| {
+            format!(
+                "Could not inspect temporary browser output directory {}: {error}",
+                output.stage_dir.display()
+            )
+        })?
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            entry
+                .file_type()
+                .ok()
+                .filter(|kind| kind.is_file())
+                .map(|_| entry.path())
+        })
+        .collect::<Vec<_>>();
+    match files.as_slice() {
+        [only] => Ok(only.clone()),
+        [] => Err(format!(
+            "Browser command completed without producing the requested output in {}",
+            output.stage_dir.display()
+        )),
+        _ => Err(format!(
+            "Browser command produced multiple unexpected files for one output in {}",
+            output.stage_dir.display()
+        )),
+    }
+}
+
+fn destination_for_staged_output(
+    workspace_root: &Path,
+    output: &BrowserOutputStage,
+    actual_staged: &Path,
+) -> Result<PathBuf, String> {
+    let destination = if actual_staged.file_name() == output.staged_requested_path.file_name() {
+        output.destination.clone()
+    } else {
+        if actual_staged.file_stem() != output.staged_requested_path.file_stem() {
+            return Err(format!(
+                "Browser command changed the staged output basename unexpectedly: {}",
+                actual_staged.display()
+            ));
+        }
+        let mut adjusted = output.destination.clone();
+        adjusted.set_extension(actual_staged.extension().unwrap_or_default());
+        adjusted
+    };
+    validate_workspace_output_destination(workspace_root, &destination, BrowserPathKind::OutputFile)
+}
+
+struct BrowserPathStager<'a> {
+    managed_temp_output: Option<&'a Path>,
+    staging_root: BrowserStagingRoot,
+    slot: usize,
+    outputs: Vec<BrowserOutputStage>,
+    rewrites: Vec<BrowserPathRewrite>,
+}
+
+impl<'a> BrowserPathStager<'a> {
+    fn new(managed_temp_output: Option<&'a Path>) -> Self {
+        Self {
+            managed_temp_output,
+            staging_root: BrowserStagingRoot::default(),
+            slot: 0,
+            outputs: Vec::new(),
+            rewrites: Vec::new(),
+        }
+    }
+}
+
+fn stage_browser_path(
+    workspace_root: &Path,
+    command: &str,
+    raw_path: &str,
+    kind: BrowserPathKind,
+    stager: &mut BrowserPathStager<'_>,
+) -> Result<PathBuf, String> {
+    if command == "screencast_start" && matches!(kind, BrowserPathKind::OutputFile) {
+        return Err(
+            "MoonDesk does not accept an explicit screencast output path because the pinned browser runtime keeps that file open until a later screencast_stop command"
+                .to_string(),
+        );
+    }
+
+    if matches!(kind, BrowserPathKind::OutputFile) {
+        let raw = PathBuf::from(raw_path);
+        let candidate = if raw.is_absolute() {
+            raw
+        } else {
+            workspace_root.join(raw)
+        };
+        if stager
+            .managed_temp_output
+            .is_some_and(|allowed| candidate == allowed)
+        {
+            return Ok(candidate);
+        }
+    }
+
+    match kind {
+        BrowserPathKind::InputFile | BrowserPathKind::InputDirectory => {
+            let source = validate_workspace_input(workspace_root, raw_path, kind)?;
+            let root = ensure_browser_staging_root(&mut stager.staging_root)?;
+            let current_slot = stager.slot;
+            stager.slot += 1;
+            let stage_dir = root.join(format!("input-{current_slot}"));
+            std::fs::create_dir(&stage_dir).map_err(|error| {
+                format!("Could not create browser input staging directory: {error}")
+            })?;
+            let name = source.file_name().ok_or_else(|| {
+                format!("Browser input path has no filename: {}", source.display())
+            })?;
+            let staged = stage_dir.join(name);
+            if matches!(kind, BrowserPathKind::InputDirectory) {
+                copy_directory_tree_strict(&source, &staged, workspace_root)?;
+            } else {
+                std::fs::copy(&source, &staged).map_err(|error| {
+                    format!(
+                        "Could not stage browser input file {}: {error}",
+                        source.display()
+                    )
+                })?;
+            }
+            stager.rewrites.push(BrowserPathRewrite {
+                staged: staged.clone(),
+                visible: source,
+            });
+            Ok(staged)
+        }
+        BrowserPathKind::OutputFile | BrowserPathKind::OutputDirectory => {
+            let requested = PathBuf::from(raw_path);
+            let destination =
+                validate_workspace_output_destination(workspace_root, &requested, kind)?;
+            let root = ensure_browser_staging_root(&mut stager.staging_root)?;
+            let current_slot = stager.slot;
+            stager.slot += 1;
+            let stage_dir = root.join(format!("output-{current_slot}"));
+            std::fs::create_dir(&stage_dir).map_err(|error| {
+                format!("Could not create browser output staging directory: {error}")
+            })?;
+            let name = destination.file_name().ok_or_else(|| {
+                format!(
+                    "Browser output path has no filename: {}",
+                    destination.display()
+                )
+            })?;
+            let staged_requested_path = stage_dir.join(name);
+            if matches!(kind, BrowserPathKind::OutputDirectory) {
+                std::fs::create_dir(&staged_requested_path).map_err(|error| {
+                    format!("Could not create staged browser output directory: {error}")
+                })?;
+            }
+            stager.outputs.push(BrowserOutputStage {
+                stage_dir,
+                staged_requested_path: staged_requested_path.clone(),
+                destination: destination.clone(),
+                kind,
+            });
+            stager.rewrites.push(BrowserPathRewrite {
+                staged: staged_requested_path.clone(),
+                visible: destination,
+            });
+            Ok(staged_requested_path)
+        }
+    }
+}
+
+#[cfg(test)]
+fn prepare_browser_invocation(
+    workspace_root: &str,
+    command: &str,
+    args: &[String],
+) -> Result<PreparedBrowserInvocation, String> {
+    prepare_browser_invocation_with_managed_temp(workspace_root, command, args, None)
+}
+
+fn prepare_browser_invocation_with_managed_temp(
+    workspace_root: &str,
+    command: &str,
+    args: &[String],
+    managed_temp_output: Option<&Path>,
+) -> Result<PreparedBrowserInvocation, String> {
+    let workspace_root =
+        crate::workspaces::canonicalize_existing_workspace_root(Path::new(workspace_root))?;
+    let mut prepared = args.to_vec();
+    let mut stager = BrowserPathStager::new(managed_temp_output);
+
+    for &(index, kind) in positional_browser_paths(command) {
+        let Some(value) = prepared.get(index).cloned() else {
+            continue;
+        };
+        if value.starts_with('-') {
+            return Err(format!(
+                "Browser command '{command}' requires its path argument in the pinned v{CHROME_DEVTOOLS_PACKAGE_VERSION} positional form"
+            ));
+        }
+        let staged = stage_browser_path(&workspace_root, command, &value, kind, &mut stager)?;
+        prepared[index] = staged.to_string_lossy().into_owned();
+    }
+
+    let mut seen_path_flags = std::collections::HashSet::new();
+    let mut index = 0;
+    while index < prepared.len() {
+        let arg = prepared[index].clone();
+        let Some(flag) = canonical_browser_flag_name(&arg) else {
+            index += 1;
+            continue;
+        };
+
+        if flag == "sessionid" {
+            return Err(
+                "Browser command arguments may not override MoonDesk's private session ID"
+                    .to_string(),
+            );
+        }
+
+        if let Some(kind) = browser_path_flag_kind(command, &flag) {
+            if !seen_path_flags.insert(flag.clone()) {
+                return Err(format!(
+                    "Browser path flag '{arg}' may only be supplied once per command"
+                ));
+            }
+            if let Some((prefix, raw_value)) = arg.split_once('=') {
+                let staged =
+                    stage_browser_path(&workspace_root, command, raw_value, kind, &mut stager)?;
+                prepared[index] = format!("{prefix}={}", staged.to_string_lossy());
+            } else {
+                let value_index = index + 1;
+                let Some(raw_value) = prepared.get(value_index).cloned() else {
+                    return Err(format!("Browser path flag '{arg}' requires a value"));
+                };
+                if raw_value.starts_with('-') {
+                    return Err(format!("Browser path flag '{arg}' requires a path value"));
+                }
+                let staged =
+                    stage_browser_path(&workspace_root, command, &raw_value, kind, &mut stager)?;
+                prepared[value_index] = staged.to_string_lossy().into_owned();
+                index += 1;
+            }
+        } else if flag.contains("path") {
+            return Err(format!(
+                "Unrecognized path-bearing browser argument '{arg}' is blocked by MoonDesk's workspace boundary"
+            ));
+        }
+        index += 1;
+    }
+
+    Ok(PreparedBrowserInvocation {
+        args: prepared,
+        workspace_root,
+        _staging_root: stager.staging_root,
+        outputs: stager.outputs,
+        rewrites: stager.rewrites,
+    })
+}
+
+fn daemon_pid_file_path(session_id: &str) -> PathBuf {
+    let app_name = format!("chrome-devtools-mcp-{session_id}");
 
     #[cfg(windows)]
     {
@@ -413,11 +1404,16 @@ fn daemon_pid_file_path() -> PathBuf {
     }
 }
 
-fn daemon_process_is_alive() -> bool {
-    std::fs::read_to_string(daemon_pid_file_path())
+fn daemon_pid(session_id: &str) -> Option<u32> {
+    std::fs::read_to_string(daemon_pid_file_path(session_id))
         .ok()
         .and_then(|value| value.trim().parse::<u32>().ok())
-        .is_some_and(process_is_live)
+}
+
+#[cfg(test)]
+#[cfg(windows)]
+fn daemon_process_is_alive(session_id: &str) -> bool {
+    daemon_pid(session_id).is_some_and(process_is_live)
 }
 
 fn daemon_status_args(stdout: &str) -> Option<Vec<String>> {
@@ -445,19 +1441,32 @@ pub fn daemon_is_running(stdout: &str, stderr: &str) -> bool {
 }
 
 fn cli_tool_error_message(stdout: &str) -> Option<String> {
+    // Pinned chrome-devtools-mcp 1.7.0 has an important CLI quirk: a daemon-level
+    // `success: true` can wrap an MCP CallToolResult with `isError: true`, and the CLI still exits
+    // 0. Its handleResponse() preserves that distinction by serializing error `content` as an
+    // array of MCP content objects, while successful markdown output is emitted as plain text.
+    // Detect the structured content envelope itself instead of relying on an "Error:" prefix.
     let content = serde_json::from_str::<Vec<serde_json::Value>>(stdout.trim()).ok()?;
+    if content.is_empty()
+        || !content.iter().all(|item| {
+            matches!(
+                item.get("type").and_then(serde_json::Value::as_str),
+                Some("text" | "image")
+            )
+        })
+    {
+        return None;
+    }
+
     let messages = content
         .iter()
-        .filter_map(|item| {
-            (item.get("type").and_then(serde_json::Value::as_str) == Some("text"))
-                .then(|| item.get("text").and_then(serde_json::Value::as_str))
-                .flatten()
-        })
+        .filter_map(|item| item.get("text").and_then(serde_json::Value::as_str))
         .collect::<Vec<_>>();
-    messages
-        .iter()
-        .any(|message| message.trim_start().starts_with("Error:"))
-        .then(|| messages.join("\n"))
+    Some(if messages.is_empty() {
+        "Chrome DevTools reported a browser tool error".to_string()
+    } else {
+        messages.join("\n")
+    })
 }
 
 pub fn browser_connectivity_failure(stdout: &str, stderr: &str) -> bool {
@@ -534,13 +1543,34 @@ mod tests {
                 .is_some_and(|message| message.contains("Element uid"))
         );
 
-        let legitimate_json = BrowserCommandOutput {
-            stdout: r#"[{"type":"text","text":"ordinary evaluate_script value"}]"#.to_string(),
+        let non_prefixed_tool_error = BrowserCommandOutput {
+            stdout: r#"[{"type":"text","text":"Element uid 99_99 was not found"}]"#.to_string(),
             stderr: String::new(),
             exit_code: 0,
             restarted: false,
         };
-        assert!(legitimate_json.success());
+        assert!(!non_prefixed_tool_error.success());
+        assert!(
+            non_prefixed_tool_error
+                .failure_details()
+                .contains("Element uid 99_99")
+        );
+
+        let legitimate_output = BrowserCommandOutput {
+            stdout: "ordinary evaluate_script value".to_string(),
+            stderr: String::new(),
+            exit_code: 0,
+            restarted: false,
+        };
+        assert!(legitimate_output.success());
+
+        let json_mode_success = BrowserCommandOutput {
+            stdout: r#"["ordinary evaluate_script value"]"#.to_string(),
+            stderr: String::new(),
+            exit_code: 0,
+            restarted: false,
+        };
+        assert!(json_mode_success.success());
     }
 
     #[test]
@@ -566,6 +1596,10 @@ mod tests {
         assert!(args.iter().any(|arg| arg == "--usageStatistics=false"));
         assert!(args.iter().any(|arg| arg == "--performanceCrux=false"));
         assert!(args.iter().any(|arg| arg == "--redactNetworkHeaders=true"));
+        assert!(
+            args.iter()
+                .any(|arg| arg == "--allowUnrestrictedPaths=false")
+        );
     }
 
     #[test]
@@ -594,6 +1628,11 @@ mod tests {
 
         let unsafe_headers = status.replace("\"--redact-network-headers\",", "");
         assert!(!runtime.daemon_status_matches_expected_configuration(&unsafe_headers));
+        let stale_path_mode = status.replace(
+            "\"--no-allow-unrestricted-paths\",",
+            "\"--allow-unrestricted-paths\",",
+        );
+        assert!(!runtime.daemon_status_matches_expected_configuration(&stale_path_mode));
         let persistent_profile = status.replace(
             "\"--isolated\",",
             "\"--isolated\",\"--user-data-dir=C:/Users/example/profile\",",
@@ -607,18 +1646,278 @@ mod tests {
     }
 
     #[test]
-    fn daemon_session_is_namespaced_and_uses_upstream_valid_id_shape() {
-        assert!(!CHROME_DEVTOOLS_SESSION_ID.is_empty());
+    fn daemon_session_is_private_per_runtime_and_uses_upstream_valid_id_shape() {
+        let first = BrowserRuntime::standalone();
+        let second = BrowserRuntime::standalone();
+        assert_ne!(first.session_id, second.session_id);
+        for runtime in [&first, &second] {
+            assert!(!runtime.session_id.is_empty());
+            assert!(
+                runtime
+                    .session_id
+                    .chars()
+                    .all(|ch| ch.is_ascii_hexdigit() || ch == '-')
+            );
+            assert!(
+                daemon_pid_file_path(&runtime.session_id)
+                    .to_string_lossy()
+                    .contains(&runtime.session_id)
+            );
+        }
+    }
+
+    #[test]
+    fn browser_workspace_paths_are_staged_in_temp_and_outputs_copy_back() {
+        let workspace = std::env::temp_dir().join(format!(
+            "moondesk-browser-path-policy-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(workspace.join("reports")).expect("create workspace fixture");
+        std::fs::write(workspace.join("upload.txt"), b"hello").expect("write upload fixture");
+        let workspace_str = workspace.to_string_lossy().into_owned();
+
+        let upload = prepare_browser_invocation(
+            &workspace_str,
+            "upload_file",
+            &["1_2".to_string(), "upload.txt".to_string()],
+        )
+        .expect("stage upload path");
+        let staged_upload = PathBuf::from(&upload.args[1]);
+        let upload_stage_root = upload
+            ._staging_root
+            .path
+            .clone()
+            .expect("upload staging root");
+        assert!(staged_upload.is_absolute());
+        assert!(path_within(&std::env::temp_dir(), &staged_upload));
+        assert!(!path_within(&workspace, &staged_upload));
+        assert_eq!(
+            std::fs::read(&staged_upload).expect("read staged upload"),
+            b"hello"
+        );
+        drop(upload);
         assert!(
-            CHROME_DEVTOOLS_SESSION_ID
-                .chars()
-                .all(|ch| ch.is_ascii_hexdigit() || ch == '-')
+            !upload_stage_root.exists(),
+            "input staging must be cleaned up"
+        );
+
+        let mut screenshot = prepare_browser_invocation(
+            &workspace_str,
+            "take_screenshot",
+            &["--FILE-PATH=reports/shot.png".to_string()],
+        )
+        .expect("stage screenshot output path");
+        let (_, staged_output) = screenshot.args[0].split_once('=').expect("rewritten flag");
+        let staged_output = PathBuf::from(staged_output);
+        let screenshot_stage_root = screenshot
+            ._staging_root
+            .path
+            .clone()
+            .expect("screenshot staging root");
+        assert!(path_within(&std::env::temp_dir(), &staged_output));
+        assert!(!path_within(&workspace, &staged_output));
+        std::fs::write(&staged_output, b"fake-png").expect("simulate browser screenshot output");
+        screenshot.commit_outputs().expect("copy screenshot back");
+        assert_eq!(
+            std::fs::read(workspace.join("reports/shot.png")).expect("read copied screenshot"),
+            b"fake-png"
+        );
+        let visible_destination = screenshot
+            .outputs
+            .first()
+            .expect("screenshot output mapping")
+            .destination
+            .clone();
+        let mut output = BrowserCommandOutput {
+            stdout: format!("Saved screenshot to {}.", staged_output.display()),
+            stderr: String::new(),
+            exit_code: 0,
+            restarted: false,
+        };
+        screenshot.rewrite_output_paths(&mut output);
+        assert!(
+            output
+                .stdout
+                .contains(&visible_destination.to_string_lossy().to_string()),
+            "rewritten output path was unexpected: {}",
+            output.stdout
+        );
+        assert!(!output.stdout.contains("moondesk-browser-files-"));
+        drop(screenshot);
+        assert!(
+            !screenshot_stage_root.exists(),
+            "output staging must be cleaned up"
+        );
+
+        let managed_temp =
+            std::env::temp_dir().join(format!("moondesk-view-page-{}.jpeg", uuid::Uuid::new_v4()));
+        let managed_arg = format!("--filePath={}", managed_temp.display());
+        let ordinary_temp_attempt = prepare_browser_invocation(
+            &workspace_str,
+            "take_screenshot",
+            std::slice::from_ref(&managed_arg),
         );
         assert!(
-            daemon_pid_file_path()
-                .to_string_lossy()
-                .contains(CHROME_DEVTOOLS_SESSION_ID)
+            ordinary_temp_attempt
+                .expect_err("ordinary browser command must not get the managed temp exemption")
+                .contains("outside the active workspace")
         );
+        let managed = prepare_browser_invocation_with_managed_temp(
+            &workspace_str,
+            "take_screenshot",
+            std::slice::from_ref(&managed_arg),
+            Some(&managed_temp),
+        )
+        .expect("exact managed view_page output should be authorized");
+        assert_eq!(managed.args, vec![managed_arg.clone()]);
+        assert!(managed.outputs.is_empty());
+        assert!(managed._staging_root.path.is_none());
+        let other_managed_temp =
+            std::env::temp_dir().join(format!("moondesk-view-page-{}.jpeg", uuid::Uuid::new_v4()));
+        let mismatched = prepare_browser_invocation_with_managed_temp(
+            &workspace_str,
+            "take_screenshot",
+            &[managed_arg],
+            Some(&other_managed_temp),
+        );
+        assert!(
+            mismatched
+                .expect_err("managed authorization must match one exact temp path")
+                .contains("outside the active workspace")
+        );
+
+        let mut snapshot = prepare_browser_invocation(
+            &workspace_str,
+            "take_snapshot",
+            &["--filePath=reports/snapshot.any".to_string()],
+        )
+        .expect("stage extension-normalized output");
+        let output_stage = snapshot.outputs.first().expect("snapshot output stage");
+        let staged_txt = output_stage.stage_dir.join("snapshot.txt");
+        std::fs::write(&staged_txt, b"snapshot").expect("simulate upstream extension change");
+        snapshot
+            .commit_outputs()
+            .expect("copy normalized snapshot output");
+        assert_eq!(
+            std::fs::read(workspace.join("reports/snapshot.txt"))
+                .expect("read normalized snapshot output"),
+            b"snapshot"
+        );
+
+        let outside = workspace
+            .parent()
+            .expect("workspace parent")
+            .join(format!("outside-{}.txt", uuid::Uuid::new_v4()));
+        std::fs::write(&outside, b"outside").expect("write outside fixture");
+        let escaped = prepare_browser_invocation(
+            &workspace_str,
+            "upload_file",
+            &["1_2".to_string(), outside.to_string_lossy().into_owned()],
+        );
+        assert!(
+            escaped
+                .expect_err("outside upload must be rejected")
+                .contains("outside the active workspace")
+        );
+        let traversal = prepare_browser_invocation(
+            &workspace_str,
+            "take_screenshot",
+            &["--filePath=../escaped.png".to_string()],
+        );
+        assert!(
+            traversal
+                .expect_err("output traversal must be rejected")
+                .contains("outside the active workspace")
+        );
+
+        let unknown_path_flag = prepare_browser_invocation(
+            &workspace_str,
+            "list_pages",
+            &["--futurePath=somewhere".to_string()],
+        );
+        assert!(unknown_path_flag.is_err());
+        let session_override = prepare_browser_invocation(
+            &workspace_str,
+            "list_pages",
+            &["--session-id=deadbeef".to_string()],
+        );
+        assert!(session_override.is_err());
+        let duplicate_path = prepare_browser_invocation(
+            &workspace_str,
+            "take_screenshot",
+            &[
+                "--filePath=reports/a.png".to_string(),
+                "--file-path=reports/b.png".to_string(),
+            ],
+        );
+        assert!(duplicate_path.is_err());
+        let screencast_path = prepare_browser_invocation(
+            &workspace_str,
+            "screencast_start",
+            &["--filePath=reports/cast.mp4".to_string()],
+        );
+        assert!(
+            screencast_path
+                .expect_err("long-lived screencast output path must be rejected")
+                .contains("keeps that file open")
+        );
+
+        let _ = std::fs::remove_file(outside);
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn browser_request_bounds_are_shared_and_strict() {
+        assert!(validate_browser_request_bounds("list_pages", &[], 1).is_ok());
+        assert!(validate_browser_request_bounds("list_pages", &[], MAX_BROWSER_TIMEOUT_MS).is_ok());
+        assert!(validate_browser_request_bounds("", &[], 1).is_err());
+        assert!(
+            validate_browser_request_bounds(&"x".repeat(MAX_BROWSER_COMMAND_BYTES + 1), &[], 1)
+                .is_err()
+        );
+        assert!(
+            validate_browser_request_bounds(
+                "list_pages",
+                &vec![String::new(); MAX_BROWSER_ARGS + 1],
+                1
+            )
+            .is_err()
+        );
+        assert!(validate_browser_request_bounds("list_pages", &[], 0).is_err());
+        assert!(
+            validate_browser_request_bounds("list_pages", &[], MAX_BROWSER_TIMEOUT_MS + 1).is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn browser_timeout_includes_time_waiting_for_operation_queue() {
+        let workspace =
+            std::env::temp_dir().join(format!("moondesk-browser-timeout-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace).expect("create timeout workspace");
+        let runtime = BrowserRuntime::standalone();
+        let guard = runtime.operation.lock().await;
+        let started = tokio::time::Instant::now();
+        let error = runtime
+            .run(
+                &workspace.to_string_lossy(),
+                "list_pages",
+                &[],
+                Duration::from_millis(50),
+            )
+            .await
+            .expect_err("queued browser operation must respect its total deadline");
+        let elapsed = started.elapsed();
+        assert!(error.contains("timed out after 50 ms total"), "{error}");
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "queued timeout took too long: {elapsed:?}"
+        );
+        assert!(
+            daemon_pid(&runtime.session_id).is_none(),
+            "a timed-out queued request must not start a daemon later"
+        );
+        drop(guard);
+        let _ = std::fs::remove_dir_all(workspace);
     }
 
     #[cfg(windows)]
@@ -725,7 +2024,7 @@ mod tests {
                 Duration::from_secs(20),
             )
             .await;
-        assert!(!daemon_process_is_alive());
+        assert!(!daemon_process_is_alive(&runtime.session_id));
 
         let help = runtime
             .run(
@@ -738,7 +2037,7 @@ mod tests {
             .expect("browser help should run without starting the daemon");
         assert!(help.success());
         assert!(
-            !daemon_process_is_alive(),
+            !daemon_process_is_alive(&runtime.session_id),
             "browser help must not launch Chrome or the daemon"
         );
 
@@ -752,7 +2051,31 @@ mod tests {
             .await
             .expect("first browser command should lazily start the daemon");
         assert!(first.success(), "first list_pages failed: {first:?}");
-        assert!(daemon_process_is_alive());
+        assert!(daemon_process_is_alive(&runtime.session_id));
+        let first_daemon_pid = daemon_pid(&runtime.session_id).expect("first private daemon pid");
+
+        // A second MoonDesk host/runtime under the same OS user must get a separate upstream
+        // namespace. Stopping it must not affect the first runtime.
+        let second_runtime = BrowserRuntime::standalone();
+        let second = second_runtime
+            .run(
+                &workspace_root_str,
+                "list_pages",
+                &[],
+                DEFAULT_BROWSER_COMMAND_TIMEOUT,
+            )
+            .await
+            .expect("second runtime should start independently");
+        assert!(second.success(), "second list_pages failed: {second:?}");
+        let second_daemon_pid =
+            daemon_pid(&second_runtime.session_id).expect("second private daemon pid");
+        assert_ne!(first_daemon_pid, second_daemon_pid);
+        second_runtime.stop_if_owned(&workspace_root_str).await;
+        assert!(!daemon_process_is_alive(&second_runtime.session_id));
+        assert!(
+            daemon_process_is_alive(&runtime.session_id),
+            "stopping a second MoonDesk runtime must not stop the first daemon"
+        );
 
         runtime
             .run_cli_raw(
@@ -762,7 +2085,7 @@ mod tests {
             )
             .await
             .expect("stop browser daemon during recovery smoke");
-        assert!(!daemon_process_is_alive());
+        assert!(!daemon_process_is_alive(&runtime.session_id));
 
         let recovered = runtime
             .run(
@@ -777,7 +2100,7 @@ mod tests {
             recovered.success(),
             "recovered list_pages failed: {recovered:?}"
         );
-        assert!(daemon_process_is_alive());
+        assert!(daemon_process_is_alive(&runtime.session_id));
 
         let status = runtime
             .run_cli_raw(
@@ -790,7 +2113,7 @@ mod tests {
         assert!(runtime.daemon_status_matches_expected_configuration(&status.stdout));
 
         runtime.stop_if_owned(&workspace_root_str).await;
-        assert!(!daemon_process_is_alive());
+        assert!(!daemon_process_is_alive(&runtime.session_id));
         let _ = std::fs::remove_dir_all(workspace_root);
     }
 
@@ -826,7 +2149,7 @@ mod tests {
             .expect("first browser command should lazily start the isolated agent browser");
         assert!(first.success(), "first list_pages failed: {first:?}");
 
-        let daemon_pid = std::fs::read_to_string(daemon_pid_file_path())
+        let daemon_pid = std::fs::read_to_string(daemon_pid_file_path(&runtime.session_id))
             .expect("read namespaced daemon pid")
             .trim()
             .parse::<u32>()
@@ -882,13 +2205,14 @@ mod tests {
         // in which case MoonDesk correctly leaves `restarted=false`. The invariant is that the
         // next operation succeeds with a replacement isolated browser, not that the daemon must
         // be restarted unnecessarily.
-        assert!(daemon_process_is_alive());
+        assert!(daemon_process_is_alive(&runtime.session_id));
 
-        let recovered_daemon_pid = std::fs::read_to_string(daemon_pid_file_path())
-            .expect("read recovered namespaced daemon pid")
-            .trim()
-            .parse::<u32>()
-            .expect("parse recovered namespaced daemon pid");
+        let recovered_daemon_pid =
+            std::fs::read_to_string(daemon_pid_file_path(&runtime.session_id))
+                .expect("read recovered namespaced daemon pid")
+                .trim()
+                .parse::<u32>()
+                .expect("parse recovered namespaced daemon pid");
         let (recovered_browser_pid, _) = (0..40)
             .find_map(|_| {
                 let found = windows_browser_descendant(recovered_daemon_pid);
@@ -911,7 +2235,7 @@ mod tests {
         assert!(runtime.daemon_status_matches_expected_configuration(&status.stdout));
 
         runtime.stop_if_owned(&workspace_root_str).await;
-        assert!(!daemon_process_is_alive());
+        assert!(!daemon_process_is_alive(&runtime.session_id));
         let _ = std::fs::remove_dir_all(workspace_root);
     }
 

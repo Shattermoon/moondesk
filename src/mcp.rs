@@ -7,7 +7,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tiktoken_rs::o200k_base_singleton;
 
-use crate::browser_runtime::{BrowserRuntime, DEFAULT_BROWSER_COMMAND_TIMEOUT};
+use crate::browser_runtime::{
+    BrowserRuntime, DEFAULT_BROWSER_COMMAND_TIMEOUT, MAX_BROWSER_ARG_BYTES, MAX_BROWSER_ARGS,
+    MAX_BROWSER_COMMAND_BYTES, MAX_BROWSER_TIMEOUT_MS, canonical_browser_flag_name,
+    validate_browser_request_bounds,
+};
 use crate::command;
 use crate::command_jobs::{
     CommandJobManager, CommandJobSnapshot, DEFAULT_JOB_TIMEOUT_MS, DEFAULT_POLL_WAIT_MS,
@@ -566,13 +570,13 @@ async fn handle_tools_list(
         tools.push(json!({
             "name": "browser_command",
             "title": "Run browser command",
-            "description": "Run one Chrome DevTools CLI browser operation against MoonDesk's shared lazy agent-browser session. The browser starts only on the first browser operation and is reused across commands. Use resize_page for normal desktop window sizes; use emulate with --viewport=<width>x<height>x<dpr>[,mobile][,touch] for exact tablet/mobile responsive testing, then take a fresh snapshot before using UIDs. Other useful commands include list_pages, new_page, navigate_page, take_snapshot, click, fill, type_text, press_key, hover, drag, evaluate_script, list_console_messages, list_network_requests, lighthouse_audit, and performance_start_trace. In read-only mode MoonDesk permits only bounded inspection commands and rejects state-changing actions or browser file-output flags. MoonDesk manages start/status/stop automatically.",
+            "description": "Run one Chrome DevTools CLI browser operation against MoonDesk's shared lazy agent-browser session. The browser starts only on the first browser operation and is reused across commands. Use resize_page for normal desktop window sizes; use emulate with --viewport=<width>x<height>x<dpr>[,mobile][,touch] for exact tablet/mobile responsive testing, then take a fresh snapshot before using UIDs. Other useful commands include list_pages, new_page, navigate_page, take_snapshot, click, fill, type_text, press_key, hover, drag, evaluate_script, list_console_messages, list_network_requests, lighthouse_audit, and performance_start_trace. In read-only mode MoonDesk permits only bounded inspection commands, requires lighthouse_audit to use explicit --mode=snapshot, and rejects state-changing actions or browser file-output flags. Browser file paths are constrained to the active workspace. MoonDesk manages start/status/stop automatically.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "command": { "type": "string", "minLength": 1, "maxLength": 128, "description": "chrome-devtools CLI command name, for example take_snapshot, emulate, or resize_page" },
-                    "args": { "type": "array", "maxItems": 64, "items": { "type": "string", "maxLength": 8192 }, "description": "Command arguments in CLI order. Use --flag=value for optional flags when convenient." },
-                    "timeout_ms": { "type": "integer", "minimum": 1, "maximum": 120000, "description": "Maximum command runtime in milliseconds (default 120000)" }
+                    "command": { "type": "string", "minLength": 1, "maxLength": MAX_BROWSER_COMMAND_BYTES, "description": "chrome-devtools CLI command name, for example take_snapshot, emulate, or resize_page" },
+                    "args": { "type": "array", "maxItems": MAX_BROWSER_ARGS, "items": { "type": "string", "maxLength": MAX_BROWSER_ARG_BYTES }, "description": "Command arguments in CLI order. Use --flag=value for optional flags when convenient." },
+                    "timeout_ms": { "type": "integer", "minimum": 1, "maximum": MAX_BROWSER_TIMEOUT_MS, "description": "Maximum end-to-end browser request runtime in milliseconds" }
                 },
                 "required": ["command"]
             },
@@ -2014,9 +2018,43 @@ fn handle_view_images(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcResp
 }
 
 fn browser_arg_uses_flag(args: &[String], flag: &str) -> bool {
-    let with_equals = format!("{flag}=");
+    let Some(expected) = canonical_browser_flag_name(flag) else {
+        return false;
+    };
     args.iter()
-        .any(|arg| arg == flag || arg.starts_with(&with_equals))
+        .filter_map(|arg| canonical_browser_flag_name(arg))
+        .any(|actual| actual == expected)
+}
+
+fn browser_all_flag_values_equal(args: &[String], flag: &str, expected_value: &str) -> bool {
+    let Some(expected_flag) = canonical_browser_flag_name(flag) else {
+        return false;
+    };
+    let mut found = false;
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        if canonical_browser_flag_name(arg).as_deref() != Some(expected_flag.as_str()) {
+            index += 1;
+            continue;
+        }
+        found = true;
+        let value = if let Some((_, value)) = arg.split_once('=') {
+            Some(value)
+        } else {
+            args.get(index + 1)
+                .filter(|value| !value.starts_with('-'))
+                .map(String::as_str)
+        };
+        if !value.is_some_and(|value| value.eq_ignore_ascii_case(expected_value)) {
+            return false;
+        }
+        if !arg.contains('=') {
+            index += 1;
+        }
+        index += 1;
+    }
+    found
 }
 
 fn browser_command_allowed_read_only(command: &str, args: &[String]) -> bool {
@@ -2031,7 +2069,13 @@ fn browser_command_allowed_read_only(command: &str, args: &[String]) -> bool {
             !browser_arg_uses_flag(args, "--requestFilePath")
                 && !browser_arg_uses_flag(args, "--responseFilePath")
         }
-        "lighthouse_audit" => !browser_arg_uses_flag(args, "--outputDirPath"),
+        // Upstream v1.7 defaults Lighthouse to navigation mode, which reloads the page and is
+        // explicitly marked readOnlyHint=false. ReadOnly only permits the non-navigating snapshot
+        // form, and never permits report output to disk.
+        "lighthouse_audit" => {
+            !browser_arg_uses_flag(args, "--outputDirPath")
+                && browser_all_flag_values_equal(args, "--mode", "snapshot")
+        }
         _ => false,
     }
 }
@@ -2047,21 +2091,18 @@ async fn handle_browser_command(
         Some(value) if !value.trim().is_empty() => value.trim(),
         _ => return tool_error_response(req, "Missing required parameter: command".to_string()),
     };
-    if command.len() > 128 {
-        return tool_error_response(req, "command exceeds the 128-byte limit".to_string());
-    }
     let args = match arguments.get("args") {
         None => Vec::new(),
-        Some(Value::Array(values)) if values.len() <= 64 => {
+        Some(Value::Array(values)) if values.len() <= MAX_BROWSER_ARGS => {
             let mut args = Vec::with_capacity(values.len());
             for (index, value) in values.iter().enumerate() {
                 let Some(value) = value.as_str() else {
                     return tool_error_response(req, format!("args[{index}] must be a string"));
                 };
-                if value.len() > 8192 {
+                if value.len() > MAX_BROWSER_ARG_BYTES {
                     return tool_error_response(
                         req,
-                        format!("args[{index}] exceeds the 8192-byte limit"),
+                        format!("args[{index}] exceeds the {MAX_BROWSER_ARG_BYTES}-byte limit"),
                     );
                 }
                 args.push(value.to_string());
@@ -2069,7 +2110,10 @@ async fn handle_browser_command(
             args
         }
         Some(Value::Array(_)) => {
-            return tool_error_response(req, "args may contain at most 64 values".to_string());
+            return tool_error_response(
+                req,
+                format!("args may contain at most {MAX_BROWSER_ARGS} values"),
+            );
         }
         Some(_) => return tool_error_response(req, "args must be an array of strings".to_string()),
     };
@@ -2083,15 +2127,19 @@ async fn handle_browser_command(
     let timeout_ms = match arguments.get("timeout_ms") {
         None => DEFAULT_BROWSER_COMMAND_TIMEOUT.as_millis() as u64,
         Some(value) => match value.as_u64() {
-            Some(value @ 1..=120_000) => value,
+            Some(value @ 1..=MAX_BROWSER_TIMEOUT_MS) => value,
             _ => {
                 return tool_error_response(
                     req,
-                    "timeout_ms must be an integer between 1 and 120000".to_string(),
+                    format!("timeout_ms must be an integer between 1 and {MAX_BROWSER_TIMEOUT_MS}"),
                 );
             }
         },
     };
+
+    if let Err(error) = validate_browser_request_bounds(command, &args, timeout_ms) {
+        return tool_error_response(req, error);
+    }
 
     let Some(runtime) = browser_runtime else {
         return tool_error_response(
@@ -2194,10 +2242,11 @@ async fn handle_view_page(
     }
 
     let output = match runtime
-        .run(
+        .run_managed_temp_output(
             workspace_root,
             "take_screenshot",
             &cli_args,
+            &temp_path,
             DEFAULT_BROWSER_COMMAND_TIMEOUT,
         )
         .await
@@ -4000,13 +4049,24 @@ mod tests {
             "take_snapshot",
             "list_console_messages",
             "list_network_requests",
-            "lighthouse_audit",
         ] {
             assert!(
                 browser_command_allowed_read_only(command, &no_args),
                 "{command}"
             );
         }
+        assert!(browser_command_allowed_read_only(
+            "lighthouse_audit",
+            &["--mode=snapshot".to_string()]
+        ));
+        assert!(browser_command_allowed_read_only(
+            "lighthouse_audit",
+            &["--MODE".to_string(), "snapshot".to_string()]
+        ));
+        assert!(!browser_command_allowed_read_only(
+            "lighthouse_audit",
+            &no_args
+        ));
         for command in [
             "take_screenshot",
             "new_page",
@@ -4032,7 +4092,25 @@ mod tests {
         ));
         assert!(!browser_command_allowed_read_only(
             "lighthouse_audit",
-            &["--outputDirPath=reports".to_string()]
+            &[
+                "--mode=snapshot".to_string(),
+                "--outputDirPath=reports".to_string(),
+            ]
+        ));
+        assert!(!browser_command_allowed_read_only(
+            "take_snapshot",
+            &["--FILE-PATH=outside.txt".to_string()]
+        ));
+        assert!(!browser_command_allowed_read_only(
+            "get_network_request",
+            &["--response_file_path=outside.bin".to_string()]
+        ));
+        assert!(!browser_command_allowed_read_only(
+            "lighthouse_audit",
+            &[
+                "--mode=snapshot".to_string(),
+                "--mode=navigation".to_string(),
+            ]
         ));
     }
 

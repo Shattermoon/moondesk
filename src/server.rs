@@ -15,7 +15,10 @@ use std::sync::Arc;
 use std::time::Duration;
 use subtle::ConstantTimeEq;
 
-use crate::browser_runtime::{BrowserRuntime, DEFAULT_BROWSER_COMMAND_TIMEOUT};
+use crate::browser_runtime::{
+    BrowserRuntime, DEFAULT_BROWSER_COMMAND_TIMEOUT, MAX_BROWSER_CONTROL_BODY_BYTES,
+    validate_browser_request_bounds,
+};
 use crate::command_jobs::CommandJobManager;
 use crate::mcp::{self, JsonRpcRequest};
 use crate::state::{
@@ -30,10 +33,6 @@ use uuid::Uuid;
 const STATELESS_FLOW_ID: &str = "stateless";
 const STATELESS_FLOW_LABEL: &str = "stateless";
 const MAX_HOST_CONTROL_BODY_BYTES: usize = 16 * 1024;
-const MAX_HOST_BROWSER_CONTROL_BODY_BYTES: usize = 128 * 1024;
-const MAX_HOST_BROWSER_COMMAND_BYTES: usize = 128;
-const MAX_HOST_BROWSER_ARGS: usize = 64;
-const MAX_HOST_BROWSER_ARG_BYTES: usize = 8 * 1024;
 pub const HOST_CONTROL_ROUTE: &str = "/__moondesk/workspaces";
 pub const HOST_BROWSER_CONTROL_ROUTE: &str = "/__moondesk/browser";
 pub const HOST_CONTROL_HEADER: &str = "x-moondesk-host-token";
@@ -159,7 +158,7 @@ pub fn router(
         .route(
             HOST_BROWSER_CONTROL_ROUTE,
             post(run_browser_command_from_local_host)
-                .layer(DefaultBodyLimit::max(MAX_HOST_BROWSER_CONTROL_BODY_BYTES)),
+                .layer(DefaultBodyLimit::max(MAX_BROWSER_CONTROL_BODY_BYTES)),
         )
         .merge(mcp_routes)
         .with_state(state)
@@ -533,7 +532,7 @@ async fn run_browser_command_from_local_host(
     if !host_control_authorized(&headers, &s.host_control_token) {
         return not_found_response();
     }
-    if body.len() > MAX_HOST_BROWSER_CONTROL_BODY_BYTES {
+    if body.len() > MAX_BROWSER_CONTROL_BODY_BYTES {
         return response_with_body(
             StatusCode::PAYLOAD_TOO_LARGE,
             "application/json",
@@ -552,33 +551,14 @@ async fn run_browser_command_from_local_host(
         }
     };
     let command = request.command.trim();
-    if command.is_empty() || command.len() > MAX_HOST_BROWSER_COMMAND_BYTES {
-        return response_with_body(
-            StatusCode::BAD_REQUEST,
-            "application/json",
-            Body::from(r#"{"error":"command must be between 1 and 128 bytes"}"#),
-        );
-    }
-    if request.args.len() > MAX_HOST_BROWSER_ARGS
-        || request
-            .args
-            .iter()
-            .any(|arg| arg.len() > MAX_HOST_BROWSER_ARG_BYTES)
-    {
-        return response_with_body(
-            StatusCode::BAD_REQUEST,
-            "application/json",
-            Body::from(r#"{"error":"browser command arguments exceed the allowed bounds"}"#),
-        );
-    }
     let timeout_ms = request
         .timeout_ms
         .unwrap_or(DEFAULT_BROWSER_COMMAND_TIMEOUT.as_millis() as u64);
-    if !(1..=120_000).contains(&timeout_ms) {
+    if let Err(error) = validate_browser_request_bounds(command, &request.args, timeout_ms) {
         return response_with_body(
             StatusCode::BAD_REQUEST,
             "application/json",
-            Body::from(r#"{"error":"timeoutMs must be between 1 and 120000"}"#),
+            Body::from(json!({"error": error}).to_string()),
         );
     }
     let cwd = PathBuf::from(request.cwd);
@@ -1918,6 +1898,13 @@ mod tests {
         let config_path = config_root.join("config.toml");
         std::fs::create_dir_all(&workspace_root).expect("create workspace");
         std::fs::create_dir_all(&config_root).expect("create config dir");
+        std::fs::create_dir_all(workspace_root.join("artifacts"))
+            .expect("create browser output directory");
+        std::fs::write(
+            workspace_root.join("upload-fixture.txt"),
+            b"MoonDesk upload fixture\n",
+        )
+        .expect("write browser upload fixture");
 
         let mut app = AppState::new_for_test(
             8787,
@@ -1952,11 +1939,13 @@ mod tests {
 <body><header>MoonDesk Host Browser E2E</header><main>
 <label>Name <input id="name" placeholder="Type here"></label>
 <button id="toggle" type="button">Toggle state</button><strong id="state">OFF</strong>
+<label>Upload <input id="upload" type="file"></label><strong id="file-name">NONE</strong>
 <div class="spacer"></div><div id="bottom">BOTTOM MARKER</div></main>
 <script>
 console.log('MOONDESK_E2E_READY');
 fetch('/ping').then(r=>r.text()).then(value=>console.log('MOONDESK_E2E_PING:'+value));
 document.getElementById('toggle').addEventListener('click',()=>{const s=document.getElementById('state');s.textContent=s.textContent==='OFF'?'ON':'OFF';});
+document.getElementById('upload').addEventListener('change',event=>{document.getElementById('file-name').textContent=event.target.files?.[0]?.name||'NONE';});
 </script>
 </body></html>"#;
         let site_app = Router::new()
@@ -2084,6 +2073,16 @@ document.getElementById('toggle').addEventListener('click',()=>{const s=document
         assert!(mobile_snapshot_text.contains("MoonDesk Host Browser E2E"));
         let input_uid = snapshot_uid(mobile_snapshot_text, "textbox");
         let button_uid = snapshot_uid(mobile_snapshot_text, "button \"Toggle state\"");
+        let upload_uid = snapshot_uid(mobile_snapshot_text, "button \"Upload \"");
+        let upload = host_browser_request(
+            host_address,
+            &workspace_root,
+            "upload_file",
+            &[upload_uid.as_str(), "upload-fixture.txt"],
+        )
+        .await;
+        assert_eq!(upload.get("success").and_then(Value::as_bool), Some(true));
+
         let fill = host_browser_request(
             host_address,
             &workspace_root,
@@ -2104,7 +2103,7 @@ document.getElementById('toggle').addEventListener('click',()=>{const s=document
         let end = host_browser_request(host_address, &workspace_root, "press_key", &["End"]).await;
         assert_eq!(end.get("success").and_then(Value::as_bool), Some(true));
 
-        let inspect_script = "() => ({width: innerWidth, height: innerHeight, value: document.querySelector('#name').value, state: document.querySelector('#state').textContent, scrolled: scrollY > 500})";
+        let inspect_script = "() => ({width: innerWidth, height: innerHeight, value: document.querySelector('#name').value, state: document.querySelector('#state').textContent, uploaded: document.querySelector('#file-name').textContent, scrolled: scrollY > 500})";
         let inspection = host_browser_request(
             host_address,
             &workspace_root,
@@ -2120,7 +2119,14 @@ document.getElementById('toggle').addEventListener('click',()=>{const s=document
             .get("stdout")
             .and_then(Value::as_str)
             .expect("inspection stdout");
-        for expected in ["390", "844", "agent-check", "ON", "true"] {
+        for expected in [
+            "390",
+            "844",
+            "agent-check",
+            "ON",
+            "upload-fixture.txt",
+            "true",
+        ] {
             assert!(
                 inspection_text.contains(expected),
                 "inspection did not contain {expected:?}: {inspection_text}"
@@ -2149,6 +2155,30 @@ document.getElementById('toggle').addEventListener('click',()=>{const s=document
         assert!(
             network_text.contains("/ping"),
             "browser network inspection missed the local project request: {network_text}"
+        );
+
+        let screenshot = host_browser_request(
+            host_address,
+            &workspace_root,
+            "take_screenshot",
+            &["--filePath=artifacts/browser-e2e.png"],
+        )
+        .await;
+        assert_eq!(
+            screenshot.get("success").and_then(Value::as_bool),
+            Some(true)
+        );
+        let screenshot_path = workspace_root.join("artifacts/browser-e2e.png");
+        assert!(
+            screenshot_path.is_file(),
+            "workspace screenshot output was not created"
+        );
+        assert!(
+            std::fs::metadata(&screenshot_path)
+                .expect("read workspace screenshot metadata")
+                .len()
+                > 0,
+            "workspace screenshot output is empty"
         );
 
         let mcp_body = serde_json::to_vec(&json!({

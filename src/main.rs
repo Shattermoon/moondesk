@@ -1749,6 +1749,7 @@ async fn attach_workspace_to_running_host(
     .map_err(|error| error.to_string())?;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|error| error.to_string())?;
     let endpoint = format!("http://127.0.0.1:{port}{}", server::HOST_CONTROL_ROUTE);
@@ -1818,15 +1819,22 @@ pub(crate) async fn send_browser_cli_request_to_host(
     command: &str,
     args: &[String],
 ) -> Result<serde_json::Value, String> {
+    let timeout_ms = browser_runtime::DEFAULT_BROWSER_COMMAND_TIMEOUT.as_millis() as u64;
+    browser_runtime::validate_browser_request_bounds(command, args, timeout_ms)
+        .map_err(|error| format!("Invalid browser command request: {error}"))?;
     let body = serde_json::to_vec(&serde_json::json!({
         "cwd": cwd.to_string_lossy(),
         "command": command,
         "args": args,
-        "timeoutMs": browser_runtime::DEFAULT_BROWSER_COMMAND_TIMEOUT.as_millis() as u64,
+        "timeoutMs": timeout_ms,
     }))
     .map_err(|error| format!("Could not encode browser command request: {error}"))?;
+    if body.len() > browser_runtime::MAX_BROWSER_CONTROL_BODY_BYTES {
+        return Err("Browser command request exceeds the local host body limit".to_string());
+    }
     let client = reqwest::Client::builder()
         .timeout(browser_runtime::DEFAULT_BROWSER_COMMAND_TIMEOUT + Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|error| format!("Could not create browser CLI client: {error}"))?;
     let endpoint = format!(
@@ -7678,6 +7686,83 @@ mod tests {
             "unexpected old-host error: {error}"
         );
         server.await.expect("fake host task");
+    }
+
+    #[tokio::test]
+    async fn browser_cli_never_forwards_host_token_across_redirects() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let redirect_target_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind redirect target");
+        let redirect_target_port = redirect_target_listener
+            .local_addr()
+            .expect("redirect target address")
+            .port();
+        let token_leaked = std::sync::Arc::new(AtomicBool::new(false));
+        let token_leaked_by_target = token_leaked.clone();
+        let redirect_target =
+            axum::Router::new().fallback(move |headers: axum::http::HeaderMap| {
+                let token_leaked = token_leaked_by_target.clone();
+                async move {
+                    if headers.contains_key(super::server::HOST_CONTROL_HEADER) {
+                        token_leaked.store(true, Ordering::SeqCst);
+                    }
+                    axum::http::StatusCode::NO_CONTENT
+                }
+            });
+        let redirect_target_server = tokio::spawn(async move {
+            let _ = axum::serve(redirect_target_listener, redirect_target).await;
+        });
+
+        let redirector_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind redirector");
+        let redirector_port = redirector_listener
+            .local_addr()
+            .expect("redirector address")
+            .port();
+        let location = format!("http://127.0.0.1:{redirect_target_port}/capture");
+        let redirector = axum::Router::new().route(
+            super::server::HOST_BROWSER_CONTROL_ROUTE,
+            axum::routing::post(move || {
+                let location = location.clone();
+                async move {
+                    axum::http::Response::builder()
+                        .status(axum::http::StatusCode::TEMPORARY_REDIRECT)
+                        .header(axum::http::header::LOCATION, location)
+                        .body(axum::body::Body::empty())
+                        .expect("build redirect response")
+                }
+            }),
+        );
+        let redirector_server = tokio::spawn(async move {
+            let _ = axum::serve(redirector_listener, redirector).await;
+        });
+
+        let error = super::send_browser_cli_request_to_host(
+            redirector_port,
+            "redirect-secret-token",
+            std::path::Path::new("."),
+            "take_snapshot",
+            &[],
+        )
+        .await
+        .expect_err("redirect response must not be followed");
+        assert!(
+            error.contains("HTTP 307"),
+            "unexpected redirect error: {error}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !token_leaked.load(Ordering::SeqCst),
+            "host-control token reached the redirect target"
+        );
+
+        redirector_server.abort();
+        redirect_target_server.abort();
+        let _ = redirector_server.await;
+        let _ = redirect_target_server.await;
     }
 
     #[test]

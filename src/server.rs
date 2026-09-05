@@ -1163,6 +1163,7 @@ mod tests {
         )
     }
 
+    #[cfg(windows)]
     async fn host_browser_request(
         address: std::net::SocketAddr,
         cwd: &std::path::Path,
@@ -1184,6 +1185,7 @@ mod tests {
         .unwrap_or_else(|error| panic!("host browser request {command} failed: {error}"))
     }
 
+    #[cfg(windows)]
     fn snapshot_uid(snapshot: &str, needle: &str) -> String {
         let line = snapshot
             .lines()

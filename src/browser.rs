@@ -244,7 +244,7 @@ fn normalize_path(path: &Path) -> String {
         .into_owned()
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 pub fn format_browser_names(browsers: &[DetectedBrowser]) -> String {
     if browsers.is_empty() {
         return "--".into();

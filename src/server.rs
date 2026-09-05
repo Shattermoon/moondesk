@@ -1994,9 +1994,9 @@ document.getElementById('toggle').addEventListener('click',()=>{const s=document
         assert!(snapshot_text.contains(&site_url));
         assert!(!snapshot_text.contains("url=\"about:blank\""));
 
-        // resize_page changes the desktop browser window; Chromium may clamp very narrow window
-        // sizes. Use it for a desktop viewport, then use DevTools viewport emulation for exact
-        // tablet/mobile responsive checks.
+        // resize_page exercises the real desktop-window path, but hosted Windows runners can
+        // expose a different inner viewport because the non-interactive window manager applies
+        // frame/desktop constraints. Use DevTools emulation for deterministic viewport assertions.
         let desktop_resize = host_browser_request(
             host_address,
             &workspace_root,
@@ -2008,6 +2008,14 @@ document.getElementById('toggle').addEventListener('click',()=>{const s=document
             desktop_resize.get("success").and_then(Value::as_bool),
             Some(true)
         );
+        let desktop = host_browser_request(
+            host_address,
+            &workspace_root,
+            "emulate",
+            &["--viewport=1280x800x1"],
+        )
+        .await;
+        assert_eq!(desktop.get("success").and_then(Value::as_bool), Some(true));
         let desktop_inspection = host_browser_request(
             host_address,
             &workspace_root,
@@ -2019,10 +2027,12 @@ document.getElementById('toggle').addEventListener('click',()=>{const s=document
             .get("stdout")
             .and_then(Value::as_str)
             .expect("desktop inspection stdout");
-        assert!(
-            desktop_text.contains("1280"),
-            "unexpected desktop viewport: {desktop_text}"
-        );
+        for expected in ["1280", "800"] {
+            assert!(
+                desktop_text.contains(expected),
+                "unexpected desktop viewport: {desktop_text}"
+            );
+        }
 
         let tablet = host_browser_request(
             host_address,

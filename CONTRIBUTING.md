@@ -21,10 +21,10 @@ Never include a real MoonDesk workspace MCP URL, ngrok authtoken, npm credential
 MoonDesk currently requires:
 
 - Rust **1.88 or newer** (`edition = 2024`)
-- Node.js **20.19 or newer** for the npm wrapper/runtime
+- Node.js **`^20.19.0 || ^22.12.0 || >=23`** for the npm wrapper/runtime (Node 21 and Node 22.0-22.11 are unsupported by the pinned browser runtime)
 - Git
 
-For the closest match to CI, use the current stable Rust toolchain with `rustfmt` and `clippy`. CI validates the npm runtime on Node 20.19 and Node 24.
+For the closest match to CI, use the current stable Rust toolchain with `rustfmt` and `clippy`. CI validates the npm runtime at Node 20.19.0, Node 22.12.0, and Node 24.
 
 Some optional integration tests require platform-specific software:
 

@@ -5,7 +5,13 @@ const os = require("node:os");
 const path = require("node:path");
 const test = require("node:test");
 
-const { cleanManagedUpdateEnv, orchestrate, runNative } = require("./moondesk");
+const {
+  SUPPORTED_NODE_RANGE,
+  cleanManagedUpdateEnv,
+  isSupportedNodeVersion,
+  orchestrate,
+  runNative,
+} = require("./moondesk");
 const { UPDATE_EXIT_CODE, changelogNoticePath, currentVersion } = require("./update-manager");
 
 function tempDir() {
@@ -33,6 +39,36 @@ test("package exposes one MoonDesk CLI and keeps browser as a subcommand", () =>
   assert.deepEqual(pkg.bin, { moondesk: "npm/moondesk.js" });
   assert.equal(pkg.files.includes("npm/moondesk-browser.js"), false);
   assert.equal(pkg.files.includes("skills/browser/SKILL.md"), true);
+});
+
+test("supported Node runtime matches the pinned browser dependency contract", () => {
+  const pkg = require("../package.json");
+  assert.equal(SUPPORTED_NODE_RANGE, "^20.19.0 || ^22.12.0 || >=23");
+  assert.equal(pkg.engines.node, SUPPORTED_NODE_RANGE);
+  for (const version of ["20.19.0", "20.99.1", "22.12.0", "22.99.0", "23.0.0", "24.20.0"]) {
+    assert.equal(isSupportedNodeVersion(version), true, `expected ${version} to be supported`);
+  }
+  for (const version of ["18.20.8", "20.18.9", "21.7.3", "22.0.0", "22.11.9", "24.0.0-rc.1", "not-a-version"]) {
+    assert.equal(isSupportedNodeVersion(version), false, `expected ${version} to be rejected`);
+  }
+});
+
+test("unsupported Node exits before MoonDesk performs startup side effects", async () => {
+  const errors = [];
+  let touchedStartup = false;
+  const result = await orchestrate({
+    nodeVersion: "22.11.0",
+    logger: { log() {}, warn() {}, error(message) { errors.push(message); } },
+    createUpdateStatePathImpl: () => {
+      touchedStartup = true;
+      throw new Error("must not run");
+    },
+  });
+  assert.deepEqual(result, { code: 1, signal: null });
+  assert.equal(touchedStartup, false);
+  assert.equal(errors.length, 1);
+  assert.match(errors[0], /\^20\.19\.0 \|\| \^22\.12\.0 \|\| >=23/);
+  assert.match(errors[0], /22\.11\.0/);
 });
 
 test("browser subcommand arguments are forwarded unchanged to native MoonDesk", async () => {

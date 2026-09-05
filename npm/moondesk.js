@@ -21,6 +21,18 @@ const {
   writePostUpdateNotice,
 } = require("./update-manager");
 
+const SUPPORTED_NODE_RANGE = "^20.19.0 || ^22.12.0 || >=23";
+
+function isSupportedNodeVersion(version = process.versions.node) {
+  const match = /^(\d+)\.(\d+)\.(\d+)$/.exec(String(version));
+  if (!match) return false;
+  const major = Number(match[1]);
+  const minor = Number(match[2]);
+  if (major === 20) return minor >= 19;
+  if (major === 22) return minor >= 12;
+  return major >= 23;
+}
+
 function cleanManagedUpdateEnv(source = process.env) {
   const env = { ...source };
   delete env.MOONDESK_NPM_MANAGED;
@@ -109,6 +121,13 @@ function nativeStartFailureHints(error, binaryPath, options = {}) {
 
 async function orchestrate(options = {}) {
   const logger = options.logger ?? console;
+  const nodeVersion = options.nodeVersion ?? process.versions.node;
+  if (!isSupportedNodeVersion(nodeVersion)) {
+    logger.error(
+      `MoonDesk requires Node.js ${SUPPORTED_NODE_RANGE} because the pinned browser runtime does not support Node.js ${nodeVersion}.`,
+    );
+    return { code: 1, signal: null };
+  }
   const originalArgs = options.args ?? process.argv.slice(2);
   const originalCwd = options.cwd ?? process.cwd();
   const baseEnv = cleanManagedUpdateEnv(options.env ?? process.env);
@@ -341,8 +360,10 @@ if (require.main === module) {
 }
 
 module.exports = {
+  SUPPORTED_NODE_RANGE,
   cleanManagedUpdateEnv,
   cleanupEphemeralUpdateFiles,
+  isSupportedNodeVersion,
   orchestrate,
   runNative,
 };

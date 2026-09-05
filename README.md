@@ -44,7 +44,7 @@ No reverse engineering. No API key. No separate agent service.
 
 ### 1. Install
 
-Node.js 20.19 or newer is required.
+MoonDesk requires Node.js `^20.19.0 || ^22.12.0 || >=23`, matching the pinned browser runtime. Node 21 and Node 22.0-22.11 are not supported.
 
 ```bash
 npm install -g moondesk

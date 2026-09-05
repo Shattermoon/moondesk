@@ -388,12 +388,23 @@ fn browser_output_from_result(
                         uuid::Uuid::new_v4().simple(),
                         extension
                     ));
-                    std::fs::write(&path, bytes).map_err(|error| {
-                        format!(
+                    let mut options = std::fs::OpenOptions::new();
+                    options.create_new(true).write(true);
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::OpenOptionsExt;
+                        options.mode(0o600);
+                    }
+                    if let Err(error) = options
+                        .open(&path)
+                        .and_then(|mut file| file.write_all(&bytes))
+                    {
+                        let _ = std::fs::remove_file(&path);
+                        return Err(format!(
                             "Could not write browser image response to {}: {error}",
                             path.display()
-                        )
-                    })?;
+                        ));
+                    }
                     images.push(serde_json::json!({
                         "filePath": path.to_string_lossy(),
                         "mimeType": mime_type,
@@ -1581,6 +1592,18 @@ mod tests {
             std::fs::read(&path).expect("read browser image output"),
             b"hello"
         );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path)
+                    .expect("browser image metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
         let _ = std::fs::remove_file(path);
     }
 

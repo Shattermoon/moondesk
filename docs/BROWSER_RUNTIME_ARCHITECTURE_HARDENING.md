@@ -16,7 +16,7 @@ The hardening work described in this document is implemented on the current bran
 - **Post-dispatch timeout cancellation - done.** A timed-out MCP request invalidates and terminates the exact owned MCP/Chromium tree while browser serialization is still held. The Windows regression `windows_browser_timeout_cancels_dispatched_mutation` proves a delayed mutation that was genuinely dispatched cannot occur after MoonDesk returns timeout.
 - **Crash/runtime-loss recovery - done.** A dead owned child is discarded and the next browser operation starts a fresh isolated runtime. MoonDesk does not automatically replay the ambiguous operation that observed the loss.
 - **Host-file navigation boundary - done.** MoonDesk owns URL validation for `navigate_page` and `new_page`; local filesystem paths and unsafe local/internal schemes such as `file:`, `view-source:file:`, `chrome:`, and `javascript:` fail before reaching Chromium. Normal HTTP(S), localhost, `data:`, safe `view-source:https:`, and HTTP(S)-origin `blob:` navigation remain available.
-- **Node compatibility contract - done.** The npm engine floor, installer diagnostics, README, contributor docs, and CI matrix now use Node 20.19+; CI also launches the exact pinned browser runtime with `--help` at the supported Node versions so wrapper-only tests cannot hide a future engine mismatch.
+- **Node compatibility contract - done.** The npm engine range, wrapper preflight, installer diagnostics, README, contributor docs, and CI matrix now match exact `chrome-devtools-mcp@1.7.0` support: `^20.19.0 || ^22.12.0 || >=23`. CI also launches the exact pinned browser runtime with `--help` at supported boundary/latest versions so wrapper-only tests cannot hide a future engine mismatch.
 - **Single deadline model - done.** Direct stdio removes the upstream CLI client's hidden 60-second socket deadline. MoonDesk's request deadline now governs queueing, runtime startup, MCP execution, staging, and output publication.
 - **Staging/output deadline hardening - done.** Potentially large staging work runs off Tokio workers; file copying checks the operation deadline in bounded chunks; file output is copied to a randomized sibling temporary file and atomically published only while the deadline remains valid. Existing traversal, symlink/reparse-point, and outside-workspace checks remain fail-closed.
 - **Pinned command contract - done.** `src/browser_contract_v1_7.json` records all 50 commands from exact v1.7 generated CLI metadata, and `src/browser_contract.rs` parses the existing `command + args[]` surface into MCP tool arguments while preserving aliases, booleans, arrays, enums/defaults, and MoonDesk-owned `--output-format`.
@@ -270,8 +270,9 @@ Validated locally on the final implementation state before push:
 | Windows native `view_page` vision smoke | **PASS** |
 | Linux stable Rust 1.98.1 format + both Clippy gates | **PASS** |
 | Linux Rust tests | **303 passed, 0 failed** |
-| Node 20.19 npm tests + package verification | **57/57 + exact 7-file package** |
-| Node 24 npm tests + package verification | **57/57 + exact 7-file package** |
-| Pinned `chrome-devtools-mcp@1.7.0 --help` on Node 20.19 and Node 24 | **PASS** |
+| Node 20.19 npm tests + package verification | **59/59 + exact 7-file package** |
+| Node 22.12 npm tests + package verification | **59/59 + exact 7-file package** |
+| Node 24 npm tests + package verification | **59/59 + exact 7-file package** |
+| Pinned `chrome-devtools-mcp@1.7.0 --help` on Node 20.19, Node 22.12, and Node 24 | **PASS** |
 
 GitHub CI must still pass on the pushed PR HEAD before review threads are considered fully closed.

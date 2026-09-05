@@ -302,7 +302,7 @@ async fn drain_stderr(stderr: tokio::process::ChildStderr, state: Option<SharedS
                         .take(MAX_DIAGNOSTIC_CHARS)
                         .collect::<String>();
                     if trimmed.chars().count() > MAX_DIAGNOSTIC_CHARS {
-                        message.push('?');
+                        message.push_str(" ...[truncated]");
                     }
                     state
                         .lock()

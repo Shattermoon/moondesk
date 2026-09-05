@@ -21,16 +21,16 @@ Never include a real MoonDesk workspace MCP URL, ngrok authtoken, npm credential
 MoonDesk currently requires:
 
 - Rust **1.88 or newer** (`edition = 2024`)
-- Node.js **18 or newer** for the npm wrapper/runtime
+- Node.js **`^20.19.0 || ^22.12.0 || >=23`** for the npm wrapper/runtime (Node 21 and Node 22.0-22.11 are unsupported by the pinned browser runtime)
 - Git
 
-For the closest match to CI, use the current stable Rust toolchain with `rustfmt` and `clippy`. CI validates the npm runtime on both Node 18 and Node 24.
+For the closest match to CI, use the current stable Rust toolchain with `rustfmt` and `clippy`. CI validates the npm runtime at Node 20.19.0, Node 22.12.0, and Node 24.
 
 Some optional integration tests require platform-specific software:
 
 - Windows tests may require PowerShell and standard developer tools.
-- Browser/DevTools tests require a locally installed supported Chromium browser.
-- Browser control itself uses `chrome-devtools-mcp` through `npx`.
+- Browser tests require a locally installed supported Chromium browser.
+- Browser control uses a pinned `chrome-devtools-mcp@1.7.0` stdio child owned directly by MoonDesk. MoonDesk starts it lazily on the first browser operation rather than during host startup and owns its complete process tree for deterministic shutdown/cancellation.
 - Running MoonDesk end-to-end through a public MCP endpoint requires ngrok configuration.
 
 ## Getting the repository running
@@ -85,15 +85,17 @@ On Windows, run the test suite serially to match CI's process-heavy validation:
 cargo test --locked -- --test-threads 1
 ```
 
-If your change touches process execution, Windows environment handling, browser launching/detection, or DevTools lifecycle code, run the relevant ignored integration smokes when your machine supports them:
+If your change touches process execution, Windows environment handling, browser detection, or the lazy browser runtime, run the relevant ignored integration smokes when your machine supports them:
 
 ```bash
 cargo test --locked windows_developer_toolchain_smoke_uses_normal_host_environment -- --ignored
-cargo test --locked remote_browser_termination_confirms_child_exit -- --ignored
-cargo test --locked windows_devtools_stop_terminates_npx_process_tree -- --ignored
+cargo test --locked windows_owned_browser_runtime_is_lazy_and_recovers_after_child_exit -- --ignored --test-threads 1
+cargo test --locked windows_browser_timeout_cancels_dispatched_mutation -- --ignored --test-threads 1
+cargo test --locked windows_host_browser_cli_and_mcp_view_page_share_one_session -- --ignored --test-threads 1
+cargo test --locked windows_view_page_returns_native_mcp_image_content -- --ignored --test-threads 1
 ```
 
-Additional ignored tests may require a live Chromium remote-debug endpoint. Do not weaken or delete environment-specific tests merely to make them run in an environment that does not satisfy their stated prerequisites.
+The browser smokes verify that help/configuration does not launch Chrome, the MoonDesk-owned stdio runtime starts only on first use, every session uses an isolated non-personal browser profile, owned-child loss is recovered with a fresh safe session, a dispatched timed-out mutation cannot continue after MoonDesk returns, separate `moondesk browser` requests share the host-owned session with MCP, responsive viewport emulation works, and `view_page` exercises the real rendered-pixel path. Do not weaken or delete environment-specific tests merely to make them run where their stated prerequisites are missing.
 
 ## npm wrapper and distribution checks
 
@@ -165,11 +167,11 @@ A single MoonDesk host can serve multiple workspace endpoints. A change in one w
 - connection/runtime state;
 - normal per-workspace quotas/history.
 
-Browser/DevTools control is intentionally shared by the host and should remain clearly distinguished from workspace-local state.
+Browser control is intentionally shared by the host and should remain clearly distinguished from workspace-local state. Keep its MCP surface stable: browser availability or runtime state must not dynamically add/remove raw DevTools tool schemas.
 
 ### Process lifecycle
 
-Process handling is cross-platform and easy to get subtly wrong. Changes to commands, background jobs, browser launching, or DevTools launching should account for:
+Process handling is cross-platform and easy to get subtly wrong. Changes to commands, background jobs, or the lazy browser runtime should account for:
 
 - cancellation before spawn;
 - cancellation during execution;
@@ -208,8 +210,8 @@ When responding to automated review feedback, verify the finding against the cur
 MoonDesk uses conventional-style commit subjects. Keep commits concise and consistent with nearby history, for example:
 
 ```text
-feat: surface DevTools page count
-fix: own DevTools process tree on Windows
+feat: add browser inspection workflow
+fix: recover lazy browser sessions after disconnects
 ci: add RustSec dependency audit
 docs: update contribution guide
 ```

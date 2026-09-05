@@ -19,11 +19,12 @@
     "npm/moondesk.js",
     "npm/install-binary.js",
     "npm/update-manager.js",
+    "skills/browser/SKILL.md",
     "LICENSE",
     "README.md"
   ],
   "engines": {
-    "node": ">=18"
+    "node": "^20.19.0 || ^22.12.0 || >=23"
   },
   "publishConfig": {
     "access": "public",

@@ -34,7 +34,7 @@ No reverse engineering. No API key. No separate agent service.
 - **Local file tools** — read, search, write, edit, and delete inside a workspace.
 - **Shell commands** — run short commands or start background jobs with polling, preserved output, and cancellation.
 - **Multiple workspaces** — serve several projects from one MoonDesk process, each with its own secret MCP URL.
-- **Browser control** — connect ChatGPT to supported Chromium browsers through `chrome-devtools-mcp`.
+- **Lazy browser control** — a stable `browser_command` + `view_page` surface backed by a pinned Chrome DevTools runtime. Selecting Browser/Both does not launch Chrome; the shared browser session starts only on first use.
 - **Read-only mode** — expose only safe local read tools when mutation is unnecessary.
 - **Cross-platform** — Windows, macOS, and Linux.
 - **Native binary distribution** — install with npm; MoonDesk downloads and verifies the matching release binary on first run.
@@ -44,7 +44,7 @@ No reverse engineering. No API key. No separate agent service.
 
 ### 1. Install
 
-Node.js 18 or newer is required.
+MoonDesk requires Node.js `^20.19.0 || ^22.12.0 || >=23`, matching the pinned browser runtime. Node 21 and Node 22.0-22.11 are not supported.
 
 ```bash
 npm install -g moondesk
@@ -121,7 +121,7 @@ Each workspace keeps its own file boundary, command jobs, retained output, histo
 
 Use `[w] Workspaces` to add, rename, inspect, copy, rotate, or remove projects. On Windows, `[b] Explorer` opens the native Explorer folder picker for adding a workspace; `[a] Path` remains available for manual path entry. Launching `moondesk` from another project while a host is already running can attach that directory to the existing host instead of starting another server.
 
-Browser control is shared by the host, so workspaces using browser mode control the same selected browser/DevTools bridge.
+Browser control is shared by the host. Workspaces using browser mode share one lazy **isolated agent browser** session that starts only on first use. It never attaches to or reuses your personal browser profile, cookies, or logged-in sessions.
 
 Because every workspace shares this host and public tunnel, stopping MoonDesk disconnects all active workspace connectors. Pressing `q` or `Ctrl+C` in the live dashboard therefore opens a shutdown confirmation instead of stopping the host immediately; `Enter` confirms and `Esc` keeps MoonDesk running.
 
@@ -146,9 +146,30 @@ In `multi-tools` mode MoonDesk exposes 12 local tools:
 
 Use `run_command` for short work. Use `start_command` + `poll_command` for builds, tests, package installs, dev servers, and other long-running commands. Polls long-wait by default and report elapsed, idle, and timeout timing so agents can avoid rapid blind polling.
 
-`read-only` mode exposes only the local guide/read tools.
+`read-only` mode removes local mutation/shell tools. In Browser/Both mode it still permits bounded browser inspection, while state-changing browser commands and browser file-output flags remain blocked.
 
-Browser mode can add DevTools tools depending on the selected browser and environment.
+Browser mode has a stable tool catalog instead of forwarding the full Chrome DevTools MCP schema:
+
+| Browser tool | Purpose |
+| --- | --- |
+| `browser_command` | Run one browser/DevTools CLI operation in the shared lazy session |
+| `view_page` | Attach the current rendered page directly to the model as bounded image content |
+
+For one-off actions, use `browser_command`. Navigate first, set the target viewport, then run `take_snapshot` before element interactions and use UIDs from the latest snapshot. Use `resize_page` for ordinary desktop window sizes. For exact tablet/mobile QA, use `emulate --viewport=390x844x1,mobile,touch` (or another target size); Chromium can clamp very narrow desktop windows, and viewport emulation can recreate the page context, so take a fresh snapshot afterward. For visual layout/rendering checks, use `view_page`; text/accessibility snapshots do not replace pixel inspection.
+
+The same `moondesk` CLI also has a `browser` subcommand for deterministic scripted flows in `Both` mode:
+
+```bash
+moondesk browser skill
+moondesk browser navigate_page --url=http://localhost:3000
+moondesk browser emulate --viewport=390x844x1,mobile,touch
+moondesk browser take_snapshot
+moondesk browser list_console_messages
+```
+
+The `browser` subcommand is handled by MoonDesk itself and acts as a lightweight authenticated localhost client to the **running MoonDesk host**. It does not launch a separate browser runtime, so separate shell commands, MCP `browser_command`, and MCP `view_page` all operate on the same host-owned agent-browser session. MoonDesk directly owns the pinned `chrome-devtools-mcp` stdio process tree and its isolated Chromium child instead of relying on the upstream detached CLI daemon. Each agent-browser session uses an isolated temporary profile, so personal cookies/logins are never inherited and browser state is discarded when that session ends. Sensitive network headers are redacted, CrUX URL lookups and usage statistics are disabled, local-file navigation is blocked, and a lost runtime is invalidated so the next browser operation starts a fresh isolated session without replaying the ambiguous failed action.
+
+The browser runtime is intentionally pinned to `chrome-devtools-mcp@1.7.0`. Version `1.8.0` changed required CLI argument shapes for commands MoonDesk currently invokes with the 1.7 contract, so upgrading the pin requires an explicit command-contract migration and the full browser regression matrix rather than a blind dependency bump.
 
 ## Workspace security
 
@@ -192,7 +213,7 @@ On macOS Terminal.app, MoonDesk can manage a dedicated terminal profile. Set `MO
 | Tunnel | ngrok |
 | MCP server | Custom implementation |
 | MCP protocol | `2025-11-25` |
-| Browser bridge | `chrome-devtools-mcp` |
+| Browser runtime | pinned `chrome-devtools-mcp@1.7.0` stdio child owned by MoonDesk, started lazily |
 | Distribution | npm + native binaries |
 
 ## Contributing

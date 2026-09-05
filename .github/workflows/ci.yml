@@ -55,6 +55,9 @@ jobs:
           node --check npm/update-manager.js
           node --check .github/scripts/verify-npm-package.mjs
           node --test npm/install-binary.test.js npm/update-manager.test.js npm/moondesk.test.js
+          browser_pin="$(sed -n 's/.*CHROME_DEVTOOLS_PACKAGE_VERSION: &str = "\([^"]*\)".*/\1/p' src/browser_runtime.rs)"
+          test -n "$browser_pin"
+          npx -y "chrome-devtools-mcp@$browser_pin" --help >/dev/null
           node -e "const p=require('./package.json'); const s=p.scripts||{}; if (s.preinstall||s.install||s.postinstall) process.exit(1)"
           node -e "const p=require('./package.json'); if (Object.keys(p.bin||{}).length !== 1 || p.bin.moondesk !== 'npm/moondesk.js') throw new Error('MoonDesk must expose exactly one CLI bin'); for (const f of ['npm/moondesk.js','npm/install-binary.js','npm/update-manager.js','skills/browser/SKILL.md']) if (!p.files?.includes(f)) throw new Error('missing packaged runtime file: '+f)"
           node .github/scripts/verify-npm-package.mjs
@@ -87,13 +90,13 @@ jobs:
       - name: Run Windows developer toolchain smoke
         run: cargo +stable test --locked windows_developer_toolchain_smoke_uses_normal_host_environment -- --ignored
 
-      - name: Run Windows lazy browser lifecycle smoke
+      - name: Run Windows owned browser lifecycle smoke
         timeout-minutes: 10
-        run: cargo +stable test --locked windows_browser_runtime_is_lazy_and_recovers_after_daemon_exit -- --ignored --test-threads 1
+        run: cargo +stable test --locked windows_owned_browser_runtime_is_lazy_and_recovers_after_child_exit -- --ignored --test-threads 1
 
-      - name: Run Windows agent-browser close recovery smoke
+      - name: Run Windows dispatched-timeout cancellation smoke
         timeout-minutes: 10
-        run: cargo +stable test --locked windows_browser_runtime_recovers_after_agent_browser_process_exit -- --ignored --test-threads 1
+        run: cargo +stable test --locked windows_browser_timeout_cancels_dispatched_mutation -- --ignored --test-threads 1
 
       - name: Run Windows host browser session smoke
         timeout-minutes: 10
@@ -110,7 +113,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        node-version: [18, 24]
+        node-version: ['20.19.0', 24]
 
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -129,3 +132,6 @@ jobs:
           node --check npm/install-binary.js
           node --check npm/update-manager.js
           node --test npm/install-binary.test.js npm/update-manager.test.js npm/moondesk.test.js
+          browser_pin="$(sed -n 's/.*CHROME_DEVTOOLS_PACKAGE_VERSION: &str = "\([^"]*\)".*/\1/p' src/browser_runtime.rs)"
+          test -n "$browser_pin"
+          npx -y "chrome-devtools-mcp@$browser_pin" --help >/dev/null

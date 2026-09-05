@@ -44,7 +44,7 @@ No reverse engineering. No API key. No separate agent service.
 
 ### 1. Install
 
-Node.js 18 or newer is required.
+Node.js 20.19 or newer is required.
 
 ```bash
 npm install -g moondesk
@@ -167,7 +167,7 @@ moondesk browser take_snapshot
 moondesk browser list_console_messages
 ```
 
-The `browser` subcommand is handled by MoonDesk itself and acts as a lightweight authenticated localhost client to the **running MoonDesk host**. There is no second browser executable. It does not start or own another browser daemon, so separate shell commands, MCP `browser_command`, and MCP `view_page` all operate on the same host-owned agent-browser session. MoonDesk scopes the underlying DevTools daemon to its own session so unrelated `chrome-devtools` users are not reused or stopped. Each agent-browser session uses an isolated temporary profile, so personal cookies/logins are never inherited and browser state is discarded when that session ends. Sensitive network headers are redacted, CrUX URL lookups and usage statistics are disabled, and a dead browser/daemon is recreated automatically with the same safe isolated settings.
+The `browser` subcommand is handled by MoonDesk itself and acts as a lightweight authenticated localhost client to the **running MoonDesk host**. It does not launch a separate browser runtime, so separate shell commands, MCP `browser_command`, and MCP `view_page` all operate on the same host-owned agent-browser session. MoonDesk directly owns the pinned `chrome-devtools-mcp` stdio process tree and its isolated Chromium child instead of relying on the upstream detached CLI daemon. Each agent-browser session uses an isolated temporary profile, so personal cookies/logins are never inherited and browser state is discarded when that session ends. Sensitive network headers are redacted, CrUX URL lookups and usage statistics are disabled, local-file navigation is blocked, and a lost runtime is invalidated so the next browser operation starts a fresh isolated session without replaying the ambiguous failed action.
 
 The browser runtime is intentionally pinned to `chrome-devtools-mcp@1.7.0`. Version `1.8.0` changed required CLI argument shapes for commands MoonDesk currently invokes with the 1.7 contract, so upgrading the pin requires an explicit command-contract migration and the full browser regression matrix rather than a blind dependency bump.
 
@@ -213,7 +213,7 @@ On macOS Terminal.app, MoonDesk can manage a dedicated terminal profile. Set `MO
 | Tunnel | ngrok |
 | MCP server | Custom implementation |
 | MCP protocol | `2025-11-25` |
-| Browser runtime | pinned `chrome-devtools-mcp@1.7.0` CLI daemon, started lazily |
+| Browser runtime | pinned `chrome-devtools-mcp@1.7.0` stdio child owned by MoonDesk, started lazily |
 | Distribution | npm + native binaries |
 
 ## Contributing

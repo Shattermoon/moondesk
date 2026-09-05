@@ -297,7 +297,7 @@ async function ensureBinary(options = {}) {
   const fetchImpl = options.fetchImpl ?? globalThis.fetch;
 
   if (typeof fetchImpl !== "function") {
-    throw new Error("MoonDesk requires Node.js 18 or newer so the native binary can be downloaded securely");
+    throw new Error("MoonDesk requires Node.js 20.19 or newer so the native binary can be downloaded securely");
   }
 
   const binaryPath = path.join(installDir, targetInfo.executableName);

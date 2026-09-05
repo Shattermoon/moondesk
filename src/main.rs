@@ -1,5 +1,7 @@
 mod browser;
+mod browser_contract;
 mod browser_runtime;
+mod browser_transport;
 mod clippymoon_gen;
 mod command;
 mod command_jobs;

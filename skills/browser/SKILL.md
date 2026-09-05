@@ -25,7 +25,7 @@ Do not invoke `npx chrome-devtools-mcp` directly. MoonDesk pins and manages the 
 6. Use `view_page` for visual judgment. Accessibility/text snapshots are structural evidence, not a substitute for seeing the rendered page.
 7. Inspect console/network/performance data when it helps the task; do not collect large traces by default.
 
-The browser starts lazily on the first operation. Normal commands reuse the existing session. MoonDesk retries once when the browser connection itself has died; ordinary action errors such as a stale UID are returned without restarting the browser.
+The browser starts lazily on the first operation. Normal commands reuse the existing session. If the owned browser runtime is lost or a dispatched operation exceeds its deadline, MoonDesk invalidates that runtime before allowing another browser operation; the next call starts a fresh isolated session. MoonDesk does not automatically replay an ambiguous state-changing action, so navigate/select the target page and take a fresh snapshot after session loss.
 
 ## Local dev-server verification
 
@@ -75,7 +75,7 @@ Prefer the CLI for orchestration, but return to `view_page` whenever the task re
 ## Safety and lifecycle
 
 - Do not run browser lifecycle commands (`start`, `status`, `stop`) through MCP `browser_command` or `moondesk browser`; the running MoonDesk host owns that lifecycle.
-- `moondesk browser` is a lightweight localhost client to the running MoonDesk host. It does not own a separate browser daemon, so independent shell commands share the same agent-browser session as MCP.
+- `moondesk browser` is a lightweight localhost client to the running MoonDesk host. It does not own a separate browser process; independent shell commands share the same MoonDesk-owned agent-browser session as MCP.
 - ReadOnly mode permits inspection commands only; navigation, JavaScript execution, interaction, uploads, resizing, and other state-changing browser commands are blocked.
 - Treat `evaluate_script` as code execution in the currently selected page. Use it only when needed and keep the function narrowly scoped.
 - Browser file paths are local machine paths. Use verified workspace paths for uploads or file-producing commands.

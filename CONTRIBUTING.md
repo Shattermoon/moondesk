@@ -21,16 +21,16 @@ Never include a real MoonDesk workspace MCP URL, ngrok authtoken, npm credential
 MoonDesk currently requires:
 
 - Rust **1.88 or newer** (`edition = 2024`)
-- Node.js **18 or newer** for the npm wrapper/runtime
+- Node.js **20.19 or newer** for the npm wrapper/runtime
 - Git
 
-For the closest match to CI, use the current stable Rust toolchain with `rustfmt` and `clippy`. CI validates the npm runtime on both Node 18 and Node 24.
+For the closest match to CI, use the current stable Rust toolchain with `rustfmt` and `clippy`. CI validates the npm runtime on Node 20.19 and Node 24.
 
 Some optional integration tests require platform-specific software:
 
 - Windows tests may require PowerShell and standard developer tools.
 - Browser tests require a locally installed supported Chromium browser.
-- Browser control uses the pinned `chrome-devtools-mcp@1.7.0` CLI daemon through `npx`, but MoonDesk starts it lazily on the first browser operation rather than during host startup.
+- Browser control uses a pinned `chrome-devtools-mcp@1.7.0` stdio child owned directly by MoonDesk. MoonDesk starts it lazily on the first browser operation rather than during host startup and owns its complete process tree for deterministic shutdown/cancellation.
 - Running MoonDesk end-to-end through a public MCP endpoint requires ngrok configuration.
 
 ## Getting the repository running
@@ -89,13 +89,13 @@ If your change touches process execution, Windows environment handling, browser 
 
 ```bash
 cargo test --locked windows_developer_toolchain_smoke_uses_normal_host_environment -- --ignored
-cargo test --locked windows_browser_runtime_is_lazy_and_recovers_after_daemon_exit -- --ignored --test-threads 1
-cargo test --locked windows_browser_runtime_recovers_after_agent_browser_process_exit -- --ignored --test-threads 1
+cargo test --locked windows_owned_browser_runtime_is_lazy_and_recovers_after_child_exit -- --ignored --test-threads 1
+cargo test --locked windows_browser_timeout_cancels_dispatched_mutation -- --ignored --test-threads 1
 cargo test --locked windows_host_browser_cli_and_mcp_view_page_share_one_session -- --ignored --test-threads 1
 cargo test --locked windows_view_page_returns_native_mcp_image_content -- --ignored --test-threads 1
 ```
 
-The browser smokes verify that help/configuration does not launch Chrome, the namespaced daemon starts only on first use, every session uses an isolated non-personal browser profile, daemon/browser loss is recovered with the same safe runtime settings, separate `moondesk browser` requests share the host-owned session with MCP, responsive viewport emulation works, and `view_page` exercises the real rendered-pixel path. Do not weaken or delete environment-specific tests merely to make them run where their stated prerequisites are missing.
+The browser smokes verify that help/configuration does not launch Chrome, the MoonDesk-owned stdio runtime starts only on first use, every session uses an isolated non-personal browser profile, owned-child loss is recovered with a fresh safe session, a dispatched timed-out mutation cannot continue after MoonDesk returns, separate `moondesk browser` requests share the host-owned session with MCP, responsive viewport emulation works, and `view_page` exercises the real rendered-pixel path. Do not weaken or delete environment-specific tests merely to make them run where their stated prerequisites are missing.
 
 ## npm wrapper and distribution checks
 
@@ -167,7 +167,7 @@ A single MoonDesk host can serve multiple workspace endpoints. A change in one w
 - connection/runtime state;
 - normal per-workspace quotas/history.
 
-Browser control is intentionally shared by the host and should remain clearly distinguished from workspace-local state. Keep its MCP surface stable: browser availability or daemon state must not dynamically add/remove raw DevTools tool schemas.
+Browser control is intentionally shared by the host and should remain clearly distinguished from workspace-local state. Keep its MCP surface stable: browser availability or runtime state must not dynamically add/remove raw DevTools tool schemas.
 
 ### Process lifecycle
 

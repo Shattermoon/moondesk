@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
-use tokio::process::{Child, ChildStderr, ChildStdout, Command};
+use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 use tokio::time::{Duration, timeout};
 
 const READ_CHUNK_BYTES: usize = 8 * 1024;
@@ -45,6 +45,10 @@ pub struct SpawnedProcess {
 impl SpawnedProcess {
     pub fn pid(&self) -> Option<u32> {
         self.child.id()
+    }
+
+    pub fn take_stdin(&mut self) -> Option<ChildStdin> {
+        self.child.stdin.take()
     }
 
     pub fn take_stdout(&mut self) -> Option<ChildStdout> {
@@ -446,11 +450,9 @@ fn shell_command(command: &str) -> Command {
     }
 }
 
-fn spawn_shell_command_blocking(command: &str, cwd: &Path) -> io::Result<SpawnedProcess> {
-    let mut shell = shell_command(command);
-    shell
-        .current_dir(cwd)
-        .stdin(Stdio::null())
+fn spawn_owned_command_blocking(mut command: Command, stdin: Stdio) -> io::Result<SpawnedProcess> {
+    command
+        .stdin(stdin)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
@@ -458,17 +460,17 @@ fn spawn_shell_command_blocking(command: &str, cwd: &Path) -> io::Result<Spawned
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
-        shell.as_std_mut().process_group(0);
+        command.as_std_mut().process_group(0);
     }
 
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         use windows_sys::Win32::System::Threading::CREATE_SUSPENDED;
-        shell.as_std_mut().creation_flags(CREATE_SUSPENDED);
+        command.as_std_mut().creation_flags(CREATE_SUSPENDED);
     }
 
-    let mut child = shell.spawn()?;
+    let mut child = command.spawn()?;
     let Some(pid) = child.id() else {
         let _ = child.start_kill();
         return Err(io::Error::other(
@@ -512,6 +514,16 @@ fn spawn_shell_command_blocking(command: &str, cwd: &Path) -> io::Result<Spawned
         stderr,
         tree,
     })
+}
+
+pub fn spawn_owned_program(command: Command) -> io::Result<SpawnedProcess> {
+    spawn_owned_command_blocking(command, Stdio::piped())
+}
+
+fn spawn_shell_command_blocking(command: &str, cwd: &Path) -> io::Result<SpawnedProcess> {
+    let mut shell = shell_command(command);
+    shell.current_dir(cwd);
+    spawn_owned_command_blocking(shell, Stdio::null())
 }
 
 pub async fn spawn_shell_command(command: &str, cwd: &Path) -> io::Result<SpawnedProcess> {

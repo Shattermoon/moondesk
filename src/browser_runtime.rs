@@ -1,16 +1,22 @@
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration;
 
+use serde_json::Value;
 use tokio::process::Command;
 use tokio::sync::Mutex;
 
-use crate::command_jobs::process_is_live;
+pub use crate::browser_contract::canonical_browser_flag_name;
+use crate::browser_contract::{
+    BrowserOutputFormat, ParsedBrowserInvocation, parse_browser_cli_invocation,
+};
+use crate::browser_transport::{BrowserMcpTransport, BrowserTransportError};
 use crate::state::SharedState;
 
 // Keep this exact pin until MoonDesk's browser command contract is deliberately migrated and
-// re-tested. chrome-devtools-mcp 1.8.0 changed required CLI argument shapes (including commands
-// MoonDesk currently invokes with 1.7-style optional flags), so it is not a drop-in upgrade.
+// re-tested. The checked-in browser_contract_v1_7.json is generated from this exact package.
 pub const CHROME_DEVTOOLS_PACKAGE_VERSION: &str = "1.7.0";
 pub const DEFAULT_BROWSER_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
 pub const MAX_BROWSER_TIMEOUT_MS: u64 = 120_000;
@@ -19,9 +25,6 @@ pub const MAX_BROWSER_ARGS: usize = 64;
 pub const MAX_BROWSER_ARG_BYTES: usize = 8 * 1024;
 pub const MAX_BROWSER_CONTROL_BODY_BYTES: usize = 128 * 1024;
 const MAX_CAPTURED_OUTPUT_BYTES: usize = 256 * 1024;
-const BROWSER_STATUS_TIMEOUT: Duration = Duration::from_secs(20);
-const BROWSER_START_TIMEOUT: Duration = Duration::from_secs(60);
-const BROWSER_STOP_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[derive(Clone, Debug)]
 pub struct BrowserCommandOutput {
@@ -33,13 +36,10 @@ pub struct BrowserCommandOutput {
 
 impl BrowserCommandOutput {
     pub fn success(&self) -> bool {
-        self.exit_code == 0 && cli_tool_error_message(&self.stdout).is_none()
+        self.exit_code == 0
     }
 
     pub fn failure_details(&self) -> String {
-        if let Some(message) = cli_tool_error_message(&self.stdout) {
-            return message;
-        }
         [self.stdout.trim(), self.stderr.trim()]
             .into_iter()
             .filter(|value| !value.is_empty())
@@ -50,18 +50,17 @@ impl BrowserCommandOutput {
 
 #[derive(Default)]
 struct BrowserRuntimeState {
-    ready: bool,
-    owned_daemon_pid: Option<u32>,
+    transport: Option<Arc<BrowserMcpTransport>>,
+    has_started: bool,
 }
 
-/// Shared, lazy Chrome DevTools CLI runtime.
+/// Shared, lazy Chrome DevTools runtime owned directly by the MoonDesk host.
 ///
-/// Constructing this value never launches Chrome. The first browser operation checks for the
-/// namespaced Chrome DevTools daemon and starts one only when needed. Each daemon owns a temporary
-/// isolated agent-browser profile, and both MCP browser_command and view_page share that session.
+/// Constructing this value never launches Chromium. The first browser operation starts one pinned
+/// `chrome-devtools-mcp` stdio child in a MoonDesk-owned process tree. MCP `browser_command`,
+/// `view_page`, and the local `moondesk browser` client all share that same isolated session.
 pub struct BrowserRuntime {
     state: Option<SharedState>,
-    session_id: String,
     runtime: Mutex<BrowserRuntimeState>,
     operation: Mutex<()>,
 }
@@ -72,8 +71,7 @@ impl BrowserRuntime {
     }
 
     /// Create a runtime without TUI state for command-help and isolated integration tests.
-    /// Normal `moondesk browser` commands do not use this path: they are lightweight clients
-    /// to the running MoonDesk host so shell invocations cannot accidentally own browser state.
+    /// Normal `moondesk browser` actions are lightweight clients to the running MoonDesk host.
     pub fn standalone() -> Self {
         Self::with_optional_state(None)
     }
@@ -81,7 +79,6 @@ impl BrowserRuntime {
     fn with_optional_state(state: Option<SharedState>) -> Self {
         Self {
             state,
-            session_id: uuid::Uuid::new_v4().simple().to_string(),
             runtime: Mutex::new(BrowserRuntimeState::default()),
             operation: Mutex::new(()),
         }
@@ -137,420 +134,355 @@ impl BrowserRuntime {
         }
         if browser_service_command(command) {
             return Err(
-                "MoonDesk manages the browser daemon automatically; use a browser operation such as list_pages, new_page, take_snapshot, click, fill, resize_page, or evaluate_script instead"
+                "MoonDesk owns the browser lifecycle; use a browser operation such as list_pages, new_page, take_snapshot, click, fill, resize_page, or evaluate_script instead"
                     .to_string(),
             );
         }
         if timeout.is_zero() {
             return Err("Browser command timeout must be at least 1 ms".to_string());
         }
-
-        let started_at = tokio::time::Instant::now();
-        let deadline = started_at + timeout;
-        let result = tokio::time::timeout(
-            timeout,
-            self.run_with_deadline(workspace_root, command, args, deadline, managed_temp_output),
-        )
-        .await;
-        match result {
-            Ok(result) => result,
-            Err(_) => Err(format!(
-                "Browser command timed out after {} ms total",
-                timeout.as_millis()
-            )),
-        }
-    }
-
-    async fn run_with_deadline(
-        &self,
-        workspace_root: &str,
-        command: &str,
-        args: &[String],
-        deadline: tokio::time::Instant,
-        managed_temp_output: Option<&Path>,
-    ) -> Result<BrowserCommandOutput, String> {
         if args
             .iter()
             .any(|arg| matches!(arg.as_str(), "--help" | "-h"))
         {
-            let budget = remaining_timeout(deadline, DEFAULT_BROWSER_COMMAND_TIMEOUT)?;
-            return self.run_cli(workspace_root, command, args, budget).await;
+            return run_cli_help(workspace_root, command, args, timeout).await;
         }
 
-        let mut prepared = prepare_browser_invocation_with_managed_temp(
-            workspace_root,
-            command,
-            args,
-            managed_temp_output,
-        )?;
-
-        // Latest-snapshot UIDs and page state are shared. Keep browser operations ordered so
-        // simultaneous MCP/CLI requests cannot race the selected page or DOM. Waiting for this
-        // lock is part of the caller's total timeout budget.
-        let _operation = self.operation.lock().await;
-        self.ensure_started(workspace_root, deadline).await?;
-        let first_budget = remaining_timeout(deadline, DEFAULT_BROWSER_COMMAND_TIMEOUT)?;
-        let mut first = self
-            .run_cli(workspace_root, command, &prepared.args, first_budget)
-            .await?;
-        if first.success() {
-            prepared.commit_outputs()?;
-            prepared.rewrite_output_paths(&mut first);
-            return Ok(first);
-        }
-        if !browser_connectivity_failure(&first.stdout, &first.stderr) {
-            prepared.rewrite_output_paths(&mut first);
-            return Ok(first);
-        }
-
-        prepared.reset_outputs()?;
-        self.restart(workspace_root, deadline).await?;
-        let retry_budget = remaining_timeout(deadline, DEFAULT_BROWSER_COMMAND_TIMEOUT)?;
-        let mut retry = self
-            .run_cli(workspace_root, command, &prepared.args, retry_budget)
-            .await?;
-        retry.restarted = true;
-        if retry.success() {
-            prepared.commit_outputs()?;
-        }
-        prepared.rewrite_output_paths(&mut retry);
-        Ok(retry)
-    }
-
-    pub async fn stop_if_owned(&self, workspace_root: &str) {
-        let _operation = self.operation.lock().await;
-        let owned_pid = {
-            let mut runtime = self.runtime.lock().await;
-            runtime.ready = false;
-            runtime.owned_daemon_pid.take()
-        };
-        if let Some(state) = &self.state {
-            state.lock().await.browser_runtime_running = false;
-        }
-        let Some(owned_pid) = owned_pid else {
-            return;
-        };
-
-        // Never send `stop` unless the daemon currently occupying this runtime's private
-        // namespace is the exact process MoonDesk started. This prevents a stale ownership bit
-        // from terminating a replacement daemon after a crash/restart race.
-        if daemon_pid(&self.session_id) != Some(owned_pid) || !process_is_live(owned_pid) {
-            if let Some(state) = &self.state {
-                state.lock().await.log(
-                    "WARN",
-                    "MoonDesk browser daemon ownership changed before shutdown; leaving the unknown process untouched"
-                        .to_string(),
-                );
-            }
-            return;
-        }
-
-        if let Err(error) = self
-            .run_cli_raw(workspace_root, &["stop".to_string()], BROWSER_STOP_TIMEOUT)
+        let deadline = tokio::time::Instant::now() + timeout;
+        let prepare_workspace = workspace_root.to_string();
+        let prepare_command = command.to_string();
+        let prepare_args = args.to_vec();
+        let prepare_managed = managed_temp_output.map(Path::to_path_buf);
+        let prepare_task = tokio::task::spawn_blocking(move || {
+            prepare_browser_invocation_with_managed_temp_deadline(
+                &prepare_workspace,
+                &prepare_command,
+                &prepare_args,
+                prepare_managed.as_deref(),
+                Some(deadline),
+            )
+        });
+        let mut prepared = tokio::time::timeout_at(deadline, prepare_task)
             .await
-            && let Some(state) = &self.state
-        {
-            state.lock().await.log(
-                "WARN",
-                format!("Could not stop MoonDesk browser runtime: {error}"),
-            );
-        }
-    }
+            .map_err(|_| total_timeout_message(timeout))?
+            .map_err(|error| format!("Browser staging task failed: {error}"))??;
+        let parsed = parse_browser_cli_invocation(command, &prepared.args)?;
 
-    async fn ensure_started(
-        &self,
-        workspace_root: &str,
-        deadline: tokio::time::Instant,
-    ) -> Result<(), String> {
-        let mut runtime = self.runtime.lock().await;
-        if runtime.ready {
-            if runtime.owned_daemon_pid.is_some_and(|pid| {
-                daemon_pid(&self.session_id) == Some(pid) && process_is_live(pid)
-            }) {
-                return Ok(());
-            }
-            runtime.ready = false;
-            runtime.owned_daemon_pid = None;
-            if let Some(state) = &self.state {
-                let mut app = state.lock().await;
-                app.browser_runtime_running = false;
-                app.log(
-                    "WARN",
-                    "MoonDesk browser daemon exited or changed identity; starting a fresh private runtime before the next browser operation"
-                        .to_string(),
-                );
-            }
-        }
-
-        // A BrowserRuntime gets a cryptographically random upstream session namespace. Seeing a
-        // live daemon in that namespace without a matching owned PID is therefore an ownership
-        // violation, not something to adopt or terminate.
-        if let Some(pid) = daemon_pid(&self.session_id).filter(|pid| process_is_live(*pid)) {
-            return Err(format!(
-                "Browser runtime namespace is unexpectedly occupied by daemon pid {pid}; refusing to reuse or stop an unowned browser daemon"
-            ));
-        }
-
-        let status_budget = remaining_timeout(deadline, BROWSER_STATUS_TIMEOUT)?;
-        let status = self
-            .run_cli_raw(workspace_root, &["status".to_string()], status_budget)
-            .await?;
-        if status.exit_code == 0 && daemon_is_running(&status.stdout, &status.stderr) {
-            return Err(
-                "Browser runtime reported an unexpected daemon in MoonDesk's private session namespace; refusing unsafe reuse"
-                    .to_string(),
-            );
-        }
-
-        self.start_locked(workspace_root, &mut runtime, deadline)
+        // Page selection, snapshot UIDs, dialogs, and DevTools state are session-global. Queueing is
+        // part of the caller's total deadline, and timeout cleanup happens while this guard is held.
+        let _operation = tokio::time::timeout_at(deadline, self.operation.lock())
             .await
-    }
+            .map_err(|_| total_timeout_message(timeout))?;
+        if tokio::time::Instant::now() >= deadline {
+            return Err(total_timeout_message(timeout));
+        }
 
-    async fn restart(
-        &self,
-        workspace_root: &str,
-        deadline: tokio::time::Instant,
-    ) -> Result<(), String> {
-        let mut runtime = self.runtime.lock().await;
-        if let Some(owned_pid) = runtime.owned_daemon_pid
-            && daemon_pid(&self.session_id) == Some(owned_pid)
-            && process_is_live(owned_pid)
+        let (transport, restarted) = self.ensure_transport(workspace_root, deadline).await?;
+        let result = match transport
+            .call_tool(command, Value::Object(parsed.arguments.clone()), deadline)
+            .await
         {
-            let stop_budget = remaining_timeout(deadline, BROWSER_STOP_TIMEOUT)?;
-            let _ = self
-                .run_cli_raw(workspace_root, &["stop".to_string()], stop_budget)
-                .await;
-        }
-        runtime.ready = false;
-        runtime.owned_daemon_pid = None;
-        self.start_locked(workspace_root, &mut runtime, deadline)
-            .await?;
-        if let Some(state) = &self.state {
-            state.lock().await.log(
-                "INFO",
-                "Browser session was unavailable, so MoonDesk restarted its private runtime and will retry the request"
-                    .to_string(),
-            );
-        }
-        Ok(())
-    }
-
-    async fn start_locked(
-        &self,
-        workspace_root: &str,
-        runtime: &mut BrowserRuntimeState,
-        deadline: tokio::time::Instant,
-    ) -> Result<(), String> {
-        if let Some(pid) = daemon_pid(&self.session_id).filter(|pid| process_is_live(*pid)) {
-            return Err(format!(
-                "Browser runtime namespace is occupied by unowned daemon pid {pid}; refusing to restart over another process"
-            ));
-        }
-
-        // Prefer chrome-devtools-mcp's normal supported-browser resolution. MoonDesk never
-        // attaches to the user's everyday browser profile: every daemon starts an isolated
-        // temporary agent profile that is discarded when the browser session ends.
-        let start_args = self.start_args(None);
-        let start_budget = remaining_timeout(deadline, BROWSER_START_TIMEOUT)?;
-        let mut output = self
-            .run_cli_raw(workspace_root, &start_args, start_budget)
-            .await?;
-        let mut browser_name = "default Chromium browser".to_string();
-
-        // Some machines have Edge/Brave/etc. but no Chrome in the location upstream probes by
-        // default. Keep selection automatic: retry once with the first supported local Chromium
-        // executable instead of asking the user to choose and persist a browser.
-        if output.exit_code != 0
-            && let Some(fallback) = crate::browser::detect_browsers()
-                .into_iter()
-                .find(|browser| browser.mcp_supported)
-        {
-            let fallback_path = Path::new(&fallback.path);
-            if fallback_path.is_file() {
-                let fallback_args = self.start_args(Some(fallback_path));
-                let fallback_budget = remaining_timeout(deadline, BROWSER_START_TIMEOUT)?;
-                output = self
-                    .run_cli_raw(workspace_root, &fallback_args, fallback_budget)
-                    .await?;
-                browser_name = fallback.name;
-            }
-        }
-
-        if output.exit_code != 0 {
-            let details = [output.stdout.trim(), output.stderr.trim()]
-                .into_iter()
-                .filter(|value| !value.is_empty())
-                .collect::<Vec<_>>()
-                .join("\n");
-            return Err(if details.is_empty() {
-                "Could not start the isolated MoonDesk agent browser".to_string()
-            } else {
-                format!("Could not start the isolated MoonDesk agent browser: {details}")
-            });
-        }
-        let Some(owned_pid) = daemon_pid(&self.session_id).filter(|pid| process_is_live(*pid))
-        else {
-            return Err(
-                "Isolated MoonDesk agent browser started without a live owned daemon PID"
-                    .to_string(),
-            );
-        };
-        let status_budget = remaining_timeout(deadline, BROWSER_STATUS_TIMEOUT)?;
-        let status = self
-            .run_cli_raw(workspace_root, &["status".to_string()], status_budget)
-            .await?;
-        if !daemon_is_running(&status.stdout, &status.stderr)
-            || !self.daemon_status_matches_expected_configuration(&status.stdout)
-        {
-            // This PID is ours, so it is safe to tear it down if startup somehow produced a
-            // daemon with different settings. Never expose a non-isolated or otherwise stale
-            // runtime even transiently as MoonDesk-ready.
-            if daemon_pid(&self.session_id) == Some(owned_pid) && process_is_live(owned_pid) {
-                let stop_budget = remaining_timeout(deadline, BROWSER_STOP_TIMEOUT)?;
-                let _ = self
-                    .run_cli_raw(workspace_root, &["stop".to_string()], stop_budget)
+            Ok(result) => result,
+            Err(BrowserTransportError::Timeout) => {
+                self.invalidate_transport(&transport, "browser operation timed out")
                     .await;
+                return Err(total_timeout_message(timeout));
             }
-            return Err(
-                "Isolated MoonDesk agent browser did not start with the expected pinned safety configuration"
-                    .to_string(),
-            );
+            Err(BrowserTransportError::Disconnected(error)) => {
+                self.invalidate_transport(&transport, "browser runtime disconnected")
+                    .await;
+                return Err(format!(
+                    "Browser runtime was lost before the operation completed: {error}. The session was invalidated; retry from a fresh page/snapshot."
+                ));
+            }
+            Err(BrowserTransportError::Protocol(error)) => return Err(error),
+        };
+
+        let mut output = browser_output_from_result(result, parsed, restarted)?;
+        if output.success() {
+            if tokio::time::Instant::now() >= deadline {
+                self.invalidate_transport(&transport, "browser output deadline expired")
+                    .await;
+                return Err(total_timeout_message(timeout));
+            }
+            let commit_task = tokio::task::spawn_blocking(move || {
+                let result = prepared.commit_outputs(Some(deadline));
+                (prepared, result)
+            });
+            let (returned, commit_result) = commit_task
+                .await
+                .map_err(|error| format!("Browser output publication task failed: {error}"))?;
+            prepared = returned;
+            if let Err(error) = commit_result {
+                if browser_deadline_expired(Some(deadline)) {
+                    self.invalidate_transport(
+                        &transport,
+                        "browser output publication exceeded its deadline",
+                    )
+                    .await;
+                    return Err(total_timeout_message(timeout));
+                }
+                return Err(error);
+            }
         }
-        runtime.ready = true;
-        runtime.owned_daemon_pid = Some(owned_pid);
+        prepared.rewrite_output_paths(&mut output);
+        Ok(output)
+    }
+
+    async fn ensure_transport(
+        &self,
+        workspace_root: &str,
+        deadline: tokio::time::Instant,
+    ) -> Result<(Arc<BrowserMcpTransport>, bool), String> {
+        let (stale, has_started) = {
+            let mut runtime = self.runtime.lock().await;
+            if let Some(transport) = runtime.transport.as_ref()
+                && transport.is_alive()
+            {
+                return Ok((transport.clone(), false));
+            }
+            (runtime.transport.take(), runtime.has_started)
+        };
+        if let Some(stale) = stale {
+            stale.shutdown().await;
+        }
+
+        let (server_args, browser_name) = browser_server_args();
+        let transport = BrowserMcpTransport::start(
+            workspace_root,
+            CHROME_DEVTOOLS_PACKAGE_VERSION,
+            &server_args,
+            self.state.clone(),
+            deadline,
+        )
+        .await
+        .map_err(|error| match error {
+            BrowserTransportError::Timeout => {
+                "Browser runtime startup exhausted the caller's total timeout".to_string()
+            }
+            other => format!("Could not start isolated MoonDesk browser runtime: {other}"),
+        })?;
+
+        {
+            let mut runtime = self.runtime.lock().await;
+            runtime.transport = Some(transport.clone());
+            runtime.has_started = true;
+        }
         if let Some(state) = &self.state {
             let mut app = state.lock().await;
             app.browser_runtime_running = true;
             app.log(
                 "INFO",
-                format!("Isolated agent browser started lazily with {browser_name}"),
+                format!("Isolated agent browser runtime started lazily with {browser_name}"),
             );
         }
-        Ok(())
+        Ok((transport, has_started))
     }
 
-    fn start_args(&self, executable: Option<&Path>) -> Vec<String> {
-        let mut args = vec![
-            "start".to_string(),
-            "--headless=false".to_string(),
-            "--isolated=true".to_string(),
-            "--screenshotFormat=jpeg".to_string(),
-            "--screenshotQuality=82".to_string(),
-            "--screenshotMaxWidth=1920".to_string(),
-            "--screenshotMaxHeight=4096".to_string(),
-            "--usageStatistics=false".to_string(),
-            "--performanceCrux=false".to_string(),
-            "--redactNetworkHeaders=true".to_string(),
-            "--allowUnrestrictedPaths=false".to_string(),
-        ];
-        if let Some(path) = executable.filter(|path| path.is_file()) {
-            args.push(format!("--executablePath={}", path.display()));
-        }
-        args
-    }
-
-    fn daemon_status_matches_expected_configuration(&self, stdout: &str) -> bool {
-        let expected_version = format!("version={CHROME_DEVTOOLS_PACKAGE_VERSION}");
-        if !stdout
-            .split_whitespace()
-            .any(|token| token == expected_version)
-        {
-            return false;
-        }
-        let Some(args) = daemon_status_args(stdout) else {
-            return false;
+    async fn invalidate_transport(&self, expected: &Arc<BrowserMcpTransport>, reason: &str) {
+        let transport = {
+            let mut runtime = self.runtime.lock().await;
+            let matches = runtime
+                .transport
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, expected));
+            matches.then(|| runtime.transport.take()).flatten()
         };
-
-        for required in [
-            "--no-headless",
-            "--isolated",
-            "--screenshot-format=jpeg",
-            "--screenshot-quality=82",
-            "--screenshot-max-width=1920",
-            "--screenshot-max-height=4096",
-            "--no-usage-statistics",
-            "--no-performance-crux",
-            "--redact-network-headers",
-            "--no-allow-unrestricted-paths",
-        ] {
-            if !args.iter().any(|arg| arg == required) {
-                return false;
-            }
+        if let Some(transport) = transport {
+            transport.shutdown().await;
         }
-        if args.iter().any(|arg| arg.starts_with("--user-data-dir=")) {
-            return false;
+        if let Some(state) = &self.state {
+            let mut app = state.lock().await;
+            app.browser_runtime_running = false;
+            app.log(
+                "WARN",
+                format!("MoonDesk invalidated the owned browser runtime: {reason}"),
+            );
         }
-
-        let Some(actual_executable) = daemon_arg_value(&args, "--executable-path=") else {
-            return true;
-        };
-        crate::browser::detect_browsers()
-            .into_iter()
-            .any(|browser| {
-                browser.mcp_supported && Path::new(&browser.path) == Path::new(actual_executable)
-            })
     }
 
-    async fn run_cli(
-        &self,
-        workspace_root: &str,
-        command: &str,
-        args: &[String],
-        timeout: Duration,
-    ) -> Result<BrowserCommandOutput, String> {
-        let mut cli_args = Vec::with_capacity(args.len() + 1);
-        cli_args.push(command.to_string());
-        cli_args.extend(args.iter().cloned());
-        self.run_cli_raw(workspace_root, &cli_args, timeout).await
-    }
-
-    async fn run_cli_raw(
-        &self,
-        workspace_root: &str,
-        cli_args: &[String],
-        timeout: Duration,
-    ) -> Result<BrowserCommandOutput, String> {
-        let package = format!("chrome-devtools-mcp@{CHROME_DEVTOOLS_PACKAGE_VERSION}");
-        let mut command = Command::new(npx_program());
-        command
-            .args(["-y", "-p", package.as_str(), "chrome-devtools"])
-            .args(cli_args)
-            .arg(format!("--sessionId={}", self.session_id))
-            .env("CHROME_DEVTOOLS_MCP_NO_UPDATE_CHECKS", "1")
-            .current_dir(workspace_root)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-
-        let output = tokio::time::timeout(timeout, command.output())
-            .await
-            .map_err(|_| {
-                format!(
-                    "Browser command timed out after {} seconds",
-                    timeout.as_secs()
-                )
-            })?
-            .map_err(|error| format!("Failed to run chrome-devtools CLI: {error}"))?;
-
-        Ok(BrowserCommandOutput {
-            stdout: bounded_output(&output.stdout),
-            stderr: bounded_output(&output.stderr),
-            exit_code: output.status.code().unwrap_or(-1),
-            restarted: false,
-        })
+    pub async fn stop_if_owned(&self, _workspace_root: &str) {
+        let _operation = self.operation.lock().await;
+        let transport = self.runtime.lock().await.transport.take();
+        if let Some(transport) = transport {
+            transport.shutdown().await;
+        }
+        if let Some(state) = &self.state {
+            state.lock().await.browser_runtime_running = false;
+        }
     }
 }
 
-fn remaining_timeout(
-    deadline: tokio::time::Instant,
-    per_step_cap: Duration,
-) -> Result<Duration, String> {
-    let now = tokio::time::Instant::now();
-    if now >= deadline {
-        return Err("Browser command total timeout budget was exhausted".to_string());
+fn browser_server_args() -> (Vec<String>, String) {
+    let mut args = vec![
+        "--headless=false".to_string(),
+        "--isolated=true".to_string(),
+        "--screenshotFormat=jpeg".to_string(),
+        "--screenshotQuality=82".to_string(),
+        "--screenshotMaxWidth=1920".to_string(),
+        "--screenshotMaxHeight=4096".to_string(),
+        "--usageStatistics=false".to_string(),
+        "--performanceCrux=false".to_string(),
+        "--redactNetworkHeaders=true".to_string(),
+        "--allowUnrestrictedPaths=false".to_string(),
+        "--viaCli=true".to_string(),
+        "--experimentalStructuredContent=true".to_string(),
+    ];
+    let mut browser_name = "default Chromium browser".to_string();
+    if let Some(browser) = crate::browser::detect_browsers()
+        .into_iter()
+        .find(|browser| browser.mcp_supported && Path::new(&browser.path).is_file())
+    {
+        args.push(format!("--executablePath={}", browser.path));
+        browser_name = browser.name;
     }
-    Ok((deadline - now).min(per_step_cap))
+    (args, browser_name)
+}
+
+fn browser_output_from_result(
+    result: Value,
+    parsed: ParsedBrowserInvocation,
+    restarted: bool,
+) -> Result<BrowserCommandOutput, String> {
+    use base64::Engine as _;
+
+    let is_error = result.get("isError").and_then(Value::as_bool) == Some(true);
+    let stdout = if is_error {
+        serde_json::to_string(result.get("content").unwrap_or(&Value::Null))
+            .map_err(|error| format!("Could not encode browser tool error: {error}"))?
+    } else {
+        let mut chunks = Vec::new();
+        let mut images = Vec::new();
+        for item in result
+            .get("content")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            match item.get("type").and_then(Value::as_str) {
+                Some("text") => {
+                    if let Some(text) = item.get("text").and_then(Value::as_str) {
+                        chunks.push(text.to_string());
+                    }
+                }
+                Some("image") => {
+                    let data = item.get("data").and_then(Value::as_str).ok_or_else(|| {
+                        "Browser image response did not contain base64 data".to_string()
+                    })?;
+                    let mime_type = item
+                        .get("mimeType")
+                        .and_then(Value::as_str)
+                        .unwrap_or("image/png");
+                    let extension = match mime_type {
+                        "image/jpeg" | "image/jpg" => "jpeg",
+                        "image/webp" => "webp",
+                        _ => "png",
+                    };
+                    let bytes = base64::engine::general_purpose::STANDARD
+                        .decode(data)
+                        .map_err(|error| {
+                            format!("Could not decode browser image response: {error}")
+                        })?;
+                    let path = std::env::temp_dir().join(format!(
+                        "moondesk-browser-image-{}.{}",
+                        uuid::Uuid::new_v4().simple(),
+                        extension
+                    ));
+                    std::fs::write(&path, bytes).map_err(|error| {
+                        format!(
+                            "Could not write browser image response to {}: {error}",
+                            path.display()
+                        )
+                    })?;
+                    images.push(serde_json::json!({
+                        "filePath": path.to_string_lossy(),
+                        "mimeType": mime_type,
+                    }));
+                    chunks.push(format!("Saved to {}.", path.display()));
+                }
+                Some(other) => {
+                    return Err(format!(
+                        "Unsupported browser response content type '{other}'"
+                    ));
+                }
+                None => {}
+            }
+        }
+
+        match parsed.output_format {
+            BrowserOutputFormat::Json => {
+                if let Some(structured) = result.get("structuredContent").and_then(Value::as_object)
+                {
+                    let mut structured = structured.clone();
+                    if !images.is_empty() {
+                        structured.insert("images".to_string(), Value::Array(images));
+                    }
+                    serde_json::to_string(&Value::Object(structured))
+                        .map_err(|error| format!("Could not encode browser JSON output: {error}"))?
+                } else {
+                    serde_json::to_string(&chunks)
+                        .map_err(|error| format!("Could not encode browser JSON output: {error}"))?
+                }
+            }
+            BrowserOutputFormat::Markdown => chunks.join(" "),
+        }
+    };
+
+    Ok(BrowserCommandOutput {
+        stdout: bounded_text(&stdout),
+        stderr: String::new(),
+        exit_code: if is_error { 1 } else { 0 },
+        restarted,
+    })
+}
+
+fn total_timeout_message(timeout: Duration) -> String {
+    format!(
+        "Browser command timed out after {} ms total; the owned browser runtime was invalidated before serialization was released",
+        timeout.as_millis()
+    )
+}
+
+async fn run_cli_help(
+    workspace_root: &str,
+    command_name: &str,
+    args: &[String],
+    timeout: Duration,
+) -> Result<BrowserCommandOutput, String> {
+    let package = format!("chrome-devtools-mcp@{CHROME_DEVTOOLS_PACKAGE_VERSION}");
+    let mut command = Command::new(npx_program());
+    command
+        .args(["-y", "-p", package.as_str(), "chrome-devtools"])
+        .arg(command_name)
+        .args(args)
+        .env("CHROME_DEVTOOLS_MCP_NO_UPDATE_CHECKS", "1")
+        .current_dir(workspace_root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let output = tokio::time::timeout(timeout, command.output())
+        .await
+        .map_err(|_| format!("Browser help timed out after {} ms", timeout.as_millis()))?
+        .map_err(|error| format!("Failed to run pinned browser help: {error}"))?;
+    Ok(BrowserCommandOutput {
+        stdout: bounded_output(&output.stdout),
+        stderr: bounded_output(&output.stderr),
+        exit_code: output.status.code().unwrap_or(-1),
+        restarted: false,
+    })
+}
+
+fn npx_program() -> &'static str {
+    if cfg!(windows) { "npx.cmd" } else { "npx" }
+}
+
+fn bounded_text(text: &str) -> String {
+    bounded_output(text.as_bytes())
+}
+
+pub fn browser_service_command(command: &str) -> bool {
+    matches!(command.trim(), "start" | "status" | "stop")
 }
 
 pub fn validate_browser_request_bounds(
@@ -631,35 +563,7 @@ struct PreparedBrowserInvocation {
 }
 
 impl PreparedBrowserInvocation {
-    fn reset_outputs(&self) -> Result<(), String> {
-        for output in &self.outputs {
-            if output.stage_dir.exists() {
-                std::fs::remove_dir_all(&output.stage_dir).map_err(|error| {
-                    format!(
-                        "Could not reset temporary browser output staging directory {}: {error}",
-                        output.stage_dir.display()
-                    )
-                })?;
-            }
-            std::fs::create_dir_all(&output.stage_dir).map_err(|error| {
-                format!(
-                    "Could not recreate temporary browser output staging directory {}: {error}",
-                    output.stage_dir.display()
-                )
-            })?;
-            if matches!(output.kind, BrowserPathKind::OutputDirectory) {
-                std::fs::create_dir_all(&output.staged_requested_path).map_err(|error| {
-                    format!(
-                        "Could not recreate temporary browser output directory {}: {error}",
-                        output.staged_requested_path.display()
-                    )
-                })?;
-            }
-        }
-        Ok(())
-    }
-
-    fn commit_outputs(&mut self) -> Result<(), String> {
+    fn commit_outputs(&mut self, deadline: Option<tokio::time::Instant>) -> Result<(), String> {
         let outputs = self.outputs.clone();
         for output in outputs {
             match output.kind {
@@ -670,13 +574,7 @@ impl PreparedBrowserInvocation {
                         &output,
                         &actual_staged,
                     )?;
-                    std::fs::copy(&actual_staged, &actual_destination).map_err(|error| {
-                        format!(
-                            "Could not copy browser output from {} to {}: {error}",
-                            actual_staged.display(),
-                            actual_destination.display()
-                        )
-                    })?;
+                    publish_browser_output_file(&actual_staged, &actual_destination, deadline)?;
                     self.rewrites.push(BrowserPathRewrite {
                         staged: actual_staged,
                         visible: actual_destination,
@@ -704,6 +602,7 @@ impl PreparedBrowserInvocation {
                         &output.staged_requested_path,
                         &destination,
                         &self.workspace_root,
+                        deadline,
                     )?;
                     self.rewrites.push(BrowserPathRewrite {
                         staged: output.staged_requested_path,
@@ -728,20 +627,6 @@ impl PreparedBrowserInvocation {
             output.stderr = output.stderr.replace(staged.as_ref(), visible.as_ref());
         }
     }
-}
-
-pub(crate) fn canonical_browser_flag_name(raw: &str) -> Option<String> {
-    let flag = raw.strip_prefix('-')?.trim_start_matches('-');
-    if flag.is_empty() {
-        return None;
-    }
-    let flag = flag.split_once('=').map_or(flag, |(name, _)| name);
-    Some(
-        flag.chars()
-            .filter(|ch| !matches!(ch, '-' | '_'))
-            .flat_map(char::to_lowercase)
-            .collect(),
-    )
 }
 
 fn browser_path_flag_kind(command: &str, flag: &str) -> Option<BrowserPathKind> {
@@ -963,10 +848,143 @@ fn ensure_browser_staging_root(staging_root: &mut BrowserStagingRoot) -> Result<
     Ok(root)
 }
 
+fn browser_deadline_expired(deadline: Option<tokio::time::Instant>) -> bool {
+    deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+}
+
+fn ensure_browser_deadline(deadline: Option<tokio::time::Instant>) -> Result<(), String> {
+    if browser_deadline_expired(deadline) {
+        return Err("Browser command total timeout budget was exhausted during filesystem staging/publication".to_string());
+    }
+    Ok(())
+}
+
+fn copy_browser_file_with_deadline(
+    source: &Path,
+    destination: &Path,
+    deadline: Option<tokio::time::Instant>,
+) -> Result<(), String> {
+    ensure_browser_deadline(deadline)?;
+    let mut input = std::fs::File::open(source)
+        .map_err(|error| format!("Could not open browser file {}: {error}", source.display()))?;
+    let mut output = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(destination)
+        .map_err(|error| {
+            format!(
+                "Could not create browser file copy destination {}: {error}",
+                destination.display()
+            )
+        })?;
+    let mut buffer = vec![0u8; 256 * 1024];
+    loop {
+        ensure_browser_deadline(deadline)?;
+        let read = input.read(&mut buffer).map_err(|error| {
+            format!("Could not read browser file {}: {error}", source.display())
+        })?;
+        if read == 0 {
+            break;
+        }
+        ensure_browser_deadline(deadline)?;
+        output.write_all(&buffer[..read]).map_err(|error| {
+            format!(
+                "Could not write browser file copy {}: {error}",
+                destination.display()
+            )
+        })?;
+    }
+    output.flush().map_err(|error| {
+        format!(
+            "Could not flush browser file copy {}: {error}",
+            destination.display()
+        )
+    })?;
+    if let Ok(permissions) = std::fs::metadata(source).map(|metadata| metadata.permissions()) {
+        let _ = std::fs::set_permissions(destination, permissions);
+    }
+    ensure_browser_deadline(deadline)
+}
+
+#[cfg(not(windows))]
+fn replace_browser_output_file(temp_path: &Path, destination: &Path) -> std::io::Result<()> {
+    std::fs::rename(temp_path, destination)
+}
+
+#[cfg(windows)]
+fn replace_browser_output_file(temp_path: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+
+    let temp_wide = temp_path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let destination_wide = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let result = unsafe {
+        MoveFileExW(
+            temp_wide.as_ptr(),
+            destination_wide.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if result == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+fn publish_browser_output_file(
+    source: &Path,
+    destination: &Path,
+    deadline: Option<tokio::time::Instant>,
+) -> Result<(), String> {
+    ensure_browser_deadline(deadline)?;
+    let parent = destination.parent().ok_or_else(|| {
+        format!(
+            "Browser output path has no parent: {}",
+            destination.display()
+        )
+    })?;
+    let name = destination
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("output");
+    let temp_path = parent.join(format!(
+        ".{name}.moondesk-{}.tmp",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let result = (|| {
+        copy_browser_file_with_deadline(source, &temp_path, deadline)?;
+        ensure_browser_deadline(deadline)?;
+        replace_browser_output_file(&temp_path, destination).map_err(|error| {
+            format!(
+                "Could not publish browser output to {}: {error}",
+                destination.display()
+            )
+        })?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp_path);
+    }
+    result
+}
+
 fn copy_directory_tree_strict(
     source: &Path,
     destination: &Path,
     workspace_root: &Path,
+    deadline: Option<tokio::time::Instant>,
 ) -> Result<(), String> {
     fn copy_one(
         source: &Path,
@@ -974,7 +992,9 @@ fn copy_directory_tree_strict(
         workspace_root: &Path,
         source_root: &Path,
         visited: &mut std::collections::HashSet<PathBuf>,
+        deadline: Option<tokio::time::Instant>,
     ) -> Result<(), String> {
+        ensure_browser_deadline(deadline)?;
         let metadata = std::fs::symlink_metadata(source).map_err(|error| {
             format!(
                 "Could not inspect staged browser input {}: {error}",
@@ -1028,6 +1048,7 @@ fn copy_directory_tree_strict(
                     workspace_root,
                     source_root,
                     visited,
+                    deadline,
                 )?;
             }
             visited.remove(&canonical);
@@ -1039,13 +1060,12 @@ fn copy_directory_tree_strict(
                 source.display()
             ));
         }
-        std::fs::copy(source, destination).map_err(|error| {
+        copy_browser_file_with_deadline(source, destination, deadline).map_err(|error| {
             format!(
                 "Could not stage browser input file {}: {error}",
                 source.display()
             )
-        })?;
-        Ok(())
+        })
     }
 
     let source_root = source.to_path_buf();
@@ -1056,6 +1076,7 @@ fn copy_directory_tree_strict(
         workspace_root,
         &source_root,
         &mut visited,
+        deadline,
     )
 }
 
@@ -1063,7 +1084,9 @@ fn copy_directory_contents_strict(
     source: &Path,
     destination: &Path,
     workspace_root: &Path,
+    deadline: Option<tokio::time::Instant>,
 ) -> Result<(), String> {
+    ensure_browser_deadline(deadline)?;
     for entry in std::fs::read_dir(source).map_err(|error| {
         format!(
             "Could not read staged browser output directory {}: {error}",
@@ -1098,20 +1121,14 @@ fn copy_directory_contents_strict(
                     validated.display()
                 )
             })?;
-            copy_directory_contents_strict(&source_path, &validated, workspace_root)?;
+            copy_directory_contents_strict(&source_path, &validated, workspace_root, deadline)?;
         } else if metadata.is_file() {
             let validated = validate_workspace_output_destination(
                 workspace_root,
                 &destination_path,
                 BrowserPathKind::OutputFile,
             )?;
-            std::fs::copy(&source_path, &validated).map_err(|error| {
-                format!(
-                    "Could not copy browser output from {} to {}: {error}",
-                    source_path.display(),
-                    validated.display()
-                )
-            })?;
+            publish_browser_output_file(&source_path, &validated, deadline)?;
         } else {
             return Err(format!(
                 "Browser output contained an unsupported filesystem entry: {}",
@@ -1202,7 +1219,9 @@ fn stage_browser_path(
     raw_path: &str,
     kind: BrowserPathKind,
     stager: &mut BrowserPathStager<'_>,
+    deadline: Option<tokio::time::Instant>,
 ) -> Result<PathBuf, String> {
+    ensure_browser_deadline(deadline)?;
     if command == "screencast_start" && matches!(kind, BrowserPathKind::OutputFile) {
         return Err(
             "MoonDesk does not accept an explicit screencast output path because the pinned browser runtime keeps that file open until a later screencast_stop command"
@@ -1240,9 +1259,9 @@ fn stage_browser_path(
             })?;
             let staged = stage_dir.join(name);
             if matches!(kind, BrowserPathKind::InputDirectory) {
-                copy_directory_tree_strict(&source, &staged, workspace_root)?;
+                copy_directory_tree_strict(&source, &staged, workspace_root, deadline)?;
             } else {
-                std::fs::copy(&source, &staged).map_err(|error| {
+                copy_browser_file_with_deadline(&source, &staged, deadline).map_err(|error| {
                     format!(
                         "Could not stage browser input file {}: {error}",
                         source.display()
@@ -1302,12 +1321,30 @@ fn prepare_browser_invocation(
     prepare_browser_invocation_with_managed_temp(workspace_root, command, args, None)
 }
 
+#[cfg(test)]
 fn prepare_browser_invocation_with_managed_temp(
     workspace_root: &str,
     command: &str,
     args: &[String],
     managed_temp_output: Option<&Path>,
 ) -> Result<PreparedBrowserInvocation, String> {
+    prepare_browser_invocation_with_managed_temp_deadline(
+        workspace_root,
+        command,
+        args,
+        managed_temp_output,
+        None,
+    )
+}
+
+fn prepare_browser_invocation_with_managed_temp_deadline(
+    workspace_root: &str,
+    command: &str,
+    args: &[String],
+    managed_temp_output: Option<&Path>,
+    deadline: Option<tokio::time::Instant>,
+) -> Result<PreparedBrowserInvocation, String> {
+    ensure_browser_deadline(deadline)?;
     let workspace_root =
         crate::workspaces::canonicalize_existing_workspace_root(Path::new(workspace_root))?;
     let mut prepared = args.to_vec();
@@ -1322,7 +1359,14 @@ fn prepare_browser_invocation_with_managed_temp(
                 "Browser command '{command}' requires its path argument in the pinned v{CHROME_DEVTOOLS_PACKAGE_VERSION} positional form"
             ));
         }
-        let staged = stage_browser_path(&workspace_root, command, &value, kind, &mut stager)?;
+        let staged = stage_browser_path(
+            &workspace_root,
+            command,
+            &value,
+            kind,
+            &mut stager,
+            deadline,
+        )?;
         prepared[index] = staged.to_string_lossy().into_owned();
     }
 
@@ -1349,8 +1393,14 @@ fn prepare_browser_invocation_with_managed_temp(
                 ));
             }
             if let Some((prefix, raw_value)) = arg.split_once('=') {
-                let staged =
-                    stage_browser_path(&workspace_root, command, raw_value, kind, &mut stager)?;
+                let staged = stage_browser_path(
+                    &workspace_root,
+                    command,
+                    raw_value,
+                    kind,
+                    &mut stager,
+                    deadline,
+                )?;
                 prepared[index] = format!("{prefix}={}", staged.to_string_lossy());
             } else {
                 let value_index = index + 1;
@@ -1360,8 +1410,14 @@ fn prepare_browser_invocation_with_managed_temp(
                 if raw_value.starts_with('-') {
                     return Err(format!("Browser path flag '{arg}' requires a path value"));
                 }
-                let staged =
-                    stage_browser_path(&workspace_root, command, &raw_value, kind, &mut stager)?;
+                let staged = stage_browser_path(
+                    &workspace_root,
+                    command,
+                    &raw_value,
+                    kind,
+                    &mut stager,
+                    deadline,
+                )?;
                 prepared[value_index] = staged.to_string_lossy().into_owned();
                 index += 1;
             }
@@ -1380,112 +1436,6 @@ fn prepare_browser_invocation_with_managed_temp(
         outputs: stager.outputs,
         rewrites: stager.rewrites,
     })
-}
-
-fn daemon_pid_file_path(session_id: &str) -> PathBuf {
-    let app_name = format!("chrome-devtools-mcp-{session_id}");
-
-    #[cfg(windows)]
-    {
-        std::env::temp_dir().join(app_name).join("daemon.pid")
-    }
-
-    #[cfg(unix)]
-    {
-        if let Some(runtime_dir) =
-            std::env::var_os("XDG_RUNTIME_DIR").filter(|value| !value.is_empty())
-        {
-            return PathBuf::from(runtime_dir).join(app_name).join("daemon.pid");
-        }
-        let uid = unsafe { libc::geteuid() };
-        PathBuf::from("/tmp")
-            .join(format!("{app_name}-{uid}"))
-            .join("daemon.pid")
-    }
-}
-
-fn daemon_pid(session_id: &str) -> Option<u32> {
-    std::fs::read_to_string(daemon_pid_file_path(session_id))
-        .ok()
-        .and_then(|value| value.trim().parse::<u32>().ok())
-}
-
-#[cfg(test)]
-#[cfg(windows)]
-fn daemon_process_is_alive(session_id: &str) -> bool {
-    daemon_pid(session_id).is_some_and(process_is_live)
-}
-
-fn daemon_status_args(stdout: &str) -> Option<Vec<String>> {
-    let encoded = stdout
-        .lines()
-        .find_map(|line| line.trim().strip_prefix("args="))?;
-    serde_json::from_str(encoded).ok()
-}
-
-fn daemon_arg_value<'a>(args: &'a [String], prefix: &str) -> Option<&'a str> {
-    args.iter().find_map(|arg| arg.strip_prefix(prefix))
-}
-
-fn npx_program() -> &'static str {
-    if cfg!(windows) { "npx.cmd" } else { "npx" }
-}
-
-pub fn browser_service_command(command: &str) -> bool {
-    matches!(command.trim(), "start" | "status" | "stop")
-}
-
-pub fn daemon_is_running(stdout: &str, stderr: &str) -> bool {
-    let combined = format!("{stdout}\n{stderr}").to_ascii_lowercase();
-    combined.contains("daemon is running") && !combined.contains("is not running")
-}
-
-fn cli_tool_error_message(stdout: &str) -> Option<String> {
-    // Pinned chrome-devtools-mcp 1.7.0 has an important CLI quirk: a daemon-level
-    // `success: true` can wrap an MCP CallToolResult with `isError: true`, and the CLI still exits
-    // 0. Its handleResponse() preserves that distinction by serializing error `content` as an
-    // array of MCP content objects, while successful markdown output is emitted as plain text.
-    // Detect the structured content envelope itself instead of relying on an "Error:" prefix.
-    let content = serde_json::from_str::<Vec<serde_json::Value>>(stdout.trim()).ok()?;
-    if content.is_empty()
-        || !content.iter().all(|item| {
-            matches!(
-                item.get("type").and_then(serde_json::Value::as_str),
-                Some("text" | "image")
-            )
-        })
-    {
-        return None;
-    }
-
-    let messages = content
-        .iter()
-        .filter_map(|item| item.get("text").and_then(serde_json::Value::as_str))
-        .collect::<Vec<_>>();
-    Some(if messages.is_empty() {
-        "Chrome DevTools reported a browser tool error".to_string()
-    } else {
-        messages.join("\n")
-    })
-}
-
-pub fn browser_connectivity_failure(stdout: &str, stderr: &str) -> bool {
-    let combined = format!("{stdout}\n{stderr}").to_ascii_lowercase();
-    [
-        "could not connect to chrome",
-        "failed to fetch browser websocket",
-        "browser has disconnected",
-        "browser is not connected",
-        "target closed",
-        "connection refused",
-        "econnrefused",
-        "socket hang up",
-        "socket closed",
-        "daemon is not running",
-        "chrome is not running",
-    ]
-    .iter()
-    .any(|needle| combined.contains(needle))
 }
 
 fn bounded_output(bytes: &[u8]) -> String {
@@ -1517,153 +1467,143 @@ mod tests {
     }
 
     #[test]
-    fn running_status_does_not_match_not_running_status() {
-        assert!(daemon_is_running(
-            "chrome-devtools-mcp daemon is running.",
-            ""
-        ));
-        assert!(!daemon_is_running(
-            "chrome-devtools-mcp daemon is not running.",
-            ""
-        ));
-    }
-
-    #[test]
-    fn zero_exit_cli_tool_errors_are_not_reported_as_success() {
-        let output = BrowserCommandOutput {
-            stdout: r#"[{"type":"text","text":"Error: Element uid \"99_99\" not found."}]"#
-                .to_string(),
-            stderr: String::new(),
-            exit_code: 0,
-            restarted: false,
+    fn mcp_tool_error_signal_controls_browser_command_success() {
+        let parsed = ParsedBrowserInvocation {
+            arguments: serde_json::Map::new(),
+            output_format: BrowserOutputFormat::Markdown,
         };
-        assert!(!output.success());
-        assert!(
-            cli_tool_error_message(&output.stdout)
-                .is_some_and(|message| message.contains("Element uid"))
-        );
+        let failure = browser_output_from_result(
+            serde_json::json!({
+                "isError": true,
+                "content": [{"type": "text", "text": "Element uid 99_99 was not found"}]
+            }),
+            parsed.clone(),
+            false,
+        )
+        .expect("format tool error");
+        assert!(!failure.success());
+        assert!(failure.failure_details().contains("Element uid 99_99"));
 
-        let non_prefixed_tool_error = BrowserCommandOutput {
-            stdout: r#"[{"type":"text","text":"Element uid 99_99 was not found"}]"#.to_string(),
-            stderr: String::new(),
-            exit_code: 0,
-            restarted: false,
-        };
-        assert!(!non_prefixed_tool_error.success());
-        assert!(
-            non_prefixed_tool_error
-                .failure_details()
-                .contains("Element uid 99_99")
-        );
-
-        let legitimate_output = BrowserCommandOutput {
-            stdout: "ordinary evaluate_script value".to_string(),
-            stderr: String::new(),
-            exit_code: 0,
-            restarted: false,
-        };
-        assert!(legitimate_output.success());
-
-        let json_mode_success = BrowserCommandOutput {
-            stdout: r#"["ordinary evaluate_script value"]"#.to_string(),
-            stderr: String::new(),
-            exit_code: 0,
-            restarted: false,
-        };
-        assert!(json_mode_success.success());
+        let success = browser_output_from_result(
+            serde_json::json!({
+                "isError": false,
+                "content": [{"type": "text", "text": "ordinary evaluate_script value"}]
+            }),
+            parsed,
+            false,
+        )
+        .expect("format tool success");
+        assert!(success.success());
     }
 
     #[test]
-    fn connectivity_failures_are_narrow_enough_for_retry() {
-        assert!(browser_connectivity_failure(
-            "",
-            "Could not connect to Chrome. Failed to fetch browser WebSocket URL"
-        ));
-        assert!(!browser_connectivity_failure(
-            "",
-            "No element with uid 4_12 exists in the latest snapshot"
-        ));
+    fn browser_cli_response_rendering_matches_pinned_upstream_contract() {
+        let json_output = browser_output_from_result(
+            serde_json::json!({
+                "isError": false,
+                "content": [{"type": "text", "text": "fallback"}],
+                "structuredContent": {"pages": [{"id": 1}]}
+            }),
+            ParsedBrowserInvocation {
+                arguments: serde_json::Map::new(),
+                output_format: BrowserOutputFormat::Json,
+            },
+            false,
+        )
+        .expect("format structured JSON browser result");
+        let decoded: Value = serde_json::from_str(&json_output.stdout).expect("decode JSON output");
+        assert_eq!(
+            decoded.pointer("/pages/0/id").and_then(Value::as_i64),
+            Some(1)
+        );
+        assert!(decoded.get("content").is_none());
+
+        let markdown = browser_output_from_result(
+            serde_json::json!({
+                "isError": false,
+                "content": [
+                    {"type": "text", "text": "first"},
+                    {"type": "text", "text": "second"}
+                ]
+            }),
+            ParsedBrowserInvocation {
+                arguments: serde_json::Map::new(),
+                output_format: BrowserOutputFormat::Markdown,
+            },
+            false,
+        )
+        .expect("format markdown browser result");
+        assert_eq!(markdown.stdout, "first second");
+
+        let error = browser_output_from_result(
+            serde_json::json!({
+                "isError": true,
+                "content": [{"type": "text", "text": "failed"}]
+            }),
+            ParsedBrowserInvocation {
+                arguments: serde_json::Map::new(),
+                output_format: BrowserOutputFormat::Markdown,
+            },
+            false,
+        )
+        .expect("format browser tool error");
+        assert!(!error.success());
+        let decoded_error: Value =
+            serde_json::from_str(&error.stdout).expect("decode serialized error content");
+        assert_eq!(
+            decoded_error.pointer("/0/text").and_then(Value::as_str),
+            Some("failed")
+        );
+
+        let image = browser_output_from_result(
+            serde_json::json!({
+                "isError": false,
+                "content": [{
+                    "type": "image",
+                    "data": "aGVsbG8=",
+                    "mimeType": "image/png"
+                }]
+            }),
+            ParsedBrowserInvocation {
+                arguments: serde_json::Map::new(),
+                output_format: BrowserOutputFormat::Markdown,
+            },
+            false,
+        )
+        .expect("materialize browser image response");
+        let path = image
+            .stdout
+            .strip_prefix("Saved to ")
+            .and_then(|value| value.strip_suffix('.'))
+            .map(PathBuf::from)
+            .expect("browser image output path");
+        assert_eq!(
+            std::fs::read(&path).expect("read browser image output"),
+            b"hello"
+        );
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
-    fn start_args_use_a_clean_isolated_agent_profile_and_redact_sensitive_network_headers() {
-        let runtime = BrowserRuntime::standalone();
-        let args = runtime.start_args(None);
-        assert!(args.iter().any(|arg| arg == "--headless=false"));
-        assert!(args.iter().any(|arg| arg == "--isolated=true"));
-        assert!(!args.iter().any(|arg| arg.starts_with("--userDataDir=")));
-        assert!(!args.iter().any(|arg| arg.starts_with("--executablePath=")));
-        assert!(args.iter().any(|arg| arg == "--usageStatistics=false"));
-        assert!(args.iter().any(|arg| arg == "--performanceCrux=false"));
-        assert!(args.iter().any(|arg| arg == "--redactNetworkHeaders=true"));
-        assert!(
-            args.iter()
-                .any(|arg| arg == "--allowUnrestrictedPaths=false")
-        );
-    }
-
-    #[test]
-    fn daemon_status_reuse_requires_the_pinned_safe_isolated_configuration() {
-        let runtime = BrowserRuntime::standalone();
-        let args = vec![
-            "--no-headless".to_string(),
-            "--isolated".to_string(),
-            "--screenshot-format=jpeg".to_string(),
-            "--screenshot-quality=82".to_string(),
-            "--screenshot-max-width=1920".to_string(),
-            "--screenshot-max-height=4096".to_string(),
-            "--no-usage-statistics".to_string(),
-            "--no-performance-crux".to_string(),
-            "--redact-network-headers".to_string(),
-            "--no-allow-unrestricted-paths".to_string(),
-            "--viaCli".to_string(),
-            "--experimentalStructuredContent".to_string(),
-        ];
-        let status = format!(
-            "chrome-devtools-mcp daemon is running.\npid=42 version={}\nargs={}",
-            CHROME_DEVTOOLS_PACKAGE_VERSION,
-            serde_json::to_string(&args).expect("serialize daemon args")
-        );
-        assert!(runtime.daemon_status_matches_expected_configuration(&status));
-
-        let unsafe_headers = status.replace("\"--redact-network-headers\",", "");
-        assert!(!runtime.daemon_status_matches_expected_configuration(&unsafe_headers));
-        let stale_path_mode = status.replace(
-            "\"--no-allow-unrestricted-paths\",",
-            "\"--allow-unrestricted-paths\",",
-        );
-        assert!(!runtime.daemon_status_matches_expected_configuration(&stale_path_mode));
-        let persistent_profile = status.replace(
-            "\"--isolated\",",
-            "\"--isolated\",\"--user-data-dir=C:/Users/example/profile\",",
-        );
-        assert!(!runtime.daemon_status_matches_expected_configuration(&persistent_profile));
-        let wrong_version = status.replace(
-            &format!("version={CHROME_DEVTOOLS_PACKAGE_VERSION}"),
-            "version=999.0.0",
-        );
-        assert!(!runtime.daemon_status_matches_expected_configuration(&wrong_version));
-    }
-
-    #[test]
-    fn daemon_session_is_private_per_runtime_and_uses_upstream_valid_id_shape() {
-        let first = BrowserRuntime::standalone();
-        let second = BrowserRuntime::standalone();
-        assert_ne!(first.session_id, second.session_id);
-        for runtime in [&first, &second] {
-            assert!(!runtime.session_id.is_empty());
-            assert!(
-                runtime
-                    .session_id
-                    .chars()
-                    .all(|ch| ch.is_ascii_hexdigit() || ch == '-')
-            );
-            assert!(
-                daemon_pid_file_path(&runtime.session_id)
-                    .to_string_lossy()
-                    .contains(&runtime.session_id)
-            );
+    fn browser_server_args_enforce_isolated_safe_runtime() {
+        let (args, _browser_name) = browser_server_args();
+        for expected in [
+            "--headless=false",
+            "--isolated=true",
+            "--screenshotFormat=jpeg",
+            "--screenshotQuality=82",
+            "--screenshotMaxWidth=1920",
+            "--screenshotMaxHeight=4096",
+            "--usageStatistics=false",
+            "--performanceCrux=false",
+            "--redactNetworkHeaders=true",
+            "--allowUnrestrictedPaths=false",
+            "--viaCli=true",
+            "--experimentalStructuredContent=true",
+        ] {
+            assert!(args.iter().any(|arg| arg == expected), "missing {expected}");
         }
+        assert!(!args.iter().any(|arg| arg.starts_with("--userDataDir=")));
     }
 
     #[test]
@@ -1717,7 +1657,9 @@ mod tests {
         assert!(path_within(&std::env::temp_dir(), &staged_output));
         assert!(!path_within(&workspace, &staged_output));
         std::fs::write(&staged_output, b"fake-png").expect("simulate browser screenshot output");
-        screenshot.commit_outputs().expect("copy screenshot back");
+        screenshot
+            .commit_outputs(None)
+            .expect("copy screenshot back");
         assert_eq!(
             std::fs::read(workspace.join("reports/shot.png")).expect("read copied screenshot"),
             b"fake-png"
@@ -1796,7 +1738,7 @@ mod tests {
         let staged_txt = output_stage.stage_dir.join("snapshot.txt");
         std::fs::write(&staged_txt, b"snapshot").expect("simulate upstream extension change");
         snapshot
-            .commit_outputs()
+            .commit_outputs(None)
             .expect("copy normalized snapshot output");
         assert_eq!(
             std::fs::read(workspace.join("reports/snapshot.txt"))
@@ -1867,6 +1809,59 @@ mod tests {
     }
 
     #[test]
+    fn expired_deadline_never_publishes_browser_output() {
+        let workspace = std::env::temp_dir().join(format!(
+            "moondesk-browser-publish-deadline-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workspace).expect("create publish workspace");
+        let source = workspace.join("source.txt");
+        let destination = workspace.join("destination.txt");
+        std::fs::write(&source, b"new output").expect("write staged output fixture");
+        std::fs::write(&destination, b"original output").expect("write destination fixture");
+
+        let expired = tokio::time::Instant::now() - Duration::from_millis(1);
+        let error = publish_browser_output_file(&source, &destination, Some(expired))
+            .expect_err("expired publication must fail before replacing destination");
+        assert!(error.contains("timeout budget was exhausted"), "{error}");
+        assert_eq!(
+            std::fs::read(&destination).expect("read untouched destination"),
+            b"original output"
+        );
+        let leaked_temps = std::fs::read_dir(&workspace)
+            .expect("list publish workspace")
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".moondesk-"))
+            .count();
+        assert_eq!(leaked_temps, 0);
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn expired_deadline_stops_workspace_input_staging_before_copy() {
+        let workspace = std::env::temp_dir().join(format!(
+            "moondesk-browser-stage-deadline-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workspace).expect("create staging workspace");
+        std::fs::write(workspace.join("upload.txt"), b"upload").expect("write upload fixture");
+        let expired = tokio::time::Instant::now() - Duration::from_millis(1);
+        let result = prepare_browser_invocation_with_managed_temp_deadline(
+            &workspace.to_string_lossy(),
+            "upload_file",
+            &["1_2".to_string(), "upload.txt".to_string()],
+            None,
+            Some(expired),
+        );
+        assert!(
+            result
+                .expect_err("expired staging must fail")
+                .contains("timeout budget was exhausted")
+        );
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
     fn browser_request_bounds_are_shared_and_strict() {
         assert!(validate_browser_request_bounds("list_pages", &[], 1).is_ok());
         assert!(validate_browser_request_bounds("list_pages", &[], MAX_BROWSER_TIMEOUT_MS).is_ok());
@@ -1913,330 +1908,249 @@ mod tests {
             "queued timeout took too long: {elapsed:?}"
         );
         assert!(
-            daemon_pid(&runtime.session_id).is_none(),
-            "a timed-out queued request must not start a daemon later"
+            runtime.runtime.lock().await.transport.is_none(),
+            "a timed-out queued request must not start a browser runtime later"
         );
         drop(guard);
         let _ = std::fs::remove_dir_all(workspace);
     }
 
     #[cfg(windows)]
-    fn windows_browser_descendant(root_pid: u32) -> Option<(u32, String)> {
-        use std::collections::{HashMap, VecDeque};
-        use std::mem::{size_of, zeroed};
-        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
-        use windows_sys::Win32::System::Diagnostics::ToolHelp::{
-            CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
-            TH32CS_SNAPPROCESS,
-        };
-
-        unsafe {
-            let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-            if snapshot == INVALID_HANDLE_VALUE {
-                return None;
-            }
-            let mut entry: PROCESSENTRY32W = zeroed();
-            entry.dwSize = size_of::<PROCESSENTRY32W>() as u32;
-            let mut found = Process32FirstW(snapshot, &mut entry) != 0;
-            let mut children: HashMap<u32, Vec<(u32, String)>> = HashMap::new();
-            while found {
-                let end = entry
-                    .szExeFile
-                    .iter()
-                    .position(|value| *value == 0)
-                    .unwrap_or(entry.szExeFile.len());
-                let name = String::from_utf16_lossy(&entry.szExeFile[..end]);
-                children
-                    .entry(entry.th32ParentProcessID)
-                    .or_default()
-                    .push((entry.th32ProcessID, name));
-                found = Process32NextW(snapshot, &mut entry) != 0;
-            }
-            CloseHandle(snapshot);
-
-            let mut queue = VecDeque::from([root_pid]);
-            while let Some(parent) = queue.pop_front() {
-                if let Some(descendants) = children.get(&parent) {
-                    for (pid, name) in descendants {
-                        let lower = name.to_ascii_lowercase();
-                        if matches!(
-                            lower.as_str(),
-                            "chrome.exe"
-                                | "msedge.exe"
-                                | "brave.exe"
-                                | "vivaldi.exe"
-                                | "opera.exe"
-                                | "chromium.exe"
-                        ) {
-                            return Some((*pid, name.clone()));
-                        }
-                        queue.push_back(*pid);
-                    }
-                }
-            }
-            None
-        }
-    }
-
-    #[cfg(windows)]
-    fn windows_terminate_process(pid: u32) -> Result<(), String> {
-        use windows_sys::Win32::Foundation::CloseHandle;
-        use windows_sys::Win32::System::Threading::{
-            OpenProcess, PROCESS_TERMINATE, TerminateProcess,
-        };
-
-        unsafe {
-            let process = OpenProcess(PROCESS_TERMINATE, 0, pid);
-            if process.is_null() {
-                return Err(format!(
-                    "OpenProcess(PROCESS_TERMINATE) failed for browser pid {pid}: {}",
-                    std::io::Error::last_os_error()
-                ));
-            }
-            let terminated = TerminateProcess(process, 91) != 0;
-            let error = (!terminated).then(std::io::Error::last_os_error);
-            CloseHandle(process);
-            match error {
-                Some(error) => Err(format!(
-                    "TerminateProcess failed for browser pid {pid}: {error}"
-                )),
-                None => Ok(()),
-            }
-        }
-    }
-
-    #[cfg(windows)]
     #[tokio::test]
-    #[ignore = "serialized Windows lazy browser lifecycle smoke"]
-    async fn windows_browser_runtime_is_lazy_and_recovers_after_daemon_exit() {
-        let workspace_root = std::env::temp_dir().join(format!(
-            "moondesk-browser-runtime-smoke-{}",
+    #[ignore = "serialized Windows owned browser lifecycle smoke"]
+    async fn windows_owned_browser_runtime_is_lazy_and_recovers_after_child_exit() {
+        let workspace = std::env::temp_dir().join(format!(
+            "moondesk-owned-browser-lifecycle-{}",
             uuid::Uuid::new_v4()
         ));
-        std::fs::create_dir_all(&workspace_root).expect("create browser runtime smoke workspace");
-        let workspace_root_str = workspace_root.to_string_lossy().into_owned();
+        std::fs::create_dir_all(&workspace).expect("create lifecycle workspace");
+        let workspace_str = workspace.to_string_lossy().into_owned();
         let runtime = BrowserRuntime::standalone();
-
-        let _ = runtime
-            .run_cli_raw(
-                &workspace_root_str,
-                &["stop".to_string()],
-                Duration::from_secs(20),
-            )
-            .await;
-        assert!(!daemon_process_is_alive(&runtime.session_id));
 
         let help = runtime
             .run(
-                &workspace_root_str,
+                &workspace_str,
                 "list_pages",
                 &["--help".to_string()],
                 Duration::from_secs(30),
             )
             .await
-            .expect("browser help should run without starting the daemon");
-        assert!(help.success());
+            .expect("browser help should remain host-independent");
+        assert!(help.success(), "browser help failed: {help:?}");
         assert!(
-            !daemon_process_is_alive(&runtime.session_id),
-            "browser help must not launch Chrome or the daemon"
+            runtime.runtime.lock().await.transport.is_none(),
+            "command help must not start the owned browser runtime"
         );
 
         let first = runtime
             .run(
-                &workspace_root_str,
+                &workspace_str,
                 "list_pages",
                 &[],
                 DEFAULT_BROWSER_COMMAND_TIMEOUT,
             )
             .await
-            .expect("first browser command should lazily start the daemon");
+            .expect("first browser operation should start the owned runtime");
         assert!(first.success(), "first list_pages failed: {first:?}");
-        assert!(daemon_process_is_alive(&runtime.session_id));
-        let first_daemon_pid = daemon_pid(&runtime.session_id).expect("first private daemon pid");
+        let first_transport = runtime
+            .runtime
+            .lock()
+            .await
+            .transport
+            .clone()
+            .expect("first transport");
+        let first_pid = first_transport.pid().await.expect("first transport pid");
+        assert!(first_transport.is_alive());
 
-        // A second MoonDesk host/runtime under the same OS user must get a separate upstream
-        // namespace. Stopping it must not affect the first runtime.
         let second_runtime = BrowserRuntime::standalone();
         let second = second_runtime
             .run(
-                &workspace_root_str,
+                &workspace_str,
                 "list_pages",
                 &[],
                 DEFAULT_BROWSER_COMMAND_TIMEOUT,
             )
             .await
-            .expect("second runtime should start independently");
+            .expect("second host-style runtime should start independently");
         assert!(second.success(), "second list_pages failed: {second:?}");
-        let second_daemon_pid =
-            daemon_pid(&second_runtime.session_id).expect("second private daemon pid");
-        assert_ne!(first_daemon_pid, second_daemon_pid);
-        second_runtime.stop_if_owned(&workspace_root_str).await;
-        assert!(!daemon_process_is_alive(&second_runtime.session_id));
+        let second_transport = second_runtime
+            .runtime
+            .lock()
+            .await
+            .transport
+            .clone()
+            .expect("second transport");
+        let second_pid = second_transport.pid().await.expect("second transport pid");
+        assert_ne!(first_pid, second_pid);
+
+        second_runtime.stop_if_owned(&workspace_str).await;
+        assert!(!second_transport.is_alive());
         assert!(
-            daemon_process_is_alive(&runtime.session_id),
-            "stopping a second MoonDesk runtime must not stop the first daemon"
+            first_transport.is_alive(),
+            "stopping an independent runtime must not stop the first runtime"
         );
 
-        runtime
-            .run_cli_raw(
-                &workspace_root_str,
-                &["stop".to_string()],
-                Duration::from_secs(20),
-            )
-            .await
-            .expect("stop browser daemon during recovery smoke");
-        assert!(!daemon_process_is_alive(&runtime.session_id));
-
+        // Simulate the exact owned MCP child disappearing. There is no detached daemon/session
+        // namespace to recover: the next operation must replace the dead child, never replay the
+        // previous operation, and continue with a new isolated browser session.
+        first_transport.shutdown().await;
+        assert!(!first_transport.is_alive());
         let recovered = runtime
             .run(
-                &workspace_root_str,
+                &workspace_str,
                 "list_pages",
                 &[],
                 DEFAULT_BROWSER_COMMAND_TIMEOUT,
             )
             .await
-            .expect("browser runtime should recover before the CLI can auto-start defaults");
+            .expect("dead owned child should be replaced before the next operation");
         assert!(
             recovered.success(),
             "recovered list_pages failed: {recovered:?}"
         );
-        assert!(daemon_process_is_alive(&runtime.session_id));
-
-        let status = runtime
-            .run_cli_raw(
-                &workspace_root_str,
-                &["status".to_string()],
-                Duration::from_secs(20),
-            )
+        assert!(
+            recovered.restarted,
+            "replacement should be reported as a restart"
+        );
+        let replacement = runtime
+            .runtime
+            .lock()
             .await
-            .expect("read recovered browser daemon status");
-        assert!(runtime.daemon_status_matches_expected_configuration(&status.stdout));
+            .transport
+            .clone()
+            .expect("replacement transport");
+        let replacement_pid = replacement.pid().await.expect("replacement pid");
+        assert_ne!(replacement_pid, first_pid);
 
-        runtime.stop_if_owned(&workspace_root_str).await;
-        assert!(!daemon_process_is_alive(&runtime.session_id));
-        let _ = std::fs::remove_dir_all(workspace_root);
+        runtime.stop_if_owned(&workspace_str).await;
+        assert!(!replacement.is_alive());
+        let _ = std::fs::remove_dir_all(workspace);
     }
 
     #[cfg(windows)]
     #[tokio::test]
-    #[ignore = "serialized Windows agent-browser process recovery smoke"]
-    async fn windows_browser_runtime_recovers_after_agent_browser_process_exit() {
-        let workspace_root = std::env::temp_dir().join(format!(
-            "moondesk-browser-process-exit-smoke-{}",
+    #[ignore = "serialized Windows dispatched-timeout cancellation smoke"]
+    async fn windows_browser_timeout_cancels_dispatched_mutation() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let workspace = std::env::temp_dir().join(format!(
+            "moondesk-browser-timeout-cancel-{}",
             uuid::Uuid::new_v4()
         ));
-        std::fs::create_dir_all(&workspace_root)
-            .expect("create browser process-exit smoke workspace");
-        let workspace_root_str = workspace_root.to_string_lossy().into_owned();
+        std::fs::create_dir_all(&workspace).expect("create timeout-cancel workspace");
+        let workspace_str = workspace.to_string_lossy().into_owned();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind timeout side-effect server");
+        let address = listener.local_addr().expect("side-effect server address");
+        let started = Arc::new(AtomicBool::new(false));
+        let late = Arc::new(AtomicBool::new(false));
+        let started_server = started.clone();
+        let late_server = late.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut request = vec![0u8; 8192];
+                let Ok(read) = socket.read(&mut request).await else {
+                    continue;
+                };
+                let request = String::from_utf8_lossy(&request[..read]);
+                let first_line = request.lines().next().unwrap_or_default();
+                if first_line.contains(" /started ") {
+                    started_server.store(true, Ordering::Release);
+                }
+                if first_line.contains(" /late ") {
+                    late_server.store(true, Ordering::Release);
+                }
+                let body = if first_line.contains(" /page ") {
+                    "<!doctype html><title>timeout probe</title><body>ready</body>"
+                } else {
+                    "ok"
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+
         let runtime = BrowserRuntime::standalone();
-
-        let _ = runtime
-            .run_cli_raw(
-                &workspace_root_str,
-                &["stop".to_string()],
-                Duration::from_secs(20),
-            )
-            .await;
-
-        let first = runtime
+        let page_url = format!("http://{address}/page");
+        let navigate = runtime
             .run(
-                &workspace_root_str,
-                "list_pages",
-                &[],
+                &workspace_str,
+                "navigate_page",
+                &[format!("--url={page_url}")],
                 DEFAULT_BROWSER_COMMAND_TIMEOUT,
             )
             .await
-            .expect("first browser command should lazily start the isolated agent browser");
-        assert!(first.success(), "first list_pages failed: {first:?}");
+            .expect("warm owned runtime and navigate to probe page");
+        assert!(navigate.success(), "probe navigation failed: {navigate:?}");
+        let timed_out_transport = runtime
+            .runtime
+            .lock()
+            .await
+            .transport
+            .clone()
+            .expect("warm transport");
 
-        let daemon_pid = std::fs::read_to_string(daemon_pid_file_path(&runtime.session_id))
-            .expect("read namespaced daemon pid")
-            .trim()
-            .parse::<u32>()
-            .expect("parse namespaced daemon pid");
+        let script = "async () => { await fetch('/started', {method:'POST'}); await new Promise(resolve => setTimeout(resolve, 1500)); await fetch('/late', {method:'POST'}); return 'late mutation completed'; }";
+        let error = runtime
+            .run(
+                &workspace_str,
+                "evaluate_script",
+                &[script.to_string()],
+                Duration::from_millis(500),
+            )
+            .await
+            .expect_err("dispatched delayed mutation must hit MoonDesk's deadline");
+        assert!(error.contains("timed out after 500 ms total"), "{error}");
         assert!(
-            process_is_live(daemon_pid),
-            "MoonDesk browser daemon is not alive"
-        );
-
-        let (browser_pid, browser_name) = (0..40)
-            .find_map(|_| {
-                let found = windows_browser_descendant(daemon_pid);
-                if found.is_none() {
-                    std::thread::sleep(Duration::from_millis(100));
-                }
-                found
-            })
-            .expect("find isolated agent-browser descendant of MoonDesk daemon");
-        assert_ne!(browser_pid, daemon_pid);
-        windows_terminate_process(browser_pid).unwrap_or_else(|error| {
-            panic!("terminate isolated {browser_name} pid {browser_pid}: {error}")
-        });
-
-        for _ in 0..50 {
-            if !process_is_live(browser_pid) {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-        assert!(
-            !process_is_live(browser_pid),
-            "isolated agent-browser process {browser_pid} did not exit"
+            started.load(Ordering::Acquire),
+            "the regression must prove the tool was dispatched before timeout"
         );
         assert!(
-            process_is_live(daemon_pid),
-            "terminating the agent browser unexpectedly killed the namespaced DevTools daemon"
+            runtime.runtime.lock().await.transport.is_none(),
+            "timeout must invalidate ownership before returning"
+        );
+        assert!(
+            !timed_out_transport.is_alive(),
+            "timed-out transport must be terminated before serialization is released"
+        );
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(
+            !late.load(Ordering::Acquire),
+            "timed-out browser JavaScript continued mutating after MoonDesk returned"
         );
 
         let recovered = runtime
             .run(
-                &workspace_root_str,
+                &workspace_str,
                 "list_pages",
                 &[],
                 DEFAULT_BROWSER_COMMAND_TIMEOUT,
             )
             .await
-            .expect("MoonDesk should recover when the isolated agent browser is closed");
+            .expect("next operation should start a fresh runtime after timeout invalidation");
         assert!(
             recovered.success(),
-            "list_pages after browser-process exit failed: {recovered:?}"
+            "fresh runtime list_pages failed: {recovered:?}"
         );
-        // chrome-devtools-mcp may recreate its isolated browser inside the still-running daemon,
-        // in which case MoonDesk correctly leaves `restarted=false`. The invariant is that the
-        // next operation succeeds with a replacement isolated browser, not that the daemon must
-        // be restarted unnecessarily.
-        assert!(daemon_process_is_alive(&runtime.session_id));
+        assert!(recovered.restarted);
 
-        let recovered_daemon_pid =
-            std::fs::read_to_string(daemon_pid_file_path(&runtime.session_id))
-                .expect("read recovered namespaced daemon pid")
-                .trim()
-                .parse::<u32>()
-                .expect("parse recovered namespaced daemon pid");
-        let (recovered_browser_pid, _) = (0..40)
-            .find_map(|_| {
-                let found = windows_browser_descendant(recovered_daemon_pid);
-                if found.is_none() {
-                    std::thread::sleep(Duration::from_millis(100));
-                }
-                found
-            })
-            .expect("find replacement isolated agent-browser process");
-        assert_ne!(recovered_browser_pid, browser_pid);
-
-        let status = runtime
-            .run_cli_raw(
-                &workspace_root_str,
-                &["status".to_string()],
-                Duration::from_secs(20),
-            )
-            .await
-            .expect("read recovered browser daemon status");
-        assert!(runtime.daemon_status_matches_expected_configuration(&status.stdout));
-
-        runtime.stop_if_owned(&workspace_root_str).await;
-        assert!(!daemon_process_is_alive(&runtime.session_id));
-        let _ = std::fs::remove_dir_all(workspace_root);
+        runtime.stop_if_owned(&workspace_str).await;
+        server.abort();
+        let _ = server.await;
+        let _ = std::fs::remove_dir_all(workspace);
     }
 
     #[test]

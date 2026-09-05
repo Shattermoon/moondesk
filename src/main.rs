@@ -2183,7 +2183,7 @@ async fn run_app(
         .as_ref()
         .is_some_and(ngrok::StartFailure::is_authentication)
     {
-        let continue_run = run_ngrok_auth_setup(
+        let continue_run = match run_ngrok_auth_setup(
             terminal,
             state.clone(),
             Some(
@@ -2191,7 +2191,16 @@ async fn run_app(
                     .into(),
             ),
         )
-        .await?;
+        .await
+        {
+            Ok(continue_run) => continue_run,
+            Err(error) => {
+                if let Some(runtime) = services.browser_runtime.take() {
+                    runtime.stop_if_owned(&browser_workspace_root).await;
+                }
+                return Err(error);
+            }
+        };
         if !continue_run {
             if let Some(runtime) = services.browser_runtime.take() {
                 runtime.stop_if_owned(&browser_workspace_root).await;

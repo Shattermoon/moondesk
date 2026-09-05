@@ -347,6 +347,7 @@ fn browser_output_from_result(
     use base64::Engine as _;
 
     let is_error = result.get("isError").and_then(Value::as_bool) == Some(true);
+    let output_format = parsed.output_format;
     let stdout = if is_error {
         serde_json::to_string(result.get("content").unwrap_or(&Value::Null))
             .map_err(|error| format!("Could not encode browser tool error: {error}"))?
@@ -420,7 +421,7 @@ fn browser_output_from_result(
             }
         }
 
-        match parsed.output_format {
+        match output_format {
             BrowserOutputFormat::Json => {
                 if let Some(structured) = result.get("structuredContent").and_then(Value::as_object)
                 {
@@ -440,7 +441,10 @@ fn browser_output_from_result(
     };
 
     Ok(BrowserCommandOutput {
-        stdout: bounded_text(&stdout),
+        stdout: match output_format {
+            BrowserOutputFormat::Json => bounded_json_text(&stdout),
+            BrowserOutputFormat::Markdown => bounded_text(&stdout),
+        },
         stderr: String::new(),
         exit_code: if is_error { 1 } else { 0 },
         restarted,
@@ -490,6 +494,21 @@ fn npx_program() -> &'static str {
 
 fn bounded_text(text: &str) -> String {
     bounded_output(text.as_bytes())
+}
+
+fn bounded_json_text(text: &str) -> String {
+    if text.len() <= MAX_CAPTURED_OUTPUT_BYTES {
+        return text.to_string();
+    }
+    serde_json::json!({
+        "_moondesk": {
+            "truncated": true,
+            "originalBytes": text.len(),
+            "limitBytes": MAX_CAPTURED_OUTPUT_BYTES,
+            "message": "Inline browser JSON exceeded MoonDesk's output limit; use command-specific pagination or a file-output option for the full result"
+        }
+    })
+    .to_string()
 }
 
 pub fn browser_service_command(command: &str) -> bool {
@@ -841,6 +860,20 @@ fn validate_workspace_output_destination(
     Ok(canonical_parent.join(name))
 }
 
+fn create_private_browser_directory(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        let mut builder = std::fs::DirBuilder::new();
+        builder.mode(0o700);
+        builder.create(path)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::DirBuilder::new().create(path)
+    }
+}
+
 fn ensure_browser_staging_root(staging_root: &mut BrowserStagingRoot) -> Result<PathBuf, String> {
     if let Some(root) = staging_root.path.as_ref() {
         return Ok(root.clone());
@@ -849,7 +882,7 @@ fn ensure_browser_staging_root(staging_root: &mut BrowserStagingRoot) -> Result<
         "moondesk-browser-files-{}",
         uuid::Uuid::new_v4().simple()
     ));
-    std::fs::create_dir(&root).map_err(|error| {
+    create_private_browser_directory(&root).map_err(|error| {
         format!(
             "Could not create temporary browser file staging directory {}: {error}",
             root.display()
@@ -878,17 +911,19 @@ fn copy_browser_file_with_deadline(
     ensure_browser_deadline(deadline)?;
     let mut input = std::fs::File::open(source)
         .map_err(|error| format!("Could not open browser file {}: {error}", source.display()))?;
-    let mut output = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(destination)
-        .map_err(|error| {
-            format!(
-                "Could not create browser file copy destination {}: {error}",
-                destination.display()
-            )
-        })?;
+    let mut options = std::fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut output = options.open(destination).map_err(|error| {
+        format!(
+            "Could not create browser file copy destination {}: {error}",
+            destination.display()
+        )
+    })?;
     let mut buffer = vec![0u8; 256 * 1024];
     loop {
         ensure_browser_deadline(deadline)?;
@@ -1038,7 +1073,7 @@ fn copy_directory_tree_strict(
                     source.display()
                 ));
             }
-            std::fs::create_dir_all(destination).map_err(|error| {
+            create_private_browser_directory(destination).map_err(|error| {
                 format!(
                     "Could not create staged browser input directory {}: {error}",
                     destination.display()
@@ -1262,7 +1297,7 @@ fn stage_browser_path(
             let current_slot = stager.slot;
             stager.slot += 1;
             let stage_dir = root.join(format!("input-{current_slot}"));
-            std::fs::create_dir(&stage_dir).map_err(|error| {
+            create_private_browser_directory(&stage_dir).map_err(|error| {
                 format!("Could not create browser input staging directory: {error}")
             })?;
             let name = source.file_name().ok_or_else(|| {
@@ -1293,7 +1328,7 @@ fn stage_browser_path(
             let current_slot = stager.slot;
             stager.slot += 1;
             let stage_dir = root.join(format!("output-{current_slot}"));
-            std::fs::create_dir(&stage_dir).map_err(|error| {
+            create_private_browser_directory(&stage_dir).map_err(|error| {
                 format!("Could not create browser output staging directory: {error}")
             })?;
             let name = destination.file_name().ok_or_else(|| {
@@ -1304,7 +1339,7 @@ fn stage_browser_path(
             })?;
             let staged_requested_path = stage_dir.join(name);
             if matches!(kind, BrowserPathKind::OutputDirectory) {
-                std::fs::create_dir(&staged_requested_path).map_err(|error| {
+                create_private_browser_directory(&staged_requested_path).map_err(|error| {
                     format!("Could not create staged browser output directory: {error}")
                 })?;
             }
@@ -1528,6 +1563,34 @@ mod tests {
             Some(1)
         );
         assert!(decoded.get("content").is_none());
+
+        let oversized_json = browser_output_from_result(
+            serde_json::json!({
+                "isError": false,
+                "content": [{"type": "text", "text": "fallback"}],
+                "structuredContent": {"value": "x".repeat(MAX_CAPTURED_OUTPUT_BYTES + 1024)}
+            }),
+            ParsedBrowserInvocation {
+                arguments: serde_json::Map::new(),
+                output_format: BrowserOutputFormat::Json,
+            },
+            false,
+        )
+        .expect("bound oversized structured JSON browser result");
+        let oversized_decoded: Value = serde_json::from_str(&oversized_json.stdout)
+            .expect("bounded browser JSON output must remain syntactically valid");
+        assert_eq!(
+            oversized_decoded
+                .pointer("/_moondesk/truncated")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(
+            oversized_decoded
+                .pointer("/_moondesk/originalBytes")
+                .and_then(Value::as_u64)
+                .is_some_and(|bytes| bytes > MAX_CAPTURED_OUTPUT_BYTES as u64)
+        );
 
         let markdown = browser_output_from_result(
             serde_json::json!({
@@ -1831,6 +1894,49 @@ mod tests {
         let _ = std::fs::remove_dir_all(workspace);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn browser_workspace_input_staging_uses_private_unix_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let workspace = std::env::temp_dir().join(format!(
+            "moondesk-browser-private-stage-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workspace).expect("create private staging workspace");
+        let secret = workspace.join("secret.txt");
+        std::fs::write(&secret, b"private").expect("write private staging fixture");
+        std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o600))
+            .expect("make source private");
+
+        let prepared = prepare_browser_invocation(
+            &workspace.to_string_lossy(),
+            "upload_file",
+            &["1_2".to_string(), "secret.txt".to_string()],
+        )
+        .expect("stage private upload");
+        let root = prepared
+            ._staging_root
+            .path
+            .as_ref()
+            .expect("private staging root");
+        let staged = PathBuf::from(&prepared.args[1]);
+        let stage_dir = staged.parent().expect("staged input directory");
+        let mode = |path: &Path| {
+            std::fs::metadata(path)
+                .expect("staging metadata")
+                .permissions()
+                .mode()
+                & 0o777
+        };
+        assert_eq!(mode(root), 0o700);
+        assert_eq!(mode(stage_dir), 0o700);
+        assert_eq!(mode(&staged), 0o600);
+
+        drop(prepared);
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
     #[test]
     fn expired_deadline_never_publishes_browser_output() {
         let workspace = std::env::temp_dir().join(format!(
@@ -1935,6 +2041,35 @@ mod tests {
             "a timed-out queued request must not start a browser runtime later"
         );
         drop(guard);
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test]
+    async fn deferred_trace_output_is_rejected_before_browser_runtime_starts() {
+        let workspace = std::env::temp_dir().join(format!(
+            "moondesk-browser-trace-contract-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(workspace.join("reports"))
+            .expect("create trace contract workspace");
+        let runtime = BrowserRuntime::standalone();
+        let error = runtime
+            .run(
+                &workspace.to_string_lossy(),
+                "performance_start_trace",
+                &[
+                    "--autoStop=false".to_string(),
+                    "--filePath=reports/trace.json".to_string(),
+                ],
+                Duration::from_secs(1),
+            )
+            .await
+            .expect_err("deferred start-trace output must fail before dispatch");
+        assert!(error.contains("performance_stop_trace"), "{error}");
+        assert!(
+            runtime.runtime.lock().await.transport.is_none(),
+            "invalid deferred trace output must not start the browser runtime"
+        );
         let _ = std::fs::remove_dir_all(workspace);
     }
 

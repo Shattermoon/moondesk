@@ -17,10 +17,12 @@ The hardening work described in this document is implemented on the current bran
 - **Crash/runtime-loss recovery - done.** A dead owned child is discarded and the next browser operation starts a fresh isolated runtime. MoonDesk does not automatically replay the ambiguous operation that observed the loss.
 - **Host-file navigation boundary - done.** MoonDesk owns URL validation for `navigate_page` and `new_page`; local filesystem paths and unsafe local/internal schemes such as `file:`, `view-source:file:`, `chrome:`, and `javascript:` fail before reaching Chromium. Normal HTTP(S), localhost, `data:`, safe `view-source:https:`, and HTTP(S)-origin `blob:` navigation remain available.
 - **Node compatibility contract - done.** The npm engine range, wrapper preflight, installer diagnostics, README, contributor docs, and CI matrix now match exact `chrome-devtools-mcp@1.7.0` support: `^20.19.0 || ^22.12.0 || >=23`. CI also launches the exact pinned browser runtime with `--help` at supported boundary/latest versions so wrapper-only tests cannot hide a future engine mismatch.
-- **Single deadline model - done.** Direct stdio removes the upstream CLI client's hidden 60-second socket deadline. MoonDesk's request deadline now governs queueing, runtime startup, MCP execution, staging, and output publication.
-- **Staging/output deadline hardening - done.** Potentially large staging work runs off Tokio workers; file copying checks the operation deadline in bounded chunks; file output is copied to a randomized sibling temporary file and atomically published only while the deadline remains valid. Existing traversal, symlink/reparse-point, and outside-workspace checks remain fail-closed.
+- **Single deadline model - done.** Direct stdio removes the upstream CLI client's hidden 60-second socket deadline. MoonDesk's absolute request deadline now governs queueing, runtime startup, MCP stdin lock/write/newline/flush, response wait, staging, and output publication. A blocked child stdin fails as `Timeout`; cleanup terminates the owned process tree before dropping buffered stdin so shutdown cannot wait behind a stuck writer.
+- **Bounded MCP framing - done.** Browser stdout is read as newline-delimited JSON-RPC with a 16 MiB frame ceiling before allocation/parsing can grow without bound. Oversized or malformed protocol frames invalidate the transport and fail pending requests explicitly. Stderr is consumed with a bounded per-line buffer while oversized tails are discarded at ingestion.
+- **Staging/output deadline hardening - done.** Potentially large staging work runs off Tokio workers; file copying checks the operation deadline in bounded chunks; file output is copied to a randomized sibling temporary file and atomically published only while the deadline remains valid. On Unix the staging root/directories are created as `0700` and staged/temp files as `0600` before the first byte is copied, preventing transient permission broadening. Existing traversal, symlink/reparse-point, and outside-workspace checks remain fail-closed.
 - **Pinned command contract - done.** `src/browser_contract_v1_7.json` records all 50 commands from exact v1.7 generated CLI metadata, and `src/browser_contract.rs` parses the existing `command + args[]` surface into MCP tool arguments while preserving aliases, booleans, arrays, enums/defaults, and MoonDesk-owned `--output-format`.
-- **CLI response parity - done.** MoonDesk now mirrors v1.7 CLI rendering for markdown, structured JSON, MCP tool errors, and image responses rather than depending on the detached CLI renderer.
+- **CLI response parity - done.** MoonDesk mirrors v1.7 CLI rendering for markdown, structured JSON, MCP tool errors, and image responses rather than depending on the detached CLI renderer. Oversized JSON remains syntactically valid by returning a bounded `_moondesk.truncated` envelope with the original/limit byte counts instead of splicing plaintext into serialized JSON.
+- **Deferred trace-output semantics - fail-closed.** `performance_start_trace --autoStop=false --filePath=...` is rejected by MoonDesk's command contract before transport startup/dispatch because exact v1.7 does not write that start-call path. Manual traces remain supported by starting without `filePath` and supplying `--filePath` to `performance_stop_trace`.
 - **Capability parity - done.** The direct MCP server keeps the old CLI safety/runtime defaults; feature-gated extension tooling is not silently enabled.
 - **Stable product surface - preserved.** The public architecture remains one `moondesk` executable, one lazy host-shared browser session, and only MCP `browser_command` + `view_page`. The host-shared browser remains an explicit trust-domain decision.
 
@@ -260,7 +262,7 @@ Validated locally on the final implementation state before push:
 
 | Validation | Result |
 | --- | --- |
-| Windows Rust tests | **306 passed, 0 failed, 7 ignored** |
+| Windows Rust tests | **311 passed, 0 failed, 7 ignored** |
 | Windows all-target Clippy (`-D warnings`) | **PASS** |
 | Windows strict production Clippy (`unwrap` / `expect` / `panic` / `unreachable` denied) | **PASS** |
 | Windows developer-tool smoke | **PASS** |
@@ -268,8 +270,9 @@ Validated locally on the final implementation state before push:
 | Windows dispatched-timeout late-mutation smoke | **PASS** |
 | Windows host CLI + MCP shared-session / workspace staging smoke | **PASS** |
 | Windows native `view_page` vision smoke | **PASS** |
-| Linux stable Rust 1.98.1 format + both Clippy gates | **PASS** |
-| Linux Rust tests | **303 passed, 0 failed** |
+| Linux stable Rust 1.98.0 format + both Clippy gates | **PASS** |
+| Linux Rust tests | **309 passed, 0 failed** |
+| Unix private staging permissions (`0700` root/dirs, `0600` staged file) | **PASS** |
 | Node 20.19 npm tests + package verification | **59/59 + exact 7-file package** |
 | Node 22.12 npm tests + package verification | **59/59 + exact 7-file package** |
 | Node 24 npm tests + package verification | **59/59 + exact 7-file package** |

@@ -211,6 +211,22 @@ fn validate_url_arguments(command: &str, arguments: &Map<String, Value>) -> Resu
     Ok(())
 }
 
+fn validate_semantic_arguments(
+    command: &str,
+    arguments: &Map<String, Value>,
+) -> Result<(), String> {
+    if command == "performance_start_trace"
+        && arguments.get("autoStop").and_then(Value::as_bool) == Some(false)
+        && arguments.get("filePath").and_then(Value::as_str).is_some()
+    {
+        return Err(
+            "performance_start_trace cannot use --filePath when --autoStop=false because the pinned runtime does not write that file until a later stop; start the trace without --filePath and pass --filePath to performance_stop_trace instead"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 pub fn parse_browser_cli_invocation(
     command: &str,
     args: &[String],
@@ -383,6 +399,7 @@ pub fn parse_browser_cli_invocation(
     }
 
     validate_url_arguments(command, &arguments)?;
+    validate_semantic_arguments(command, &arguments)?;
     Ok(ParsedBrowserInvocation {
         arguments,
         output_format,
@@ -458,6 +475,24 @@ mod tests {
             parse_browser_cli_invocation("new_page", &strings(&[url]))
                 .unwrap_or_else(|error| panic!("unexpectedly rejected {url}: {error}"));
         }
+    }
+
+    #[test]
+    fn performance_trace_deferred_output_is_rejected_before_dispatch() {
+        let error = parse_browser_cli_invocation(
+            "performance_start_trace",
+            &strings(&["--autoStop=false", "--filePath=reports/trace.json"]),
+        )
+        .expect_err("deferred trace output must be rejected");
+        assert!(error.contains("performance_stop_trace"), "{error}");
+
+        parse_browser_cli_invocation("performance_start_trace", &strings(&["--autoStop=false"]))
+            .expect("manual trace without start-time file path should remain valid");
+        parse_browser_cli_invocation(
+            "performance_start_trace",
+            &strings(&["--autoStop=true", "--filePath=reports/trace.json"]),
+        )
+        .expect("auto-stopped trace may write its own output");
     }
 
     #[test]

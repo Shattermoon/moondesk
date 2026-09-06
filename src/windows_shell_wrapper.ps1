@@ -79,14 +79,23 @@ function Convert-MoonDeskEnvPrefix([string]$segment) {
     $script:__moondesk_env_prefix_id = [int64]$script:__moondesk_env_prefix_id + 1
     $okVar = '__MOONDESK_ENV_OK___MOONDESK_SUFFIX___' + $scopeId
     $codeVar = '__MOONDESK_ENV_CODE___MOONDESK_SUFFIX___' + $scopeId
+    $snapshotVar = '__MOONDESK_ENV_SNAPSHOT___MOONDESK_SUFFIX___' + $scopeId
     $builder = New-Object System.Text.StringBuilder
 
+    [void]$builder.Append(
+        '$' + $snapshotVar + '=[Environment]::GetEnvironmentVariables([EnvironmentVariableTarget]::Process)' + "`n"
+    )
     for ($index = 0; $index -lt $assignments.Count; $index++) {
         $assignment = $assignments[$index]
         $existsVar = '__MOONDESK_ENV_EXISTED_' + $index + '___MOONDESK_SUFFIX___' + $scopeId
         $valueVar = '__MOONDESK_ENV_VALUE_' + $index + '___MOONDESK_SUFFIX___' + $scopeId
-        [void]$builder.Append('$' + $valueVar + '=[Environment]::GetEnvironmentVariable(''' + $assignment.Name + ''',[EnvironmentVariableTarget]::Process)' + "`n")
-        [void]$builder.Append('$' + $existsVar + '=($null -ne $' + $valueVar + ")`n")
+        [void]$builder.Append(
+            '$' + $existsVar + '=@($' + $snapshotVar + '.Keys) -contains ''' + $assignment.Name + '''' + "`n"
+        )
+        [void]$builder.Append(
+            '$' + $valueVar + '=if ($' + $existsVar + ') {[string][Environment]::GetEnvironmentVariable(''' +
+            $assignment.Name + ''',[EnvironmentVariableTarget]::Process)} else {$null}' + "`n"
+        )
     }
 
     [void]$builder.Append("try {`n")

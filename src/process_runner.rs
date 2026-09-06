@@ -1349,7 +1349,7 @@ value && literal
         assert!(empty_env.stdout.contains("empty-after=False"));
 
         let restored_empty_env = run_shell_command(
-            "$__native=[System.Object].Assembly.GetType('Microsoft.Win32.Win32Native').GetMethod('SetEnvironmentVariable',[System.Reflection.BindingFlags]'NonPublic,Static'); [void]$__native.Invoke($null,@('MOONDESK_EMPTY_RESTORE','')); MOONDESK_EMPTY_RESTORE=temporary Write-Output (\"empty-inside=$env:MOONDESK_EMPTY_RESTORE\"); Write-Output (\"empty-restored=$([Environment]::GetEnvironmentVariables('Process').Contains('MOONDESK_EMPTY_RESTORE'))|$(([string][Environment]::GetEnvironmentVariable('MOONDESK_EMPTY_RESTORE',[EnvironmentVariableTarget]::Process)).Length)\")",
+            "$__native=[System.Object].Assembly.GetType('Microsoft.Win32.Win32Native').GetMethod('SetEnvironmentVariable',[System.Reflection.BindingFlags]'NonPublic,Static'); [void]$__native.Invoke($null,@('MOONDESK_EMPTY_RESTORE','')); Write-Output (\"empty-before=$([Environment]::GetEnvironmentVariables('Process').Contains('MOONDESK_EMPTY_RESTORE'))|$(([string][Environment]::GetEnvironmentVariable('MOONDESK_EMPTY_RESTORE',[EnvironmentVariableTarget]::Process)).Length)\"); MOONDESK_EMPTY_RESTORE=temporary Write-Output (\"empty-inside=$env:MOONDESK_EMPTY_RESTORE\"); Write-Output (\"empty-restored=$([Environment]::GetEnvironmentVariables('Process').Contains('MOONDESK_EMPTY_RESTORE'))|$(([string][Environment]::GetEnvironmentVariable('MOONDESK_EMPTY_RESTORE',[EnvironmentVariableTarget]::Process)).Length)\")",
             &root,
             15_000,
             8 * 1024,
@@ -1361,8 +1361,17 @@ value && literal
             "empty env restoration failed: {}",
             restored_empty_env.stderr
         );
+        assert!(
+            restored_empty_env.stdout.contains("empty-before=True|0"),
+            "failed to create pre-existing empty env value: {}",
+            restored_empty_env.stdout
+        );
         assert!(restored_empty_env.stdout.contains("empty-inside=temporary"));
-        assert!(restored_empty_env.stdout.contains("empty-restored=True|0"));
+        assert!(
+            restored_empty_env.stdout.contains("empty-restored=True|0"),
+            "empty env value was not restored: {}",
+            restored_empty_env.stdout
+        );
 
         let helper_name_collision = run_shell_command(
             "function Set-MoonDeskProcessEnvironment { param($name,$value) Write-Output (\"hijacked=$name\") }; MOONDESK_HELPER_COLLISION=visible Write-Output (\"collision-inside=$env:MOONDESK_HELPER_COLLISION\"); Write-Output (\"collision-after=$([string]$env:MOONDESK_HELPER_COLLISION)\")",

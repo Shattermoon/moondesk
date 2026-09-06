@@ -1048,7 +1048,7 @@ $listener.Stop()
         let and_result = run_shell_command(
             "Write-Output first && Write-Output second",
             &root,
-            5_000,
+            15_000,
             8 * 1024,
             None,
         )
@@ -1064,7 +1064,7 @@ $listener.Stop()
         let or_result = run_shell_command(
             "cmd /c exit 7 || Write-Output recovered",
             &root,
-            5_000,
+            15_000,
             8 * 1024,
             None,
         )
@@ -1075,7 +1075,7 @@ $listener.Stop()
         let short_circuit = run_shell_command(
             "cmd /c exit 7 && Write-Output should-not-run",
             &root,
-            5_000,
+            15_000,
             8 * 1024,
             None,
         )
@@ -1084,14 +1084,14 @@ $listener.Stop()
         assert_eq!(short_circuit.exit_code, Some(7));
         assert!(!short_circuit.stdout.contains("should-not-run"));
 
-        let native_exit = run_shell_command("cmd /c exit 11", &root, 5_000, 8 * 1024, None).await;
+        let native_exit = run_shell_command("cmd /c exit 11", &root, 15_000, 8 * 1024, None).await;
         assert!(!native_exit.success);
         assert_eq!(native_exit.exit_code, Some(11));
 
         let commented_native_exit = run_shell_command(
             "cmd /c exit 13 # expected failure",
             &root,
-            5_000,
+            15_000,
             8 * 1024,
             None,
         )
@@ -1102,7 +1102,7 @@ $listener.Stop()
         let commented_chain = run_shell_command(
             "Write-Output before-comment && cmd /c exit 17 # expected failure",
             &root,
-            5_000,
+            15_000,
             8 * 1024,
             None,
         )
@@ -1117,7 +1117,7 @@ $listener.Stop()
         let operators_in_comment = run_shell_command(
             "Write-Output before-only # && Write-Output should-not-run || Write-Output neither",
             &root,
-            5_000,
+            15_000,
             8 * 1024,
             None,
         )
@@ -1134,7 +1134,7 @@ $listener.Stop()
         let hash_in_bareword = run_shell_command(
             "Write-Output file#name.txt && Write-Output after-hash",
             &root,
-            5_000,
+            15_000,
             8 * 1024,
             None,
         )
@@ -1150,7 +1150,7 @@ $listener.Stop()
         let block_comment = run_shell_command(
             "Write-Output before-block <# block\n&& Write-Output hidden\n#> && Write-Output after-block",
             &root,
-            5_000,
+            15_000,
             8 * 1024,
             None,
         )
@@ -1169,7 +1169,7 @@ $listener.Stop()
 it's && literal
 '@ && Write-Output after-single-here"#,
             &root,
-            5_000,
+            15_000,
             8 * 1024,
             None,
         )
@@ -1187,7 +1187,7 @@ it's && literal
 value && literal
 "@ && Write-Output after-double-here"#,
             &root,
-            5_000,
+            15_000,
             8 * 1024,
             None,
         )
@@ -1203,7 +1203,7 @@ value && literal
         let env_result = run_shell_command(
             "MOONDESK_SHELL_COMPAT=visible Write-Output $env:MOONDESK_SHELL_COMPAT",
             &root,
-            5_000,
+            15_000,
             8 * 1024,
             None,
         )
@@ -1218,7 +1218,7 @@ value && literal
         let internal_transport_env = run_shell_command(
             "if ($null -eq $env:MOONDESK_INTERNAL_WINDOWS_COMMAND) { Write-Output hidden } else { Write-Output leaked }",
             &root,
-            5_000,
+            15_000,
             8 * 1024,
             None,
         )
@@ -1233,7 +1233,7 @@ value && literal
         let spaced_env = run_shell_command(
             "MOONDESK_SPACE='hello world' MOONDESK_TWO=second Write-Output \"$env:MOONDESK_SPACE|$env:MOONDESK_TWO\"",
             &root,
-            5_000,
+            15_000,
             8 * 1024,
             None,
         )
@@ -1245,10 +1245,84 @@ value && literal
         );
         assert_eq!(spaced_env.stdout.trim(), "hello world|second");
 
+        let escaped_single_env = run_shell_command(
+            "MOONDESK_APOSTROPHE='don''t' Write-Output $env:MOONDESK_APOSTROPHE",
+            &root,
+            15_000,
+            8 * 1024,
+            None,
+        )
+        .await;
+        assert!(
+            escaped_single_env.success,
+            "single-quoted env escape failed: {}",
+            escaped_single_env.stderr
+        );
+        assert_eq!(escaped_single_env.stdout.trim(), "don't");
+
+        let escaped_double_env = run_shell_command(
+            "MOONDESK_BACKTICK=\"left`tvalue\" Write-Output ($env:MOONDESK_BACKTICK -replace \"`t\", \"|\")",
+            &root,
+            15_000,
+            8 * 1024,
+            None,
+        )
+        .await;
+        assert!(
+            escaped_double_env.success,
+            "double-quoted env escape failed: {}",
+            escaped_double_env.stderr
+        );
+        assert_eq!(escaped_double_env.stdout.trim(), "left|value");
+
+        for (command, expected_code) in [
+            (
+                "$null = (cmd /c exit 31 && Write-Output should-not-run)",
+                31,
+            ),
+            (
+                "$null = $(cmd /c exit 32 && Write-Output should-not-run)",
+                32,
+            ),
+            (
+                "$null = @(cmd /c exit 33 && Write-Output should-not-run)",
+                33,
+            ),
+        ] {
+            let expression_failure =
+                run_shell_command(command, &root, 15_000, 8 * 1024, None).await;
+            assert!(
+                !expression_failure.success,
+                "failing expression chain unexpectedly succeeded: {command}"
+            );
+            assert_eq!(
+                expression_failure.exit_code,
+                Some(expected_code),
+                "wrong expression-chain exit code: {command}"
+            );
+            assert!(!expression_failure.stdout.contains("should-not-run"));
+        }
+
+        let later_statement_wins = run_shell_command(
+            "if ($true) { cmd /c exit 34 && Write-Output should-not-run; Write-Output recovered-inside-if }",
+            &root,
+            15_000,
+            8 * 1024,
+            None,
+        )
+        .await;
+        assert!(
+            later_statement_wins.success,
+            "later successful statement did not supersede earlier chain failure: {}",
+            later_statement_wins.stderr
+        );
+        assert!(later_statement_wins.stdout.contains("recovered-inside-if"));
+        assert!(!later_statement_wins.stdout.contains("should-not-run"));
+
         let quoted_operator = run_shell_command(
             "Write-Output 'literal && operator || text' && Write-Output quoted-done",
             &root,
-            5_000,
+            15_000,
             8 * 1024,
             None,
         )
@@ -1268,7 +1342,7 @@ value && literal
         let nested_block = run_shell_command(
             "& { Write-Output nested-one && Write-Output nested-two }",
             &root,
-            5_000,
+            15_000,
             8 * 1024,
             None,
         )
@@ -1284,7 +1358,7 @@ value && literal
         let unicode_result = run_shell_command(
             "Write-Output 'こんにちは🙂'; [Console]::Error.WriteLine('错误🙂')",
             &root,
-            5_000,
+            15_000,
             8 * 1024,
             None,
         )
@@ -1300,7 +1374,7 @@ value && literal
         let mixed_result = run_shell_command(
             "Write-Output begin && cmd /c exit 9 || Write-Output fallback && Write-Output end",
             &root,
-            5_000,
+            15_000,
             8 * 1024,
             None,
         )

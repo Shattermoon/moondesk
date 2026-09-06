@@ -7,6 +7,10 @@ $OutputEncoding = [Console]::OutputEncoding
 $__moondesk_source = $env:MOONDESK_INTERNAL_WINDOWS_COMMAND
 Remove-Item Env:MOONDESK_INTERNAL_WINDOWS_COMMAND -ErrorAction SilentlyContinue
 
+$global:__MOONDESK_CHAIN_EPOCH___MOONDESK_SUFFIX__ = [int64]0
+$global:__MOONDESK_CHAIN_LAST_CODE___MOONDESK_SUFFIX__ = 0
+$global:__MOONDESK_FINAL_EPOCH_BEFORE___MOONDESK_SUFFIX__ = [int64]0
+
 function Convert-MoonDeskEnvPrefix([string]$segment) {
     $remaining = $segment
     $prefix = New-Object System.Text.StringBuilder
@@ -28,7 +32,19 @@ function Convert-MoonDeskEnvPrefix([string]$segment) {
         }
         if (($raw.StartsWith("'") -and $raw.EndsWith("'")) -or
             ($raw.StartsWith('"') -and $raw.EndsWith('"'))) {
-            $raw = $raw.Substring(1, $raw.Length - 2)
+            $valueTokens = $null
+            $valueErrors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseInput(
+                $raw,
+                [ref]$valueTokens,
+                [ref]$valueErrors
+            )
+            if ($valueTokens.Count -gt 0 -and
+                $valueTokens[0].PSObject.Properties.Name -contains 'Value') {
+                $raw = [string]$valueTokens[0].Value
+            } else {
+                $raw = $raw.Substring(1, $raw.Length - 2)
+            }
         }
 
         $quoted = "'" + $raw.Replace("'", "''") + "'"
@@ -64,6 +80,44 @@ function Get-MoonDeskTokenRecords($tokens) {
         }
     }
     return $records.ToArray()
+}
+
+function Add-MoonDeskStatementSnapshots([string]$text) {
+    $tokens = $null
+    $parseErrors = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseInput(
+        $text,
+        [ref]$tokens,
+        [ref]$parseErrors
+    )
+    $offsets = New-Object 'System.Collections.Generic.HashSet[int]'
+
+    foreach ($block in @($ast.BeginBlock, $ast.ProcessBlock, $ast.EndBlock)) {
+        if ($null -eq $block) {
+            continue
+        }
+        foreach ($statement in $block.Statements) {
+            [void]$offsets.Add([int]$statement.Extent.StartOffset)
+        }
+    }
+    foreach ($block in $ast.FindAll({
+        param($node)
+        $node -is [System.Management.Automation.Language.StatementBlockAst]
+    }, $true)) {
+        foreach ($statement in $block.Statements) {
+            [void]$offsets.Add([int]$statement.Extent.StartOffset)
+        }
+    }
+    if ($offsets.Count -eq 0) {
+        return $text
+    }
+
+    $snapshot = "`n`$global:__MOONDESK_FINAL_EPOCH_BEFORE___MOONDESK_SUFFIX__=`$global:__MOONDESK_CHAIN_EPOCH___MOONDESK_SUFFIX__`n"
+    foreach ($offset in @($offsets) | Sort-Object -Descending) {
+        $safeOffset = [Math]::Min([int]$offset, $text.Length)
+        $text = $text.Substring(0, $safeOffset) + $snapshot + $text.Substring($safeOffset)
+    }
+    return $text
 }
 
 function Test-MoonDeskNewLineContinuation($records, [int]$index, [int]$depth) {
@@ -102,11 +156,35 @@ function Test-MoonDeskNewLineContinuation($records, [int]$index, [int]$depth) {
     return $false
 }
 
-function Add-MoonDeskChainStatus([System.Text.StringBuilder]$builder) {
-    [void]$builder.Append("`n`$__MOONDESK_CHAIN_OK___MOONDESK_SUFFIX__=`$?`n")
+function Add-MoonDeskChainSegmentPrelude([System.Text.StringBuilder]$builder) {
     [void]$builder.Append(
-        "`$__MOONDESK_CHAIN_CODE___MOONDESK_SUFFIX__=if (`$__MOONDESK_CHAIN_OK___MOONDESK_SUFFIX__) {0} elseif (`$LASTEXITCODE -ne 0) {`$LASTEXITCODE} else {1}`n"
+        "`$__MOONDESK_CHAIN_EPOCH_BEFORE___MOONDESK_SUFFIX__=`$global:__MOONDESK_CHAIN_EPOCH___MOONDESK_SUFFIX__`n"
     )
+    [void]$builder.Append("`$global:LASTEXITCODE=0`n")
+}
+
+function Add-MoonDeskChainStatus([System.Text.StringBuilder]$builder) {
+    [void]$builder.Append("`n`$__MOONDESK_CHAIN_RAW_OK___MOONDESK_SUFFIX__=`$?`n")
+    [void]$builder.Append(
+        "`$__MOONDESK_CHAIN_RAW_CODE___MOONDESK_SUFFIX__=if (`$__MOONDESK_CHAIN_RAW_OK___MOONDESK_SUFFIX__) {0} elseif (`$LASTEXITCODE -ne 0) {`$LASTEXITCODE} else {1}`n"
+    )
+    [void]$builder.Append(
+        "if (`$global:__MOONDESK_CHAIN_EPOCH___MOONDESK_SUFFIX__ -gt `$__MOONDESK_CHAIN_EPOCH_BEFORE___MOONDESK_SUFFIX__) {`n"
+    )
+    [void]$builder.Append(
+        "`$__MOONDESK_CHAIN_CODE___MOONDESK_SUFFIX__=`$global:__MOONDESK_CHAIN_LAST_CODE___MOONDESK_SUFFIX__`n"
+    )
+    [void]$builder.Append(
+        "`$__MOONDESK_CHAIN_OK___MOONDESK_SUFFIX__=(`$__MOONDESK_CHAIN_CODE___MOONDESK_SUFFIX__ -eq 0)`n"
+    )
+    [void]$builder.Append("} else {`n")
+    [void]$builder.Append(
+        "`$__MOONDESK_CHAIN_CODE___MOONDESK_SUFFIX__=`$__MOONDESK_CHAIN_RAW_CODE___MOONDESK_SUFFIX__`n"
+    )
+    [void]$builder.Append(
+        "`$__MOONDESK_CHAIN_OK___MOONDESK_SUFFIX__=`$__MOONDESK_CHAIN_RAW_OK___MOONDESK_SUFFIX__`n"
+    )
+    [void]$builder.Append("}`n")
 }
 
 function Convert-MoonDeskChains([string]$text) {
@@ -225,7 +303,7 @@ function Convert-MoonDeskChains([string]$text) {
         [void]$parts.Add($text.Substring($cursor, $end - $cursor))
 
         $builder = New-Object System.Text.StringBuilder
-        [void]$builder.Append("`$global:LASTEXITCODE=0`n")
+        Add-MoonDeskChainSegmentPrelude $builder
         [void]$builder.Append((Convert-MoonDeskEnvPrefix $parts[0]))
         Add-MoonDeskChainStatus $builder
         for ($index = 0; $index -lt $targetOperators.Count; $index++) {
@@ -234,7 +312,7 @@ function Convert-MoonDeskChains([string]$text) {
             } else {
                 [void]$builder.Append("if (-not `$__MOONDESK_CHAIN_OK___MOONDESK_SUFFIX__) {`n")
             }
-            [void]$builder.Append("`$global:LASTEXITCODE=0`n")
+            Add-MoonDeskChainSegmentPrelude $builder
             [void]$builder.Append((Convert-MoonDeskEnvPrefix $parts[$index + 1]))
             Add-MoonDeskChainStatus $builder
             [void]$builder.Append("}`n")
@@ -242,14 +320,26 @@ function Convert-MoonDeskChains([string]$text) {
         [void]$builder.Append(
             'if (-not $__MOONDESK_CHAIN_OK___MOONDESK_SUFFIX__) { & $env:ComSpec /d /c ("exit " + $__MOONDESK_CHAIN_CODE___MOONDESK_SUFFIX__) >$null 2>$null }' + "`n"
         )
+        [void]$builder.Append(
+            "`$global:__MOONDESK_CHAIN_EPOCH___MOONDESK_SUFFIX__=[int64]`$global:__MOONDESK_CHAIN_EPOCH___MOONDESK_SUFFIX__+1`n"
+        )
+        [void]$builder.Append(
+            "`$global:__MOONDESK_CHAIN_LAST_CODE___MOONDESK_SUFFIX__=`$__MOONDESK_CHAIN_CODE___MOONDESK_SUFFIX__`n"
+        )
 
-        $text = $text.Substring(0, $start) + $builder.ToString() + $text.Substring($end)
+        $replacement = $builder.ToString()
+        if ($targetDepth -gt 0) {
+            $replacement = "& {`n" + $replacement + "}`n"
+        }
+        $text = $text.Substring(0, $start) + $replacement + $text.Substring($end)
     }
 }
 
 $__moondesk_saved_error_action = $ErrorActionPreference
 $ErrorActionPreference = 'Stop'
 try {
+    $__moondesk_source = Convert-MoonDeskEnvPrefix $__moondesk_source
+    $__moondesk_source = Add-MoonDeskStatementSnapshots $__moondesk_source
     $__moondesk_converted = Convert-MoonDeskChains $__moondesk_source
 } catch {
     [Console]::Error.WriteLine(
@@ -260,8 +350,15 @@ try {
     $ErrorActionPreference = $__moondesk_saved_error_action
 }
 
-$__moondesk_converted += "`n`n`$global:__MOONDESK_FINAL_OK___MOONDESK_SUFFIX__=`$?`n"
-$__moondesk_converted += "`$global:__MOONDESK_FINAL_CODE___MOONDESK_SUFFIX__=if (`$global:__MOONDESK_FINAL_OK___MOONDESK_SUFFIX__) {0} elseif (`$LASTEXITCODE -ne 0) {`$LASTEXITCODE} else {1}`n"
+$__moondesk_converted += "`n`n`$__MOONDESK_FINAL_RAW_OK___MOONDESK_SUFFIX__=`$?`n"
+$__moondesk_converted += "`$__MOONDESK_FINAL_RAW_CODE___MOONDESK_SUFFIX__=if (`$__MOONDESK_FINAL_RAW_OK___MOONDESK_SUFFIX__) {0} elseif (`$LASTEXITCODE -ne 0) {`$LASTEXITCODE} else {1}`n"
+$__moondesk_converted += "if (`$global:__MOONDESK_CHAIN_EPOCH___MOONDESK_SUFFIX__ -gt `$global:__MOONDESK_FINAL_EPOCH_BEFORE___MOONDESK_SUFFIX__) {`n"
+$__moondesk_converted += "`$global:__MOONDESK_FINAL_CODE___MOONDESK_SUFFIX__=`$global:__MOONDESK_CHAIN_LAST_CODE___MOONDESK_SUFFIX__`n"
+$__moondesk_converted += "`$global:__MOONDESK_FINAL_OK___MOONDESK_SUFFIX__=(`$global:__MOONDESK_FINAL_CODE___MOONDESK_SUFFIX__ -eq 0)`n"
+$__moondesk_converted += "} else {`n"
+$__moondesk_converted += "`$global:__MOONDESK_FINAL_CODE___MOONDESK_SUFFIX__=`$__MOONDESK_FINAL_RAW_CODE___MOONDESK_SUFFIX__`n"
+$__moondesk_converted += "`$global:__MOONDESK_FINAL_OK___MOONDESK_SUFFIX__=`$__MOONDESK_FINAL_RAW_OK___MOONDESK_SUFFIX__`n"
+$__moondesk_converted += "}`n"
 
 Invoke-Expression $__moondesk_converted
 

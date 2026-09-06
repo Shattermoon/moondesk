@@ -1455,6 +1455,17 @@ value && literal
         assert!(!direct_prefixed_failure.success);
         assert_eq!(direct_prefixed_failure.exit_code, Some(42));
 
+        let prefixed_expression_failure = run_shell_command(
+            "MOONDESK_EXPR_FAILURE=visible (cmd /c exit 47)",
+            &root,
+            15_000,
+            8 * 1024,
+            None,
+        )
+        .await;
+        assert!(!prefixed_expression_failure.success);
+        assert_eq!(prefixed_expression_failure.exit_code, Some(47));
+
         let nested_env = run_shell_command(
             "MOONDESK_NEST=outer & { MOONDESK_NEST=inner Write-Output (\"inner=$env:MOONDESK_NEST\"); Write-Output (\"outer-restored=$env:MOONDESK_NEST\") }; Write-Output (\"nested-after=$([string]$env:MOONDESK_NEST)\")",
             &root,

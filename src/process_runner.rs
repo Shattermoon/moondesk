@@ -551,10 +551,18 @@ fn windows_shell_split_chain(
     let mut index = 0usize;
     let mut in_single = false;
     let mut in_double = false;
+    let mut in_comment = false;
     let mut escaped = false;
 
     while index < bytes.len() {
         let byte = bytes[index];
+        if in_comment {
+            if matches!(byte, b'\r' | b'\n') {
+                in_comment = false;
+            }
+            index += 1;
+            continue;
+        }
         if escaped {
             escaped = false;
             index += 1;
@@ -572,6 +580,11 @@ fn windows_shell_split_chain(
         }
         if byte == b'"' && !in_single {
             in_double = !in_double;
+            index += 1;
+            continue;
+        }
+        if byte == b'#' && !in_single && !in_double {
+            in_comment = true;
             index += 1;
             continue;
         }
@@ -1326,6 +1339,23 @@ $listener.Stop()
         );
         assert_eq!(commented_chain.exit_code, Some(17));
         assert!(commented_chain.stdout.contains("before-comment"));
+
+        let operators_in_comment = run_shell_command(
+            "Write-Output before-only # && Write-Output should-not-run || Write-Output neither",
+            &root,
+            5_000,
+            8 * 1024,
+            None,
+        )
+        .await;
+        assert!(
+            operators_in_comment.success,
+            "operators inside comment changed execution: {}",
+            operators_in_comment.stderr
+        );
+        assert_eq!(operators_in_comment.stdout.trim(), "before-only");
+        assert!(!operators_in_comment.stdout.contains("should-not-run"));
+        assert!(!operators_in_comment.stdout.contains("neither"));
 
         let env_result = run_shell_command(
             "MOONDESK_SHELL_COMPAT=visible Write-Output $env:MOONDESK_SHELL_COMPAT",

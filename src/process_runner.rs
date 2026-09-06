@@ -427,9 +427,229 @@ pub fn process_tree_size(_root_pid: u32) -> Option<usize> {
     None
 }
 
+#[cfg(windows)]
+#[derive(Clone, Copy)]
+enum WindowsShellChainOperator {
+    And,
+    Or,
+}
+
+#[cfg(windows)]
+fn windows_shell_assignment_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first.is_ascii_alphabetic() || first == '_')
+        && chars.all(|character| character.is_ascii_alphanumeric() || character == '_')
+}
+
+#[cfg(windows)]
+fn windows_shell_next_word(text: &str, start: usize) -> Option<(usize, usize)> {
+    let bytes = text.as_bytes();
+    let mut index = start;
+    while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+        index += 1;
+    }
+    if index >= bytes.len() {
+        return None;
+    }
+    let word_start = index;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if escaped {
+            escaped = false;
+            index += 1;
+            continue;
+        }
+        if byte == b'`' && !in_single {
+            escaped = true;
+            index += 1;
+            continue;
+        }
+        if byte == b'\'' && !in_double {
+            in_single = !in_single;
+            index += 1;
+            continue;
+        }
+        if byte == b'"' && !in_single {
+            in_double = !in_double;
+            index += 1;
+            continue;
+        }
+        if !in_single && !in_double && byte.is_ascii_whitespace() {
+            break;
+        }
+        index += 1;
+    }
+    Some((word_start, index))
+}
+
+#[cfg(windows)]
+fn windows_shell_unquote_assignment_value(value: &str) -> &str {
+    if value.len() >= 2 {
+        let bytes = value.as_bytes();
+        if (bytes[0] == b'\'' && bytes[value.len() - 1] == b'\'')
+            || (bytes[0] == b'"' && bytes[value.len() - 1] == b'"')
+        {
+            return &value[1..value.len() - 1];
+        }
+    }
+    value
+}
+
+#[cfg(windows)]
+fn windows_shell_quote_single(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+#[cfg(windows)]
+fn windows_shell_rewrite_env_prefix(segment: &str) -> String {
+    let mut cursor = 0usize;
+    let mut assignments = Vec::new();
+    while let Some((start, end)) = windows_shell_next_word(segment, cursor) {
+        let word = &segment[start..end];
+        let Some((name, value)) = word.split_once('=') else {
+            break;
+        };
+        if !windows_shell_assignment_name(name) {
+            break;
+        }
+        assignments.push((
+            name.to_string(),
+            windows_shell_unquote_assignment_value(value).to_string(),
+        ));
+        cursor = end;
+    }
+    if assignments.is_empty() {
+        return segment.trim().to_string();
+    }
+
+    let mut rewritten = String::new();
+    for (name, value) in assignments {
+        rewritten.push_str("$env:");
+        rewritten.push_str(&name);
+        rewritten.push('=');
+        rewritten.push_str(&windows_shell_quote_single(&value));
+        rewritten.push_str("; ");
+    }
+    rewritten.push_str(segment[cursor..].trim_start());
+    rewritten
+}
+
+#[cfg(windows)]
+fn windows_shell_split_chain(
+    command: &str,
+) -> Option<(Vec<String>, Vec<WindowsShellChainOperator>)> {
+    let bytes = command.as_bytes();
+    let mut segments = Vec::new();
+    let mut operators = Vec::new();
+    let mut start = 0usize;
+    let mut index = 0usize;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if escaped {
+            escaped = false;
+            index += 1;
+            continue;
+        }
+        if byte == b'`' && !in_single {
+            escaped = true;
+            index += 1;
+            continue;
+        }
+        if byte == b'\'' && !in_double {
+            in_single = !in_single;
+            index += 1;
+            continue;
+        }
+        if byte == b'"' && !in_single {
+            in_double = !in_double;
+            index += 1;
+            continue;
+        }
+        if in_single || in_double || index + 1 >= bytes.len() {
+            index += 1;
+            continue;
+        }
+
+        let operator = match (bytes[index], bytes[index + 1]) {
+            (b'&', b'&') => Some(WindowsShellChainOperator::And),
+            (b'|', b'|') => Some(WindowsShellChainOperator::Or),
+            _ => None,
+        };
+        if let Some(operator) = operator {
+            let segment = command[start..index].trim();
+            if segment.is_empty() {
+                return None;
+            }
+            segments.push(windows_shell_rewrite_env_prefix(segment));
+            operators.push(operator);
+            index += 2;
+            start = index;
+            continue;
+        }
+        index += 1;
+    }
+
+    if operators.is_empty() {
+        return None;
+    }
+    let tail = command[start..].trim();
+    if tail.is_empty() {
+        return None;
+    }
+    segments.push(windows_shell_rewrite_env_prefix(tail));
+    Some((segments, operators))
+}
+
+#[cfg(windows)]
+fn windows_shell_record_status(script: &mut String) {
+    script.push_str("; $__moondesk_chain_ok=$?; ");
+    script.push_str("$__moondesk_chain_code=if ($__moondesk_chain_ok) {0} elseif ($LASTEXITCODE -ne 0) {$LASTEXITCODE} else {1}; ");
+}
+
+#[cfg(windows)]
+fn windows_shell_compatible_command(command: &str) -> String {
+    let Some((segments, operators)) = windows_shell_split_chain(command) else {
+        let mut script = String::from("$global:LASTEXITCODE=0; ");
+        script.push_str(&windows_shell_rewrite_env_prefix(command));
+        windows_shell_record_status(&mut script);
+        script.push_str("if (-not $__moondesk_chain_ok) { exit $__moondesk_chain_code }");
+        return script;
+    };
+
+    let mut script = String::from("$global:LASTEXITCODE=0; ");
+    script.push_str(&segments[0]);
+    windows_shell_record_status(&mut script);
+    for (operator, segment) in operators.into_iter().zip(segments.iter().skip(1)) {
+        match operator {
+            WindowsShellChainOperator::And => script.push_str("if ($__moondesk_chain_ok) { "),
+            WindowsShellChainOperator::Or => script.push_str("if (-not $__moondesk_chain_ok) { "),
+        }
+        script.push_str("$global:LASTEXITCODE=0; ");
+        script.push_str(segment);
+        windows_shell_record_status(&mut script);
+        script.push_str("}; ");
+    }
+    script.push_str("if (-not $__moondesk_chain_ok) { exit $__moondesk_chain_code }");
+    script
+}
+
 fn shell_command(command: &str) -> Command {
     #[cfg(windows)]
     {
+        let compatible_command = windows_shell_compatible_command(command);
+        let script = format!(
+            "[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false); $OutputEncoding=[Console]::OutputEncoding; {compatible_command}"
+        );
         let mut shell = Command::new("powershell.exe");
         shell
             .arg("-NoLogo")
@@ -438,7 +658,7 @@ fn shell_command(command: &str) -> Command {
             .arg("-ExecutionPolicy")
             .arg("Bypass")
             .arg("-Command")
-            .arg(command);
+            .arg(script);
         shell
     }
 
@@ -1028,6 +1248,109 @@ $listener.Stop()
         assert_eq!(result.exit_code, Some(0));
         assert_eq!(result.stdout.trim(), "hello");
         assert!(!result.timed_out);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_shell_supports_common_agent_boolean_chains_and_env_prefixes() {
+        let root = workspace("windows-shell-compat");
+
+        let and_result = run_shell_command(
+            "Write-Output first && Write-Output second",
+            &root,
+            5_000,
+            8 * 1024,
+            None,
+        )
+        .await;
+        assert!(
+            and_result.success,
+            "and-chain failed: {}",
+            and_result.stderr
+        );
+        assert!(and_result.stdout.contains("first"));
+        assert!(and_result.stdout.contains("second"));
+
+        let or_result = run_shell_command(
+            "cmd /c exit 7 || Write-Output recovered",
+            &root,
+            5_000,
+            8 * 1024,
+            None,
+        )
+        .await;
+        assert!(or_result.success, "or-chain failed: {}", or_result.stderr);
+        assert!(or_result.stdout.contains("recovered"));
+
+        let short_circuit = run_shell_command(
+            "cmd /c exit 7 && Write-Output should-not-run",
+            &root,
+            5_000,
+            8 * 1024,
+            None,
+        )
+        .await;
+        assert!(!short_circuit.success);
+        assert_eq!(short_circuit.exit_code, Some(7));
+        assert!(!short_circuit.stdout.contains("should-not-run"));
+
+        let native_exit = run_shell_command("cmd /c exit 11", &root, 5_000, 8 * 1024, None).await;
+        assert!(!native_exit.success);
+        assert_eq!(native_exit.exit_code, Some(11));
+
+        let env_result = run_shell_command(
+            "MOONDESK_SHELL_COMPAT=visible Write-Output $env:MOONDESK_SHELL_COMPAT",
+            &root,
+            5_000,
+            8 * 1024,
+            None,
+        )
+        .await;
+        assert!(
+            env_result.success,
+            "env-prefix failed: {}",
+            env_result.stderr
+        );
+        assert_eq!(env_result.stdout.trim(), "visible");
+
+        let unicode_result = run_shell_command(
+            "Write-Output 'こんにちは🙂'; [Console]::Error.WriteLine('错误🙂')",
+            &root,
+            5_000,
+            8 * 1024,
+            None,
+        )
+        .await;
+        assert!(
+            unicode_result.success,
+            "unicode command failed: {}",
+            unicode_result.stderr
+        );
+        assert!(unicode_result.stdout.contains("こんにちは🙂"));
+        assert!(unicode_result.stderr.contains("错误🙂"));
+
+        let mixed_result = run_shell_command(
+            "Write-Output begin && cmd /c exit 9 || Write-Output fallback && Write-Output end",
+            &root,
+            5_000,
+            8 * 1024,
+            None,
+        )
+        .await;
+        assert!(
+            mixed_result.success,
+            "mixed chain failed: {}",
+            mixed_result.stderr
+        );
+        for expected in ["begin", "fallback", "end"] {
+            assert!(
+                mixed_result.stdout.contains(expected),
+                "missing {expected}: {}",
+                mixed_result.stdout
+            );
+        }
+
         let _ = std::fs::remove_dir_all(root);
     }
 

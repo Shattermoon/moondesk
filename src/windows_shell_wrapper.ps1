@@ -10,10 +10,24 @@ Remove-Item Env:MOONDESK_INTERNAL_WINDOWS_COMMAND -ErrorAction SilentlyContinue
 $global:__MOONDESK_CHAIN_EPOCH___MOONDESK_SUFFIX__ = [int64]0
 $global:__MOONDESK_CHAIN_LAST_CODE___MOONDESK_SUFFIX__ = 0
 $global:__MOONDESK_FINAL_EPOCH_BEFORE___MOONDESK_SUFFIX__ = [int64]0
+$script:__moondesk_env_prefix_id = [int64]0
+
+# Windows PowerShell 5.1 cannot preserve an existing empty process-environment value through
+# either Env: or Environment.SetEnvironmentVariable: both treat an empty string as deletion.
+# Reuse the .NET Framework Win32 binding so empty and absent values stay distinguishable.
+$script:__MOONDESK_WIN32_NATIVE_TYPE___MOONDESK_SUFFIX__ = [System.Object].Assembly.GetType('Microsoft.Win32.Win32Native')
+$script:__MOONDESK_NATIVE_SET_ENV___MOONDESK_SUFFIX__ = if ($null -ne $script:__MOONDESK_WIN32_NATIVE_TYPE___MOONDESK_SUFFIX__) {
+    $script:__MOONDESK_WIN32_NATIVE_TYPE___MOONDESK_SUFFIX__.GetMethod(
+        'SetEnvironmentVariable',
+        [System.Reflection.BindingFlags]'NonPublic,Static'
+    )
+} else {
+    $null
+}
 
 function Convert-MoonDeskEnvPrefix([string]$segment) {
     $remaining = $segment
-    $prefix = New-Object System.Text.StringBuilder
+    $assignments = New-Object System.Collections.Generic.List[object]
     while ($true) {
         $match = [regex]::Match(
             $remaining,
@@ -47,15 +61,111 @@ function Convert-MoonDeskEnvPrefix([string]$segment) {
             }
         }
 
-        $quoted = "'" + $raw.Replace("'", "''") + "'"
-        [void]$prefix.Append('$env:' + $match.Groups['name'].Value + '=' + $quoted + '; ')
+        [void]$assignments.Add([pscustomobject]@{
+            Name = $match.Groups['name'].Value
+            Value = $raw
+        })
         $remaining = $remaining.Substring($match.Length)
     }
 
-    if ($prefix.Length -eq 0) {
+    if ($assignments.Count -eq 0 -or [string]::IsNullOrWhiteSpace($remaining)) {
         return $segment
     }
-    return $prefix.ToString() + $remaining.TrimStart()
+    if ($null -eq $script:__MOONDESK_NATIVE_SET_ENV___MOONDESK_SUFFIX__) {
+        throw 'MoonDesk could not access the Windows process environment setter.'
+    }
+
+    $scopeId = $script:__moondesk_env_prefix_id
+    $script:__moondesk_env_prefix_id = [int64]$script:__moondesk_env_prefix_id + 1
+    $okVar = '__MOONDESK_ENV_OK___MOONDESK_SUFFIX___' + $scopeId
+    $codeVar = '__MOONDESK_ENV_CODE___MOONDESK_SUFFIX___' + $scopeId
+    $builder = New-Object System.Text.StringBuilder
+
+    for ($index = 0; $index -lt $assignments.Count; $index++) {
+        $assignment = $assignments[$index]
+        $existsVar = '__MOONDESK_ENV_EXISTED_' + $index + '___MOONDESK_SUFFIX___' + $scopeId
+        $valueVar = '__MOONDESK_ENV_VALUE_' + $index + '___MOONDESK_SUFFIX___' + $scopeId
+        [void]$builder.Append('$' + $valueVar + '=[Environment]::GetEnvironmentVariable(''' + $assignment.Name + ''',[EnvironmentVariableTarget]::Process)' + "`n")
+        [void]$builder.Append('$' + $existsVar + '=($null -ne $' + $valueVar + ")`n")
+    }
+
+    [void]$builder.Append("try {`n")
+    foreach ($assignment in $assignments) {
+        $quoted = "'" + ([string]$assignment.Value).Replace("'", "''") + "'"
+        [void]$builder.Append(
+            'if (-not $script:__MOONDESK_NATIVE_SET_ENV___MOONDESK_SUFFIX__.Invoke($null,@(''' +
+            $assignment.Name + ''',' + $quoted +
+            '))) { throw ''MoonDesk could not set the temporary Windows process environment.'' }' + "`n"
+        )
+    }
+    [void]$builder.Append("`$global:LASTEXITCODE=0`n")
+    [void]$builder.Append($remaining.TrimStart())
+    [void]$builder.Append("`n`$" + $okVar + "=`$?`n")
+    [void]$builder.Append(
+        '$' + $codeVar + '=if ($' + $okVar + ') {0} elseif ($LASTEXITCODE -ne 0) {$LASTEXITCODE} else {1}' + "`n"
+    )
+    [void]$builder.Append("} finally {`n")
+    for ($index = $assignments.Count - 1; $index -ge 0; $index--) {
+        $assignment = $assignments[$index]
+        $existsVar = '__MOONDESK_ENV_EXISTED_' + $index + '___MOONDESK_SUFFIX___' + $scopeId
+        $valueVar = '__MOONDESK_ENV_VALUE_' + $index + '___MOONDESK_SUFFIX___' + $scopeId
+        [void]$builder.Append('if ($' + $existsVar + ") {`n")
+        [void]$builder.Append(
+            'if (-not $script:__MOONDESK_NATIVE_SET_ENV___MOONDESK_SUFFIX__.Invoke($null,@(''' +
+            $assignment.Name + ''',$' + $valueVar +
+            '))) { throw ''MoonDesk could not restore the Windows process environment.'' }' + "`n"
+        )
+        [void]$builder.Append("} else {`n")
+        [void]$builder.Append(
+            'if (-not $script:__MOONDESK_NATIVE_SET_ENV___MOONDESK_SUFFIX__.Invoke($null,@(''' +
+            $assignment.Name + ''',$null))) { throw ''MoonDesk could not restore the Windows process environment.'' }' + "`n"
+        )
+        [void]$builder.Append("}`n")
+    }
+    [void]$builder.Append("}`n")
+    [void]$builder.Append(
+        'if ($' + $okVar + ') {$global:LASTEXITCODE=0} else {& $env:ComSpec /d /c ("exit " + $' + $codeVar + ') >$null 2>$null}' + "`n"
+    )
+    return $builder.ToString()
+}
+
+function Convert-MoonDeskEnvPrefixes([string]$text) {
+    while ($true) {
+        $tokens = $null
+        $parseErrors = $null
+        $ast = [System.Management.Automation.Language.Parser]::ParseInput(
+            $text,
+            [ref]$tokens,
+            [ref]$parseErrors
+        )
+        $target = $null
+        $targetReplacement = $null
+        foreach ($pipeline in $ast.FindAll({
+            param($node)
+            $node -is [System.Management.Automation.Language.PipelineAst]
+        }, $true)) {
+            $candidate = $pipeline.Extent.Text
+            $replacement = Convert-MoonDeskEnvPrefix $candidate
+            if ($replacement -eq $candidate) {
+                continue
+            }
+            if ($null -eq $target -or
+                $pipeline.Extent.StartOffset -gt $target.Extent.StartOffset -or
+                ($pipeline.Extent.StartOffset -eq $target.Extent.StartOffset -and
+                 $pipeline.Extent.EndOffset -lt $target.Extent.EndOffset)) {
+                $target = $pipeline
+                $targetReplacement = $replacement
+            }
+        }
+
+        if ($null -eq $target) {
+            return $text
+        }
+
+        $start = [Math]::Min([int]$target.Extent.StartOffset, $text.Length)
+        $end = [Math]::Min([int]$target.Extent.EndOffset, $text.Length)
+        $text = $text.Substring(0, $start) + $targetReplacement + $text.Substring($end)
+    }
 }
 
 function Get-MoonDeskTokenRecords($tokens) {
@@ -188,8 +298,6 @@ function Add-MoonDeskChainStatus([System.Text.StringBuilder]$builder) {
 }
 
 function Convert-MoonDeskChains([string]$text) {
-    $text = Convert-MoonDeskEnvPrefix $text
-
     while ($true) {
         $tokens = $null
         $parseErrors = $null
@@ -304,7 +412,7 @@ function Convert-MoonDeskChains([string]$text) {
 
         $builder = New-Object System.Text.StringBuilder
         Add-MoonDeskChainSegmentPrelude $builder
-        [void]$builder.Append((Convert-MoonDeskEnvPrefix $parts[0]))
+        [void]$builder.Append($parts[0])
         Add-MoonDeskChainStatus $builder
         for ($index = 0; $index -lt $targetOperators.Count; $index++) {
             if ($targetOperators[$index].Kind -eq [System.Management.Automation.Language.TokenKind]::AndAnd) {
@@ -313,7 +421,7 @@ function Convert-MoonDeskChains([string]$text) {
                 [void]$builder.Append("if (-not `$__MOONDESK_CHAIN_OK___MOONDESK_SUFFIX__) {`n")
             }
             Add-MoonDeskChainSegmentPrelude $builder
-            [void]$builder.Append((Convert-MoonDeskEnvPrefix $parts[$index + 1]))
+            [void]$builder.Append($parts[$index + 1])
             Add-MoonDeskChainStatus $builder
             [void]$builder.Append("}`n")
         }
@@ -338,9 +446,9 @@ function Convert-MoonDeskChains([string]$text) {
 $__moondesk_saved_error_action = $ErrorActionPreference
 $ErrorActionPreference = 'Stop'
 try {
-    $__moondesk_source = Convert-MoonDeskEnvPrefix $__moondesk_source
     $__moondesk_source = Add-MoonDeskStatementSnapshots $__moondesk_source
     $__moondesk_converted = Convert-MoonDeskChains $__moondesk_source
+    $__moondesk_converted = Convert-MoonDeskEnvPrefixes $__moondesk_converted
 } catch {
     [Console]::Error.WriteLine(
         'MoonDesk could not prepare the Windows shell command: ' + $_.Exception.Message

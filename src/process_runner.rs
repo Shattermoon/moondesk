@@ -1275,6 +1275,196 @@ value && literal
         );
         assert_eq!(escaped_double_env.stdout.trim(), "left|value");
 
+        let scoped_env = run_shell_command(
+            "MOONDESK_SCOPED=visible Write-Output (\"prefixed=$env:MOONDESK_SCOPED\"); Write-Output (\"later=$([string]$env:MOONDESK_SCOPED)\")",
+            &root,
+            15_000,
+            8 * 1024,
+            None,
+        )
+        .await;
+        assert!(
+            scoped_env.success,
+            "scoped env prefix failed: {}",
+            scoped_env.stderr
+        );
+        assert!(scoped_env.stdout.contains("prefixed=visible"));
+        assert!(scoped_env.stdout.contains("later="));
+        assert!(!scoped_env.stdout.contains("later=visible"));
+
+        let restored_env = run_shell_command(
+            "$env:MOONDESK_RESTORE='original'; MOONDESK_RESTORE=temporary Write-Output (\"inside=$env:MOONDESK_RESTORE\"); Write-Output (\"after=$env:MOONDESK_RESTORE\")",
+            &root,
+            15_000,
+            8 * 1024,
+            None,
+        )
+        .await;
+        assert!(
+            restored_env.success,
+            "existing env restoration failed: {}",
+            restored_env.stderr
+        );
+        assert!(restored_env.stdout.contains("inside=temporary"));
+        assert!(restored_env.stdout.contains("after=original"));
+
+        let case_insensitive_restore = run_shell_command(
+            "$env:MoOnDeSk_CaSe_ReStOrE='original'; MOONDESK_CASE_RESTORE=temporary Write-Output (\"case-inside=$env:MOONDESK_CASE_RESTORE\"); Write-Output (\"case-after=$env:moondesk_case_restore\")",
+            &root,
+            15_000,
+            8 * 1024,
+            None,
+        )
+        .await;
+        assert!(
+            case_insensitive_restore.success,
+            "case-insensitive env restoration failed: {}",
+            case_insensitive_restore.stderr
+        );
+        assert!(
+            case_insensitive_restore
+                .stdout
+                .contains("case-inside=temporary")
+        );
+        assert!(
+            case_insensitive_restore
+                .stdout
+                .contains("case-after=original")
+        );
+
+        let empty_env = run_shell_command(
+            "MOONDESK_EMPTY_PREFIX='' Write-Output (\"empty-prefix=$([Environment]::GetEnvironmentVariables('Process').Contains('MOONDESK_EMPTY_PREFIX'))\"); Write-Output (\"empty-after=$([Environment]::GetEnvironmentVariables('Process').Contains('MOONDESK_EMPTY_PREFIX'))\")",
+            &root,
+            15_000,
+            8 * 1024,
+            None,
+        )
+        .await;
+        assert!(
+            empty_env.success,
+            "empty env prefix failed: {}",
+            empty_env.stderr
+        );
+        assert!(empty_env.stdout.contains("empty-prefix=True"));
+        assert!(empty_env.stdout.contains("empty-after=False"));
+
+        let restored_empty_env = run_shell_command(
+            "$__native=[System.Object].Assembly.GetType('Microsoft.Win32.Win32Native').GetMethod('SetEnvironmentVariable',[System.Reflection.BindingFlags]'NonPublic,Static'); [void]$__native.Invoke($null,@('MOONDESK_EMPTY_RESTORE','')); MOONDESK_EMPTY_RESTORE=temporary Write-Output (\"empty-inside=$env:MOONDESK_EMPTY_RESTORE\"); Write-Output (\"empty-restored=$([Environment]::GetEnvironmentVariables('Process').Contains('MOONDESK_EMPTY_RESTORE'))|$(([string][Environment]::GetEnvironmentVariable('MOONDESK_EMPTY_RESTORE',[EnvironmentVariableTarget]::Process)).Length)\")",
+            &root,
+            15_000,
+            8 * 1024,
+            None,
+        )
+        .await;
+        assert!(
+            restored_empty_env.success,
+            "empty env restoration failed: {}",
+            restored_empty_env.stderr
+        );
+        assert!(restored_empty_env.stdout.contains("empty-inside=temporary"));
+        assert!(restored_empty_env.stdout.contains("empty-restored=True|0"));
+
+        let helper_name_collision = run_shell_command(
+            "function Set-MoonDeskProcessEnvironment { param($name,$value) Write-Output (\"hijacked=$name\") }; MOONDESK_HELPER_COLLISION=visible Write-Output (\"collision-inside=$env:MOONDESK_HELPER_COLLISION\"); Write-Output (\"collision-after=$([string]$env:MOONDESK_HELPER_COLLISION)\")",
+            &root,
+            15_000,
+            8 * 1024,
+            None,
+        )
+        .await;
+        assert!(
+            helper_name_collision.success,
+            "user-defined helper name intercepted env scoping: {}",
+            helper_name_collision.stderr
+        );
+        assert!(
+            helper_name_collision
+                .stdout
+                .contains("collision-inside=visible")
+        );
+        assert!(helper_name_collision.stdout.contains("collision-after="));
+        assert!(!helper_name_collision.stdout.contains("hijacked="));
+
+        let chain_scoped_env = run_shell_command(
+            "MOONDESK_CHAIN_SCOPE=visible Write-Output (\"chain-first=$env:MOONDESK_CHAIN_SCOPE\") && Write-Output (\"chain-second=$([string]$env:MOONDESK_CHAIN_SCOPE)\")",
+            &root,
+            15_000,
+            8 * 1024,
+            None,
+        )
+        .await;
+        assert!(
+            chain_scoped_env.success,
+            "chain env scoping failed: {}",
+            chain_scoped_env.stderr
+        );
+        assert!(chain_scoped_env.stdout.contains("chain-first=visible"));
+        assert!(chain_scoped_env.stdout.contains("chain-second="));
+        assert!(!chain_scoped_env.stdout.contains("chain-second=visible"));
+
+        let prefixed_failure = run_shell_command(
+            "MOONDESK_FAILURE_SCOPE=visible cmd /c exit 41 || Write-Output (\"recovered=$([string]$env:MOONDESK_FAILURE_SCOPE)\")",
+            &root,
+            15_000,
+            8 * 1024,
+            None,
+        )
+        .await;
+        assert!(
+            prefixed_failure.success,
+            "prefixed failure did not preserve chain status: {}",
+            prefixed_failure.stderr
+        );
+        assert_eq!(prefixed_failure.stdout.trim(), "recovered=");
+
+        let restored_after_failure = run_shell_command(
+            "$env:MOONDESK_FAILURE_RESTORE='original'; MOONDESK_FAILURE_RESTORE=temporary cmd /c exit 43 || Write-Output (\"failure-after=$env:MOONDESK_FAILURE_RESTORE\")",
+            &root,
+            15_000,
+            8 * 1024,
+            None,
+        )
+        .await;
+        assert!(
+            restored_after_failure.success,
+            "failed env-prefixed command did not restore before fallback: {}",
+            restored_after_failure.stderr
+        );
+        assert_eq!(
+            restored_after_failure.stdout.trim(),
+            "failure-after=original"
+        );
+
+        let direct_prefixed_failure = run_shell_command(
+            "MOONDESK_DIRECT_FAILURE=visible cmd /c exit 42",
+            &root,
+            15_000,
+            8 * 1024,
+            None,
+        )
+        .await;
+        assert!(!direct_prefixed_failure.success);
+        assert_eq!(direct_prefixed_failure.exit_code, Some(42));
+
+        let nested_env = run_shell_command(
+            "MOONDESK_NEST=outer & { MOONDESK_NEST=inner Write-Output (\"inner=$env:MOONDESK_NEST\"); Write-Output (\"outer-restored=$env:MOONDESK_NEST\") }; Write-Output (\"nested-after=$([string]$env:MOONDESK_NEST)\")",
+            &root,
+            15_000,
+            8 * 1024,
+            None,
+        )
+        .await;
+        assert!(
+            nested_env.success,
+            "nested env prefix failed: {}",
+            nested_env.stderr
+        );
+        assert!(nested_env.stdout.contains("inner=inner"));
+        assert!(nested_env.stdout.contains("outer-restored=outer"));
+        assert!(nested_env.stdout.contains("nested-after="));
+        assert!(!nested_env.stdout.contains("nested-after=outer"));
+        assert!(!nested_env.stdout.contains("nested-after=inner"));
+
         for (command, expected_code) in [
             (
                 "$null = (cmd /c exit 31 && Write-Output should-not-run)",

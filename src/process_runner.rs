@@ -612,34 +612,36 @@ fn windows_shell_split_chain(
 
 #[cfg(windows)]
 fn windows_shell_record_status(script: &mut String) {
-    script.push_str("; $__moondesk_chain_ok=$?; ");
-    script.push_str("$__moondesk_chain_code=if ($__moondesk_chain_ok) {0} elseif ($LASTEXITCODE -ne 0) {$LASTEXITCODE} else {1}; ");
+    script.push_str("\n$__moondesk_chain_ok=$?\n");
+    script.push_str(
+        "$__moondesk_chain_code=if ($__moondesk_chain_ok) {0} elseif ($LASTEXITCODE -ne 0) {$LASTEXITCODE} else {1}\n",
+    );
 }
 
 #[cfg(windows)]
 fn windows_shell_compatible_command(command: &str) -> String {
     let Some((segments, operators)) = windows_shell_split_chain(command) else {
-        let mut script = String::from("$global:LASTEXITCODE=0; ");
+        let mut script = String::from("$global:LASTEXITCODE=0\n");
         script.push_str(&windows_shell_rewrite_env_prefix(command));
         windows_shell_record_status(&mut script);
-        script.push_str("if (-not $__moondesk_chain_ok) { exit $__moondesk_chain_code }");
+        script.push_str("if (-not $__moondesk_chain_ok) { exit $__moondesk_chain_code }\n");
         return script;
     };
 
-    let mut script = String::from("$global:LASTEXITCODE=0; ");
+    let mut script = String::from("$global:LASTEXITCODE=0\n");
     script.push_str(&segments[0]);
     windows_shell_record_status(&mut script);
     for (operator, segment) in operators.into_iter().zip(segments.iter().skip(1)) {
         match operator {
-            WindowsShellChainOperator::And => script.push_str("if ($__moondesk_chain_ok) { "),
-            WindowsShellChainOperator::Or => script.push_str("if (-not $__moondesk_chain_ok) { "),
+            WindowsShellChainOperator::And => script.push_str("if ($__moondesk_chain_ok) {\n"),
+            WindowsShellChainOperator::Or => script.push_str("if (-not $__moondesk_chain_ok) {\n"),
         }
-        script.push_str("$global:LASTEXITCODE=0; ");
+        script.push_str("$global:LASTEXITCODE=0\n");
         script.push_str(segment);
         windows_shell_record_status(&mut script);
-        script.push_str("}; ");
+        script.push_str("}\n");
     }
-    script.push_str("if (-not $__moondesk_chain_ok) { exit $__moondesk_chain_code }");
+    script.push_str("if (-not $__moondesk_chain_ok) { exit $__moondesk_chain_code }\n");
     script
 }
 
@@ -648,7 +650,7 @@ fn shell_command(command: &str) -> Command {
     {
         let compatible_command = windows_shell_compatible_command(command);
         let script = format!(
-            "[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false); $OutputEncoding=[Console]::OutputEncoding; {compatible_command}"
+            "[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false)\n$OutputEncoding=[Console]::OutputEncoding\n{compatible_command}"
         );
         let mut shell = Command::new("powershell.exe");
         shell
@@ -1298,6 +1300,32 @@ $listener.Stop()
         let native_exit = run_shell_command("cmd /c exit 11", &root, 5_000, 8 * 1024, None).await;
         assert!(!native_exit.success);
         assert_eq!(native_exit.exit_code, Some(11));
+
+        let commented_native_exit = run_shell_command(
+            "cmd /c exit 13 # expected failure",
+            &root,
+            5_000,
+            8 * 1024,
+            None,
+        )
+        .await;
+        assert!(!commented_native_exit.success);
+        assert_eq!(commented_native_exit.exit_code, Some(13));
+
+        let commented_chain = run_shell_command(
+            "Write-Output before-comment && cmd /c exit 17 # expected failure",
+            &root,
+            5_000,
+            8 * 1024,
+            None,
+        )
+        .await;
+        assert!(
+            !commented_chain.success,
+            "commented chain unexpectedly succeeded"
+        );
+        assert_eq!(commented_chain.exit_code, Some(17));
+        assert!(commented_chain.stdout.contains("before-comment"));
 
         let env_result = run_shell_command(
             "MOONDESK_SHELL_COMPAT=visible Write-Output $env:MOONDESK_SHELL_COMPAT",

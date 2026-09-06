@@ -1314,6 +1314,57 @@ $listener.Stop()
         );
         assert_eq!(env_result.stdout.trim(), "visible");
 
+        let spaced_env = run_shell_command(
+            "MOONDESK_SPACE='hello world' MOONDESK_TWO=second Write-Output \"$env:MOONDESK_SPACE|$env:MOONDESK_TWO\"",
+            &root,
+            5_000,
+            8 * 1024,
+            None,
+        )
+        .await;
+        assert!(
+            spaced_env.success,
+            "spaced env prefix failed: {}",
+            spaced_env.stderr
+        );
+        assert_eq!(spaced_env.stdout.trim(), "hello world|second");
+
+        let quoted_operator = run_shell_command(
+            "Write-Output 'literal && operator || text' && Write-Output quoted-done",
+            &root,
+            5_000,
+            8 * 1024,
+            None,
+        )
+        .await;
+        assert!(
+            quoted_operator.success,
+            "quoted operator failed: {}",
+            quoted_operator.stderr
+        );
+        assert!(
+            quoted_operator
+                .stdout
+                .contains("literal && operator || text")
+        );
+        assert!(quoted_operator.stdout.contains("quoted-done"));
+
+        let nested_block = run_shell_command(
+            "& { Write-Output nested-one && Write-Output nested-two }",
+            &root,
+            5_000,
+            8 * 1024,
+            None,
+        )
+        .await;
+        assert!(
+            nested_block.success,
+            "nested chain failed: {}",
+            nested_block.stderr
+        );
+        assert!(nested_block.stdout.contains("nested-one"));
+        assert!(nested_block.stdout.contains("nested-two"));
+
         let unicode_result = run_shell_command(
             "Write-Output 'こんにちは🙂'; [Console]::Error.WriteLine('错误🙂')",
             &root,

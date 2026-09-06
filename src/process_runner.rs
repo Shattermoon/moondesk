@@ -428,243 +428,16 @@ pub fn process_tree_size(_root_pid: u32) -> Option<usize> {
 }
 
 #[cfg(windows)]
-#[derive(Clone, Copy)]
-enum WindowsShellChainOperator {
-    And,
-    Or,
-}
+const WINDOWS_SHELL_WRAPPER: &str = include_str!("windows_shell_wrapper.ps1");
 
 #[cfg(windows)]
-fn windows_shell_assignment_name(name: &str) -> bool {
-    let mut chars = name.chars();
-    let Some(first) = chars.next() else {
-        return false;
-    };
-    (first.is_ascii_alphabetic() || first == '_')
-        && chars.all(|character| character.is_ascii_alphanumeric() || character == '_')
-}
-
-#[cfg(windows)]
-fn windows_shell_next_word(text: &str, start: usize) -> Option<(usize, usize)> {
-    let bytes = text.as_bytes();
-    let mut index = start;
-    while index < bytes.len() && bytes[index].is_ascii_whitespace() {
-        index += 1;
-    }
-    if index >= bytes.len() {
-        return None;
-    }
-    let word_start = index;
-    let mut in_single = false;
-    let mut in_double = false;
-    let mut escaped = false;
-    while index < bytes.len() {
-        let byte = bytes[index];
-        if escaped {
-            escaped = false;
-            index += 1;
-            continue;
-        }
-        if byte == b'`' && !in_single {
-            escaped = true;
-            index += 1;
-            continue;
-        }
-        if byte == b'\'' && !in_double {
-            in_single = !in_single;
-            index += 1;
-            continue;
-        }
-        if byte == b'"' && !in_single {
-            in_double = !in_double;
-            index += 1;
-            continue;
-        }
-        if !in_single && !in_double && byte.is_ascii_whitespace() {
-            break;
-        }
-        index += 1;
-    }
-    Some((word_start, index))
-}
-
-#[cfg(windows)]
-fn windows_shell_unquote_assignment_value(value: &str) -> &str {
-    if value.len() >= 2 {
-        let bytes = value.as_bytes();
-        if (bytes[0] == b'\'' && bytes[value.len() - 1] == b'\'')
-            || (bytes[0] == b'"' && bytes[value.len() - 1] == b'"')
-        {
-            return &value[1..value.len() - 1];
-        }
-    }
-    value
-}
-
-#[cfg(windows)]
-fn windows_shell_quote_single(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "''"))
-}
-
-#[cfg(windows)]
-fn windows_shell_rewrite_env_prefix(segment: &str) -> String {
-    let mut cursor = 0usize;
-    let mut assignments = Vec::new();
-    while let Some((start, end)) = windows_shell_next_word(segment, cursor) {
-        let word = &segment[start..end];
-        let Some((name, value)) = word.split_once('=') else {
-            break;
-        };
-        if !windows_shell_assignment_name(name) {
-            break;
-        }
-        assignments.push((
-            name.to_string(),
-            windows_shell_unquote_assignment_value(value).to_string(),
-        ));
-        cursor = end;
-    }
-    if assignments.is_empty() {
-        return segment.trim().to_string();
-    }
-
-    let mut rewritten = String::new();
-    for (name, value) in assignments {
-        rewritten.push_str("$env:");
-        rewritten.push_str(&name);
-        rewritten.push('=');
-        rewritten.push_str(&windows_shell_quote_single(&value));
-        rewritten.push_str("; ");
-    }
-    rewritten.push_str(segment[cursor..].trim_start());
-    rewritten
-}
-
-#[cfg(windows)]
-fn windows_shell_split_chain(
-    command: &str,
-) -> Option<(Vec<String>, Vec<WindowsShellChainOperator>)> {
-    let bytes = command.as_bytes();
-    let mut segments = Vec::new();
-    let mut operators = Vec::new();
-    let mut start = 0usize;
-    let mut index = 0usize;
-    let mut in_single = false;
-    let mut in_double = false;
-    let mut in_comment = false;
-    let mut escaped = false;
-
-    while index < bytes.len() {
-        let byte = bytes[index];
-        if in_comment {
-            if matches!(byte, b'\r' | b'\n') {
-                in_comment = false;
-            }
-            index += 1;
-            continue;
-        }
-        if escaped {
-            escaped = false;
-            index += 1;
-            continue;
-        }
-        if byte == b'`' && !in_single {
-            escaped = true;
-            index += 1;
-            continue;
-        }
-        if byte == b'\'' && !in_double {
-            in_single = !in_single;
-            index += 1;
-            continue;
-        }
-        if byte == b'"' && !in_single {
-            in_double = !in_double;
-            index += 1;
-            continue;
-        }
-        if byte == b'#' && !in_single && !in_double {
-            in_comment = true;
-            index += 1;
-            continue;
-        }
-        if in_single || in_double || index + 1 >= bytes.len() {
-            index += 1;
-            continue;
-        }
-
-        let operator = match (bytes[index], bytes[index + 1]) {
-            (b'&', b'&') => Some(WindowsShellChainOperator::And),
-            (b'|', b'|') => Some(WindowsShellChainOperator::Or),
-            _ => None,
-        };
-        if let Some(operator) = operator {
-            let segment = command[start..index].trim();
-            if segment.is_empty() {
-                return None;
-            }
-            segments.push(windows_shell_rewrite_env_prefix(segment));
-            operators.push(operator);
-            index += 2;
-            start = index;
-            continue;
-        }
-        index += 1;
-    }
-
-    if operators.is_empty() {
-        return None;
-    }
-    let tail = command[start..].trim();
-    if tail.is_empty() {
-        return None;
-    }
-    segments.push(windows_shell_rewrite_env_prefix(tail));
-    Some((segments, operators))
-}
-
-#[cfg(windows)]
-fn windows_shell_record_status(script: &mut String) {
-    script.push_str("\n$__moondesk_chain_ok=$?\n");
-    script.push_str(
-        "$__moondesk_chain_code=if ($__moondesk_chain_ok) {0} elseif ($LASTEXITCODE -ne 0) {$LASTEXITCODE} else {1}\n",
-    );
-}
-
-#[cfg(windows)]
-fn windows_shell_compatible_command(command: &str) -> String {
-    let Some((segments, operators)) = windows_shell_split_chain(command) else {
-        let mut script = String::from("$global:LASTEXITCODE=0\n");
-        script.push_str(&windows_shell_rewrite_env_prefix(command));
-        windows_shell_record_status(&mut script);
-        script.push_str("if (-not $__moondesk_chain_ok) { exit $__moondesk_chain_code }\n");
-        return script;
-    };
-
-    let mut script = String::from("$global:LASTEXITCODE=0\n");
-    script.push_str(&segments[0]);
-    windows_shell_record_status(&mut script);
-    for (operator, segment) in operators.into_iter().zip(segments.iter().skip(1)) {
-        match operator {
-            WindowsShellChainOperator::And => script.push_str("if ($__moondesk_chain_ok) {\n"),
-            WindowsShellChainOperator::Or => script.push_str("if (-not $__moondesk_chain_ok) {\n"),
-        }
-        script.push_str("$global:LASTEXITCODE=0\n");
-        script.push_str(segment);
-        windows_shell_record_status(&mut script);
-        script.push_str("}\n");
-    }
-    script.push_str("if (-not $__moondesk_chain_ok) { exit $__moondesk_chain_code }\n");
-    script
-}
+const WINDOWS_SHELL_SOURCE_ENV: &str = "MOONDESK_INTERNAL_WINDOWS_COMMAND";
 
 fn shell_command(command: &str) -> Command {
     #[cfg(windows)]
     {
-        let compatible_command = windows_shell_compatible_command(command);
-        let script = format!(
-            "[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false)\n$OutputEncoding=[Console]::OutputEncoding\n{compatible_command}"
-        );
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let script = WINDOWS_SHELL_WRAPPER.replace("__MOONDESK_SUFFIX__", &suffix);
         let mut shell = Command::new("powershell.exe");
         shell
             .arg("-NoLogo")
@@ -673,7 +446,8 @@ fn shell_command(command: &str) -> Command {
             .arg("-ExecutionPolicy")
             .arg("Bypass")
             .arg("-Command")
-            .arg(script);
+            .arg(script)
+            .env(WINDOWS_SHELL_SOURCE_ENV, command);
         shell
     }
 
@@ -1357,6 +1131,75 @@ $listener.Stop()
         assert!(!operators_in_comment.stdout.contains("should-not-run"));
         assert!(!operators_in_comment.stdout.contains("neither"));
 
+        let hash_in_bareword = run_shell_command(
+            "Write-Output file#name.txt && Write-Output after-hash",
+            &root,
+            5_000,
+            8 * 1024,
+            None,
+        )
+        .await;
+        assert!(
+            hash_in_bareword.success,
+            "hash in bareword broke chain parsing: {}",
+            hash_in_bareword.stderr
+        );
+        assert!(hash_in_bareword.stdout.contains("file#name.txt"));
+        assert!(hash_in_bareword.stdout.contains("after-hash"));
+
+        let block_comment = run_shell_command(
+            "Write-Output before-block <# block\n&& Write-Output hidden\n#> && Write-Output after-block",
+            &root,
+            5_000,
+            8 * 1024,
+            None,
+        )
+        .await;
+        assert!(
+            block_comment.success,
+            "block comment broke chain parsing: {}",
+            block_comment.stderr
+        );
+        assert!(block_comment.stdout.contains("before-block"));
+        assert!(block_comment.stdout.contains("after-block"));
+        assert!(!block_comment.stdout.contains("hidden"));
+
+        let single_here_string = run_shell_command(
+            r#"@'
+it's && literal
+'@ && Write-Output after-single-here"#,
+            &root,
+            5_000,
+            8 * 1024,
+            None,
+        )
+        .await;
+        assert!(
+            single_here_string.success,
+            "single-quoted here-string broke chain parsing: {}",
+            single_here_string.stderr
+        );
+        assert!(single_here_string.stdout.contains("it's && literal"));
+        assert!(single_here_string.stdout.contains("after-single-here"));
+
+        let double_here_string = run_shell_command(
+            r#"@"
+value && literal
+"@ && Write-Output after-double-here"#,
+            &root,
+            5_000,
+            8 * 1024,
+            None,
+        )
+        .await;
+        assert!(
+            double_here_string.success,
+            "double-quoted here-string broke chain parsing: {}",
+            double_here_string.stderr
+        );
+        assert!(double_here_string.stdout.contains("value && literal"));
+        assert!(double_here_string.stdout.contains("after-double-here"));
+
         let env_result = run_shell_command(
             "MOONDESK_SHELL_COMPAT=visible Write-Output $env:MOONDESK_SHELL_COMPAT",
             &root,
@@ -1371,6 +1214,21 @@ $listener.Stop()
             env_result.stderr
         );
         assert_eq!(env_result.stdout.trim(), "visible");
+
+        let internal_transport_env = run_shell_command(
+            "if ($null -eq $env:MOONDESK_INTERNAL_WINDOWS_COMMAND) { Write-Output hidden } else { Write-Output leaked }",
+            &root,
+            5_000,
+            8 * 1024,
+            None,
+        )
+        .await;
+        assert!(
+            internal_transport_env.success,
+            "internal transport env check failed: {}",
+            internal_transport_env.stderr
+        );
+        assert_eq!(internal_transport_env.stdout.trim(), "hidden");
 
         let spaced_env = run_shell_command(
             "MOONDESK_SPACE='hello world' MOONDESK_TWO=second Write-Output \"$env:MOONDESK_SPACE|$env:MOONDESK_TWO\"",

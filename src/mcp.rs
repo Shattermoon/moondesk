@@ -322,7 +322,7 @@ async fn handle_tools_list(
             tools.push(json!({
                 "name": "run_command",
                 "title": "Run command",
-                "description": "Execute a short command in the user's normal developer shell with the workspace root as its working directory. The shell inherits the user's normal PATH, home directory, environment, and OS permissions; it is not an OS filesystem sandbox. Prefer dedicated workspace file tools when they can complete the task. Common directory-listing commands may be compacted before execution. For commands that may produce large output, prefer start_command plus poll_command. If a one-shot command exceeds the inline capture limit, run_command returns outputId and read_command_output can retrieve the complete preserved stdout/stderr without rerunning it.",
+                "description": "Execute a short command in the user's normal developer shell with the workspace root as its working directory. The shell inherits the user's normal PATH, home directory, environment, and OS permissions; it is not an OS filesystem sandbox. On Windows MoonDesk uses PowerShell while accepting common agent-generated &&, ||, and NAME=value command syntax for cross-platform CLI workflows. Prefer dedicated workspace file tools when they can complete the task. Common directory-listing commands may be compacted before execution. For commands that may produce large output, prefer start_command plus poll_command. If a one-shot command exceeds the inline capture limit, run_command returns outputId and read_command_output can retrieve the complete preserved stdout/stderr without rerunning it.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -345,7 +345,7 @@ async fn handle_tools_list(
             tools.push(json!({
                 "name": "start_command",
                 "title": "Start command",
-                "description": "Start a long-running command in the user's normal developer shell with the workspace root as its working directory and return a job ID immediately. The shell inherits normal user environment and OS permissions and is not an OS filesystem sandbox. Prefer this for builds, compilation, dependency installation, long test suites, and development servers instead of keeping run_command open. Exact running duplicates are reused by default; the response reports reusedExisting plus the job's current elapsed and timeout values.",
+                "description": "Start a long-running command in the user's normal developer shell with the workspace root as its working directory and return a job ID immediately. The shell inherits normal user environment and OS permissions and is not an OS filesystem sandbox. On Windows it has the same compatibility handling as run_command for common &&, ||, and NAME=value command syntax. Prefer this for builds, compilation, dependency installation, long test suites, and development servers instead of keeping run_command open. Exact running duplicates are reused by default; the response reports reusedExisting plus the job's current elapsed and timeout values.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -1582,7 +1582,7 @@ Always specify the branch explicitly when using `git push`."#
 
     if mode.computer_enabled() && tool_mode.run_command_enabled() {
         lines.push(
-            "Use run_command only as a last resort when the available dedicated tools cannot complete the operation, and keep it for short commands that should finish quickly. It is a real developer shell with the workspace as CWD, not an OS sandbox: it inherits normal user PATH/environment and can access other paths permitted to the MoonDesk user."
+            "Use run_command only as a last resort when the available dedicated tools cannot complete the operation, and keep it for short commands that should finish quickly. It is a real developer shell with the workspace as CWD, not an OS sandbox: it inherits normal user PATH/environment and can access other paths permitted to the MoonDesk user. On Windows MoonDesk uses PowerShell but accepts common cross-platform agent syntax such as command1 && command2, command1 || fallback, and NAME=value command."
                 .to_string(),
         );
         lines.push(
@@ -2809,7 +2809,7 @@ mod tests {
         let workspace_root_str = workspace_root.to_string_lossy().into_owned();
         let command_jobs = CommandJobManager::new();
         let command = if cfg!(windows) {
-            "Start-Sleep -Milliseconds 150; Write-Output job-done"
+            "Start-Sleep -Milliseconds 150 && Write-Output job-done"
         } else {
             "sleep 0.15; printf 'job-done\\n'"
         };
@@ -2962,6 +2962,75 @@ mod tests {
         assert!(structured.get("exitCode").is_none());
         assert_eq!(seen_output.matches("job-done").count(), 1);
 
+        let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn start_command_preserves_native_status_across_chain_bookkeeping() {
+        let workspace_root =
+            std::env::temp_dir().join(format!("moondesk-mcp-status-job-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        let workspace_root_str = workspace_root.to_string_lossy().into_owned();
+        let command_jobs = CommandJobManager::new();
+        let start_req = tool_call_request(
+            "start_command",
+            json!({
+                "command": "Write-Output chain && Write-Output compat; cmd /c exit 7; Write-Output (\"background-status=$? code=$LASTEXITCODE\")",
+                "timeout": 15_000
+            }),
+        );
+        let start_response = handle_tools_call(
+            &start_req,
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &None,
+        )
+        .await;
+        let job_id = start_response
+            .result
+            .as_ref()
+            .and_then(|result| result.get("structuredContent"))
+            .and_then(|structured| structured.get("jobId"))
+            .and_then(Value::as_str)
+            .expect("missing background job id")
+            .to_string();
+
+        let mut cursor = 0;
+        let mut terminal = None;
+        for _ in 0..30 {
+            let snapshot = command_jobs
+                .poll(&job_id, cursor, 250)
+                .await
+                .expect("poll background status job");
+            cursor = snapshot.next_cursor;
+            if snapshot.state.is_terminal() {
+                terminal = Some(
+                    command_jobs
+                        .poll(&job_id, 0, 0)
+                        .await
+                        .expect("read terminal background status job"),
+                );
+                break;
+            }
+        }
+        let terminal = terminal.expect("background status job did not finish");
+        let stdout = terminal
+            .events
+            .iter()
+            .filter(|event| event.stream == "stdout")
+            .map(|event| event.text.as_str())
+            .collect::<String>();
+
+        assert_eq!(
+            terminal.state,
+            crate::command_jobs::CommandJobState::Succeeded
+        );
+        assert_eq!(terminal.exit_code, Some(0));
+        assert!(stdout.contains("background-status=False code=7"));
         let _ = std::fs::remove_dir_all(workspace_root);
     }
 
@@ -3344,6 +3413,89 @@ mod tests {
             .and_then(|result| result.get("structuredContent"))
             .expect("missing run_command structured result");
         assert!(structured.get("exitCode").is_none());
+
+        let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn run_command_supports_agent_style_and_or_and_env_prefix_syntax_on_windows() {
+        let workspace_root = std::env::temp_dir().join(format!(
+            "moondesk-mcp-windows-shell-compat-{}",
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        let workspace_root_str = workspace_root.to_string_lossy().into_owned();
+        let command_jobs = CommandJobManager::new();
+
+        for (command, expected) in [
+            ("Write-Output one && Write-Output two", "two"),
+            ("cmd /c exit 7 || Write-Output recovered", "recovered"),
+            (
+                "MOONDESK_MCP_SHELL_COMPAT=visible Write-Output $env:MOONDESK_MCP_SHELL_COMPAT",
+                "visible",
+            ),
+            ("Write-Output 'こんにちは🙂'", "こんにちは🙂"),
+        ] {
+            let response = handle_tools_call(
+                &tool_call_request("run_command", json!({ "command": command })),
+                &workspace_root_str,
+                Mode::Both,
+                ToolMode::MultiTools,
+                false,
+                &command_jobs,
+                &None,
+            )
+            .await;
+            assert_ne!(
+                response
+                    .result
+                    .as_ref()
+                    .and_then(|result| result.get("isError"))
+                    .and_then(Value::as_bool),
+                Some(true),
+                "run_command failed for {command:?}: {:?}",
+                response.result
+            );
+            let stdout = response
+                .result
+                .as_ref()
+                .and_then(|result| result.get("structuredContent"))
+                .and_then(|structured| structured.get("stdout"))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            assert!(
+                stdout.contains(expected),
+                "run_command output for {command:?} did not contain {expected:?}: {stdout}"
+            );
+        }
+
+        let failed = handle_tools_call(
+            &tool_call_request(
+                "run_command",
+                json!({ "command": "cmd /c exit 7 && Write-Output should-not-run" }),
+            ),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &None,
+        )
+        .await;
+        let structured = failed
+            .result
+            .as_ref()
+            .and_then(|result| result.get("structuredContent"))
+            .expect("failed run_command structured result");
+        assert_eq!(structured.get("exitCode").and_then(Value::as_i64), Some(7));
+        assert!(
+            !structured
+                .get("stdout")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .contains("should-not-run")
+        );
 
         let _ = std::fs::remove_dir_all(workspace_root);
     }

@@ -427,9 +427,17 @@ pub fn process_tree_size(_root_pid: u32) -> Option<usize> {
     None
 }
 
+#[cfg(windows)]
+const WINDOWS_SHELL_WRAPPER: &str = include_str!("windows_shell_wrapper.ps1");
+
+#[cfg(windows)]
+const WINDOWS_SHELL_SOURCE_ENV: &str = "MOONDESK_INTERNAL_WINDOWS_COMMAND";
+
 fn shell_command(command: &str) -> Command {
     #[cfg(windows)]
     {
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let script = WINDOWS_SHELL_WRAPPER.replace("__MOONDESK_SUFFIX__", &suffix);
         let mut shell = Command::new("powershell.exe");
         shell
             .arg("-NoLogo")
@@ -438,7 +446,8 @@ fn shell_command(command: &str) -> Command {
             .arg("-ExecutionPolicy")
             .arg("Bypass")
             .arg("-Command")
-            .arg(command);
+            .arg(script)
+            .env(WINDOWS_SHELL_SOURCE_ENV, command);
         shell
     }
 
@@ -1000,6 +1009,64 @@ if (Test-Path Env:CUDA_PATH) { Write-Output "CUDA_PATH_PRESENT" }
 
     #[cfg(windows)]
     #[tokio::test]
+    async fn windows_shell_falls_back_to_native_powershell_in_constrained_language() {
+        let suffix = Uuid::new_v4().simple().to_string();
+        let wrapper = WINDOWS_SHELL_WRAPPER.replace("__MOONDESK_SUFFIX__", &suffix);
+        let script = format!(
+            "$ExecutionContext.SessionState.LanguageMode = 'ConstrainedLanguage'\n{wrapper}"
+        );
+
+        for (command, expected_code, expected_stdout) in [
+            ("Write-Output 'clm-ok'", 0, Some("clm-ok")),
+            ("cmd /c exit 7", 7, None),
+            ("Write-Error 'bad' -ErrorAction SilentlyContinue", 1, None),
+            (
+                "cmd /c exit 7; Write-Output recovered",
+                0,
+                Some("recovered"),
+            ),
+            (
+                "cmd /c exit 7; Write-Output (\"status=$?\")",
+                0,
+                Some("status=False"),
+            ),
+        ] {
+            let output = tokio::process::Command::new("powershell.exe")
+                .arg("-NoLogo")
+                .arg("-NoProfile")
+                .arg("-NonInteractive")
+                .arg("-ExecutionPolicy")
+                .arg("Bypass")
+                .arg("-Command")
+                .arg(&script)
+                .env(WINDOWS_SHELL_SOURCE_ENV, command)
+                .output()
+                .await
+                .expect("run constrained-language wrapper");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+
+            assert_eq!(
+                output.status.code(),
+                Some(expected_code),
+                "wrong CLM exit code for {command}: stdout={stdout} stderr={stderr}"
+            );
+            if let Some(expected_stdout) = expected_stdout {
+                assert!(
+                    stdout.contains(expected_stdout),
+                    "missing CLM output for {command}: stdout={stdout} stderr={stderr}"
+                );
+            }
+            assert!(
+                !stderr.contains("Cannot create type")
+                    && !stderr.contains("Method invocation is supported only on core types"),
+                "compatibility transformer ran under CLM for {command}: {stderr}"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
     async fn developer_shell_can_bind_localhost_for_dev_servers() {
         let root = workspace("localhost-bind");
         let command = r#"
@@ -1029,6 +1096,711 @@ $listener.Stop()
         assert_eq!(result.stdout.trim(), "hello");
         assert!(!result.timed_out);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_shell_supports_common_agent_boolean_chains_and_env_prefixes() {
+        let root = workspace("windows-shell-compat");
+
+        let and_result = run_shell_command(
+            "Write-Output first && Write-Output second",
+            &root,
+            15_000,
+            8 * 1024,
+            None,
+        )
+        .await;
+        assert!(
+            and_result.success,
+            "and-chain failed: {}",
+            and_result.stderr
+        );
+        assert!(and_result.stdout.contains("first"));
+        assert!(and_result.stdout.contains("second"));
+
+        let or_result = run_shell_command(
+            "cmd /c exit 7 || Write-Output recovered",
+            &root,
+            15_000,
+            8 * 1024,
+            None,
+        )
+        .await;
+        assert!(or_result.success, "or-chain failed: {}", or_result.stderr);
+        assert!(or_result.stdout.contains("recovered"));
+
+        let short_circuit = run_shell_command(
+            "cmd /c exit 7 && Write-Output should-not-run",
+            &root,
+            15_000,
+            8 * 1024,
+            None,
+        )
+        .await;
+        assert!(!short_circuit.success);
+        assert_eq!(short_circuit.exit_code, Some(7));
+        assert!(!short_circuit.stdout.contains("should-not-run"));
+
+        let native_exit = run_shell_command("cmd /c exit 11", &root, 15_000, 8 * 1024, None).await;
+        assert!(!native_exit.success);
+        assert_eq!(native_exit.exit_code, Some(11));
+
+        let commented_native_exit = run_shell_command(
+            "cmd /c exit 13 # expected failure",
+            &root,
+            15_000,
+            8 * 1024,
+            None,
+        )
+        .await;
+        assert!(!commented_native_exit.success);
+        assert_eq!(commented_native_exit.exit_code, Some(13));
+
+        let commented_chain = run_shell_command(
+            "Write-Output before-comment && cmd /c exit 17 # expected failure",
+            &root,
+            15_000,
+            8 * 1024,
+            None,
+        )
+        .await;
+        assert!(
+            !commented_chain.success,
+            "commented chain unexpectedly succeeded"
+        );
+        assert_eq!(commented_chain.exit_code, Some(17));
+        assert!(commented_chain.stdout.contains("before-comment"));
+
+        let operators_in_comment = run_shell_command(
+            "Write-Output before-only # && Write-Output should-not-run || Write-Output neither",
+            &root,
+            15_000,
+            8 * 1024,
+            None,
+        )
+        .await;
+        assert!(
+            operators_in_comment.success,
+            "operators inside comment changed execution: {}",
+            operators_in_comment.stderr
+        );
+        assert_eq!(operators_in_comment.stdout.trim(), "before-only");
+        assert!(!operators_in_comment.stdout.contains("should-not-run"));
+        assert!(!operators_in_comment.stdout.contains("neither"));
+
+        let hash_in_bareword = run_shell_command(
+            "Write-Output file#name.txt && Write-Output after-hash",
+            &root,
+            15_000,
+            8 * 1024,
+            None,
+        )
+        .await;
+        assert!(
+            hash_in_bareword.success,
+            "hash in bareword broke chain parsing: {}",
+            hash_in_bareword.stderr
+        );
+        assert!(hash_in_bareword.stdout.contains("file#name.txt"));
+        assert!(hash_in_bareword.stdout.contains("after-hash"));
+
+        let block_comment = run_shell_command(
+            "Write-Output before-block <# block\n&& Write-Output hidden\n#> && Write-Output after-block",
+            &root,
+            15_000,
+            8 * 1024,
+            None,
+        )
+        .await;
+        assert!(
+            block_comment.success,
+            "block comment broke chain parsing: {}",
+            block_comment.stderr
+        );
+        assert!(block_comment.stdout.contains("before-block"));
+        assert!(block_comment.stdout.contains("after-block"));
+        assert!(!block_comment.stdout.contains("hidden"));
+
+        let single_here_string = run_shell_command(
+            r#"@'
+it's && literal
+'@ && Write-Output after-single-here"#,
+            &root,
+            15_000,
+            8 * 1024,
+            None,
+        )
+        .await;
+        assert!(
+            single_here_string.success,
+            "single-quoted here-string broke chain parsing: {}",
+            single_here_string.stderr
+        );
+        assert!(single_here_string.stdout.contains("it's && literal"));
+        assert!(single_here_string.stdout.contains("after-single-here"));
+
+        let double_here_string = run_shell_command(
+            r#"@"
+value && literal
+"@ && Write-Output after-double-here"#,
+            &root,
+            15_000,
+            8 * 1024,
+            None,
+        )
+        .await;
+        assert!(
+            double_here_string.success,
+            "double-quoted here-string broke chain parsing: {}",
+            double_here_string.stderr
+        );
+        assert!(double_here_string.stdout.contains("value && literal"));
+        assert!(double_here_string.stdout.contains("after-double-here"));
+
+        let env_result = run_shell_command(
+            "MOONDESK_SHELL_COMPAT=visible Write-Output $env:MOONDESK_SHELL_COMPAT",
+            &root,
+            15_000,
+            8 * 1024,
+            None,
+        )
+        .await;
+        assert!(
+            env_result.success,
+            "env-prefix failed: {}",
+            env_result.stderr
+        );
+        assert_eq!(env_result.stdout.trim(), "visible");
+
+        let internal_transport_env = run_shell_command(
+            "if ($null -eq $env:MOONDESK_INTERNAL_WINDOWS_COMMAND) { Write-Output hidden } else { Write-Output leaked }",
+            &root,
+            15_000,
+            8 * 1024,
+            None,
+        )
+        .await;
+        assert!(
+            internal_transport_env.success,
+            "internal transport env check failed: {}",
+            internal_transport_env.stderr
+        );
+        assert_eq!(internal_transport_env.stdout.trim(), "hidden");
+
+        let spaced_env = run_shell_command(
+            "MOONDESK_SPACE='hello world' MOONDESK_TWO=second Write-Output \"$env:MOONDESK_SPACE|$env:MOONDESK_TWO\"",
+            &root,
+            15_000,
+            8 * 1024,
+            None,
+        )
+        .await;
+        assert!(
+            spaced_env.success,
+            "spaced env prefix failed: {}",
+            spaced_env.stderr
+        );
+        assert_eq!(spaced_env.stdout.trim(), "hello world|second");
+
+        let escaped_single_env = run_shell_command(
+            "MOONDESK_APOSTROPHE='don''t' Write-Output $env:MOONDESK_APOSTROPHE",
+            &root,
+            15_000,
+            8 * 1024,
+            None,
+        )
+        .await;
+        assert!(
+            escaped_single_env.success,
+            "single-quoted env escape failed: {}",
+            escaped_single_env.stderr
+        );
+        assert_eq!(escaped_single_env.stdout.trim(), "don't");
+
+        let escaped_double_env = run_shell_command(
+            "MOONDESK_BACKTICK=\"left`tvalue\" Write-Output ($env:MOONDESK_BACKTICK -replace \"`t\", \"|\")",
+            &root,
+            15_000,
+            8 * 1024,
+            None,
+        )
+        .await;
+        assert!(
+            escaped_double_env.success,
+            "double-quoted env escape failed: {}",
+            escaped_double_env.stderr
+        );
+        assert_eq!(escaped_double_env.stdout.trim(), "left|value");
+
+        let scoped_env = run_shell_command(
+            "MOONDESK_SCOPED=visible Write-Output (\"prefixed=$env:MOONDESK_SCOPED\"); Write-Output (\"later=$([string]$env:MOONDESK_SCOPED)\")",
+            &root,
+            15_000,
+            8 * 1024,
+            None,
+        )
+        .await;
+        assert!(
+            scoped_env.success,
+            "scoped env prefix failed: {}",
+            scoped_env.stderr
+        );
+        assert!(scoped_env.stdout.contains("prefixed=visible"));
+        assert!(scoped_env.stdout.contains("later="));
+        assert!(!scoped_env.stdout.contains("later=visible"));
+
+        let restored_env = run_shell_command(
+            "$env:MOONDESK_RESTORE='original'; MOONDESK_RESTORE=temporary Write-Output (\"inside=$env:MOONDESK_RESTORE\"); Write-Output (\"after=$env:MOONDESK_RESTORE\")",
+            &root,
+            15_000,
+            8 * 1024,
+            None,
+        )
+        .await;
+        assert!(
+            restored_env.success,
+            "existing env restoration failed: {}",
+            restored_env.stderr
+        );
+        assert!(restored_env.stdout.contains("inside=temporary"));
+        assert!(restored_env.stdout.contains("after=original"));
+
+        let case_insensitive_restore = run_shell_command(
+            "$env:MoOnDeSk_CaSe_ReStOrE='original'; MOONDESK_CASE_RESTORE=temporary Write-Output (\"case-inside=$env:MOONDESK_CASE_RESTORE\"); Write-Output (\"case-after=$env:moondesk_case_restore\")",
+            &root,
+            15_000,
+            8 * 1024,
+            None,
+        )
+        .await;
+        assert!(
+            case_insensitive_restore.success,
+            "case-insensitive env restoration failed: {}",
+            case_insensitive_restore.stderr
+        );
+        assert!(
+            case_insensitive_restore
+                .stdout
+                .contains("case-inside=temporary")
+        );
+        assert!(
+            case_insensitive_restore
+                .stdout
+                .contains("case-after=original")
+        );
+
+        let empty_env = run_shell_command(
+            "MOONDESK_EMPTY_PREFIX='' Write-Output (\"empty-prefix=$([Environment]::GetEnvironmentVariables('Process').Contains('MOONDESK_EMPTY_PREFIX'))\"); Write-Output (\"empty-after=$([Environment]::GetEnvironmentVariables('Process').Contains('MOONDESK_EMPTY_PREFIX'))\")",
+            &root,
+            15_000,
+            8 * 1024,
+            None,
+        )
+        .await;
+        assert!(
+            empty_env.success,
+            "empty env prefix failed: {}",
+            empty_env.stderr
+        );
+        assert!(empty_env.stdout.contains("empty-prefix=True"));
+        assert!(empty_env.stdout.contains("empty-after=False"));
+
+        let restored_empty_env = run_shell_command(
+            "$__native=[System.Object].Assembly.GetType('Microsoft.Win32.Win32Native').GetMethod('SetEnvironmentVariable',[System.Reflection.BindingFlags]'NonPublic,Static'); [void]$__native.Invoke($null,@('MOONDESK_EMPTY_RESTORE','')); Write-Output (\"empty-before=$([Environment]::GetEnvironmentVariables('Process').Contains('MOONDESK_EMPTY_RESTORE'))|$(([string][Environment]::GetEnvironmentVariable('MOONDESK_EMPTY_RESTORE',[EnvironmentVariableTarget]::Process)).Length)\"); MOONDESK_EMPTY_RESTORE=temporary Write-Output (\"empty-inside=$env:MOONDESK_EMPTY_RESTORE\"); Write-Output (\"empty-restored=$([Environment]::GetEnvironmentVariables('Process').Contains('MOONDESK_EMPTY_RESTORE'))|$(([string][Environment]::GetEnvironmentVariable('MOONDESK_EMPTY_RESTORE',[EnvironmentVariableTarget]::Process)).Length)\")",
+            &root,
+            15_000,
+            8 * 1024,
+            None,
+        )
+        .await;
+        assert!(
+            restored_empty_env.success,
+            "empty env restoration failed: {}",
+            restored_empty_env.stderr
+        );
+        assert!(
+            restored_empty_env.stdout.contains("empty-before=True|0"),
+            "failed to create pre-existing empty env value: {}",
+            restored_empty_env.stdout
+        );
+        assert!(restored_empty_env.stdout.contains("empty-inside=temporary"));
+        assert!(
+            restored_empty_env.stdout.contains("empty-restored=True|0"),
+            "empty env value was not restored: {}",
+            restored_empty_env.stdout
+        );
+
+        let helper_name_collision = run_shell_command(
+            "function Set-MoonDeskProcessEnvironment { param($name,$value) Write-Output (\"hijacked=$name\") }; MOONDESK_HELPER_COLLISION=visible Write-Output (\"collision-inside=$env:MOONDESK_HELPER_COLLISION\"); Write-Output (\"collision-after=$([string]$env:MOONDESK_HELPER_COLLISION)\")",
+            &root,
+            15_000,
+            8 * 1024,
+            None,
+        )
+        .await;
+        assert!(
+            helper_name_collision.success,
+            "user-defined helper name intercepted env scoping: {}",
+            helper_name_collision.stderr
+        );
+        assert!(
+            helper_name_collision
+                .stdout
+                .contains("collision-inside=visible")
+        );
+        assert!(helper_name_collision.stdout.contains("collision-after="));
+        assert!(!helper_name_collision.stdout.contains("hijacked="));
+
+        let chain_scoped_env = run_shell_command(
+            "MOONDESK_CHAIN_SCOPE=visible Write-Output (\"chain-first=$env:MOONDESK_CHAIN_SCOPE\") && Write-Output (\"chain-second=$([string]$env:MOONDESK_CHAIN_SCOPE)\")",
+            &root,
+            15_000,
+            8 * 1024,
+            None,
+        )
+        .await;
+        assert!(
+            chain_scoped_env.success,
+            "chain env scoping failed: {}",
+            chain_scoped_env.stderr
+        );
+        assert!(chain_scoped_env.stdout.contains("chain-first=visible"));
+        assert!(chain_scoped_env.stdout.contains("chain-second="));
+        assert!(!chain_scoped_env.stdout.contains("chain-second=visible"));
+
+        let prefixed_failure = run_shell_command(
+            "MOONDESK_FAILURE_SCOPE=visible cmd /c exit 41 || Write-Output (\"recovered=$([string]$env:MOONDESK_FAILURE_SCOPE)\")",
+            &root,
+            15_000,
+            8 * 1024,
+            None,
+        )
+        .await;
+        assert!(
+            prefixed_failure.success,
+            "prefixed failure did not preserve chain status: {}",
+            prefixed_failure.stderr
+        );
+        assert_eq!(prefixed_failure.stdout.trim(), "recovered=");
+
+        let restored_after_failure = run_shell_command(
+            "$env:MOONDESK_FAILURE_RESTORE='original'; MOONDESK_FAILURE_RESTORE=temporary cmd /c exit 43 || Write-Output (\"failure-after=$env:MOONDESK_FAILURE_RESTORE\")",
+            &root,
+            15_000,
+            8 * 1024,
+            None,
+        )
+        .await;
+        assert!(
+            restored_after_failure.success,
+            "failed env-prefixed command did not restore before fallback: {}",
+            restored_after_failure.stderr
+        );
+        assert_eq!(
+            restored_after_failure.stdout.trim(),
+            "failure-after=original"
+        );
+
+        let direct_prefixed_failure = run_shell_command(
+            "MOONDESK_DIRECT_FAILURE=visible cmd /c exit 42",
+            &root,
+            15_000,
+            8 * 1024,
+            None,
+        )
+        .await;
+        assert!(!direct_prefixed_failure.success);
+        assert_eq!(direct_prefixed_failure.exit_code, Some(42));
+
+        let prefixed_expression_failure = run_shell_command(
+            "MOONDESK_EXPR_FAILURE=visible (cmd /c exit 47)",
+            &root,
+            15_000,
+            8 * 1024,
+            None,
+        )
+        .await;
+        assert!(!prefixed_expression_failure.success);
+        assert_eq!(prefixed_expression_failure.exit_code, Some(47));
+
+        for (command, expected) in [
+            (
+                "MOONDESK_EXPR=visible $(cmd /c exit 47; Write-Output recovered)",
+                "recovered",
+            ),
+            (
+                "MOONDESK_EXPR=visible & { cmd /c exit 47; Write-Output recovered-block }",
+                "recovered-block",
+            ),
+        ] {
+            let recovered_expression =
+                run_shell_command(command, &root, 15_000, 8 * 1024, None).await;
+            assert!(
+                recovered_expression.success,
+                "recovered prefixed expression failed: {command}: {}",
+                recovered_expression.stderr
+            );
+            assert_eq!(recovered_expression.stdout.trim(), expected);
+        }
+
+        let nested_env = run_shell_command(
+            "MOONDESK_NEST=outer & { MOONDESK_NEST=inner Write-Output (\"inner=$env:MOONDESK_NEST\"); Write-Output (\"outer-restored=$env:MOONDESK_NEST\") }; Write-Output (\"nested-after=$([string]$env:MOONDESK_NEST)\")",
+            &root,
+            15_000,
+            8 * 1024,
+            None,
+        )
+        .await;
+        assert!(
+            nested_env.success,
+            "nested env prefix failed: {}",
+            nested_env.stderr
+        );
+        assert!(nested_env.stdout.contains("inner=inner"));
+        assert!(nested_env.stdout.contains("outer-restored=outer"));
+        assert!(nested_env.stdout.contains("nested-after="));
+        assert!(!nested_env.stdout.contains("nested-after=outer"));
+        assert!(!nested_env.stdout.contains("nested-after=inner"));
+
+        for (command, expected_code) in [
+            (
+                "$null = (cmd /c exit 31 && Write-Output should-not-run)",
+                31,
+            ),
+            (
+                "$null = $(cmd /c exit 32 && Write-Output should-not-run)",
+                32,
+            ),
+            (
+                "$null = @(cmd /c exit 33 && Write-Output should-not-run)",
+                33,
+            ),
+        ] {
+            let expression_failure =
+                run_shell_command(command, &root, 15_000, 8 * 1024, None).await;
+            assert!(
+                !expression_failure.success,
+                "failing expression chain unexpectedly succeeded: {command}"
+            );
+            assert_eq!(
+                expression_failure.exit_code,
+                Some(expected_code),
+                "wrong expression-chain exit code: {command}"
+            );
+            assert!(!expression_failure.stdout.contains("should-not-run"));
+        }
+
+        let later_statement_wins = run_shell_command(
+            "if ($true) { cmd /c exit 34 && Write-Output should-not-run; Write-Output recovered-inside-if }",
+            &root,
+            15_000,
+            8 * 1024,
+            None,
+        )
+        .await;
+        assert!(
+            later_statement_wins.success,
+            "later successful statement did not supersede earlier chain failure: {}",
+            later_statement_wins.stderr
+        );
+        assert!(later_statement_wins.stdout.contains("recovered-inside-if"));
+        assert!(!later_statement_wins.stdout.contains("should-not-run"));
+
+        let quoted_operator = run_shell_command(
+            "Write-Output 'literal && operator || text' && Write-Output quoted-done",
+            &root,
+            15_000,
+            8 * 1024,
+            None,
+        )
+        .await;
+        assert!(
+            quoted_operator.success,
+            "quoted operator failed: {}",
+            quoted_operator.stderr
+        );
+        assert!(
+            quoted_operator
+                .stdout
+                .contains("literal && operator || text")
+        );
+        assert!(quoted_operator.stdout.contains("quoted-done"));
+
+        let nested_block = run_shell_command(
+            "& { Write-Output nested-one && Write-Output nested-two }",
+            &root,
+            15_000,
+            8 * 1024,
+            None,
+        )
+        .await;
+        assert!(
+            nested_block.success,
+            "nested chain failed: {}",
+            nested_block.stderr
+        );
+        assert!(nested_block.stdout.contains("nested-one"));
+        assert!(nested_block.stdout.contains("nested-two"));
+
+        let unicode_result = run_shell_command(
+            "Write-Output 'こんにちは🙂'; [Console]::Error.WriteLine('错误🙂')",
+            &root,
+            15_000,
+            8 * 1024,
+            None,
+        )
+        .await;
+        assert!(
+            unicode_result.success,
+            "unicode command failed: {}",
+            unicode_result.stderr
+        );
+        assert!(unicode_result.stdout.contains("こんにちは🙂"));
+        assert!(unicode_result.stderr.contains("错误🙂"));
+
+        let mixed_result = run_shell_command(
+            "Write-Output begin && cmd /c exit 9 || Write-Output fallback && Write-Output end",
+            &root,
+            15_000,
+            8 * 1024,
+            None,
+        )
+        .await;
+        assert!(
+            mixed_result.success,
+            "mixed chain failed: {}",
+            mixed_result.stderr
+        );
+        for expected in ["begin", "fallback", "end"] {
+            assert!(
+                mixed_result.stdout.contains(expected),
+                "missing {expected}: {}",
+                mixed_result.stdout
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_shell_preserves_native_failure_status_for_next_statement() {
+        let root = workspace("windows-native-status");
+        let result = run_shell_command(
+            "cmd /c exit 7; Write-Output (\"native-status=$? code=$LASTEXITCODE\")",
+            &root,
+            15_000,
+            8 * 1024,
+            None,
+        )
+        .await;
+        let _ = std::fs::remove_dir_all(root);
+
+        assert!(result.success, "status probe failed: {}", result.stderr);
+        assert_eq!(result.stdout.trim(), "native-status=False code=7");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_shell_preserves_nonterminating_error_status_for_next_statement() {
+        let get_item_root = workspace("windows-cmdlet-status");
+        let get_item = run_shell_command(
+            "Get-Item '__moondesk_missing_status_probe__' -ErrorAction SilentlyContinue; Write-Output (\"cmdlet-status=$?\")",
+            &get_item_root,
+            15_000,
+            8 * 1024,
+            None,
+        )
+        .await;
+        let _ = std::fs::remove_dir_all(get_item_root);
+        assert!(
+            get_item.success,
+            "cmdlet status probe failed: {}",
+            get_item.stderr
+        );
+        assert_eq!(get_item.stdout.trim(), "cmdlet-status=False");
+
+        let write_error_root = workspace("windows-write-error-status");
+        let write_error = run_shell_command(
+            "Write-Error 'audit-error' -ErrorAction SilentlyContinue; Write-Output (\"writeerror-status=$?\")",
+            &write_error_root,
+            15_000,
+            8 * 1024,
+            None,
+        )
+        .await;
+        let _ = std::fs::remove_dir_all(write_error_root);
+        assert!(
+            write_error.success,
+            "Write-Error status probe failed: {}",
+            write_error.stderr
+        );
+        assert_eq!(write_error.stdout.trim(), "writeerror-status=False");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_shell_preserves_native_failure_status_for_if_branch() {
+        let root = workspace("windows-status-if");
+        let result = run_shell_command(
+            "cmd /c exit 7; if ($?) { Write-Output yes } else { Write-Output no }",
+            &root,
+            15_000,
+            8 * 1024,
+            None,
+        )
+        .await;
+        let _ = std::fs::remove_dir_all(root);
+
+        assert!(result.success, "status branch failed: {}", result.stderr);
+        assert_eq!(result.stdout.trim(), "no");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_shell_preserves_saved_status_after_native_failure() {
+        let root = workspace("windows-status-save");
+        let result = run_shell_command(
+            "cmd /c exit 7; $saved=$?; cmd /c exit 0; Write-Output (\"saved=$saved\")",
+            &root,
+            15_000,
+            8 * 1024,
+            None,
+        )
+        .await;
+        let _ = std::fs::remove_dir_all(root);
+
+        assert!(
+            result.success,
+            "saved status probe failed: {}",
+            result.stderr
+        );
+        assert_eq!(result.stdout.trim(), "saved=False");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_chain_bookkeeping_preserves_status_for_untouched_statements() {
+        let root = workspace("windows-chain-status-boundary");
+        let result = run_shell_command(
+            "$Error.Clear(); Write-Output chain && Write-Output compat; cmd /c exit 7; Write-Output (\"after-chain=$? code=$LASTEXITCODE errors=$($Error.Count)\")",
+            &root,
+            15_000,
+            8 * 1024,
+            None,
+        )
+        .await;
+        let _ = std::fs::remove_dir_all(root);
+
+        assert!(
+            result.success,
+            "mixed status probe failed: {}",
+            result.stderr
+        );
+        assert!(result.stdout.contains("chain"));
+        assert!(result.stdout.contains("compat"));
+        assert!(result.stdout.contains("after-chain=False code=7 errors=0"));
     }
 
     #[tokio::test]

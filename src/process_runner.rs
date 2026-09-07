@@ -1009,6 +1009,64 @@ if (Test-Path Env:CUDA_PATH) { Write-Output "CUDA_PATH_PRESENT" }
 
     #[cfg(windows)]
     #[tokio::test]
+    async fn windows_shell_falls_back_to_native_powershell_in_constrained_language() {
+        let suffix = Uuid::new_v4().simple().to_string();
+        let wrapper = WINDOWS_SHELL_WRAPPER.replace("__MOONDESK_SUFFIX__", &suffix);
+        let script = format!(
+            "$ExecutionContext.SessionState.LanguageMode = 'ConstrainedLanguage'\n{wrapper}"
+        );
+
+        for (command, expected_code, expected_stdout) in [
+            ("Write-Output 'clm-ok'", 0, Some("clm-ok")),
+            ("cmd /c exit 7", 7, None),
+            ("Write-Error 'bad' -ErrorAction SilentlyContinue", 1, None),
+            (
+                "cmd /c exit 7; Write-Output recovered",
+                0,
+                Some("recovered"),
+            ),
+            (
+                "cmd /c exit 7; Write-Output (\"status=$?\")",
+                0,
+                Some("status=False"),
+            ),
+        ] {
+            let output = tokio::process::Command::new("powershell.exe")
+                .arg("-NoLogo")
+                .arg("-NoProfile")
+                .arg("-NonInteractive")
+                .arg("-ExecutionPolicy")
+                .arg("Bypass")
+                .arg("-Command")
+                .arg(&script)
+                .env(WINDOWS_SHELL_SOURCE_ENV, command)
+                .output()
+                .await
+                .expect("run constrained-language wrapper");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+
+            assert_eq!(
+                output.status.code(),
+                Some(expected_code),
+                "wrong CLM exit code for {command}: stdout={stdout} stderr={stderr}"
+            );
+            if let Some(expected_stdout) = expected_stdout {
+                assert!(
+                    stdout.contains(expected_stdout),
+                    "missing CLM output for {command}: stdout={stdout} stderr={stderr}"
+                );
+            }
+            assert!(
+                !stderr.contains("Cannot create type")
+                    && !stderr.contains("Method invocation is supported only on core types"),
+                "compatibility transformer ran under CLM for {command}: {stderr}"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
     async fn developer_shell_can_bind_localhost_for_dev_servers() {
         let root = workspace("localhost-bind");
         let command = r#"

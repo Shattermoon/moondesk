@@ -1,11 +1,34 @@
 # Windows PowerShell 5.1 rejects pipeline-chain operators at execution time, but its own parser
 # still tokenizes AndAnd/OrOr correctly. Use that token stream for compatibility rewriting so
 # comments, barewords, block comments, quoted strings, and here-strings keep native lexical rules.
-[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
-$OutputEncoding = [Console]::OutputEncoding
-
 $__moondesk_source = $env:MOONDESK_INTERNAL_WINDOWS_COMMAND
 Remove-Item Env:MOONDESK_INTERNAL_WINDOWS_COMMAND -ErrorAction SilentlyContinue
+
+# Hardened Windows hosts can force Constrained Language Mode, where the reflection/type creation
+# used by the compatibility transformer is unavailable. Preserve native PowerShell behavior there
+# instead of failing before an otherwise ordinary command can run.
+if ($ExecutionContext.SessionState.LanguageMode -eq 'ConstrainedLanguage') {
+    $__moondesk_converted = $__moondesk_source
+    $__moondesk_converted += "`n`n`$global:__MOONDESK_CLM_FINAL_OK___MOONDESK_SUFFIX__=`$?`n"
+    $__moondesk_converted += "`$global:__MOONDESK_CLM_FINAL_CODE___MOONDESK_SUFFIX__=if (`$global:__MOONDESK_CLM_FINAL_OK___MOONDESK_SUFFIX__) {0} elseif (`$LASTEXITCODE -ne 0) {`$LASTEXITCODE} else {1}`n"
+    Invoke-Expression $__moondesk_converted
+
+    $__moondesk_clm_ok = Get-Variable -Name '__MOONDESK_CLM_FINAL_OK___MOONDESK_SUFFIX__' -Scope Global -ValueOnly -ErrorAction SilentlyContinue
+    $__moondesk_clm_code = Get-Variable -Name '__MOONDESK_CLM_FINAL_CODE___MOONDESK_SUFFIX__' -Scope Global -ValueOnly -ErrorAction SilentlyContinue
+    if ($null -eq $__moondesk_clm_ok) {
+        exit 1
+    }
+    if (-not $__moondesk_clm_ok) {
+        if ($null -ne $__moondesk_clm_code) {
+            exit $__moondesk_clm_code
+        }
+        exit 1
+    }
+    exit 0
+}
+
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+$OutputEncoding = [Console]::OutputEncoding
 
 $global:__MOONDESK_CHAIN_EPOCH___MOONDESK_SUFFIX__ = [int64]0
 $global:__MOONDESK_CHAIN_LAST_CODE___MOONDESK_SUFFIX__ = 0

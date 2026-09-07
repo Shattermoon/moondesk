@@ -1605,6 +1605,126 @@ value && literal
         let _ = std::fs::remove_dir_all(root);
     }
 
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_shell_preserves_native_failure_status_for_next_statement() {
+        let root = workspace("windows-native-status");
+        let result = run_shell_command(
+            "cmd /c exit 7; Write-Output (\"native-status=$? code=$LASTEXITCODE\")",
+            &root,
+            15_000,
+            8 * 1024,
+            None,
+        )
+        .await;
+        let _ = std::fs::remove_dir_all(root);
+
+        assert!(result.success, "status probe failed: {}", result.stderr);
+        assert_eq!(result.stdout.trim(), "native-status=False code=7");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_shell_preserves_nonterminating_error_status_for_next_statement() {
+        let get_item_root = workspace("windows-cmdlet-status");
+        let get_item = run_shell_command(
+            "Get-Item '__moondesk_missing_status_probe__' -ErrorAction SilentlyContinue; Write-Output (\"cmdlet-status=$?\")",
+            &get_item_root,
+            15_000,
+            8 * 1024,
+            None,
+        )
+        .await;
+        let _ = std::fs::remove_dir_all(get_item_root);
+        assert!(
+            get_item.success,
+            "cmdlet status probe failed: {}",
+            get_item.stderr
+        );
+        assert_eq!(get_item.stdout.trim(), "cmdlet-status=False");
+
+        let write_error_root = workspace("windows-write-error-status");
+        let write_error = run_shell_command(
+            "Write-Error 'audit-error' -ErrorAction SilentlyContinue; Write-Output (\"writeerror-status=$?\")",
+            &write_error_root,
+            15_000,
+            8 * 1024,
+            None,
+        )
+        .await;
+        let _ = std::fs::remove_dir_all(write_error_root);
+        assert!(
+            write_error.success,
+            "Write-Error status probe failed: {}",
+            write_error.stderr
+        );
+        assert_eq!(write_error.stdout.trim(), "writeerror-status=False");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_shell_preserves_native_failure_status_for_if_branch() {
+        let root = workspace("windows-status-if");
+        let result = run_shell_command(
+            "cmd /c exit 7; if ($?) { Write-Output yes } else { Write-Output no }",
+            &root,
+            15_000,
+            8 * 1024,
+            None,
+        )
+        .await;
+        let _ = std::fs::remove_dir_all(root);
+
+        assert!(result.success, "status branch failed: {}", result.stderr);
+        assert_eq!(result.stdout.trim(), "no");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_shell_preserves_saved_status_after_native_failure() {
+        let root = workspace("windows-status-save");
+        let result = run_shell_command(
+            "cmd /c exit 7; $saved=$?; cmd /c exit 0; Write-Output (\"saved=$saved\")",
+            &root,
+            15_000,
+            8 * 1024,
+            None,
+        )
+        .await;
+        let _ = std::fs::remove_dir_all(root);
+
+        assert!(
+            result.success,
+            "saved status probe failed: {}",
+            result.stderr
+        );
+        assert_eq!(result.stdout.trim(), "saved=False");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_chain_bookkeeping_preserves_status_for_untouched_statements() {
+        let root = workspace("windows-chain-status-boundary");
+        let result = run_shell_command(
+            "$Error.Clear(); Write-Output chain && Write-Output compat; cmd /c exit 7; Write-Output (\"after-chain=$? code=$LASTEXITCODE errors=$($Error.Count)\")",
+            &root,
+            15_000,
+            8 * 1024,
+            None,
+        )
+        .await;
+        let _ = std::fs::remove_dir_all(root);
+
+        assert!(
+            result.success,
+            "mixed status probe failed: {}",
+            result.stderr
+        );
+        assert!(result.stdout.contains("chain"));
+        assert!(result.stdout.contains("compat"));
+        assert!(result.stdout.contains("after-chain=False code=7 errors=0"));
+    }
+
     #[tokio::test]
     async fn large_stdout_and_stderr_are_drained_without_deadlock_and_bounded() {
         let root = workspace("bounded-output");

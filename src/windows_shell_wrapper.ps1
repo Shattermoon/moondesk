@@ -209,6 +209,20 @@ function Add-MoonDeskStatementSnapshots([string]$text) {
         [ref]$tokens,
         [ref]$parseErrors
     )
+    # Ordinary PowerShell must not pay for chain bookkeeping or have its automatic status touched.
+    # Only scripts that actually contain tokenized &&/|| operators need statement snapshots.
+    $hasChain = $false
+    foreach ($token in $tokens) {
+        if ($token.Kind -eq [System.Management.Automation.Language.TokenKind]::AndAnd -or
+            $token.Kind -eq [System.Management.Automation.Language.TokenKind]::OrOr) {
+            $hasChain = $true
+            break
+        }
+    }
+    if (-not $hasChain) {
+        return $text
+    }
+
     $offsets = New-Object 'System.Collections.Generic.HashSet[int]'
 
     foreach ($block in @($ast.BeginBlock, $ast.ProcessBlock, $ast.EndBlock)) {
@@ -231,7 +245,12 @@ function Add-MoonDeskStatementSnapshots([string]$text) {
         return $text
     }
 
-    $snapshot = "`n`$global:__MOONDESK_FINAL_EPOCH_BEFORE___MOONDESK_SUFFIX__=`$global:__MOONDESK_CHAIN_EPOCH___MOONDESK_SUFFIX__`n"
+    # Capturing/updating the epoch uses successful assignments, which would otherwise turn `$?` true.
+    # Restore an incoming false status with the module-qualified built-in cmdlet. -ErrorAction Ignore
+    # changes `$?` without emitting output, appending to `$Error`, or changing `$LASTEXITCODE`.
+    $snapshot = "`n`$__MOONDESK_STATUS_BEFORE_SNAPSHOT___MOONDESK_SUFFIX__=`$?`n" +
+        "`$global:__MOONDESK_FINAL_EPOCH_BEFORE___MOONDESK_SUFFIX__=`$global:__MOONDESK_CHAIN_EPOCH___MOONDESK_SUFFIX__`n" +
+        "if (-not `$__MOONDESK_STATUS_BEFORE_SNAPSHOT___MOONDESK_SUFFIX__) { Microsoft.PowerShell.Utility\Write-Error 'MoonDesk status restore' -ErrorAction Ignore }`n"
     foreach ($offset in @($offsets) | Sort-Object -Descending) {
         $safeOffset = [Math]::Min([int]$offset, $text.Length)
         $text = $text.Substring(0, $safeOffset) + $snapshot + $text.Substring($safeOffset)

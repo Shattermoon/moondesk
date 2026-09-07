@@ -2965,6 +2965,75 @@ mod tests {
         let _ = std::fs::remove_dir_all(workspace_root);
     }
 
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn start_command_preserves_native_status_across_chain_bookkeeping() {
+        let workspace_root =
+            std::env::temp_dir().join(format!("moondesk-mcp-status-job-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        let workspace_root_str = workspace_root.to_string_lossy().into_owned();
+        let command_jobs = CommandJobManager::new();
+        let start_req = tool_call_request(
+            "start_command",
+            json!({
+                "command": "Write-Output chain && Write-Output compat; cmd /c exit 7; Write-Output (\"background-status=$? code=$LASTEXITCODE\")",
+                "timeout": 15_000
+            }),
+        );
+        let start_response = handle_tools_call(
+            &start_req,
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &None,
+        )
+        .await;
+        let job_id = start_response
+            .result
+            .as_ref()
+            .and_then(|result| result.get("structuredContent"))
+            .and_then(|structured| structured.get("jobId"))
+            .and_then(Value::as_str)
+            .expect("missing background job id")
+            .to_string();
+
+        let mut cursor = 0;
+        let mut terminal = None;
+        for _ in 0..30 {
+            let snapshot = command_jobs
+                .poll(&job_id, cursor, 250)
+                .await
+                .expect("poll background status job");
+            cursor = snapshot.next_cursor;
+            if snapshot.state.is_terminal() {
+                terminal = Some(
+                    command_jobs
+                        .poll(&job_id, 0, 0)
+                        .await
+                        .expect("read terminal background status job"),
+                );
+                break;
+            }
+        }
+        let terminal = terminal.expect("background status job did not finish");
+        let stdout = terminal
+            .events
+            .iter()
+            .filter(|event| event.stream == "stdout")
+            .map(|event| event.text.as_str())
+            .collect::<String>();
+
+        assert_eq!(
+            terminal.state,
+            crate::command_jobs::CommandJobState::Succeeded
+        );
+        assert_eq!(terminal.exit_code, Some(0));
+        assert!(stdout.contains("background-status=False code=7"));
+        let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
     #[tokio::test]
     async fn start_command_reuses_logical_duplicate_and_list_commands_rediscovers_it() {
         let workspace_root =

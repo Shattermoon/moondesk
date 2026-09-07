@@ -108,11 +108,19 @@ function Convert-MoonDeskEnvPrefix([string]$segment) {
         )
     }
     [void]$builder.Append("`$global:LASTEXITCODE=0`n")
+    $trimmedRemaining = $remaining.Trim()
+    $plainParenthesized = $trimmedRemaining.StartsWith('(') -and $trimmedRemaining.EndsWith(')')
     [void]$builder.Append($remaining.TrimStart())
     [void]$builder.Append("`n`$" + $okVar + "=`$?`n")
-    [void]$builder.Append(
-        '$' + $codeVar + '=if ($LASTEXITCODE -ne 0) {$LASTEXITCODE} elseif ($' + $okVar + ') {0} else {1}' + "`n"
-    )
+    if ($plainParenthesized) {
+        [void]$builder.Append(
+            '$' + $codeVar + '=if ($LASTEXITCODE -ne 0) {$LASTEXITCODE} elseif ($' + $okVar + ') {0} else {1}' + "`n"
+        )
+    } else {
+        [void]$builder.Append(
+            '$' + $codeVar + '=if ($' + $okVar + ') {0} elseif ($LASTEXITCODE -ne 0) {$LASTEXITCODE} else {1}' + "`n"
+        )
+    }
     [void]$builder.Append("} finally {`n")
     for ($index = $assignments.Count - 1; $index -ge 0; $index--) {
         $assignment = $assignments[$index]

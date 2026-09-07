@@ -1466,6 +1466,26 @@ value && literal
         assert!(!prefixed_expression_failure.success);
         assert_eq!(prefixed_expression_failure.exit_code, Some(47));
 
+        for (command, expected) in [
+            (
+                "MOONDESK_EXPR=visible $(cmd /c exit 47; Write-Output recovered)",
+                "recovered",
+            ),
+            (
+                "MOONDESK_EXPR=visible & { cmd /c exit 47; Write-Output recovered-block }",
+                "recovered-block",
+            ),
+        ] {
+            let recovered_expression =
+                run_shell_command(command, &root, 15_000, 8 * 1024, None).await;
+            assert!(
+                recovered_expression.success,
+                "recovered prefixed expression failed: {command}: {}",
+                recovered_expression.stderr
+            );
+            assert_eq!(recovered_expression.stdout.trim(), expected);
+        }
+
         let nested_env = run_shell_command(
             "MOONDESK_NEST=outer & { MOONDESK_NEST=inner Write-Output (\"inner=$env:MOONDESK_NEST\"); Write-Output (\"outer-restored=$env:MOONDESK_NEST\") }; Write-Output (\"nested-after=$([string]$env:MOONDESK_NEST)\")",
             &root,

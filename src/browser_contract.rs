@@ -108,33 +108,17 @@ pub fn browser_structured_arguments_to_cli(
         }
     }
 
-    let mut args = Vec::new();
     for spec in specs.iter().filter(|spec| spec.required) {
-        let Some(value) = normalized.get(&spec.name) else {
+        if !normalized.contains_key(&spec.name) {
             return Err(format!(
                 "Browser command '{command}' is missing required argument '{}'",
                 spec.name
             ));
-        };
-        if spec.kind == "array" {
-            let values = value
-                .as_array()
-                .ok_or_else(|| format!("Browser argument '{}' must be an array", spec.name))?;
-            for value in values {
-                let Some(value) = value.as_str() else {
-                    return Err(format!(
-                        "Browser array argument '{}' must contain only strings",
-                        spec.name
-                    ));
-                };
-                args.push(value.to_string());
-            }
-        } else {
-            args.push(render_structured_scalar(spec, value)?);
         }
     }
 
-    for spec in specs.iter().filter(|spec| !spec.required) {
+    let mut args = Vec::new();
+    for spec in specs {
         let Some(value) = normalized.get(&spec.name) else {
             continue;
         };
@@ -142,6 +126,12 @@ pub fn browser_structured_arguments_to_cli(
             let values = value
                 .as_array()
                 .ok_or_else(|| format!("Browser argument '{}' must be an array", spec.name))?;
+            if spec.required && values.is_empty() {
+                return Err(format!(
+                    "Browser required array argument '{}' must not be empty",
+                    spec.name
+                ));
+            }
             for value in values {
                 let Some(value) = value.as_str() else {
                     return Err(format!(
@@ -379,6 +369,12 @@ pub fn parse_browser_cli_invocation(
     while index < args.len() {
         let raw = &args[index];
         if !raw.starts_with('-') {
+            while required
+                .get(required_index)
+                .is_some_and(|spec| arguments.contains_key(&spec.name))
+            {
+                required_index += 1;
+            }
             let Some(spec) = required.get(required_index) else {
                 return Err(format!(
                     "Browser command '{command}' received unexpected positional argument '{raw}'"
@@ -507,14 +503,15 @@ pub fn parse_browser_cli_invocation(
         index += 1;
     }
 
-    if required_index != required.len() {
-        let missing = required[required_index..]
-            .iter()
-            .map(|spec| spec.name.as_str())
-            .collect::<Vec<_>>()
-            .join(", ");
+    let missing = required
+        .iter()
+        .filter(|spec| !arguments.contains_key(&spec.name))
+        .map(|spec| spec.name.as_str())
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
         return Err(format!(
-            "Browser command '{command}' is missing required positional argument(s): {missing}"
+            "Browser command '{command}' is missing required positional argument(s): {}",
+            missing.join(", ")
         ));
     }
 
@@ -592,6 +589,21 @@ mod tests {
                 .get("includeSnapshot")
                 .and_then(Value::as_bool),
             Some(false)
+        );
+
+        let leading_dash = browser_structured_arguments_to_cli(
+            "fill",
+            &serde_json::json!({ "uid": "1_23", "value": "-1" }),
+        )
+        .expect("structured required values may begin with a dash");
+        let parsed_leading_dash = parse_browser_cli_invocation("fill", &leading_dash)
+            .expect("parse leading-dash structured fill value");
+        assert_eq!(
+            parsed_leading_dash
+                .arguments
+                .get("value")
+                .and_then(Value::as_str),
+            Some("-1")
         );
 
         let blocked = browser_structured_arguments_to_cli(

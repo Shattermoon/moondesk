@@ -2432,33 +2432,7 @@ async fn handle_browser_command(
         Err(error) => return tool_error_response(req, format!("Browser command failed: {error}")),
     };
 
-    if !output.success() {
-        let details = output.failure_details();
-        return tool_error_response(
-            req,
-            if details.is_empty() {
-                format!("Browser command '{command}' failed")
-            } else {
-                format!("Browser command '{command}' failed:\n{details}")
-            },
-        );
-    }
-
-    let text = [output.stdout.trim(), output.stderr.trim()]
-        .into_iter()
-        .filter(|value| !value.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n");
-    tool_success_response_with_structured(
-        req,
-        text,
-        json!({
-            "stdout": output.stdout,
-            "stderr": output.stderr,
-            "exitCode": output.exit_code,
-            "restarted": output.restarted,
-        }),
-    )
+    browser_command_output_response(req, command, output)
 }
 
 async fn handle_view_page(
@@ -4894,7 +4868,7 @@ mod tests {
                 "fill_form",
                 json!({
                     "elements": [
-                        { "uid": first_uid, "value": "alpha" },
+                        { "uid": first_uid, "value": "-1" },
                         { "uid": second_uid, "value": "beta" }
                     ],
                     "includeSnapshot": true
@@ -4940,8 +4914,83 @@ mod tests {
             .and_then(|structured| structured.get("stdout"))
             .and_then(Value::as_str)
             .expect("connector-expanded evaluate_script stdout");
-        assert!(evaluated_stdout.contains("alpha"), "{evaluated_stdout}");
+        assert!(evaluated_stdout.contains("-1"), "{evaluated_stdout}");
         assert!(evaluated_stdout.contains("beta"), "{evaluated_stdout}");
+
+        let refreshed_snapshot = handle_tools_call(
+            &tool_call_request("take_snapshot", json!({})),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        let refreshed_stdout = refreshed_snapshot
+            .result
+            .as_ref()
+            .and_then(|result| result.get("structuredContent"))
+            .and_then(|structured| structured.get("stdout"))
+            .and_then(Value::as_str)
+            .expect("refreshed connector snapshot stdout");
+        let refreshed_first_uid = refreshed_stdout
+            .lines()
+            .find(|line| line.contains("textbox \"first\""))
+            .and_then(|line| line.trim().strip_prefix("uid="))
+            .and_then(|line| line.split_whitespace().next())
+            .expect("refreshed first textbox uid")
+            .to_string();
+        let partial_fill = handle_tools_call(
+            &tool_call_request(
+                "fill_form",
+                json!({
+                    "elements": [
+                        { "uid": refreshed_first_uid, "value": "gamma" },
+                        { "uid": "missing-fill-form-uid", "value": "delta" }
+                    ]
+                }),
+            ),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        assert!(
+            result_text(&partial_fill)
+                .contains("fill_form element 1 failed after 1 completed element(s)"),
+            "partial fill failure should identify progress: {}",
+            result_text(&partial_fill)
+        );
+        let partial_value = handle_tools_call(
+            &tool_call_request(
+                "evaluate_script",
+                json!({
+                    "function": "() => document.querySelector('[aria-label=first]').value"
+                }),
+            ),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        let partial_value_stdout = partial_value
+            .result
+            .as_ref()
+            .and_then(|result| result.get("structuredContent"))
+            .and_then(|structured| structured.get("stdout"))
+            .and_then(Value::as_str)
+            .expect("partial fill verification stdout");
+        assert!(
+            partial_value_stdout.contains("gamma"),
+            "{partial_value_stdout}"
+        );
 
         let waited = handle_tools_call(
             &tool_call_request(
@@ -4964,6 +5013,45 @@ mod tests {
             .and_then(Value::as_str)
             .expect("connector wait_for stdout");
         assert!(waited_stdout.contains("ready-text"), "{waited_stdout}");
+
+        let missing_wait = handle_tools_call(
+            &tool_call_request(
+                "wait_for",
+                json!({ "text": ["definitely-missing-wait-text"], "timeout": 250 }),
+            ),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::ReadOnly,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        assert!(
+            result_text(&missing_wait).contains("Timed out waiting for any of"),
+            "ordinary wait timeout should be reported cleanly: {}",
+            result_text(&missing_wait)
+        );
+        let after_missing_wait = handle_tools_call(
+            &tool_call_request("list_pages", json!({})),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        assert_eq!(
+            after_missing_wait
+                .result
+                .as_ref()
+                .and_then(|result| result.get("structuredContent"))
+                .and_then(|structured| structured.get("restarted"))
+                .and_then(Value::as_bool),
+            Some(false),
+            "ordinary wait timeout must not restart the shared browser session"
+        );
 
         let navigate = runtime
             .run(

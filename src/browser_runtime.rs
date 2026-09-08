@@ -10,7 +10,8 @@ use tokio::sync::Mutex;
 
 pub use crate::browser_contract::canonical_browser_flag_name;
 use crate::browser_contract::{
-    BrowserOutputFormat, ParsedBrowserInvocation, parse_browser_cli_invocation,
+    BrowserOutputFormat, ParsedBrowserInvocation, browser_structured_arguments_to_cli,
+    parse_browser_cli_invocation,
 };
 use crate::browser_transport::{BrowserMcpTransport, BrowserTransportError};
 use crate::state::SharedState;
@@ -134,14 +135,18 @@ impl BrowserRuntime {
             .iter()
             .enumerate()
             .map(|(index, (uid, value))| {
-                let mut args = vec![uid.clone(), value.clone()];
-                if include_snapshot && index + 1 == elements.len() {
-                    args.push("--includeSnapshot=true".to_string());
-                }
-                ("fill".to_string(), args)
+                let args = browser_structured_arguments_to_cli(
+                    "fill",
+                    &serde_json::json!({
+                        "uid": uid,
+                        "value": value,
+                        "includeSnapshot": include_snapshot && index + 1 == elements.len(),
+                    }),
+                )?;
+                Ok(("fill".to_string(), args))
             })
-            .collect::<Vec<_>>();
-        self.run_serialized_pinned_calls(workspace_root, &calls, timeout)
+            .collect::<Result<Vec<_>, String>>()?;
+        self.run_serialized_fill_calls(workspace_root, &calls, timeout)
             .await
     }
 
@@ -164,16 +169,30 @@ impl BrowserRuntime {
             .map_err(|_| total_timeout_message(timeout))?;
         let (transport, restarted) = self.ensure_transport(workspace_root, deadline).await?;
 
+        let timeout_message = || format!("Timed out waiting for any of: {}", texts.join(", "));
         loop {
-            let result = self
-                .call_transport_tool(
-                    &transport,
+            if tokio::time::Instant::now() >= deadline {
+                return Err(timeout_message());
+            }
+            let result = match transport
+                .call_tool(
                     "take_snapshot",
                     Value::Object(parsed.arguments.clone()),
                     deadline,
-                    timeout,
                 )
-                .await?;
+                .await
+            {
+                Ok(result) => result,
+                Err(BrowserTransportError::Timeout) => return Err(timeout_message()),
+                Err(BrowserTransportError::Disconnected(error)) => {
+                    self.invalidate_transport(&transport, "browser runtime disconnected")
+                        .await;
+                    return Err(format!(
+                        "Browser runtime was lost while waiting for page text: {error}. The session was invalidated; retry from a fresh page/snapshot."
+                    ));
+                }
+                Err(BrowserTransportError::Protocol(error)) => return Err(error),
+            };
             let output = browser_output_from_result(result, parsed.clone(), restarted)?;
             if !output.success() {
                 return Ok(output);
@@ -189,16 +208,13 @@ impl BrowserRuntime {
             }
             let now = tokio::time::Instant::now();
             if now >= deadline {
-                return Err(format!(
-                    "Timed out waiting for any of: {}",
-                    texts.join(", ")
-                ));
+                return Err(timeout_message());
             }
             tokio::time::sleep((deadline - now).min(Duration::from_millis(200))).await;
         }
     }
 
-    async fn run_serialized_pinned_calls(
+    async fn run_serialized_fill_calls(
         &self,
         workspace_root: &str,
         calls: &[(String, Vec<String>)],
@@ -224,7 +240,7 @@ impl BrowserRuntime {
             exit_code: 0,
             restarted,
         };
-        for (command, parsed) in parsed_calls {
+        for (index, (command, parsed)) in parsed_calls.into_iter().enumerate() {
             let result = self
                 .call_transport_tool(
                     &transport,
@@ -234,8 +250,15 @@ impl BrowserRuntime {
                     timeout,
                 )
                 .await?;
-            let output = browser_output_from_result(result, parsed, restarted)?;
+            let mut output = browser_output_from_result(result, parsed, restarted)?;
             if !output.success() {
+                let diagnostic =
+                    format!("fill_form element {index} failed after {index} completed element(s)");
+                output.stderr = if output.stderr.trim().is_empty() {
+                    diagnostic
+                } else {
+                    format!("{diagnostic}\n{}", output.stderr)
+                };
                 return Ok(output);
             }
             last_output = output;

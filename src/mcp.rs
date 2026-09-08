@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tiktoken_rs::o200k_base_singleton;
 
+use crate::browser_contract::browser_structured_arguments_to_cli;
 use crate::browser_runtime::{
     BrowserRuntime, DEFAULT_BROWSER_COMMAND_TIMEOUT, MAX_BROWSER_ARG_BYTES, MAX_BROWSER_ARGS,
     MAX_BROWSER_COMMAND_BYTES, MAX_BROWSER_TIMEOUT_MS, canonical_browser_flag_name,
@@ -673,7 +674,8 @@ async fn handle_tools_call_for_workspace(
         .unwrap_or("")
         .to_string();
 
-    if matches!(tool_name.as_str(), "browser_command" | "view_page") {
+    let connector_browser_tool = connector_expanded_browser_tool(&tool_name);
+    if matches!(tool_name.as_str(), "browser_command" | "view_page") || connector_browser_tool {
         if workspaces::workspace_availability(Path::new(workspace_root))
             == WorkspaceAvailability::Unavailable
         {
@@ -691,7 +693,24 @@ async fn handle_tools_call_for_workspace(
         if tool_name == "browser_command" {
             return handle_browser_command(req, workspace_root, tool_mode, browser_runtime).await;
         }
-        return handle_view_page(req, workspace_root, browser_runtime).await;
+        if tool_name == "view_page" {
+            return handle_view_page(req, workspace_root, browser_runtime).await;
+        }
+        if tool_name == "fill_form" {
+            return handle_connector_fill_form(req, workspace_root, tool_mode, browser_runtime)
+                .await;
+        }
+        if tool_name == "wait_for" {
+            return handle_connector_wait_for(req, workspace_root, browser_runtime).await;
+        }
+        return handle_connector_browser_command(
+            req,
+            workspace_root,
+            tool_mode,
+            browser_runtime,
+            &tool_name,
+        )
+        .await;
     }
 
     let workspace_dependent = matches!(
@@ -2017,6 +2036,41 @@ fn handle_view_images(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcResp
     )
 }
 
+const CONNECTOR_PINNED_BROWSER_TOOLS: &[&str] = &[
+    "click",
+    "close_page",
+    "drag",
+    "emulate",
+    "evaluate_script",
+    "fill",
+    "get_console_message",
+    "get_network_request",
+    "handle_dialog",
+    "hover",
+    "lighthouse_audit",
+    "list_console_messages",
+    "list_network_requests",
+    "list_pages",
+    "navigate_page",
+    "new_page",
+    "performance_analyze_insight",
+    "performance_start_trace",
+    "performance_stop_trace",
+    "press_key",
+    "resize_page",
+    "select_page",
+    "take_heapsnapshot",
+    "take_screenshot",
+    "take_snapshot",
+    "type_text",
+    "upload_file",
+];
+
+fn connector_expanded_browser_tool(tool_name: &str) -> bool {
+    CONNECTOR_PINNED_BROWSER_TOOLS.contains(&tool_name)
+        || matches!(tool_name, "fill_form" | "wait_for")
+}
+
 fn browser_arg_uses_flag(args: &[String], flag: &str) -> bool {
     let Some(expected) = canonical_browser_flag_name(flag) else {
         return false;
@@ -2080,6 +2134,223 @@ fn browser_command_allowed_read_only(command: &str, args: &[String]) -> bool {
     }
 }
 
+fn browser_command_output_response(
+    req: &JsonRpcRequest,
+    command: &str,
+    output: crate::browser_runtime::BrowserCommandOutput,
+) -> JsonRpcResponse {
+    if !output.success() {
+        let details = output.failure_details();
+        return tool_error_response(
+            req,
+            if details.is_empty() {
+                format!("Browser command '{command}' failed")
+            } else {
+                format!("Browser command '{command}' failed:\n{details}")
+            },
+        );
+    }
+    let text = [output.stdout.trim(), output.stderr.trim()]
+        .into_iter()
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    tool_success_response_with_structured(
+        req,
+        text,
+        json!({
+            "stdout": output.stdout,
+            "stderr": output.stderr,
+            "exitCode": output.exit_code,
+            "restarted": output.restarted,
+        }),
+    )
+}
+
+async fn handle_connector_fill_form(
+    req: &JsonRpcRequest,
+    workspace_root: &str,
+    tool_mode: ToolMode,
+    browser_runtime: &Option<Arc<BrowserRuntime>>,
+) -> JsonRpcResponse {
+    if tool_mode.read_only() {
+        return tool_error_response(
+            req,
+            "Browser command 'fill_form' is blocked in read-only mode".to_string(),
+        );
+    }
+    let arguments = tool_arguments(req);
+    let Some(elements) = arguments.get("elements").and_then(Value::as_array) else {
+        return tool_error_response(req, "fill_form elements must be an array".to_string());
+    };
+    if elements.is_empty() || elements.len() > MAX_BROWSER_ARGS {
+        return tool_error_response(
+            req,
+            format!("fill_form elements must contain between 1 and {MAX_BROWSER_ARGS} entries"),
+        );
+    }
+    let mut parsed = Vec::with_capacity(elements.len());
+    for (index, element) in elements.iter().enumerate() {
+        let Some(element) = element.as_object() else {
+            return tool_error_response(
+                req,
+                format!("fill_form elements[{index}] must be an object"),
+            );
+        };
+        let Some(uid) = element.get("uid").and_then(Value::as_str) else {
+            return tool_error_response(
+                req,
+                format!("fill_form elements[{index}].uid must be a string"),
+            );
+        };
+        let Some(value) = element.get("value").and_then(Value::as_str) else {
+            return tool_error_response(
+                req,
+                format!("fill_form elements[{index}].value must be a string"),
+            );
+        };
+        if uid.is_empty()
+            || uid.len() > MAX_BROWSER_ARG_BYTES
+            || value.len() > MAX_BROWSER_ARG_BYTES
+        {
+            return tool_error_response(
+                req,
+                format!("fill_form elements[{index}] exceeds browser argument limits"),
+            );
+        }
+        if element
+            .keys()
+            .any(|key| !matches!(key.as_str(), "uid" | "value"))
+        {
+            return tool_error_response(
+                req,
+                format!("fill_form elements[{index}] contains an unknown field"),
+            );
+        }
+        parsed.push((uid.to_string(), value.to_string()));
+    }
+    let include_snapshot = match optional_bool_argument(&arguments, "includeSnapshot", false) {
+        Ok(value) => value,
+        Err(error) => return tool_error_response(req, error),
+    };
+    if let Some(object) = arguments.as_object()
+        && object
+            .keys()
+            .any(|key| !matches!(key.as_str(), "elements" | "includeSnapshot"))
+    {
+        return tool_error_response(req, "fill_form contains an unknown argument".to_string());
+    }
+    let Some(runtime) = browser_runtime else {
+        return tool_error_response(
+            req,
+            "Browser runtime is unavailable. Restart MoonDesk in Browser or Both mode.".to_string(),
+        );
+    };
+    match runtime
+        .fill_form(
+            workspace_root,
+            &parsed,
+            include_snapshot,
+            DEFAULT_BROWSER_COMMAND_TIMEOUT,
+        )
+        .await
+    {
+        Ok(output) => browser_command_output_response(req, "fill_form", output),
+        Err(error) => tool_error_response(req, format!("Browser command failed: {error}")),
+    }
+}
+
+fn connector_wait_timeout_ms(arguments: &Value) -> Result<Option<u64>, String> {
+    match arguments.get("timeout") {
+        None => Ok(None),
+        Some(value) => match value.as_u64() {
+            Some(value @ 0..=MAX_BROWSER_TIMEOUT_MS) => Ok(Some(value)),
+            _ => Err(format!(
+                "wait_for timeout must be between 0 and {MAX_BROWSER_TIMEOUT_MS} ms"
+            )),
+        },
+    }
+}
+
+async fn handle_connector_wait_for(
+    req: &JsonRpcRequest,
+    workspace_root: &str,
+    browser_runtime: &Option<Arc<BrowserRuntime>>,
+) -> JsonRpcResponse {
+    let arguments = tool_arguments(req);
+    let Some(values) = arguments.get("text").and_then(Value::as_array) else {
+        return tool_error_response(req, "wait_for text must be an array".to_string());
+    };
+    if values.is_empty() || values.len() > MAX_BROWSER_ARGS {
+        return tool_error_response(
+            req,
+            format!("wait_for text must contain between 1 and {MAX_BROWSER_ARGS} values"),
+        );
+    }
+    let mut texts = Vec::with_capacity(values.len());
+    for (index, value) in values.iter().enumerate() {
+        let Some(value) = value.as_str() else {
+            return tool_error_response(req, format!("wait_for text[{index}] must be a string"));
+        };
+        if value.is_empty() || value.len() > MAX_BROWSER_ARG_BYTES {
+            return tool_error_response(
+                req,
+                format!("wait_for text[{index}] is empty or too large"),
+            );
+        }
+        texts.push(value.to_string());
+    }
+    let timeout_ms = match connector_wait_timeout_ms(&arguments) {
+        Ok(timeout_ms) => timeout_ms,
+        Err(error) => return tool_error_response(req, error),
+    };
+    if let Some(object) = arguments.as_object()
+        && object
+            .keys()
+            .any(|key| !matches!(key.as_str(), "text" | "timeout"))
+    {
+        return tool_error_response(req, "wait_for contains an unknown argument".to_string());
+    }
+    let Some(runtime) = browser_runtime else {
+        return tool_error_response(
+            req,
+            "Browser runtime is unavailable. Restart MoonDesk in Browser or Both mode.".to_string(),
+        );
+    };
+    match runtime
+        .wait_for_text(workspace_root, &texts, timeout_ms)
+        .await
+    {
+        Ok(output) => browser_command_output_response(req, "wait_for", output),
+        Err(error) => tool_error_response(req, format!("Browser command failed: {error}")),
+    }
+}
+
+async fn handle_connector_browser_command(
+    req: &JsonRpcRequest,
+    workspace_root: &str,
+    tool_mode: ToolMode,
+    browser_runtime: &Option<Arc<BrowserRuntime>>,
+    command: &str,
+) -> JsonRpcResponse {
+    let args = match browser_structured_arguments_to_cli(command, &tool_arguments(req)) {
+        Ok(args) => args,
+        Err(error) => return tool_error_response(req, error),
+    };
+    let proxied = JsonRpcRequest {
+        jsonrpc: req.jsonrpc.clone(),
+        id: req.id.clone(),
+        method: req.method.clone(),
+        params: json!({
+            "name": "browser_command",
+            "arguments": {
+                "command": command,
+                "args": args,
+            }
+        }),
+    };
+    handle_browser_command(&proxied, workspace_root, tool_mode, browser_runtime).await
+}
 async fn handle_browser_command(
     req: &JsonRpcRequest,
     workspace_root: &str,
@@ -2160,33 +2431,7 @@ async fn handle_browser_command(
         Err(error) => return tool_error_response(req, format!("Browser command failed: {error}")),
     };
 
-    if !output.success() {
-        let details = output.failure_details();
-        return tool_error_response(
-            req,
-            if details.is_empty() {
-                format!("Browser command '{command}' failed")
-            } else {
-                format!("Browser command '{command}' failed:\n{details}")
-            },
-        );
-    }
-
-    let text = [output.stdout.trim(), output.stderr.trim()]
-        .into_iter()
-        .filter(|value| !value.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n");
-    tool_success_response_with_structured(
-        req,
-        text,
-        json!({
-            "stdout": output.stdout,
-            "stderr": output.stderr,
-            "exitCode": output.exit_code,
-            "restarted": output.restarted,
-        }),
-    )
+    browser_command_output_response(req, command, output)
 }
 
 async fn handle_view_page(
@@ -4341,6 +4586,150 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn connector_expanded_browser_tools_route_through_the_stable_browser_contract() {
+        assert_eq!(CONNECTOR_PINNED_BROWSER_TOOLS.len(), 27);
+        for tool_name in CONNECTOR_PINNED_BROWSER_TOOLS {
+            assert!(
+                crate::browser_contract::is_browser_command(tool_name),
+                "connector tool {tool_name} must remain in the pinned browser contract"
+            );
+            assert!(connector_expanded_browser_tool(tool_name));
+        }
+        assert!(connector_expanded_browser_tool("fill_form"));
+        assert!(connector_expanded_browser_tool("wait_for"));
+        assert!(
+            crate::browser_contract::is_browser_command("install_extension"),
+            "test requires a contract-only command"
+        );
+        assert!(
+            !connector_expanded_browser_tool("install_extension"),
+            "contract-only capabilities must not become hidden top-level tools"
+        );
+
+        let workspace_root =
+            std::env::temp_dir().join(format!("moondesk-browser-adapter-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace_root).expect("create browser adapter workspace");
+        let workspace_root_str = workspace_root.to_string_lossy().into_owned();
+        let command_jobs = CommandJobManager::new();
+
+        let list_pages = handle_tools_call(
+            &tool_call_request("list_pages", json!({})),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &None,
+        )
+        .await;
+        let list_pages_text = result_text(&list_pages);
+        assert!(
+            list_pages_text.contains("Browser runtime is unavailable"),
+            "expanded browser call should reach the browser handler: {list_pages_text}"
+        );
+        assert!(!list_pages_text.contains("Unknown tool"));
+
+        let blocked_navigation = handle_tools_call(
+            &tool_call_request("new_page", json!({ "url": "file:///C:/secret.txt" })),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &None,
+        )
+        .await;
+        let blocked_text = result_text(&blocked_navigation);
+        assert!(
+            blocked_text.contains("blocked") || blocked_text.contains("filesystem"),
+            "expanded browser call must keep URL validation: {blocked_text}"
+        );
+
+        let read_only = handle_tools_call(
+            &tool_call_request("new_page", json!({ "url": "about:blank" })),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::ReadOnly,
+            false,
+            &command_jobs,
+            &None,
+        )
+        .await;
+        assert!(result_text(&read_only).contains("blocked in read-only mode"));
+
+        let fill_read_only = handle_tools_call(
+            &tool_call_request(
+                "fill_form",
+                json!({ "elements": [{ "uid": "1_1", "value": "x" }] }),
+            ),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::ReadOnly,
+            false,
+            &command_jobs,
+            &None,
+        )
+        .await;
+        assert!(result_text(&fill_read_only).contains("blocked in read-only mode"));
+
+        assert_eq!(
+            connector_wait_timeout_ms(&json!({ "text": ["later"] })).expect("omitted wait timeout"),
+            None
+        );
+        assert_eq!(
+            connector_wait_timeout_ms(&json!({ "text": ["later"], "timeout": 0 }))
+                .expect("zero wait timeout"),
+            Some(0)
+        );
+        assert_eq!(
+            connector_wait_timeout_ms(&json!({ "text": ["later"], "timeout": 750 }))
+                .expect("explicit wait timeout"),
+            Some(750)
+        );
+
+        let wait_default_timeout = handle_tools_call(
+            &tool_call_request("wait_for", json!({ "text": ["later"], "timeout": 0 })),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::ReadOnly,
+            false,
+            &command_jobs,
+            &None,
+        )
+        .await;
+        assert!(
+            result_text(&wait_default_timeout).contains("Browser runtime is unavailable"),
+            "timeout=0 should use the default and reach the runtime check"
+        );
+
+        let unrelated_unknown = handle_tools_call(
+            &tool_call_request("definitely_not_a_browser_tool", json!({})),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &None,
+        )
+        .await;
+        assert!(result_text(&unrelated_unknown).contains("Unknown tool"));
+
+        let contract_only = handle_tools_call(
+            &tool_call_request("install_extension", json!({ "path": "extension" })),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &None,
+        )
+        .await;
+        assert!(result_text(&contract_only).contains("Unknown tool"));
+
+        std::fs::remove_dir_all(workspace_root).expect("remove browser adapter workspace");
+    }
+
     #[cfg(windows)]
     #[tokio::test]
     #[ignore = "serialized Windows browser vision smoke"]
@@ -4403,6 +4792,296 @@ mod tests {
         let runtime = Arc::new(BrowserRuntime::new(state));
         let runtime_option = Some(runtime.clone());
         let workspace_root_str = workspace_root.to_string_lossy().into_owned();
+        let command_jobs = CommandJobManager::new();
+
+        let connector_list_pages = handle_tools_call(
+            &tool_call_request("list_pages", json!({})),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        assert_ne!(
+            connector_list_pages
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true),
+            "connector-expanded list_pages should route through browser_command"
+        );
+        let connector_stdout = connector_list_pages
+            .result
+            .as_ref()
+            .and_then(|result| result.get("structuredContent"))
+            .and_then(|structured| structured.get("stdout"))
+            .and_then(Value::as_str)
+            .expect("expanded list_pages stdout");
+        assert!(connector_stdout.contains("Pages"), "{connector_stdout}");
+
+        let form_page = handle_tools_call(
+            &tool_call_request(
+                "navigate_page",
+                json!({
+                    "type": "url",
+                    "url": "data:text/html,<input aria-label='first'><input aria-label='second'><div id='status'>waiting</div><script>setTimeout(()=>document.getElementById('status').textContent='ready-text',300)</script>"
+                }),
+            ),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        assert_ne!(
+            form_page
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true),
+            "connector-expanded navigate_page should succeed"
+        );
+
+        let snapshot = handle_tools_call(
+            &tool_call_request("take_snapshot", json!({})),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        let snapshot_stdout = snapshot
+            .result
+            .as_ref()
+            .and_then(|result| result.get("structuredContent"))
+            .and_then(|structured| structured.get("stdout"))
+            .and_then(Value::as_str)
+            .expect("connector-expanded snapshot stdout");
+        let uid_for = |label: &str| {
+            snapshot_stdout
+                .lines()
+                .find(|line| line.contains(&format!("textbox \"{label}\"")))
+                .and_then(|line| line.trim().strip_prefix("uid="))
+                .and_then(|line| line.split_whitespace().next())
+                .map(str::to_string)
+                .unwrap_or_else(|| panic!("missing snapshot uid for {label}: {snapshot_stdout}"))
+        };
+        let first_uid = uid_for("first");
+        let second_uid = uid_for("second");
+
+        let filled = handle_tools_call(
+            &tool_call_request(
+                "fill_form",
+                json!({
+                    "elements": [
+                        { "uid": first_uid, "value": "-1" },
+                        { "uid": second_uid, "value": "beta" }
+                    ],
+                    "includeSnapshot": true
+                }),
+            ),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        assert_ne!(
+            filled
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true),
+            "connector fill_form should succeed"
+        );
+
+        let evaluated = handle_tools_call(
+            &tool_call_request(
+                "evaluate_script",
+                json!({
+                    "function": "() => ({first: document.querySelector('[aria-label=first]').value, second: document.querySelector('[aria-label=second]').value})"
+                }),
+            ),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        let evaluated_stdout = evaluated
+            .result
+            .as_ref()
+            .and_then(|result| result.get("structuredContent"))
+            .and_then(|structured| structured.get("stdout"))
+            .and_then(Value::as_str)
+            .expect("connector-expanded evaluate_script stdout");
+        assert!(evaluated_stdout.contains("-1"), "{evaluated_stdout}");
+        assert!(evaluated_stdout.contains("beta"), "{evaluated_stdout}");
+
+        let refreshed_snapshot = handle_tools_call(
+            &tool_call_request("take_snapshot", json!({})),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        let refreshed_stdout = refreshed_snapshot
+            .result
+            .as_ref()
+            .and_then(|result| result.get("structuredContent"))
+            .and_then(|structured| structured.get("stdout"))
+            .and_then(Value::as_str)
+            .expect("refreshed connector snapshot stdout");
+        let refreshed_first_uid = refreshed_stdout
+            .lines()
+            .find(|line| line.contains("textbox \"first\""))
+            .and_then(|line| line.trim().strip_prefix("uid="))
+            .and_then(|line| line.split_whitespace().next())
+            .expect("refreshed first textbox uid")
+            .to_string();
+        let partial_fill = handle_tools_call(
+            &tool_call_request(
+                "fill_form",
+                json!({
+                    "elements": [
+                        { "uid": refreshed_first_uid, "value": "gamma" },
+                        { "uid": "missing-fill-form-uid", "value": "delta" }
+                    ]
+                }),
+            ),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        assert!(
+            result_text(&partial_fill)
+                .contains("fill_form element 1 failed after 1 completed element(s)"),
+            "partial fill failure should identify progress: {}",
+            result_text(&partial_fill)
+        );
+        let partial_value = handle_tools_call(
+            &tool_call_request(
+                "evaluate_script",
+                json!({
+                    "function": "() => document.querySelector('[aria-label=first]').value"
+                }),
+            ),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        let partial_value_stdout = partial_value
+            .result
+            .as_ref()
+            .and_then(|result| result.get("structuredContent"))
+            .and_then(|structured| structured.get("stdout"))
+            .and_then(Value::as_str)
+            .expect("partial fill verification stdout");
+        assert!(
+            partial_value_stdout.contains("gamma"),
+            "{partial_value_stdout}"
+        );
+
+        let waited = handle_tools_call(
+            &tool_call_request(
+                "wait_for",
+                json!({ "text": ["ready-text"], "timeout": 3_000 }),
+            ),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::ReadOnly,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        let waited_stdout = waited
+            .result
+            .as_ref()
+            .and_then(|result| result.get("structuredContent"))
+            .and_then(|structured| structured.get("stdout"))
+            .and_then(Value::as_str)
+            .expect("connector wait_for stdout");
+        assert!(waited_stdout.contains("ready-text"), "{waited_stdout}");
+
+        let metadata_only_wait = handle_tools_call(
+            &tool_call_request("wait_for", json!({ "text": ["uid="], "timeout": 250 })),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::ReadOnly,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        assert!(
+            result_text(&metadata_only_wait).contains("Timed out after waiting 250ms"),
+            "snapshot metadata must not satisfy wait_for: {}",
+            result_text(&metadata_only_wait)
+        );
+
+        let missing_wait = handle_tools_call(
+            &tool_call_request(
+                "wait_for",
+                json!({ "text": ["definitely-missing-wait-text"], "timeout": 250 }),
+            ),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::ReadOnly,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        assert!(
+            result_text(&missing_wait).contains("Timed out after waiting 250ms"),
+            "ordinary wait timeout should be reported cleanly: {}",
+            result_text(&missing_wait)
+        );
+        let after_missing_wait = handle_tools_call(
+            &tool_call_request("list_pages", json!({})),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        assert_eq!(
+            after_missing_wait
+                .result
+                .as_ref()
+                .and_then(|result| result.get("structuredContent"))
+                .and_then(|structured| structured.get("restarted"))
+                .and_then(Value::as_bool),
+            Some(false),
+            "ordinary wait timeout must not restart the shared browser session"
+        );
 
         let navigate = runtime
             .run(

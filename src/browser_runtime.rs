@@ -120,6 +120,129 @@ impl BrowserRuntime {
         .await
     }
 
+    pub(crate) async fn fill_form(
+        &self,
+        workspace_root: &str,
+        elements: &[(String, String)],
+        include_snapshot: bool,
+        timeout: Duration,
+    ) -> Result<BrowserCommandOutput, String> {
+        if elements.is_empty() {
+            return Err("fill_form requires at least one element".to_string());
+        }
+        let calls = elements
+            .iter()
+            .enumerate()
+            .map(|(index, (uid, value))| {
+                let mut args = vec![uid.clone(), value.clone()];
+                if include_snapshot && index + 1 == elements.len() {
+                    args.push("--includeSnapshot=true".to_string());
+                }
+                ("fill".to_string(), args)
+            })
+            .collect::<Vec<_>>();
+        self.run_serialized_pinned_calls(workspace_root, &calls, timeout)
+            .await
+    }
+
+    pub(crate) async fn wait_for_text(
+        &self,
+        workspace_root: &str,
+        texts: &[String],
+        timeout: Duration,
+    ) -> Result<BrowserCommandOutput, String> {
+        if texts.is_empty() {
+            return Err("wait_for requires at least one text value".to_string());
+        }
+        if timeout.is_zero() {
+            return Err("Browser command timeout must be at least 1 ms".to_string());
+        }
+        let parsed = parse_browser_cli_invocation("take_snapshot", &[])?;
+        let deadline = tokio::time::Instant::now() + timeout;
+        let _operation = tokio::time::timeout_at(deadline, self.operation.lock())
+            .await
+            .map_err(|_| total_timeout_message(timeout))?;
+        let (transport, restarted) = self.ensure_transport(workspace_root, deadline).await?;
+
+        loop {
+            let result = self
+                .call_transport_tool(
+                    &transport,
+                    "take_snapshot",
+                    Value::Object(parsed.arguments.clone()),
+                    deadline,
+                    timeout,
+                )
+                .await?;
+            let output = browser_output_from_result(result, parsed.clone(), restarted)?;
+            if !output.success() {
+                return Ok(output);
+            }
+            if let Some(matched) = texts
+                .iter()
+                .find(|text| output.stdout.contains(text.as_str()))
+            {
+                return Ok(BrowserCommandOutput {
+                    stdout: format!("Found text: {matched}\n{}", output.stdout),
+                    ..output
+                });
+            }
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return Err(format!(
+                    "Timed out waiting for any of: {}",
+                    texts.join(", ")
+                ));
+            }
+            tokio::time::sleep((deadline - now).min(Duration::from_millis(200))).await;
+        }
+    }
+
+    async fn run_serialized_pinned_calls(
+        &self,
+        workspace_root: &str,
+        calls: &[(String, Vec<String>)],
+        timeout: Duration,
+    ) -> Result<BrowserCommandOutput, String> {
+        if timeout.is_zero() {
+            return Err("Browser command timeout must be at least 1 ms".to_string());
+        }
+        let parsed_calls = calls
+            .iter()
+            .map(|(command, args)| {
+                parse_browser_cli_invocation(command, args).map(|parsed| (command.as_str(), parsed))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let deadline = tokio::time::Instant::now() + timeout;
+        let _operation = tokio::time::timeout_at(deadline, self.operation.lock())
+            .await
+            .map_err(|_| total_timeout_message(timeout))?;
+        let (transport, restarted) = self.ensure_transport(workspace_root, deadline).await?;
+        let mut last_output = BrowserCommandOutput {
+            stdout: String::new(),
+            stderr: String::new(),
+            exit_code: 0,
+            restarted,
+        };
+        for (command, parsed) in parsed_calls {
+            let result = self
+                .call_transport_tool(
+                    &transport,
+                    command,
+                    Value::Object(parsed.arguments.clone()),
+                    deadline,
+                    timeout,
+                )
+                .await?;
+            let output = browser_output_from_result(result, parsed, restarted)?;
+            if !output.success() {
+                return Ok(output);
+            }
+            last_output = output;
+        }
+        Ok(last_output)
+    }
+
     async fn run_internal(
         &self,
         workspace_root: &str,
@@ -178,25 +301,24 @@ impl BrowserRuntime {
         }
 
         let (transport, restarted) = self.ensure_transport(workspace_root, deadline).await?;
-        let result = match transport
-            .call_tool(command, Value::Object(parsed.arguments.clone()), deadline)
-            .await
-        {
-            Ok(result) => result,
-            Err(BrowserTransportError::Timeout) => {
-                self.invalidate_transport(&transport, "browser operation timed out")
-                    .await;
-                return Err(total_timeout_message(timeout));
-            }
-            Err(BrowserTransportError::Disconnected(error)) => {
-                self.invalidate_transport(&transport, "browser runtime disconnected")
-                    .await;
-                return Err(format!(
-                    "Browser runtime was lost before the operation completed: {error}. The session was invalidated; retry from a fresh page/snapshot."
-                ));
-            }
-            Err(BrowserTransportError::Protocol(error)) => return Err(error),
-        };
+        if command == "close_page" {
+            self.select_surviving_page_before_close(
+                &transport,
+                &parsed.arguments,
+                deadline,
+                timeout,
+            )
+            .await?;
+        }
+        let result = self
+            .call_transport_tool(
+                &transport,
+                command,
+                Value::Object(parsed.arguments.clone()),
+                deadline,
+                timeout,
+            )
+            .await?;
 
         let mut output = browser_output_from_result(result, parsed, restarted)?;
         if output.success() {
@@ -227,6 +349,88 @@ impl BrowserRuntime {
         }
         prepared.rewrite_output_paths(&mut output);
         Ok(output)
+    }
+
+    async fn call_transport_tool(
+        &self,
+        transport: &Arc<BrowserMcpTransport>,
+        command: &str,
+        arguments: Value,
+        deadline: tokio::time::Instant,
+        timeout: Duration,
+    ) -> Result<Value, String> {
+        match transport.call_tool(command, arguments, deadline).await {
+            Ok(result) => Ok(result),
+            Err(BrowserTransportError::Timeout) => {
+                self.invalidate_transport(transport, "browser operation timed out")
+                    .await;
+                Err(total_timeout_message(timeout))
+            }
+            Err(BrowserTransportError::Disconnected(error)) => {
+                self.invalidate_transport(transport, "browser runtime disconnected")
+                    .await;
+                Err(format!(
+                    "Browser runtime was lost before the operation completed: {error}. The session was invalidated; retry from a fresh page/snapshot."
+                ))
+            }
+            Err(BrowserTransportError::Protocol(error)) => Err(error),
+        }
+    }
+
+    async fn select_surviving_page_before_close(
+        &self,
+        transport: &Arc<BrowserMcpTransport>,
+        arguments: &serde_json::Map<String, Value>,
+        deadline: tokio::time::Instant,
+        timeout: Duration,
+    ) -> Result<(), String> {
+        let Some(target_page_id) = arguments.get("pageId").and_then(Value::as_f64) else {
+            return Ok(());
+        };
+        let listed = self
+            .call_transport_tool(
+                transport,
+                "list_pages",
+                serde_json::json!({}),
+                deadline,
+                timeout,
+            )
+            .await?;
+        if listed.get("isError").and_then(Value::as_bool) == Some(true) {
+            return Err(format!(
+                "Could not inspect browser pages before closing the selected page: {}",
+                browser_result_text(&listed)
+            ));
+        }
+        let pages = browser_page_listing(&listed);
+        let Some((selected_page_id, _)) = pages.iter().find(|(_, selected)| *selected) else {
+            return Ok(());
+        };
+        if (*selected_page_id as f64) != target_page_id {
+            return Ok(());
+        }
+        let Some((survivor_page_id, _)) = pages
+            .iter()
+            .find(|(page_id, _)| (*page_id as f64) != target_page_id)
+        else {
+            return Ok(());
+        };
+        let selected = self
+            .call_transport_tool(
+                transport,
+                "select_page",
+                serde_json::json!({ "pageId": survivor_page_id }),
+                deadline,
+                timeout,
+            )
+            .await?;
+        if selected.get("isError").and_then(Value::as_bool) == Some(true) {
+            return Err(format!(
+                "Could not select a surviving browser page before close: {}",
+                browser_result_text(&selected)
+            ));
+        }
+        Ok(())
     }
 
     async fn ensure_transport(
@@ -311,6 +515,41 @@ impl BrowserRuntime {
             state.lock().await.browser_runtime_running = false;
         }
     }
+}
+
+fn browser_result_text(result: &Value) -> String {
+    result
+        .get("content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| {
+            (item.get("type").and_then(Value::as_str) == Some("text"))
+                .then(|| item.get("text").and_then(Value::as_str))
+                .flatten()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn browser_page_listing_text(text: &str) -> Vec<(u64, bool)> {
+    text.lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            let selected = line.ends_with(" [selected]");
+            let line = line.strip_suffix(" [selected]").unwrap_or(line);
+            let (page_id, _) = line.split_once(':')?;
+            page_id
+                .trim()
+                .parse::<u64>()
+                .ok()
+                .map(|page_id| (page_id, selected))
+        })
+        .collect()
+}
+
+fn browser_page_listing(result: &Value) -> Vec<(u64, bool)> {
+    browser_page_listing_text(&browser_result_text(result))
 }
 
 fn browser_server_args() -> (Vec<String>, String) {
@@ -1513,6 +1752,17 @@ mod tests {
     }
 
     #[test]
+    fn page_listing_parser_tracks_selected_and_surviving_pages() {
+        let result = serde_json::json!({
+            "content": [{
+                "type": "text",
+                "text": "## Pages\n1: about:blank\n7: Audit (data:text/html,test) [selected]"
+            }]
+        });
+        assert_eq!(browser_page_listing(&result), vec![(1, false), (7, true)]);
+    }
+
+    #[test]
     fn mcp_tool_error_signal_controls_browser_command_success() {
         let parsed = ParsedBrowserInvocation {
             arguments: serde_json::Map::new(),
@@ -2119,6 +2369,60 @@ mod tests {
             .expect("first transport");
         let first_pid = first_transport.pid().await.expect("first transport pid");
         assert!(first_transport.is_alive());
+
+        let opened = runtime
+            .run(
+                &workspace_str,
+                "new_page",
+                &["data:text/html,<title>close-selected-smoke</title>".to_string()],
+                DEFAULT_BROWSER_COMMAND_TIMEOUT,
+            )
+            .await
+            .expect("open second page before selected-page close smoke");
+        assert!(opened.success(), "new_page failed: {opened:?}");
+        let opened_pages = browser_page_listing_text(&opened.stdout);
+        assert!(
+            opened_pages.len() >= 2,
+            "expected at least two pages: {opened:?}"
+        );
+        let selected_page_id = opened_pages
+            .iter()
+            .find_map(|(page_id, selected)| selected.then_some(*page_id))
+            .expect("new page should be selected");
+        let closed = runtime
+            .run(
+                &workspace_str,
+                "close_page",
+                &[selected_page_id.to_string()],
+                DEFAULT_BROWSER_COMMAND_TIMEOUT,
+            )
+            .await
+            .expect("close selected page without leaving stale browser selection");
+        assert!(closed.success(), "close_page failed: {closed:?}");
+        let after_close = runtime
+            .run(
+                &workspace_str,
+                "list_pages",
+                &[],
+                DEFAULT_BROWSER_COMMAND_TIMEOUT,
+            )
+            .await
+            .expect("list_pages should work immediately after closing selected page");
+        assert!(
+            after_close.success(),
+            "post-close list_pages failed: {after_close:?}"
+        );
+        let surviving_pages = browser_page_listing_text(&after_close.stdout);
+        assert!(
+            surviving_pages.iter().any(|(_, selected)| *selected),
+            "a surviving page must remain selected: {after_close:?}"
+        );
+        assert!(
+            surviving_pages
+                .iter()
+                .all(|(page_id, _)| *page_id != selected_page_id),
+            "closed page must not remain listed: {after_close:?}"
+        );
 
         let second_runtime = BrowserRuntime::standalone();
         let second = second_runtime

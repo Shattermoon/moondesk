@@ -36,6 +36,134 @@ pub struct ParsedBrowserInvocation {
     pub output_format: BrowserOutputFormat,
 }
 
+#[cfg(test)]
+pub fn is_browser_command(command: &str) -> bool {
+    contract()
+        .map(|contract| contract.commands.contains_key(command))
+        .unwrap_or(false)
+}
+
+fn render_structured_scalar(spec: &BrowserArgSpec, value: &Value) -> Result<String, String> {
+    match spec.kind.as_str() {
+        "string" => value
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(|| format!("Browser argument '{}' must be a string", spec.name)),
+        "boolean" => value
+            .as_bool()
+            .map(|value| value.to_string())
+            .ok_or_else(|| format!("Browser argument '{}' must be a boolean", spec.name)),
+        "integer" => {
+            let integer = value
+                .as_i64()
+                .map(|value| value.to_string())
+                .or_else(|| value.as_u64().map(|value| value.to_string()))
+                .ok_or_else(|| format!("Browser argument '{}' must be an integer", spec.name))?;
+            Ok(integer)
+        }
+        "number" => value
+            .as_number()
+            .map(ToString::to_string)
+            .ok_or_else(|| format!("Browser argument '{}' must be a number", spec.name)),
+        "array" => Err(format!(
+            "internal browser contract error: '{}' is an array",
+            spec.name
+        )),
+        other => Err(format!(
+            "unsupported browser argument type '{other}' for '{}'",
+            spec.name
+        )),
+    }
+}
+
+pub fn browser_structured_arguments_to_cli(
+    command: &str,
+    arguments: &Value,
+) -> Result<Vec<String>, String> {
+    let contract = contract()?;
+    let Some(specs) = contract.commands.get(command) else {
+        return Err(format!(
+            "Unknown browser command '{command}' for pinned chrome-devtools-mcp@1.7.0"
+        ));
+    };
+    let Some(object) = arguments.as_object() else {
+        return Err("Browser tool arguments must be an object".to_string());
+    };
+
+    let mut normalized = Map::new();
+    for (name, value) in object {
+        let Some(spec) = spec_by_flag(specs, name) else {
+            return Err(format!(
+                "Unknown argument '{name}' for browser command '{command}'"
+            ));
+        };
+        if normalized
+            .insert(spec.name.clone(), value.clone())
+            .is_some()
+        {
+            return Err(format!(
+                "Browser argument '{}' may only be supplied once",
+                spec.name
+            ));
+        }
+    }
+
+    let mut args = Vec::new();
+    for spec in specs.iter().filter(|spec| spec.required) {
+        let Some(value) = normalized.get(&spec.name) else {
+            return Err(format!(
+                "Browser command '{command}' is missing required argument '{}'",
+                spec.name
+            ));
+        };
+        if spec.kind == "array" {
+            let values = value
+                .as_array()
+                .ok_or_else(|| format!("Browser argument '{}' must be an array", spec.name))?;
+            for value in values {
+                let Some(value) = value.as_str() else {
+                    return Err(format!(
+                        "Browser array argument '{}' must contain only strings",
+                        spec.name
+                    ));
+                };
+                args.push(value.to_string());
+            }
+        } else {
+            args.push(render_structured_scalar(spec, value)?);
+        }
+    }
+
+    for spec in specs.iter().filter(|spec| !spec.required) {
+        let Some(value) = normalized.get(&spec.name) else {
+            continue;
+        };
+        if spec.kind == "array" {
+            let values = value
+                .as_array()
+                .ok_or_else(|| format!("Browser argument '{}' must be an array", spec.name))?;
+            for value in values {
+                let Some(value) = value.as_str() else {
+                    return Err(format!(
+                        "Browser array argument '{}' must contain only strings",
+                        spec.name
+                    ));
+                };
+                args.push(format!("--{}={value}", spec.name));
+            }
+        } else {
+            args.push(format!(
+                "--{}={}",
+                spec.name,
+                render_structured_scalar(spec, value)?
+            ));
+        }
+    }
+
+    parse_browser_cli_invocation(command, &args)?;
+    Ok(args)
+}
+
 fn contract() -> Result<&'static BrowserContractFile, String> {
     static CONTRACT: OnceLock<Result<BrowserContractFile, String>> = OnceLock::new();
     CONTRACT
@@ -436,6 +564,58 @@ mod tests {
                 .and_then(Value::as_bool),
             Some(false)
         );
+    }
+
+    #[test]
+    fn structured_browser_arguments_reuse_the_pinned_cli_contract() {
+        let args = browser_structured_arguments_to_cli(
+            "click",
+            &serde_json::json!({
+                "uid": "1_23",
+                "dbl_click": true,
+                "includeSnapshot": false
+            }),
+        )
+        .expect("normalize connector-expanded click arguments");
+        let parsed = parse_browser_cli_invocation("click", &args).expect("parse normalized click");
+        assert_eq!(
+            parsed.arguments.get("uid").and_then(Value::as_str),
+            Some("1_23")
+        );
+        assert_eq!(
+            parsed.arguments.get("dblClick").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            parsed
+                .arguments
+                .get("includeSnapshot")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+
+        let blocked = browser_structured_arguments_to_cli(
+            "new_page",
+            &serde_json::json!({ "url": "file:///C:/secret.txt" }),
+        )
+        .expect_err("connector-expanded navigation must keep the host-file boundary");
+        assert!(blocked.contains("blocked") || blocked.contains("filesystem"));
+
+        assert!(
+            browser_structured_arguments_to_cli("new_page", &serde_json::json!({}))
+                .expect_err("required connector argument must remain required")
+                .contains("missing required argument 'url'")
+        );
+        assert!(
+            browser_structured_arguments_to_cli(
+                "resize_page",
+                &serde_json::json!({ "width": "wide", "height": 900 })
+            )
+            .expect_err("typed connector arguments must be validated")
+            .contains("must be a number")
+        );
+        assert!(is_browser_command("list_pages"));
+        assert!(!is_browser_command("browser_command"));
     }
 
     #[test]

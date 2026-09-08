@@ -2260,6 +2260,18 @@ async fn handle_connector_fill_form(
     }
 }
 
+fn connector_wait_timeout_ms(arguments: &Value) -> Result<Option<u64>, String> {
+    match arguments.get("timeout") {
+        None => Ok(None),
+        Some(value) => match value.as_u64() {
+            Some(value @ 0..=MAX_BROWSER_TIMEOUT_MS) => Ok(Some(value)),
+            _ => Err(format!(
+                "wait_for timeout must be between 0 and {MAX_BROWSER_TIMEOUT_MS} ms"
+            )),
+        },
+    }
+}
+
 async fn handle_connector_wait_for(
     req: &JsonRpcRequest,
     workspace_root: &str,
@@ -2288,18 +2300,9 @@ async fn handle_connector_wait_for(
         }
         texts.push(value.to_string());
     }
-    let timeout_ms = match arguments.get("timeout") {
-        None => DEFAULT_BROWSER_COMMAND_TIMEOUT.as_millis() as u64,
-        Some(value) => match value.as_u64() {
-            Some(0) => DEFAULT_BROWSER_COMMAND_TIMEOUT.as_millis() as u64,
-            Some(value @ 1..=MAX_BROWSER_TIMEOUT_MS) => value,
-            _ => {
-                return tool_error_response(
-                    req,
-                    format!("wait_for timeout must be between 0 and {MAX_BROWSER_TIMEOUT_MS} ms"),
-                );
-            }
-        },
+    let timeout_ms = match connector_wait_timeout_ms(&arguments) {
+        Ok(timeout_ms) => timeout_ms,
+        Err(error) => return tool_error_response(req, error),
     };
     if let Some(object) = arguments.as_object()
         && object
@@ -2315,11 +2318,7 @@ async fn handle_connector_wait_for(
         );
     };
     match runtime
-        .wait_for_text(
-            workspace_root,
-            &texts,
-            std::time::Duration::from_millis(timeout_ms),
-        )
+        .wait_for_text(workspace_root, &texts, timeout_ms)
         .await
     {
         Ok(output) => browser_command_output_response(req, "wait_for", output),
@@ -4674,6 +4673,21 @@ mod tests {
         .await;
         assert!(result_text(&fill_read_only).contains("blocked in read-only mode"));
 
+        assert_eq!(
+            connector_wait_timeout_ms(&json!({ "text": ["later"] })).expect("omitted wait timeout"),
+            None
+        );
+        assert_eq!(
+            connector_wait_timeout_ms(&json!({ "text": ["later"], "timeout": 0 }))
+                .expect("zero wait timeout"),
+            Some(0)
+        );
+        assert_eq!(
+            connector_wait_timeout_ms(&json!({ "text": ["later"], "timeout": 750 }))
+                .expect("explicit wait timeout"),
+            Some(750)
+        );
+
         let wait_default_timeout = handle_tools_call(
             &tool_call_request("wait_for", json!({ "text": ["later"], "timeout": 0 })),
             &workspace_root_str,
@@ -5014,6 +5028,22 @@ mod tests {
             .expect("connector wait_for stdout");
         assert!(waited_stdout.contains("ready-text"), "{waited_stdout}");
 
+        let metadata_only_wait = handle_tools_call(
+            &tool_call_request("wait_for", json!({ "text": ["uid="], "timeout": 250 })),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::ReadOnly,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        assert!(
+            result_text(&metadata_only_wait).contains("Timed out after waiting 250ms"),
+            "snapshot metadata must not satisfy wait_for: {}",
+            result_text(&metadata_only_wait)
+        );
+
         let missing_wait = handle_tools_call(
             &tool_call_request(
                 "wait_for",
@@ -5028,7 +5058,7 @@ mod tests {
         )
         .await;
         assert!(
-            result_text(&missing_wait).contains("Timed out waiting for any of"),
+            result_text(&missing_wait).contains("Timed out after waiting 250ms"),
             "ordinary wait timeout should be reported cleanly: {}",
             result_text(&missing_wait)
         );

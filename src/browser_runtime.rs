@@ -154,64 +154,41 @@ impl BrowserRuntime {
         &self,
         workspace_root: &str,
         texts: &[String],
-        timeout: Duration,
+        timeout_ms: Option<u64>,
     ) -> Result<BrowserCommandOutput, String> {
         if texts.is_empty() {
             return Err("wait_for requires at least one text value".to_string());
         }
-        if timeout.is_zero() {
-            return Err("Browser command timeout must be at least 1 ms".to_string());
-        }
-        let parsed = parse_browser_cli_invocation("take_snapshot", &[])?;
-        let deadline = tokio::time::Instant::now() + timeout;
+        let requested_timeout = timeout_ms.unwrap_or(0);
+        // This is only MoonDesk's queue/transport safety ceiling. The connector timeout itself is
+        // forwarded unchanged below, including omitted/zero values, so pinned v1.7 keeps ownership
+        // of its actual waiter default and CPU-throttling semantics.
+        let operation_timeout = if requested_timeout == 0 {
+            DEFAULT_BROWSER_COMMAND_TIMEOUT
+        } else {
+            Duration::from_millis(requested_timeout).saturating_add(Duration::from_secs(10))
+        };
+        let deadline = tokio::time::Instant::now() + operation_timeout;
         let _operation = tokio::time::timeout_at(deadline, self.operation.lock())
             .await
-            .map_err(|_| total_timeout_message(timeout))?;
+            .map_err(|_| total_timeout_message(operation_timeout))?;
         let (transport, restarted) = self.ensure_transport(workspace_root, deadline).await?;
 
-        let timeout_message = || format!("Timed out waiting for any of: {}", texts.join(", "));
-        loop {
-            if tokio::time::Instant::now() >= deadline {
-                return Err(timeout_message());
-            }
-            let result = match transport
-                .call_tool(
-                    "take_snapshot",
-                    Value::Object(parsed.arguments.clone()),
-                    deadline,
-                )
-                .await
-            {
-                Ok(result) => result,
-                Err(BrowserTransportError::Timeout) => return Err(timeout_message()),
-                Err(BrowserTransportError::Disconnected(error)) => {
-                    self.invalidate_transport(&transport, "browser runtime disconnected")
-                        .await;
-                    return Err(format!(
-                        "Browser runtime was lost while waiting for page text: {error}. The session was invalidated; retry from a fresh page/snapshot."
-                    ));
-                }
-                Err(BrowserTransportError::Protocol(error)) => return Err(error),
-            };
-            let output = browser_output_from_result(result, parsed.clone(), restarted)?;
-            if !output.success() {
-                return Ok(output);
-            }
-            if let Some(matched) = texts
-                .iter()
-                .find(|text| output.stdout.contains(text.as_str()))
-            {
-                return Ok(BrowserCommandOutput {
-                    stdout: format!("Found text: {matched}\n{}", output.stdout),
-                    ..output
-                });
-            }
-            let now = tokio::time::Instant::now();
-            if now >= deadline {
-                return Err(timeout_message());
-            }
-            tokio::time::sleep((deadline - now).min(Duration::from_millis(200))).await;
+        let mut arguments = serde_json::json!({ "text": texts });
+        if let Some(timeout_ms) = timeout_ms {
+            arguments["timeout"] = Value::from(timeout_ms);
         }
+        let result = self
+            .call_transport_tool(
+                &transport,
+                "wait_for",
+                arguments,
+                deadline,
+                operation_timeout,
+            )
+            .await?;
+        let parsed = parse_browser_cli_invocation("take_snapshot", &[])?;
+        browser_output_from_result(result, parsed, restarted)
     }
 
     async fn run_serialized_fill_calls(
@@ -951,7 +928,7 @@ fn browser_path_flag_kind(command: &str, flag: &str) -> Option<BrowserPathKind> 
     }
 }
 
-fn positional_browser_paths(command: &str) -> &'static [(usize, BrowserPathKind)] {
+fn positional_browser_paths(command: &str) -> &'static [(usize, BrowserPathKind, &'static str)] {
     use BrowserPathKind::{InputDirectory, InputFile, OutputFile};
     match command {
         "close_heapsnapshot"
@@ -963,11 +940,14 @@ fn positional_browser_paths(command: &str) -> &'static [(usize, BrowserPathKind)
         | "get_heapsnapshot_object_details"
         | "get_heapsnapshot_retainers"
         | "get_heapsnapshot_retaining_paths"
-        | "get_heapsnapshot_summary" => &[(0, InputFile)],
-        "compare_heapsnapshots" => &[(0, InputFile), (1, InputFile)],
-        "install_extension" => &[(0, InputDirectory)],
-        "take_heapsnapshot" => &[(0, OutputFile)],
-        "upload_file" => &[(1, InputFile)],
+        | "get_heapsnapshot_summary" => &[(0, InputFile, "filepath")],
+        "compare_heapsnapshots" => &[
+            (0, InputFile, "basefilepath"),
+            (1, InputFile, "currentfilepath"),
+        ],
+        "install_extension" => &[(0, InputDirectory, "path")],
+        "take_heapsnapshot" => &[(0, OutputFile, "filepath")],
+        "upload_file" => &[(1, InputFile, "filepath")],
         _ => &[],
     }
 }
@@ -1658,14 +1638,18 @@ fn prepare_browser_invocation_with_managed_temp_deadline(
     let mut prepared = args.to_vec();
     let mut stager = BrowserPathStager::new(managed_temp_output);
 
-    for &(index, kind) in positional_browser_paths(command) {
+    for &(index, kind, flag_name) in positional_browser_paths(command) {
+        if prepared
+            .iter()
+            .any(|arg| canonical_browser_flag_name(arg).as_deref() == Some(flag_name))
+        {
+            continue;
+        }
         let Some(value) = prepared.get(index).cloned() else {
             continue;
         };
         if value.starts_with('-') {
-            return Err(format!(
-                "Browser command '{command}' requires its path argument in the pinned v{CHROME_DEVTOOLS_PACKAGE_VERSION} positional form"
-            ));
+            continue;
         }
         let staged = stage_browser_path(
             &workspace_root,
@@ -1999,6 +1983,28 @@ mod tests {
             !upload_stage_root.exists(),
             "input staging must be cleaned up"
         );
+
+        let structured_upload_args = browser_structured_arguments_to_cli(
+            "upload_file",
+            &serde_json::json!({ "uid": "1_2", "filePath": "upload.txt" }),
+        )
+        .expect("normalize structured upload arguments");
+        prepare_browser_invocation(&workspace_str, "upload_file", &structured_upload_args)
+            .expect("structured upload arguments must survive workspace staging");
+        prepare_browser_invocation(
+            &workspace_str,
+            "upload_file",
+            &["--filePath=upload.txt".to_string(), "1_2".to_string()],
+        )
+        .expect("named path plus positional uid must survive workspace staging");
+
+        let structured_heap_args = browser_structured_arguments_to_cli(
+            "take_heapsnapshot",
+            &serde_json::json!({ "filePath": "reports/heap.heapsnapshot" }),
+        )
+        .expect("normalize structured heap snapshot arguments");
+        prepare_browser_invocation(&workspace_str, "take_heapsnapshot", &structured_heap_args)
+            .expect("structured heap snapshot arguments must survive workspace staging");
 
         let mut screenshot = prepare_browser_invocation(
             &workspace_str,

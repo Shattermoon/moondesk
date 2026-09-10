@@ -9,16 +9,18 @@ use tiktoken_rs::o200k_base_singleton;
 
 use crate::browser_contract::browser_structured_arguments_to_cli;
 use crate::browser_runtime::{
-    BrowserRuntime, DEFAULT_BROWSER_COMMAND_TIMEOUT, MAX_BROWSER_ARG_BYTES, MAX_BROWSER_ARGS,
-    MAX_BROWSER_COMMAND_BYTES, MAX_BROWSER_TIMEOUT_MS, canonical_browser_flag_name,
-    validate_browser_request_bounds,
+    BrowserPresentationChange, BrowserRuntime, DEFAULT_BROWSER_COMMAND_TIMEOUT,
+    MAX_BROWSER_ARG_BYTES, MAX_BROWSER_ARGS, MAX_BROWSER_COMMAND_BYTES, MAX_BROWSER_TIMEOUT_MS,
+    canonical_browser_flag_name, validate_browser_request_bounds,
 };
 use crate::command;
 use crate::command_jobs::{
     CommandJobManager, CommandJobSnapshot, DEFAULT_JOB_TIMEOUT_MS, DEFAULT_POLL_WAIT_MS,
     MAX_COMMAND_OUTPUT_READ_BYTES, MAX_JOB_TIMEOUT_MS, MAX_POLL_WAIT_MS,
 };
-use crate::state::{AgentsPathMode, Mode, ToolMode, load_app_config, user_home_dir};
+use crate::state::{
+    AgentsPathMode, BrowserPresentation, Mode, ToolMode, load_app_config, user_home_dir,
+};
 use crate::vision;
 use crate::workspace_tools;
 use crate::workspaces::{self, WorkspaceAvailability, WorkspaceId};
@@ -179,6 +181,22 @@ fn local_tool_output_schema(name: &str) -> Option<Value> {
                 "images".to_string(),
                 json!({ "type": "array", "items": { "type": "object" } }),
             );
+        }
+        "set_browser_presentation" => {
+            properties.insert("status".to_string(), json!({ "type": "string" }));
+            properties.insert("detail".to_string(), json!({ "type": "string" }));
+            properties.insert("presentation".to_string(), json!({ "type": "string" }));
+            properties.insert(
+                "requestedPresentation".to_string(),
+                json!({ "type": "string" }),
+            );
+            properties.insert("browserRunning".to_string(), json!({ "type": "boolean" }));
+            properties.insert("sessionClosed".to_string(), json!({ "type": "boolean" }));
+            properties.insert(
+                "confirmationRequired".to_string(),
+                json!({ "type": "boolean" }),
+            );
+            properties.insert("retryable".to_string(), json!({ "type": "boolean" }));
         }
         "browser_command" => {
             properties.insert("stdout".to_string(), json!({ "type": "string" }));
@@ -568,10 +586,26 @@ async fn handle_tools_list(
             }));
         }
         let browser_read_only = tool_mode.read_only();
+        if !browser_read_only {
+            tools.push(json!({
+                "name": "set_browser_presentation",
+                "title": "Set browser presentation",
+                "description": "Switch MoonDesk's isolated agent browser between headless and visible presentation. Prefer headless for normal autonomous work. Use visible only when the user needs to watch or manually interact with the browser, such as a login, CAPTCHA, permission prompt, or other human-input step. If a different presentation would close an active browser session, the first call returns confirmation_required without changing anything. Retry with confirm_restart=true only after the user explicitly approves losing that temporary session. A live presentation change discards tabs, cookies/storage, page state, and snapshot UIDs. After human input, keep using the visible session while that state is still needed; switch back to headless only after the flow is finished.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "presentation": { "type": "string", "enum": ["headless", "visible"], "description": "Requested agent-browser presentation" },
+                        "confirm_restart": { "type": "boolean", "description": "Confirm closing the current isolated browser session if a restart is required. Set true only after explicit user approval. Default false." }
+                    },
+                    "required": ["presentation"]
+                },
+                "annotations": { "readOnlyHint": false, "openWorldHint": false, "destructiveHint": true }
+            }));
+        }
         tools.push(json!({
             "name": "browser_command",
             "title": "Run browser command",
-            "description": "Run one Chrome DevTools CLI browser operation against MoonDesk's shared lazy agent-browser session. The browser starts only on the first browser operation and is reused across commands. Use resize_page for normal desktop window sizes; use emulate with --viewport=<width>x<height>x<dpr>[,mobile][,touch] for exact tablet/mobile responsive testing, then take a fresh snapshot before using UIDs. Other useful commands include list_pages, new_page, navigate_page, take_snapshot, click, fill, type_text, press_key, hover, drag, evaluate_script, list_console_messages, list_network_requests, lighthouse_audit, and performance_start_trace. In read-only mode MoonDesk permits only bounded inspection commands, requires lighthouse_audit to use explicit --mode=snapshot, and rejects state-changing actions or browser file-output flags. Browser file paths are constrained to the active workspace. MoonDesk manages start/status/stop automatically.",
+            "description": "Run one Chrome DevTools CLI browser operation against MoonDesk's shared lazy agent-browser session. The isolated browser is headless by default, starts only on the first browser operation, and is reused across commands; the user can switch it to visible presentation from MoonDesk. Use resize_page for normal desktop window sizes; use emulate with --viewport=<width>x<height>x<dpr>[,mobile][,touch] for exact tablet/mobile responsive testing, then take a fresh snapshot before using UIDs. Other useful commands include list_pages, new_page, navigate_page, take_snapshot, click, fill, type_text, press_key, hover, drag, evaluate_script, list_console_messages, list_network_requests, lighthouse_audit, and performance_start_trace. In read-only mode MoonDesk permits only bounded inspection commands, requires lighthouse_audit to use explicit --mode=snapshot, and rejects state-changing actions or browser file-output flags. Browser file paths are constrained to the active workspace. MoonDesk manages start/status/stop automatically.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -675,7 +709,11 @@ async fn handle_tools_call_for_workspace(
         .to_string();
 
     let connector_browser_tool = connector_expanded_browser_tool(&tool_name);
-    if matches!(tool_name.as_str(), "browser_command" | "view_page") || connector_browser_tool {
+    if matches!(
+        tool_name.as_str(),
+        "set_browser_presentation" | "browser_command" | "view_page"
+    ) || connector_browser_tool
+    {
         if workspaces::workspace_availability(Path::new(workspace_root))
             == WorkspaceAvailability::Unavailable
         {
@@ -689,6 +727,12 @@ async fn handle_tools_call_for_workspace(
                 req,
                 format!("Tool '{tool_name}' requires Browser or Both mode"),
             );
+        }
+        if tool_name == "set_browser_presentation" {
+            if tool_mode.read_only() {
+                return read_only_blocked_response(req, &tool_name);
+            }
+            return handle_set_browser_presentation(req, workspace_root, browser_runtime).await;
         }
         if tool_name == "browser_command" {
             return handle_browser_command(req, workspace_root, tool_mode, browser_runtime).await;
@@ -1588,9 +1632,15 @@ Always specify the branch explicitly when using `git push`."#
 
     if mode.browser_enabled() {
         lines.push(
-            "Browser mode exposes a stable browser surface instead of forwarding the full Chrome DevTools MCP catalog. Use browser_command for browser actions and view_page for actual rendered pixels. The browser starts lazily in an isolated temporary agent profile that never inherits the user's personal cookies or logged-in browser state. The same live agent session is reused across browser_command, view_page, and `moondesk browser` until that session ends. For local web-app verification, navigate to the dev server, set the target viewport before taking interaction UIDs, use resize_page for normal desktop sizes and emulate --viewport=<width>x<height>x<dpr>[,mobile][,touch] for exact tablet/mobile QA, then take_snapshot. Navigation, viewport emulation, and substantial DOM changes can invalidate UIDs, so take a fresh snapshot before further element interactions. Accessibility/text snapshots are useful for structure but do not replace view_page for visual judgment. MoonDesk manages browser start/status/stop automatically; do not invoke lifecycle commands through browser_command or call npx chrome-devtools-mcp directly."
+            "Browser mode exposes a stable browser surface instead of forwarding the full Chrome DevTools MCP catalog. Use browser_command for browser actions and view_page for actual rendered pixels. The browser starts lazily, headless by default at a deterministic 1280x800 initial viewport, in an isolated temporary agent profile that never inherits the user's personal cookies or logged-in browser state. Headless presentation still supports rendered-pixel inspection through view_page and screenshots; resize or emulate the target viewport before responsive or pixel-sensitive QA. The user can switch the browser to visible presentation from MoonDesk; changing presentation while Chromium is running closes that isolated session, so take a fresh page/snapshot afterward. The same live agent session is reused across browser_command, view_page, and `moondesk browser` until that session ends. For local web-app verification, navigate to the dev server, set the target viewport before taking interaction UIDs, use resize_page for normal desktop sizes and emulate --viewport=<width>x<height>x<dpr>[,mobile][,touch] for exact tablet/mobile QA, then take_snapshot. Navigation, viewport emulation, substantial DOM changes, and presentation changes can invalidate UIDs, so take a fresh snapshot before further element interactions. Accessibility/text snapshots are useful for structure but do not replace view_page for visual judgment. MoonDesk manages browser start/status/stop automatically; do not invoke lifecycle commands through browser_command or call npx chrome-devtools-mcp directly."
                 .to_string(),
         );
+        if tool_mode.write_tools_enabled() {
+            lines.push(
+                "In multi-tools mode, use set_browser_presentation only when browser visibility itself is needed. Prefer headless for normal autonomous work. Request visible before a login, CAPTCHA, permission prompt, or other step that needs the user to see or manually interact with the isolated browser. If changing presentation would close a live session, the tool returns confirmation_required without changing anything; ask the user for explicit approval before retrying with confirm_restart=true. A live presentation change creates a fresh isolated session, so keep a human-assisted visible session visible while its entered cookies/storage/page state are still needed, and return to headless only after that flow is finished."
+                    .to_string(),
+            );
+        }
         if mode.computer_enabled() && tool_mode.run_command_enabled() {
             lines.push(
                 "For repetitive deterministic browser flows in Both mode, use the `moondesk browser <command> ...` subcommand from scripts or loops; it is a lightweight client to the same running MoonDesk host/session rather than a second browser executable. Run `moondesk browser skill` when you need the workflow reference. Prefer browser_command for one-off actions and return to view_page whenever appearance matters."
@@ -2323,6 +2373,180 @@ async fn handle_connector_wait_for(
     {
         Ok(output) => browser_command_output_response(req, "wait_for", output),
         Err(error) => tool_error_response(req, format!("Browser command failed: {error}")),
+    }
+}
+
+async fn handle_set_browser_presentation(
+    req: &JsonRpcRequest,
+    workspace_root: &str,
+    browser_runtime: &Option<Arc<BrowserRuntime>>,
+) -> JsonRpcResponse {
+    let arguments = tool_arguments(req);
+    if let Some(object) = arguments.as_object()
+        && object
+            .keys()
+            .any(|key| !matches!(key.as_str(), "presentation" | "confirm_restart"))
+    {
+        return tool_error_response(
+            req,
+            "set_browser_presentation contains an unknown argument".to_string(),
+        );
+    }
+    let requested = match arguments.get("presentation").and_then(Value::as_str) {
+        Some("headless") => BrowserPresentation::Headless,
+        Some("visible") => BrowserPresentation::Visible,
+        Some(_) => {
+            return tool_error_response(
+                req,
+                "presentation must be either 'headless' or 'visible'".to_string(),
+            );
+        }
+        None => {
+            return tool_error_response(
+                req,
+                "Missing required parameter: presentation".to_string(),
+            );
+        }
+    };
+    let confirm_restart = match optional_bool_argument(&arguments, "confirm_restart", false) {
+        Ok(value) => value,
+        Err(error) => return tool_error_response(req, error),
+    };
+    let Some(runtime) = browser_runtime else {
+        return tool_error_response(
+            req,
+            "Browser runtime is unavailable. Restart MoonDesk in Browser or Both mode.".to_string(),
+        );
+    };
+
+    let change = runtime.set_presentation(requested, confirm_restart).await;
+    match change {
+        BrowserPresentationChange::Busy => {
+            let detail = "The browser is busy with another operation, so its presentation was not changed. Retry after the current browser action finishes.";
+            tool_error_response_with_structured(
+                req,
+                String::new(),
+                json!({
+                    "status": "busy",
+                    "detail": detail,
+                    "requestedPresentation": requested.config_value(),
+                    "confirmationRequired": false,
+                    "retryable": true,
+                }),
+            )
+        }
+        BrowserPresentationChange::RequiresRestart => {
+            let detail = "Changing browser presentation would close the current isolated browser session. Ask the user to approve losing its tabs, cookies/storage, page state, and snapshot UIDs, then retry with confirm_restart=true.";
+            tool_success_response_with_structured(
+                req,
+                String::new(),
+                json!({
+                    "status": "confirmation_required",
+                    "detail": detail,
+                    "requestedPresentation": requested.config_value(),
+                    "browserRunning": true,
+                    "sessionClosed": false,
+                    "confirmationRequired": true,
+                    "retryable": true,
+                }),
+            )
+        }
+        BrowserPresentationChange::Unchanged
+        | BrowserPresentationChange::Updated
+        | BrowserPresentationChange::UpdatedAndSessionClosed => {
+            let session_closed = change == BrowserPresentationChange::UpdatedAndSessionClosed;
+            if requested == BrowserPresentation::Visible {
+                let started = runtime
+                    .run(
+                        workspace_root,
+                        "list_pages",
+                        &[],
+                        DEFAULT_BROWSER_COMMAND_TIMEOUT,
+                    )
+                    .await;
+                let start_error = match started {
+                    Ok(output) if output.success() => None,
+                    Ok(output) => {
+                        let details = output.failure_details();
+                        Some(if details.is_empty() {
+                            "visible browser startup returned a failed browser result".to_string()
+                        } else {
+                            details
+                        })
+                    }
+                    Err(error) => Some(error),
+                };
+                if let Some(error) = start_error {
+                    let rollback = runtime
+                        .set_presentation(BrowserPresentation::Headless, true)
+                        .await;
+                    let reverted = matches!(
+                        rollback,
+                        BrowserPresentationChange::Unchanged
+                            | BrowserPresentationChange::Updated
+                            | BrowserPresentationChange::UpdatedAndSessionClosed
+                    );
+                    let detail = if reverted {
+                        format!(
+                            "Visible browser could not start and MoonDesk reverted to headless: {error}"
+                        )
+                    } else {
+                        format!(
+                            "Visible browser could not start, and MoonDesk could not immediately revert the presentation because the browser became busy: {error}"
+                        )
+                    };
+                    return tool_error_response_with_structured(
+                        req,
+                        String::new(),
+                        json!({
+                            "status": if reverted { "visible_start_failed_reverted" } else { "visible_start_failed" },
+                            "detail": detail,
+                            "presentation": if reverted { "headless" } else { "visible" },
+                            "requestedPresentation": "visible",
+                            "browserRunning": runtime.is_running().await,
+                            "sessionClosed": session_closed,
+                            "confirmationRequired": false,
+                            "retryable": true,
+                        }),
+                    );
+                }
+            }
+
+            let browser_running = runtime.is_running().await;
+            let status = match change {
+                BrowserPresentationChange::Unchanged => "unchanged",
+                BrowserPresentationChange::Updated => "updated",
+                BrowserPresentationChange::UpdatedAndSessionClosed => "session_closed",
+                BrowserPresentationChange::RequiresRestart => "confirmation_required",
+                BrowserPresentationChange::Busy => "busy",
+            };
+            let detail = match requested {
+                BrowserPresentation::Headless => {
+                    if session_closed {
+                        "Browser presentation is now headless. The previous visible session was closed; the next browser action will start a fresh hidden isolated session."
+                    } else {
+                        "Browser presentation is headless. Normal agent browser work will stay hidden."
+                    }
+                }
+                BrowserPresentation::Visible => {
+                    "Browser presentation is visible and the isolated browser window is running. Keep using this visible session while any human-entered state is still needed."
+                }
+            };
+            tool_success_response_with_structured(
+                req,
+                String::new(),
+                json!({
+                    "status": status,
+                    "detail": detail,
+                    "presentation": requested.config_value(),
+                    "requestedPresentation": requested.config_value(),
+                    "browserRunning": browser_running,
+                    "sessionClosed": session_closed,
+                    "confirmationRequired": false,
+                    "retryable": false,
+                }),
+            )
+        }
     }
 }
 
@@ -3921,6 +4145,7 @@ mod tests {
                 "write",
                 "edit",
                 "delete",
+                "set_browser_presentation",
                 "browser_command",
                 "view_page",
             ]
@@ -3981,6 +4206,7 @@ mod tests {
             ("view_images", "images"),
             ("search", "text"),
             ("edit", "replacements"),
+            ("set_browser_presentation", "presentation"),
             ("browser_command", "stdout"),
             ("view_page", "width"),
         ] {
@@ -4584,6 +4810,153 @@ mod tests {
                 .and_then(Value::as_bool),
             Some(true)
         );
+        let presentation_tool = writable
+            .result
+            .as_ref()
+            .and_then(|result| result.get("tools"))
+            .and_then(Value::as_array)
+            .and_then(|tools| {
+                tools.iter().find(|tool| {
+                    tool.get("name").and_then(Value::as_str) == Some("set_browser_presentation")
+                })
+            })
+            .expect("set_browser_presentation descriptor");
+        assert_eq!(
+            presentation_tool
+                .pointer("/annotations/readOnlyHint")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            presentation_tool
+                .pointer("/annotations/destructiveHint")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            presentation_tool
+                .pointer("/inputSchema/properties/presentation/enum")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(2)
+        );
+    }
+
+    #[tokio::test]
+    async fn set_browser_presentation_is_blocked_in_read_only_and_idle_headless_is_noop() {
+        use crate::state::AppState;
+        use tokio::sync::Mutex;
+
+        let workspace_root = std::env::temp_dir().join(format!(
+            "moondesk-browser-presentation-tool-{}",
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workspace_root).expect("create browser presentation workspace");
+        let workspace_root_str = workspace_root.to_string_lossy().into_owned();
+        let config_path = workspace_root.join("config.toml");
+        let app = AppState::new_for_test(0, workspace_root_str.clone(), config_path.clone())
+            .expect("create browser presentation app");
+        let state = Arc::new(Mutex::new(app));
+        let runtime = Some(Arc::new(BrowserRuntime::new(state.clone())));
+        let command_jobs = CommandJobManager::new();
+
+        let read_only = handle_tools_call(
+            &tool_call_request(
+                "set_browser_presentation",
+                json!({ "presentation": "headless" }),
+            ),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::ReadOnly,
+            false,
+            &command_jobs,
+            &runtime,
+        )
+        .await;
+        assert_eq!(
+            read_only
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(result_text(&read_only).contains("disabled in read-only mode"));
+
+        let idle = handle_tools_call(
+            &tool_call_request(
+                "set_browser_presentation",
+                json!({ "presentation": "headless" }),
+            ),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime,
+        )
+        .await;
+        let idle_structured = idle
+            .result
+            .as_ref()
+            .and_then(|result| result.get("structuredContent"))
+            .expect("idle presentation result");
+        assert_eq!(
+            idle_structured.get("status").and_then(Value::as_str),
+            Some("unchanged")
+        );
+        assert_eq!(
+            idle_structured.get("presentation").and_then(Value::as_str),
+            Some("headless")
+        );
+        assert_eq!(
+            idle_structured
+                .get("browserRunning")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            idle_structured
+                .get("confirmationRequired")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+        assert!(
+            idle_structured
+                .get("detail")
+                .and_then(Value::as_str)
+                .is_some_and(|detail| detail.contains("stay hidden"))
+        );
+        assert_eq!(
+            state.lock().await.browser_presentation,
+            BrowserPresentation::Headless
+        );
+
+        let invalid = handle_tools_call(
+            &tool_call_request(
+                "set_browser_presentation",
+                json!({ "presentation": "sometimes-visible" }),
+            ),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime,
+        )
+        .await;
+        assert_eq!(
+            invalid
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(result_text(&invalid).contains("either 'headless' or 'visible'"));
+
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_dir_all(workspace_root);
     }
 
     #[tokio::test]
@@ -4728,6 +5101,201 @@ mod tests {
         assert!(result_text(&contract_only).contains("Unknown tool"));
 
         std::fs::remove_dir_all(workspace_root).expect("remove browser adapter workspace");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    #[ignore = "serialized Windows agent browser presentation smoke"]
+    async fn windows_agent_can_request_visible_browser_with_restart_confirmation() {
+        use crate::state::AppState;
+        use tokio::sync::Mutex;
+
+        if !crate::browser::detect_browsers()
+            .into_iter()
+            .any(|browser| browser.mcp_supported)
+        {
+            eprintln!(
+                "skipping agent presentation smoke: no supported Chromium browser is installed"
+            );
+            return;
+        }
+
+        let workspace_root = std::env::temp_dir().join(format!(
+            "moondesk-agent-browser-presentation-{}",
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workspace_root).expect("create browser presentation workspace");
+        let workspace_root_str = workspace_root.to_string_lossy().into_owned();
+        let config_path = workspace_root.join("config.toml");
+        let app = AppState::new_for_test(0, workspace_root_str.clone(), config_path.clone())
+            .expect("create browser presentation app");
+        let state = Arc::new(Mutex::new(app));
+        let runtime = Arc::new(BrowserRuntime::new(state.clone()));
+        let runtime_option = Some(runtime.clone());
+        let command_jobs = CommandJobManager::new();
+
+        let started = handle_tools_call(
+            &tool_call_request("list_pages", json!({})),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        assert_ne!(
+            started
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true),
+            "default headless browser should start before presentation handoff"
+        );
+        assert!(runtime.is_running().await);
+
+        let requested = handle_tools_call(
+            &tool_call_request(
+                "set_browser_presentation",
+                json!({ "presentation": "visible" }),
+            ),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        let requested_structured = requested
+            .result
+            .as_ref()
+            .and_then(|result| result.get("structuredContent"))
+            .expect("presentation request result");
+        assert_eq!(
+            requested_structured.get("status").and_then(Value::as_str),
+            Some("confirmation_required")
+        );
+        assert_eq!(
+            requested_structured
+                .get("confirmationRequired")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            state.lock().await.browser_presentation,
+            BrowserPresentation::Headless
+        );
+        assert!(runtime.is_running().await);
+
+        let approved = handle_tools_call(
+            &tool_call_request(
+                "set_browser_presentation",
+                json!({ "presentation": "visible", "confirm_restart": true }),
+            ),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        let approved_structured = approved
+            .result
+            .as_ref()
+            .and_then(|result| result.get("structuredContent"))
+            .expect("approved presentation result");
+        assert_eq!(
+            approved_structured
+                .get("presentation")
+                .and_then(Value::as_str),
+            Some("visible")
+        );
+        assert_eq!(
+            approved_structured
+                .get("sessionClosed")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            approved_structured
+                .get("browserRunning")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            state.lock().await.browser_presentation,
+            BrowserPresentation::Visible
+        );
+        assert!(runtime.is_running().await);
+
+        let back_requires_confirmation = handle_tools_call(
+            &tool_call_request(
+                "set_browser_presentation",
+                json!({ "presentation": "headless" }),
+            ),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        assert_eq!(
+            back_requires_confirmation
+                .result
+                .as_ref()
+                .and_then(|result| result.get("structuredContent"))
+                .and_then(|structured| structured.get("status"))
+                .and_then(Value::as_str),
+            Some("confirmation_required")
+        );
+
+        let back = handle_tools_call(
+            &tool_call_request(
+                "set_browser_presentation",
+                json!({ "presentation": "headless", "confirm_restart": true }),
+            ),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        let back_structured = back
+            .result
+            .as_ref()
+            .and_then(|result| result.get("structuredContent"))
+            .expect("headless presentation result");
+        assert_eq!(
+            back_structured.get("presentation").and_then(Value::as_str),
+            Some("headless")
+        );
+        assert_eq!(
+            back_structured
+                .get("sessionClosed")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            back_structured
+                .get("browserRunning")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            state.lock().await.browser_presentation,
+            BrowserPresentation::Headless
+        );
+
+        runtime.stop_if_owned(&workspace_root_str).await;
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_dir_all(workspace_root);
     }
 
     #[cfg(windows)]
@@ -5097,6 +5665,54 @@ mod tests {
             "browser navigation failed: stdout={} stderr={}",
             navigate.stdout,
             navigate.stderr
+        );
+        let viewport = runtime
+            .run(
+                &workspace_root_str,
+                "evaluate_script",
+                &[
+                    "() => ({width: innerWidth, height: innerHeight, scrollHeight: document.documentElement.scrollHeight})".to_string(),
+                    "--outputFormat=json".to_string(),
+                ],
+                DEFAULT_BROWSER_COMMAND_TIMEOUT,
+            )
+            .await
+            .expect("inspect default headless viewport");
+        assert!(
+            viewport.success(),
+            "viewport inspection failed: {viewport:?}"
+        );
+        let viewport_envelope: Value =
+            serde_json::from_str(&viewport.stdout).unwrap_or_else(|error| {
+                panic!("decode viewport envelope: {error}; {}", viewport.stdout)
+            });
+        let viewport_message = viewport_envelope
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| panic!("missing viewport message: {}", viewport.stdout));
+        let viewport_json = viewport_message
+            .strip_prefix("Script ran on page and returned:\n```json\n")
+            .and_then(|value| value.strip_suffix("\n```"))
+            .unwrap_or_else(|| panic!("unexpected viewport message format: {viewport_message}"));
+        let viewport_metrics: Value = serde_json::from_str(viewport_json)
+            .unwrap_or_else(|error| panic!("decode viewport metrics: {error}; {viewport_json}"));
+        assert_eq!(
+            viewport_metrics.get("width").and_then(Value::as_u64),
+            Some(1280),
+            "unexpected default headless viewport/page metrics: {}",
+            viewport.stdout
+        );
+        assert_eq!(
+            viewport_metrics.get("height").and_then(Value::as_u64),
+            Some(800),
+            "unexpected default headless viewport/page metrics: {}",
+            viewport.stdout
+        );
+        assert_eq!(
+            viewport_metrics.get("scrollHeight").and_then(Value::as_u64),
+            Some(2400),
+            "unexpected default headless viewport/page metrics: {}",
+            viewport.stdout
         );
 
         let invalid_scope = handle_view_page(
@@ -5972,10 +6588,12 @@ mod tests {
         assert!(instruction_text.contains("model receives the pixels through its vision input"));
         assert!(instruction_text.contains("view_page for actual rendered pixels"));
         assert!(instruction_text.contains("do not replace view_page for visual judgment"));
-        assert!(
-            instruction_text
-                .contains("browser starts lazily in an isolated temporary agent profile")
-        );
+        assert!(instruction_text.contains("browser starts lazily, headless by default"));
+        assert!(instruction_text.contains(
+            "use set_browser_presentation only when browser visibility itself is needed"
+        ));
+        assert!(instruction_text.contains("tool returns confirmation_required"));
+        assert!(instruction_text.contains("retrying with confirm_restart=true"));
         assert!(instruction_text.contains("same live agent session is reused"));
         assert!(instruction_text.contains("never inherits the user's personal cookies"));
         assert!(instruction_text.contains("emulate --viewport=<width>x<height>x<dpr>"));

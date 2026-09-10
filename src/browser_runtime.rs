@@ -14,7 +14,7 @@ use crate::browser_contract::{
     parse_browser_cli_invocation,
 };
 use crate::browser_transport::{BrowserMcpTransport, BrowserTransportError};
-use crate::state::SharedState;
+use crate::state::{BrowserPresentation, SharedState};
 
 // Keep this exact pin until MoonDesk's browser command contract is deliberately migrated and
 // re-tested. The checked-in browser_contract_v1_7.json is generated from this exact package.
@@ -26,6 +26,8 @@ pub const MAX_BROWSER_ARGS: usize = 64;
 pub const MAX_BROWSER_ARG_BYTES: usize = 8 * 1024;
 pub const MAX_BROWSER_CONTROL_BODY_BYTES: usize = 128 * 1024;
 const MAX_CAPTURED_OUTPUT_BYTES: usize = 256 * 1024;
+const DEFAULT_HEADLESS_VIEWPORT: &str = "1280x800";
+const BROWSER_PRESENTATION_LOCK_TIMEOUT: Duration = Duration::from_millis(250);
 
 #[derive(Clone, Debug)]
 pub struct BrowserCommandOutput {
@@ -33,6 +35,15 @@ pub struct BrowserCommandOutput {
     pub stderr: String,
     pub exit_code: i32,
     pub restarted: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BrowserPresentationChange {
+    Unchanged,
+    Updated,
+    UpdatedAndSessionClosed,
+    RequiresRestart,
+    Busy,
 }
 
 impl BrowserCommandOutput {
@@ -451,7 +462,12 @@ impl BrowserRuntime {
             stale.shutdown().await;
         }
 
-        let (server_args, browser_name) = browser_server_args();
+        let presentation = if let Some(state) = &self.state {
+            state.lock().await.browser_presentation
+        } else {
+            BrowserPresentation::default()
+        };
+        let (server_args, browser_name) = browser_server_args(presentation);
         let transport = BrowserMcpTransport::start(
             workspace_root,
             CHROME_DEVTOOLS_PACKAGE_VERSION,
@@ -477,7 +493,10 @@ impl BrowserRuntime {
             app.browser_runtime_running = true;
             app.log(
                 "INFO",
-                format!("Isolated agent browser runtime started lazily with {browser_name}"),
+                format!(
+                    "Isolated agent browser runtime started lazily with {browser_name} · {}",
+                    presentation.label()
+                ),
             );
         }
         Ok((transport, has_started))
@@ -503,6 +522,79 @@ impl BrowserRuntime {
                 format!("MoonDesk invalidated the owned browser runtime: {reason}"),
             );
         }
+    }
+
+    /// Change whether the isolated agent browser is headless or visible.
+    ///
+    /// Presentation is a Chromium process-startup choice. Hold the same operation lock used by
+    /// browser actions while tearing down the current transport and publishing the new setting so
+    /// another request cannot race in and restart Chromium with the old presentation.
+    /// A live session is never discarded unless `allow_restart` is true.
+    pub async fn set_presentation(
+        &self,
+        presentation: BrowserPresentation,
+        allow_restart: bool,
+    ) -> BrowserPresentationChange {
+        let Ok(_operation) =
+            tokio::time::timeout(BROWSER_PRESENTATION_LOCK_TIMEOUT, self.operation.lock()).await
+        else {
+            return BrowserPresentationChange::Busy;
+        };
+        let Some(state) = &self.state else {
+            return BrowserPresentationChange::Unchanged;
+        };
+        let current = state.lock().await.browser_presentation;
+        if current == presentation {
+            return BrowserPresentationChange::Unchanged;
+        }
+
+        let has_live_session = self
+            .runtime
+            .lock()
+            .await
+            .transport
+            .as_ref()
+            .is_some_and(|transport| transport.is_alive());
+        if has_live_session && !allow_restart {
+            return BrowserPresentationChange::RequiresRestart;
+        }
+
+        let transport = self.runtime.lock().await.transport.take();
+        if let Some(transport) = transport {
+            transport.shutdown().await;
+        }
+
+        let mut app = state.lock().await;
+        app.browser_presentation = presentation;
+        app.browser_runtime_running = false;
+        app.mark_config_dirty();
+        app.log(
+            "INFO",
+            format!(
+                "Agent browser display changed to {}{}",
+                presentation.label(),
+                if has_live_session {
+                    "; previous isolated browser session closed"
+                } else {
+                    ""
+                }
+            ),
+        );
+        if has_live_session {
+            BrowserPresentationChange::UpdatedAndSessionClosed
+        } else {
+            BrowserPresentationChange::Updated
+        }
+    }
+
+    /// Return whether MoonDesk currently owns a live browser transport.
+    pub async fn is_running(&self) -> bool {
+        self.runtime
+            .lock()
+            .await
+            .transport
+            .as_ref()
+            .is_some_and(|transport| transport.is_alive())
     }
 
     pub async fn stop_if_owned(&self, _workspace_root: &str) {
@@ -552,9 +644,9 @@ fn browser_page_listing(result: &Value) -> Vec<(u64, bool)> {
     browser_page_listing_text(&browser_result_text(result))
 }
 
-fn browser_server_args() -> (Vec<String>, String) {
+fn browser_server_args(presentation: BrowserPresentation) -> (Vec<String>, String) {
     let mut args = vec![
-        "--headless=false".to_string(),
+        format!("--headless={}", presentation.is_headless()),
         "--isolated=true".to_string(),
         "--screenshotFormat=jpeg".to_string(),
         "--screenshotQuality=82".to_string(),
@@ -567,6 +659,9 @@ fn browser_server_args() -> (Vec<String>, String) {
         "--viaCli=true".to_string(),
         "--experimentalStructuredContent=true".to_string(),
     ];
+    if presentation.is_headless() {
+        args.push(format!("--viewport={DEFAULT_HEADLESS_VIEWPORT}"));
+    }
     let mut browser_name = "default Chromium browser".to_string();
     if let Some(browser) = crate::browser::detect_browsers()
         .into_iter()
@@ -1747,6 +1842,7 @@ fn bounded_output(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::AppState;
 
     #[test]
     fn service_commands_are_reserved_for_runtime_lifecycle() {
@@ -1928,25 +2024,102 @@ mod tests {
     }
 
     #[test]
-    fn browser_server_args_enforce_isolated_safe_runtime() {
-        let (args, _browser_name) = browser_server_args();
-        for expected in [
-            "--headless=false",
-            "--isolated=true",
-            "--screenshotFormat=jpeg",
-            "--screenshotQuality=82",
-            "--screenshotMaxWidth=1920",
-            "--screenshotMaxHeight=4096",
-            "--usageStatistics=false",
-            "--performanceCrux=false",
-            "--redactNetworkHeaders=true",
-            "--allowUnrestrictedPaths=false",
-            "--viaCli=true",
-            "--experimentalStructuredContent=true",
+    fn browser_server_args_enforce_isolated_safe_runtime_and_presentation() {
+        for (presentation, expected_headless) in [
+            (BrowserPresentation::Headless, "--headless=true"),
+            (BrowserPresentation::Visible, "--headless=false"),
         ] {
-            assert!(args.iter().any(|arg| arg == expected), "missing {expected}");
+            let (args, _browser_name) = browser_server_args(presentation);
+            for expected in [
+                expected_headless,
+                "--isolated=true",
+                "--screenshotFormat=jpeg",
+                "--screenshotQuality=82",
+                "--screenshotMaxWidth=1920",
+                "--screenshotMaxHeight=4096",
+                "--usageStatistics=false",
+                "--performanceCrux=false",
+                "--redactNetworkHeaders=true",
+                "--allowUnrestrictedPaths=false",
+                "--viaCli=true",
+                "--experimentalStructuredContent=true",
+            ] {
+                assert!(args.iter().any(|arg| arg == expected), "missing {expected}");
+            }
+            assert!(!args.iter().any(|arg| arg.starts_with("--userDataDir=")));
+            if presentation.is_headless() {
+                assert!(
+                    args.iter()
+                        .any(|arg| arg == &format!("--viewport={DEFAULT_HEADLESS_VIEWPORT}"))
+                );
+            } else {
+                assert!(!args.iter().any(|arg| arg.starts_with("--viewport=")));
+            }
         }
-        assert!(!args.iter().any(|arg| arg.starts_with("--userDataDir=")));
+    }
+
+    #[tokio::test]
+    async fn browser_presentation_change_returns_busy_instead_of_waiting_for_active_operation() {
+        let workspace = std::env::temp_dir().join(format!(
+            "moondesk-browser-presentation-busy-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workspace).expect("create presentation workspace");
+        let config_path = workspace.join("config.toml");
+        let app = AppState::new_for_test(
+            8787,
+            workspace.to_string_lossy().into_owned(),
+            config_path.clone(),
+        )
+        .expect("create browser presentation app");
+        let state = Arc::new(Mutex::new(app));
+        let runtime = BrowserRuntime::new(state.clone());
+        let operation = runtime.operation.lock().await;
+
+        let started = tokio::time::Instant::now();
+        let change = runtime
+            .set_presentation(BrowserPresentation::Visible, false)
+            .await;
+        assert_eq!(change, BrowserPresentationChange::Busy);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(
+            state.lock().await.browser_presentation,
+            BrowserPresentation::Headless
+        );
+
+        drop(operation);
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test]
+    async fn changing_idle_browser_presentation_updates_state_without_starting_chromium() {
+        let workspace = std::env::temp_dir().join(format!(
+            "moondesk-browser-presentation-idle-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workspace).expect("create presentation workspace");
+        let config_path = workspace.join("config.toml");
+        let app = AppState::new_for_test(
+            8787,
+            workspace.to_string_lossy().into_owned(),
+            config_path.clone(),
+        )
+        .expect("create browser presentation app");
+        let state = Arc::new(Mutex::new(app));
+        let runtime = BrowserRuntime::new(state.clone());
+
+        let change = runtime
+            .set_presentation(BrowserPresentation::Visible, false)
+            .await;
+        assert_eq!(change, BrowserPresentationChange::Updated);
+        let app = state.lock().await;
+        assert_eq!(app.browser_presentation, BrowserPresentation::Visible);
+        assert!(!app.browser_runtime_running);
+        drop(app);
+
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_dir_all(workspace);
     }
 
     #[test]
@@ -2349,6 +2522,109 @@ mod tests {
             runtime.runtime.lock().await.transport.is_none(),
             "invalid deferred trace output must not start the browser runtime"
         );
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    #[ignore = "serialized Windows browser presentation restart smoke"]
+    async fn windows_browser_presentation_change_requires_confirmation_and_restarts() {
+        let workspace = std::env::temp_dir().join(format!(
+            "moondesk-browser-presentation-restart-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workspace).expect("create presentation restart workspace");
+        let workspace_str = workspace.to_string_lossy().into_owned();
+        let config_path = workspace.join("config.toml");
+        let app = AppState::new_for_test(8787, workspace_str.clone(), config_path.clone())
+            .expect("create presentation restart app");
+        let state = Arc::new(Mutex::new(app));
+        let runtime = BrowserRuntime::new(state.clone());
+
+        let first = runtime
+            .run(
+                &workspace_str,
+                "list_pages",
+                &[],
+                DEFAULT_BROWSER_COMMAND_TIMEOUT,
+            )
+            .await
+            .expect("start default headless browser");
+        assert!(first.success(), "headless list_pages failed: {first:?}");
+        let first_transport = runtime
+            .runtime
+            .lock()
+            .await
+            .transport
+            .clone()
+            .expect("headless transport");
+        let first_pid = first_transport.pid().await.expect("headless transport pid");
+        assert!(first_transport.is_alive());
+
+        let refused = runtime
+            .set_presentation(BrowserPresentation::Visible, false)
+            .await;
+        assert_eq!(refused, BrowserPresentationChange::RequiresRestart);
+        assert!(first_transport.is_alive());
+        assert_eq!(
+            state.lock().await.browser_presentation,
+            BrowserPresentation::Headless
+        );
+
+        let session_closed = runtime
+            .set_presentation(BrowserPresentation::Visible, true)
+            .await;
+        assert_eq!(
+            session_closed,
+            BrowserPresentationChange::UpdatedAndSessionClosed
+        );
+        assert!(!first_transport.is_alive());
+        {
+            let app = state.lock().await;
+            assert_eq!(app.browser_presentation, BrowserPresentation::Visible);
+            assert!(!app.browser_runtime_running);
+        }
+
+        let visible = runtime
+            .run(
+                &workspace_str,
+                "list_pages",
+                &[],
+                DEFAULT_BROWSER_COMMAND_TIMEOUT,
+            )
+            .await
+            .expect("start visible browser after confirmed presentation change");
+        assert!(visible.success(), "visible list_pages failed: {visible:?}");
+        let visible_transport = runtime
+            .runtime
+            .lock()
+            .await
+            .transport
+            .clone()
+            .expect("visible transport");
+        let visible_pid = visible_transport
+            .pid()
+            .await
+            .expect("visible transport pid");
+        assert_ne!(visible_pid, first_pid);
+        assert!(visible_transport.is_alive());
+        assert!(state.lock().await.browser_runtime_running);
+
+        let back_to_headless = runtime
+            .set_presentation(BrowserPresentation::Headless, true)
+            .await;
+        assert_eq!(
+            back_to_headless,
+            BrowserPresentationChange::UpdatedAndSessionClosed
+        );
+        assert!(!visible_transport.is_alive());
+        assert_eq!(
+            state.lock().await.browser_presentation,
+            BrowserPresentation::Headless
+        );
+
+        runtime.stop_if_owned(&workspace_str).await;
+        let _ = std::fs::remove_file(config_path);
         let _ = std::fs::remove_dir_all(workspace);
     }
 

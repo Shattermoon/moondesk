@@ -1,4 +1,4 @@
-use crate::state::user_home_dir;
+use crate::state::moondesk_data_dir;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::fs::{self, OpenOptions};
@@ -255,8 +255,7 @@ fn changelog_notice_path(current_version: &str) -> std::io::Result<PathBuf> {
             "invalid MoonDesk changelog version {current_version}"
         )));
     }
-    Ok(user_home_dir()?
-        .join(".moondesk")
+    Ok(moondesk_data_dir()?
         .join("updates")
         .join(format!("v{current_version}"))
         .join("post-update.json"))
@@ -356,6 +355,12 @@ mod tests {
                     .join("v1.2.4")
                     .join("post-update.json")
             )
+        );
+        assert!(
+            path.starts_with(
+                crate::state::moondesk_data_dir().expect("resolve MoonDesk data directory")
+            ),
+            "Rust update notices must share MoonDesk's canonical data root with the npm wrapper"
         );
         assert!(changelog_notice_path("1.2.4-beta.1").is_err());
     }

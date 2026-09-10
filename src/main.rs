@@ -19,7 +19,7 @@ mod vision;
 mod workspace_tools;
 mod workspaces;
 
-use browser_runtime::BrowserRuntime;
+use browser_runtime::{BrowserPresentationChange, BrowserRuntime, DEFAULT_BROWSER_COMMAND_TIMEOUT};
 use crossterm::{
     ExecutableCommand,
     event::{
@@ -35,11 +35,11 @@ use ratatui::{
 };
 use serde::{Deserialize, Serialize};
 use state::{
-    AppState, CommandActivityState, FLOW_ANIM_CELLS, FLOW_BOOTSTRAP_PHASES, FlowAnimKind,
-    FlowAnimSegment, FlowDirection, FlowLane, Mode, SharedState, ToolMode, UiEventReceiver,
-    UiEventSender, UsageTotals, add_workspace, app_config_path, flow_anim_lit_count, flush_config,
-    normalize_ngrok_domain, remove_workspace, rename_workspace, rotate_workspace_secret,
-    ui_event_channel, user_home_dir,
+    AppState, BrowserPresentation, CommandActivityState, FLOW_ANIM_CELLS, FLOW_BOOTSTRAP_PHASES,
+    FlowAnimKind, FlowAnimSegment, FlowDirection, FlowLane, Mode, SharedState, ToolMode,
+    UiEventReceiver, UiEventSender, UsageTotals, add_workspace, app_config_path,
+    flow_anim_lit_count, flush_config, legacy_windows_app_config_path, normalize_ngrok_domain,
+    remove_workspace, rename_workspace, rotate_workspace_secret, ui_event_channel, user_home_dir,
 };
 use std::io::{Write, stdout};
 use std::path::PathBuf;
@@ -224,6 +224,7 @@ struct UiSnapshot {
     remote_connected: bool,
     last_remote_activity_ms: Option<u128>,
     browser_runtime_running: bool,
+    browser_presentation: BrowserPresentation,
     port: u16,
     workspace_count: usize,
     connected_workspace_count: usize,
@@ -253,6 +254,7 @@ impl UiSnapshot {
             remote_connected: app.remote_connected,
             last_remote_activity_ms: app.last_remote_activity_ms,
             browser_runtime_running: app.browser_runtime_running,
+            browser_presentation: app.browser_presentation,
             port: app.port,
             workspace_count: app.workspaces.len(),
             connected_workspace_count: app
@@ -1526,6 +1528,10 @@ fn key_is_clipboard_paste(key: &crossterm::event::KeyEvent) -> bool {
             && key.modifiers.contains(KeyModifiers::CONTROL)
 }
 
+fn ngrok_setup_cancel_key(code: KeyCode) -> bool {
+    matches!(code, KeyCode::Esc)
+}
+
 fn key_is_interrupt(key: &crossterm::event::KeyEvent) -> bool {
     matches!(key.code, KeyCode::Char(c) if c.eq_ignore_ascii_case(&'c'))
         && key.modifiers.contains(KeyModifiers::CONTROL)
@@ -1678,12 +1684,24 @@ struct HostAttachResult {
     already_registered: bool,
 }
 
-fn host_runtime_path(port: u16) -> std::io::Result<PathBuf> {
-    let config_path = app_config_path()?;
+fn host_runtime_path_for_config(
+    config_path: &std::path::Path,
+    port: u16,
+) -> std::io::Result<PathBuf> {
     let directory = config_path.parent().ok_or_else(|| {
         std::io::Error::other("MoonDesk config path does not have a parent directory")
     })?;
     Ok(directory.join(format!("host-{port}.json")))
+}
+
+fn host_runtime_path(port: u16) -> std::io::Result<PathBuf> {
+    host_runtime_path_for_config(&app_config_path()?, port)
+}
+
+fn legacy_host_runtime_path(port: u16) -> std::io::Result<Option<PathBuf>> {
+    legacy_windows_app_config_path()?
+        .map(|config_path| host_runtime_path_for_config(&config_path, port))
+        .transpose()
 }
 
 fn write_host_runtime_registration(port: u16, token: &str) -> std::io::Result<HostRuntimeGuard> {
@@ -1718,26 +1736,49 @@ fn write_host_runtime_registration(port: u16, token: &str) -> std::io::Result<Ho
     Ok(HostRuntimeGuard { path })
 }
 
-fn read_host_runtime_registration(port: u16) -> Result<HostRuntimeRegistration, String> {
-    let path = host_runtime_path(port).map_err(|error| error.to_string())?;
-    let payload = std::fs::read(&path).map_err(|error| {
+fn read_host_runtime_registration_from_path(
+    path: &std::path::Path,
+    port: u16,
+) -> Result<HostRuntimeRegistration, String> {
+    let payload = std::fs::read(path).map_err(|error| {
         format!(
             "could not read the running host registration file {}: {error}",
             path.display()
         )
     })?;
     let registration: HostRuntimeRegistration = serde_json::from_slice(&payload)
-        .map_err(|error| format!("invalid host registration: {error}"))?;
+        .map_err(|error| format!("invalid host registration {}: {error}", path.display()))?;
     if registration.port != port {
         return Err(format!(
-            "host registration is for port {}, expected {port}",
+            "host registration {} is for port {}, expected {port}",
+            path.display(),
             registration.port
         ));
     }
     if registration.token.is_empty() {
-        return Err("host registration token is empty".into());
+        return Err(format!(
+            "host registration token is empty in {}",
+            path.display()
+        ));
     }
     Ok(registration)
+}
+
+fn read_host_runtime_registration(port: u16) -> Result<HostRuntimeRegistration, String> {
+    let canonical = host_runtime_path(port).map_err(|error| error.to_string())?;
+    match read_host_runtime_registration_from_path(&canonical, port) {
+        Ok(registration) => Ok(registration),
+        Err(primary_error) => {
+            let legacy = legacy_host_runtime_path(port).map_err(|error| error.to_string())?;
+            if let Some(legacy) = legacy
+                && legacy != canonical
+                && let Ok(registration) = read_host_runtime_registration_from_path(&legacy, port)
+            {
+                return Ok(registration);
+            }
+            Err(primary_error)
+        }
+    }
 }
 
 async fn attach_workspace_to_running_host(
@@ -2154,7 +2195,7 @@ async fn run_app(
         }
     }
 
-    let continue_run = run_ngrok_auth_setup(terminal, state.clone(), None).await?;
+    let continue_run = run_ngrok_auth_setup(terminal, state.clone(), None, false).await?;
     if !continue_run {
         return Ok(AppExit::Quit);
     }
@@ -2164,7 +2205,7 @@ async fn run_app(
         return Ok(AppExit::Quit);
     }
 
-    if let Err(error) = flush_config(&state, true).await {
+    if let Err(error) = flush_config(&state, false).await {
         state.lock().await.log(
             "WARN",
             format!("Failed to persist config before startup: {error}"),
@@ -2190,6 +2231,7 @@ async fn run_app(
                 "ngrok rejected the saved authtoken. Paste a fresh token from the ngrok dashboard."
                     .into(),
             ),
+            true,
         )
         .await
         {
@@ -2221,7 +2263,15 @@ async fn run_app(
     // interrupts so an accidental Ctrl+C cannot tear down every workspace before
     // the TUI has a chance to confirm and run its normal shutdown path.
     *interrupt_listener = Some(spawn_interrupt_listener(interrupts.clone()));
-    let result = run_tui(terminal, state, ui_event_rx, interrupts.clone()).await;
+    let live_browser_runtime = services.browser_runtime.clone();
+    let result = run_tui(
+        terminal,
+        state,
+        ui_event_rx,
+        live_browser_runtime,
+        interrupts.clone(),
+    )
+    .await;
     interrupts.begin_shutdown();
     if let Some(runtime) = services.browser_runtime.take() {
         runtime.stop_if_owned(&browser_workspace_root).await;
@@ -2347,11 +2397,13 @@ async fn run_ngrok_auth_setup(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     state: SharedState,
     initial_error: Option<String>,
+    force_prompt: bool,
 ) -> Result<bool, Box<dyn std::error::Error>> {
-    if initial_error.is_none() && state.lock().await.ngrok_authtoken().is_some() {
+    if !force_prompt && initial_error.is_none() && state.lock().await.ngrok_authtoken().is_some() {
         return Ok(true);
     }
 
+    let previous_token = state.lock().await.ngrok_authtoken().map(str::to_owned);
     let config_path = app_config_path()?;
     let config_path_text = config_path.to_string_lossy().into_owned();
     let mut input = String::new();
@@ -2406,8 +2458,10 @@ async fn run_ngrok_auth_setup(
                 if key.kind != KeyEventKind::Press {
                     continue;
                 }
+                if ngrok_setup_cancel_key(key.code) {
+                    return Ok(false);
+                }
                 match key.code {
-                    KeyCode::Esc | KeyCode::Char('q') => return Ok(false),
                     KeyCode::Enter => {
                         let token = normalize_ngrok_authtoken_input(&input);
                         if token.is_empty() {
@@ -2430,9 +2484,13 @@ async fn run_ngrok_auth_setup(
                                 return Ok(true);
                             }
                             Err(error) => {
-                                state.lock().await.set_ngrok_authtoken(None);
+                                state
+                                    .lock()
+                                    .await
+                                    .set_ngrok_authtoken(previous_token.clone());
                                 error_message = Some(format!(
-                                    "Failed to save ~/.moondesk/config.toml: {error}"
+                                    "Failed to save {}: {error}",
+                                    config_path.to_string_lossy()
                                 ));
                             }
                         }
@@ -2525,8 +2583,10 @@ async fn run_ngrok_domain_setup(
                 if key.kind != KeyEventKind::Press {
                     continue;
                 }
+                if ngrok_setup_cancel_key(key.code) {
+                    return Ok(false);
+                }
                 match key.code {
-                    KeyCode::Esc | KeyCode::Char('q') => return Ok(false),
                     KeyCode::Enter => {
                         let domain = match normalize_ngrok_domain(&input) {
                             Ok(Some(domain)) => domain,
@@ -2557,7 +2617,8 @@ async fn run_ngrok_domain_setup(
                             Err(error) => {
                                 state.lock().await.set_ngrok_domain(None);
                                 error_message = Some(format!(
-                                    "Failed to save ~/.moondesk/config.toml: {error}"
+                                    "Failed to save {}: {error}",
+                                    config_path.to_string_lossy()
                                 ));
                             }
                         }
@@ -2690,7 +2751,7 @@ fn draw_ngrok_domain_setup(
         )))
     } else {
         Paragraph::new(Line::from(Span::styled(
-            "[Enter] Save  [q/Esc] Quit  [Paste/Ctrl+V] Insert domain",
+            "[Enter] Save  [Esc] Cancel  [Paste/Ctrl+V] Insert domain",
             Style::default().fg(palette.muted_fg).bg(modal_bg),
         )))
     };
@@ -2848,7 +2909,7 @@ fn draw_ngrok_auth_setup(
         .bg(modal_bg)
         .add_modifier(Modifier::BOLD);
     let body_lines = vec![
-        Line::from(Span::styled("ngrok setup required", step_style)),
+        Line::from(Span::styled("ngrok authentication", step_style)),
         Line::from(""),
         Line::from(vec![
             Span::styled("1. Open in browser and get your authtoken", step_style),
@@ -2897,7 +2958,7 @@ fn draw_ngrok_auth_setup(
         )))
     } else {
         Paragraph::new(Line::from(Span::styled(
-            "[Enter] Save  [q/Esc] Quit  [Paste/Ctrl+V] Insert token",
+            "[Enter] Save  [Esc] Cancel  [Paste/Ctrl+V] Insert token",
             Style::default().fg(palette.muted_fg).bg(modal_bg),
         )))
     };
@@ -3883,27 +3944,33 @@ async fn run_settings(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let themes = theme::all();
     let tool_modes = ToolMode::all();
+    let browser_presentations = BrowserPresentation::all();
+    let config_path_text = app_config_path()?.to_string_lossy().into_owned();
     let mut confirm_reset_token_billing = false;
     let mut selected_row = {
         let app = state.lock().await;
         themes.iter().position(|t| t.id == app.theme).unwrap_or(0)
     };
-    let total_rows = themes.len() + tool_modes.len() + 2;
+    let total_rows = themes.len() + tool_modes.len() + browser_presentations.len() + 3;
 
     loop {
         let (
             current_theme,
             current_tool_mode,
+            current_browser_presentation,
             usage_totals,
             set_moondesk_as_co_author,
+            ngrok_authtoken_configured,
             ngrok_domain,
         ) = {
             let app = state.lock().await;
             (
                 app.current_theme(),
                 app.tool_mode,
+                app.browser_presentation,
                 app.all_time_usage_totals(),
                 app.set_moondesk_as_co_author,
+                app.ngrok_authtoken().is_some(),
                 app.ngrok_domain.clone(),
             )
         };
@@ -3913,8 +3980,11 @@ async fn run_settings(
                 SettingsView {
                     current_theme,
                     current_tool_mode,
+                    current_browser_presentation,
                     set_moondesk_as_co_author,
+                    ngrok_authtoken_configured,
                     ngrok_domain: ngrok_domain.as_deref(),
+                    config_path: &config_path_text,
                     usage_totals: &usage_totals,
                     selected_row,
                     confirm_reset_token_billing,
@@ -3953,13 +4023,27 @@ async fn run_settings(
                     } else {
                         let tool_mode_start = themes.len();
                         let tool_mode_end = tool_mode_start + tool_modes.len();
-                        let settings_action_start = tool_mode_end;
+                        let browser_presentation_start = tool_mode_end;
+                        let browser_presentation_end =
+                            browser_presentation_start + browser_presentations.len();
+                        let settings_action_start = browser_presentation_end;
 
                         if selected_row < tool_mode_end {
                             let picked = tool_modes[selected_row - tool_mode_start];
                             if app.tool_mode != picked {
                                 app.tool_mode = picked;
                                 app.log("INFO", format!("Tool mode: {}", picked.label()));
+                                app.mark_config_dirty();
+                            }
+                        } else if selected_row < browser_presentation_end {
+                            let picked =
+                                browser_presentations[selected_row - browser_presentation_start];
+                            if app.browser_presentation != picked {
+                                app.browser_presentation = picked;
+                                app.log(
+                                    "INFO",
+                                    format!("Agent browser display: {}", picked.label()),
+                                );
                                 app.mark_config_dirty();
                             }
                         } else if selected_row == settings_action_start {
@@ -3974,6 +4058,10 @@ async fn run_settings(
                             );
                             app.mark_config_dirty();
                         } else if selected_row == settings_action_start + 1 {
+                            drop(app);
+                            let _ =
+                                run_ngrok_auth_setup(terminal, state.clone(), None, true).await?;
+                        } else if selected_row == settings_action_start + 2 {
                             let previous_domain = app.ngrok_domain.clone();
                             let current_domain = previous_domain.clone().unwrap_or_default();
                             drop(app);
@@ -4053,8 +4141,11 @@ async fn run_settings(
 struct SettingsView<'a> {
     current_theme: &'a theme::ThemeDef,
     current_tool_mode: ToolMode,
+    current_browser_presentation: BrowserPresentation,
     set_moondesk_as_co_author: bool,
+    ngrok_authtoken_configured: bool,
     ngrok_domain: Option<&'a str>,
+    config_path: &'a str,
     usage_totals: &'a UsageTotals,
     selected_row: usize,
     confirm_reset_token_billing: bool,
@@ -4064,14 +4155,18 @@ fn draw_settings(f: &mut Frame, view: SettingsView<'_>) {
     let SettingsView {
         current_theme,
         current_tool_mode,
+        current_browser_presentation,
         set_moondesk_as_co_author,
+        ngrok_authtoken_configured,
         ngrok_domain,
+        config_path,
         usage_totals,
         selected_row,
         confirm_reset_token_billing,
     } = view;
     let themes = theme::all();
     let tool_modes = ToolMode::all();
+    let browser_presentations = BrowserPresentation::all();
     let palette = current_theme.palette;
     let cost_estimate = estimate_gpt_5_6_sol_tool_cost(usage_totals);
     render_theme_background(f, palette);
@@ -4182,7 +4277,48 @@ fn draw_settings(f: &mut Frame, view: SettingsView<'_>) {
         )]));
     }
 
-    let co_author_row = themes.len() + tool_modes.len();
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![Span::styled(
+        "  Agent browser display",
+        Style::default()
+            .fg(palette.title_fg)
+            .add_modifier(Modifier::BOLD),
+    )]));
+    for (idx, presentation) in browser_presentations.iter().enumerate() {
+        let row_idx = themes.len() + tool_modes.len() + idx;
+        let selected = row_idx == selected_row;
+        let marker = if selected { ">" } else { " " };
+        let name_style = if selected {
+            Style::default()
+                .fg(palette.key_fg)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(palette.primary_fg)
+        };
+        lines.push(Line::from(""));
+        if selected {
+            selected_line_idx = lines.len();
+        }
+        let mut spans = vec![Span::styled(
+            format!(" {} [{}] {}", marker, row_idx + 1, presentation.label()),
+            name_style,
+        )];
+        if *presentation == current_browser_presentation {
+            spans.push(Span::styled(
+                "  [current]",
+                Style::default()
+                    .fg(palette.secondary_fg)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        lines.push(Line::from(spans));
+        lines.push(Line::from(vec![Span::styled(
+            format!("     {}", presentation.description()),
+            Style::default().fg(palette.muted_fg),
+        )]));
+    }
+
+    let co_author_row = themes.len() + tool_modes.len() + browser_presentations.len();
     let co_author_selected = co_author_row == selected_row;
     let co_author_marker = if co_author_selected { ">" } else { " " };
     let co_author_name_style = if co_author_selected {
@@ -4231,7 +4367,17 @@ fn draw_settings(f: &mut Frame, view: SettingsView<'_>) {
         Style::default().fg(palette.muted_fg),
     )]));
 
-    let domain_row = co_author_row + 1;
+    let auth_token_row = co_author_row + 1;
+    let auth_token_selected = auth_token_row == selected_row;
+    let auth_token_marker = if auth_token_selected { ">" } else { " " };
+    let auth_token_name_style = if auth_token_selected {
+        Style::default()
+            .fg(palette.key_fg)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(palette.primary_fg)
+    };
+    let domain_row = co_author_row + 2;
     let domain_selected = domain_row == selected_row;
     let domain_marker = if domain_selected { ">" } else { " " };
     let domain_name_style = if domain_selected {
@@ -4253,6 +4399,41 @@ fn draw_settings(f: &mut Frame, view: SettingsView<'_>) {
         "     Workspace-specific MCP URLs are managed from [w] Workspaces.",
         Style::default().fg(palette.muted_fg),
     )));
+    lines.push(Line::from(Span::styled(
+        format!("     Config: {config_path}"),
+        Style::default().fg(palette.muted_fg),
+    )));
+    if auth_token_selected {
+        selected_line_idx = lines.len();
+    }
+    lines.push(Line::from(vec![Span::styled(
+        format!(
+            " {} [{}] Set ngrok authtoken",
+            auth_token_marker,
+            auth_token_row + 1
+        ),
+        auth_token_name_style,
+    )]));
+    lines.push(Line::from(vec![
+        Span::styled("     ", Style::default()),
+        Span::styled(
+            if ngrok_authtoken_configured {
+                "[configured]"
+            } else {
+                "[not set]"
+            },
+            Style::default().fg(if ngrok_authtoken_configured {
+                palette.success_fg
+            } else {
+                palette.muted_fg
+            }),
+        ),
+    ]));
+    lines.push(Line::from(Span::styled(
+        "     The token is stored in the MoonDesk config shown above and is never displayed here.",
+        Style::default().fg(palette.muted_fg),
+    )));
+    lines.push(Line::from(""));
     if domain_selected {
         selected_line_idx = lines.len();
     }
@@ -4367,7 +4548,7 @@ fn draw_settings(f: &mut Frame, view: SettingsView<'_>) {
 
     let body = Paragraph::new(lines).scroll((scroll_y, 0)).block(
         Block::default()
-            .title(" Theme, Tool Mode & Usage ")
+            .title(" Theme, Tools, Browser & Usage ")
             .borders(Borders::ALL)
             .border_type(palette.border_type)
             .border_style(Style::default().fg(palette.border_fg)),
@@ -4546,6 +4727,7 @@ async fn run_tui(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     state: SharedState,
     mut ui_events: UiEventReceiver,
+    browser_runtime: Option<Arc<BrowserRuntime>>,
     interrupts: InterruptState,
 ) -> Result<AppExit, Box<dyn std::error::Error>> {
     let mut log_scroll: usize = 0;
@@ -4814,6 +4996,148 @@ async fn run_tui(
                     match key.code {
                         KeyCode::Char('w') => {
                             run_workspaces(terminal, state.clone()).await?;
+                        }
+                        KeyCode::Char('v')
+                            if app.mode.browser_enabled()
+                                && key.modifiers == KeyModifiers::NONE =>
+                        {
+                            let next_presentation = match app.browser_presentation {
+                                BrowserPresentation::Headless => BrowserPresentation::Visible,
+                                BrowserPresentation::Visible => BrowserPresentation::Headless,
+                            };
+                            if let Some(runtime) = browser_runtime.as_ref() {
+                                let mut change =
+                                    runtime.set_presentation(next_presentation, false).await;
+                                if change == BrowserPresentationChange::Busy {
+                                    toast = Some((
+                                        "Browser is busy; try display toggle again",
+                                        (2, 2),
+                                        Instant::now(),
+                                    ));
+                                    continue;
+                                }
+                                if change == BrowserPresentationChange::RequiresRestart {
+                                    if !run_browser_presentation_confirm(
+                                        terminal,
+                                        &state,
+                                        next_presentation,
+                                    )
+                                    .await?
+                                    {
+                                        continue;
+                                    }
+                                    change =
+                                        runtime.set_presentation(next_presentation, true).await;
+                                    if change == BrowserPresentationChange::Busy {
+                                        toast = Some((
+                                            "Browser became busy; display was not changed",
+                                            (2, 2),
+                                            Instant::now(),
+                                        ));
+                                        continue;
+                                    }
+                                }
+                                if matches!(
+                                    change,
+                                    BrowserPresentationChange::Updated
+                                        | BrowserPresentationChange::UpdatedAndSessionClosed
+                                ) {
+                                    let mut visible_start_failed = false;
+                                    let mut visible_fallback_busy = false;
+                                    if next_presentation == BrowserPresentation::Visible {
+                                        let workspace_root =
+                                            { state.lock().await.workspace_root.clone() };
+                                        match runtime
+                                            .run(
+                                                &workspace_root,
+                                                "list_pages",
+                                                &[],
+                                                DEFAULT_BROWSER_COMMAND_TIMEOUT,
+                                            )
+                                            .await
+                                        {
+                                            Ok(output) if output.success() => {}
+                                            Ok(output) => {
+                                                visible_start_failed = true;
+                                                let details = output.failure_details();
+                                                let rollback = runtime
+                                                    .set_presentation(
+                                                        BrowserPresentation::Headless,
+                                                        true,
+                                                    )
+                                                    .await;
+                                                if browser_headless_fallback_succeeded(rollback) {
+                                                    state.lock().await.log(
+                                                        "WARN",
+                                                        format!(
+                                                            "Visible agent browser could not start; reverted to headless: {details}"
+                                                        ),
+                                                    );
+                                                } else {
+                                                    visible_fallback_busy = true;
+                                                    state.lock().await.log(
+                                                        "WARN",
+                                                        format!(
+                                                            "Visible agent browser could not start, and MoonDesk could not immediately revert to headless because the browser became busy: {details}"
+                                                        ),
+                                                    );
+                                                }
+                                            }
+                                            Err(error) => {
+                                                visible_start_failed = true;
+                                                let rollback = runtime
+                                                    .set_presentation(
+                                                        BrowserPresentation::Headless,
+                                                        true,
+                                                    )
+                                                    .await;
+                                                if browser_headless_fallback_succeeded(rollback) {
+                                                    state.lock().await.log(
+                                                        "WARN",
+                                                        format!(
+                                                            "Visible agent browser could not start; reverted to headless: {error}"
+                                                        ),
+                                                    );
+                                                } else {
+                                                    visible_fallback_busy = true;
+                                                    state.lock().await.log(
+                                                        "WARN",
+                                                        format!(
+                                                            "Visible agent browser could not start, and MoonDesk could not immediately revert to headless because the browser became busy: {error}"
+                                                        ),
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
+                                    if let Err(error) = flush_config(&state, true).await {
+                                        state.lock().await.log(
+                                            "WARN",
+                                            format!(
+                                                "Failed to persist agent browser display setting: {error}"
+                                            ),
+                                        );
+                                    }
+                                    toast = Some((
+                                        if visible_fallback_busy {
+                                            "Visible browser start failed; headless fallback is busy"
+                                        } else if visible_start_failed {
+                                            "Visible browser start failed; reverted to headless"
+                                        } else {
+                                            match next_presentation {
+                                                BrowserPresentation::Headless => {
+                                                    "Browser display: headless"
+                                                }
+                                                BrowserPresentation::Visible => {
+                                                    "Browser display: visible"
+                                                }
+                                            }
+                                        },
+                                        (2, 2),
+                                        Instant::now(),
+                                    ));
+                                }
+                            }
                         }
                         KeyCode::Char('u') if update_info.is_some() => {
                             let Some(selected_update) = update_info.clone() else {
@@ -5417,13 +5741,22 @@ async fn run_tui(
         }
     }
 
-    if let Err(error) = flush_config(&state, true).await {
+    if let Err(error) = flush_config(&state, false).await {
         state.lock().await.log(
             "WARN",
             format!("Failed to persist config on shutdown: {error}"),
         );
     }
     Ok(exit)
+}
+
+fn browser_headless_fallback_succeeded(change: BrowserPresentationChange) -> bool {
+    matches!(
+        change,
+        BrowserPresentationChange::Unchanged
+            | BrowserPresentationChange::Updated
+            | BrowserPresentationChange::UpdatedAndSessionClosed
+    )
 }
 
 fn quit_confirm_action(key: &crossterm::event::KeyEvent) -> Option<bool> {
@@ -5438,6 +5771,136 @@ fn quit_confirm_action(key: &crossterm::event::KeyEvent) -> Option<bool> {
         KeyCode::Esc => Some(false),
         _ => None,
     }
+}
+
+async fn run_browser_presentation_confirm(
+    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    state: &SharedState,
+    presentation: BrowserPresentation,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    loop {
+        let theme = { state.lock().await.current_theme() };
+        terminal.draw(|f| draw_browser_presentation_confirm(f, theme, presentation))?;
+        if !event::poll(UI_POLL_INTERVAL)? {
+            continue;
+        }
+        if let Event::Key(key) = event::read()? {
+            if key.kind != KeyEventKind::Press {
+                continue;
+            }
+            match key.code {
+                KeyCode::Enter => return Ok(true),
+                KeyCode::Esc => return Ok(false),
+                _ => {}
+            }
+        }
+    }
+}
+
+fn draw_browser_presentation_confirm(
+    f: &mut Frame,
+    theme: &theme::ThemeDef,
+    presentation: BrowserPresentation,
+) {
+    let palette = theme.palette;
+    render_theme_background(f, palette);
+    let area = centered_rect(82, 14, f.area());
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .title(" Restart Agent Browser? ")
+        .borders(Borders::ALL)
+        .border_type(palette.border_type)
+        .border_style(Style::default().fg(palette.warning_fg))
+        .style(Style::default().fg(palette.modal_fg).bg(palette.modal_bg));
+    let inner = block.inner(area).inner(Margin {
+        horizontal: 2,
+        vertical: 1,
+    });
+    f.render_widget(block, area);
+
+    let compact_actions = inner.width < 48;
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(1),
+            Constraint::Length(if compact_actions { 2 } else { 1 }),
+        ])
+        .split(inner);
+    let lines = vec![
+        Line::from(Span::styled(
+            format!("Switch agent browser display to {}?", presentation.label()),
+            Style::default()
+                .fg(palette.title_fg)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Chromium presentation is chosen when the browser process starts, so the current isolated browser session must be closed.",
+            Style::default().fg(palette.primary_fg),
+        )),
+        Line::from(Span::styled(
+            "Current tabs, cookies, storage, page state, and snapshot UIDs in that temporary session will be discarded.",
+            Style::default().fg(palette.warning_fg),
+        )),
+        Line::from(Span::styled(
+            match presentation {
+                BrowserPresentation::Visible => {
+                    "A fresh empty visible browser session will start immediately after the restart."
+                }
+                BrowserPresentation::Headless => {
+                    "The next browser action will start a fresh headless isolated session."
+                }
+            },
+            Style::default().fg(palette.muted_fg),
+        )),
+    ];
+    let action_lines = if compact_actions {
+        vec![
+            Line::from(vec![
+                Span::styled(
+                    "[Enter]",
+                    Style::default()
+                        .fg(palette.warning_fg)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(" Restart browser"),
+            ]),
+            Line::from(vec![
+                Span::styled(
+                    "[Esc]",
+                    Style::default()
+                        .fg(palette.success_fg)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(" Cancel"),
+            ]),
+        ]
+    } else {
+        vec![Line::from(vec![
+            Span::styled(
+                "[Enter]",
+                Style::default()
+                    .fg(palette.warning_fg)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" Restart browser    "),
+            Span::styled(
+                "[Esc]",
+                Style::default()
+                    .fg(palette.success_fg)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" Cancel"),
+        ])]
+    };
+    f.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: false }),
+        sections[0],
+    );
+    f.render_widget(
+        Paragraph::new(action_lines).wrap(Wrap { trim: false }),
+        sections[1],
+    );
 }
 
 async fn run_quit_confirm(
@@ -6297,9 +6760,15 @@ fn draw_ui(f: &mut Frame, context: UiRenderContext<'_>) {
     let mcp_url_security_status = mcp_url_reveal_remaining
         .map(|remaining| format!("[ EXPOSED {:>2}s ]", mcp_url_reveal_seconds(remaining)));
     let compact_browser_summary = if app.browser_runtime_running {
-        "Isolated agent browser · running".to_string()
+        format!(
+            "Isolated agent browser · {} · running · [v] toggle",
+            app.browser_presentation.label()
+        )
     } else {
-        "Isolated agent browser · starts on demand".to_string()
+        format!(
+            "Isolated agent browser · {} · starts on demand · [v] toggle",
+            app.browser_presentation.label()
+        )
     };
     let computer_role_style = Style::default()
         .fg(if app.server_running {
@@ -7346,14 +7815,15 @@ fn draw_ui(f: &mut Frame, context: UiRenderContext<'_>) {
 mod tests {
     use super::state::{CommandActivity, LogEntry};
     use super::{
-        AppState, BottomPanelAreas, BottomPanelHitMaps, DashboardFocus, DashboardHitAreas,
-        DashboardSecretHit, DashboardSecretTarget, DashboardWorkspaceRow, InterruptState,
-        ObservabilityCutoff, PanelItemHit, PanelScrollView, TimedSecretClick, UiRenderContext,
-        UiSnapshot, WorkspaceFilter, WorkspaceHitAreas, WorkspaceId, WorkspaceUiAction,
-        active_reveal_remaining, apply_workspace_observability_filter, cycle_dashboard_focus,
-        dashboard_secret_target_at, draw_changelog_notice, draw_prompt, draw_quit_confirm, draw_ui,
-        draw_update_confirm, item_under_cursor, key_is_clipboard_paste, key_is_interrupt,
-        key_is_plain_quit, log_secret_target, move_panel_selection,
+        AppState, BottomPanelAreas, BottomPanelHitMaps, BrowserPresentationChange, DashboardFocus,
+        DashboardHitAreas, DashboardSecretHit, DashboardSecretTarget, DashboardWorkspaceRow,
+        InterruptState, ObservabilityCutoff, PanelItemHit, PanelScrollView, TimedSecretClick,
+        UiRenderContext, UiSnapshot, WorkspaceFilter, WorkspaceHitAreas, WorkspaceId,
+        WorkspaceUiAction, active_reveal_remaining, apply_workspace_observability_filter,
+        browser_headless_fallback_succeeded, cycle_dashboard_focus, dashboard_secret_target_at,
+        draw_changelog_notice, draw_prompt, draw_quit_confirm, draw_ui, draw_update_confirm,
+        item_under_cursor, key_is_clipboard_paste, key_is_interrupt, key_is_plain_quit,
+        log_secret_target, move_panel_selection, ngrok_setup_cancel_key,
         normalize_ngrok_authtoken_input, normalize_ngrok_domain, normalize_workspace_path_input,
         panel_under_cursor, parse_clippymoon_export_args, parse_port_value,
         primary_mcp_url_line_index, quit_confirm_action, reconcile_workspace_filter,
@@ -7993,6 +8463,22 @@ mod tests {
         assert_eq!(
             normalize_ngrok_authtoken_input("ngrok config add-authtoken test-token-123"),
             "test-token-123"
+        );
+    }
+
+    #[test]
+    fn ngrok_text_entry_only_cancels_on_escape() {
+        assert!(ngrok_setup_cancel_key(KeyCode::Esc));
+        assert!(!ngrok_setup_cancel_key(KeyCode::Char('q')));
+        assert!(!ngrok_setup_cancel_key(KeyCode::Char('Q')));
+        assert!(!ngrok_setup_cancel_key(KeyCode::Char('v')));
+    }
+
+    #[test]
+    fn normalizes_pasted_ngrok_token_without_dropping_q_characters() {
+        assert_eq!(
+            normalize_ngrok_authtoken_input("token-prefix-q-token-suffix"),
+            "token-prefix-q-token-suffix"
         );
     }
 
@@ -8976,9 +9462,103 @@ mod tests {
         );
         assert!(browser.text.contains("Browser"));
         assert!(browser.text.contains("Isolated agent browser"));
+        assert!(browser.text.contains("hidden (headless)"));
         assert!(browser.text.contains("starts on demand"));
+        assert!(browser.text.contains("[v] toggle"));
         assert!(!browser.text.contains("Local browsers"));
         assert!(!browser.text.contains("Remote dbg support"));
+
+        snapshot.browser_presentation = super::BrowserPresentation::Visible;
+        snapshot.browser_runtime_running = true;
+        let visible = render_dashboard(
+            &snapshot,
+            140,
+            44,
+            DashboardFocus::Logs,
+            &WorkspaceFilter::All,
+            None,
+            None,
+        );
+        assert!(visible.text.contains("visible · running"));
+    }
+
+    #[test]
+    fn browser_presentation_confirmation_explains_session_loss() {
+        let backend = TestBackend::new(100, 24);
+        let mut terminal =
+            Terminal::new(backend).expect("create browser presentation confirmation terminal");
+        let theme = super::theme::resolve(super::theme::DEFAULT_THEME_ID);
+        terminal
+            .draw(|frame| {
+                super::draw_browser_presentation_confirm(
+                    frame,
+                    theme,
+                    super::BrowserPresentation::Visible,
+                );
+            })
+            .expect("render browser presentation confirmation");
+
+        let buffer = terminal.backend().buffer();
+        let mut rendered = String::new();
+        for row in 0..buffer.area.height {
+            for column in 0..buffer.area.width {
+                rendered.push_str(buffer[(column, row)].symbol());
+            }
+            rendered.push('\n');
+        }
+        assert!(rendered.contains("Restart Agent Browser?"));
+        assert!(rendered.contains("visible"));
+        assert!(rendered.contains("tabs, cookies, storage"));
+        assert!(rendered.contains("[Enter]"));
+        assert!(rendered.contains("[Esc]"));
+    }
+
+    #[test]
+    fn browser_presentation_confirmation_keeps_controls_visible_on_narrow_terminals() {
+        let backend = TestBackend::new(52, 16);
+        let mut terminal =
+            Terminal::new(backend).expect("create compact browser confirmation terminal");
+        let theme = super::theme::resolve(super::theme::DEFAULT_THEME_ID);
+        terminal
+            .draw(|frame| {
+                super::draw_browser_presentation_confirm(
+                    frame,
+                    theme,
+                    super::BrowserPresentation::Visible,
+                );
+            })
+            .expect("render compact browser presentation confirmation");
+
+        let buffer = terminal.backend().buffer();
+        let mut rendered = String::new();
+        for row in 0..16 {
+            for column in 0..52 {
+                rendered.push_str(buffer[(column, row)].symbol());
+            }
+            rendered.push('\n');
+        }
+        assert!(rendered.contains("Restart Agent Browser?"));
+        assert!(rendered.contains("[Enter] Restart browser"));
+        assert!(rendered.contains("[Esc] Cancel"));
+    }
+
+    #[test]
+    fn browser_headless_fallback_never_treats_busy_as_reverted() {
+        assert!(browser_headless_fallback_succeeded(
+            BrowserPresentationChange::Unchanged
+        ));
+        assert!(browser_headless_fallback_succeeded(
+            BrowserPresentationChange::Updated
+        ));
+        assert!(browser_headless_fallback_succeeded(
+            BrowserPresentationChange::UpdatedAndSessionClosed
+        ));
+        assert!(!browser_headless_fallback_succeeded(
+            BrowserPresentationChange::Busy
+        ));
+        assert!(!browser_headless_fallback_succeeded(
+            BrowserPresentationChange::RequiresRestart
+        ));
     }
 
     #[test]
@@ -9178,8 +9758,11 @@ mod tests {
                         super::SettingsView {
                             current_theme: theme,
                             current_tool_mode: tool_mode,
+                            current_browser_presentation: super::BrowserPresentation::Headless,
                             set_moondesk_as_co_author: false,
+                            ngrok_authtoken_configured: false,
                             ngrok_domain: None,
+                            config_path: r"C:\Users\tester\.moondesk\config.toml",
                             usage_totals: &usage,
                             selected_row,
                             confirm_reset_token_billing: false,
@@ -9188,6 +9771,97 @@ mod tests {
                 })
                 .unwrap_or_else(|error| panic!("render theme {}: {error}", theme.id));
         }
+    }
+
+    #[test]
+    fn settings_browser_presentation_rows_are_reachable_and_mark_current_mode() {
+        let usage = super::UsageTotals::default();
+        let theme = super::theme::resolve(super::theme::DEFAULT_THEME_ID);
+        let tool_mode = super::ToolMode::all()[0];
+        let browser_row = super::theme::all().len() + super::ToolMode::all().len() + 1;
+        let backend = TestBackend::new(100, 32);
+        let mut terminal = Terminal::new(backend).expect("create browser settings terminal");
+
+        terminal
+            .draw(|frame| {
+                super::draw_settings(
+                    frame,
+                    super::SettingsView {
+                        current_theme: theme,
+                        current_tool_mode: tool_mode,
+                        current_browser_presentation: super::BrowserPresentation::Visible,
+                        set_moondesk_as_co_author: false,
+                        ngrok_authtoken_configured: false,
+                        ngrok_domain: None,
+                        config_path: r"C:\Users\tester\.moondesk\config.toml",
+                        usage_totals: &usage,
+                        selected_row: browser_row,
+                        confirm_reset_token_billing: false,
+                    },
+                )
+            })
+            .expect("render browser presentation settings");
+
+        let buffer = terminal.backend().buffer();
+        let mut rendered = String::new();
+        for row in 0..buffer.area.height {
+            for column in 0..buffer.area.width {
+                rendered.push_str(buffer[(column, row)].symbol());
+            }
+            rendered.push('\n');
+        }
+
+        assert!(rendered.contains("Agent browser display"));
+        assert!(rendered.contains("visible"));
+        assert!(rendered.contains("[current]"));
+        assert!(rendered.contains("Open the isolated Chromium window"));
+    }
+
+    #[test]
+    fn settings_exposes_masked_ngrok_authtoken_action() {
+        let usage = super::UsageTotals::default();
+        let theme = super::theme::resolve(super::theme::DEFAULT_THEME_ID);
+        let tool_mode = super::ToolMode::all()[0];
+        let auth_token_row = super::theme::all().len()
+            + super::ToolMode::all().len()
+            + super::BrowserPresentation::all().len()
+            + 1;
+        let backend = TestBackend::new(100, 32);
+        let mut terminal = Terminal::new(backend).expect("create ngrok auth settings terminal");
+
+        terminal
+            .draw(|frame| {
+                super::draw_settings(
+                    frame,
+                    super::SettingsView {
+                        current_theme: theme,
+                        current_tool_mode: tool_mode,
+                        current_browser_presentation: super::BrowserPresentation::Headless,
+                        set_moondesk_as_co_author: false,
+                        ngrok_authtoken_configured: true,
+                        ngrok_domain: Some("example.ngrok-free.app"),
+                        config_path: r"C:\Users\tester\.moondesk\config.toml",
+                        usage_totals: &usage,
+                        selected_row: auth_token_row,
+                        confirm_reset_token_billing: false,
+                    },
+                )
+            })
+            .expect("render ngrok auth settings");
+
+        let buffer = terminal.backend().buffer();
+        let mut rendered = String::new();
+        for row in 0..buffer.area.height {
+            for column in 0..buffer.area.width {
+                rendered.push_str(buffer[(column, row)].symbol());
+            }
+            rendered.push('\n');
+        }
+
+        assert!(rendered.contains("Set ngrok authtoken"));
+        assert!(rendered.contains("[configured]"));
+        assert!(rendered.contains("never displayed here"));
+        assert!(rendered.contains("Config: C:\\Users\\tester\\.moondesk\\config.toml"));
     }
 
     #[test]
@@ -9236,8 +9910,11 @@ mod tests {
                     super::SettingsView {
                         current_theme: theme,
                         current_tool_mode: tool_mode,
+                        current_browser_presentation: super::BrowserPresentation::Headless,
                         set_moondesk_as_co_author: false,
+                        ngrok_authtoken_configured: false,
                         ngrok_domain: None,
+                        config_path: r"C:\Users\tester\.moondesk\config.toml",
                         usage_totals: &usage,
                         selected_row: super::theme::all().len() - 1,
                         confirm_reset_token_billing: false,

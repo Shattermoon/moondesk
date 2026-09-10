@@ -97,7 +97,7 @@ cargo test --locked state::tests::automatic_flush_does_not_treat_non_file_config
 cargo test --locked state::tests::missing_workspace_registry_logs_launch_directory_bootstrap -- --exact --test-threads 1
 ```
 
-These tests protect the Windows upgrade/reset contract: MoonDesk-owned state uses one canonical profile location; an older conflicting `HOME` config migrates at most once without overriding canonical state; migration preserves the complete existing workspace registry (IDs, names, roots, and connector slugs); a racing canonical creation wins without deleting the legacy source; deleting the live config is not undone even if an automatic save was already staged; and a fresh launch clearly records when workspace #1 was recreated from the launch directory.
+These tests protect the Windows upgrade/reset contract: MoonDesk-owned state uses one canonical profile location; an older conflicting `HOME` config migrates at most once without overriding canonical state; migration preserves the complete existing workspace registry (IDs, names, roots, and connector slugs); a racing canonical creation wins without deleting the legacy source; a completed migration marker prevents stale legacy state from being imported again after a later reset; deleting the live config is not undone even if an automatic save was already staged; and a fresh launch clearly records when workspace #1 was recreated from the launch directory.
 
 If your change touches process execution, Windows environment handling, browser detection, or the lazy browser runtime, run the relevant ignored integration smokes when your machine supports them:
 

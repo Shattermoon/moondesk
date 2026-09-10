@@ -67,7 +67,7 @@ Choose:
 
 On first launch, MoonDesk asks for your **ngrok authtoken** and **static domain**. MoonDesk stores them in its config file (`%USERPROFILE%\.moondesk\config.toml` on Windows and `$HOME/.moondesk/config.toml` on macOS/Linux). You can update either value later from Settings; the authtoken editor is masked, Settings only shows whether a token is configured, and it also shows the exact active config path.
 
-When upgrading on Windows from a version that previously used a conflicting `HOME\.moondesk\config.toml`, the next MoonDesk host startup migrates that existing config once into the canonical `%USERPROFILE%` location. The migration preserves the complete workspace registry and connector identities; it does **not** clear or recreate users' workspaces. If another process creates the canonical config during that migration, the canonical file wins and the legacy source is retained instead of being overwritten or deleted.
+When upgrading on Windows from a version that previously used a conflicting `HOME\.moondesk\config.toml`, the next MoonDesk host startup migrates that existing config once into the canonical `%USERPROFILE%` location. The migration preserves the complete workspace registry and connector identities; it does **not** clear or recreate users' workspaces. If another process creates the canonical config during that migration, the canonical file wins and the legacy source is retained instead of being overwritten or deleted. A migration marker beside the legacy location prevents a stale legacy config from being imported again later if Windows could not remove it or another old process recreates it.
 
 ### 3. Copy the workspace URL
 

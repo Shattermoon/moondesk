@@ -77,6 +77,7 @@ pub struct FlowBootstrapProgress {
 
 const APP_CONFIG_DIR_NAME: &str = ".moondesk";
 const APP_CONFIG_FILE_NAME: &str = "config.toml";
+const LEGACY_CONFIG_MIGRATION_MARKER_NAME: &str = ".config.toml.migrated";
 const CURRENT_CONFIG_VERSION: u32 = 2;
 const WORKSPACE_DRAIN_TIMEOUT: Duration = Duration::from_secs(130);
 const WORKSPACE_CLEANUP_RETRY_ATTEMPTS: usize = 4;
@@ -1082,6 +1083,29 @@ struct ConfigPathMigration {
     cleanup_warning: Option<String>,
 }
 
+fn legacy_config_migration_marker_path(legacy: &Path) -> std::io::Result<PathBuf> {
+    let parent = legacy.parent().ok_or_else(|| {
+        std::io::Error::other("failed to resolve legacy MoonDesk config directory")
+    })?;
+    Ok(parent.join(LEGACY_CONFIG_MIGRATION_MARKER_NAME))
+}
+
+fn write_legacy_config_migration_marker(legacy: &Path) -> std::io::Result<()> {
+    let marker = legacy_config_migration_marker_path(legacy)?;
+    let mut options = OpenOptions::new();
+    options.create(true).truncate(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(marker)?;
+    use std::io::Write as _;
+    file.write_all(b"migrated\n")?;
+    file.flush()?;
+    file.sync_all()
+}
+
 fn migrate_config_file_if_needed(
     canonical: &Path,
     legacy: &Path,
@@ -1097,7 +1121,7 @@ fn migrate_config_file_if_needed_with_hook<F>(
 where
     F: FnOnce(),
 {
-    if canonical.try_exists()? {
+    if canonical.try_exists()? || legacy_config_migration_marker_path(legacy)?.try_exists()? {
         return Ok(None);
     }
     let legacy_metadata = match fs::metadata(legacy) {
@@ -1115,11 +1139,24 @@ where
         // and the legacy file is deliberately retained rather than deleting data we did not move.
         return Ok(None);
     }
-    let cleanup_warning = match fs::remove_file(legacy) {
+    let marker_error = write_legacy_config_migration_marker(legacy).err();
+    let cleanup_error = match fs::remove_file(legacy) {
         Ok(()) => None,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => Some(format!(
-            "could not remove legacy config {} after migration: {error}",
+        Err(error) => Some(error),
+    };
+    let cleanup_warning = match (marker_error, cleanup_error) {
+        (None, None) => None,
+        (Some(marker_error), None) => Some(format!(
+            "could not record the legacy-config migration marker beside {}: {marker_error}",
+            legacy.display()
+        )),
+        (None, Some(cleanup_error)) => Some(format!(
+            "could not remove legacy config {} after migration: {cleanup_error}; the migration marker will prevent this stale file from being restored later",
+            legacy.display()
+        )),
+        (Some(marker_error), Some(cleanup_error)) => Some(format!(
+            "could not remove legacy config {} after migration ({cleanup_error}) or record its migration marker ({marker_error}); the canonical config is active, but the stale legacy file could require manual cleanup before a future full reset",
             legacy.display()
         )),
     };
@@ -2580,6 +2617,23 @@ mod tests {
         assert!(
             legacy_path.exists(),
             "canonical state must not delete unrelated fallback state"
+        );
+        let migration_marker =
+            legacy_config_migration_marker_path(&legacy_path).expect("resolve migration marker");
+        assert!(
+            migration_marker.is_file(),
+            "successful migration must leave a marker that suppresses any stale legacy config that later reappears"
+        );
+        std::fs::remove_file(&canonical_path).expect("simulate a later canonical config reset");
+        assert!(
+            migrate_config_file_if_needed(&canonical_path, &legacy_path)
+                .expect("stale legacy config should remain suppressed")
+                .is_none(),
+            "a stale legacy config must never be migrated again after a completed migration"
+        );
+        assert!(
+            !canonical_path.exists(),
+            "the migration marker must prevent stale legacy state from resurrecting the reset canonical config"
         );
 
         let _ = std::fs::remove_dir_all(root);

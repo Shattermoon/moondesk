@@ -34,7 +34,7 @@ No reverse engineering. No API key. No separate agent service.
 - **Local file tools** — read, search, write, edit, and delete inside a workspace.
 - **Shell commands** — run short commands or start background jobs with polling, preserved output, and cancellation.
 - **Multiple workspaces** — serve several projects from one MoonDesk process, each with its own secret MCP URL.
-- **Lazy browser control** — a stable `browser_command` + `view_page` surface backed by a pinned Chrome DevTools runtime. Selecting Browser/Both does not launch Chrome; the shared browser session starts only on first use.
+- **Headless agent browser by default** — a stable `browser_command` + `view_page` surface backed by a pinned Chrome DevTools runtime. Selecting Browser/Both does not launch Chrome; the shared isolated browser starts lazily on first use without opening a desktop window unless you switch it to visible mode.
 - **Read-only mode** — expose only safe local read tools when mutation is unnecessary.
 - **Cross-platform** — Windows, macOS, and Linux.
 - **Native binary distribution** — install with npm; MoonDesk downloads and verifies the matching release binary on first run.
@@ -121,7 +121,7 @@ Each workspace keeps its own file boundary, command jobs, retained output, histo
 
 Use `[w] Workspaces` to add, rename, inspect, copy, rotate, or remove projects. On Windows, `[b] Explorer` opens the native Explorer folder picker for adding a workspace; `[a] Path` remains available for manual path entry. Launching `moondesk` from another project while a host is already running can attach that directory to the existing host instead of starting another server.
 
-Browser control is shared by the host. Workspaces using browser mode share one lazy **isolated agent browser** session that starts only on first use. It never attaches to or reuses your personal browser profile, cookies, or logged-in sessions.
+Browser control is shared by the host. Workspaces using browser mode share one lazy **isolated agent browser** session that starts only on first use. It runs **headless by default** at a deterministic 1280×800 initial viewport, so normal agent work does not open a Chrome window, while `view_page` and screenshots still inspect the browser's rendered pixels. Agents can still resize or emulate the target viewport for responsive QA. Press `[v]` in the live dashboard to switch between hidden/headless and visible presentation; the Browser status row shows the current mode and the toggle hint. Changing presentation while the browser is running closes that temporary session first, so its tabs, cookies, storage, page state, and snapshot UIDs are discarded. Switching to visible starts a fresh empty visible browser immediately; if that headful launch fails, MoonDesk reverts the setting to headless so later agent browser work remains usable. Switching back to headless closes the visible window and returns to lazy hidden startup on the next browser action. MoonDesk never attaches to or reuses your personal browser profile, cookies, or logged-in sessions.
 
 Because every workspace shares this host and public tunnel, stopping MoonDesk disconnects all active workspace connectors. Pressing `q` or `Ctrl+C` in the live dashboard therefore opens a shutdown confirmation instead of stopping the host immediately; `Enter` confirms and `Esc` keeps MoonDesk running.
 
@@ -167,7 +167,7 @@ moondesk browser take_snapshot
 moondesk browser list_console_messages
 ```
 
-The `browser` subcommand is handled by MoonDesk itself and acts as a lightweight authenticated localhost client to the **running MoonDesk host**. It does not launch a separate browser runtime, so separate shell commands, MCP `browser_command`, and MCP `view_page` all operate on the same host-owned agent-browser session. MoonDesk directly owns the pinned `chrome-devtools-mcp` stdio process tree and its isolated Chromium child instead of relying on the upstream detached CLI daemon. Each agent-browser session uses an isolated temporary profile, so personal cookies/logins are never inherited and browser state is discarded when that session ends. Sensitive network headers are redacted, CrUX URL lookups and usage statistics are disabled, local-file navigation is blocked, and a lost runtime is invalidated so the next browser operation starts a fresh isolated session without replaying the ambiguous failed action.
+The `browser` subcommand is handled by MoonDesk itself and acts as a lightweight authenticated localhost client to the **running MoonDesk host**. It does not launch a separate browser runtime, so separate shell commands, MCP `browser_command`, and MCP `view_page` all operate on the same host-owned agent-browser session. MoonDesk directly owns the pinned `chrome-devtools-mcp` stdio process tree and its isolated Chromium child instead of relying on the upstream detached CLI daemon. The browser starts headless by default; visible mode changes only Chromium presentation, not the browser tool surface or isolation model. Each agent-browser session uses an isolated temporary profile, so personal cookies/logins are never inherited and browser state is discarded when that session ends. Sensitive network headers are redacted, CrUX URL lookups and usage statistics are disabled, local-file navigation is blocked, and a lost runtime is invalidated so the next browser operation starts a fresh isolated session without replaying the ambiguous failed action.
 
 The browser runtime is intentionally pinned to `chrome-devtools-mcp@1.7.0`. Version `1.8.0` changed required CLI argument shapes for commands MoonDesk currently invokes with the 1.7 contract, so upgrading the pin requires an explicit command-contract migration and the full browser regression matrix rather than a blind dependency bump.
 
@@ -213,7 +213,7 @@ On macOS Terminal.app, MoonDesk can manage a dedicated terminal profile. Set `MO
 | Tunnel | ngrok |
 | MCP server | Custom implementation |
 | MCP protocol | `2025-11-25` |
-| Browser runtime | pinned `chrome-devtools-mcp@1.7.0` stdio child owned by MoonDesk, started lazily |
+| Browser runtime | pinned `chrome-devtools-mcp@1.7.0` stdio child owned by MoonDesk, lazy + headless by default with opt-in visible presentation |
 | Distribution | npm + native binaries |
 
 ## Contributing

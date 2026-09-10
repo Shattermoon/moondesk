@@ -19,7 +19,7 @@ mod vision;
 mod workspace_tools;
 mod workspaces;
 
-use browser_runtime::BrowserRuntime;
+use browser_runtime::{BrowserPresentationChange, BrowserRuntime, DEFAULT_BROWSER_COMMAND_TIMEOUT};
 use crossterm::{
     ExecutableCommand,
     event::{
@@ -35,11 +35,11 @@ use ratatui::{
 };
 use serde::{Deserialize, Serialize};
 use state::{
-    AppState, CommandActivityState, FLOW_ANIM_CELLS, FLOW_BOOTSTRAP_PHASES, FlowAnimKind,
-    FlowAnimSegment, FlowDirection, FlowLane, Mode, SharedState, ToolMode, UiEventReceiver,
-    UiEventSender, UsageTotals, add_workspace, app_config_path, flow_anim_lit_count, flush_config,
-    normalize_ngrok_domain, remove_workspace, rename_workspace, rotate_workspace_secret,
-    ui_event_channel, user_home_dir,
+    AppState, BrowserPresentation, CommandActivityState, FLOW_ANIM_CELLS, FLOW_BOOTSTRAP_PHASES,
+    FlowAnimKind, FlowAnimSegment, FlowDirection, FlowLane, Mode, SharedState, ToolMode,
+    UiEventReceiver, UiEventSender, UsageTotals, add_workspace, app_config_path,
+    flow_anim_lit_count, flush_config, normalize_ngrok_domain, remove_workspace, rename_workspace,
+    rotate_workspace_secret, ui_event_channel, user_home_dir,
 };
 use std::io::{Write, stdout};
 use std::path::PathBuf;
@@ -224,6 +224,7 @@ struct UiSnapshot {
     remote_connected: bool,
     last_remote_activity_ms: Option<u128>,
     browser_runtime_running: bool,
+    browser_presentation: BrowserPresentation,
     port: u16,
     workspace_count: usize,
     connected_workspace_count: usize,
@@ -253,6 +254,7 @@ impl UiSnapshot {
             remote_connected: app.remote_connected,
             last_remote_activity_ms: app.last_remote_activity_ms,
             browser_runtime_running: app.browser_runtime_running,
+            browser_presentation: app.browser_presentation,
             port: app.port,
             workspace_count: app.workspaces.len(),
             connected_workspace_count: app
@@ -2221,7 +2223,15 @@ async fn run_app(
     // interrupts so an accidental Ctrl+C cannot tear down every workspace before
     // the TUI has a chance to confirm and run its normal shutdown path.
     *interrupt_listener = Some(spawn_interrupt_listener(interrupts.clone()));
-    let result = run_tui(terminal, state, ui_event_rx, interrupts.clone()).await;
+    let live_browser_runtime = services.browser_runtime.clone();
+    let result = run_tui(
+        terminal,
+        state,
+        ui_event_rx,
+        live_browser_runtime,
+        interrupts.clone(),
+    )
+    .await;
     interrupts.begin_shutdown();
     if let Some(runtime) = services.browser_runtime.take() {
         runtime.stop_if_owned(&browser_workspace_root).await;
@@ -3883,17 +3893,19 @@ async fn run_settings(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let themes = theme::all();
     let tool_modes = ToolMode::all();
+    let browser_presentations = BrowserPresentation::all();
     let mut confirm_reset_token_billing = false;
     let mut selected_row = {
         let app = state.lock().await;
         themes.iter().position(|t| t.id == app.theme).unwrap_or(0)
     };
-    let total_rows = themes.len() + tool_modes.len() + 2;
+    let total_rows = themes.len() + tool_modes.len() + browser_presentations.len() + 2;
 
     loop {
         let (
             current_theme,
             current_tool_mode,
+            current_browser_presentation,
             usage_totals,
             set_moondesk_as_co_author,
             ngrok_domain,
@@ -3902,6 +3914,7 @@ async fn run_settings(
             (
                 app.current_theme(),
                 app.tool_mode,
+                app.browser_presentation,
                 app.all_time_usage_totals(),
                 app.set_moondesk_as_co_author,
                 app.ngrok_domain.clone(),
@@ -3913,6 +3926,7 @@ async fn run_settings(
                 SettingsView {
                     current_theme,
                     current_tool_mode,
+                    current_browser_presentation,
                     set_moondesk_as_co_author,
                     ngrok_domain: ngrok_domain.as_deref(),
                     usage_totals: &usage_totals,
@@ -3953,13 +3967,27 @@ async fn run_settings(
                     } else {
                         let tool_mode_start = themes.len();
                         let tool_mode_end = tool_mode_start + tool_modes.len();
-                        let settings_action_start = tool_mode_end;
+                        let browser_presentation_start = tool_mode_end;
+                        let browser_presentation_end =
+                            browser_presentation_start + browser_presentations.len();
+                        let settings_action_start = browser_presentation_end;
 
                         if selected_row < tool_mode_end {
                             let picked = tool_modes[selected_row - tool_mode_start];
                             if app.tool_mode != picked {
                                 app.tool_mode = picked;
                                 app.log("INFO", format!("Tool mode: {}", picked.label()));
+                                app.mark_config_dirty();
+                            }
+                        } else if selected_row < browser_presentation_end {
+                            let picked =
+                                browser_presentations[selected_row - browser_presentation_start];
+                            if app.browser_presentation != picked {
+                                app.browser_presentation = picked;
+                                app.log(
+                                    "INFO",
+                                    format!("Agent browser display: {}", picked.label()),
+                                );
                                 app.mark_config_dirty();
                             }
                         } else if selected_row == settings_action_start {
@@ -4053,6 +4081,7 @@ async fn run_settings(
 struct SettingsView<'a> {
     current_theme: &'a theme::ThemeDef,
     current_tool_mode: ToolMode,
+    current_browser_presentation: BrowserPresentation,
     set_moondesk_as_co_author: bool,
     ngrok_domain: Option<&'a str>,
     usage_totals: &'a UsageTotals,
@@ -4064,6 +4093,7 @@ fn draw_settings(f: &mut Frame, view: SettingsView<'_>) {
     let SettingsView {
         current_theme,
         current_tool_mode,
+        current_browser_presentation,
         set_moondesk_as_co_author,
         ngrok_domain,
         usage_totals,
@@ -4072,6 +4102,7 @@ fn draw_settings(f: &mut Frame, view: SettingsView<'_>) {
     } = view;
     let themes = theme::all();
     let tool_modes = ToolMode::all();
+    let browser_presentations = BrowserPresentation::all();
     let palette = current_theme.palette;
     let cost_estimate = estimate_gpt_5_6_sol_tool_cost(usage_totals);
     render_theme_background(f, palette);
@@ -4182,7 +4213,48 @@ fn draw_settings(f: &mut Frame, view: SettingsView<'_>) {
         )]));
     }
 
-    let co_author_row = themes.len() + tool_modes.len();
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![Span::styled(
+        "  Agent browser display",
+        Style::default()
+            .fg(palette.title_fg)
+            .add_modifier(Modifier::BOLD),
+    )]));
+    for (idx, presentation) in browser_presentations.iter().enumerate() {
+        let row_idx = themes.len() + tool_modes.len() + idx;
+        let selected = row_idx == selected_row;
+        let marker = if selected { ">" } else { " " };
+        let name_style = if selected {
+            Style::default()
+                .fg(palette.key_fg)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(palette.primary_fg)
+        };
+        lines.push(Line::from(""));
+        if selected {
+            selected_line_idx = lines.len();
+        }
+        let mut spans = vec![Span::styled(
+            format!(" {} [{}] {}", marker, row_idx + 1, presentation.label()),
+            name_style,
+        )];
+        if *presentation == current_browser_presentation {
+            spans.push(Span::styled(
+                "  [current]",
+                Style::default()
+                    .fg(palette.secondary_fg)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        lines.push(Line::from(spans));
+        lines.push(Line::from(vec![Span::styled(
+            format!("     {}", presentation.description()),
+            Style::default().fg(palette.muted_fg),
+        )]));
+    }
+
+    let co_author_row = themes.len() + tool_modes.len() + browser_presentations.len();
     let co_author_selected = co_author_row == selected_row;
     let co_author_marker = if co_author_selected { ">" } else { " " };
     let co_author_name_style = if co_author_selected {
@@ -4367,7 +4439,7 @@ fn draw_settings(f: &mut Frame, view: SettingsView<'_>) {
 
     let body = Paragraph::new(lines).scroll((scroll_y, 0)).block(
         Block::default()
-            .title(" Theme, Tool Mode & Usage ")
+            .title(" Theme, Tools, Browser & Usage ")
             .borders(Borders::ALL)
             .border_type(palette.border_type)
             .border_style(Style::default().fg(palette.border_fg)),
@@ -4546,6 +4618,7 @@ async fn run_tui(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     state: SharedState,
     mut ui_events: UiEventReceiver,
+    browser_runtime: Option<Arc<BrowserRuntime>>,
     interrupts: InterruptState,
 ) -> Result<AppExit, Box<dyn std::error::Error>> {
     let mut log_scroll: usize = 0;
@@ -4814,6 +4887,109 @@ async fn run_tui(
                     match key.code {
                         KeyCode::Char('w') => {
                             run_workspaces(terminal, state.clone()).await?;
+                        }
+                        KeyCode::Char('v')
+                            if app.mode.browser_enabled()
+                                && key.modifiers == KeyModifiers::NONE =>
+                        {
+                            let next_presentation = match app.browser_presentation {
+                                BrowserPresentation::Headless => BrowserPresentation::Visible,
+                                BrowserPresentation::Visible => BrowserPresentation::Headless,
+                            };
+                            if let Some(runtime) = browser_runtime.as_ref() {
+                                let mut change =
+                                    runtime.set_presentation(next_presentation, false).await;
+                                if change == BrowserPresentationChange::RequiresRestart {
+                                    if !run_browser_presentation_confirm(
+                                        terminal,
+                                        &state,
+                                        next_presentation,
+                                    )
+                                    .await?
+                                    {
+                                        continue;
+                                    }
+                                    change =
+                                        runtime.set_presentation(next_presentation, true).await;
+                                }
+                                if matches!(
+                                    change,
+                                    BrowserPresentationChange::Updated
+                                        | BrowserPresentationChange::UpdatedAndSessionClosed
+                                ) {
+                                    let mut visible_start_failed = false;
+                                    if next_presentation == BrowserPresentation::Visible {
+                                        let workspace_root =
+                                            { state.lock().await.workspace_root.clone() };
+                                        match runtime
+                                            .run(
+                                                &workspace_root,
+                                                "list_pages",
+                                                &[],
+                                                DEFAULT_BROWSER_COMMAND_TIMEOUT,
+                                            )
+                                            .await
+                                        {
+                                            Ok(output) if output.success() => {}
+                                            Ok(output) => {
+                                                visible_start_failed = true;
+                                                let details = output.failure_details();
+                                                let _ = runtime
+                                                    .set_presentation(
+                                                        BrowserPresentation::Headless,
+                                                        true,
+                                                    )
+                                                    .await;
+                                                state.lock().await.log(
+                                                    "WARN",
+                                                    format!(
+                                                        "Visible agent browser could not start; reverted to headless: {details}"
+                                                    ),
+                                                );
+                                            }
+                                            Err(error) => {
+                                                visible_start_failed = true;
+                                                let _ = runtime
+                                                    .set_presentation(
+                                                        BrowserPresentation::Headless,
+                                                        true,
+                                                    )
+                                                    .await;
+                                                state.lock().await.log(
+                                                    "WARN",
+                                                    format!(
+                                                        "Visible agent browser could not start; reverted to headless: {error}"
+                                                    ),
+                                                );
+                                            }
+                                        }
+                                    }
+                                    if let Err(error) = flush_config(&state, true).await {
+                                        state.lock().await.log(
+                                            "WARN",
+                                            format!(
+                                                "Failed to persist agent browser display setting: {error}"
+                                            ),
+                                        );
+                                    }
+                                    toast = Some((
+                                        if visible_start_failed {
+                                            "Visible browser start failed; reverted to headless"
+                                        } else {
+                                            match next_presentation {
+                                                BrowserPresentation::Headless => {
+                                                    "Browser display: headless"
+                                                }
+                                                BrowserPresentation::Visible => {
+                                                    "Browser display: visible"
+                                                }
+                                            }
+                                        },
+                                        (2, 2),
+                                        Instant::now(),
+                                    ));
+                                }
+                            }
                         }
                         KeyCode::Char('u') if update_info.is_some() => {
                             let Some(selected_update) = update_info.clone() else {
@@ -5438,6 +5614,99 @@ fn quit_confirm_action(key: &crossterm::event::KeyEvent) -> Option<bool> {
         KeyCode::Esc => Some(false),
         _ => None,
     }
+}
+
+async fn run_browser_presentation_confirm(
+    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    state: &SharedState,
+    presentation: BrowserPresentation,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    loop {
+        let theme = { state.lock().await.current_theme() };
+        terminal.draw(|f| draw_browser_presentation_confirm(f, theme, presentation))?;
+        if !event::poll(UI_POLL_INTERVAL)? {
+            continue;
+        }
+        if let Event::Key(key) = event::read()? {
+            if key.kind != KeyEventKind::Press {
+                continue;
+            }
+            match key.code {
+                KeyCode::Enter => return Ok(true),
+                KeyCode::Esc => return Ok(false),
+                _ => {}
+            }
+        }
+    }
+}
+
+fn draw_browser_presentation_confirm(
+    f: &mut Frame,
+    theme: &theme::ThemeDef,
+    presentation: BrowserPresentation,
+) {
+    let palette = theme.palette;
+    render_theme_background(f, palette);
+    let area = centered_rect(82, 14, f.area());
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .title(" Restart Agent Browser? ")
+        .borders(Borders::ALL)
+        .border_type(palette.border_type)
+        .border_style(Style::default().fg(palette.warning_fg))
+        .style(Style::default().fg(palette.modal_fg).bg(palette.modal_bg));
+    let inner = block.inner(area).inner(Margin {
+        horizontal: 2,
+        vertical: 1,
+    });
+    f.render_widget(block, area);
+
+    let lines = vec![
+        Line::from(Span::styled(
+            format!("Switch agent browser display to {}?", presentation.label()),
+            Style::default()
+                .fg(palette.title_fg)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Chromium presentation is chosen when the browser process starts, so the current isolated browser session must be closed.",
+            Style::default().fg(palette.primary_fg),
+        )),
+        Line::from(Span::styled(
+            "Current tabs, cookies, storage, page state, and snapshot UIDs in that temporary session will be discarded.",
+            Style::default().fg(palette.warning_fg),
+        )),
+        Line::from(Span::styled(
+            match presentation {
+                BrowserPresentation::Visible => {
+                    "A fresh empty visible browser session will start immediately after the restart."
+                }
+                BrowserPresentation::Headless => {
+                    "The next browser action will start a fresh headless isolated session."
+                }
+            },
+            Style::default().fg(palette.muted_fg),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(
+                "[Enter]",
+                Style::default()
+                    .fg(palette.warning_fg)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" Restart browser    "),
+            Span::styled(
+                "[Esc]",
+                Style::default()
+                    .fg(palette.success_fg)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" Cancel"),
+        ]),
+    ];
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 
 async fn run_quit_confirm(
@@ -6297,9 +6566,15 @@ fn draw_ui(f: &mut Frame, context: UiRenderContext<'_>) {
     let mcp_url_security_status = mcp_url_reveal_remaining
         .map(|remaining| format!("[ EXPOSED {:>2}s ]", mcp_url_reveal_seconds(remaining)));
     let compact_browser_summary = if app.browser_runtime_running {
-        "Isolated agent browser · running".to_string()
+        format!(
+            "Isolated agent browser · {} · running · [v] toggle",
+            app.browser_presentation.label()
+        )
     } else {
-        "Isolated agent browser · starts on demand".to_string()
+        format!(
+            "Isolated agent browser · {} · starts on demand · [v] toggle",
+            app.browser_presentation.label()
+        )
     };
     let computer_role_style = Style::default()
         .fg(if app.server_running {
@@ -8976,9 +9251,55 @@ mod tests {
         );
         assert!(browser.text.contains("Browser"));
         assert!(browser.text.contains("Isolated agent browser"));
+        assert!(browser.text.contains("hidden (headless)"));
         assert!(browser.text.contains("starts on demand"));
+        assert!(browser.text.contains("[v] toggle"));
         assert!(!browser.text.contains("Local browsers"));
         assert!(!browser.text.contains("Remote dbg support"));
+
+        snapshot.browser_presentation = super::BrowserPresentation::Visible;
+        snapshot.browser_runtime_running = true;
+        let visible = render_dashboard(
+            &snapshot,
+            140,
+            44,
+            DashboardFocus::Logs,
+            &WorkspaceFilter::All,
+            None,
+            None,
+        );
+        assert!(visible.text.contains("visible · running"));
+    }
+
+    #[test]
+    fn browser_presentation_confirmation_explains_session_loss() {
+        let backend = TestBackend::new(100, 24);
+        let mut terminal =
+            Terminal::new(backend).expect("create browser presentation confirmation terminal");
+        let theme = super::theme::resolve(super::theme::DEFAULT_THEME_ID);
+        terminal
+            .draw(|frame| {
+                super::draw_browser_presentation_confirm(
+                    frame,
+                    theme,
+                    super::BrowserPresentation::Visible,
+                );
+            })
+            .expect("render browser presentation confirmation");
+
+        let buffer = terminal.backend().buffer();
+        let mut rendered = String::new();
+        for row in 0..buffer.area.height {
+            for column in 0..buffer.area.width {
+                rendered.push_str(buffer[(column, row)].symbol());
+            }
+            rendered.push('\n');
+        }
+        assert!(rendered.contains("Restart Agent Browser?"));
+        assert!(rendered.contains("visible"));
+        assert!(rendered.contains("tabs, cookies, storage"));
+        assert!(rendered.contains("[Enter]"));
+        assert!(rendered.contains("[Esc]"));
     }
 
     #[test]
@@ -9178,6 +9499,7 @@ mod tests {
                         super::SettingsView {
                             current_theme: theme,
                             current_tool_mode: tool_mode,
+                            current_browser_presentation: super::BrowserPresentation::Headless,
                             set_moondesk_as_co_author: false,
                             ngrok_domain: None,
                             usage_totals: &usage,
@@ -9188,6 +9510,48 @@ mod tests {
                 })
                 .unwrap_or_else(|error| panic!("render theme {}: {error}", theme.id));
         }
+    }
+
+    #[test]
+    fn settings_browser_presentation_rows_are_reachable_and_mark_current_mode() {
+        let usage = super::UsageTotals::default();
+        let theme = super::theme::resolve(super::theme::DEFAULT_THEME_ID);
+        let tool_mode = super::ToolMode::all()[0];
+        let browser_row = super::theme::all().len() + super::ToolMode::all().len() + 1;
+        let backend = TestBackend::new(100, 32);
+        let mut terminal = Terminal::new(backend).expect("create browser settings terminal");
+
+        terminal
+            .draw(|frame| {
+                super::draw_settings(
+                    frame,
+                    super::SettingsView {
+                        current_theme: theme,
+                        current_tool_mode: tool_mode,
+                        current_browser_presentation: super::BrowserPresentation::Visible,
+                        set_moondesk_as_co_author: false,
+                        ngrok_domain: None,
+                        usage_totals: &usage,
+                        selected_row: browser_row,
+                        confirm_reset_token_billing: false,
+                    },
+                )
+            })
+            .expect("render browser presentation settings");
+
+        let buffer = terminal.backend().buffer();
+        let mut rendered = String::new();
+        for row in 0..buffer.area.height {
+            for column in 0..buffer.area.width {
+                rendered.push_str(buffer[(column, row)].symbol());
+            }
+            rendered.push('\n');
+        }
+
+        assert!(rendered.contains("Agent browser display"));
+        assert!(rendered.contains("visible"));
+        assert!(rendered.contains("[current]"));
+        assert!(rendered.contains("Open the isolated Chromium window"));
     }
 
     #[test]
@@ -9236,6 +9600,7 @@ mod tests {
                     super::SettingsView {
                         current_theme: theme,
                         current_tool_mode: tool_mode,
+                        current_browser_presentation: super::BrowserPresentation::Headless,
                         set_moondesk_as_co_author: false,
                         ngrok_domain: None,
                         usage_totals: &usage,

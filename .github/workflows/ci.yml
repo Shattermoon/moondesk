@@ -94,6 +94,10 @@ jobs:
         timeout-minutes: 10
         run: cargo +stable test --locked windows_owned_browser_runtime_is_lazy_and_recovers_after_child_exit -- --ignored --test-threads 1
 
+      - name: Run Windows browser presentation smoke
+        timeout-minutes: 10
+        run: cargo +stable test --locked windows_browser_presentation_change_requires_confirmation_and_restarts -- --ignored --test-threads 1
+
       - name: Run Windows dispatched-timeout cancellation smoke
         timeout-minutes: 10
         run: cargo +stable test --locked windows_browser_timeout_cancels_dispatched_mutation -- --ignored --test-threads 1

@@ -170,6 +170,8 @@ pub struct AppConfig {
     pub mode: Mode,
     pub tool_mode: ToolMode,
     #[serde(default)]
+    pub browser_presentation: BrowserPresentation,
+    #[serde(default)]
     pub usage_by_model: BTreeMap<String, UsageTotals>,
 }
 
@@ -186,6 +188,7 @@ impl Default for AppConfig {
             theme: theme::DEFAULT_THEME_ID.to_string(),
             mode: Mode::Both,
             tool_mode: ToolMode::MultiTools,
+            browser_presentation: BrowserPresentation::Headless,
             usage_by_model: BTreeMap::new(),
         }
     }
@@ -596,6 +599,45 @@ impl Mode {
     }
 }
 
+/// Whether MoonDesk's isolated agent browser opens a desktop window.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BrowserPresentation {
+    #[default]
+    Headless,
+    Visible,
+}
+
+impl BrowserPresentation {
+    pub fn all() -> &'static [Self] {
+        const PRESENTATIONS: [BrowserPresentation; 2] =
+            [BrowserPresentation::Headless, BrowserPresentation::Visible];
+        &PRESENTATIONS
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            BrowserPresentation::Headless => "hidden (headless)",
+            BrowserPresentation::Visible => "visible",
+        }
+    }
+
+    pub fn description(self) -> &'static str {
+        match self {
+            BrowserPresentation::Headless => {
+                "Run the isolated agent browser without opening a desktop window. Recommended."
+            }
+            BrowserPresentation::Visible => {
+                "Open the isolated Chromium window so you can watch or manually interact with it."
+            }
+        }
+    }
+
+    pub fn is_headless(self) -> bool {
+        matches!(self, BrowserPresentation::Headless)
+    }
+}
+
 /// Which local toolset to expose in MCP.
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -646,6 +688,7 @@ pub struct AppState {
     pub theme: String,
     pub mode: Mode,
     pub tool_mode: ToolMode,
+    pub browser_presentation: BrowserPresentation,
     pub mcp_slug: String,
     pub workspaces: Vec<WorkspaceConfig>,
     pub workspace_runtimes: HashMap<WorkspaceId, Arc<WorkspaceRuntime>>,
@@ -1067,6 +1110,7 @@ impl AppState {
             theme: config.theme,
             mode: config.mode,
             tool_mode: config.tool_mode,
+            browser_presentation: config.browser_presentation,
             mcp_slug,
             workspaces: config.workspaces,
             workspace_runtimes,
@@ -1295,6 +1339,7 @@ impl AppState {
             theme: self.theme.clone(),
             mode: self.mode,
             tool_mode: self.tool_mode,
+            browser_presentation: self.browser_presentation,
             usage_by_model: self.usage_by_model.clone(),
         }
         .normalized()
@@ -2043,6 +2088,7 @@ mod tests {
         assert_eq!(app.theme, "neon");
         assert!(matches!(app.mode, Mode::Browser));
         assert!(matches!(app.tool_mode, ToolMode::MultiTools));
+        assert_eq!(app.browser_presentation, BrowserPresentation::Headless);
         assert!(app.set_moondesk_as_co_author);
         let all_time_usage = app.all_time_usage_totals();
         assert_eq!(all_time_usage.tool_input_tokens, 120);
@@ -2125,6 +2171,7 @@ toolCallCount = 1
         app.theme = "neon".into();
         app.mode = Mode::Computer;
         app.tool_mode = ToolMode::ReadOnly;
+        app.browser_presentation = BrowserPresentation::Visible;
         app.usage_by_model
             .entry(CURRENT_USAGE_BUCKET.to_string())
             .or_default()
@@ -2140,6 +2187,7 @@ toolCallCount = 1
         assert_eq!(saved.theme, "neon");
         assert!(matches!(saved.mode, Mode::Computer));
         assert!(matches!(saved.tool_mode, ToolMode::ReadOnly));
+        assert_eq!(saved.browser_presentation, BrowserPresentation::Visible);
         let saved_usage = saved
             .usage_by_model
             .get(CURRENT_USAGE_BUCKET)
@@ -2155,6 +2203,7 @@ toolCallCount = 1
             config_path.clone(),
         )
         .expect("reload app state");
+        assert_eq!(reloaded.browser_presentation, BrowserPresentation::Visible);
         assert_eq!(reloaded.all_time_usage_totals().total_tokens, 20);
         assert_eq!(reloaded.session_usage_totals, UsageTotals::default());
 

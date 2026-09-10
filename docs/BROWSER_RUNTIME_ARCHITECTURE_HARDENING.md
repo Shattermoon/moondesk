@@ -33,8 +33,9 @@ Two cleanup ideas from the audit are intentionally **not required for this PR**:
 MoonDesk should continue to provide:
 
 - one `moondesk` executable;
-- a lazy browser runtime that starts only on first browser use;
+- a lazy browser runtime that starts only on first browser use and is headless by default;
 - one host-owned browser session shared by MCP `browser_command`, MCP `view_page`, and `moondesk browser ...`;
+- hidden/headless and visible presentation as launch modes of that same isolated runtime, never parallel browser architectures; a presentation change that would discard a live session requires explicit user confirmation;
 - a clean isolated Chromium profile that never attaches to the user's personal browser profile, cookies, extensions, or history;
 - a deliberately small MCP browser surface (`browser_command` and `view_page`) rather than dynamically forwarding the full upstream Chrome DevTools MCP schema;
 - safe workspace staging/copy-back for browser file inputs/outputs while keeping upstream unrestricted filesystem access disabled;

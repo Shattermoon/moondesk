@@ -2546,6 +2546,21 @@ mod tests {
         );
         assert_eq!(canonical.workspaces, expected_workspaces);
 
+        let unrelated_launch_root = root.join("unrelated-launch-directory");
+        std::fs::create_dir_all(&unrelated_launch_root)
+            .expect("create unrelated post-upgrade launch directory");
+        let upgraded_app = AppState::from_config_path(
+            8787,
+            unrelated_launch_root.to_string_lossy().into_owned(),
+            canonical_path.clone(),
+        )
+        .expect("start upgraded MoonDesk from migrated config");
+        assert_eq!(
+            upgraded_app.workspaces, expected_workspaces,
+            "the upgraded host must load every migrated workspace instead of bootstrapping from its launch directory"
+        );
+        assert!(upgraded_app.is_returning_user);
+
         let stale_legacy = AppConfig {
             config_version: CURRENT_CONFIG_VERSION,
             workspaces: vec![workspace, secondary_workspace],

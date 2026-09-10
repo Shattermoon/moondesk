@@ -34,7 +34,7 @@ No reverse engineering. No API key. No separate agent service.
 - **Local file tools** — read, search, write, edit, and delete inside a workspace.
 - **Shell commands** — run short commands or start background jobs with polling, preserved output, and cancellation.
 - **Multiple workspaces** — serve several projects from one MoonDesk process, each with its own secret MCP URL.
-- **Headless agent browser by default** — a stable `browser_command` + `view_page` surface backed by a pinned Chrome DevTools runtime. Selecting Browser/Both does not launch Chrome; the shared isolated browser starts lazily on first use without opening a desktop window unless you switch it to visible mode.
+- **Headless agent browser by default** — a small `set_browser_presentation` + `browser_command` + `view_page` surface backed by a pinned Chrome DevTools runtime. Selecting Browser/Both does not launch Chrome; the shared isolated browser starts lazily on first use without opening a desktop window unless the user or agent switches it to visible mode.
 - **Read-only mode** — expose only safe local read tools when mutation is unnecessary.
 - **Cross-platform** — Windows, macOS, and Linux.
 - **Native binary distribution** — install with npm; MoonDesk downloads and verifies the matching release binary on first run.
@@ -65,7 +65,7 @@ Choose:
 - `Control Browser`
 - `Both`
 
-On first launch, MoonDesk asks for your **ngrok authtoken** and **static domain**. These are stored in `~/.moondesk/config.toml`.
+On first launch, MoonDesk asks for your **ngrok authtoken** and **static domain**. These are stored in `~/.moondesk/config.toml`. You can update either value later from Settings; the authtoken editor is masked and Settings only shows whether a token is configured.
 
 ### 3. Copy the workspace URL
 
@@ -121,7 +121,7 @@ Each workspace keeps its own file boundary, command jobs, retained output, histo
 
 Use `[w] Workspaces` to add, rename, inspect, copy, rotate, or remove projects. On Windows, `[b] Explorer` opens the native Explorer folder picker for adding a workspace; `[a] Path` remains available for manual path entry. Launching `moondesk` from another project while a host is already running can attach that directory to the existing host instead of starting another server.
 
-Browser control is shared by the host. Workspaces using browser mode share one lazy **isolated agent browser** session that starts only on first use. It runs **headless by default** at a deterministic 1280×800 initial viewport, so normal agent work does not open a Chrome window, while `view_page` and screenshots still inspect the browser's rendered pixels. Agents can still resize or emulate the target viewport for responsive QA. Press `[v]` in the live dashboard to switch between hidden/headless and visible presentation; the Browser status row shows the current mode and the toggle hint. Changing presentation while the browser is running closes that temporary session first, so its tabs, cookies, storage, page state, and snapshot UIDs are discarded. Switching to visible starts a fresh empty visible browser immediately; if that headful launch fails, MoonDesk reverts the setting to headless so later agent browser work remains usable. Switching back to headless closes the visible window and returns to lazy hidden startup on the next browser action. MoonDesk never attaches to or reuses your personal browser profile, cookies, or logged-in sessions.
+Browser control is shared by the host. Workspaces using browser mode share one lazy **isolated agent browser** session that starts only on first use. It runs **headless by default** at a deterministic 1280×800 initial viewport, so normal agent work does not open a Chrome window, while `view_page` and screenshots still inspect the browser's rendered pixels. Agents can still resize or emulate the target viewport for responsive QA. Press `[v]` in the live dashboard to switch between hidden/headless and visible presentation; the Browser status row shows the current mode and the toggle hint. In `multi-tools` mode an agent can also call `set_browser_presentation`, primarily when a login, CAPTCHA, permission prompt, or other step needs human input. If changing presentation would close a live session, the tool refuses the change and reports `confirmation_required`; the agent must get explicit user approval before retrying with `confirm_restart=true`. Changing presentation while the browser is running closes that temporary session first, so its tabs, cookies, storage, page state, and snapshot UIDs are discarded. Switching to visible starts a fresh empty visible browser immediately; if that headful launch fails, MoonDesk reverts the setting to headless so later agent browser work remains usable. A human-assisted visible session should stay visible while its entered state is still needed; switching back to headless closes that session and returns to lazy hidden startup on the next browser action. MoonDesk never attaches to or reuses your personal browser profile, cookies, or logged-in sessions.
 
 Because every workspace shares this host and public tunnel, stopping MoonDesk disconnects all active workspace connectors. Pressing `q` or `Ctrl+C` in the live dashboard therefore opens a shutdown confirmation instead of stopping the host immediately; `Enter` confirms and `Esc` keeps MoonDesk running.
 
@@ -152,6 +152,7 @@ Browser mode has a stable tool catalog instead of forwarding the full Chrome Dev
 
 | Browser tool | Purpose |
 | --- | --- |
+| `set_browser_presentation` | In `multi-tools`, request headless or visible presentation; live-session changes require explicit restart confirmation |
 | `browser_command` | Run one browser/DevTools CLI operation in the shared lazy session |
 | `view_page` | Attach the current rendered page directly to the model as bounded image content |
 

@@ -91,12 +91,13 @@ If your change touches process execution, Windows environment handling, browser 
 cargo test --locked windows_developer_toolchain_smoke_uses_normal_host_environment -- --ignored
 cargo test --locked windows_owned_browser_runtime_is_lazy_and_recovers_after_child_exit -- --ignored --test-threads 1
 cargo test --locked windows_browser_presentation_change_requires_confirmation_and_restarts -- --ignored --test-threads 1
+cargo test --locked windows_agent_can_request_visible_browser_with_restart_confirmation -- --ignored --test-threads 1
 cargo test --locked windows_browser_timeout_cancels_dispatched_mutation -- --ignored --test-threads 1
 cargo test --locked windows_host_browser_cli_and_mcp_view_page_share_one_session -- --ignored --test-threads 1
 cargo test --locked windows_view_page_returns_native_mcp_image_content -- --ignored --test-threads 1
 ```
 
-The browser smokes verify that help/configuration does not launch Chrome, the MoonDesk-owned stdio runtime starts only on first use, the default runtime is headless while still supporting the real rendered-pixel path, every session uses an isolated non-personal browser profile, owned-child loss is recovered with a fresh safe session, a dispatched timed-out mutation cannot continue after MoonDesk returns, separate `moondesk browser` requests share the host-owned session with MCP, responsive viewport emulation works, and `view_page` exercises the actual page pixels. Presentation changes must preserve the same ownership/isolation model and must never discard a live browser session without explicit user confirmation. Do not weaken or delete environment-specific tests merely to make them run where their stated prerequisites are missing.
+The browser smokes verify that help/configuration does not launch Chrome, the MoonDesk-owned stdio runtime starts only on first use, the default runtime is headless while still supporting the real rendered-pixel path, every session uses an isolated non-personal browser profile, owned-child loss is recovered with a fresh safe session, a dispatched timed-out mutation cannot continue after MoonDesk returns, separate `moondesk browser` requests share the host-owned session with MCP, responsive viewport emulation works, and `view_page` exercises the actual page pixels. Presentation changes must preserve the same ownership/isolation model and must never discard a live browser session without explicit user confirmation; the agent presentation smoke also verifies that `set_browser_presentation` refuses a live handoff before confirmation, starts a visible browser after approval, and can return to lazy headless mode after a second approved session close. Do not weaken or delete environment-specific tests merely to make them run where their stated prerequisites are missing.
 
 ## npm wrapper and distribution checks
 

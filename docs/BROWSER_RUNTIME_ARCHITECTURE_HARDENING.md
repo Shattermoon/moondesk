@@ -24,7 +24,7 @@ The hardening work described in this document is implemented on the current bran
 - **CLI response parity - done.** MoonDesk mirrors v1.7 CLI rendering for markdown, structured JSON, MCP tool errors, and image responses rather than depending on the detached CLI renderer. Oversized JSON remains syntactically valid by returning a bounded `_moondesk.truncated` envelope with the original/limit byte counts instead of splicing plaintext into serialized JSON.
 - **Deferred trace-output semantics - fail-closed.** `performance_start_trace --autoStop=false --filePath=...` is rejected by MoonDesk's command contract before transport startup/dispatch because exact v1.7 does not write that start-call path. Manual traces remain supported by starting without `filePath` and supplying `--filePath` to `performance_stop_trace`.
 - **Capability parity - done.** The direct MCP server keeps the old CLI safety/runtime defaults; feature-gated extension tooling is not silently enabled.
-- **Stable product surface - preserved.** The public architecture remains one `moondesk` executable, one lazy host-shared browser session, and only MCP `browser_command` + `view_page`. `tools/call` also accepts only the connector-defined expanded browser operation allowlist as a compatibility ingress, normalizes pinned commands through the same v1.7 contract, and routes them into the shared runtime without advertising a second public tool surface. Connector-only `fill_form` remains a MoonDesk-owned composite over pinned `fill` and is blocked in ReadOnly because it mutates page state; connector `wait_for` is permitted in ReadOnly as an inspection operation and delegates directly to the pinned v1.7 MCP waiter so text/ARIA matching and upstream timeout semantics stay exact. Both use the same shared browser session, serialization, and workspace-boundary rules. The host-shared browser remains an explicit trust-domain decision.
+- **Stable product surface - preserved and deliberately extended.** The public architecture remains one `moondesk` executable and one lazy host-shared browser session. MCP exposes `browser_command` + `view_page`, plus the narrow MoonDesk-owned `set_browser_presentation` control in MultiTools mode so an agent can request headless or visible presentation without gaining raw browser lifecycle access. A live presentation change is destructive to the temporary browser session, so the tool refuses it until `confirm_restart=true` is supplied after explicit user approval. `tools/call` also accepts only the connector-defined expanded browser operation allowlist as a compatibility ingress, normalizes pinned commands through the same v1.7 contract, and routes them into the shared runtime without advertising a second public tool surface. Connector-only `fill_form` remains a MoonDesk-owned composite over pinned `fill` and is blocked in ReadOnly because it mutates page state; connector `wait_for` is permitted in ReadOnly as an inspection operation and delegates directly to the pinned v1.7 MCP waiter so text/ARIA matching and upstream timeout semantics stay exact. Both use the same shared browser session, serialization, and workspace-boundary rules. The host-shared browser remains an explicit trust-domain decision.
 
 Two cleanup ideas from the audit are intentionally **not required for this PR**: fully moving every path/read-only metadata table into the checked-in command registry, and splitting `browser_runtime.rs` into a deeper module tree. The current path and ReadOnly policies remain centralized enough to be fail-closed and are covered by regression tests; those structural cleanups can be performed separately without reopening lifecycle semantics.
 
@@ -34,10 +34,10 @@ MoonDesk should continue to provide:
 
 - one `moondesk` executable;
 - a lazy browser runtime that starts only on first browser use and is headless by default;
-- one host-owned browser session shared by MCP `browser_command`, MCP `view_page`, and `moondesk browser ...`;
+- one host-owned browser session shared by MCP `set_browser_presentation`, MCP `browser_command`, MCP `view_page`, and `moondesk browser ...`;
 - hidden/headless and visible presentation as launch modes of that same isolated runtime, never parallel browser architectures; a presentation change that would discard a live session requires explicit user confirmation;
 - a clean isolated Chromium profile that never attaches to the user's personal browser profile, cookies, extensions, or history;
-- a deliberately small MCP browser surface (`browser_command` and `view_page`) rather than dynamically forwarding the full upstream Chrome DevTools MCP schema;
+- a deliberately small MCP browser surface (`set_browser_presentation`, `browser_command`, and `view_page`) rather than dynamically forwarding the full upstream Chrome DevTools MCP schema; presentation control remains MoonDesk-owned, unavailable in ReadOnly, and cannot discard a live session without explicit restart confirmation;
 - safe workspace staging/copy-back for browser file inputs/outputs while keeping upstream unrestricted filesystem access disabled;
 - ReadOnly browser policy enforced by MoonDesk rather than trusting upstream defaults;
 - automatic recovery after a browser/runtime loss, but without replaying ambiguous state-changing actions.
@@ -248,7 +248,7 @@ At minimum:
 - outside-workspace/traversal/symlink/reparse-point path tests remain green;
 - ReadOnly inspection policy remains green, including Lighthouse snapshot-only behavior;
 - `view_page` still returns native bounded image content and cleans managed temp files;
-- one runtime remains shared across MCP `browser_command`, MCP `view_page`, and `moondesk browser`;
+- one runtime remains shared across MCP `set_browser_presentation`, MCP `browser_command`, MCP `view_page`, and `moondesk browser`;
 - two MoonDesk hosts remain independent at the process/runtime level;
 - minimum supported Node version can actually launch the pinned browser runtime;
 - Windows and Linux Clippy/test matrices remain clean.

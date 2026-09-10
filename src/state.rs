@@ -633,6 +633,13 @@ impl BrowserPresentation {
         }
     }
 
+    pub fn config_value(self) -> &'static str {
+        match self {
+            BrowserPresentation::Headless => "headless",
+            BrowserPresentation::Visible => "visible",
+        }
+    }
+
     pub fn is_headless(self) -> bool {
         matches!(self, BrowserPresentation::Headless)
     }

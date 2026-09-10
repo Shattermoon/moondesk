@@ -98,6 +98,10 @@ jobs:
         timeout-minutes: 10
         run: cargo +stable test --locked windows_browser_presentation_change_requires_confirmation_and_restarts -- --ignored --test-threads 1
 
+      - name: Run Windows agent browser presentation smoke
+        timeout-minutes: 10
+        run: cargo +stable test --locked windows_agent_can_request_visible_browser_with_restart_confirmation -- --ignored --test-threads 1
+
       - name: Run Windows dispatched-timeout cancellation smoke
         timeout-minutes: 10
         run: cargo +stable test --locked windows_browser_timeout_cancels_dispatched_mutation -- --ignored --test-threads 1

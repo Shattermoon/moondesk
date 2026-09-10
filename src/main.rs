@@ -1528,6 +1528,10 @@ fn key_is_clipboard_paste(key: &crossterm::event::KeyEvent) -> bool {
             && key.modifiers.contains(KeyModifiers::CONTROL)
 }
 
+fn ngrok_setup_cancel_key(code: KeyCode) -> bool {
+    matches!(code, KeyCode::Esc)
+}
+
 fn key_is_interrupt(key: &crossterm::event::KeyEvent) -> bool {
     matches!(key.code, KeyCode::Char(c) if c.eq_ignore_ascii_case(&'c'))
         && key.modifiers.contains(KeyModifiers::CONTROL)
@@ -2156,7 +2160,7 @@ async fn run_app(
         }
     }
 
-    let continue_run = run_ngrok_auth_setup(terminal, state.clone(), None).await?;
+    let continue_run = run_ngrok_auth_setup(terminal, state.clone(), None, false).await?;
     if !continue_run {
         return Ok(AppExit::Quit);
     }
@@ -2192,6 +2196,7 @@ async fn run_app(
                 "ngrok rejected the saved authtoken. Paste a fresh token from the ngrok dashboard."
                     .into(),
             ),
+            true,
         )
         .await
         {
@@ -2357,11 +2362,13 @@ async fn run_ngrok_auth_setup(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     state: SharedState,
     initial_error: Option<String>,
+    force_prompt: bool,
 ) -> Result<bool, Box<dyn std::error::Error>> {
-    if initial_error.is_none() && state.lock().await.ngrok_authtoken().is_some() {
+    if !force_prompt && initial_error.is_none() && state.lock().await.ngrok_authtoken().is_some() {
         return Ok(true);
     }
 
+    let previous_token = state.lock().await.ngrok_authtoken().map(str::to_owned);
     let config_path = app_config_path()?;
     let config_path_text = config_path.to_string_lossy().into_owned();
     let mut input = String::new();
@@ -2416,8 +2423,10 @@ async fn run_ngrok_auth_setup(
                 if key.kind != KeyEventKind::Press {
                     continue;
                 }
+                if ngrok_setup_cancel_key(key.code) {
+                    return Ok(false);
+                }
                 match key.code {
-                    KeyCode::Esc | KeyCode::Char('q') => return Ok(false),
                     KeyCode::Enter => {
                         let token = normalize_ngrok_authtoken_input(&input);
                         if token.is_empty() {
@@ -2440,7 +2449,10 @@ async fn run_ngrok_auth_setup(
                                 return Ok(true);
                             }
                             Err(error) => {
-                                state.lock().await.set_ngrok_authtoken(None);
+                                state
+                                    .lock()
+                                    .await
+                                    .set_ngrok_authtoken(previous_token.clone());
                                 error_message = Some(format!(
                                     "Failed to save ~/.moondesk/config.toml: {error}"
                                 ));
@@ -2535,8 +2547,10 @@ async fn run_ngrok_domain_setup(
                 if key.kind != KeyEventKind::Press {
                     continue;
                 }
+                if ngrok_setup_cancel_key(key.code) {
+                    return Ok(false);
+                }
                 match key.code {
-                    KeyCode::Esc | KeyCode::Char('q') => return Ok(false),
                     KeyCode::Enter => {
                         let domain = match normalize_ngrok_domain(&input) {
                             Ok(Some(domain)) => domain,
@@ -2700,7 +2714,7 @@ fn draw_ngrok_domain_setup(
         )))
     } else {
         Paragraph::new(Line::from(Span::styled(
-            "[Enter] Save  [q/Esc] Quit  [Paste/Ctrl+V] Insert domain",
+            "[Enter] Save  [Esc] Cancel  [Paste/Ctrl+V] Insert domain",
             Style::default().fg(palette.muted_fg).bg(modal_bg),
         )))
     };
@@ -2858,7 +2872,7 @@ fn draw_ngrok_auth_setup(
         .bg(modal_bg)
         .add_modifier(Modifier::BOLD);
     let body_lines = vec![
-        Line::from(Span::styled("ngrok setup required", step_style)),
+        Line::from(Span::styled("ngrok authentication", step_style)),
         Line::from(""),
         Line::from(vec![
             Span::styled("1. Open in browser and get your authtoken", step_style),
@@ -2907,7 +2921,7 @@ fn draw_ngrok_auth_setup(
         )))
     } else {
         Paragraph::new(Line::from(Span::styled(
-            "[Enter] Save  [q/Esc] Quit  [Paste/Ctrl+V] Insert token",
+            "[Enter] Save  [Esc] Cancel  [Paste/Ctrl+V] Insert token",
             Style::default().fg(palette.muted_fg).bg(modal_bg),
         )))
     };
@@ -3899,7 +3913,7 @@ async fn run_settings(
         let app = state.lock().await;
         themes.iter().position(|t| t.id == app.theme).unwrap_or(0)
     };
-    let total_rows = themes.len() + tool_modes.len() + browser_presentations.len() + 2;
+    let total_rows = themes.len() + tool_modes.len() + browser_presentations.len() + 3;
 
     loop {
         let (
@@ -3908,6 +3922,7 @@ async fn run_settings(
             current_browser_presentation,
             usage_totals,
             set_moondesk_as_co_author,
+            ngrok_authtoken_configured,
             ngrok_domain,
         ) = {
             let app = state.lock().await;
@@ -3917,6 +3932,7 @@ async fn run_settings(
                 app.browser_presentation,
                 app.all_time_usage_totals(),
                 app.set_moondesk_as_co_author,
+                app.ngrok_authtoken().is_some(),
                 app.ngrok_domain.clone(),
             )
         };
@@ -3928,6 +3944,7 @@ async fn run_settings(
                     current_tool_mode,
                     current_browser_presentation,
                     set_moondesk_as_co_author,
+                    ngrok_authtoken_configured,
                     ngrok_domain: ngrok_domain.as_deref(),
                     usage_totals: &usage_totals,
                     selected_row,
@@ -4002,6 +4019,10 @@ async fn run_settings(
                             );
                             app.mark_config_dirty();
                         } else if selected_row == settings_action_start + 1 {
+                            drop(app);
+                            let _ =
+                                run_ngrok_auth_setup(terminal, state.clone(), None, true).await?;
+                        } else if selected_row == settings_action_start + 2 {
                             let previous_domain = app.ngrok_domain.clone();
                             let current_domain = previous_domain.clone().unwrap_or_default();
                             drop(app);
@@ -4083,6 +4104,7 @@ struct SettingsView<'a> {
     current_tool_mode: ToolMode,
     current_browser_presentation: BrowserPresentation,
     set_moondesk_as_co_author: bool,
+    ngrok_authtoken_configured: bool,
     ngrok_domain: Option<&'a str>,
     usage_totals: &'a UsageTotals,
     selected_row: usize,
@@ -4095,6 +4117,7 @@ fn draw_settings(f: &mut Frame, view: SettingsView<'_>) {
         current_tool_mode,
         current_browser_presentation,
         set_moondesk_as_co_author,
+        ngrok_authtoken_configured,
         ngrok_domain,
         usage_totals,
         selected_row,
@@ -4303,7 +4326,17 @@ fn draw_settings(f: &mut Frame, view: SettingsView<'_>) {
         Style::default().fg(palette.muted_fg),
     )]));
 
-    let domain_row = co_author_row + 1;
+    let auth_token_row = co_author_row + 1;
+    let auth_token_selected = auth_token_row == selected_row;
+    let auth_token_marker = if auth_token_selected { ">" } else { " " };
+    let auth_token_name_style = if auth_token_selected {
+        Style::default()
+            .fg(palette.key_fg)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(palette.primary_fg)
+    };
+    let domain_row = co_author_row + 2;
     let domain_selected = domain_row == selected_row;
     let domain_marker = if domain_selected { ">" } else { " " };
     let domain_name_style = if domain_selected {
@@ -4325,6 +4358,37 @@ fn draw_settings(f: &mut Frame, view: SettingsView<'_>) {
         "     Workspace-specific MCP URLs are managed from [w] Workspaces.",
         Style::default().fg(palette.muted_fg),
     )));
+    if auth_token_selected {
+        selected_line_idx = lines.len();
+    }
+    lines.push(Line::from(vec![Span::styled(
+        format!(
+            " {} [{}] Set ngrok authtoken",
+            auth_token_marker,
+            auth_token_row + 1
+        ),
+        auth_token_name_style,
+    )]));
+    lines.push(Line::from(vec![
+        Span::styled("     ", Style::default()),
+        Span::styled(
+            if ngrok_authtoken_configured {
+                "[configured]"
+            } else {
+                "[not set]"
+            },
+            Style::default().fg(if ngrok_authtoken_configured {
+                palette.success_fg
+            } else {
+                palette.muted_fg
+            }),
+        ),
+    ]));
+    lines.push(Line::from(Span::styled(
+        "     The token is stored in ~/.moondesk/config.toml and is never shown here.",
+        Style::default().fg(palette.muted_fg),
+    )));
+    lines.push(Line::from(""));
     if domain_selected {
         selected_line_idx = lines.len();
     }
@@ -4899,6 +4963,14 @@ async fn run_tui(
                             if let Some(runtime) = browser_runtime.as_ref() {
                                 let mut change =
                                     runtime.set_presentation(next_presentation, false).await;
+                                if change == BrowserPresentationChange::Busy {
+                                    toast = Some((
+                                        "Browser is busy; try display toggle again",
+                                        (2, 2),
+                                        Instant::now(),
+                                    ));
+                                    continue;
+                                }
                                 if change == BrowserPresentationChange::RequiresRestart {
                                     if !run_browser_presentation_confirm(
                                         terminal,
@@ -4911,6 +4983,14 @@ async fn run_tui(
                                     }
                                     change =
                                         runtime.set_presentation(next_presentation, true).await;
+                                    if change == BrowserPresentationChange::Busy {
+                                        toast = Some((
+                                            "Browser became busy; display was not changed",
+                                            (2, 2),
+                                            Instant::now(),
+                                        ));
+                                        continue;
+                                    }
                                 }
                                 if matches!(
                                     change,
@@ -5661,6 +5741,14 @@ fn draw_browser_presentation_confirm(
     });
     f.render_widget(block, area);
 
+    let compact_actions = inner.width < 48;
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(1),
+            Constraint::Length(if compact_actions { 2 } else { 1 }),
+        ])
+        .split(inner);
     let lines = vec![
         Line::from(Span::styled(
             format!("Switch agent browser display to {}?", presentation.label()),
@@ -5688,8 +5776,30 @@ fn draw_browser_presentation_confirm(
             },
             Style::default().fg(palette.muted_fg),
         )),
-        Line::from(""),
-        Line::from(vec![
+    ];
+    let action_lines = if compact_actions {
+        vec![
+            Line::from(vec![
+                Span::styled(
+                    "[Enter]",
+                    Style::default()
+                        .fg(palette.warning_fg)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(" Restart browser"),
+            ]),
+            Line::from(vec![
+                Span::styled(
+                    "[Esc]",
+                    Style::default()
+                        .fg(palette.success_fg)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(" Cancel"),
+            ]),
+        ]
+    } else {
+        vec![Line::from(vec![
             Span::styled(
                 "[Enter]",
                 Style::default()
@@ -5704,9 +5814,16 @@ fn draw_browser_presentation_confirm(
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw(" Cancel"),
-        ]),
-    ];
-    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+        ])]
+    };
+    f.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: false }),
+        sections[0],
+    );
+    f.render_widget(
+        Paragraph::new(action_lines).wrap(Wrap { trim: false }),
+        sections[1],
+    );
 }
 
 async fn run_quit_confirm(
@@ -7628,7 +7745,7 @@ mod tests {
         active_reveal_remaining, apply_workspace_observability_filter, cycle_dashboard_focus,
         dashboard_secret_target_at, draw_changelog_notice, draw_prompt, draw_quit_confirm, draw_ui,
         draw_update_confirm, item_under_cursor, key_is_clipboard_paste, key_is_interrupt,
-        key_is_plain_quit, log_secret_target, move_panel_selection,
+        key_is_plain_quit, log_secret_target, move_panel_selection, ngrok_setup_cancel_key,
         normalize_ngrok_authtoken_input, normalize_ngrok_domain, normalize_workspace_path_input,
         panel_under_cursor, parse_clippymoon_export_args, parse_port_value,
         primary_mcp_url_line_index, quit_confirm_action, reconcile_workspace_filter,
@@ -8268,6 +8385,22 @@ mod tests {
         assert_eq!(
             normalize_ngrok_authtoken_input("ngrok config add-authtoken test-token-123"),
             "test-token-123"
+        );
+    }
+
+    #[test]
+    fn ngrok_text_entry_only_cancels_on_escape() {
+        assert!(ngrok_setup_cancel_key(KeyCode::Esc));
+        assert!(!ngrok_setup_cancel_key(KeyCode::Char('q')));
+        assert!(!ngrok_setup_cancel_key(KeyCode::Char('Q')));
+        assert!(!ngrok_setup_cancel_key(KeyCode::Char('v')));
+    }
+
+    #[test]
+    fn normalizes_pasted_ngrok_token_without_dropping_q_characters() {
+        assert_eq!(
+            normalize_ngrok_authtoken_input("token-prefix-q-token-suffix"),
+            "token-prefix-q-token-suffix"
         );
     }
 
@@ -9303,6 +9436,35 @@ mod tests {
     }
 
     #[test]
+    fn browser_presentation_confirmation_keeps_controls_visible_on_narrow_terminals() {
+        let backend = TestBackend::new(52, 16);
+        let mut terminal =
+            Terminal::new(backend).expect("create compact browser confirmation terminal");
+        let theme = super::theme::resolve(super::theme::DEFAULT_THEME_ID);
+        terminal
+            .draw(|frame| {
+                super::draw_browser_presentation_confirm(
+                    frame,
+                    theme,
+                    super::BrowserPresentation::Visible,
+                );
+            })
+            .expect("render compact browser presentation confirmation");
+
+        let buffer = terminal.backend().buffer();
+        let mut rendered = String::new();
+        for row in 0..16 {
+            for column in 0..52 {
+                rendered.push_str(buffer[(column, row)].symbol());
+            }
+            rendered.push('\n');
+        }
+        assert!(rendered.contains("Restart Agent Browser?"));
+        assert!(rendered.contains("[Enter] Restart browser"));
+        assert!(rendered.contains("[Esc] Cancel"));
+    }
+
+    #[test]
     fn update_confirmation_only_accepts_enter_or_escape() {
         assert_eq!(update_confirm_action(KeyCode::Enter), Some(true));
         assert_eq!(update_confirm_action(KeyCode::Esc), Some(false));
@@ -9501,6 +9663,7 @@ mod tests {
                             current_tool_mode: tool_mode,
                             current_browser_presentation: super::BrowserPresentation::Headless,
                             set_moondesk_as_co_author: false,
+                            ngrok_authtoken_configured: false,
                             ngrok_domain: None,
                             usage_totals: &usage,
                             selected_row,
@@ -9530,6 +9693,7 @@ mod tests {
                         current_tool_mode: tool_mode,
                         current_browser_presentation: super::BrowserPresentation::Visible,
                         set_moondesk_as_co_author: false,
+                        ngrok_authtoken_configured: false,
                         ngrok_domain: None,
                         usage_totals: &usage,
                         selected_row: browser_row,
@@ -9552,6 +9716,51 @@ mod tests {
         assert!(rendered.contains("visible"));
         assert!(rendered.contains("[current]"));
         assert!(rendered.contains("Open the isolated Chromium window"));
+    }
+
+    #[test]
+    fn settings_exposes_masked_ngrok_authtoken_action() {
+        let usage = super::UsageTotals::default();
+        let theme = super::theme::resolve(super::theme::DEFAULT_THEME_ID);
+        let tool_mode = super::ToolMode::all()[0];
+        let auth_token_row = super::theme::all().len()
+            + super::ToolMode::all().len()
+            + super::BrowserPresentation::all().len()
+            + 1;
+        let backend = TestBackend::new(100, 32);
+        let mut terminal = Terminal::new(backend).expect("create ngrok auth settings terminal");
+
+        terminal
+            .draw(|frame| {
+                super::draw_settings(
+                    frame,
+                    super::SettingsView {
+                        current_theme: theme,
+                        current_tool_mode: tool_mode,
+                        current_browser_presentation: super::BrowserPresentation::Headless,
+                        set_moondesk_as_co_author: false,
+                        ngrok_authtoken_configured: true,
+                        ngrok_domain: Some("example.ngrok-free.app"),
+                        usage_totals: &usage,
+                        selected_row: auth_token_row,
+                        confirm_reset_token_billing: false,
+                    },
+                )
+            })
+            .expect("render ngrok auth settings");
+
+        let buffer = terminal.backend().buffer();
+        let mut rendered = String::new();
+        for row in 0..buffer.area.height {
+            for column in 0..buffer.area.width {
+                rendered.push_str(buffer[(column, row)].symbol());
+            }
+            rendered.push('\n');
+        }
+
+        assert!(rendered.contains("Set ngrok authtoken"));
+        assert!(rendered.contains("[configured]"));
+        assert!(rendered.contains("never shown here"));
     }
 
     #[test]
@@ -9602,6 +9811,7 @@ mod tests {
                         current_tool_mode: tool_mode,
                         current_browser_presentation: super::BrowserPresentation::Headless,
                         set_moondesk_as_co_author: false,
+                        ngrok_authtoken_configured: false,
                         ngrok_domain: None,
                         usage_totals: &usage,
                         selected_row: super::theme::all().len() - 1,

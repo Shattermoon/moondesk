@@ -27,6 +27,7 @@ pub const MAX_BROWSER_ARG_BYTES: usize = 8 * 1024;
 pub const MAX_BROWSER_CONTROL_BODY_BYTES: usize = 128 * 1024;
 const MAX_CAPTURED_OUTPUT_BYTES: usize = 256 * 1024;
 const DEFAULT_HEADLESS_VIEWPORT: &str = "1280x800";
+const BROWSER_PRESENTATION_LOCK_TIMEOUT: Duration = Duration::from_millis(250);
 
 #[derive(Clone, Debug)]
 pub struct BrowserCommandOutput {
@@ -42,6 +43,7 @@ pub enum BrowserPresentationChange {
     Updated,
     UpdatedAndSessionClosed,
     RequiresRestart,
+    Busy,
 }
 
 impl BrowserCommandOutput {
@@ -533,7 +535,11 @@ impl BrowserRuntime {
         presentation: BrowserPresentation,
         allow_restart: bool,
     ) -> BrowserPresentationChange {
-        let _operation = self.operation.lock().await;
+        let Ok(_operation) =
+            tokio::time::timeout(BROWSER_PRESENTATION_LOCK_TIMEOUT, self.operation.lock()).await
+        else {
+            return BrowserPresentationChange::Busy;
+        };
         let Some(state) = &self.state else {
             return BrowserPresentationChange::Unchanged;
         };
@@ -579,6 +585,16 @@ impl BrowserRuntime {
         } else {
             BrowserPresentationChange::Updated
         }
+    }
+
+    /// Return whether MoonDesk currently owns a live browser transport.
+    pub async fn is_running(&self) -> bool {
+        self.runtime
+            .lock()
+            .await
+            .transport
+            .as_ref()
+            .is_some_and(|transport| transport.is_alive())
     }
 
     pub async fn stop_if_owned(&self, _workspace_root: &str) {
@@ -2040,6 +2056,40 @@ mod tests {
                 assert!(!args.iter().any(|arg| arg.starts_with("--viewport=")));
             }
         }
+    }
+
+    #[tokio::test]
+    async fn browser_presentation_change_returns_busy_instead_of_waiting_for_active_operation() {
+        let workspace = std::env::temp_dir().join(format!(
+            "moondesk-browser-presentation-busy-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workspace).expect("create presentation workspace");
+        let config_path = workspace.join("config.toml");
+        let app = AppState::new_for_test(
+            8787,
+            workspace.to_string_lossy().into_owned(),
+            config_path.clone(),
+        )
+        .expect("create browser presentation app");
+        let state = Arc::new(Mutex::new(app));
+        let runtime = BrowserRuntime::new(state.clone());
+        let operation = runtime.operation.lock().await;
+
+        let started = tokio::time::Instant::now();
+        let change = runtime
+            .set_presentation(BrowserPresentation::Visible, false)
+            .await;
+        assert_eq!(change, BrowserPresentationChange::Busy);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(
+            state.lock().await.browser_presentation,
+            BrowserPresentation::Headless
+        );
+
+        drop(operation);
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_dir_all(workspace);
     }
 
     #[tokio::test]

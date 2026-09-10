@@ -38,8 +38,8 @@ use state::{
     AppState, BrowserPresentation, CommandActivityState, FLOW_ANIM_CELLS, FLOW_BOOTSTRAP_PHASES,
     FlowAnimKind, FlowAnimSegment, FlowDirection, FlowLane, Mode, SharedState, ToolMode,
     UiEventReceiver, UiEventSender, UsageTotals, add_workspace, app_config_path,
-    flow_anim_lit_count, flush_config, normalize_ngrok_domain, remove_workspace, rename_workspace,
-    rotate_workspace_secret, ui_event_channel, user_home_dir,
+    flow_anim_lit_count, flush_config, legacy_windows_app_config_path, normalize_ngrok_domain,
+    remove_workspace, rename_workspace, rotate_workspace_secret, ui_event_channel, user_home_dir,
 };
 use std::io::{Write, stdout};
 use std::path::PathBuf;
@@ -1684,12 +1684,24 @@ struct HostAttachResult {
     already_registered: bool,
 }
 
-fn host_runtime_path(port: u16) -> std::io::Result<PathBuf> {
-    let config_path = app_config_path()?;
+fn host_runtime_path_for_config(
+    config_path: &std::path::Path,
+    port: u16,
+) -> std::io::Result<PathBuf> {
     let directory = config_path.parent().ok_or_else(|| {
         std::io::Error::other("MoonDesk config path does not have a parent directory")
     })?;
     Ok(directory.join(format!("host-{port}.json")))
+}
+
+fn host_runtime_path(port: u16) -> std::io::Result<PathBuf> {
+    host_runtime_path_for_config(&app_config_path()?, port)
+}
+
+fn legacy_host_runtime_path(port: u16) -> std::io::Result<Option<PathBuf>> {
+    legacy_windows_app_config_path()?
+        .map(|config_path| host_runtime_path_for_config(&config_path, port))
+        .transpose()
 }
 
 fn write_host_runtime_registration(port: u16, token: &str) -> std::io::Result<HostRuntimeGuard> {
@@ -1724,26 +1736,49 @@ fn write_host_runtime_registration(port: u16, token: &str) -> std::io::Result<Ho
     Ok(HostRuntimeGuard { path })
 }
 
-fn read_host_runtime_registration(port: u16) -> Result<HostRuntimeRegistration, String> {
-    let path = host_runtime_path(port).map_err(|error| error.to_string())?;
-    let payload = std::fs::read(&path).map_err(|error| {
+fn read_host_runtime_registration_from_path(
+    path: &std::path::Path,
+    port: u16,
+) -> Result<HostRuntimeRegistration, String> {
+    let payload = std::fs::read(path).map_err(|error| {
         format!(
             "could not read the running host registration file {}: {error}",
             path.display()
         )
     })?;
     let registration: HostRuntimeRegistration = serde_json::from_slice(&payload)
-        .map_err(|error| format!("invalid host registration: {error}"))?;
+        .map_err(|error| format!("invalid host registration {}: {error}", path.display()))?;
     if registration.port != port {
         return Err(format!(
-            "host registration is for port {}, expected {port}",
+            "host registration {} is for port {}, expected {port}",
+            path.display(),
             registration.port
         ));
     }
     if registration.token.is_empty() {
-        return Err("host registration token is empty".into());
+        return Err(format!(
+            "host registration token is empty in {}",
+            path.display()
+        ));
     }
     Ok(registration)
+}
+
+fn read_host_runtime_registration(port: u16) -> Result<HostRuntimeRegistration, String> {
+    let canonical = host_runtime_path(port).map_err(|error| error.to_string())?;
+    match read_host_runtime_registration_from_path(&canonical, port) {
+        Ok(registration) => Ok(registration),
+        Err(primary_error) => {
+            let legacy = legacy_host_runtime_path(port).map_err(|error| error.to_string())?;
+            if let Some(legacy) = legacy
+                && legacy != canonical
+                && let Ok(registration) = read_host_runtime_registration_from_path(&legacy, port)
+            {
+                return Ok(registration);
+            }
+            Err(primary_error)
+        }
+    }
 }
 
 async fn attach_workspace_to_running_host(
@@ -2170,7 +2205,7 @@ async fn run_app(
         return Ok(AppExit::Quit);
     }
 
-    if let Err(error) = flush_config(&state, true).await {
+    if let Err(error) = flush_config(&state, false).await {
         state.lock().await.log(
             "WARN",
             format!("Failed to persist config before startup: {error}"),
@@ -2454,7 +2489,8 @@ async fn run_ngrok_auth_setup(
                                     .await
                                     .set_ngrok_authtoken(previous_token.clone());
                                 error_message = Some(format!(
-                                    "Failed to save ~/.moondesk/config.toml: {error}"
+                                    "Failed to save {}: {error}",
+                                    config_path.to_string_lossy()
                                 ));
                             }
                         }
@@ -2581,7 +2617,8 @@ async fn run_ngrok_domain_setup(
                             Err(error) => {
                                 state.lock().await.set_ngrok_domain(None);
                                 error_message = Some(format!(
-                                    "Failed to save ~/.moondesk/config.toml: {error}"
+                                    "Failed to save {}: {error}",
+                                    config_path.to_string_lossy()
                                 ));
                             }
                         }
@@ -3908,6 +3945,7 @@ async fn run_settings(
     let themes = theme::all();
     let tool_modes = ToolMode::all();
     let browser_presentations = BrowserPresentation::all();
+    let config_path_text = app_config_path()?.to_string_lossy().into_owned();
     let mut confirm_reset_token_billing = false;
     let mut selected_row = {
         let app = state.lock().await;
@@ -3946,6 +3984,7 @@ async fn run_settings(
                     set_moondesk_as_co_author,
                     ngrok_authtoken_configured,
                     ngrok_domain: ngrok_domain.as_deref(),
+                    config_path: &config_path_text,
                     usage_totals: &usage_totals,
                     selected_row,
                     confirm_reset_token_billing,
@@ -4106,6 +4145,7 @@ struct SettingsView<'a> {
     set_moondesk_as_co_author: bool,
     ngrok_authtoken_configured: bool,
     ngrok_domain: Option<&'a str>,
+    config_path: &'a str,
     usage_totals: &'a UsageTotals,
     selected_row: usize,
     confirm_reset_token_billing: bool,
@@ -4119,6 +4159,7 @@ fn draw_settings(f: &mut Frame, view: SettingsView<'_>) {
         set_moondesk_as_co_author,
         ngrok_authtoken_configured,
         ngrok_domain,
+        config_path,
         usage_totals,
         selected_row,
         confirm_reset_token_billing,
@@ -4358,6 +4399,10 @@ fn draw_settings(f: &mut Frame, view: SettingsView<'_>) {
         "     Workspace-specific MCP URLs are managed from [w] Workspaces.",
         Style::default().fg(palette.muted_fg),
     )));
+    lines.push(Line::from(Span::styled(
+        format!("     Config: {config_path}"),
+        Style::default().fg(palette.muted_fg),
+    )));
     if auth_token_selected {
         selected_line_idx = lines.len();
     }
@@ -4385,7 +4430,7 @@ fn draw_settings(f: &mut Frame, view: SettingsView<'_>) {
         ),
     ]));
     lines.push(Line::from(Span::styled(
-        "     The token is stored in ~/.moondesk/config.toml and is never shown here.",
+        "     The token is stored in the MoonDesk config shown above and is never displayed here.",
         Style::default().fg(palette.muted_fg),
     )));
     lines.push(Line::from(""));
@@ -4998,6 +5043,7 @@ async fn run_tui(
                                         | BrowserPresentationChange::UpdatedAndSessionClosed
                                 ) {
                                     let mut visible_start_failed = false;
+                                    let mut visible_fallback_busy = false;
                                     if next_presentation == BrowserPresentation::Visible {
                                         let workspace_root =
                                             { state.lock().await.workspace_root.clone() };
@@ -5014,33 +5060,53 @@ async fn run_tui(
                                             Ok(output) => {
                                                 visible_start_failed = true;
                                                 let details = output.failure_details();
-                                                let _ = runtime
+                                                let rollback = runtime
                                                     .set_presentation(
                                                         BrowserPresentation::Headless,
                                                         true,
                                                     )
                                                     .await;
-                                                state.lock().await.log(
-                                                    "WARN",
-                                                    format!(
-                                                        "Visible agent browser could not start; reverted to headless: {details}"
-                                                    ),
-                                                );
+                                                if browser_headless_fallback_succeeded(rollback) {
+                                                    state.lock().await.log(
+                                                        "WARN",
+                                                        format!(
+                                                            "Visible agent browser could not start; reverted to headless: {details}"
+                                                        ),
+                                                    );
+                                                } else {
+                                                    visible_fallback_busy = true;
+                                                    state.lock().await.log(
+                                                        "WARN",
+                                                        format!(
+                                                            "Visible agent browser could not start, and MoonDesk could not immediately revert to headless because the browser became busy: {details}"
+                                                        ),
+                                                    );
+                                                }
                                             }
                                             Err(error) => {
                                                 visible_start_failed = true;
-                                                let _ = runtime
+                                                let rollback = runtime
                                                     .set_presentation(
                                                         BrowserPresentation::Headless,
                                                         true,
                                                     )
                                                     .await;
-                                                state.lock().await.log(
-                                                    "WARN",
-                                                    format!(
-                                                        "Visible agent browser could not start; reverted to headless: {error}"
-                                                    ),
-                                                );
+                                                if browser_headless_fallback_succeeded(rollback) {
+                                                    state.lock().await.log(
+                                                        "WARN",
+                                                        format!(
+                                                            "Visible agent browser could not start; reverted to headless: {error}"
+                                                        ),
+                                                    );
+                                                } else {
+                                                    visible_fallback_busy = true;
+                                                    state.lock().await.log(
+                                                        "WARN",
+                                                        format!(
+                                                            "Visible agent browser could not start, and MoonDesk could not immediately revert to headless because the browser became busy: {error}"
+                                                        ),
+                                                    );
+                                                }
                                             }
                                         }
                                     }
@@ -5053,7 +5119,9 @@ async fn run_tui(
                                         );
                                     }
                                     toast = Some((
-                                        if visible_start_failed {
+                                        if visible_fallback_busy {
+                                            "Visible browser start failed; headless fallback is busy"
+                                        } else if visible_start_failed {
                                             "Visible browser start failed; reverted to headless"
                                         } else {
                                             match next_presentation {
@@ -5673,13 +5741,22 @@ async fn run_tui(
         }
     }
 
-    if let Err(error) = flush_config(&state, true).await {
+    if let Err(error) = flush_config(&state, false).await {
         state.lock().await.log(
             "WARN",
             format!("Failed to persist config on shutdown: {error}"),
         );
     }
     Ok(exit)
+}
+
+fn browser_headless_fallback_succeeded(change: BrowserPresentationChange) -> bool {
+    matches!(
+        change,
+        BrowserPresentationChange::Unchanged
+            | BrowserPresentationChange::Updated
+            | BrowserPresentationChange::UpdatedAndSessionClosed
+    )
 }
 
 fn quit_confirm_action(key: &crossterm::event::KeyEvent) -> Option<bool> {
@@ -7738,14 +7815,15 @@ fn draw_ui(f: &mut Frame, context: UiRenderContext<'_>) {
 mod tests {
     use super::state::{CommandActivity, LogEntry};
     use super::{
-        AppState, BottomPanelAreas, BottomPanelHitMaps, DashboardFocus, DashboardHitAreas,
-        DashboardSecretHit, DashboardSecretTarget, DashboardWorkspaceRow, InterruptState,
-        ObservabilityCutoff, PanelItemHit, PanelScrollView, TimedSecretClick, UiRenderContext,
-        UiSnapshot, WorkspaceFilter, WorkspaceHitAreas, WorkspaceId, WorkspaceUiAction,
-        active_reveal_remaining, apply_workspace_observability_filter, cycle_dashboard_focus,
-        dashboard_secret_target_at, draw_changelog_notice, draw_prompt, draw_quit_confirm, draw_ui,
-        draw_update_confirm, item_under_cursor, key_is_clipboard_paste, key_is_interrupt,
-        key_is_plain_quit, log_secret_target, move_panel_selection, ngrok_setup_cancel_key,
+        AppState, BottomPanelAreas, BottomPanelHitMaps, BrowserPresentationChange, DashboardFocus,
+        DashboardHitAreas, DashboardSecretHit, DashboardSecretTarget, DashboardWorkspaceRow,
+        InterruptState, ObservabilityCutoff, PanelItemHit, PanelScrollView, TimedSecretClick,
+        UiRenderContext, UiSnapshot, WorkspaceFilter, WorkspaceHitAreas, WorkspaceId,
+        WorkspaceUiAction, active_reveal_remaining, apply_workspace_observability_filter,
+        browser_headless_fallback_succeeded, cycle_dashboard_focus, dashboard_secret_target_at,
+        draw_changelog_notice, draw_prompt, draw_quit_confirm, draw_ui, draw_update_confirm,
+        item_under_cursor, key_is_clipboard_paste, key_is_interrupt, key_is_plain_quit,
+        log_secret_target, move_panel_selection, ngrok_setup_cancel_key,
         normalize_ngrok_authtoken_input, normalize_ngrok_domain, normalize_workspace_path_input,
         panel_under_cursor, parse_clippymoon_export_args, parse_port_value,
         primary_mcp_url_line_index, quit_confirm_action, reconcile_workspace_filter,
@@ -9465,6 +9543,25 @@ mod tests {
     }
 
     #[test]
+    fn browser_headless_fallback_never_treats_busy_as_reverted() {
+        assert!(browser_headless_fallback_succeeded(
+            BrowserPresentationChange::Unchanged
+        ));
+        assert!(browser_headless_fallback_succeeded(
+            BrowserPresentationChange::Updated
+        ));
+        assert!(browser_headless_fallback_succeeded(
+            BrowserPresentationChange::UpdatedAndSessionClosed
+        ));
+        assert!(!browser_headless_fallback_succeeded(
+            BrowserPresentationChange::Busy
+        ));
+        assert!(!browser_headless_fallback_succeeded(
+            BrowserPresentationChange::RequiresRestart
+        ));
+    }
+
+    #[test]
     fn update_confirmation_only_accepts_enter_or_escape() {
         assert_eq!(update_confirm_action(KeyCode::Enter), Some(true));
         assert_eq!(update_confirm_action(KeyCode::Esc), Some(false));
@@ -9665,6 +9762,7 @@ mod tests {
                             set_moondesk_as_co_author: false,
                             ngrok_authtoken_configured: false,
                             ngrok_domain: None,
+                            config_path: r"C:\Users\tester\.moondesk\config.toml",
                             usage_totals: &usage,
                             selected_row,
                             confirm_reset_token_billing: false,
@@ -9695,6 +9793,7 @@ mod tests {
                         set_moondesk_as_co_author: false,
                         ngrok_authtoken_configured: false,
                         ngrok_domain: None,
+                        config_path: r"C:\Users\tester\.moondesk\config.toml",
                         usage_totals: &usage,
                         selected_row: browser_row,
                         confirm_reset_token_billing: false,
@@ -9741,6 +9840,7 @@ mod tests {
                         set_moondesk_as_co_author: false,
                         ngrok_authtoken_configured: true,
                         ngrok_domain: Some("example.ngrok-free.app"),
+                        config_path: r"C:\Users\tester\.moondesk\config.toml",
                         usage_totals: &usage,
                         selected_row: auth_token_row,
                         confirm_reset_token_billing: false,
@@ -9760,7 +9860,8 @@ mod tests {
 
         assert!(rendered.contains("Set ngrok authtoken"));
         assert!(rendered.contains("[configured]"));
-        assert!(rendered.contains("never shown here"));
+        assert!(rendered.contains("never displayed here"));
+        assert!(rendered.contains("Config: C:\\Users\\tester\\.moondesk\\config.toml"));
     }
 
     #[test]
@@ -9813,6 +9914,7 @@ mod tests {
                         set_moondesk_as_co_author: false,
                         ngrok_authtoken_configured: false,
                         ngrok_domain: None,
+                        config_path: r"C:\Users\tester\.moondesk\config.toml",
                         usage_totals: &usage,
                         selected_row: super::theme::all().len() - 1,
                         confirm_reset_token_billing: false,

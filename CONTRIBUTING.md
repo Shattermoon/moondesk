@@ -85,6 +85,18 @@ On Windows, run the test suite serially to match CI's process-heavy validation:
 cargo test --locked -- --test-threads 1
 ```
 
+If your change touches config paths, workspace bootstrap, persistence, or Windows home-directory handling, also run the explicit persistence regressions that CI keeps as a named gate:
+
+```powershell
+cargo test --locked state::tests::windows_config_home_prefers_userprofile_over_conflicting_home -- --exact --test-threads 1
+cargo test --locked state::tests::legacy_config_migration_is_one_time_and_never_overwrites_canonical_state -- --exact --test-threads 1
+cargo test --locked state::tests::automatic_flush_does_not_resurrect_config_removed_while_running -- --exact --test-threads 1
+cargo test --locked state::tests::automatic_flush_does_not_treat_non_file_config_path_as_external_reset -- --exact --test-threads 1
+cargo test --locked state::tests::missing_workspace_registry_logs_launch_directory_bootstrap -- --exact --test-threads 1
+```
+
+These tests protect the Windows upgrade/reset contract: MoonDesk-owned state uses one canonical profile location, an older conflicting `HOME` config migrates at most once without overriding canonical state, deleting the live config is not undone by automatic/shutdown persistence, and a fresh launch clearly records when workspace #1 was recreated from the launch directory.
+
 If your change touches process execution, Windows environment handling, browser detection, or the lazy browser runtime, run the relevant ignored integration smokes when your machine supports them:
 
 ```bash

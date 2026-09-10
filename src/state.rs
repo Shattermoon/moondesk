@@ -525,14 +525,13 @@ fn replace_config_file_if_present(
     ))
 ))]
 fn replace_config_file_if_present(
-    temp_path: &Path,
-    target_path: &Path,
+    _temp_path: &Path,
+    _target_path: &Path,
 ) -> std::io::Result<ConfigCommitOutcome> {
-    if !target_path.try_exists()? {
-        return Ok(ConfigCommitOutcome::DestinationStateChanged);
-    }
-    fs::rename(temp_path, target_path)?;
-    Ok(ConfigCommitOutcome::Committed)
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "atomic replace-if-present config persistence is unsupported on this platform",
+    ))
 }
 
 #[cfg(windows)]

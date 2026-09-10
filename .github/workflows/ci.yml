@@ -90,12 +90,19 @@ jobs:
       - name: Run Windows config persistence regressions
         run: |
           cargo +stable test --locked state::tests::windows_config_home_prefers_userprofile_over_conflicting_home -- --exact --test-threads 1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo +stable test --locked state::tests::legacy_config_migration_is_one_time_and_never_overwrites_canonical_state -- --exact --test-threads 1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo +stable test --locked state::tests::migration_commit_never_overwrites_canonical_config_created_during_race -- --exact --test-threads 1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo +stable test --locked state::tests::automatic_flush_does_not_resurrect_config_removed_while_running -- --exact --test-threads 1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo +stable test --locked state::tests::automatic_flush_commit_does_not_recreate_config_removed_during_race -- --exact --test-threads 1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo +stable test --locked state::tests::automatic_flush_does_not_treat_non_file_config_path_as_external_reset -- --exact --test-threads 1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo +stable test --locked state::tests::missing_workspace_registry_logs_launch_directory_bootstrap -- --exact --test-threads 1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Run Windows developer toolchain smoke
         run: cargo +stable test --locked windows_developer_toolchain_smoke_uses_normal_host_environment -- --ignored

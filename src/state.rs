@@ -323,6 +323,40 @@ impl AppConfig {
     }
 
     fn save_to_path(&self, path: &Path) -> std::io::Result<()> {
+        let outcome = self.save_to_path_with_commit(path, ConfigCommitMode::Replace, || {})?;
+        debug_assert_eq!(outcome, ConfigCommitOutcome::Committed);
+        Ok(())
+    }
+
+    fn save_to_path_if_absent<F>(&self, path: &Path, before_commit: F) -> std::io::Result<bool>
+    where
+        F: FnOnce(),
+    {
+        Ok(matches!(
+            self.save_to_path_with_commit(path, ConfigCommitMode::CreateIfAbsent, before_commit)?,
+            ConfigCommitOutcome::Committed
+        ))
+    }
+
+    fn save_to_path_if_present<F>(&self, path: &Path, before_commit: F) -> std::io::Result<bool>
+    where
+        F: FnOnce(),
+    {
+        Ok(matches!(
+            self.save_to_path_with_commit(path, ConfigCommitMode::ReplaceIfPresent, before_commit)?,
+            ConfigCommitOutcome::Committed
+        ))
+    }
+
+    fn save_to_path_with_commit<F>(
+        &self,
+        path: &Path,
+        commit_mode: ConfigCommitMode,
+        before_commit: F,
+    ) -> std::io::Result<ConfigCommitOutcome>
+    where
+        F: FnOnce(),
+    {
         let config = self.clone().normalized();
         config.validate_versioned()?;
         let parent = path.parent().ok_or_else(|| {
@@ -344,27 +378,60 @@ impl AppConfig {
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600);
         }
-        let write_result = (|| -> std::io::Result<()> {
+        let write_result = (|| -> std::io::Result<ConfigCommitOutcome> {
             let mut file = options.open(&temp_path)?;
             use std::io::Write as _;
             file.write_all(text.as_bytes())?;
             file.flush()?;
             file.sync_all()?;
-            replace_config_file(&temp_path, path)?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
-                if let Ok(directory) = fs::File::open(parent) {
-                    let _ = directory.sync_all();
+            before_commit();
+            let outcome = commit_config_file(&temp_path, path, commit_mode)?;
+            if outcome == ConfigCommitOutcome::Committed {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+                    if let Ok(directory) = fs::File::open(parent) {
+                        let _ = directory.sync_all();
+                    }
                 }
             }
-            Ok(())
+            Ok(outcome)
         })();
-        if write_result.is_err() {
+        if !matches!(write_result, Ok(ConfigCommitOutcome::Committed)) {
             let _ = fs::remove_file(&temp_path);
         }
         write_result
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConfigCommitMode {
+    Replace,
+    CreateIfAbsent,
+    ReplaceIfPresent,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConfigCommitOutcome {
+    Committed,
+    DestinationStateChanged,
+}
+
+fn commit_config_file(
+    temp_path: &Path,
+    target_path: &Path,
+    mode: ConfigCommitMode,
+) -> std::io::Result<ConfigCommitOutcome> {
+    match mode {
+        ConfigCommitMode::Replace => {
+            replace_config_file(temp_path, target_path)?;
+            Ok(ConfigCommitOutcome::Committed)
+        }
+        ConfigCommitMode::CreateIfAbsent => create_config_file_if_absent(temp_path, target_path),
+        ConfigCommitMode::ReplaceIfPresent => {
+            replace_config_file_if_present(temp_path, target_path)
+        }
     }
 }
 
@@ -373,23 +440,118 @@ fn replace_config_file(temp_path: &Path, target_path: &Path) -> std::io::Result<
     fs::rename(temp_path, target_path)
 }
 
+#[cfg(not(windows))]
+fn create_config_file_if_absent(
+    temp_path: &Path,
+    target_path: &Path,
+) -> std::io::Result<ConfigCommitOutcome> {
+    match fs::hard_link(temp_path, target_path) {
+        Ok(()) => {
+            fs::remove_file(temp_path)?;
+            Ok(ConfigCommitOutcome::Committed)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            Ok(ConfigCommitOutcome::DestinationStateChanged)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn replace_config_file_if_present(
+    temp_path: &Path,
+    target_path: &Path,
+) -> std::io::Result<ConfigCommitOutcome> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let temp = CString::new(temp_path.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::other("temporary config path contains a NUL byte"))?;
+    let target = CString::new(target_path.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::other("config path contains a NUL byte"))?;
+    let result = unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            temp.as_ptr(),
+            libc::AT_FDCWD,
+            target.as_ptr(),
+            libc::RENAME_EXCHANGE,
+        )
+    };
+    if result == 0 {
+        fs::remove_file(temp_path)?;
+        return Ok(ConfigCommitOutcome::Committed);
+    }
+    let error = std::io::Error::last_os_error();
+    if error.kind() == std::io::ErrorKind::NotFound {
+        Ok(ConfigCommitOutcome::DestinationStateChanged)
+    } else {
+        Err(error)
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn replace_config_file_if_present(
+    temp_path: &Path,
+    target_path: &Path,
+) -> std::io::Result<ConfigCommitOutcome> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let temp = CString::new(temp_path.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::other("temporary config path contains a NUL byte"))?;
+    let target = CString::new(target_path.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::other("config path contains a NUL byte"))?;
+    let result = unsafe { libc::renamex_np(temp.as_ptr(), target.as_ptr(), libc::RENAME_SWAP) };
+    if result == 0 {
+        fs::remove_file(temp_path)?;
+        return Ok(ConfigCommitOutcome::Committed);
+    }
+    let error = std::io::Error::last_os_error();
+    if error.kind() == std::io::ErrorKind::NotFound {
+        Ok(ConfigCommitOutcome::DestinationStateChanged)
+    } else {
+        Err(error)
+    }
+}
+
+#[cfg(all(
+    not(windows),
+    not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))
+))]
+fn replace_config_file_if_present(
+    temp_path: &Path,
+    target_path: &Path,
+) -> std::io::Result<ConfigCommitOutcome> {
+    if !target_path.try_exists()? {
+        return Ok(ConfigCommitOutcome::DestinationStateChanged);
+    }
+    fs::rename(temp_path, target_path)?;
+    Ok(ConfigCommitOutcome::Committed)
+}
+
+#[cfg(windows)]
+fn wide_path(path: &Path) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
+    path.as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect()
+}
+
 #[cfg(windows)]
 fn replace_config_file(temp_path: &Path, target_path: &Path) -> std::io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::{
         MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
     };
 
-    let temp_wide = temp_path
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect::<Vec<_>>();
-    let target_wide = target_path
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect::<Vec<_>>();
+    let temp_wide = wide_path(temp_path);
+    let target_wide = wide_path(target_path);
     let result = unsafe {
         MoveFileExW(
             temp_wide.as_ptr(),
@@ -401,6 +563,65 @@ fn replace_config_file(temp_path: &Path, target_path: &Path) -> std::io::Result<
         Err(std::io::Error::last_os_error())
     } else {
         Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn create_config_file_if_absent(
+    temp_path: &Path,
+    target_path: &Path,
+) -> std::io::Result<ConfigCommitOutcome> {
+    use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_WRITE_THROUGH, MoveFileExW};
+
+    let temp_wide = wide_path(temp_path);
+    let target_wide = wide_path(target_path);
+    let result = unsafe {
+        MoveFileExW(
+            temp_wide.as_ptr(),
+            target_wide.as_ptr(),
+            MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if result != 0 {
+        return Ok(ConfigCommitOutcome::Committed);
+    }
+    let error = std::io::Error::last_os_error();
+    if error.kind() == std::io::ErrorKind::AlreadyExists
+        || matches!(error.raw_os_error(), Some(80 | 183))
+    {
+        Ok(ConfigCommitOutcome::DestinationStateChanged)
+    } else {
+        Err(error)
+    }
+}
+
+#[cfg(windows)]
+fn replace_config_file_if_present(
+    temp_path: &Path,
+    target_path: &Path,
+) -> std::io::Result<ConfigCommitOutcome> {
+    use windows_sys::Win32::Storage::FileSystem::ReplaceFileW;
+
+    let temp_wide = wide_path(temp_path);
+    let target_wide = wide_path(target_path);
+    let result = unsafe {
+        ReplaceFileW(
+            target_wide.as_ptr(),
+            temp_wide.as_ptr(),
+            std::ptr::null(),
+            0,
+            std::ptr::null(),
+            std::ptr::null(),
+        )
+    };
+    if result != 0 {
+        return Ok(ConfigCommitOutcome::Committed);
+    }
+    let error = std::io::Error::last_os_error();
+    if error.kind() == std::io::ErrorKind::NotFound {
+        Ok(ConfigCommitOutcome::DestinationStateChanged)
+    } else {
+        Err(error)
     }
 }
 
@@ -866,6 +1087,17 @@ fn migrate_config_file_if_needed(
     canonical: &Path,
     legacy: &Path,
 ) -> std::io::Result<Option<ConfigPathMigration>> {
+    migrate_config_file_if_needed_with_hook(canonical, legacy, || {})
+}
+
+fn migrate_config_file_if_needed_with_hook<F>(
+    canonical: &Path,
+    legacy: &Path,
+    before_commit: F,
+) -> std::io::Result<Option<ConfigPathMigration>>
+where
+    F: FnOnce(),
+{
     if canonical.try_exists()? {
         return Ok(None);
     }
@@ -879,7 +1111,11 @@ fn migrate_config_file_if_needed(
     }
 
     let config = AppConfig::load_from_path(legacy)?;
-    config.save_to_path(canonical)?;
+    if !config.save_to_path_if_absent(canonical, before_commit)? {
+        // Another process created the canonical config after our initial check. Its state wins,
+        // and the legacy file is deliberately retained rather than deleting data we did not move.
+        return Ok(None);
+    }
     let cleanup_warning = match fs::remove_file(legacy) {
         Ok(()) => None,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
@@ -2117,6 +2353,17 @@ pub async fn remove_workspace(
 }
 
 pub async fn flush_config(state: &SharedState, force: bool) -> std::io::Result<bool> {
+    flush_config_with_commit_hook(state, force, || {}).await
+}
+
+async fn flush_config_with_commit_hook<F>(
+    state: &SharedState,
+    force: bool,
+    before_commit: F,
+) -> std::io::Result<bool>
+where
+    F: FnOnce() + Send + 'static,
+{
     // Serialize generic settings/usage flushes with workspace registry mutations.
     // Otherwise an older snapshot could finish after a secret/root update and
     // overwrite the newly persisted workspace registry.
@@ -2161,7 +2408,17 @@ pub async fn flush_config(state: &SharedState, force: bool) -> std::io::Result<b
         return Ok(false);
     };
 
-    let write_result = match tokio::task::spawn_blocking(move || config.save_to_path(&path)).await {
+    let write_result = match tokio::task::spawn_blocking(move || {
+        if force {
+            before_commit();
+            config.save_to_path(&path)?;
+            Ok(true)
+        } else {
+            config.save_to_path_if_present(&path, before_commit)
+        }
+    })
+    .await
+    {
         Ok(result) => result,
         Err(error) => {
             state.lock().await.config_dirty = true;
@@ -2170,9 +2427,27 @@ pub async fn flush_config(state: &SharedState, force: bool) -> std::io::Result<b
             )));
         }
     };
-    if let Err(error) = write_result {
-        state.lock().await.config_dirty = true;
-        return Err(error);
+    let committed = match write_result {
+        Ok(committed) => committed,
+        Err(error) => {
+            state.lock().await.config_dirty = true;
+            return Err(error);
+        }
+    };
+    if !committed {
+        let mut app = state.lock().await;
+        app.config_dirty = false;
+        if !app.config_persistence_suspended {
+            let path = app.config_path.to_string_lossy().into_owned();
+            app.config_persistence_suspended = true;
+            app.log(
+                "WARN",
+                format!(
+                    "MoonDesk config was removed while an automatic save was being prepared; persistence is paused and will not recreate it: {path}"
+                ),
+            );
+        }
+        return Ok(false);
     }
     state.lock().await.config_persistence_suspended = false;
     Ok(true)
@@ -2223,9 +2498,12 @@ mod tests {
             .as_nanos();
         let root = std::env::temp_dir().join(format!("moondesk-config-migration-{unique}"));
         let workspace_root = root.join("workspace");
+        let secondary_workspace_root = root.join("workspace-secondary");
         let legacy_path = root.join("legacy").join(APP_CONFIG_FILE_NAME);
         let canonical_path = root.join("canonical").join(APP_CONFIG_FILE_NAME);
         std::fs::create_dir_all(&workspace_root).expect("create migration workspace");
+        std::fs::create_dir_all(&secondary_workspace_root)
+            .expect("create secondary migration workspace");
 
         let workspace = WorkspaceConfig::new(
             "Migrated Workspace",
@@ -2233,9 +2511,17 @@ mod tests {
             workspaces::generate_mcp_slug(),
         )
         .expect("create migration workspace config");
+        let secondary_workspace = WorkspaceConfig::new(
+            "Migrated Secondary",
+            &secondary_workspace_root,
+            workspaces::generate_mcp_slug(),
+        )
+        .expect("create secondary migration workspace config");
+        let expected_workspaces = vec![workspace.clone(), secondary_workspace.clone()];
         let legacy_config = AppConfig {
             config_version: CURRENT_CONFIG_VERSION,
-            workspaces: vec![workspace.clone()],
+            workspaces: expected_workspaces.clone(),
+            ngrok_domain: Some("existing-user.ngrok-free.app".into()),
             theme: "neon".into(),
             ..AppConfig::default()
         };
@@ -2254,11 +2540,15 @@ mod tests {
         );
         let canonical = AppConfig::load_from_path(&canonical_path).expect("load canonical config");
         assert_eq!(canonical.theme, "neon");
-        assert_eq!(canonical.workspaces, vec![workspace.clone()]);
+        assert_eq!(
+            canonical.ngrok_domain.as_deref(),
+            Some("existing-user.ngrok-free.app")
+        );
+        assert_eq!(canonical.workspaces, expected_workspaces);
 
         let stale_legacy = AppConfig {
             config_version: CURRENT_CONFIG_VERSION,
-            workspaces: vec![workspace],
+            workspaces: vec![workspace, secondary_workspace],
             theme: "paper".into(),
             ..AppConfig::default()
         };
@@ -2277,6 +2567,90 @@ mod tests {
             legacy_path.exists(),
             "canonical state must not delete unrelated fallback state"
         );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn migration_commit_never_overwrites_canonical_config_created_during_race() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("moondesk-config-migration-race-{unique}"));
+        let legacy_workspace_root = root.join("legacy-workspace");
+        let canonical_workspace_root = root.join("canonical-workspace");
+        let legacy_path = root.join("legacy").join(APP_CONFIG_FILE_NAME);
+        let canonical_path = root.join("canonical").join(APP_CONFIG_FILE_NAME);
+        std::fs::create_dir_all(&legacy_workspace_root).expect("create legacy race workspace");
+        std::fs::create_dir_all(&canonical_workspace_root)
+            .expect("create canonical race workspace");
+
+        let legacy_workspace = WorkspaceConfig::new(
+            "Legacy Workspace",
+            &legacy_workspace_root,
+            workspaces::generate_mcp_slug(),
+        )
+        .expect("create legacy race workspace config");
+        let canonical_workspace = WorkspaceConfig::new(
+            "Canonical Workspace",
+            &canonical_workspace_root,
+            workspaces::generate_mcp_slug(),
+        )
+        .expect("create canonical race workspace config");
+        let legacy_config = AppConfig {
+            config_version: CURRENT_CONFIG_VERSION,
+            workspaces: vec![legacy_workspace.clone()],
+            theme: "neon".into(),
+            ..AppConfig::default()
+        };
+        legacy_config
+            .save_to_path(&legacy_path)
+            .expect("save legacy race config");
+        let canonical_config = AppConfig {
+            config_version: CURRENT_CONFIG_VERSION,
+            workspaces: vec![canonical_workspace.clone()],
+            theme: "paper".into(),
+            ..AppConfig::default()
+        };
+
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let worker_barrier = barrier.clone();
+        let worker_canonical = canonical_path.clone();
+        let worker_legacy = legacy_path.clone();
+        let migration = std::thread::spawn(move || {
+            migrate_config_file_if_needed_with_hook(&worker_canonical, &worker_legacy, move || {
+                worker_barrier.wait();
+                worker_barrier.wait();
+            })
+        });
+
+        barrier.wait();
+        canonical_config
+            .save_to_path(&canonical_path)
+            .expect("create canonical config during migration race");
+        barrier.wait();
+
+        assert!(
+            migration
+                .join()
+                .expect("join migration race thread")
+                .expect("migration race should remain safe")
+                .is_none(),
+            "a racing canonical config must win without being overwritten"
+        );
+        let canonical =
+            AppConfig::load_from_path(&canonical_path).expect("load winning canonical config");
+        assert_eq!(canonical.theme, "paper");
+        assert_eq!(canonical.workspaces, vec![canonical_workspace]);
+        assert!(
+            legacy_path.is_file(),
+            "legacy state must be preserved when migration loses the create race"
+        );
+        let legacy =
+            AppConfig::load_from_path(&legacy_path).expect("reload preserved legacy config");
+        assert_eq!(legacy.theme, "neon");
+        assert_eq!(legacy.workspaces, vec![legacy_workspace]);
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -2335,6 +2709,52 @@ mod tests {
         assert!(!state.lock().await.config_persistence_suspended);
 
         let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn automatic_flush_commit_does_not_recreate_config_removed_during_race() {
+        let (mut app, workspace, config_path) = test_app("moondesk-config-flush-race");
+        app.theme = "paper".into();
+        app.mark_config_dirty();
+        let state = Arc::new(Mutex::new(app));
+
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let worker_barrier = barrier.clone();
+        let worker_state = state.clone();
+        let flush = tokio::spawn(async move {
+            flush_config_with_commit_hook(&worker_state, false, move || {
+                worker_barrier.wait();
+                worker_barrier.wait();
+            })
+            .await
+        });
+
+        barrier.wait();
+        std::fs::remove_file(&config_path)
+            .expect("remove config after automatic save has staged its replacement");
+        barrier.wait();
+
+        assert!(
+            !flush
+                .await
+                .expect("join automatic flush race task")
+                .expect("automatic flush race should fail closed")
+        );
+        assert!(
+            !config_path.exists(),
+            "automatic commit must not recreate a config removed after its precheck"
+        );
+        let app = state.lock().await;
+        assert!(app.config_persistence_suspended);
+        assert!(!app.config_dirty);
+        assert!(app.logs.iter().any(|entry| {
+            entry
+                .message
+                .contains("removed while an automatic save was being prepared")
+        }));
+        drop(app);
+
         let _ = std::fs::remove_dir_all(workspace);
     }
 

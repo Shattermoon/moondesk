@@ -57,6 +57,8 @@ const FLOW_LANE_LEFT_LABEL: &str = "Your computer ";
 const REMOTE_CONNECT_UI_GRACE_MS: u128 = 8_000;
 const UI_POLL_INTERVAL: Duration = Duration::from_nanos(1_000_000_000 / 60);
 const CONFIG_FLUSH_INTERVAL: Duration = Duration::from_millis(500);
+const CONFIG_FLUSH_RETRY_INITIAL_DELAY: Duration = Duration::from_secs(2);
+const CONFIG_FLUSH_RETRY_MAX_DELAY: Duration = Duration::from_secs(30);
 const UPDATE_STATE_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 const UPDATE_CONFIRM_SESSION_WARNING: &str =
     "Make sure no ChatGPT/MCP session or command is currently running.";
@@ -86,6 +88,49 @@ const GPT_5_6_SOL_CACHE_WRITE_USD_PER_1M: f64 = GPT_5_6_SOL_INPUT_USD_PER_1M * 1
 const GPT_5_6_SOL_OUTPUT_USD_PER_1M: f64 = 20.0;
 const PRICE_DISPLAY_DECIMALS: usize = 2;
 const NGROK_SETUP_URL: &str = "https://dashboard.ngrok.com/get-started/setup";
+
+#[derive(Debug)]
+struct ConfigFlushRetry {
+    next_attempt: Option<Instant>,
+    next_delay: Duration,
+    last_error: Option<String>,
+}
+
+impl Default for ConfigFlushRetry {
+    fn default() -> Self {
+        Self {
+            next_attempt: None,
+            next_delay: CONFIG_FLUSH_RETRY_INITIAL_DELAY,
+            last_error: None,
+        }
+    }
+}
+
+impl ConfigFlushRetry {
+    fn can_attempt(&self, now: Instant) -> bool {
+        self.next_attempt.is_none_or(|deadline| now >= deadline)
+    }
+
+    fn record_failure(&mut self, now: Instant, error: &std::io::Error) -> (Duration, bool) {
+        let error_text = error.to_string();
+        let should_warn = self.last_error.as_deref() != Some(error_text.as_str());
+        let retry_delay = self.next_delay;
+        self.next_attempt = Some(now + retry_delay);
+        self.next_delay = std::cmp::min(
+            self.next_delay.saturating_mul(2),
+            CONFIG_FLUSH_RETRY_MAX_DELAY,
+        );
+        self.last_error = Some(error_text);
+        (retry_delay, should_warn)
+    }
+
+    fn record_success(&mut self) -> bool {
+        let recovered = self.last_error.take().is_some();
+        self.next_attempt = None;
+        self.next_delay = CONFIG_FLUSH_RETRY_INITIAL_DELAY;
+        recovered
+    }
+}
 #[cfg(target_os = "windows")]
 const WORKSPACE_BROWSE_ACTION_LABEL: &str = "[b] Explorer ";
 #[cfg(not(target_os = "windows"))]
@@ -2205,11 +2250,18 @@ async fn run_app(
         return Ok(AppExit::Quit);
     }
 
+    let mut config_flush_retry = ConfigFlushRetry::default();
     if let Err(error) = flush_config(&state, false).await {
-        state.lock().await.log(
-            "WARN",
-            format!("Failed to persist config before startup: {error}"),
-        );
+        let (retry_delay, should_warn) = config_flush_retry.record_failure(Instant::now(), &error);
+        if should_warn {
+            state.lock().await.log(
+                "WARN",
+                format!(
+                    "Failed to persist config before startup; MoonDesk will retry in {}s with backoff and suppress identical warnings: {error}",
+                    retry_delay.as_secs()
+                ),
+            );
+        }
     }
 
     // Start services
@@ -2270,6 +2322,7 @@ async fn run_app(
         ui_event_rx,
         live_browser_runtime,
         interrupts.clone(),
+        config_flush_retry,
     )
     .await;
     interrupts.begin_shutdown();
@@ -4778,6 +4831,7 @@ async fn run_tui(
     mut ui_events: UiEventReceiver,
     browser_runtime: Option<Arc<BrowserRuntime>>,
     interrupts: InterruptState,
+    mut config_flush_retry: ConfigFlushRetry,
 ) -> Result<AppExit, Box<dyn std::error::Error>> {
     let mut log_scroll: usize = 0;
     let mut log_follow_tail = true;
@@ -4846,13 +4900,34 @@ async fn run_tui(
             continue;
         }
         if last_config_flush.elapsed() >= CONFIG_FLUSH_INTERVAL {
-            if let Err(error) = flush_config(&state, false).await {
-                state
-                    .lock()
-                    .await
-                    .log("WARN", format!("Failed to persist config: {error}"));
+            let now = Instant::now();
+            if config_flush_retry.can_attempt(now) {
+                match flush_config(&state, false).await {
+                    Ok(committed) => {
+                        let recovered = config_flush_retry.record_success();
+                        if committed && recovered {
+                            state
+                                .lock()
+                                .await
+                                .log("INFO", "Config persistence recovered".into());
+                        }
+                    }
+                    Err(error) => {
+                        let (retry_delay, should_warn) =
+                            config_flush_retry.record_failure(now, &error);
+                        if should_warn {
+                            state.lock().await.log(
+                                "WARN",
+                                format!(
+                                    "Failed to persist config; MoonDesk will retry in {}s with backoff and suppress identical warnings: {error}",
+                                    retry_delay.as_secs()
+                                ),
+                            );
+                        }
+                    }
+                }
+                last_config_flush = now;
             }
-            last_config_flush = Instant::now();
         }
         if last_update_refresh.elapsed() >= UPDATE_STATE_REFRESH_INTERVAL {
             update_info = update::available_update();
@@ -7925,6 +8000,32 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn config_flush_retry_backs_off_and_suppresses_duplicate_errors() {
+        let mut retry = super::ConfigFlushRetry::default();
+        let start = std::time::Instant::now();
+        assert!(retry.can_attempt(start));
+
+        let locked = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "config locked");
+        let (first_delay, first_warning) = retry.record_failure(start, &locked);
+        assert_eq!(first_delay, super::CONFIG_FLUSH_RETRY_INITIAL_DELAY);
+        assert!(first_warning);
+        assert!(!retry.can_attempt(start + std::time::Duration::from_secs(1)));
+        assert!(retry.can_attempt(start + first_delay));
+
+        let (second_delay, duplicate_warning) = retry.record_failure(start + first_delay, &locked);
+        assert_eq!(second_delay, std::time::Duration::from_secs(4));
+        assert!(!duplicate_warning);
+
+        let changed = std::io::Error::other("different persistence failure");
+        let (_, changed_warning) = retry.record_failure(start + second_delay, &changed);
+        assert!(changed_warning);
+
+        assert!(retry.record_success());
+        assert!(retry.can_attempt(start));
+        assert!(!retry.record_success());
     }
 
     fn test_workspace_id(index: u64) -> WorkspaceId {

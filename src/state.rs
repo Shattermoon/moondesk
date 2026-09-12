@@ -557,6 +557,42 @@ fn wide_path(path: &Path) -> Vec<u16> {
 }
 
 #[cfg(windows)]
+fn transient_windows_config_commit_error(
+    error: &std::io::Error,
+    retry_access_denied: bool,
+) -> bool {
+    // ReplaceFileW reports delete-sharing conflicts as sharing/lock violations (32/33),
+    // while MoveFileExW can report the same short-lived destination lock as access denied
+    // (5). Retry error 5 only for MoveFileExW callers; broader failures still surface
+    // promptly after the bounded retry window.
+    matches!(error.raw_os_error(), Some(32 | 33))
+        || (retry_access_denied && matches!(error.raw_os_error(), Some(5)))
+}
+
+#[cfg(windows)]
+fn retry_windows_config_commit(
+    retry_access_denied: bool,
+    mut commit: impl FnMut() -> i32,
+) -> std::io::Result<()> {
+    let mut retry_delays = WINDOWS_CONFIG_REPLACE_RETRY_DELAYS.iter();
+
+    loop {
+        if commit() != 0 {
+            return Ok(());
+        }
+
+        let error = std::io::Error::last_os_error();
+        if transient_windows_config_commit_error(&error, retry_access_denied)
+            && let Some(delay) = retry_delays.next()
+        {
+            std::thread::sleep(*delay);
+            continue;
+        }
+        return Err(error);
+    }
+}
+
+#[cfg(windows)]
 fn replace_config_file(temp_path: &Path, target_path: &Path) -> std::io::Result<()> {
     use windows_sys::Win32::Storage::FileSystem::{
         MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
@@ -564,18 +600,13 @@ fn replace_config_file(temp_path: &Path, target_path: &Path) -> std::io::Result<
 
     let temp_wide = wide_path(temp_path);
     let target_wide = wide_path(target_path);
-    let result = unsafe {
+    retry_windows_config_commit(true, || unsafe {
         MoveFileExW(
             temp_wide.as_ptr(),
             target_wide.as_ptr(),
             MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
         )
-    };
-    if result == 0 {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
+    })
 }
 
 #[cfg(windows)]
@@ -587,32 +618,22 @@ fn create_config_file_if_absent(
 
     let temp_wide = wide_path(temp_path);
     let target_wide = wide_path(target_path);
-    let result = unsafe {
+    match retry_windows_config_commit(true, || unsafe {
         MoveFileExW(
             temp_wide.as_ptr(),
             target_wide.as_ptr(),
             MOVEFILE_WRITE_THROUGH,
         )
-    };
-    if result != 0 {
-        return Ok(ConfigCommitOutcome::Committed);
-    }
-    let error = std::io::Error::last_os_error();
-    if error.kind() == std::io::ErrorKind::AlreadyExists
-        || matches!(error.raw_os_error(), Some(80 | 183))
-    {
-        Ok(ConfigCommitOutcome::DestinationStateChanged)
-    } else {
+    }) {
+        Ok(()) => Ok(ConfigCommitOutcome::Committed),
         Err(error)
+            if error.kind() == std::io::ErrorKind::AlreadyExists
+                || matches!(error.raw_os_error(), Some(80 | 183)) =>
+        {
+            Ok(ConfigCommitOutcome::DestinationStateChanged)
+        }
+        Err(error) => Err(error),
     }
-}
-
-#[cfg(windows)]
-fn transient_windows_config_replace_error(error: &std::io::Error) -> bool {
-    // ReplaceFileW requires delete-sharing on the destination. Antivirus, indexers,
-    // editors, or another short-lived MoonDesk save can briefly deny that access.
-    // Retry only lock-specific Win32 errors; broader failures should surface promptly.
-    matches!(error.raw_os_error(), Some(32 | 33))
 }
 
 #[cfg(windows)]
@@ -624,34 +645,21 @@ fn replace_config_file_if_present(
 
     let temp_wide = wide_path(temp_path);
     let target_wide = wide_path(target_path);
-    let mut retry_delays = WINDOWS_CONFIG_REPLACE_RETRY_DELAYS.iter();
-
-    loop {
-        let result = unsafe {
-            ReplaceFileW(
-                target_wide.as_ptr(),
-                temp_wide.as_ptr(),
-                std::ptr::null(),
-                0,
-                std::ptr::null(),
-                std::ptr::null(),
-            )
-        };
-        if result != 0 {
-            return Ok(ConfigCommitOutcome::Committed);
+    match retry_windows_config_commit(false, || unsafe {
+        ReplaceFileW(
+            target_wide.as_ptr(),
+            temp_wide.as_ptr(),
+            std::ptr::null(),
+            0,
+            std::ptr::null(),
+            std::ptr::null(),
+        )
+    }) {
+        Ok(()) => Ok(ConfigCommitOutcome::Committed),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(ConfigCommitOutcome::DestinationStateChanged)
         }
-
-        let error = std::io::Error::last_os_error();
-        if error.kind() == std::io::ErrorKind::NotFound {
-            return Ok(ConfigCommitOutcome::DestinationStateChanged);
-        }
-        if transient_windows_config_replace_error(&error)
-            && let Some(delay) = retry_delays.next()
-        {
-            std::thread::sleep(*delay);
-            continue;
-        }
-        return Err(error);
+        Err(error) => Err(error),
     }
 }
 
@@ -2554,6 +2562,38 @@ mod tests {
         )
         .expect("ignore relative USERPROFILE for persistent config");
         assert_eq!(relative_profile_is_ignored, PathBuf::from(r"D:\git-home"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_config_replace_retries_short_sharing_violation() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+
+        let (mut app, workspace, config_path) = test_app("moondesk-config-replace-sharing-retry");
+        app.theme = "paper".into();
+
+        let held_config = OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .open(&config_path)
+            .expect("open config without delete sharing");
+        let worker_config = app.app_config();
+        let worker_path = config_path.clone();
+        let save = std::thread::spawn(move || worker_config.save_to_path(&worker_path));
+
+        std::thread::sleep(Duration::from_millis(120));
+        drop(held_config);
+
+        save.join()
+            .expect("join config save thread")
+            .expect("direct config save should outwait a short sharing violation");
+
+        let persisted = AppConfig::load_from_path(&config_path).expect("reload persisted config");
+        assert_eq!(persisted.theme, "paper");
+
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_dir_all(workspace);
     }
 
     #[cfg(windows)]

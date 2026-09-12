@@ -82,6 +82,14 @@ const CURRENT_CONFIG_VERSION: u32 = 2;
 const WORKSPACE_DRAIN_TIMEOUT: Duration = Duration::from_secs(130);
 const WORKSPACE_CLEANUP_RETRY_ATTEMPTS: usize = 4;
 const WORKSPACE_CLEANUP_RETRY_DELAY: Duration = Duration::from_secs(1);
+#[cfg(windows)]
+const WINDOWS_CONFIG_REPLACE_RETRY_DELAYS: [Duration; 5] = [
+    Duration::from_millis(25),
+    Duration::from_millis(50),
+    Duration::from_millis(100),
+    Duration::from_millis(200),
+    Duration::from_millis(400),
+];
 pub const GPT_5_6_AND_EARLIER_USAGE_BUCKET: &str = "through-gpt-5.6";
 pub const CURRENT_USAGE_BUCKET: &str = GPT_5_6_AND_EARLIER_USAGE_BUCKET;
 
@@ -385,6 +393,10 @@ impl AppConfig {
             file.write_all(text.as_bytes())?;
             file.flush()?;
             file.sync_all()?;
+            // Windows replacement APIs are sensitive to open handles on the staged
+            // file. The bytes are durable now, so release our own handle before the
+            // atomic commit instead of letting it live until the closure returns.
+            drop(file);
             before_commit();
             let outcome = commit_config_file(&temp_path, path, commit_mode)?;
             if outcome == ConfigCommitOutcome::Committed {
@@ -596,6 +608,14 @@ fn create_config_file_if_absent(
 }
 
 #[cfg(windows)]
+fn transient_windows_config_replace_error(error: &std::io::Error) -> bool {
+    // ReplaceFileW requires delete-sharing on the destination. Antivirus, indexers,
+    // editors, or another short-lived MoonDesk save can briefly deny that access.
+    // Retry only lock-specific Win32 errors; broader failures should surface promptly.
+    matches!(error.raw_os_error(), Some(32 | 33))
+}
+
+#[cfg(windows)]
 fn replace_config_file_if_present(
     temp_path: &Path,
     target_path: &Path,
@@ -604,24 +624,34 @@ fn replace_config_file_if_present(
 
     let temp_wide = wide_path(temp_path);
     let target_wide = wide_path(target_path);
-    let result = unsafe {
-        ReplaceFileW(
-            target_wide.as_ptr(),
-            temp_wide.as_ptr(),
-            std::ptr::null(),
-            0,
-            std::ptr::null(),
-            std::ptr::null(),
-        )
-    };
-    if result != 0 {
-        return Ok(ConfigCommitOutcome::Committed);
-    }
-    let error = std::io::Error::last_os_error();
-    if error.kind() == std::io::ErrorKind::NotFound {
-        Ok(ConfigCommitOutcome::DestinationStateChanged)
-    } else {
-        Err(error)
+    let mut retry_delays = WINDOWS_CONFIG_REPLACE_RETRY_DELAYS.iter();
+
+    loop {
+        let result = unsafe {
+            ReplaceFileW(
+                target_wide.as_ptr(),
+                temp_wide.as_ptr(),
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                std::ptr::null(),
+            )
+        };
+        if result != 0 {
+            return Ok(ConfigCommitOutcome::Committed);
+        }
+
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::NotFound {
+            return Ok(ConfigCommitOutcome::DestinationStateChanged);
+        }
+        if transient_windows_config_replace_error(&error)
+            && let Some(delay) = retry_delays.next()
+        {
+            std::thread::sleep(*delay);
+            continue;
+        }
+        return Err(error);
     }
 }
 
@@ -2524,6 +2554,50 @@ mod tests {
         )
         .expect("ignore relative USERPROFILE for persistent config");
         assert_eq!(relative_profile_is_ignored, PathBuf::from(r"D:\git-home"));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn windows_config_save_retries_short_sharing_violation() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+
+        let (mut app, workspace, config_path) = test_app("moondesk-config-sharing-retry");
+        app.theme = "paper".into();
+        app.mark_config_dirty();
+        let state = Arc::new(Mutex::new(app));
+
+        let held_config = OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .open(&config_path)
+            .expect("open config without delete sharing");
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let worker_barrier = barrier.clone();
+        let worker_state = state.clone();
+        let flush = tokio::spawn(async move {
+            flush_config_with_commit_hook(&worker_state, false, move || {
+                worker_barrier.wait();
+            })
+            .await
+        });
+
+        barrier.wait();
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        drop(held_config);
+
+        assert!(
+            flush
+                .await
+                .expect("join config flush task")
+                .expect("automatic config flush should outwait a short sharing violation")
+        );
+
+        let persisted = AppConfig::load_from_path(&config_path).expect("reload persisted config");
+        assert_eq!(persisted.theme, "paper");
+
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_dir_all(workspace);
     }
 
     #[test]

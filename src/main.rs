@@ -4595,11 +4595,14 @@ struct StartedServices {
 }
 
 const MAX_HEALTH_PROBE_BODY_BYTES: usize = 4 * 1024;
+const LOCAL_SERVER_READY_TIMEOUT: Duration = Duration::from_secs(3);
+const LOCAL_SERVER_READY_RETRY_DELAY: Duration = Duration::from_millis(50);
 
 async fn port_hosts_moondesk(port: u16) -> bool {
     let endpoint = format!("http://127.0.0.1:{port}/");
     let client = match reqwest::Client::builder()
         .timeout(Duration::from_secs(1))
+        .no_proxy()
         .build()
     {
         Ok(client) => client,
@@ -4634,6 +4637,37 @@ async fn port_hosts_moondesk(port: u16) -> bool {
     };
     payload.get("status").and_then(serde_json::Value::as_str) == Some("ok")
         && payload.get("name").and_then(serde_json::Value::as_str) == Some("MoonDesk")
+}
+
+async fn wait_for_local_server_ready(port: u16) -> bool {
+    let deadline = Instant::now() + LOCAL_SERVER_READY_TIMEOUT;
+    loop {
+        if port_hosts_moondesk(port).await {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(LOCAL_SERVER_READY_RETRY_DELAY).await;
+    }
+}
+
+async fn handle_mcp_server_exit(state: SharedState, result: Result<(), std::io::Error>) {
+    {
+        let mut app = state.lock().await;
+        app.server_running = false;
+        match result {
+            Ok(()) => app.log("WARN", "MCP server exited".into()),
+            Err(error) => app.log("ERROR", format!("MCP server failed: {error}")),
+        }
+        if app.ngrok_running {
+            app.log(
+                "WARN",
+                "Stopping ngrok because the local MCP server is unavailable".into(),
+            );
+        }
+    }
+    ngrok::stop(state).await;
 }
 
 async fn start_services(
@@ -4690,12 +4724,7 @@ async fn start_services(
     let server_state = state.clone();
     let handle = tokio::spawn(async move {
         let result = axum::serve(listener, router).await;
-        let mut app = server_state.lock().await;
-        app.server_running = false;
-        match result {
-            Ok(()) => app.log("WARN", "MCP server exited".into()),
-            Err(error) => app.log("ERROR", format!("MCP server failed: {error}")),
-        }
+        handle_mcp_server_exit(server_state, result).await;
     });
 
     {
@@ -4705,7 +4734,27 @@ async fn start_services(
         app.log("INFO", format!("MCP Server started on port {port}"));
     }
 
-    // Start ngrok
+    if !wait_for_local_server_ready(port).await {
+        let handle = {
+            let mut app = state.lock().await;
+            app.server_running = false;
+            app.server_handle.take()
+        };
+        if let Some(handle) = handle {
+            handle.abort();
+            let _ = handle.await;
+        }
+        let message =
+            format!("MCP server on 127.0.0.1:{port} did not become healthy; ngrok was not started");
+        state.lock().await.log("ERROR", message.clone());
+        return Err(message);
+    }
+    state.lock().await.log(
+        "INFO",
+        format!("Local MCP health check passed on 127.0.0.1:{port}"),
+    );
+
+    // Start ngrok only after the local HTTP server has answered its health probe.
     let ngrok_start_error = match ngrok::start(state.clone()).await {
         Ok(()) => None,
         Err(error) => {
@@ -7822,16 +7871,16 @@ mod tests {
         WorkspaceUiAction, active_reveal_remaining, apply_workspace_observability_filter,
         browser_headless_fallback_succeeded, cycle_dashboard_focus, dashboard_secret_target_at,
         draw_changelog_notice, draw_prompt, draw_quit_confirm, draw_ui, draw_update_confirm,
-        item_under_cursor, key_is_clipboard_paste, key_is_interrupt, key_is_plain_quit,
-        log_secret_target, move_panel_selection, ngrok_setup_cancel_key,
+        handle_mcp_server_exit, item_under_cursor, key_is_clipboard_paste, key_is_interrupt,
+        key_is_plain_quit, log_secret_target, move_panel_selection, ngrok_setup_cancel_key,
         normalize_ngrok_authtoken_input, normalize_ngrok_domain, normalize_workspace_path_input,
-        panel_under_cursor, parse_clippymoon_export_args, parse_port_value,
+        panel_under_cursor, parse_clippymoon_export_args, parse_port_value, port_hosts_moondesk,
         primary_mcp_url_line_index, quit_confirm_action, reconcile_workspace_filter,
         record_clear_view, reset_filtered_navigation, scroll_panel_down, scroll_panel_up,
         tail_start_index, timed_secret_click, truncate_with_ellipsis, update_confirm_action,
-        user_home_dir, workspace_action_from_event, workspace_detail_sections,
-        workspace_filter_from_index, workspace_filter_index, wrap_preserving_chars,
-        wrapped_line_hit_area,
+        user_home_dir, wait_for_local_server_ready, workspace_action_from_event,
+        workspace_detail_sections, workspace_filter_from_index, workspace_filter_index,
+        wrap_preserving_chars, wrapped_line_hit_area,
     };
     use crossterm::event::{
         Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -8058,6 +8107,87 @@ mod tests {
             workspace_scroll,
             workspace_visible_count,
         }
+    }
+
+    #[tokio::test]
+    async fn local_server_readiness_waits_for_real_moondesk_health() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind delayed health server");
+        let port = listener
+            .local_addr()
+            .expect("delayed health server address")
+            .port();
+        let server = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let app = axum::Router::new().route(
+                "/",
+                axum::routing::get(|| async {
+                    axum::Json(serde_json::json!({
+                        "status": "ok",
+                        "name": "MoonDesk"
+                    }))
+                }),
+            );
+            let _ = axum::serve(listener, app).await;
+        });
+
+        assert!(
+            wait_for_local_server_ready(port).await,
+            "startup should wait until the local MoonDesk health route is serving"
+        );
+        assert!(port_hosts_moondesk(port).await);
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn mcp_server_exit_stops_ngrok_instead_of_leaving_a_502_tunnel() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let workspace = std::env::temp_dir().join(format!("moondesk-server-exit-ngrok-{unique}"));
+        std::fs::create_dir_all(&workspace).expect("create server-exit test workspace");
+        let config_path = workspace.join("config.toml");
+        let app = AppState::new_for_test(
+            3200,
+            workspace.to_string_lossy().into_owned(),
+            config_path.clone(),
+        )
+        .expect("create server-exit app state");
+        let state = std::sync::Arc::new(tokio::sync::Mutex::new(app));
+        let tunnel_task = tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        });
+        {
+            let mut app = state.lock().await;
+            app.server_running = true;
+            app.ngrok_running = true;
+            app.ngrok_url = Some("https://test.ngrok.app".into());
+            app.remote_connected = true;
+            app.ngrok_task = Some(tunnel_task);
+        }
+
+        handle_mcp_server_exit(state.clone(), Ok(())).await;
+
+        {
+            let app = state.lock().await;
+            assert!(!app.server_running);
+            assert!(!app.ngrok_running);
+            assert!(app.ngrok_url.is_none());
+            assert!(!app.remote_connected);
+            assert!(app.ngrok_task.is_none());
+            assert!(app.logs.iter().any(|entry| {
+                entry
+                    .message
+                    .contains("Stopping ngrok because the local MCP server is unavailable")
+            }));
+        }
+
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_dir_all(workspace);
     }
 
     #[test]

@@ -4602,6 +4602,7 @@ async fn port_hosts_moondesk(port: u16) -> bool {
     let endpoint = format!("http://127.0.0.1:{port}/");
     let client = match reqwest::Client::builder()
         .timeout(Duration::from_secs(1))
+        .no_proxy()
         .build()
     {
         Ok(client) => client,

@@ -55,14 +55,15 @@ async fn public_tunnel_bad_gateway(public_url: &str) -> Result<Option<String>, S
             .await
         {
             Ok(response) if response.status() == StatusCode::BAD_GATEWAY => {
-                let body = response
-                    .bytes()
-                    .await
-                    .map_err(|error| format!("could not read ngrok 502 response: {error}"))?;
-                let detail_len = body.len().min(BAD_GATEWAY_DETAIL_LIMIT);
-                let detail = String::from_utf8_lossy(&body[..detail_len])
-                    .trim()
-                    .to_string();
+                let detail = match response.bytes().await {
+                    Ok(body) => {
+                        let detail_len = body.len().min(BAD_GATEWAY_DETAIL_LIMIT);
+                        String::from_utf8_lossy(&body[..detail_len])
+                            .trim()
+                            .to_string()
+                    }
+                    Err(_) => String::new(),
+                };
                 last_detail = Some(if detail.is_empty() {
                     "ngrok returned HTTP 502 Bad Gateway".to_string()
                 } else {
@@ -80,6 +81,16 @@ async fn public_tunnel_bad_gateway(public_url: &str) -> Result<Option<String>, S
     }
 
     Ok(last_detail)
+}
+
+fn ensure_local_server_running(server_running: bool) -> Result<(), StartFailure> {
+    if server_running {
+        Ok(())
+    } else {
+        Err(StartFailure::Other(
+            "Local MCP server exited before the ngrok tunnel could be published".into(),
+        ))
+    }
 }
 
 async fn close_forwarder<T>(forwarder: &mut ngrok::forwarder::Forwarder<T>)
@@ -194,6 +205,13 @@ pub async fn start(state: SharedState) -> Result<(), StartFailure> {
     let forward_target = selected_target
         .ok_or_else(|| StartFailure::Other("ngrok forwarder did not select an upstream".into()))?;
 
+    let mut app = state.lock().await;
+    if let Err(error) = ensure_local_server_running(app.server_running) {
+        drop(app);
+        close_forwarder(&mut forwarder).await;
+        return Err(error);
+    }
+
     let state_clone = state.clone();
     let watcher = tokio::spawn(async move {
         let result = forwarder.join().await;
@@ -209,28 +227,25 @@ pub async fn start(state: SharedState) -> Result<(), StartFailure> {
         app.clear_remote_connection_state();
     });
 
-    {
-        let mut app = state.lock().await;
-        app.ngrok_task = Some(watcher);
-        app.ngrok_running = true;
-        app.ngrok_url = Some(url.clone());
-        let workspace_count = app.workspaces.len();
-        app.log("INFO", "ngrok SDK tunnel started".into());
-        app.log("INFO", format!("ngrok local upstream: {forward_target}"));
-        app.log("INFO", format!("ngrok URL: {url}"));
-        app.log(
-            "INFO",
-            format!("Workspace MCP endpoints ready: {workspace_count}"),
-        );
+    app.ngrok_task = Some(watcher);
+    app.ngrok_running = true;
+    app.ngrok_url = Some(url.clone());
+    let workspace_count = app.workspaces.len();
+    app.log("INFO", "ngrok SDK tunnel started".into());
+    app.log("INFO", format!("ngrok local upstream: {forward_target}"));
+    app.log("INFO", format!("ngrok URL: {url}"));
+    app.log(
+        "INFO",
+        format!("Workspace MCP endpoints ready: {workspace_count}"),
+    );
 
-        if app.ngrok_domain.is_none()
-            && let Ok(parsed_url) = reqwest::Url::parse(&url)
-            && let Some(host) = parsed_url.host_str()
-        {
-            app.ngrok_domain = Some(host.to_string());
-            app.log("INFO", format!("Auto-saved ngrok static domain: {host}"));
-            app.mark_config_dirty();
-        }
+    if app.ngrok_domain.is_none()
+        && let Ok(parsed_url) = reqwest::Url::parse(&url)
+        && let Some(host) = parsed_url.host_str()
+    {
+        app.ngrok_domain = Some(host.to_string());
+        app.log("INFO", format!("Auto-saved ngrok static domain: {host}"));
+        app.mark_config_dirty();
     }
 
     Ok(())
@@ -261,8 +276,11 @@ pub async fn restart(state: SharedState) -> Result<(), StartFailure> {
 
 #[cfg(test)]
 mod tests {
-    use super::{StartFailure, local_forward_targets, public_tunnel_bad_gateway};
+    use super::{
+        StartFailure, ensure_local_server_running, local_forward_targets, public_tunnel_bad_gateway,
+    };
     use axum::{Router, http::StatusCode, routing::get};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[test]
     fn authentication_failures_are_distinguished_for_token_recovery() {
@@ -314,6 +332,48 @@ mod tests {
 
         server.abort();
         let _ = server.await;
+    }
+
+    #[test]
+    fn tunnel_publication_requires_live_local_server() {
+        assert!(ensure_local_server_running(true).is_ok());
+        let error =
+            ensure_local_server_running(false).expect_err("dead server must block publication");
+        assert!(
+            error
+                .to_string()
+                .contains("Local MCP server exited before the ngrok tunnel could be published")
+        );
+    }
+
+    #[tokio::test]
+    async fn public_probe_keeps_502_fallback_when_diagnostic_body_is_truncated() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind truncated-502 server");
+        let address = listener.local_addr().expect("truncated-502 server address");
+        let server = tokio::spawn(async move {
+            for _ in 0..super::PUBLIC_TUNNEL_BAD_GATEWAY_RETRIES {
+                let (mut stream, _) = listener.accept().await.expect("accept probe request");
+                let mut request = [0_u8; 2048];
+                let _ = stream.read(&mut request).await;
+                stream
+                    .write_all(
+                        b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 128\r\nConnection: close\r\n\r\nshort",
+                    )
+                    .await
+                    .expect("write truncated 502 response");
+                let _ = stream.shutdown().await;
+            }
+        });
+
+        let detail = public_tunnel_bad_gateway(&format!("http://{address}"))
+            .await
+            .expect("truncated 502 body must not turn into a generic probe error")
+            .expect("502 must still be detected");
+        assert_eq!(detail, "ngrok returned HTTP 502 Bad Gateway");
+
+        server.await.expect("truncated-502 server task");
     }
 
     #[tokio::test]

@@ -121,11 +121,7 @@ async function readResponseBuffer(response, url, maxBytes, onProgress) {
 
   reportDownloadProgress(onProgress, 0, totalBytes);
 
-  if (
-    typeof onProgress !== "function" ||
-    !response.body ||
-    typeof response.body.getReader !== "function"
-  ) {
+  if (!response.body || typeof response.body.getReader !== "function") {
     const buffer = Buffer.from(await response.arrayBuffer());
     if (buffer.length > maxBytes) {
       throw new Error(`${url} exceeded the ${maxBytes}-byte download limit`);

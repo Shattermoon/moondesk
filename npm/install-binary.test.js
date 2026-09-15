@@ -115,6 +115,61 @@ test("ensureBinary reports native binary download progress while streaming", asy
   }
 });
 
+test("ensureBinary streams readable responses even without a progress callback", async () => {
+  const dir = tempDir();
+  try {
+    const target = resolveTarget();
+    const binary = Buffer.from(`moondesk-stream-no-progress-${crypto.randomUUID()}\n`);
+    const expected = sha256Buffer(binary);
+    const checksum = Buffer.from(`${expected}  ${target.assetName}\n`);
+
+    const streamOnlyResponse = (buffer) => {
+      let offset = 0;
+      return {
+        ok: true,
+        status: 200,
+        headers: {
+          get(name) {
+            return name.toLowerCase() === "content-length" ? String(buffer.length) : null;
+          },
+        },
+        body: {
+          getReader() {
+            return {
+              async read() {
+                if (offset >= buffer.length) return { done: true, value: undefined };
+                const end = Math.min(offset + 17, buffer.length);
+                const value = buffer.subarray(offset, end);
+                offset = end;
+                return { done: false, value };
+              },
+              async cancel() {},
+              releaseLock() {},
+            };
+          },
+        },
+        async arrayBuffer() {
+          throw new Error("readable responses must not fall back to arrayBuffer");
+        },
+      };
+    };
+
+    const binaryPath = await ensureBinary({
+      installDir: dir,
+      releaseBaseUrl: "https://example.invalid/releases/v-test",
+      fetchImpl: async (url) => {
+        if (url.endsWith("/SHA256SUMS")) return streamOnlyResponse(checksum);
+        if (url.endsWith(`/${target.assetName}`)) return streamOnlyResponse(binary);
+        return new Response("not found", { status: 404 });
+      },
+    });
+
+    assert.equal(fs.readFileSync(binaryPath).compare(binary), 0);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("missing cached executable is redownloaded even when checksum metadata remains", async () => {
   const dir = tempDir();
   try {

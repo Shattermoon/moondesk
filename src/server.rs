@@ -1901,11 +1901,13 @@ mod tests {
         std::fs::create_dir_all(&config_root).expect("create config dir");
         std::fs::create_dir_all(workspace_root.join("artifacts"))
             .expect("create browser output directory");
+        let external_upload_fixture = config_root.join("external-upload-fixture.txt");
+        assert!(!external_upload_fixture.starts_with(&workspace_root));
         std::fs::write(
-            workspace_root.join("upload-fixture.txt"),
-            b"MoonDesk upload fixture\n",
+            &external_upload_fixture,
+            b"MoonDesk external upload fixture\n",
         )
-        .expect("write browser upload fixture");
+        .expect("write external browser upload fixture");
 
         let mut app = AppState::new_for_test(
             8787,
@@ -2075,11 +2077,12 @@ document.getElementById('upload').addEventListener('change',event=>{document.get
         let input_uid = snapshot_uid(mobile_snapshot_text, "textbox");
         let button_uid = snapshot_uid(mobile_snapshot_text, "button \"Toggle state\"");
         let upload_uid = snapshot_uid(mobile_snapshot_text, "button \"Upload \"");
+        let external_upload_arg = external_upload_fixture.to_string_lossy().into_owned();
         let upload = host_browser_request(
             host_address,
             &workspace_root,
             "upload_file",
-            &[upload_uid.as_str(), "upload-fixture.txt"],
+            &[upload_uid.as_str(), external_upload_arg.as_str()],
         )
         .await;
         assert_eq!(upload.get("success").and_then(Value::as_bool), Some(true));
@@ -2125,7 +2128,7 @@ document.getElementById('upload').addEventListener('change',event=>{document.get
             "844",
             "agent-check",
             "ON",
-            "upload-fixture.txt",
+            "external-upload-fixture.txt",
             "true",
         ] {
             assert!(

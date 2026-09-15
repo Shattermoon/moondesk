@@ -9,7 +9,7 @@ use tiktoken_rs::o200k_base_singleton;
 
 use crate::browser_contract::browser_structured_arguments_to_cli;
 use crate::browser_runtime::{
-    BrowserPresentationChange, BrowserRuntime, DEFAULT_BROWSER_COMMAND_TIMEOUT,
+    BrowserPresentationChange, BrowserRuntime, BrowserSessionKey, DEFAULT_BROWSER_COMMAND_TIMEOUT,
     MAX_BROWSER_ARG_BYTES, MAX_BROWSER_ARGS, MAX_BROWSER_COMMAND_BYTES, MAX_BROWSER_TIMEOUT_MS,
     canonical_browser_flag_name, validate_browser_request_bounds,
 };
@@ -712,7 +712,7 @@ async fn handle_tools_list(
             tools.push(json!({
                 "name": "set_browser_presentation",
                 "title": "Set browser presentation",
-                "description": "Switch MoonDesk's isolated agent browser between headless and visible presentation. Prefer headless for normal autonomous work. Use visible only when the user needs to watch or manually interact with the browser, such as a login, CAPTCHA, permission prompt, or other human-input step. If a different presentation would close an active browser session, the first call returns confirmation_required without changing anything. Retry with confirm_restart=true only after the user explicitly approves losing that temporary session. A live presentation change discards tabs, cookies/storage, page state, and snapshot UIDs. After human input, keep using the visible session while that state is still needed; switch back to headless only after the flow is finished.",
+                "description": "Switch MoonDesk's one host-owned agent Chromium between headless and visible presentation. Prefer headless for normal autonomous work. Use visible only when the user needs to watch or manually interact with the browser, such as a login, CAPTCHA, permission prompt, or other human-input step. Presentation is process-global: if Chromium is already running, changing it would close every MoonDesk browser workspace/context and conversation-owned tab. The first call therefore returns confirmation_required without changing anything. Retry with confirm_restart=true only after the user explicitly approves losing all temporary MoonDesk browser tabs, workspace browser storage, page state, and snapshot UIDs.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -727,7 +727,7 @@ async fn handle_tools_list(
         tools.push(json!({
             "name": "browser_command",
             "title": "Run browser command",
-            "description": "Run one Chrome DevTools CLI browser operation against MoonDesk's shared lazy agent-browser session. The isolated browser is headless by default, starts only on the first browser operation, and is reused across commands; the user can switch it to visible presentation from MoonDesk. Use resize_page for normal desktop window sizes; use emulate with --viewport=<width>x<height>x<dpr>[,mobile][,touch] for exact tablet/mobile responsive testing, then take a fresh snapshot before using UIDs. Other useful commands include list_pages, new_page, navigate_page, take_snapshot, click, fill, type_text, press_key, hover, drag, evaluate_script, list_console_messages, list_network_requests, lighthouse_audit, and performance_start_trace. In read-only mode MoonDesk permits only bounded inspection commands, requires lighthouse_audit to use explicit --mode=snapshot, and rejects state-changing actions or browser file-output flags. Relative browser input paths stay inside the active workspace. Browser-only mode keeps browser inputs workspace-scoped. When Computer tools are also enabled (Both mode), an explicit absolute input-file path may reference another regular file readable by the MoonDesk user and is privately staged before Chromium sees it. Browser input directories and file-producing/output paths remain workspace-bound. MoonDesk manages start/status/stop automatically.",
+            "description": "Run one Chrome DevTools browser operation through MoonDesk's shared lazy Chromium runtime. MoonDesk keeps one Chromium/MCP process for efficiency, gives each workspace an isolated BrowserContext for cookies/storage, and gives each MCP conversation its own logical tab set. Page-scoped operations are routed server-side to this conversation's owned page rather than to Chromium's globally selected tab; list/select/close expose only conversation-local logical page IDs. Keep browser work on the connector that owns the project instead of switching to another workspace connector. The browser is headless by default and can be made visible with set_browser_presentation. Use resize_page for normal desktop sizes; use emulate with --viewport=<width>x<height>x<dpr>[,mobile][,touch] for exact responsive testing, then take a fresh snapshot before using UIDs. Browser-global extension lifecycle commands are intentionally blocked. In read-only mode MoonDesk permits only bounded inspection commands, requires lighthouse_audit to use explicit --mode=snapshot, and rejects state-changing actions or browser file-output flags. Relative browser input paths stay inside the active workspace. Browser-only mode keeps browser inputs workspace-scoped. When Computer tools are also enabled (Both mode), an explicit absolute input-file path may reference another regular file readable by the MoonDesk user and is privately staged before Chromium sees it. Browser input directories and file-producing/output paths remain workspace-bound. MoonDesk manages start/status/stop automatically.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -742,7 +742,7 @@ async fn handle_tools_list(
         tools.push(json!({
             "name": "view_page",
             "title": "View current page",
-            "description": "Capture the current MoonDesk browser page and attach its rendered pixels directly to the model's vision input. This uses the same live isolated agent-browser session as browser_command, so visual inspection always reflects the page the agent actually manipulated.",
+            "description": "Capture this conversation's current MoonDesk browser page and attach its rendered pixels directly to the model's vision input. This uses the same conversation-owned logical page routing as browser_command, so another workspace or chat cannot redirect visual inspection by changing Chromium's global selection.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -811,6 +811,24 @@ fn read_call_requires_workspace(req: &JsonRpcRequest, tool_name: &str) -> bool {
     }
 }
 
+const MAX_BROWSER_CALLER_META_BYTES: usize = 512;
+
+fn browser_session_key(req: &JsonRpcRequest, workspace_id: &WorkspaceId) -> BrowserSessionKey {
+    let meta = req.params.get("_meta").and_then(Value::as_object);
+    let session = meta
+        .and_then(|meta| meta.get("openai/session"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty() && value.len() <= MAX_BROWSER_CALLER_META_BYTES);
+    let subject = meta
+        .and_then(|meta| meta.get("openai/subject"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty() && value.len() <= MAX_BROWSER_CALLER_META_BYTES);
+    match session {
+        Some(session) => BrowserSessionKey::openai(workspace_id, subject, session),
+        None => BrowserSessionKey::workspace_fallback(workspace_id),
+    }
+}
+
 async fn handle_tools_call_for_workspace(
     req: &JsonRpcRequest,
     context: McpRequestContext<'_>,
@@ -856,23 +874,44 @@ async fn handle_tools_call_for_workspace(
             if tool_mode.read_only() {
                 return read_only_blocked_response(req, &tool_name);
             }
-            return handle_set_browser_presentation(req, workspace_root, browser_runtime).await;
+            return handle_set_browser_presentation(req, browser_runtime).await;
         }
+        let browser_session = browser_session_key(req, workspace_id);
         if tool_name == "browser_command" {
-            return handle_browser_command(req, workspace_root, tool_mode, browser_runtime).await;
+            return handle_browser_command(
+                req,
+                &browser_session,
+                workspace_root,
+                tool_mode,
+                browser_runtime,
+            )
+            .await;
         }
         if tool_name == "view_page" {
-            return handle_view_page(req, workspace_root, browser_runtime).await;
+            return handle_view_page(req, &browser_session, workspace_root, browser_runtime).await;
         }
         if tool_name == "fill_form" {
-            return handle_connector_fill_form(req, workspace_root, tool_mode, browser_runtime)
-                .await;
+            return handle_connector_fill_form(
+                req,
+                &browser_session,
+                workspace_root,
+                tool_mode,
+                browser_runtime,
+            )
+            .await;
         }
         if tool_name == "wait_for" {
-            return handle_connector_wait_for(req, workspace_root, browser_runtime).await;
+            return handle_connector_wait_for(
+                req,
+                &browser_session,
+                workspace_root,
+                browser_runtime,
+            )
+            .await;
         }
         return handle_connector_browser_command(
             req,
+            &browser_session,
             workspace_root,
             tool_mode,
             browser_runtime,
@@ -2062,12 +2101,12 @@ Always specify the branch explicitly when using `git push`."#
 
     if mode.browser_enabled() {
         lines.push(
-            "Browser mode exposes a stable browser surface instead of forwarding the full Chrome DevTools MCP catalog. Use browser_command for browser actions and view_page for actual rendered pixels. The browser starts lazily, headless by default at a deterministic 1280x800 initial viewport, in an isolated temporary agent profile that never inherits the user's personal cookies or logged-in browser state. Headless presentation still supports rendered-pixel inspection through view_page and screenshots; resize or emulate the target viewport before responsive or pixel-sensitive QA. The user can switch the browser to visible presentation from MoonDesk; changing presentation while Chromium is running closes that isolated session, so take a fresh page/snapshot afterward. The same live agent session is reused across browser_command, view_page, and `moondesk browser` until that session ends. For local web-app verification, navigate to the dev server, set the target viewport before taking interaction UIDs, use resize_page for normal desktop sizes and emulate --viewport=<width>x<height>x<dpr>[,mobile][,touch] for exact tablet/mobile QA, then take_snapshot. Navigation, viewport emulation, substantial DOM changes, and presentation changes can invalidate UIDs, so take a fresh snapshot before further element interactions. Accessibility/text snapshots are useful for structure but do not replace view_page for visual judgment. MoonDesk manages browser start/status/stop automatically; do not invoke lifecycle commands through browser_command or call npx chrome-devtools-mcp directly. Relative browser input paths stay inside the active workspace. Browser-only mode keeps browser inputs workspace-scoped. When Computer tools are also enabled (Both mode), an explicit absolute input-file path may reference another regular file readable by the MoonDesk user and is privately staged before Chromium sees it. Browser input directories and file-producing/output paths remain workspace-bound."
+            "Browser mode exposes a stable browser surface instead of forwarding the full Chrome DevTools MCP catalog. Use browser_command for browser actions and view_page for actual rendered pixels. MoonDesk starts one host-owned Chromium lazily, headless by default at a deterministic 1280x800 initial viewport, in a temporary agent profile that never inherits the user's personal cookies or logged-in browser state. Inside that Chromium, each MoonDesk workspace gets an isolated BrowserContext for cookies/storage and each MCP conversation gets its own logical page set; page operations are routed to this conversation's owned page rather than whatever tab Chromium globally selected. Keep browser actions on the connector that owns the project; do not switch to another workspace connector merely because it exposes browser tools. `moondesk browser` shares the same Chromium and workspace BrowserContext but intentionally has its own local-CLI logical tab session instead of stealing an MCP conversation's active page. Headless presentation still supports rendered-pixel inspection through view_page and screenshots; resize or emulate the target viewport before responsive or pixel-sensitive QA. Presentation is global to Chromium, so changing it while the browser is running closes all MoonDesk workspace contexts and conversation tabs; take fresh pages/snapshots afterward. For local web-app verification, navigate to the dev server, set the target viewport before taking interaction UIDs, use resize_page for normal desktop sizes and emulate --viewport=<width>x<height>x<dpr>[,mobile][,touch] for exact tablet/mobile QA, then take_snapshot. Navigation, viewport emulation, substantial DOM changes, and presentation changes can invalidate UIDs, so take a fresh snapshot before further element interactions. Accessibility/text snapshots are useful for structure but do not replace view_page for visual judgment. MoonDesk manages browser start/status/stop automatically; do not invoke lifecycle commands through browser_command or call npx chrome-devtools-mcp directly. Relative browser input paths stay inside the active workspace. Browser-only mode keeps browser inputs workspace-scoped. When Computer tools are also enabled (Both mode), an explicit absolute input-file path may reference another regular file readable by the MoonDesk user and is privately staged before Chromium sees it. Browser input directories and file-producing/output paths remain workspace-bound."
                 .to_string(),
         );
         if tool_mode.write_tools_enabled() {
             lines.push(
-                "In multi-tools mode, use set_browser_presentation only when browser visibility itself is needed. Prefer headless for normal autonomous work. Request visible before a login, CAPTCHA, permission prompt, or other step that needs the user to see or manually interact with the isolated browser. If changing presentation would close a live session, the tool returns confirmation_required without changing anything; ask the user for explicit approval before retrying with confirm_restart=true. A live presentation change creates a fresh isolated session, so keep a human-assisted visible session visible while its entered cookies/storage/page state are still needed, and return to headless only after that flow is finished."
+                "In multi-tools mode, use set_browser_presentation only when browser visibility itself is needed. Prefer headless for normal autonomous work. Request visible before a login, CAPTCHA, permission prompt, or other step that needs the user to see or manually interact with the agent browser. Presentation belongs to the one shared Chromium process. If changing it would close a live runtime, the tool returns confirmation_required without changing anything; tell the user that every MoonDesk browser workspace/chat will lose its temporary tabs and workspace BrowserContext state, and get explicit approval before retrying with confirm_restart=true."
                     .to_string(),
             );
         }
@@ -2702,6 +2741,7 @@ fn browser_command_output_response(
 
 async fn handle_connector_fill_form(
     req: &JsonRpcRequest,
+    browser_session: &BrowserSessionKey,
     workspace_root: &str,
     tool_mode: ToolMode,
     browser_runtime: &Option<Arc<BrowserRuntime>>,
@@ -2780,7 +2820,8 @@ async fn handle_connector_fill_form(
         );
     };
     match runtime
-        .fill_form(
+        .fill_form_for_session(
+            browser_session,
             workspace_root,
             &parsed,
             include_snapshot,
@@ -2807,6 +2848,7 @@ fn connector_wait_timeout_ms(arguments: &Value) -> Result<Option<u64>, String> {
 
 async fn handle_connector_wait_for(
     req: &JsonRpcRequest,
+    browser_session: &BrowserSessionKey,
     workspace_root: &str,
     browser_runtime: &Option<Arc<BrowserRuntime>>,
 ) -> JsonRpcResponse {
@@ -2851,7 +2893,7 @@ async fn handle_connector_wait_for(
         );
     };
     match runtime
-        .wait_for_text(workspace_root, &texts, timeout_ms)
+        .wait_for_text_for_session(browser_session, workspace_root, &texts, timeout_ms)
         .await
     {
         Ok(output) => browser_command_output_response(req, "wait_for", output),
@@ -2861,7 +2903,6 @@ async fn handle_connector_wait_for(
 
 async fn handle_set_browser_presentation(
     req: &JsonRpcRequest,
-    workspace_root: &str,
     browser_runtime: &Option<Arc<BrowserRuntime>>,
 ) -> JsonRpcResponse {
     let arguments = tool_arguments(req);
@@ -2919,7 +2960,7 @@ async fn handle_set_browser_presentation(
             )
         }
         BrowserPresentationChange::RequiresRestart => {
-            let detail = "Changing browser presentation would close the current isolated browser session. Ask the user to approve losing its tabs, cookies/storage, page state, and snapshot UIDs, then retry with confirm_restart=true.";
+            let detail = "Changing browser presentation would restart MoonDesk's shared Chromium process. Ask the user to approve losing every MoonDesk browser workspace/context, conversation-owned tab, cookies/storage, page state, and snapshot UID, then retry with confirm_restart=true.";
             tool_success_response_with_structured(
                 req,
                 String::new(),
@@ -2939,26 +2980,10 @@ async fn handle_set_browser_presentation(
         | BrowserPresentationChange::UpdatedAndSessionClosed => {
             let session_closed = change == BrowserPresentationChange::UpdatedAndSessionClosed;
             if requested == BrowserPresentation::Visible {
-                let started = runtime
-                    .run(
-                        workspace_root,
-                        "list_pages",
-                        &[],
-                        DEFAULT_BROWSER_COMMAND_TIMEOUT,
-                    )
-                    .await;
-                let start_error = match started {
-                    Ok(output) if output.success() => None,
-                    Ok(output) => {
-                        let details = output.failure_details();
-                        Some(if details.is_empty() {
-                            "visible browser startup returned a failed browser result".to_string()
-                        } else {
-                            details
-                        })
-                    }
-                    Err(error) => Some(error),
-                };
+                let start_error = runtime
+                    .ensure_started(DEFAULT_BROWSER_COMMAND_TIMEOUT)
+                    .await
+                    .err();
                 if let Some(error) = start_error {
                     let rollback = runtime
                         .set_presentation(BrowserPresentation::Headless, true)
@@ -3006,13 +3031,13 @@ async fn handle_set_browser_presentation(
             let detail = match requested {
                 BrowserPresentation::Headless => {
                     if session_closed {
-                        "Browser presentation is now headless. The previous visible session was closed; the next browser action will start a fresh hidden isolated session."
+                        "Browser presentation is now headless. The previous shared Chromium runtime was closed; the next browser action will start a fresh hidden runtime with new workspace contexts and conversation tabs."
                     } else {
                         "Browser presentation is headless. Normal agent browser work will stay hidden."
                     }
                 }
                 BrowserPresentation::Visible => {
-                    "Browser presentation is visible and the isolated browser window is running. Keep using this visible session while any human-entered state is still needed."
+                    "Browser presentation is visible and MoonDesk's shared agent Chromium window is running. Keep it visible while any human-entered browser state is still needed."
                 }
             };
             tool_success_response_with_structured(
@@ -3035,6 +3060,7 @@ async fn handle_set_browser_presentation(
 
 async fn handle_connector_browser_command(
     req: &JsonRpcRequest,
+    browser_session: &BrowserSessionKey,
     workspace_root: &str,
     tool_mode: ToolMode,
     browser_runtime: &Option<Arc<BrowserRuntime>>,
@@ -3056,10 +3082,18 @@ async fn handle_connector_browser_command(
             }
         }),
     };
-    handle_browser_command(&proxied, workspace_root, tool_mode, browser_runtime).await
+    handle_browser_command(
+        &proxied,
+        browser_session,
+        workspace_root,
+        tool_mode,
+        browser_runtime,
+    )
+    .await
 }
 async fn handle_browser_command(
     req: &JsonRpcRequest,
+    browser_session: &BrowserSessionKey,
     workspace_root: &str,
     tool_mode: ToolMode,
     browser_runtime: &Option<Arc<BrowserRuntime>>,
@@ -3126,7 +3160,8 @@ async fn handle_browser_command(
         );
     };
     let output = match runtime
-        .run(
+        .run_for_session(
+            browser_session,
             workspace_root,
             command,
             &args,
@@ -3143,6 +3178,7 @@ async fn handle_browser_command(
 
 async fn handle_view_page(
     req: &JsonRpcRequest,
+    browser_session: &BrowserSessionKey,
     workspace_root: &str,
     browser_runtime: &Option<Arc<BrowserRuntime>>,
 ) -> JsonRpcResponse {
@@ -3194,7 +3230,8 @@ async fn handle_view_page(
     }
 
     let output = match runtime
-        .run_managed_temp_output(
+        .run_managed_temp_output_for_session(
+            browser_session,
             workspace_root,
             "take_screenshot",
             &cli_args,
@@ -3595,6 +3632,66 @@ mod tests {
                 && entry.get("type").and_then(Value::as_str) != Some("text")),
             "tool result content must not contain text entries: {content:?}"
         );
+    }
+
+    #[test]
+    fn browser_session_identity_uses_openai_meta_and_falls_back_per_workspace() {
+        let workspace = WorkspaceId::new();
+        let mut request = tool_call_request("list_pages", json!({}));
+        request.params["_meta"] = json!({
+            "openai/subject": "anon-user-a",
+            "openai/session": "conversation-a"
+        });
+        let same = request.params.clone();
+        let first = browser_session_key(&request, &workspace);
+        let second = browser_session_key(
+            &JsonRpcRequest {
+                jsonrpc: request.jsonrpc.clone(),
+                id: request.id.clone(),
+                method: request.method.clone(),
+                params: same,
+            },
+            &workspace,
+        );
+        assert!(first == second);
+
+        request.params["_meta"]["openai/session"] = json!("conversation-b");
+        let different_chat = browser_session_key(&request, &workspace);
+        assert!(first != different_chat);
+
+        request.params["_meta"]["openai/session"] = json!("conversation-a");
+        request.params["_meta"]["openai/subject"] = json!("anon-user-b");
+        let different_subject = browser_session_key(&request, &workspace);
+        assert!(first != different_subject);
+
+        let no_meta = tool_call_request("list_pages", json!({}));
+        let fallback_a = browser_session_key(&no_meta, &workspace);
+        let fallback_b = browser_session_key(&no_meta, &workspace);
+        assert!(fallback_a == fallback_b);
+        assert!(fallback_a != first);
+
+        let other_workspace = WorkspaceId::new();
+        assert!(
+            browser_session_key(&no_meta, &other_workspace)
+                != browser_session_key(&no_meta, &workspace)
+        );
+    }
+
+    #[test]
+    fn invalid_openai_session_meta_does_not_create_unbounded_browser_keys() {
+        let workspace = WorkspaceId::new();
+        let mut request = tool_call_request("list_pages", json!({}));
+        request.params["_meta"] = json!({
+            "openai/session": "x".repeat(MAX_BROWSER_CALLER_META_BYTES + 1),
+            "openai/subject": "anon-user"
+        });
+        let oversized = browser_session_key(&request, &workspace);
+        let fallback = browser_session_key(&tool_call_request("list_pages", json!({})), &workspace);
+        assert!(oversized == fallback);
+
+        request.params["_meta"]["openai/session"] = json!("");
+        let empty = browser_session_key(&request, &workspace);
+        assert!(empty == fallback);
     }
 
     #[test]
@@ -6107,7 +6204,7 @@ mod tests {
             BrowserPresentation::Headless
         );
 
-        runtime.stop_if_owned(&workspace_root_str).await;
+        runtime.stop().await;
         let _ = std::fs::remove_file(config_path);
         let _ = std::fs::remove_dir_all(workspace_root);
     }
@@ -6174,6 +6271,7 @@ mod tests {
         let runtime = Arc::new(BrowserRuntime::new(state));
         let runtime_option = Some(runtime.clone());
         let workspace_root_str = workspace_root.to_string_lossy().into_owned();
+        let browser_session = BrowserSessionKey::workspace_fallback(&WorkspaceId::test_default());
         let command_jobs = CommandJobManager::new();
 
         let connector_list_pages = handle_tools_call(
@@ -6462,11 +6560,12 @@ mod tests {
                 .and_then(|structured| structured.get("restarted"))
                 .and_then(Value::as_bool),
             Some(false),
-            "ordinary wait timeout must not restart the shared browser session"
+            "ordinary wait timeout must not restart the shared browser runtime"
         );
 
         let navigate = runtime
-            .run(
+            .run_for_session(
+                &browser_session,
                 &workspace_root_str,
                 "navigate_page",
                 &["--url=data:text/html,<body style='margin:0;background:rgb(12,34,56);height:2400px'><div style='height:1200px'></div><div style='height:1200px;background:rgb(210,60,40)'></div></body>".to_string()],
@@ -6481,7 +6580,8 @@ mod tests {
             navigate.stderr
         );
         let viewport = runtime
-            .run(
+            .run_for_session(
+                &browser_session,
                 &workspace_root_str,
                 "evaluate_script",
                 &[
@@ -6534,6 +6634,7 @@ mod tests {
                 "view_page",
                 json!({ "full_page": true, "uid": "node-does-not-matter" }),
             ),
+            &browser_session,
             &workspace_root_str,
             &runtime_option,
         )
@@ -6553,6 +6654,7 @@ mod tests {
                 "view_page",
                 json!({ "quality": u64::from(vision::MIN_JPEG_QUALITY - 1) }),
             ),
+            &browser_session,
             &workspace_root_str,
             &runtime_option,
         )
@@ -6570,6 +6672,7 @@ mod tests {
         let before = managed_view_page_files();
         let invalid_uid = handle_view_page(
             &tool_call_request("view_page", json!({ "uid": "missing-vision-smoke-uid" })),
+            &browser_session,
             &workspace_root_str,
             &runtime_option,
         )
@@ -6590,7 +6693,13 @@ mod tests {
         );
 
         let request = tool_call_request("view_page", json!({}));
-        let response = handle_view_page(&request, &workspace_root_str, &runtime_option).await;
+        let response = handle_view_page(
+            &request,
+            &browser_session,
+            &workspace_root_str,
+            &runtime_option,
+        )
+        .await;
         let result = response.result.as_ref().expect("view_page result");
         assert_ne!(result.get("isError").and_then(Value::as_bool), Some(true));
         let content = result
@@ -6648,6 +6757,7 @@ mod tests {
 
         let full_page_response = handle_view_page(
             &tool_call_request("view_page", json!({ "full_page": true })),
+            &browser_session,
             &workspace_root_str,
             &runtime_option,
         )
@@ -6691,7 +6801,7 @@ mod tests {
             "full-page view_page must clean its managed screenshot"
         );
 
-        runtime.stop_if_owned(&workspace_root_str).await;
+        runtime.stop().await;
         let _ = std::fs::remove_dir_all(workspace_root);
     }
 
@@ -7402,13 +7512,15 @@ mod tests {
         assert!(instruction_text.contains("model receives the pixels through its vision input"));
         assert!(instruction_text.contains("view_page for actual rendered pixels"));
         assert!(instruction_text.contains("do not replace view_page for visual judgment"));
-        assert!(instruction_text.contains("browser starts lazily, headless by default"));
+        assert!(
+            instruction_text.contains("starts one host-owned Chromium lazily, headless by default")
+        );
         assert!(instruction_text.contains(
             "use set_browser_presentation only when browser visibility itself is needed"
         ));
         assert!(instruction_text.contains("tool returns confirmation_required"));
         assert!(instruction_text.contains("retrying with confirm_restart=true"));
-        assert!(instruction_text.contains("same live agent session is reused"));
+        assert!(instruction_text.contains("each MCP conversation gets its own logical page set"));
         assert!(instruction_text.contains("never inherits the user's personal cookies"));
         assert!(instruction_text.contains("emulate --viewport=<width>x<height>x<dpr>"));
         assert!(

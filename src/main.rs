@@ -2222,7 +2222,7 @@ async fn run_app(
                 KeyCode::Char('3') => Mode::Both,
                 KeyCode::Char('q') => return Ok(AppExit::Quit),
                 KeyCode::Char('w') => {
-                    run_workspaces(terminal, state.clone()).await?;
+                    run_workspaces(terminal, state.clone(), None).await?;
                     continue;
                 }
                 KeyCode::Char('s') => {
@@ -2270,8 +2270,6 @@ async fn run_app(
     let mut services = start_services(state.clone(), ui_event_tx)
         .await
         .map_err(std::io::Error::other)?;
-    let browser_workspace_root = { state.lock().await.workspace_root.clone() };
-
     while services
         .ngrok_start_error
         .as_ref()
@@ -2291,14 +2289,14 @@ async fn run_app(
             Ok(continue_run) => continue_run,
             Err(error) => {
                 if let Some(runtime) = services.browser_runtime.take() {
-                    runtime.stop_if_owned(&browser_workspace_root).await;
+                    runtime.stop().await;
                 }
                 return Err(error);
             }
         };
         if !continue_run {
             if let Some(runtime) = services.browser_runtime.take() {
-                runtime.stop_if_owned(&browser_workspace_root).await;
+                runtime.stop().await;
             }
             return Ok(AppExit::Quit);
         }
@@ -2328,7 +2326,7 @@ async fn run_app(
     .await;
     interrupts.begin_shutdown();
     if let Some(runtime) = services.browser_runtime.take() {
-        runtime.stop_if_owned(&browser_workspace_root).await;
+        runtime.stop().await;
     }
     result
 }
@@ -3448,6 +3446,7 @@ fn workspace_action_from_event(
 async fn run_workspaces(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     state: SharedState,
+    browser_runtime: Option<Arc<BrowserRuntime>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut selected = 0usize;
     let mut revealed: Option<(WorkspaceId, Instant)> = None;
@@ -3648,10 +3647,31 @@ async fn run_workspaces(
                     let removed_name = selected_row.config.name.clone();
                     match remove_workspace(&state, &selected_row.config.id).await {
                         Ok(()) => {
+                            let browser_cleanup_error =
+                                if let Some(runtime) = browser_runtime.as_ref() {
+                                    runtime
+                                        .release_workspace(&selected_row.config.id)
+                                        .await
+                                        .err()
+                                } else {
+                                    None
+                                };
                             selected = selected.saturating_sub(1);
                             revealed = None;
                             confirm_remove = None;
-                            message = Some(format!("Removed workspace {removed_name}"));
+                            message = Some(if let Some(error) = browser_cleanup_error {
+                                state.lock().await.log(
+                                    "WARN",
+                                    format!(
+                                        "Removed workspace {removed_name}, but its browser cleanup required resetting the shared browser runtime: {error}"
+                                    ),
+                                );
+                                format!(
+                                    "Removed workspace {removed_name}; shared browser was reset during cleanup"
+                                )
+                            } else {
+                                format!("Removed workspace {removed_name}")
+                            });
                         }
                         Err(error) => {
                             confirm_remove = None;
@@ -5120,7 +5140,8 @@ async fn run_tui(
                     }
                     match key.code {
                         KeyCode::Char('w') => {
-                            run_workspaces(terminal, state.clone()).await?;
+                            run_workspaces(terminal, state.clone(), browser_runtime.clone())
+                                .await?;
                         }
                         KeyCode::Char('v')
                             if app.mode.browser_enabled()
@@ -5170,44 +5191,11 @@ async fn run_tui(
                                     let mut visible_start_failed = false;
                                     let mut visible_fallback_busy = false;
                                     if next_presentation == BrowserPresentation::Visible {
-                                        let workspace_root =
-                                            { state.lock().await.workspace_root.clone() };
                                         match runtime
-                                            .run(
-                                                &workspace_root,
-                                                "list_pages",
-                                                &[],
-                                                DEFAULT_BROWSER_COMMAND_TIMEOUT,
-                                            )
+                                            .ensure_started(DEFAULT_BROWSER_COMMAND_TIMEOUT)
                                             .await
                                         {
-                                            Ok(output) if output.success() => {}
-                                            Ok(output) => {
-                                                visible_start_failed = true;
-                                                let details = output.failure_details();
-                                                let rollback = runtime
-                                                    .set_presentation(
-                                                        BrowserPresentation::Headless,
-                                                        true,
-                                                    )
-                                                    .await;
-                                                if browser_headless_fallback_succeeded(rollback) {
-                                                    state.lock().await.log(
-                                                        "WARN",
-                                                        format!(
-                                                            "Visible agent browser could not start; reverted to headless: {details}"
-                                                        ),
-                                                    );
-                                                } else {
-                                                    visible_fallback_busy = true;
-                                                    state.lock().await.log(
-                                                        "WARN",
-                                                        format!(
-                                                            "Visible agent browser could not start, and MoonDesk could not immediately revert to headless because the browser became busy: {details}"
-                                                        ),
-                                                    );
-                                                }
-                                            }
+                                            Ok(()) => {}
                                             Err(error) => {
                                                 visible_start_failed = true;
                                                 let rollback = runtime
@@ -6886,12 +6874,12 @@ fn draw_ui(f: &mut Frame, context: UiRenderContext<'_>) {
         .map(|remaining| format!("[ EXPOSED {:>2}s ]", mcp_url_reveal_seconds(remaining)));
     let compact_browser_summary = if app.browser_runtime_running {
         format!(
-            "Isolated agent browser · {} · running · [v] toggle",
+            "Shared agent browser · {} · running · [v] toggle",
             app.browser_presentation.label()
         )
     } else {
         format!(
-            "Isolated agent browser · {} · starts on demand · [v] toggle",
+            "Shared agent browser · {} · starts on demand · [v] toggle",
             app.browser_presentation.label()
         )
     };
@@ -9680,7 +9668,7 @@ mod tests {
         assert!(!computer.text.contains("Remote dbg active"));
         assert!(!computer.text.contains("Selected browser"));
         assert!(!computer.text.contains("Selected target"));
-        assert!(!computer.text.contains("Isolated agent browser"));
+        assert!(!computer.text.contains("Shared agent browser"));
 
         snapshot.mode = super::Mode::Browser;
         let browser = render_dashboard(
@@ -9693,7 +9681,7 @@ mod tests {
             None,
         );
         assert!(browser.text.contains("Browser"));
-        assert!(browser.text.contains("Isolated agent browser"));
+        assert!(browser.text.contains("Shared agent browser"));
         assert!(browser.text.contains("hidden (headless)"));
         assert!(browser.text.contains("starts on demand"));
         assert!(browser.text.contains("[v] toggle"));

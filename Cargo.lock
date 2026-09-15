@@ -1546,6 +1546,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "sha2",
  "subtle",
  "tiktoken-rs",
  "time",

@@ -1,10 +1,12 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command as ProcessCommand, Stdio};
+use std::process::{Child, Command as ProcessCommand, ExitStatus, Stdio};
 use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::thread;
+use std::time::{Duration, Instant};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
 
@@ -13,6 +15,9 @@ use crate::workspaces::WorkspaceId;
 pub const MAX_HANDOFF_LIST_ITEMS: usize = 100;
 const MAX_HANDOFF_BYTES: usize = 128 * 1024;
 const MAX_GIT_STATUS_LINES: usize = 80;
+const MAX_GIT_OUTPUT_BYTES: usize = 128 * 1024;
+const GIT_CONTEXT_TIMEOUT_MS: u64 = 5_000;
+const GIT_WAIT_POLL_MS: u64 = 20;
 const RECENT_COMMIT_COUNT: usize = 5;
 const MAX_JOB_SNAPSHOTS: usize = 64;
 const MAX_RETAINED_CHECKPOINTS_PER_WORKSPACE: usize = 32;
@@ -730,12 +735,57 @@ fn git_command(workspace_root: &str) -> ProcessCommand {
     command
 }
 
+fn wait_for_child_with_timeout(child: &mut Child, timeout: Duration) -> Option<ExitStatus> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Some(status),
+            Ok(None) => {}
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+        thread::sleep(Duration::from_millis(GIT_WAIT_POLL_MS));
+    }
+}
+
 fn git_output(workspace_root: &str, args: &[&str]) -> Option<String> {
-    let output = git_command(workspace_root).args(args).output().ok()?;
-    output
-        .status
+    let mut child = git_command(workspace_root)
+        .args(args)
+        .stdout(Stdio::piped())
+        .spawn()
+        .ok()?;
+    let stdout = child.stdout.take()?;
+    let reader = thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        let mut output = Vec::new();
+        let mut chunk = [0_u8; 8 * 1024];
+        loop {
+            let read = reader.read(&mut chunk).ok()?;
+            if read == 0 {
+                break;
+            }
+            let remaining = MAX_GIT_OUTPUT_BYTES.saturating_sub(output.len());
+            if remaining > 0 {
+                output.extend_from_slice(&chunk[..read.min(remaining)]);
+            }
+        }
+        Some(output)
+    });
+    let child_status =
+        wait_for_child_with_timeout(&mut child, Duration::from_millis(GIT_CONTEXT_TIMEOUT_MS));
+    let output = reader.join().ok()??;
+    let child_status = child_status?;
+    child_status
         .success()
-        .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+        .then(|| String::from_utf8_lossy(&output).into_owned())
 }
 
 fn git_status_output(workspace_root: &str) -> Option<Vec<String>> {
@@ -744,49 +794,42 @@ fn git_status_output(workspace_root: &str) -> Option<Vec<String>> {
         .stdout(Stdio::piped())
         .spawn()
         .ok()?;
-    let Some(stdout) = child.stdout.take() else {
-        let _ = child.kill();
-        let _ = child.wait();
-        return None;
-    };
-    let mut reader = BufReader::new(stdout);
-    let mut status = Vec::with_capacity(MAX_GIT_STATUS_LINES + 1);
-    let mut line = String::new();
-    let mut truncated = false;
+    let stdout = child.stdout.take()?;
+    let reader = thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        let mut status = Vec::with_capacity(MAX_GIT_STATUS_LINES + 1);
+        let mut line = String::new();
+        let mut truncated = false;
 
-    loop {
-        line.clear();
-        let bytes_read = match reader.read_line(&mut line) {
-            Ok(value) => value,
-            Err(_) => {
-                drop(reader);
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
+        loop {
+            line.clear();
+            let bytes_read = reader.read_line(&mut line).ok()?;
+            if bytes_read == 0 {
+                break;
             }
-        };
-        if bytes_read == 0 {
-            break;
+            while line.ends_with('\n') || line.ends_with('\r') {
+                line.pop();
+            }
+            if status.len() < MAX_GIT_STATUS_LINES {
+                status.push(line.clone());
+            } else {
+                truncated = true;
+            }
         }
-        while line.ends_with('\n') || line.ends_with('\r') {
-            line.pop();
-        }
-        if status.len() == MAX_GIT_STATUS_LINES {
-            truncated = true;
-            break;
-        }
-        status.push(line.clone());
-    }
+        Some((status, truncated))
+    });
 
-    drop(reader);
-    if truncated {
-        let _ = child.kill();
-        let _ = child.wait();
-        status.push(format!("… truncated after {MAX_GIT_STATUS_LINES} lines"));
-        Some(status)
-    } else {
-        child.wait().ok()?.success().then_some(status)
+    let child_status =
+        wait_for_child_with_timeout(&mut child, Duration::from_millis(GIT_CONTEXT_TIMEOUT_MS));
+    let (mut status, truncated) = reader.join().ok()??;
+    let child_status = child_status?;
+    if !child_status.success() {
+        return None;
     }
+    if truncated {
+        status.push(format!("… truncated after {MAX_GIT_STATUS_LINES} lines"));
+    }
+    Some(status)
 }
 
 pub fn capture_git_context(workspace_root: &str) -> GitSnapshot {
@@ -1426,6 +1469,49 @@ mod tests {
         assert!(
             args.windows(2)
                 .any(|pair| pair == ["-c", "core.fsmonitor=false"])
+        );
+    }
+    #[test]
+    fn child_wait_timeout_terminates_stalled_process() {
+        #[cfg(windows)]
+        let mut child = ProcessCommand::new("powershell.exe")
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Start-Sleep -Seconds 5",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn stalled test process");
+
+        #[cfg(not(windows))]
+        let mut child = ProcessCommand::new("sh")
+            .args(["-c", "sleep 5"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn stalled test process");
+
+        let started = Instant::now();
+        assert!(
+            wait_for_child_with_timeout(&mut child, Duration::from_millis(50)).is_none(),
+            "stalled child should time out"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "timeout helper should return promptly"
+        );
+        assert!(
+            child
+                .try_wait()
+                .expect("inspect child after timeout")
+                .is_some(),
+            "timed-out child must already be reaped"
         );
     }
 }

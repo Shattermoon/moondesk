@@ -127,7 +127,7 @@ When no saved workspace registry exists, MoonDesk creates workspace #1 from the 
 
 ### Session handoffs
 
-Session handoffs are manual and explicit. When you ask ChatGPT for a handoff, say you are moving the work to another chat, or otherwise explicitly request continuation state, ChatGPT can call `create_handoff`. MoonDesk does not create handoffs silently or periodically in the background. The checkpoint is stored under `~/.moondesk/handoffs/<workspace-id>/` rather than inside the project and contains the goal, completed work, decisions, validation, blockers, next steps, optional notes, the current Git branch/HEAD/status/recent commits, and currently running MoonDesk command jobs. Never put credentials, tokens, passwords, private keys, or other secrets in handoff text.
+Session handoffs are manual and explicit. When you ask ChatGPT for a handoff, say you are moving the work to another chat, or otherwise explicitly request continuation state, ChatGPT can call `create_handoff`. MoonDesk does not create handoffs silently or periodically in the background. The checkpoint is stored in MoonDesk's data directory (`%USERPROFILE%\.moondesk\handoffs\<workspace-id>\` on Windows; `$HOME/.moondesk/handoffs/<workspace-id>/` on macOS/Linux) rather than inside the project and contains the goal, completed work, decisions, validation, blockers, next steps, optional notes, the current Git branch/HEAD/status/recent commits, and currently running MoonDesk command jobs. Never put credentials, tokens, passwords, private keys, or other secrets in handoff text.
 
 On a later connection, `moondesk_instruction` automatically announces the newest active handoff for that exact persisted MoonDesk workspace UUID. Call `resume_handoff` with the reported ID before continuing. MoonDesk re-reads current Git and retained command-job state and reports drift such as a changed branch/HEAD, working-tree changes, moved workspace root, completed/missing jobs, or new running jobs. The checkpoint remains recoverable after resume; call `complete_handoff` only when the continuation is genuinely finished. Creating a newer checkpoint supersedes older active checkpoints while retaining a bounded recent history; once the per-workspace history limit is exceeded, MoonDesk prunes only the oldest inactive checkpoints and never the active checkpoint.
 
@@ -215,7 +215,7 @@ Use:
 | Port override | `PORT` |
 | Initial workspace override | `WORKSPACE_ROOT` |
 | Global instructions | `~/.moondesk/AGENTS.md` |
-| Session handoffs | `~/.moondesk/handoffs/<workspace-id>/` |
+| Session handoffs | `%USERPROFILE%\.moondesk\handoffs\<workspace-id>\` on Windows; `$HOME/.moondesk/handoffs/<workspace-id>/` on macOS/Linux |
 | Codex-compatible instructions | `~/.codex/AGENTS.md` |
 
 MoonDesk also checks `AGENTS.md` in the current workspace. Workspace instructions take priority.

@@ -87,6 +87,7 @@ pub struct McpRequestContext<'a> {
     pub mode: Mode,
     pub tool_mode: ToolMode,
     pub set_moondesk_as_co_author: bool,
+    pub handoff_store_root: Option<&'a Path>,
     pub command_jobs: &'a CommandJobManager,
     pub browser_runtime: &'a Option<Arc<BrowserRuntime>>,
 }
@@ -782,6 +783,7 @@ async fn handle_tools_call(
             mode,
             tool_mode,
             set_moondesk_as_co_author,
+            handoff_store_root: None,
             command_jobs,
             browser_runtime,
         },
@@ -819,6 +821,7 @@ async fn handle_tools_call_for_workspace(
         mode,
         tool_mode,
         set_moondesk_as_co_author,
+        handoff_store_root,
         command_jobs,
         browser_runtime,
     } = context;
@@ -909,12 +912,28 @@ async fn handle_tools_call_for_workspace(
         }
         return match tool_name.as_str() {
             "create_handoff" => {
-                handle_create_handoff(req, workspace_id, workspace_root, command_jobs).await
+                handle_create_handoff(
+                    req,
+                    workspace_id,
+                    workspace_root,
+                    handoff_store_root,
+                    command_jobs,
+                )
+                .await
             }
             "resume_handoff" => {
-                handle_resume_handoff(req, workspace_id, workspace_root, command_jobs).await
+                handle_resume_handoff(
+                    req,
+                    workspace_id,
+                    workspace_root,
+                    handoff_store_root,
+                    command_jobs,
+                )
+                .await
             }
-            "complete_handoff" => handle_complete_handoff(req, workspace_id).await,
+            "complete_handoff" => {
+                handle_complete_handoff(req, workspace_id, handoff_store_root).await
+            }
             _ => tool_error_response(req, format!("Unknown handoff tool: {tool_name}")),
         };
     }
@@ -974,13 +993,17 @@ async fn handle_tools_call_for_workspace(
                 }
             } else {
                 match tool_name.as_str() {
-                    "moondesk_instruction" => handle_moondesk_instruction(
-                        req,
-                        workspace_id,
-                        workspace_root,
-                        mode,
-                        tool_mode,
-                    ),
+                    "moondesk_instruction" => {
+                        handle_moondesk_instruction(
+                            req,
+                            workspace_id,
+                            workspace_root,
+                            mode,
+                            tool_mode,
+                            handoff_store_root,
+                        )
+                        .await
+                    }
                     "read" => handle_read_file(req, workspace_root),
                     "view_image" => handle_view_image(req, workspace_root),
                     "view_images" => handle_view_images(req, workspace_root),
@@ -1002,7 +1025,15 @@ async fn handle_tools_call_for_workspace(
                 }
             }
         } else if mode.browser_enabled() && tool_name == "moondesk_instruction" {
-            handle_moondesk_instruction(req, workspace_id, workspace_root, mode, tool_mode)
+            handle_moondesk_instruction(
+                req,
+                workspace_id,
+                workspace_root,
+                mode,
+                tool_mode,
+                handoff_store_root,
+            )
+            .await
         } else {
             tool_error_response(req, format!("Unknown tool: {tool_name}"))
         }
@@ -1050,6 +1081,7 @@ async fn handle_create_handoff(
     req: &JsonRpcRequest,
     workspace_id: &WorkspaceId,
     workspace_root: &str,
+    handoff_store_root: Option<&Path>,
     command_jobs: &CommandJobManager,
 ) -> JsonRpcResponse {
     let arguments = tool_arguments(req);
@@ -1102,10 +1134,14 @@ async fn handle_create_handoff(
         next_steps,
         notes,
     };
+    let handoff_store_root = handoff_store_root.map(Path::to_path_buf);
     let workspace_id = workspace_id.clone();
     let workspace_root = workspace_root.to_string();
-    let result = match tokio::task::spawn_blocking(move || {
-        handoff::create_handoff(&workspace_id, &workspace_root, input, jobs)
+    let result = match tokio::task::spawn_blocking(move || match handoff_store_root {
+        Some(store_root) => {
+            handoff::create_handoff_at(&store_root, &workspace_id, &workspace_root, input, jobs)
+        }
+        None => handoff::create_handoff(&workspace_id, &workspace_root, input, jobs),
     })
     .await
     {
@@ -1148,6 +1184,7 @@ async fn handle_resume_handoff(
     req: &JsonRpcRequest,
     workspace_id: &WorkspaceId,
     workspace_root: &str,
+    handoff_store_root: Option<&Path>,
     command_jobs: &CommandJobManager,
 ) -> JsonRpcResponse {
     let arguments = tool_arguments(req);
@@ -1161,10 +1198,18 @@ async fn handle_resume_handoff(
         .into_iter()
         .map(handoff_job_from_summary)
         .collect::<Vec<_>>();
+    let handoff_store_root = handoff_store_root.map(Path::to_path_buf);
     let workspace_id = workspace_id.clone();
     let workspace_root = workspace_root.to_string();
-    let result = match tokio::task::spawn_blocking(move || {
-        handoff::resume_handoff(&workspace_id, &workspace_root, &handoff_id, current_jobs)
+    let result = match tokio::task::spawn_blocking(move || match handoff_store_root {
+        Some(store_root) => handoff::resume_handoff_at(
+            &store_root,
+            &workspace_id,
+            &workspace_root,
+            &handoff_id,
+            current_jobs,
+        ),
+        None => handoff::resume_handoff(&workspace_id, &workspace_root, &handoff_id, current_jobs),
     })
     .await
     {
@@ -1218,16 +1263,21 @@ async fn handle_resume_handoff(
 async fn handle_complete_handoff(
     req: &JsonRpcRequest,
     workspace_id: &WorkspaceId,
+    handoff_store_root: Option<&Path>,
 ) -> JsonRpcResponse {
     let arguments = tool_arguments(req);
     let handoff_id = match required_string_argument(&arguments, "handoff_id") {
         Ok(value) => value.to_string(),
         Err(error) => return tool_error_response(req, error),
     };
+    let handoff_store_root = handoff_store_root.map(Path::to_path_buf);
     let workspace_id = workspace_id.clone();
     let handoff_id_for_task = handoff_id.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        handoff::complete_handoff(&workspace_id, &handoff_id_for_task)
+    let result = tokio::task::spawn_blocking(move || match handoff_store_root {
+        Some(store_root) => {
+            handoff::complete_handoff_at(&store_root, &workspace_id, &handoff_id_for_task)
+        }
+        None => handoff::complete_handoff(&workspace_id, &handoff_id_for_task),
     })
     .await;
     match result {
@@ -1971,6 +2021,7 @@ fn moondesk_instruction_text(
     workspace_root: &str,
     mode: Mode,
     tool_mode: ToolMode,
+    handoff_store_root: Option<&Path>,
 ) -> std::io::Result<String> {
     let mut lines: Vec<String> = r#"MoonDesk usage instructions
 
@@ -2058,7 +2109,11 @@ Always specify the branch explicitly when using `git push`."#
                 .to_string(),
         );
     }
-    match handoff::latest_active_summary(workspace_id) {
+    let active_handoff = match handoff_store_root {
+        Some(store_root) => handoff::latest_active_summary_at(store_root, workspace_id),
+        None => handoff::latest_active_summary(workspace_id),
+    };
+    match active_handoff {
         Ok(Some(summary)) => {
             lines.push("".to_string());
             lines.push("Active MoonDesk session handoff:".to_string());
@@ -2086,23 +2141,39 @@ Always specify the branch explicitly when using `git push`."#
     Ok(lines.join("\n"))
 }
 
-fn handle_moondesk_instruction(
+async fn handle_moondesk_instruction(
     req: &JsonRpcRequest,
     workspace_id: &WorkspaceId,
     workspace_root: &str,
     mode: Mode,
     tool_mode: ToolMode,
+    handoff_store_root: Option<&Path>,
 ) -> JsonRpcResponse {
-    let instruction_text =
-        match moondesk_instruction_text(workspace_id, workspace_root, mode, tool_mode) {
-            Ok(value) => value,
-            Err(error) => {
-                return tool_error_response(
-                    req,
-                    format!("Failed to resolve AGENTS.md configuration: {error}"),
-                );
-            }
-        };
+    let workspace_id = workspace_id.clone();
+    let workspace_root = workspace_root.to_string();
+    let handoff_store_root = handoff_store_root.map(Path::to_path_buf);
+    let instruction_text = match tokio::task::spawn_blocking(move || {
+        moondesk_instruction_text(
+            &workspace_id,
+            &workspace_root,
+            mode,
+            tool_mode,
+            handoff_store_root.as_deref(),
+        )
+    })
+    .await
+    {
+        Ok(Ok(value)) => value,
+        Ok(Err(error)) => {
+            return tool_error_response(
+                req,
+                format!("Failed to resolve AGENTS.md configuration: {error}"),
+            );
+        }
+        Err(error) => {
+            return tool_error_response(req, format!("Instruction task failed: {error}"));
+        }
+    };
     let structured = json!({ "instructionText": instruction_text.clone() });
     tool_success_response_with_structured(req, instruction_text, structured)
 }
@@ -3462,6 +3533,28 @@ mod tests {
     use super::*;
     use uuid::Uuid;
 
+    struct TestTempDir {
+        path: PathBuf,
+    }
+
+    impl TestTempDir {
+        fn new(prefix: &str) -> Self {
+            let path = std::env::temp_dir().join(format!("{prefix}-{}", Uuid::new_v4()));
+            std::fs::create_dir_all(&path).expect("create test temp dir");
+            Self { path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TestTempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
     fn tool_call_request(name: &str, arguments: Value) -> JsonRpcRequest {
         JsonRpcRequest {
             jsonrpc: "2.0".into(),
@@ -4190,16 +4283,13 @@ mod tests {
 
     #[tokio::test]
     async fn handoff_mcp_lifecycle_discovers_resumes_and_completes_without_bootstrap_injection() {
-        let workspace_root =
-            std::env::temp_dir().join(format!("moondesk-mcp-handoff-e2e-{}", Uuid::new_v4()));
+        let temp_root = TestTempDir::new("moondesk-mcp-handoff-e2e");
+        let workspace_root = temp_root.path().join("workspace");
+        let handoff_store_root = temp_root.path().join("handoff-store");
         std::fs::create_dir_all(&workspace_root).expect("create workspace");
         let workspace_root_str = workspace_root.to_string_lossy().into_owned();
         let workspace_id = WorkspaceId::new();
         let command_jobs = CommandJobManager::new();
-        let store_dir = handoff::default_store_root()
-            .expect("resolve handoff test store")
-            .join(workspace_id.as_str());
-        let _ = std::fs::remove_dir_all(&store_dir);
 
         let initial_instruction = handle_tools_call_for_workspace(
             &tool_call_request("moondesk_instruction", json!({})),
@@ -4209,6 +4299,7 @@ mod tests {
                 mode: Mode::Both,
                 tool_mode: ToolMode::MultiTools,
                 set_moondesk_as_co_author: false,
+                handoff_store_root: Some(&handoff_store_root),
                 command_jobs: &command_jobs,
                 browser_runtime: &None,
             },
@@ -4226,7 +4317,7 @@ mod tests {
             initial_instruction_text.contains("do not create handoffs silently or periodically")
         );
         assert!(
-            handoff::latest_active_summary(&workspace_id)
+            handoff::latest_active_summary_at(&handoff_store_root, &workspace_id)
                 .expect("read initial handoff state")
                 .is_none(),
             "reading MoonDesk instructions must never create a handoff"
@@ -4251,6 +4342,7 @@ mod tests {
                 mode: Mode::Both,
                 tool_mode: ToolMode::MultiTools,
                 set_moondesk_as_co_author: false,
+                handoff_store_root: Some(&handoff_store_root),
                 command_jobs: &command_jobs,
                 browser_runtime: &None,
             },
@@ -4281,6 +4373,7 @@ mod tests {
                 mode: Mode::Both,
                 tool_mode: ToolMode::MultiTools,
                 set_moondesk_as_co_author: false,
+                handoff_store_root: Some(&handoff_store_root),
                 command_jobs: &command_jobs,
                 browser_runtime: &None,
             },
@@ -4308,6 +4401,7 @@ mod tests {
                 mode: Mode::Both,
                 tool_mode: ToolMode::MultiTools,
                 set_moondesk_as_co_author: false,
+                handoff_store_root: Some(&handoff_store_root),
                 command_jobs: &command_jobs,
                 browser_runtime: &None,
             },
@@ -4343,6 +4437,7 @@ mod tests {
                 mode: Mode::Both,
                 tool_mode: ToolMode::MultiTools,
                 set_moondesk_as_co_author: false,
+                handoff_store_root: Some(&handoff_store_root),
                 command_jobs: &command_jobs,
                 browser_runtime: &None,
             },
@@ -4367,6 +4462,7 @@ mod tests {
                 mode: Mode::Both,
                 tool_mode: ToolMode::MultiTools,
                 set_moondesk_as_co_author: false,
+                handoff_store_root: Some(&handoff_store_root),
                 command_jobs: &command_jobs,
                 browser_runtime: &None,
             },
@@ -4390,6 +4486,7 @@ mod tests {
                 mode: Mode::Both,
                 tool_mode: ToolMode::MultiTools,
                 set_moondesk_as_co_author: false,
+                handoff_store_root: Some(&handoff_store_root),
                 command_jobs: &command_jobs,
                 browser_runtime: &None,
             },
@@ -4404,9 +4501,6 @@ mod tests {
             .expect("final instruction text");
         assert!(!final_instruction_text.contains(&handoff_id));
         assert!(!final_instruction_text.contains(hostile_goal));
-
-        let _ = std::fs::remove_dir_all(store_dir);
-        let _ = std::fs::remove_dir_all(workspace_root);
     }
 
     #[tokio::test]

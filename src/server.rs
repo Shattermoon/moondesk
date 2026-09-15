@@ -845,6 +845,7 @@ async fn post_mcp(
             mode,
             tool_mode,
             set_moondesk_as_co_author,
+            handoff_store_root: None,
             command_jobs: &s.command_jobs,
             browser_runtime: &s.browser_runtime,
         },

@@ -125,18 +125,31 @@ Use `[w] Workspaces` to add, rename, inspect, copy, rotate, or remove projects. 
 
 When no saved workspace registry exists, MoonDesk creates workspace #1 from the directory it was launched in (or `WORKSPACE_ROOT`). After deleting/resetting the config, launching again from the same project can therefore show the same workspace name and root even though it is a freshly generated registration with a new secret. Startup logs state explicitly when this bootstrap path was used.
 
+### Session handoffs
+
+Session handoffs are manual and explicit. When you ask ChatGPT for a handoff, say you are moving the work to another chat, or otherwise explicitly request continuation state, ChatGPT can call `create_handoff`. MoonDesk does not create handoffs silently or periodically in the background. The checkpoint is stored in MoonDesk's data directory (`%USERPROFILE%\.moondesk\handoffs\<workspace-id>\` on Windows; `$HOME/.moondesk/handoffs/<workspace-id>/` on macOS/Linux) rather than inside the project and contains the goal, completed work, decisions, validation, blockers, next steps, optional notes, the current Git branch/HEAD/status/recent commits, and currently running MoonDesk command jobs. Never put credentials, tokens, passwords, private keys, or other secrets in handoff text.
+
+On a later connection, `moondesk_instruction` automatically announces the newest active handoff for that exact persisted MoonDesk workspace UUID. Call `resume_handoff` with the reported ID before continuing. MoonDesk re-reads current Git and retained command-job state and reports drift such as a changed branch/HEAD, working-tree changes, moved workspace root, completed/missing jobs, or new running jobs. The checkpoint remains recoverable after resume; call `complete_handoff` only when the continuation is genuinely finished. Creating a newer checkpoint supersedes older active checkpoints while retaining a bounded recent history; once the per-workspace history limit is exceeded, MoonDesk prunes only the oldest inactive checkpoints and never the active checkpoint.
+
+Handoff metadata changes MoonDesk's own persistent state, so `create_handoff`, `resume_handoff`, and `complete_handoff` are available in `multi-tools` mode, not `read-only` mode. Discovery through `moondesk_instruction` remains read-only. `create_handoff` can optionally return a portable Markdown rendering for manual export, but ChatGPT Library is not required for normal recovery.
+
 Browser control is shared by the host. Workspaces using browser mode share one lazy **isolated agent browser** session that starts only on first use. It runs **headless by default** at a deterministic 1280×800 initial viewport, so normal agent work does not open a Chrome window, while `view_page` and screenshots still inspect the browser's rendered pixels. Agents can still resize or emulate the target viewport for responsive QA. Press `[v]` in the live dashboard to switch between hidden/headless and visible presentation; the Browser status row shows the current mode and the toggle hint. In `multi-tools` mode an agent can also call `set_browser_presentation`, primarily when a login, CAPTCHA, permission prompt, or other step needs human input. If changing presentation would close a live session, the tool refuses the change and reports `confirmation_required`; the agent must get explicit user approval before retrying with `confirm_restart=true`. Changing presentation while the browser is running closes that temporary session first, so its tabs, cookies, storage, page state, and snapshot UIDs are discarded. Switching to visible starts a fresh empty visible browser immediately; if that headful launch fails, MoonDesk reverts the setting to headless so later agent browser work remains usable. A human-assisted visible session should stay visible while its entered state is still needed; switching back to headless closes that session and returns to lazy hidden startup on the next browser action. MoonDesk never attaches to or reuses your personal browser profile, cookies, or logged-in sessions.
 
 Because every workspace shares this host and public tunnel, stopping MoonDesk disconnects all active workspace connectors. Pressing `q` or `Ctrl+C` in the live dashboard therefore opens a shutdown confirmation instead of stopping the host immediately; `Enter` confirms and `Esc` keeps MoonDesk running.
 
 ## Tools
 
-In `multi-tools` mode MoonDesk exposes 12 local tools:
+In `multi-tools` mode MoonDesk exposes 17 local computer/workspace tools:
 
 | Tool | Purpose |
 | --- | --- |
-| `moondesk_instruction` | MoonDesk usage guidance |
-| `read` | Read workspace files |
+| `moondesk_instruction` | MoonDesk usage guidance and active-handoff discovery |
+| `create_handoff` | Persist a workspace-scoped session checkpoint |
+| `resume_handoff` | Load a checkpoint and verify current Git/job drift |
+| `complete_handoff` | Mark a continuation finished |
+| `read` | Read workspace or explicitly addressed local files |
+| `view_image` | Inspect one local image with model vision |
+| `view_images` | Inspect several local images together |
 | `search` | Search workspace text |
 | `write` | Create or overwrite files |
 | `edit` | Replace exact text |
@@ -150,7 +163,7 @@ In `multi-tools` mode MoonDesk exposes 12 local tools:
 
 Use `run_command` for short work. Use `start_command` + `poll_command` for builds, tests, package installs, dev servers, and other long-running commands. Polls long-wait by default and report elapsed, idle, and timeout timing so agents can avoid rapid blind polling.
 
-`read-only` mode removes local mutation/shell tools. In Browser/Both mode it still permits bounded browser inspection, while state-changing browser commands and browser file-output flags remain blocked.
+`read-only` mode removes workspace mutation/shell tools and MoonDesk metadata mutation tools such as `create_handoff`, `resume_handoff`, and `complete_handoff`. `moondesk_instruction` can still report that an active handoff exists. In Browser/Both mode, read-only also permits bounded browser inspection while state-changing browser commands and browser file-output flags remain blocked.
 
 Browser mode has a stable tool catalog instead of forwarding the full Chrome DevTools MCP schema:
 
@@ -202,6 +215,7 @@ Use:
 | Port override | `PORT` |
 | Initial workspace override | `WORKSPACE_ROOT` |
 | Global instructions | `~/.moondesk/AGENTS.md` |
+| Session handoffs | `%USERPROFILE%\.moondesk\handoffs\<workspace-id>\` on Windows; `$HOME/.moondesk/handoffs/<workspace-id>/` on macOS/Linux |
 | Codex-compatible instructions | `~/.codex/AGENTS.md` |
 
 MoonDesk also checks `AGENTS.md` in the current workspace. Workspace instructions take priority.

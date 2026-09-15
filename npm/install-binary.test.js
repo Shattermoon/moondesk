@@ -85,6 +85,36 @@ test("ensureBinary downloads, verifies, and reuses a cached binary", async () =>
   }
 });
 
+test("ensureBinary reports native binary download progress while streaming", async () => {
+  const dir = tempDir();
+  try {
+    const target = resolveTarget();
+    const binary = Buffer.alloc(1024 * 1024 + 17, 0x5a);
+    const { fetchImpl } = makeFetch(binary, target.assetName);
+    const progress = [];
+
+    await ensureBinary({
+      installDir: dir,
+      releaseBaseUrl: "https://example.invalid/releases/v-test",
+      fetchImpl,
+      onDownloadProgress: (event) => progress.push(event),
+    });
+
+    assert.ok(progress.length >= 2, "download should report a start event and transferred bytes");
+    assert.deepEqual(progress[0], { downloadedBytes: 0, totalBytes: binary.length });
+    assert.equal(progress.at(-1).downloadedBytes, binary.length);
+    assert.equal(progress.at(-1).totalBytes, binary.length);
+    for (let index = 1; index < progress.length; index += 1) {
+      assert.ok(
+        progress[index].downloadedBytes >= progress[index - 1].downloadedBytes,
+        "reported byte counts must be monotonic",
+      );
+    }
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("missing cached executable is redownloaded even when checksum metadata remains", async () => {
   const dir = tempDir();
   try {

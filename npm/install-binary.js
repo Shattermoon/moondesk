@@ -442,15 +442,16 @@ function createDownloadProgressReporter(logger = console) {
   let lastUnknownBytes = 0;
   const unknownReportStep = 5 * 1024 * 1024;
 
+  // Progress is diagnostic output: keep stdout reserved for native command results.
   return ({ downloadedBytes, totalBytes }) => {
     if (!started) {
       started = true;
       if (Number.isFinite(totalBytes) && totalBytes > 0) {
-        logger.log?.(
+        logger.warn?.(
           `Downloading MoonDesk ${version} native binary (${formatMiB(totalBytes)})...`,
         );
       } else {
-        logger.log?.(`Downloading MoonDesk ${version} native binary...`);
+        logger.warn?.(`Downloading MoonDesk ${version} native binary...`);
       }
     }
 
@@ -461,7 +462,7 @@ function createDownloadProgressReporter(logger = console) {
       const bucket = percent === 100 ? 100 : Math.floor(percent / 25) * 25;
       if (bucket >= 25 && bucket > lastPercentBucket) {
         lastPercentBucket = bucket;
-        logger.log?.(
+        logger.warn?.(
           `MoonDesk ${version} native binary download: ${bucket}% (${formatMiB(Math.min(downloadedBytes, totalBytes))} / ${formatMiB(totalBytes)})`,
         );
       }
@@ -470,7 +471,7 @@ function createDownloadProgressReporter(logger = console) {
 
     if (downloadedBytes - lastUnknownBytes >= unknownReportStep) {
       lastUnknownBytes = downloadedBytes;
-      logger.log?.(
+      logger.warn?.(
         `MoonDesk ${version} native binary download: ${formatMiB(downloadedBytes)} downloaded...`,
       );
     }

@@ -135,6 +135,47 @@ test("managed update environment variables never leak into npm or the restarted 
   );
 });
 
+test("startup reports native binary download progress without contaminating stdout", async () => {
+  const dir = tempDir();
+  const stdoutLogs = [];
+  const progressMessages = [];
+  try {
+    const result = await orchestrateWithoutRefresh({
+      cwd: dir,
+      logger: {
+        log(message) {
+          stdoutLogs.push(message);
+        },
+        warn(message) {
+          progressMessages.push(message);
+        },
+        error() {},
+      },
+      updateStatePath: path.join(dir, "state.json"),
+      updateRequestPath: path.join(dir, "request.json"),
+      ensureBinaryImpl: async ({ onDownloadProgress }) => {
+        const totalBytes = 8 * 1024 * 1024;
+        onDownloadProgress({ downloadedBytes: 0, totalBytes });
+        onDownloadProgress({ downloadedBytes: totalBytes / 2, totalBytes });
+        onDownloadProgress({ downloadedBytes: totalBytes, totalBytes });
+        return "/fake/moondesk";
+      },
+      cleanupOldBinaryVersionsImpl: () => {},
+      cleanupOldUpdateVersionsImpl: () => {},
+      startUpdateMonitorImpl: () => () => {},
+      runNativeImpl: async () => ({ code: 0, signal: null }),
+    });
+
+    assert.deepEqual(result, { code: 0, signal: null });
+    assert.deepEqual(stdoutLogs, []);
+    assert.match(progressMessages[0], /^Downloading MoonDesk .+ native binary \(8\.0 MiB\)\.\.\.$/);
+    assert.match(progressMessages[1], /native binary download: 50% \(4\.0 MiB \/ 8\.0 MiB\)$/);
+    assert.match(progressMessages[2], /native binary download: 100% \(8\.0 MiB \/ 8\.0 MiB\)$/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("normal native exit leaves npm untouched and stops the update monitor", async () => {
   const dir = tempDir();
   const requestPath = path.join(dir, "request.json");

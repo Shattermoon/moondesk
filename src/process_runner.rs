@@ -475,8 +475,16 @@ fn spawn_owned_command_blocking(mut command: Command, stdin: Stdio) -> io::Resul
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        use windows_sys::Win32::System::Threading::CREATE_SUSPENDED;
-        command.as_std_mut().creation_flags(CREATE_SUSPENDED);
+        use windows_sys::Win32::System::Threading::{CREATE_NO_WINDOW, CREATE_SUSPENDED};
+
+        // MoonDesk owns stdin/stdout/stderr for these background children. Keep them detached from
+        // the TUI's console as well: Windows console-host output (notably PowerShell progress
+        // records) can otherwise bypass redirected stdio and paint directly over Ratatui's
+        // alternate screen. CREATE_NO_WINDOW preserves pipes and Job Object ownership while
+        // preventing those children from sharing MoonDesk's console surface.
+        command
+            .as_std_mut()
+            .creation_flags(CREATE_SUSPENDED | CREATE_NO_WINDOW);
     }
 
     let mut child = command.spawn()?;
@@ -943,6 +951,32 @@ mod tests {
         );
         assert!(result.stdout.to_ascii_lowercase().contains("cargo"));
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    #[ignore = "local Windows console-isolation smoke"]
+    async fn windows_owned_shell_does_not_share_parent_console_surface() {
+        let root = workspace("console-isolation");
+        let command = r#"
+Add-Type -Namespace MoonDesk -Name ConsoleProbe -MemberDefinition @'
+[System.Runtime.InteropServices.DllImport("kernel32.dll")]
+public static extern System.IntPtr GetConsoleWindow();
+'@
+if ([MoonDesk.ConsoleProbe]::GetConsoleWindow() -ne [IntPtr]::Zero) {
+    Write-Error "MoonDesk child unexpectedly inherited the parent console"
+    exit 91
+}
+Write-Output "NO_CONSOLE"
+"#;
+        let result = run_shell_command(command, &root, 10_000, 16 * 1024, None).await;
+        let _ = std::fs::remove_dir_all(root);
+        assert!(
+            result.success,
+            "owned shell retained a console surface: stdout={} stderr={}",
+            result.stdout, result.stderr
+        );
+        assert!(result.stdout.contains("NO_CONSOLE"));
     }
 
     #[cfg(windows)]

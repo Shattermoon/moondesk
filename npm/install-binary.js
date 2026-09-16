@@ -103,7 +103,67 @@ function cleanupOldBinaryVersions(options = {}) {
   return { removed, skipped };
 }
 
-async function fetchRequired(fetchImpl, url, maxBytes, timeoutMs = METADATA_TIMEOUT_MS) {
+function reportDownloadProgress(callback, downloadedBytes, totalBytes) {
+  if (typeof callback !== "function") return;
+  try {
+    callback({ downloadedBytes, totalBytes });
+  } catch {
+    // Download reporting is best-effort and must never make a verified install fail.
+  }
+}
+
+async function readResponseBuffer(response, url, maxBytes, onProgress) {
+  const declaredLength = Number(response.headers.get("content-length"));
+  const totalBytes = Number.isFinite(declaredLength) && declaredLength >= 0 ? declaredLength : null;
+  if (totalBytes !== null && totalBytes > maxBytes) {
+    throw new Error(`${url} is unexpectedly large (${totalBytes} bytes)`);
+  }
+
+  reportDownloadProgress(onProgress, 0, totalBytes);
+
+  if (!response.body || typeof response.body.getReader !== "function") {
+    const buffer = Buffer.from(await response.arrayBuffer());
+    if (buffer.length > maxBytes) {
+      throw new Error(`${url} exceeded the ${maxBytes}-byte download limit`);
+    }
+    reportDownloadProgress(onProgress, buffer.length, totalBytes);
+    return buffer;
+  }
+
+  const reader = response.body.getReader();
+  const chunks = [];
+  let downloadedBytes = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const chunk = Buffer.from(value);
+      downloadedBytes += chunk.length;
+      if (downloadedBytes > maxBytes) {
+        try {
+          await reader.cancel();
+        } catch {
+          // Preserve the size-limit error below if cancellation itself fails.
+        }
+        throw new Error(`${url} exceeded the ${maxBytes}-byte download limit`);
+      }
+      chunks.push(chunk);
+      reportDownloadProgress(onProgress, downloadedBytes, totalBytes);
+    }
+  } finally {
+    reader.releaseLock?.();
+  }
+
+  return Buffer.concat(chunks, downloadedBytes);
+}
+
+async function fetchRequired(
+  fetchImpl,
+  url,
+  maxBytes,
+  timeoutMs = METADATA_TIMEOUT_MS,
+  onProgress,
+) {
   const response = await fetchImpl(url, {
     headers: {
       "User-Agent": `moondesk-npm/${version}`,
@@ -115,17 +175,7 @@ async function fetchRequired(fetchImpl, url, maxBytes, timeoutMs = METADATA_TIME
     throw new Error(`${url} returned HTTP ${response.status}`);
   }
 
-  const contentLength = Number(response.headers.get("content-length"));
-  if (Number.isFinite(contentLength) && contentLength > maxBytes) {
-    throw new Error(`${url} is unexpectedly large (${contentLength} bytes)`);
-  }
-
-  const buffer = Buffer.from(await response.arrayBuffer());
-  if (buffer.length > maxBytes) {
-    throw new Error(`${url} exceeded the ${maxBytes}-byte download limit`);
-  }
-
-  return buffer;
+  return readResponseBuffer(response, url, maxBytes, onProgress);
 }
 
 function expectedSha256(checksums, name) {
@@ -343,6 +393,7 @@ async function ensureBinary(options = {}) {
       `${releaseBaseUrl}/${targetInfo.assetName}`,
       MAX_BINARY_BYTES,
       BINARY_TIMEOUT_MS,
+      options.onDownloadProgress,
     );
     const actual = sha256Buffer(binary);
 
@@ -381,8 +432,55 @@ async function ensureBinary(options = {}) {
   }
 }
 
+function formatMiB(bytes) {
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
+}
+
+function createDownloadProgressReporter(logger = console) {
+  let started = false;
+  let lastPercentBucket = 0;
+  let lastUnknownBytes = 0;
+  const unknownReportStep = 5 * 1024 * 1024;
+
+  // Progress is diagnostic output: keep stdout reserved for native command results.
+  return ({ downloadedBytes, totalBytes }) => {
+    if (!started) {
+      started = true;
+      if (Number.isFinite(totalBytes) && totalBytes > 0) {
+        logger.warn?.(
+          `Downloading MoonDesk ${version} native binary (${formatMiB(totalBytes)})...`,
+        );
+      } else {
+        logger.warn?.(`Downloading MoonDesk ${version} native binary...`);
+      }
+    }
+
+    if (!Number.isFinite(downloadedBytes) || downloadedBytes <= 0) return;
+
+    if (Number.isFinite(totalBytes) && totalBytes > 0) {
+      const percent = Math.min(100, Math.floor((downloadedBytes / totalBytes) * 100));
+      const bucket = percent === 100 ? 100 : Math.floor(percent / 25) * 25;
+      if (bucket >= 25 && bucket > lastPercentBucket) {
+        lastPercentBucket = bucket;
+        logger.warn?.(
+          `MoonDesk ${version} native binary download: ${bucket}% (${formatMiB(Math.min(downloadedBytes, totalBytes))} / ${formatMiB(totalBytes)})`,
+        );
+      }
+      return;
+    }
+
+    if (downloadedBytes - lastUnknownBytes >= unknownReportStep) {
+      lastUnknownBytes = downloadedBytes;
+      logger.warn?.(
+        `MoonDesk ${version} native binary download: ${formatMiB(downloadedBytes)} downloaded...`,
+      );
+    }
+  };
+}
+
 module.exports = {
   cleanupOldBinaryVersions,
+  createDownloadProgressReporter,
   ensureBinary,
   expectedSha256,
   resolveTarget,
@@ -390,7 +488,7 @@ module.exports = {
 };
 
 if (require.main === module) {
-  ensureBinary()
+  ensureBinary({ onDownloadProgress: createDownloadProgressReporter(console) })
     .then((binaryPath) => {
       console.log(`MoonDesk native binary ready at ${binaryPath}`);
     })

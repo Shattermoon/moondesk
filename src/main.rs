@@ -14,6 +14,7 @@ mod ngrok;
 mod process_runner;
 mod server;
 mod state;
+mod terminal_compat;
 mod theme;
 mod update;
 mod vision;
@@ -49,9 +50,12 @@ use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use std::time::{Duration, Instant, SystemTime};
+use terminal_compat::ColorCompatBackend;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 use workspaces::{WorkspaceAvailability, WorkspaceConfig, WorkspaceId, workspace_availability};
+
+type AppTerminalBackend = ColorCompatBackend<CrosstermBackend<std::io::Stdout>>;
 
 const FLOW_ROW_CELLS: usize = FLOW_ANIM_CELLS;
 const FLOW_LANE_LEFT_LABEL: &str = "Your computer ";
@@ -1583,11 +1587,22 @@ fn key_is_interrupt(key: &crossterm::event::KeyEvent) -> bool {
         && key.modifiers.contains(KeyModifiers::CONTROL)
 }
 
+fn key_has_plain_ui_modifiers(key: &crossterm::event::KeyEvent) -> bool {
+    !key.modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+}
+
+fn key_is_plain_char(key: &crossterm::event::KeyEvent, expected: char) -> bool {
+    matches!(key.code, KeyCode::Char(c) if c.eq_ignore_ascii_case(&expected))
+        && key_has_plain_ui_modifiers(key)
+}
+
 fn key_is_plain_quit(key: &crossterm::event::KeyEvent) -> bool {
-    matches!(key.code, KeyCode::Char(c) if c.eq_ignore_ascii_case(&'q'))
-        && !key
-            .modifiers
-            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+    key_is_plain_char(key, 'q')
+}
+
+fn key_is_plain_back(key: &crossterm::event::KeyEvent) -> bool {
+    (matches!(key.code, KeyCode::Esc) || key_is_plain_quit(key)) && key_has_plain_ui_modifiers(key)
 }
 
 fn normalize_ngrok_authtoken_input(text: &str) -> String {
@@ -2117,21 +2132,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    match macos_terminal::maybe_relaunch_in_terminal_profile() {
-        Ok(macos_terminal::LaunchAction::Continue) => {}
-        #[cfg(target_os = "macos")]
-        Ok(macos_terminal::LaunchAction::ExitAfterProfileBootstrap) => {
-            eprintln!(
-                "MoonDesk applied the Terminal.app profile. Run the same command again in this tab."
-            );
-            return Ok(());
-        }
-        Err(error) => {
-            return Err(std::io::Error::other(format!(
-                "MoonDesk: macOS Terminal profile bootstrap failed: {error}"
-            ))
-            .into());
-        }
+    if let Err(error) = macos_terminal::restore_legacy_profile_if_needed() {
+        eprintln!(
+            "MoonDesk warning: could not restore the legacy Terminal.app profile: {error}. Continuing with the current terminal profile."
+        );
     }
 
     let state: SharedState = Arc::new(Mutex::new(AppState::new(port, workspace_root)?));
@@ -2139,7 +2143,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut interrupt_listener = None;
 
     let mut terminal_guard = TerminalRestoreGuard::enter()?;
-    let backend = CrosstermBackend::new(stdout());
+    let backend = ColorCompatBackend::for_environment(CrosstermBackend::new(stdout()));
     let mut terminal = Terminal::new(backend)?;
 
     let result = run_app(
@@ -2197,7 +2201,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 // ── Phase 1: Mode selection ─────────────────────────────────
 
 async fn run_app(
-    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    terminal: &mut Terminal<AppTerminalBackend>,
     state: SharedState,
     interrupts: InterruptState,
     interrupt_listener: &mut Option<tokio::task::JoinHandle<()>>,
@@ -2214,6 +2218,9 @@ async fn run_app(
             && let Event::Key(key) = event::read()?
         {
             if key.kind != KeyEventKind::Press {
+                continue;
+            }
+            if matches!(key.code, KeyCode::Char(_)) && !key_has_plain_ui_modifiers(&key) {
                 continue;
             }
             let mode = match key.code {
@@ -2446,7 +2453,7 @@ fn draw_mode_select(f: &mut Frame, theme: &theme::ThemeDef, tool_mode: ToolMode)
 }
 
 async fn run_ngrok_auth_setup(
-    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    terminal: &mut Terminal<AppTerminalBackend>,
     state: SharedState,
     initial_error: Option<String>,
     force_prompt: bool,
@@ -2592,7 +2599,7 @@ async fn run_ngrok_auth_setup(
 }
 
 async fn run_ngrok_domain_setup(
-    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    terminal: &mut Terminal<AppTerminalBackend>,
     state: SharedState,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     if state.lock().await.ngrok_domain.is_some() {
@@ -3074,7 +3081,7 @@ fn draw_prompt(f: &mut Frame, palette: theme::Palette, prompt_title: &str, input
 }
 
 async fn run_prompt(
-    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    terminal: &mut Terminal<AppTerminalBackend>,
     palette: theme::Palette,
     prompt_title: &str,
     initial_value: &str,
@@ -3281,6 +3288,11 @@ fn pick_workspace_folder_blocking() -> Result<Option<PathBuf>, String> {
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
+fn macos_folder_picker_cancelled(stderr: &str) -> bool {
+    stderr.contains("(-128)") || stderr.to_ascii_lowercase().contains("user canceled")
+}
+
 #[cfg(target_os = "macos")]
 fn pick_workspace_folder_blocking() -> Result<Option<PathBuf>, String> {
     let output = std::process::Command::new("/usr/bin/osascript")
@@ -3291,8 +3303,15 @@ fn pick_workspace_folder_blocking() -> Result<Option<PathBuf>, String> {
         .output()
         .map_err(|error| format!("failed to open the macOS folder picker: {error}"))?;
     if !output.status.success() {
-        // AppleScript returns a non-zero status when the user presses Cancel.
-        return Ok(None);
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        if macos_folder_picker_cancelled(&stderr) {
+            return Ok(None);
+        }
+        return Err(if stderr.is_empty() {
+            format!("macOS folder picker exited with status {}", output.status)
+        } else {
+            format!("macOS folder picker failed: {stderr}")
+        });
     }
     let selected = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if selected.is_empty() {
@@ -3397,19 +3416,26 @@ fn workspace_action_from_event(
     hit_areas: &WorkspaceHitAreas,
 ) -> Option<WorkspaceUiAction> {
     match event {
-        Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => Some(WorkspaceUiAction::Back),
-            KeyCode::Up => Some(WorkspaceUiAction::MoveUp),
-            KeyCode::Down => Some(WorkspaceUiAction::MoveDown),
-            KeyCode::Char('a') => Some(WorkspaceUiAction::AddPath),
-            KeyCode::Char('b') => Some(WorkspaceUiAction::BrowseAdd),
-            KeyCode::Char('r') => Some(WorkspaceUiAction::Rename),
-            KeyCode::Enter | KeyCode::Char('v') => Some(WorkspaceUiAction::Reveal),
-            KeyCode::Char('c') => Some(WorkspaceUiAction::Copy),
-            KeyCode::Char('x') => Some(WorkspaceUiAction::Rotate),
-            KeyCode::Char('d') => Some(WorkspaceUiAction::Remove),
-            _ => None,
-        },
+        Event::Key(key) if key.kind == KeyEventKind::Press => {
+            if key_is_plain_back(&key) {
+                return Some(WorkspaceUiAction::Back);
+            }
+            if matches!(key.code, KeyCode::Char(_)) && !key_has_plain_ui_modifiers(&key) {
+                return None;
+            }
+            match key.code {
+                KeyCode::Up => Some(WorkspaceUiAction::MoveUp),
+                KeyCode::Down => Some(WorkspaceUiAction::MoveDown),
+                KeyCode::Char('a') => Some(WorkspaceUiAction::AddPath),
+                KeyCode::Char('b') => Some(WorkspaceUiAction::BrowseAdd),
+                KeyCode::Char('r') => Some(WorkspaceUiAction::Rename),
+                KeyCode::Enter | KeyCode::Char('v') => Some(WorkspaceUiAction::Reveal),
+                KeyCode::Char('c') => Some(WorkspaceUiAction::Copy),
+                KeyCode::Char('x') => Some(WorkspaceUiAction::Rotate),
+                KeyCode::Char('d') => Some(WorkspaceUiAction::Remove),
+                _ => None,
+            }
+        }
         Event::Mouse(mouse) if matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left)) => {
             for (index, area) in &hit_areas.project_rows {
                 if rect_contains(*area, mouse.column, mouse.row) {
@@ -3444,7 +3470,7 @@ fn workspace_action_from_event(
 }
 
 async fn run_workspaces(
-    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    terminal: &mut Terminal<AppTerminalBackend>,
     state: SharedState,
     browser_runtime: Option<Arc<BrowserRuntime>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -4013,7 +4039,7 @@ fn draw_workspaces(f: &mut Frame, view: WorkspacesView<'_>, hit_areas: &mut Work
 }
 
 async fn run_settings(
-    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    terminal: &mut Terminal<AppTerminalBackend>,
     state: SharedState,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let themes = theme::all();
@@ -4072,8 +4098,13 @@ async fn run_settings(
             if key.kind != KeyEventKind::Press {
                 continue;
             }
+            if key_is_plain_back(&key) {
+                return Ok(());
+            }
+            if matches!(key.code, KeyCode::Char(_)) && !key_has_plain_ui_modifiers(&key) {
+                continue;
+            }
             match key.code {
-                KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
                 KeyCode::Up => {
                     confirm_reset_token_billing = false;
                     selected_row = selected_row.saturating_sub(1);
@@ -4847,7 +4878,7 @@ async fn start_services(
 // ── Phase 2: Main TUI ──────────────────────────────────────
 
 async fn run_tui(
-    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    terminal: &mut Terminal<AppTerminalBackend>,
     state: SharedState,
     mut ui_events: UiEventReceiver,
     browser_runtime: Option<Arc<BrowserRuntime>>,
@@ -5136,6 +5167,9 @@ async fn run_tui(
                         if run_quit_confirm(terminal, &state, &interrupts).await? {
                             break;
                         }
+                        continue;
+                    }
+                    if matches!(key.code, KeyCode::Char(_)) && !key_has_plain_ui_modifiers(&key) {
                         continue;
                     }
                     match key.code {
@@ -5887,7 +5921,7 @@ fn quit_confirm_action(key: &crossterm::event::KeyEvent) -> Option<bool> {
 }
 
 async fn run_browser_presentation_confirm(
-    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    terminal: &mut Terminal<AppTerminalBackend>,
     state: &SharedState,
     presentation: BrowserPresentation,
 ) -> Result<bool, Box<dyn std::error::Error>> {
@@ -6017,7 +6051,7 @@ fn draw_browser_presentation_confirm(
 }
 
 async fn run_quit_confirm(
-    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    terminal: &mut Terminal<AppTerminalBackend>,
     state: &SharedState,
     interrupts: &InterruptState,
 ) -> Result<bool, Box<dyn std::error::Error>> {
@@ -6246,7 +6280,7 @@ fn changelog_preview_lines(
 }
 
 async fn run_update_confirm(
-    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    terminal: &mut Terminal<AppTerminalBackend>,
     state: &SharedState,
     update_info: &update::UpdateInfo,
 ) -> Result<bool, Box<dyn std::error::Error>> {
@@ -6458,7 +6492,7 @@ fn draw_update_confirm(
 }
 
 async fn run_changelog_notice(
-    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    terminal: &mut Terminal<AppTerminalBackend>,
     state: &SharedState,
     notice: &update::ChangelogNotice,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -6472,7 +6506,7 @@ async fn run_changelog_notice(
             if key.kind != KeyEventKind::Press {
                 continue;
             }
-            if matches!(key.code, KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q')) {
+            if matches!(key.code, KeyCode::Enter) || key_is_plain_back(&key) {
                 return Ok(());
             }
         }
@@ -7936,9 +7970,10 @@ mod tests {
         browser_headless_fallback_succeeded, cycle_dashboard_focus, dashboard_secret_target_at,
         draw_changelog_notice, draw_prompt, draw_quit_confirm, draw_ui, draw_update_confirm,
         handle_mcp_server_exit, item_under_cursor, key_is_clipboard_paste, key_is_interrupt,
-        key_is_plain_quit, log_secret_target, move_panel_selection, ngrok_setup_cancel_key,
-        normalize_ngrok_authtoken_input, normalize_ngrok_domain, normalize_workspace_path_input,
-        panel_under_cursor, parse_clippymoon_export_args, parse_port_value, port_hosts_moondesk,
+        key_is_plain_back, key_is_plain_quit, log_secret_target, macos_folder_picker_cancelled,
+        move_panel_selection, ngrok_setup_cancel_key, normalize_ngrok_authtoken_input,
+        normalize_ngrok_domain, normalize_workspace_path_input, panel_under_cursor,
+        parse_clippymoon_export_args, parse_port_value, port_hosts_moondesk,
         primary_mcp_url_line_index, quit_confirm_action, reconcile_workspace_filter,
         record_clear_view, reset_filtered_navigation, scroll_panel_down, scroll_panel_up,
         tail_start_index, timed_secret_click, truncate_with_ellipsis, update_confirm_action,
@@ -8744,6 +8779,53 @@ mod tests {
             KeyCode::Char('q'),
             KeyModifiers::ALT,
         )));
+    }
+
+    #[test]
+    fn modified_keys_do_not_trigger_back_or_workspace_shortcuts() {
+        assert!(key_is_plain_back(&KeyEvent::new(
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+        )));
+        assert!(key_is_plain_back(&KeyEvent::new(
+            KeyCode::Char('q'),
+            KeyModifiers::NONE,
+        )));
+        assert!(!key_is_plain_back(&KeyEvent::new(
+            KeyCode::Esc,
+            KeyModifiers::ALT,
+        )));
+        assert!(!key_is_plain_back(&KeyEvent::new(
+            KeyCode::Char('q'),
+            KeyModifiers::SUPER,
+        )));
+
+        let hit_areas = WorkspaceHitAreas::default();
+        assert_eq!(
+            workspace_action_from_event(
+                Event::Key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::SUPER)),
+                &hit_areas,
+            ),
+            None,
+        );
+        assert_eq!(
+            workspace_action_from_event(
+                Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::SUPER)),
+                &hit_areas,
+            ),
+            None,
+        );
+    }
+
+    #[test]
+    fn macos_folder_picker_only_treats_user_cancel_as_cancellation() {
+        assert!(macos_folder_picker_cancelled(
+            "execution error: User canceled. (-128)"
+        ));
+        assert!(macos_folder_picker_cancelled("User canceled."));
+        assert!(!macos_folder_picker_cancelled(
+            "execution error: Not authorized to send Apple events. (-1743)"
+        ));
     }
 
     #[test]

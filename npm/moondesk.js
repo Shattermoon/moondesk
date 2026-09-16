@@ -2,7 +2,11 @@
 
 const fs = require("node:fs");
 const { spawn } = require("node:child_process");
-const { cleanupOldBinaryVersions, ensureBinary } = require("./install-binary");
+const {
+  cleanupOldBinaryVersions,
+  createDownloadProgressReporter,
+  ensureBinary,
+} = require("./install-binary");
 const {
   UPDATE_EXIT_CODE,
   acquireUpdateLock,
@@ -176,7 +180,9 @@ async function orchestrate(options = {}) {
 
   let binaryPath;
   try {
-    binaryPath = await ensureBinaryImpl();
+    binaryPath = await ensureBinaryImpl({
+      onDownloadProgress: createDownloadProgressReporter(logger),
+    });
   } catch (error) {
     stopUpdateMonitor();
     cleanupEphemeralUpdateFiles(updateStatePath, updateRequestPath);

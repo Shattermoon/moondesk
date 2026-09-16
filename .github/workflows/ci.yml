@@ -62,6 +62,34 @@ jobs:
           node -e "const p=require('./package.json'); if (Object.keys(p.bin||{}).length !== 1 || p.bin.moondesk !== 'npm/moondesk.js') throw new Error('MoonDesk must expose exactly one CLI bin'); for (const f of ['npm/moondesk.js','npm/install-binary.js','npm/update-manager.js','skills/browser/SKILL.md']) if (!p.files?.includes(f)) throw new Error('missing packaged runtime file: '+f)"
           node .github/scripts/verify-npm-package.mjs
 
+  macos-rust:
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.draft == false
+    name: macOS Rust validation
+    runs-on: macos-15
+
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal --component clippy
+
+      - name: Run Clippy
+        run: cargo +stable clippy --all-targets --locked -- -D warnings
+
+      - name: Reject production panics and unchecked assumptions
+        run: cargo +stable clippy --bin moondesk --locked -- -D warnings -D clippy::unwrap_used -D clippy::expect_used -D clippy::panic -D clippy::unreachable
+
+      - name: Run tests
+        run: cargo +stable test --locked -- --test-threads 1
+
+      - name: Build and smoke-test release binary
+        run: |
+          cargo +stable build --release --locked
+          ./target/release/moondesk --version
+          ./target/release/moondesk clippymoon --help
+
   windows-rust:
     if: github.event_name == 'workflow_dispatch' || github.event.pull_request.draft == false
     name: Windows Rust validation
@@ -103,6 +131,9 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo +stable test --locked state::tests::missing_workspace_registry_logs_launch_directory_bootstrap -- --exact --test-threads 1
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Run Windows TUI console isolation smoke
+        run: cargo +stable test --locked windows_owned_shell_does_not_share_parent_console_surface -- --ignored
 
       - name: Run Windows developer toolchain smoke
         run: cargo +stable test --locked windows_developer_toolchain_smoke_uses_normal_host_environment -- --ignored

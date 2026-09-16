@@ -727,7 +727,7 @@ async fn handle_tools_list(
         tools.push(json!({
             "name": "browser_command",
             "title": "Run browser command",
-            "description": "Run one Chrome DevTools CLI browser operation against MoonDesk's shared lazy agent-browser session. The isolated browser is headless by default, starts only on the first browser operation, and is reused across commands; the user can switch it to visible presentation from MoonDesk. Use resize_page for normal desktop window sizes; use emulate with --viewport=<width>x<height>x<dpr>[,mobile][,touch] for exact tablet/mobile responsive testing, then take a fresh snapshot before using UIDs. Other useful commands include list_pages, new_page, navigate_page, take_snapshot, click, fill, type_text, press_key, hover, drag, evaluate_script, list_console_messages, list_network_requests, lighthouse_audit, and performance_start_trace. In read-only mode MoonDesk permits only bounded inspection commands, requires lighthouse_audit to use explicit --mode=snapshot, and rejects state-changing actions or browser file-output flags. Browser file paths are constrained to the active workspace. MoonDesk manages start/status/stop automatically.",
+            "description": "Run one Chrome DevTools CLI browser operation against MoonDesk's shared lazy agent-browser session. The isolated browser is headless by default, starts only on the first browser operation, and is reused across commands; the user can switch it to visible presentation from MoonDesk. Use resize_page for normal desktop window sizes; use emulate with --viewport=<width>x<height>x<dpr>[,mobile][,touch] for exact tablet/mobile responsive testing, then take a fresh snapshot before using UIDs. Other useful commands include list_pages, new_page, navigate_page, take_snapshot, click, fill, type_text, press_key, hover, drag, evaluate_script, list_console_messages, list_network_requests, lighthouse_audit, and performance_start_trace. In read-only mode MoonDesk permits only bounded inspection commands, requires lighthouse_audit to use explicit --mode=snapshot, and rejects state-changing actions or browser file-output flags. Relative browser input paths stay inside the active workspace. Browser-only mode keeps browser inputs workspace-scoped. When Computer tools are also enabled (Both mode), an explicit absolute input-file path may reference another regular file readable by the MoonDesk user and is privately staged before Chromium sees it. Browser input directories and file-producing/output paths remain workspace-bound. MoonDesk manages start/status/stop automatically.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -2073,7 +2073,7 @@ Always specify the branch explicitly when using `git push`."#
 
     if mode.browser_enabled() {
         lines.push(
-            "Browser mode exposes a stable browser surface instead of forwarding the full Chrome DevTools MCP catalog. Use browser_command for browser actions and view_page for actual rendered pixels. The browser starts lazily, headless by default at a deterministic 1280x800 initial viewport, in an isolated temporary agent profile that never inherits the user's personal cookies or logged-in browser state. Headless presentation still supports rendered-pixel inspection through view_page and screenshots; resize or emulate the target viewport before responsive or pixel-sensitive QA. The user can switch the browser to visible presentation from MoonDesk; changing presentation while Chromium is running closes that isolated session, so take a fresh page/snapshot afterward. The same live agent session is reused across browser_command, view_page, and `moondesk browser` until that session ends. For local web-app verification, navigate to the dev server, set the target viewport before taking interaction UIDs, use resize_page for normal desktop sizes and emulate --viewport=<width>x<height>x<dpr>[,mobile][,touch] for exact tablet/mobile QA, then take_snapshot. Navigation, viewport emulation, substantial DOM changes, and presentation changes can invalidate UIDs, so take a fresh snapshot before further element interactions. Accessibility/text snapshots are useful for structure but do not replace view_page for visual judgment. MoonDesk manages browser start/status/stop automatically; do not invoke lifecycle commands through browser_command or call npx chrome-devtools-mcp directly."
+            "Browser mode exposes a stable browser surface instead of forwarding the full Chrome DevTools MCP catalog. Use browser_command for browser actions and view_page for actual rendered pixels. The browser starts lazily, headless by default at a deterministic 1280x800 initial viewport, in an isolated temporary agent profile that never inherits the user's personal cookies or logged-in browser state. Headless presentation still supports rendered-pixel inspection through view_page and screenshots; resize or emulate the target viewport before responsive or pixel-sensitive QA. The user can switch the browser to visible presentation from MoonDesk; changing presentation while Chromium is running closes that isolated session, so take a fresh page/snapshot afterward. The same live agent session is reused across browser_command, view_page, and `moondesk browser` until that session ends. For local web-app verification, navigate to the dev server, set the target viewport before taking interaction UIDs, use resize_page for normal desktop sizes and emulate --viewport=<width>x<height>x<dpr>[,mobile][,touch] for exact tablet/mobile QA, then take_snapshot. Navigation, viewport emulation, substantial DOM changes, and presentation changes can invalidate UIDs, so take a fresh snapshot before further element interactions. Accessibility/text snapshots are useful for structure but do not replace view_page for visual judgment. MoonDesk manages browser start/status/stop automatically; do not invoke lifecycle commands through browser_command or call npx chrome-devtools-mcp directly. Relative browser input paths stay inside the active workspace. Browser-only mode keeps browser inputs workspace-scoped. When Computer tools are also enabled (Both mode), an explicit absolute input-file path may reference another regular file readable by the MoonDesk user and is privately staged before Chromium sees it. Browser input directories and file-producing/output paths remain workspace-bound."
                 .to_string(),
         );
         if tool_mode.write_tools_enabled() {
@@ -4937,6 +4937,43 @@ mod tests {
                 "view_page",
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn browser_command_descriptor_matches_mode_aware_input_path_policy() {
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0".into(),
+            id: Some(json!("req-browser-description")),
+            method: "tools/list".into(),
+            params: json!({}),
+        };
+
+        for mode in [Mode::Browser, Mode::Both] {
+            let response = handle_tools_list(&req, mode, ToolMode::MultiTools).await;
+            let description = response
+                .result
+                .as_ref()
+                .and_then(|result| result.get("tools"))
+                .and_then(Value::as_array)
+                .expect("missing tools")
+                .iter()
+                .find(|tool| tool.get("name").and_then(Value::as_str) == Some("browser_command"))
+                .and_then(|tool| tool.get("description"))
+                .and_then(Value::as_str)
+                .expect("missing browser_command description");
+
+            assert!(
+                description
+                    .contains("Relative browser input paths stay inside the active workspace")
+            );
+            assert!(
+                description.contains("Browser-only mode keeps browser inputs workspace-scoped")
+            );
+            assert!(description.contains("When Computer tools are also enabled (Both mode)"));
+            assert!(description.contains(
+                "Browser input directories and file-producing/output paths remain workspace-bound"
+            ));
+        }
     }
 
     #[tokio::test]

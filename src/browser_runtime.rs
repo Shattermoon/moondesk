@@ -14,7 +14,7 @@ use crate::browser_contract::{
     parse_browser_cli_invocation,
 };
 use crate::browser_transport::{BrowserMcpTransport, BrowserTransportError};
-use crate::state::{BrowserPresentation, SharedState};
+use crate::state::{BrowserPresentation, Mode, SharedState};
 
 // Keep this exact pin until MoonDesk's browser command contract is deliberately migrated and
 // re-tested. The checked-in browser_contract_v1_7.json is generated from this exact package.
@@ -75,6 +75,13 @@ pub struct BrowserRuntime {
     state: Option<SharedState>,
     runtime: Mutex<BrowserRuntimeState>,
     operation: Mutex<()>,
+}
+
+fn external_browser_input_files_allowed(mode: Option<Mode>) -> bool {
+    match mode {
+        Some(mode) => mode.computer_enabled(),
+        None => true,
+    }
 }
 
 impl BrowserRuntime {
@@ -283,6 +290,16 @@ impl BrowserRuntime {
         }
 
         let deadline = tokio::time::Instant::now() + timeout;
+        // Browser-only mode intentionally keeps local file inputs workspace-scoped. Both mode
+        // already exposes explicit absolute-file reads and the unrestricted developer shell, so an
+        // explicitly addressed external file may be staged for browser input there. Standalone CLI
+        // calls are initiated directly by the local user and follow the same permissive input rule.
+        let mode = if let Some(state) = &self.state {
+            Some(state.lock().await.mode)
+        } else {
+            None
+        };
+        let allow_external_absolute_input_files = external_browser_input_files_allowed(mode);
         let prepare_workspace = workspace_root.to_string();
         let prepare_command = command.to_string();
         let prepare_args = args.to_vec();
@@ -292,6 +309,7 @@ impl BrowserRuntime {
                 &prepare_workspace,
                 &prepare_command,
                 &prepare_args,
+                allow_external_absolute_input_files,
                 prepare_managed.as_deref(),
                 Some(deadline),
             )
@@ -1082,12 +1100,14 @@ fn validate_workspace_input(
     workspace_root: &Path,
     raw_path: &str,
     kind: BrowserPathKind,
+    allow_external_absolute_input_files: bool,
 ) -> Result<PathBuf, String> {
     if raw_path.trim().is_empty() {
         return Err("Browser file path cannot be empty".to_string());
     }
     let raw = PathBuf::from(raw_path);
-    let candidate = if raw.is_absolute() {
+    let explicitly_absolute = raw.is_absolute();
+    let candidate = if explicitly_absolute {
         raw
     } else {
         workspace_root.join(raw)
@@ -1118,7 +1138,14 @@ fn validate_workspace_input(
             candidate.display()
         ));
     }
-    if !path_within(workspace_root, &canonical) {
+    // Relative browser inputs remain workspace-scoped. Explicit absolute files follow the same
+    // local-read contract as MoonDesk's read/vision tools: if the user can read the regular file,
+    // MoonDesk may stage a private copy for the isolated browser. Directories stay workspace-bound
+    // because they expose a broader filesystem tree than a single explicitly addressed file.
+    let external_absolute_file = allow_external_absolute_input_files
+        && explicitly_absolute
+        && matches!(kind, BrowserPathKind::InputFile);
+    if !path_within(workspace_root, &canonical) && !external_absolute_file {
         return Err(format!(
             "Browser path is outside the active workspace: {}",
             candidate.display()
@@ -1601,6 +1628,7 @@ fn stage_browser_path(
     command: &str,
     raw_path: &str,
     kind: BrowserPathKind,
+    allow_external_absolute_input_files: bool,
     stager: &mut BrowserPathStager<'_>,
     deadline: Option<tokio::time::Instant>,
 ) -> Result<PathBuf, String> {
@@ -1629,7 +1657,12 @@ fn stage_browser_path(
 
     match kind {
         BrowserPathKind::InputFile | BrowserPathKind::InputDirectory => {
-            let source = validate_workspace_input(workspace_root, raw_path, kind)?;
+            let source = validate_workspace_input(
+                workspace_root,
+                raw_path,
+                kind,
+                allow_external_absolute_input_files,
+            )?;
             let root = ensure_browser_staging_root(&mut stager.staging_root)?;
             let current_slot = stager.slot;
             stager.slot += 1;
@@ -1701,7 +1734,24 @@ fn prepare_browser_invocation(
     command: &str,
     args: &[String],
 ) -> Result<PreparedBrowserInvocation, String> {
-    prepare_browser_invocation_with_managed_temp(workspace_root, command, args, None)
+    prepare_browser_invocation_with_policy(workspace_root, command, args, false)
+}
+
+#[cfg(test)]
+fn prepare_browser_invocation_with_policy(
+    workspace_root: &str,
+    command: &str,
+    args: &[String],
+    allow_external_absolute_input_files: bool,
+) -> Result<PreparedBrowserInvocation, String> {
+    prepare_browser_invocation_with_managed_temp_deadline(
+        workspace_root,
+        command,
+        args,
+        allow_external_absolute_input_files,
+        None,
+        None,
+    )
 }
 
 #[cfg(test)]
@@ -1715,6 +1765,7 @@ fn prepare_browser_invocation_with_managed_temp(
         workspace_root,
         command,
         args,
+        false,
         managed_temp_output,
         None,
     )
@@ -1724,6 +1775,7 @@ fn prepare_browser_invocation_with_managed_temp_deadline(
     workspace_root: &str,
     command: &str,
     args: &[String],
+    allow_external_absolute_input_files: bool,
     managed_temp_output: Option<&Path>,
     deadline: Option<tokio::time::Instant>,
 ) -> Result<PreparedBrowserInvocation, String> {
@@ -1751,6 +1803,7 @@ fn prepare_browser_invocation_with_managed_temp_deadline(
             command,
             &value,
             kind,
+            allow_external_absolute_input_files,
             &mut stager,
             deadline,
         )?;
@@ -1785,6 +1838,7 @@ fn prepare_browser_invocation_with_managed_temp_deadline(
                     command,
                     raw_value,
                     kind,
+                    allow_external_absolute_input_files,
                     &mut stager,
                     deadline,
                 )?;
@@ -1802,6 +1856,7 @@ fn prepare_browser_invocation_with_managed_temp_deadline(
                     command,
                     &raw_value,
                     kind,
+                    allow_external_absolute_input_files,
                     &mut stager,
                     deadline,
                 )?;
@@ -1852,6 +1907,14 @@ mod tests {
         for command in ["list_pages", "take_snapshot", "click", "resize_page"] {
             assert!(!browser_service_command(command));
         }
+    }
+
+    #[test]
+    fn external_browser_input_files_follow_mode_trust_boundary() {
+        assert!(!external_browser_input_files_allowed(Some(Mode::Browser)));
+        assert!(external_browser_input_files_allowed(Some(Mode::Both)));
+        assert!(external_browser_input_files_allowed(Some(Mode::Computer)));
+        assert!(external_browser_input_files_allowed(None));
     }
 
     #[test]
@@ -2289,16 +2352,66 @@ mod tests {
             .expect("workspace parent")
             .join(format!("outside-{}.txt", uuid::Uuid::new_v4()));
         std::fs::write(&outside, b"outside").expect("write outside fixture");
-        let escaped = prepare_browser_invocation(
+        let browser_only_upload = prepare_browser_invocation(
             &workspace_str,
             "upload_file",
             &["1_2".to_string(), outside.to_string_lossy().into_owned()],
         );
         assert!(
-            escaped
-                .expect_err("outside upload must be rejected")
+            browser_only_upload
+                .expect_err("browser-only policy must keep external uploads workspace-bound")
                 .contains("outside the active workspace")
         );
+
+        let external_upload = prepare_browser_invocation_with_policy(
+            &workspace_str,
+            "upload_file",
+            &["1_2".to_string(), outside.to_string_lossy().into_owned()],
+            true,
+        )
+        .expect("Both/CLI policy should stage an explicit absolute upload input");
+        let staged_external_upload = PathBuf::from(&external_upload.args[1]);
+        assert_ne!(staged_external_upload, outside);
+        assert!(path_within(&std::env::temp_dir(), &staged_external_upload));
+        assert_eq!(
+            std::fs::read(&staged_external_upload).expect("read staged external upload"),
+            b"outside"
+        );
+        drop(external_upload);
+
+        let relative_escape = Path::new("..")
+            .join(outside.file_name().expect("outside fixture name"))
+            .to_string_lossy()
+            .into_owned();
+        let escaped_upload = prepare_browser_invocation_with_policy(
+            &workspace_str,
+            "upload_file",
+            &["1_2".to_string(), relative_escape],
+            true,
+        );
+        assert!(
+            escaped_upload
+                .expect_err("relative upload escape must be rejected")
+                .contains("outside the active workspace")
+        );
+
+        let outside_directory = workspace
+            .parent()
+            .expect("workspace parent")
+            .join(format!("outside-dir-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&outside_directory).expect("create outside directory fixture");
+        let external_directory = prepare_browser_invocation_with_policy(
+            &workspace_str,
+            "install_extension",
+            &[outside_directory.to_string_lossy().into_owned()],
+            true,
+        );
+        assert!(
+            external_directory
+                .expect_err("external browser input directories must remain workspace-bound")
+                .contains("outside the active workspace")
+        );
+
         let traversal = prepare_browser_invocation(
             &workspace_str,
             "take_screenshot",
@@ -2343,6 +2456,7 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(outside);
+        let _ = std::fs::remove_dir_all(outside_directory);
         let _ = std::fs::remove_dir_all(workspace);
     }
 
@@ -2431,6 +2545,7 @@ mod tests {
             &workspace.to_string_lossy(),
             "upload_file",
             &["1_2".to_string(), "upload.txt".to_string()],
+            false,
             None,
             Some(expired),
         );

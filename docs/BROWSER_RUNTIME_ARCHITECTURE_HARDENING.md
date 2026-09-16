@@ -1,6 +1,6 @@
 # Browser Runtime Architecture Hardening
 
-Status: implemented and locally validated for PR #42 (`refactor/lazy-browser-skill-runtime`)
+Status: PR #42 runtime hardening implemented; extended by the shared-Chromium workspace/conversation routing follow-up
 
 ## Purpose
 
@@ -24,7 +24,7 @@ The hardening work described in this document is implemented on the current bran
 - **CLI response parity - done.** MoonDesk mirrors v1.7 CLI rendering for markdown, structured JSON, MCP tool errors, and image responses rather than depending on the detached CLI renderer. Oversized JSON remains syntactically valid by returning a bounded `_moondesk.truncated` envelope with the original/limit byte counts instead of splicing plaintext into serialized JSON.
 - **Deferred trace-output semantics - fail-closed.** `performance_start_trace --autoStop=false --filePath=...` is rejected by MoonDesk's command contract before transport startup/dispatch because exact v1.7 does not write that start-call path. Manual traces remain supported by starting without `filePath` and supplying `--filePath` to `performance_stop_trace`.
 - **Capability parity - done.** The direct MCP server keeps the old CLI safety/runtime defaults; feature-gated extension tooling is not silently enabled.
-- **Stable product surface - preserved and deliberately extended.** The public architecture remains one `moondesk` executable and one lazy host-shared browser session. MCP exposes `browser_command` + `view_page`, plus the narrow MoonDesk-owned `set_browser_presentation` control in MultiTools mode so an agent can request headless or visible presentation without gaining raw browser lifecycle access. A live presentation change is destructive to the temporary browser session, so the tool refuses it until `confirm_restart=true` is supplied after explicit user approval. `tools/call` also accepts only the connector-defined expanded browser operation allowlist as a compatibility ingress, normalizes pinned commands through the same v1.7 contract, and routes them into the shared runtime without advertising a second public tool surface. Connector-only `fill_form` remains a MoonDesk-owned composite over pinned `fill` and is blocked in ReadOnly because it mutates page state; connector `wait_for` is permitted in ReadOnly as an inspection operation and delegates directly to the pinned v1.7 MCP waiter so text/ARIA matching and upstream timeout semantics stay exact. Both use the same shared browser session, serialization, and workspace-boundary rules. The host-shared browser remains an explicit trust-domain decision.
+- **Stable product surface - preserved and deliberately extended.** The public architecture remains one `moondesk` executable and one lazy host-owned Chromium/MCP process, but browser authority is no longer one host-global session. MoonDesk enables pinned v1.7 page-ID routing, creates one named isolated BrowserContext per workspace, and keeps a logical page namespace per MCP conversation/local-CLI caller. Same-workspace callers may share project cookies/storage without sharing selected-page authority; different workspaces get separate cookie/storage contexts. `browser_command`, `view_page`, connector-expanded browser tools, and the CLI all route through this ownership layer. Raw upstream page IDs and BrowserContext names are not caller authority. Presentation remains process-global and a live change requires explicit confirmation because it destroys every workspace context and logical tab. Browser-global extension lifecycle operations are blocked, while singleton performance traces/screencasts are leased to the exact caller and page that started them.
 
 Two cleanup ideas from the audit are intentionally **not required for this PR**: fully moving every path/read-only metadata table into the checked-in command registry, and splitting `browser_runtime.rs` into a deeper module tree. The current path and ReadOnly policies remain centralized enough to be fail-closed and are covered by regression tests; those structural cleanups can be performed separately without reopening lifecycle semantics.
 
@@ -34,15 +34,16 @@ MoonDesk should continue to provide:
 
 - one `moondesk` executable;
 - a lazy browser runtime that starts only on first browser use and is headless by default;
-- one host-owned browser session shared by MCP `set_browser_presentation`, MCP `browser_command`, MCP `view_page`, and `moondesk browser ...`;
-- hidden/headless and visible presentation as launch modes of that same isolated runtime, never parallel browser architectures; a presentation change that would discard a live session requires explicit user confirmation;
-- a clean isolated Chromium profile that never attaches to the user's personal browser profile, cookies, extensions, or history;
+- one host-owned lazy Chromium/MCP process shared for efficiency, with one isolated BrowserContext per workspace and one logical page set per MCP conversation/local-CLI caller;
+- explicit upstream `pageId` routing owned by MoonDesk, so no caller acts on "whatever tab is globally selected" and no caller can use another session's raw upstream page ID;
+- hidden/headless and visible presentation as launch modes of that same Chromium runtime, never parallel browser architectures; a presentation change that would discard the live runtime requires explicit user confirmation that every workspace context/logical tab is lost;
+- a clean temporary Chromium profile that never attaches to the user's personal browser profile, cookies, extensions, or history; workspace BrowserContexts provide project-local cookies/storage inside that profile;
 - a deliberately small MCP browser surface (`set_browser_presentation`, `browser_command`, and `view_page`) rather than dynamically forwarding the full upstream Chrome DevTools MCP schema; presentation control remains MoonDesk-owned, unavailable in ReadOnly, and cannot discard a live session without explicit restart confirmation;
 - safe workspace staging/copy-back for browser file inputs/outputs while keeping upstream unrestricted filesystem access disabled;
 - ReadOnly browser policy enforced by MoonDesk rather than trusting upstream defaults;
 - automatic recovery after a browser/runtime loss, but without replaying ambiguous state-changing actions.
 
-The host-shared browser is an explicit trust-domain decision. Filesystem and command tooling remain workspace-scoped, while browser tabs/cookies/page state are host-scoped. If MoonDesk later needs mutually untrusted concurrent project sessions, browser isolation should move to a per-workspace model.
+The Chromium process is host-shared, but its control/storage scopes are explicit: filesystem and command tooling remain workspace-scoped; browser cookies/storage are BrowserContext-scoped per workspace; and tabs/active-page authority are logical-session scoped per MCP conversation or local CLI. Presentation and a few upstream recording facilities remain process-global, so MoonDesk either requires explicit host-wide confirmation (presentation), disables the global facility (extension lifecycle), or leases it to one session/page at a time (performance tracing and screencast).
 
 ## Current architecture and why it is fragile
 
@@ -62,19 +63,41 @@ This is a poor ownership boundary for MoonDesk because MoonDesk is already the p
 The implemented replacement is:
 
 ```text
-ChatGPT / `moondesk browser`
+ChatGPT connector / `moondesk browser`
         -> MoonDesk host
         -> BrowserRuntime
+             - resolve workspace + caller identity
+             - workspace BrowserContext name
+             - conversation/CLI logical page ownership
+             - logical page ID -> upstream pageId routing
              - command contract / argument translation
              - ReadOnly + URL policy
              - workspace staging
              - deadline + cancellation ownership
              - direct owned MCP stdio transport
-        -> pinned chrome-devtools-mcp server child
-        -> isolated Chromium
+        -> one pinned chrome-devtools-mcp server child
+        -> one isolated Chromium
+             -> BrowserContext workspace A -> session-owned tabs
+             -> BrowserContext workspace B -> session-owned tabs
 ```
 
 This is not a restoration of the deleted legacy browser architecture. MoonDesk should not restore raw schema forwarding, personal remote-debug attachment, old browser picker state, or dynamic upstream tool exposure. Only the process-ownership principle is reused: MoonDesk owns the exact subprocess tree that implements its browser runtime.
+
+## Shared-Chromium routing follow-up
+
+The follow-up architecture keeps the process-sharing benefit of PR #42 without retaining host-global browser-control semantics:
+
+- exact `chrome-devtools-mcp@1.7.0` runs with `--experimentalPageIdRouting=true`;
+- each persisted MoonDesk workspace UUID maps to a MoonDesk-owned named `isolatedContext` / BrowserContext;
+- ChatGPT calls use bounded, hashed `_meta["openai/session"]` plus optional `_meta["openai/subject"]` as the logical browser-session identity; raw provider identifiers are not retained or logged;
+- clients without a stable provider session ID use a workspace-local fallback session, while `moondesk browser` uses a dedicated local-CLI session;
+- `list_pages`, `select_page`, and `close_page` expose only MoonDesk logical page IDs; upstream page IDs and context names are filtered from caller-visible page listings;
+- popup/new-tab adoption is differential (before/after target sets) and context-checked, preventing one conversation from claiming another conversation's unowned tab;
+- the shared MCP child starts from a neutral MoonDesk-owned temporary directory rather than whichever workspace first used the browser;
+- workspace removal closes only that workspace's owned pages and retires its logical routing; cleanup failure invalidates the whole shared runtime fail-closed;
+- browser-global extension lifecycle commands are blocked; performance tracing and screencast ownership are bound to one logical session and exact upstream page, with runtime invalidation if an owning page disappears unexpectedly.
+
+The resulting hierarchy is **host process -> shared Chromium -> workspace BrowserContext -> caller logical session -> owned pages**.
 
 ## Confirmed blockers
 
@@ -209,7 +232,7 @@ That registry should drive argument parsing/translation, ReadOnly policy, path s
 1. Introduce a lazy owned `BrowserTransport` that starts exact `chrome-devtools-mcp@1.7.0` as a direct stdio MCP server child with the current safe isolated server flags.
 2. Own its full process tree using MoonDesk's existing process-ownership infrastructure; ensure host exit/drop cannot leave descendants alive.
 3. Perform MCP initialize once per runtime generation and keep the child alive across browser operations.
-4. Serialize browser operations at BrowserRuntime as today because selected page, snapshots, and UIDs are session-global.
+4. Keep BrowserRuntime operation serialization around routing/reconciliation and upstream process-global facilities, but route every page-scoped operation by explicit owned `pageId`; Chromium's global selected-page pointer is never authority.
 5. On timeout/cancellation after dispatch, terminate the runtime tree, clear state, wait for teardown, and return timeout/session-lost without replay.
 6. Remove daemon session ID/PID-file/start/status/stop logic once the new transport is proven.
 
@@ -248,7 +271,7 @@ At minimum:
 - outside-workspace/traversal/symlink/reparse-point path tests remain green;
 - ReadOnly inspection policy remains green, including Lighthouse snapshot-only behavior;
 - `view_page` still returns native bounded image content and cleans managed temp files;
-- one runtime remains shared across MCP `set_browser_presentation`, MCP `browser_command`, MCP `view_page`, and `moondesk browser`;
+- one Chromium/MCP runtime remains host-shared while real-browser tests prove workspace BrowserContext storage isolation, same-workspace conversation tab isolation, popup ownership, logical page-ID filtering, and a separate local-CLI tab session;
 - two MoonDesk hosts remain independent at the process/runtime level;
 - minimum supported Node version can actually launch the pinned browser runtime;
 - Windows and Linux Clippy/test matrices remain clean.

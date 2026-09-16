@@ -1,3 +1,4 @@
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -5,6 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use tokio::process::Command;
 use tokio::sync::Mutex;
 
@@ -15,6 +17,7 @@ use crate::browser_contract::{
 };
 use crate::browser_transport::{BrowserMcpTransport, BrowserTransportError};
 use crate::state::{BrowserPresentation, Mode, SharedState};
+use crate::workspaces::WorkspaceId;
 
 // Keep this exact pin until MoonDesk's browser command contract is deliberately migrated and
 // re-tested. The checked-in browser_contract_v1_7.json is generated from this exact package.
@@ -28,6 +31,7 @@ pub const MAX_BROWSER_CONTROL_BODY_BYTES: usize = 128 * 1024;
 const MAX_CAPTURED_OUTPUT_BYTES: usize = 256 * 1024;
 const DEFAULT_HEADLESS_VIEWPORT: &str = "1280x800";
 const BROWSER_PRESENTATION_LOCK_TIMEOUT: Duration = Duration::from_millis(250);
+const BROWSER_WORKSPACE_RELEASE_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Clone, Debug)]
 pub struct BrowserCommandOutput {
@@ -60,17 +64,154 @@ impl BrowserCommandOutput {
     }
 }
 
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum BrowserCallerIdentity {
+    OpenAi {
+        subject_digest: Option<[u8; 32]>,
+        session_digest: [u8; 32],
+    },
+    LocalCli,
+    WorkspaceFallback,
+    Standalone,
+}
+
+fn browser_identity_digest(label: &str, value: &str) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"moondesk-browser-identity-v1\0");
+    hasher.update(label.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(value.as_bytes());
+    hasher.finalize().into()
+}
+
+fn browser_workspace_context_name(workspace_key: &str) -> String {
+    let digest = browser_identity_digest("workspace", workspace_key);
+    let mut suffix = String::with_capacity(24);
+    for byte in &digest[..12] {
+        use std::fmt::Write as _;
+        let _ = write!(&mut suffix, "{byte:02x}");
+    }
+    format!("moondesk-ws-{suffix}")
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct BrowserSessionKey {
+    workspace_key: String,
+    caller: BrowserCallerIdentity,
+}
+
+impl BrowserSessionKey {
+    pub fn openai(workspace_id: &WorkspaceId, subject: Option<&str>, session: &str) -> Self {
+        Self {
+            workspace_key: workspace_id.as_str().to_string(),
+            caller: BrowserCallerIdentity::OpenAi {
+                subject_digest: subject.map(|value| browser_identity_digest("subject", value)),
+                session_digest: browser_identity_digest("session", session),
+            },
+        }
+    }
+
+    pub fn local_cli(workspace_id: &WorkspaceId) -> Self {
+        Self {
+            workspace_key: workspace_id.as_str().to_string(),
+            caller: BrowserCallerIdentity::LocalCli,
+        }
+    }
+
+    pub fn workspace_fallback(workspace_id: &WorkspaceId) -> Self {
+        Self {
+            workspace_key: workspace_id.as_str().to_string(),
+            caller: BrowserCallerIdentity::WorkspaceFallback,
+        }
+    }
+
+    fn standalone(workspace_root: &str) -> Self {
+        Self {
+            workspace_key: workspace_root.to_string(),
+            caller: BrowserCallerIdentity::Standalone,
+        }
+    }
+
+    fn workspace_context_name(&self) -> String {
+        browser_workspace_context_name(&self.workspace_key)
+    }
+
+    fn belongs_to_workspace(&self, workspace_id: &WorkspaceId) -> bool {
+        self.workspace_key == workspace_id.as_str()
+    }
+}
+
+#[derive(Clone)]
+struct BrowserOwnedPage {
+    upstream_id: u64,
+    url: String,
+    title: String,
+}
+
+struct BrowserLogicalSession {
+    pages: BTreeMap<u64, BrowserOwnedPage>,
+    active_page: Option<u64>,
+    next_page_id: u64,
+}
+
+impl BrowserLogicalSession {
+    fn new() -> Self {
+        Self {
+            pages: BTreeMap::new(),
+            active_page: None,
+            next_page_id: 1,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct BrowserPageLease {
+    owner: BrowserSessionKey,
+    upstream_page_id: u64,
+}
+
+#[derive(Default)]
+struct BrowserRoutingState {
+    sessions: HashMap<BrowserSessionKey, BrowserLogicalSession>,
+    upstream_owners: HashMap<u64, (BrowserSessionKey, u64)>,
+    active_trace: Option<BrowserPageLease>,
+    last_trace_owner: Option<BrowserSessionKey>,
+    active_screencast: Option<BrowserPageLease>,
+}
+
+impl BrowserRoutingState {
+    fn clear(&mut self) {
+        self.sessions.clear();
+        self.upstream_owners.clear();
+        self.active_trace = None;
+        self.last_trace_owner = None;
+        self.active_screencast = None;
+    }
+}
+
 #[derive(Default)]
 struct BrowserRuntimeState {
     transport: Option<Arc<BrowserMcpTransport>>,
     has_started: bool,
+    generation: u64,
+    routing: BrowserRoutingState,
+}
+
+#[derive(Clone, Debug)]
+struct UpstreamPageInfo {
+    id: u64,
+    url: String,
+    title: String,
+    selected: bool,
+    isolated_context: Option<String>,
 }
 
 /// Shared, lazy Chrome DevTools runtime owned directly by the MoonDesk host.
 ///
 /// Constructing this value never launches Chromium. The first browser operation starts one pinned
-/// `chrome-devtools-mcp` stdio child in a MoonDesk-owned process tree. MCP `browser_command`,
-/// `view_page`, and the local `moondesk browser` client all share that same isolated session.
+/// `chrome-devtools-mcp` stdio child in a MoonDesk-owned process tree. Workspaces get isolated
+/// BrowserContexts inside that Chromium process, while each MCP conversation and local CLI caller
+/// owns a logical page set routed by MoonDesk rather than by upstream global page selection.
 pub struct BrowserRuntime {
     state: Option<SharedState>,
     runtime: Mutex<BrowserRuntimeState>,
@@ -110,12 +251,26 @@ impl BrowserRuntime {
         args: &[String],
         timeout: Duration,
     ) -> Result<BrowserCommandOutput, String> {
-        self.run_internal(workspace_root, command, args, timeout, None)
+        let session = BrowserSessionKey::standalone(workspace_root);
+        self.run_for_session(&session, workspace_root, command, args, timeout)
             .await
     }
 
-    pub(crate) async fn run_managed_temp_output(
+    pub async fn run_for_session(
         &self,
+        session: &BrowserSessionKey,
+        workspace_root: &str,
+        command: &str,
+        args: &[String],
+        timeout: Duration,
+    ) -> Result<BrowserCommandOutput, String> {
+        self.run_internal(session, workspace_root, command, args, timeout, None)
+            .await
+    }
+
+    pub(crate) async fn run_managed_temp_output_for_session(
+        &self,
+        session: &BrowserSessionKey,
         workspace_root: &str,
         command: &str,
         args: &[String],
@@ -130,6 +285,7 @@ impl BrowserRuntime {
             );
         }
         self.run_internal(
+            session,
             workspace_root,
             command,
             args,
@@ -139,8 +295,9 @@ impl BrowserRuntime {
         .await
     }
 
-    pub(crate) async fn fill_form(
+    pub(crate) async fn fill_form_for_session(
         &self,
+        session: &BrowserSessionKey,
         workspace_root: &str,
         elements: &[(String, String)],
         include_snapshot: bool,
@@ -164,13 +321,14 @@ impl BrowserRuntime {
                 Ok(("fill".to_string(), args))
             })
             .collect::<Result<Vec<_>, String>>()?;
-        self.run_serialized_fill_calls(workspace_root, &calls, timeout)
+        self.run_serialized_fill_calls(session, workspace_root, &calls, timeout)
             .await
     }
 
-    pub(crate) async fn wait_for_text(
+    pub(crate) async fn wait_for_text_for_session(
         &self,
-        workspace_root: &str,
+        session: &BrowserSessionKey,
+        _workspace_root: &str,
         texts: &[String],
         timeout_ms: Option<u64>,
     ) -> Result<BrowserCommandOutput, String> {
@@ -190,9 +348,12 @@ impl BrowserRuntime {
         let _operation = tokio::time::timeout_at(deadline, self.operation.lock())
             .await
             .map_err(|_| total_timeout_message(operation_timeout))?;
-        let (transport, restarted) = self.ensure_transport(workspace_root, deadline).await?;
+        let (transport, restarted) = self.ensure_transport(deadline).await?;
+        let page_id = self
+            .ensure_active_upstream_page(session, &transport, deadline, operation_timeout)
+            .await?;
 
-        let mut arguments = serde_json::json!({ "text": texts });
+        let mut arguments = serde_json::json!({ "text": texts, "pageId": page_id });
         if let Some(timeout_ms) = timeout_ms {
             arguments["timeout"] = Value::from(timeout_ms);
         }
@@ -211,7 +372,8 @@ impl BrowserRuntime {
 
     async fn run_serialized_fill_calls(
         &self,
-        workspace_root: &str,
+        session: &BrowserSessionKey,
+        _workspace_root: &str,
         calls: &[(String, Vec<String>)],
         timeout: Duration,
     ) -> Result<BrowserCommandOutput, String> {
@@ -228,7 +390,10 @@ impl BrowserRuntime {
         let _operation = tokio::time::timeout_at(deadline, self.operation.lock())
             .await
             .map_err(|_| total_timeout_message(timeout))?;
-        let (transport, restarted) = self.ensure_transport(workspace_root, deadline).await?;
+        let (transport, restarted) = self.ensure_transport(deadline).await?;
+        let page_id = self
+            .ensure_active_upstream_page(session, &transport, deadline, timeout)
+            .await?;
         let mut last_output = BrowserCommandOutput {
             stdout: String::new(),
             stderr: String::new(),
@@ -236,11 +401,13 @@ impl BrowserRuntime {
             restarted,
         };
         for (index, (command, parsed)) in parsed_calls.into_iter().enumerate() {
+            let mut arguments = parsed.arguments.clone();
+            arguments.insert("pageId".to_string(), Value::from(page_id));
             let result = self
                 .call_transport_tool(
                     &transport,
                     command,
-                    Value::Object(parsed.arguments.clone()),
+                    Value::Object(arguments),
                     deadline,
                     timeout,
                 )
@@ -263,6 +430,7 @@ impl BrowserRuntime {
 
     async fn run_internal(
         &self,
+        session: &BrowserSessionKey,
         workspace_root: &str,
         command: &str,
         args: &[String],
@@ -278,6 +446,11 @@ impl BrowserRuntime {
                 "MoonDesk owns the browser lifecycle; use a browser operation such as list_pages, new_page, take_snapshot, click, fill, resize_page, or evaluate_script instead"
                     .to_string(),
             );
+        }
+        if browser_global_extension_command(command) {
+            return Err(format!(
+                "Browser command '{command}' is browser-global and is disabled in MoonDesk's shared Chromium runtime so one workspace cannot mutate another workspace's browser environment"
+            ));
         }
         if timeout.is_zero() {
             return Err("Browser command timeout must be at least 1 ms".to_string());
@@ -320,8 +493,9 @@ impl BrowserRuntime {
             .map_err(|error| format!("Browser staging task failed: {error}"))??;
         let parsed = parse_browser_cli_invocation(command, &prepared.args)?;
 
-        // Page selection, snapshot UIDs, dialogs, and DevTools state are session-global. Queueing is
-        // part of the caller's total deadline, and timeout cleanup happens while this guard is held.
+        // Upstream chrome-devtools-mcp still owns one global selected-page pointer. MoonDesk never
+        // trusts that pointer for caller routing: this lock serializes reconciliation and each
+        // page-scoped call receives the caller's owned upstream pageId explicitly.
         let _operation = tokio::time::timeout_at(deadline, self.operation.lock())
             .await
             .map_err(|_| total_timeout_message(timeout))?;
@@ -329,26 +503,236 @@ impl BrowserRuntime {
             return Err(total_timeout_message(timeout));
         }
 
-        let (transport, restarted) = self.ensure_transport(workspace_root, deadline).await?;
-        if command == "close_page" {
-            self.select_surviving_page_before_close(
-                &transport,
-                &parsed.arguments,
-                deadline,
-                timeout,
-            )
-            .await?;
-        }
-        let result = self
-            .call_transport_tool(
-                &transport,
-                command,
-                Value::Object(parsed.arguments.clone()),
-                deadline,
-                timeout,
-            )
-            .await?;
+        let (transport, restarted) = self.ensure_transport(deadline).await?;
+        let mut arguments = parsed.arguments.clone();
+        let mut result = match command {
+            "list_pages" => {
+                self.ensure_active_upstream_page(session, &transport, deadline, timeout)
+                    .await?;
+                let result = self
+                    .list_upstream_pages_result(&transport, deadline, timeout)
+                    .await?;
+                let pages = upstream_pages_from_result(&result)?;
+                self.ensure_global_recording_pages_present(&transport, &pages)
+                    .await?;
+                self.reconcile_pages(session, &pages, None).await;
+                result
+            }
+            "new_page" => {
+                if arguments.contains_key("isolatedContext") {
+                    return Err(
+                        "MoonDesk owns browser workspace isolation; isolatedContext cannot be supplied by callers"
+                            .to_string(),
+                    );
+                }
+                let before = self
+                    .list_upstream_pages(&transport, deadline, timeout)
+                    .await?;
+                self.ensure_global_recording_pages_present(&transport, &before)
+                    .await?;
+                let before_ids = upstream_page_ids(&before);
+                arguments.insert(
+                    "isolatedContext".to_string(),
+                    Value::String(session.workspace_context_name()),
+                );
+                let result = self
+                    .call_transport_tool(
+                        &transport,
+                        command,
+                        Value::Object(arguments),
+                        deadline,
+                        timeout,
+                    )
+                    .await?;
+                if !browser_result_is_error(&result) {
+                    let pages = self
+                        .pages_from_result_or_list(&transport, &result, deadline, timeout)
+                        .await?;
+                    self.ensure_global_recording_pages_present(&transport, &pages)
+                        .await?;
+                    let claim_ids = new_upstream_page_ids(&before_ids, &pages);
+                    self.reconcile_pages(session, &pages, Some(&claim_ids))
+                        .await;
+                }
+                result
+            }
+            "select_page" => {
+                let logical_page_id = browser_requested_page_id(&arguments)?;
+                let upstream_page_id = self
+                    .owned_upstream_page_id(session, logical_page_id)
+                    .await?;
+                arguments.insert("pageId".to_string(), Value::from(upstream_page_id));
+                let result = self
+                    .call_transport_tool(
+                        &transport,
+                        command,
+                        Value::Object(arguments),
+                        deadline,
+                        timeout,
+                    )
+                    .await?;
+                if !browser_result_is_error(&result) {
+                    self.set_active_logical_page(session, logical_page_id).await;
+                    let pages = self
+                        .pages_from_result_or_list(&transport, &result, deadline, timeout)
+                        .await?;
+                    self.ensure_global_recording_pages_present(&transport, &pages)
+                        .await?;
+                    self.reconcile_pages(session, &pages, None).await;
+                }
+                result
+            }
+            "close_page" => {
+                let logical_page_id = browser_requested_page_id(&arguments)?;
+                let upstream_page_id = self
+                    .owned_upstream_page_id(session, logical_page_id)
+                    .await?;
+                self.ensure_page_can_close(session, upstream_page_id)
+                    .await?;
+                self.select_surviving_upstream_page_before_close(
+                    &transport,
+                    upstream_page_id,
+                    deadline,
+                    timeout,
+                )
+                .await?;
+                arguments.insert("pageId".to_string(), Value::from(upstream_page_id));
+                let result = self
+                    .call_transport_tool(
+                        &transport,
+                        command,
+                        Value::Object(arguments),
+                        deadline,
+                        timeout,
+                    )
+                    .await?;
+                if !browser_result_is_error(&result) {
+                    let pages = self
+                        .pages_from_result_or_list(&transport, &result, deadline, timeout)
+                        .await?;
+                    self.ensure_global_recording_pages_present(&transport, &pages)
+                        .await?;
+                    self.reconcile_pages(session, &pages, None).await;
+                }
+                result
+            }
+            _ if browser_page_scoped_command(command) => {
+                let mut page_id = self
+                    .ensure_active_upstream_page(session, &transport, deadline, timeout)
+                    .await?;
+                if matches!(command, "performance_stop_trace" | "screencast_stop") {
+                    let pages = self
+                        .list_upstream_pages(&transport, deadline, timeout)
+                        .await?;
+                    self.ensure_global_recording_pages_present(&transport, &pages)
+                        .await?;
+                }
+                if command == "performance_stop_trace" {
+                    page_id = self.performance_trace_page(session).await?;
+                } else if command == "screencast_stop" {
+                    page_id = self.screencast_page(session).await?;
+                }
+                let before_ids = if browser_command_may_open_or_close_pages(command) {
+                    let pages = self
+                        .list_upstream_pages(&transport, deadline, timeout)
+                        .await?;
+                    self.ensure_global_recording_pages_present(&transport, &pages)
+                        .await?;
+                    Some(upstream_page_ids(&pages))
+                } else {
+                    None
+                };
+                if command == "evaluate_script" && arguments.contains_key("serviceWorkerId") {
+                    return Err(
+                        "evaluate_script serviceWorkerId targeting is disabled in MoonDesk's shared Chromium runtime because raw service-worker IDs are not scoped to the caller's logical browser session"
+                            .to_string(),
+                    );
+                }
+                arguments.insert("pageId".to_string(), Value::from(page_id));
+                if command == "performance_analyze_insight" {
+                    self.require_last_trace_owner(session).await?;
+                }
+                let trace_auto_stop = if command == "performance_start_trace" {
+                    self.begin_performance_trace(session, page_id).await?;
+                    Some(
+                        arguments
+                            .get("autoStop")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(true),
+                    )
+                } else {
+                    None
+                };
+                let started_screencast = command == "screencast_start";
+                if started_screencast {
+                    self.begin_screencast(session, page_id).await?;
+                }
+                let result = match self
+                    .call_transport_tool(
+                        &transport,
+                        command,
+                        Value::Object(arguments),
+                        deadline,
+                        timeout,
+                    )
+                    .await
+                {
+                    Ok(result) => result,
+                    Err(error) => {
+                        if trace_auto_stop.is_some() {
+                            self.finish_performance_trace(session, false).await;
+                        }
+                        if started_screencast {
+                            self.finish_screencast(session).await;
+                        }
+                        return Err(error);
+                    }
+                };
+                let browser_error = browser_result_is_error(&result);
+                if let Some(auto_stop) = trace_auto_stop {
+                    if browser_error || auto_stop {
+                        self.finish_performance_trace(session, !browser_error && auto_stop)
+                            .await;
+                    }
+                } else if command == "performance_stop_trace" && !browser_error {
+                    self.finish_performance_trace(session, true).await;
+                }
+                if (started_screencast && browser_error)
+                    || (command == "screencast_stop" && !browser_error)
+                {
+                    self.finish_screencast(session).await;
+                }
+                if !browser_error && let Some(before_ids) = before_ids {
+                    let pages = self
+                        .list_upstream_pages(&transport, deadline, timeout)
+                        .await?;
+                    self.ensure_global_recording_pages_present(&transport, &pages)
+                        .await?;
+                    let claim_ids = new_upstream_page_ids(&before_ids, &pages);
+                    self.reconcile_pages(session, &pages, Some(&claim_ids))
+                        .await;
+                }
+                result
+            }
+            _ if browser_workspace_file_command(command) => {
+                self.call_transport_tool(
+                    &transport,
+                    command,
+                    Value::Object(arguments),
+                    deadline,
+                    timeout,
+                )
+                .await?
+            }
+            _ => {
+                return Err(format!(
+                    "Browser command '{command}' is not classified for MoonDesk's shared session router"
+                ));
+            }
+        };
 
+        self.sanitize_page_result_for_session(session, &mut result)
+            .await;
         let mut output = browser_output_from_result(result, parsed, restarted)?;
         if output.success() {
             if tokio::time::Instant::now() >= deadline {
@@ -380,6 +764,489 @@ impl BrowserRuntime {
         Ok(output)
     }
 
+    async fn ensure_active_upstream_page(
+        &self,
+        session: &BrowserSessionKey,
+        transport: &Arc<BrowserMcpTransport>,
+        deadline: tokio::time::Instant,
+        timeout: Duration,
+    ) -> Result<u64, String> {
+        if let Some(page_id) = self.active_upstream_page_id(session).await {
+            return Ok(page_id);
+        }
+
+        let existing = self
+            .list_upstream_pages(transport, deadline, timeout)
+            .await?;
+        self.ensure_global_recording_pages_present(transport, &existing)
+            .await?;
+        self.reconcile_pages(session, &existing, None).await;
+        if let Some(page_id) = self.active_upstream_page_id(session).await {
+            return Ok(page_id);
+        }
+
+        let before_ids = upstream_page_ids(&existing);
+        let created = self
+            .call_transport_tool(
+                transport,
+                "new_page",
+                serde_json::json!({
+                    "url": "about:blank",
+                    "background": true,
+                    "isolatedContext": session.workspace_context_name(),
+                }),
+                deadline,
+                timeout,
+            )
+            .await?;
+        if browser_result_is_error(&created) {
+            return Err(format!(
+                "Could not create an isolated page for this browser session: {}",
+                browser_result_text(&created)
+            ));
+        }
+        let pages = self
+            .pages_from_result_or_list(transport, &created, deadline, timeout)
+            .await?;
+        self.ensure_global_recording_pages_present(transport, &pages)
+            .await?;
+        let claim_ids = new_upstream_page_ids(&before_ids, &pages);
+        self.reconcile_pages(session, &pages, Some(&claim_ids))
+            .await;
+        self.active_upstream_page_id(session).await.ok_or_else(|| {
+            "MoonDesk created a browser page but could not bind it to this browser session"
+                .to_string()
+        })
+    }
+
+    async fn active_upstream_page_id(&self, session: &BrowserSessionKey) -> Option<u64> {
+        let mut runtime = self.runtime.lock().await;
+        let logical = runtime.routing.sessions.get_mut(session)?;
+        let active = logical.active_page?;
+        logical.pages.get(&active).map(|page| page.upstream_id)
+    }
+
+    async fn owned_upstream_page_id(
+        &self,
+        session: &BrowserSessionKey,
+        logical_page_id: u64,
+    ) -> Result<u64, String> {
+        let mut runtime = self.runtime.lock().await;
+        let logical = runtime.routing.sessions.get_mut(session).ok_or_else(|| {
+            format!("Browser page {logical_page_id} does not belong to this session")
+        })?;
+        logical
+            .pages
+            .get(&logical_page_id)
+            .map(|page| page.upstream_id)
+            .ok_or_else(|| {
+                format!("Browser page {logical_page_id} does not belong to this session")
+            })
+    }
+
+    async fn set_active_logical_page(&self, session: &BrowserSessionKey, logical_page_id: u64) {
+        let mut runtime = self.runtime.lock().await;
+        if let Some(logical) = runtime.routing.sessions.get_mut(session)
+            && logical.pages.contains_key(&logical_page_id)
+        {
+            logical.active_page = Some(logical_page_id);
+        }
+    }
+
+    async fn missing_global_recording_page(
+        &self,
+        pages: &[UpstreamPageInfo],
+    ) -> Option<&'static str> {
+        let existing = pages.iter().map(|page| page.id).collect::<HashSet<_>>();
+        let runtime = self.runtime.lock().await;
+        if runtime
+            .routing
+            .active_trace
+            .as_ref()
+            .is_some_and(|active| !existing.contains(&active.upstream_page_id))
+        {
+            return Some("performance trace");
+        }
+        if runtime
+            .routing
+            .active_screencast
+            .as_ref()
+            .is_some_and(|active| !existing.contains(&active.upstream_page_id))
+        {
+            return Some("screencast");
+        }
+        None
+    }
+
+    async fn ensure_global_recording_pages_present(
+        &self,
+        transport: &Arc<BrowserMcpTransport>,
+        pages: &[UpstreamPageInfo],
+    ) -> Result<(), String> {
+        let Some(kind) = self.missing_global_recording_page(pages).await else {
+            return Ok(());
+        };
+        self.invalidate_transport(
+            transport,
+            "a page owning shared browser recording state disappeared",
+        )
+        .await;
+        Err(format!(
+            "The page owning the active {kind} disappeared. MoonDesk reset the shared browser runtime so recording state cannot leak across sessions; re-establish the page and start the recording again."
+        ))
+    }
+
+    async fn ensure_page_can_close(
+        &self,
+        session: &BrowserSessionKey,
+        upstream_page_id: u64,
+    ) -> Result<(), String> {
+        let runtime = self.runtime.lock().await;
+        if runtime.routing.active_trace.as_ref().is_some_and(|active| {
+            active.owner == *session && active.upstream_page_id == upstream_page_id
+        }) {
+            return Err(
+                "Stop the active performance trace before closing its browser page".to_string(),
+            );
+        }
+        if runtime
+            .routing
+            .active_screencast
+            .as_ref()
+            .is_some_and(|active| {
+                active.owner == *session && active.upstream_page_id == upstream_page_id
+            })
+        {
+            return Err("Stop the active screencast before closing its browser page".to_string());
+        }
+        Ok(())
+    }
+
+    async fn select_surviving_upstream_page_before_close(
+        &self,
+        transport: &Arc<BrowserMcpTransport>,
+        target_page_id: u64,
+        deadline: tokio::time::Instant,
+        timeout: Duration,
+    ) -> Result<(), String> {
+        let pages = self
+            .list_upstream_pages(transport, deadline, timeout)
+            .await?;
+        let Some(survivor_page_id) = browser_close_survivor_page_id(&pages, target_page_id) else {
+            return Ok(());
+        };
+        let selected = self
+            .call_transport_tool(
+                transport,
+                "select_page",
+                serde_json::json!({
+                    "pageId": survivor_page_id,
+                    "bringToFront": false,
+                }),
+                deadline,
+                timeout,
+            )
+            .await?;
+        if browser_result_is_error(&selected) {
+            return Err(format!(
+                "Could not select MoonDesk's surviving browser page before close: {}",
+                browser_result_text(&selected)
+            ));
+        }
+        Ok(())
+    }
+
+    async fn begin_performance_trace(
+        &self,
+        session: &BrowserSessionKey,
+        upstream_page_id: u64,
+    ) -> Result<(), String> {
+        let mut runtime = self.runtime.lock().await;
+        if let Some(active) = runtime.routing.active_trace.as_ref() {
+            return Err(if active.owner == *session {
+                "This browser session already owns the active performance trace; stop it before starting another"
+                    .to_string()
+            } else {
+                "Another browser session currently owns the shared Chromium performance trace; retry after it stops"
+                    .to_string()
+            });
+        }
+        runtime.routing.active_trace = Some(BrowserPageLease {
+            owner: session.clone(),
+            upstream_page_id,
+        });
+        Ok(())
+    }
+
+    async fn performance_trace_page(&self, session: &BrowserSessionKey) -> Result<u64, String> {
+        let runtime = self.runtime.lock().await;
+        match runtime.routing.active_trace.as_ref() {
+            Some(active) if active.owner == *session => Ok(active.upstream_page_id),
+            Some(_) => Err(
+                "Another browser session owns the active performance trace; this session cannot stop it"
+                    .to_string(),
+            ),
+            None => Err("This browser session has no active performance trace".to_string()),
+        }
+    }
+
+    async fn finish_performance_trace(&self, session: &BrowserSessionKey, recorded: bool) {
+        let mut runtime = self.runtime.lock().await;
+        if runtime
+            .routing
+            .active_trace
+            .as_ref()
+            .is_some_and(|active| active.owner == *session)
+        {
+            runtime.routing.active_trace = None;
+            if recorded {
+                runtime.routing.last_trace_owner = Some(session.clone());
+            }
+        }
+    }
+
+    async fn require_last_trace_owner(&self, session: &BrowserSessionKey) -> Result<(), String> {
+        let runtime = self.runtime.lock().await;
+        match runtime.routing.last_trace_owner.as_ref() {
+            Some(owner) if owner == session => Ok(()),
+            Some(_) => Err(
+                "The most recent performance trace belongs to another browser session; record a trace in this session before analyzing insights"
+                    .to_string(),
+            ),
+            None => Err(
+                "No performance trace is available for this browser session; record one before analyzing insights"
+                    .to_string(),
+            ),
+        }
+    }
+
+    async fn begin_screencast(
+        &self,
+        session: &BrowserSessionKey,
+        upstream_page_id: u64,
+    ) -> Result<(), String> {
+        let mut runtime = self.runtime.lock().await;
+        if let Some(active) = runtime.routing.active_screencast.as_ref() {
+            return Err(if active.owner == *session {
+                "This browser session already owns the active screencast; stop it before starting another"
+                    .to_string()
+            } else {
+                "Another browser session currently owns the shared Chromium screencast; retry after it stops"
+                    .to_string()
+            });
+        }
+        runtime.routing.active_screencast = Some(BrowserPageLease {
+            owner: session.clone(),
+            upstream_page_id,
+        });
+        Ok(())
+    }
+
+    async fn screencast_page(&self, session: &BrowserSessionKey) -> Result<u64, String> {
+        let runtime = self.runtime.lock().await;
+        match runtime.routing.active_screencast.as_ref() {
+            Some(active) if active.owner == *session => Ok(active.upstream_page_id),
+            Some(_) => Err(
+                "Another browser session owns the active screencast; this session cannot stop it"
+                    .to_string(),
+            ),
+            None => Err("This browser session has no active screencast".to_string()),
+        }
+    }
+
+    async fn finish_screencast(&self, session: &BrowserSessionKey) {
+        let mut runtime = self.runtime.lock().await;
+        if runtime
+            .routing
+            .active_screencast
+            .as_ref()
+            .is_some_and(|active| active.owner == *session)
+        {
+            runtime.routing.active_screencast = None;
+        }
+    }
+
+    async fn list_upstream_pages_result(
+        &self,
+        transport: &Arc<BrowserMcpTransport>,
+        deadline: tokio::time::Instant,
+        timeout: Duration,
+    ) -> Result<Value, String> {
+        let result = self
+            .call_transport_tool(
+                transport,
+                "list_pages",
+                serde_json::json!({}),
+                deadline,
+                timeout,
+            )
+            .await?;
+        if browser_result_is_error(&result) {
+            return Err(format!(
+                "Could not inspect browser pages: {}",
+                browser_result_text(&result)
+            ));
+        }
+        Ok(result)
+    }
+
+    async fn list_upstream_pages(
+        &self,
+        transport: &Arc<BrowserMcpTransport>,
+        deadline: tokio::time::Instant,
+        timeout: Duration,
+    ) -> Result<Vec<UpstreamPageInfo>, String> {
+        let result = self
+            .list_upstream_pages_result(transport, deadline, timeout)
+            .await?;
+        upstream_pages_from_result(&result)
+    }
+
+    async fn pages_from_result_or_list(
+        &self,
+        transport: &Arc<BrowserMcpTransport>,
+        result: &Value,
+        deadline: tokio::time::Instant,
+        timeout: Duration,
+    ) -> Result<Vec<UpstreamPageInfo>, String> {
+        match upstream_pages_from_result(result) {
+            Ok(pages) => Ok(pages),
+            Err(_) => self.list_upstream_pages(transport, deadline, timeout).await,
+        }
+    }
+
+    async fn reconcile_pages(
+        &self,
+        acting_session: &BrowserSessionKey,
+        pages: &[UpstreamPageInfo],
+        claim_upstream_ids: Option<&HashSet<u64>>,
+    ) {
+        let all_page_ids = pages
+            .iter()
+            .map(|page| page.id)
+            .collect::<std::collections::HashSet<_>>();
+        let workspace_context = acting_session.workspace_context_name();
+        let mut runtime = self.runtime.lock().await;
+
+        let vanished = runtime
+            .routing
+            .upstream_owners
+            .keys()
+            .copied()
+            .filter(|page_id| !all_page_ids.contains(page_id))
+            .collect::<Vec<_>>();
+        for upstream_id in vanished {
+            if let Some((owner, logical_id)) = runtime.routing.upstream_owners.remove(&upstream_id)
+                && let Some(logical) = runtime.routing.sessions.get_mut(&owner)
+            {
+                logical.pages.remove(&logical_id);
+                if logical.active_page == Some(logical_id) {
+                    logical.active_page = logical.pages.keys().next().copied();
+                }
+            }
+        }
+
+        for page in pages {
+            if let Some((owner, logical_id)) =
+                runtime.routing.upstream_owners.get(&page.id).cloned()
+            {
+                if let Some(logical) = runtime.routing.sessions.get_mut(&owner)
+                    && let Some(owned) = logical.pages.get_mut(&logical_id)
+                {
+                    owned.url = page.url.clone();
+                    owned.title = page.title.clone();
+                }
+                continue;
+            }
+            if !claim_upstream_ids.is_some_and(|ids| ids.contains(&page.id))
+                || page.isolated_context.as_deref() != Some(workspace_context.as_str())
+            {
+                continue;
+            }
+
+            let logical = runtime
+                .routing
+                .sessions
+                .entry(acting_session.clone())
+                .or_insert_with(BrowserLogicalSession::new);
+            let logical_id = logical.next_page_id;
+            logical.next_page_id = logical.next_page_id.saturating_add(1);
+            logical.pages.insert(
+                logical_id,
+                BrowserOwnedPage {
+                    upstream_id: page.id,
+                    url: page.url.clone(),
+                    title: page.title.clone(),
+                },
+            );
+            if logical.active_page.is_none() || page.selected {
+                logical.active_page = Some(logical_id);
+            }
+            runtime
+                .routing
+                .upstream_owners
+                .insert(page.id, (acting_session.clone(), logical_id));
+        }
+
+        if let Some(logical) = runtime.routing.sessions.get_mut(acting_session)
+            && logical.active_page.is_none()
+        {
+            logical.active_page = logical.pages.keys().next().copied();
+        }
+    }
+
+    async fn safe_pages_for_session(&self, session: &BrowserSessionKey) -> Vec<Value> {
+        let runtime = self.runtime.lock().await;
+        let Some(logical) = runtime.routing.sessions.get(session) else {
+            return Vec::new();
+        };
+        logical
+            .pages
+            .iter()
+            .map(|(logical_id, page)| {
+                serde_json::json!({
+                    "id": logical_id,
+                    "url": page.url,
+                    "title": page.title,
+                    "selected": logical.active_page == Some(*logical_id),
+                })
+            })
+            .collect()
+    }
+
+    async fn sanitize_page_result_for_session(
+        &self,
+        session: &BrowserSessionKey,
+        result: &mut Value,
+    ) {
+        let safe_pages = self.safe_pages_for_session(session).await;
+        let had_structured_pages = result
+            .pointer("/structuredContent/pages")
+            .and_then(Value::as_array)
+            .is_some();
+        if had_structured_pages
+            && let Some(structured) = result
+                .get_mut("structuredContent")
+                .and_then(Value::as_object_mut)
+        {
+            structured.insert("pages".to_string(), Value::Array(safe_pages.clone()));
+            structured.remove("extensionPages");
+        }
+
+        let safe_text = browser_safe_pages_markdown(&safe_pages);
+        if let Some(content) = result.get_mut("content").and_then(Value::as_array_mut) {
+            for item in content {
+                let Some(text) = item.get_mut("text") else {
+                    continue;
+                };
+                let Some(original) = text.as_str() else {
+                    continue;
+                };
+                *text = Value::String(rewrite_browser_page_sections(original, &safe_text));
+            }
+        }
+    }
+
     async fn call_transport_tool(
         &self,
         transport: &Arc<BrowserMcpTransport>,
@@ -406,65 +1273,8 @@ impl BrowserRuntime {
         }
     }
 
-    async fn select_surviving_page_before_close(
-        &self,
-        transport: &Arc<BrowserMcpTransport>,
-        arguments: &serde_json::Map<String, Value>,
-        deadline: tokio::time::Instant,
-        timeout: Duration,
-    ) -> Result<(), String> {
-        let Some(target_page_id) = arguments.get("pageId").and_then(Value::as_f64) else {
-            return Ok(());
-        };
-        let listed = self
-            .call_transport_tool(
-                transport,
-                "list_pages",
-                serde_json::json!({}),
-                deadline,
-                timeout,
-            )
-            .await?;
-        if listed.get("isError").and_then(Value::as_bool) == Some(true) {
-            return Err(format!(
-                "Could not inspect browser pages before closing the selected page: {}",
-                browser_result_text(&listed)
-            ));
-        }
-        let pages = browser_page_listing(&listed);
-        let Some((selected_page_id, _)) = pages.iter().find(|(_, selected)| *selected) else {
-            return Ok(());
-        };
-        if (*selected_page_id as f64) != target_page_id {
-            return Ok(());
-        }
-        let Some((survivor_page_id, _)) = pages
-            .iter()
-            .find(|(page_id, _)| (*page_id as f64) != target_page_id)
-        else {
-            return Ok(());
-        };
-        let selected = self
-            .call_transport_tool(
-                transport,
-                "select_page",
-                serde_json::json!({ "pageId": survivor_page_id }),
-                deadline,
-                timeout,
-            )
-            .await?;
-        if selected.get("isError").and_then(Value::as_bool) == Some(true) {
-            return Err(format!(
-                "Could not select a surviving browser page before close: {}",
-                browser_result_text(&selected)
-            ));
-        }
-        Ok(())
-    }
-
     async fn ensure_transport(
         &self,
-        workspace_root: &str,
         deadline: tokio::time::Instant,
     ) -> Result<(Arc<BrowserMcpTransport>, bool), String> {
         let (stale, has_started) = {
@@ -487,7 +1297,6 @@ impl BrowserRuntime {
         };
         let (server_args, browser_name) = browser_server_args(presentation);
         let transport = BrowserMcpTransport::start(
-            workspace_root,
             CHROME_DEVTOOLS_PACKAGE_VERSION,
             &server_args,
             self.state.clone(),
@@ -501,18 +1310,21 @@ impl BrowserRuntime {
             other => format!("Could not start isolated MoonDesk browser runtime: {other}"),
         })?;
 
-        {
+        let generation = {
             let mut runtime = self.runtime.lock().await;
             runtime.transport = Some(transport.clone());
             runtime.has_started = true;
-        }
+            runtime.generation = runtime.generation.saturating_add(1);
+            runtime.routing.clear();
+            runtime.generation
+        };
         if let Some(state) = &self.state {
             let mut app = state.lock().await;
             app.browser_runtime_running = true;
             app.log(
                 "INFO",
                 format!(
-                    "Isolated agent browser runtime started lazily with {browser_name} · {}",
+                    "Shared agent browser runtime generation {generation} started lazily with {browser_name} Â· {}",
                     presentation.label()
                 ),
             );
@@ -527,7 +1339,11 @@ impl BrowserRuntime {
                 .transport
                 .as_ref()
                 .is_some_and(|current| Arc::ptr_eq(current, expected));
-            matches.then(|| runtime.transport.take()).flatten()
+            let transport = matches.then(|| runtime.transport.take()).flatten();
+            if transport.is_some() {
+                runtime.routing.clear();
+            }
+            transport
         };
         if let Some(transport) = transport {
             transport.shutdown().await;
@@ -577,7 +1393,14 @@ impl BrowserRuntime {
             return BrowserPresentationChange::RequiresRestart;
         }
 
-        let transport = self.runtime.lock().await.transport.take();
+        let transport = {
+            let mut runtime = self.runtime.lock().await;
+            let transport = runtime.transport.take();
+            if transport.is_some() {
+                runtime.routing.clear();
+            }
+            transport
+        };
         if let Some(transport) = transport {
             transport.shutdown().await;
         }
@@ -605,6 +1428,202 @@ impl BrowserRuntime {
         }
     }
 
+    pub async fn ensure_started(&self, timeout: Duration) -> Result<(), String> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        let _operation = tokio::time::timeout_at(deadline, self.operation.lock())
+            .await
+            .map_err(|_| total_timeout_message(timeout))?;
+        self.ensure_transport(deadline).await.map(|_| ())
+    }
+
+    #[cfg(all(test, windows))]
+    async fn transport_pid(&self) -> Option<u32> {
+        let transport = self.runtime.lock().await.transport.clone()?;
+        transport.pid().await
+    }
+
+    /// Retire all logical sessions and pages owned by one workspace without disturbing other
+    /// workspaces sharing the host Chromium process. If upstream cleanup cannot be completed,
+    /// invalidate the shared runtime so removed-workspace state cannot remain reachable.
+    pub async fn release_workspace(&self, workspace_id: &WorkspaceId) -> Result<(), String> {
+        let _operation = self.operation.lock().await;
+        let (transport, trace_page, screencast_page, mut page_ids) = {
+            let runtime = self.runtime.lock().await;
+            let transport = runtime
+                .transport
+                .as_ref()
+                .filter(|transport| transport.is_alive())
+                .cloned();
+            let trace_page = runtime
+                .routing
+                .active_trace
+                .as_ref()
+                .filter(|active| active.owner.belongs_to_workspace(workspace_id))
+                .map(|active| active.upstream_page_id);
+            let screencast_page = runtime
+                .routing
+                .active_screencast
+                .as_ref()
+                .filter(|active| active.owner.belongs_to_workspace(workspace_id))
+                .map(|active| active.upstream_page_id);
+            let page_ids = runtime
+                .routing
+                .upstream_owners
+                .iter()
+                .filter_map(|(page_id, (owner, _))| {
+                    owner.belongs_to_workspace(workspace_id).then_some(*page_id)
+                })
+                .collect::<Vec<_>>();
+            (transport, trace_page, screencast_page, page_ids)
+        };
+        page_ids.sort_unstable();
+
+        let mut cleanup_error = None;
+        if let Some(transport) = transport.as_ref() {
+            let deadline = tokio::time::Instant::now() + BROWSER_WORKSPACE_RELEASE_TIMEOUT;
+            if let Some(page_id) = trace_page {
+                match self
+                    .call_transport_tool(
+                        transport,
+                        "performance_stop_trace",
+                        serde_json::json!({ "pageId": page_id }),
+                        deadline,
+                        BROWSER_WORKSPACE_RELEASE_TIMEOUT,
+                    )
+                    .await
+                {
+                    Ok(result) if browser_result_is_error(&result) => {
+                        cleanup_error = Some(format!(
+                            "could not stop workspace performance trace: {}",
+                            browser_result_text(&result)
+                        ));
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        cleanup_error = Some(format!(
+                            "could not stop workspace performance trace: {error}"
+                        ));
+                    }
+                }
+            }
+            if cleanup_error.is_none()
+                && let Some(page_id) = screencast_page
+            {
+                match self
+                    .call_transport_tool(
+                        transport,
+                        "screencast_stop",
+                        serde_json::json!({ "pageId": page_id }),
+                        deadline,
+                        BROWSER_WORKSPACE_RELEASE_TIMEOUT,
+                    )
+                    .await
+                {
+                    Ok(result) if browser_result_is_error(&result) => {
+                        cleanup_error = Some(format!(
+                            "could not stop workspace screencast: {}",
+                            browser_result_text(&result)
+                        ));
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        cleanup_error =
+                            Some(format!("could not stop workspace screencast: {error}"));
+                    }
+                }
+            }
+            if cleanup_error.is_none() {
+                for page_id in page_ids {
+                    if let Err(error) = self
+                        .select_surviving_upstream_page_before_close(
+                            transport,
+                            page_id,
+                            deadline,
+                            BROWSER_WORKSPACE_RELEASE_TIMEOUT,
+                        )
+                        .await
+                    {
+                        cleanup_error = Some(format!(
+                            "could not prepare removed-workspace browser page {page_id} for close: {error}"
+                        ));
+                        break;
+                    }
+                    match self
+                        .call_transport_tool(
+                            transport,
+                            "close_page",
+                            serde_json::json!({ "pageId": page_id }),
+                            deadline,
+                            BROWSER_WORKSPACE_RELEASE_TIMEOUT,
+                        )
+                        .await
+                    {
+                        Ok(result) if browser_result_is_error(&result) => {
+                            cleanup_error = Some(format!(
+                                "could not close removed-workspace browser page {page_id}: {}",
+                                browser_result_text(&result)
+                            ));
+                            break;
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            cleanup_error = Some(format!(
+                                "could not close removed-workspace browser page {page_id}: {error}"
+                            ));
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(error) = cleanup_error {
+            if let Some(transport) = transport {
+                self.invalidate_transport(
+                    &transport,
+                    "workspace browser cleanup could not be completed safely",
+                )
+                .await;
+            }
+            return Err(error);
+        }
+
+        let mut runtime = self.runtime.lock().await;
+        runtime
+            .routing
+            .sessions
+            .retain(|owner, _| !owner.belongs_to_workspace(workspace_id));
+        runtime
+            .routing
+            .upstream_owners
+            .retain(|_, (owner, _)| !owner.belongs_to_workspace(workspace_id));
+        if runtime
+            .routing
+            .active_trace
+            .as_ref()
+            .is_some_and(|active| active.owner.belongs_to_workspace(workspace_id))
+        {
+            runtime.routing.active_trace = None;
+        }
+        if runtime
+            .routing
+            .last_trace_owner
+            .as_ref()
+            .is_some_and(|owner| owner.belongs_to_workspace(workspace_id))
+        {
+            runtime.routing.last_trace_owner = None;
+        }
+        if runtime
+            .routing
+            .active_screencast
+            .as_ref()
+            .is_some_and(|active| active.owner.belongs_to_workspace(workspace_id))
+        {
+            runtime.routing.active_screencast = None;
+        }
+        Ok(())
+    }
+
     /// Return whether MoonDesk currently owns a live browser transport.
     pub async fn is_running(&self) -> bool {
         self.runtime
@@ -615,9 +1634,14 @@ impl BrowserRuntime {
             .is_some_and(|transport| transport.is_alive())
     }
 
-    pub async fn stop_if_owned(&self, _workspace_root: &str) {
+    pub async fn stop(&self) {
         let _operation = self.operation.lock().await;
-        let transport = self.runtime.lock().await.transport.take();
+        let transport = {
+            let mut runtime = self.runtime.lock().await;
+            let transport = runtime.transport.take();
+            runtime.routing.clear();
+            transport
+        };
         if let Some(transport) = transport {
             transport.shutdown().await;
         }
@@ -625,6 +1649,240 @@ impl BrowserRuntime {
             state.lock().await.browser_runtime_running = false;
         }
     }
+}
+
+fn browser_result_is_error(result: &Value) -> bool {
+    result.get("isError").and_then(Value::as_bool) == Some(true)
+}
+
+fn browser_requested_page_id(arguments: &serde_json::Map<String, Value>) -> Result<u64, String> {
+    let Some(value) = arguments.get("pageId") else {
+        return Err("Browser pageId is required".to_string());
+    };
+    let page_id = value
+        .as_u64()
+        .or_else(|| {
+            value
+                .as_f64()
+                .filter(|value| value.is_finite() && value.fract() == 0.0 && *value >= 0.0)
+                .map(|value| value as u64)
+        })
+        .filter(|value| *value > 0)
+        .ok_or_else(|| "Browser pageId must be a positive integer".to_string())?;
+    Ok(page_id)
+}
+
+fn upstream_pages_from_result(result: &Value) -> Result<Vec<UpstreamPageInfo>, String> {
+    let pages = result
+        .pointer("/structuredContent/pages")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            "chrome-devtools-mcp did not return structured page metadata; the pinned browser contract may have changed"
+                .to_string()
+        })?;
+    pages
+        .iter()
+        .map(|page| {
+            let id = page
+                .get("id")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| "Browser page metadata did not contain a numeric id".to_string())?;
+            Ok(UpstreamPageInfo {
+                id,
+                url: page
+                    .get("url")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                title: page
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                selected: page
+                    .get("selected")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                isolated_context: page
+                    .get("isolatedContext")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+            })
+        })
+        .collect()
+}
+
+fn upstream_page_ids(pages: &[UpstreamPageInfo]) -> HashSet<u64> {
+    pages.iter().map(|page| page.id).collect()
+}
+
+fn new_upstream_page_ids(before: &HashSet<u64>, after: &[UpstreamPageInfo]) -> HashSet<u64> {
+    after
+        .iter()
+        .map(|page| page.id)
+        .filter(|page_id| !before.contains(page_id))
+        .collect()
+}
+
+fn browser_close_survivor_page_id(pages: &[UpstreamPageInfo], target_page_id: u64) -> Option<u64> {
+    if !pages
+        .iter()
+        .any(|page| page.id == target_page_id && page.selected)
+    {
+        return None;
+    }
+    pages
+        .iter()
+        .find(|page| page.id != target_page_id && page.isolated_context.is_none())
+        .or_else(|| pages.iter().find(|page| page.id != target_page_id))
+        .map(|page| page.id)
+}
+
+fn browser_workspace_file_command(command: &str) -> bool {
+    matches!(
+        command,
+        "close_heapsnapshot"
+            | "compare_heapsnapshots"
+            | "get_heapsnapshot_class_nodes"
+            | "get_heapsnapshot_details"
+            | "get_heapsnapshot_dominators"
+            | "get_heapsnapshot_duplicate_strings"
+            | "get_heapsnapshot_edges"
+            | "get_heapsnapshot_object_details"
+            | "get_heapsnapshot_retainers"
+            | "get_heapsnapshot_retaining_paths"
+            | "get_heapsnapshot_summary"
+    )
+}
+
+fn browser_global_extension_command(command: &str) -> bool {
+    matches!(
+        command,
+        "install_extension"
+            | "list_extensions"
+            | "reload_extension"
+            | "trigger_extension_action"
+            | "uninstall_extension"
+    )
+}
+
+#[cfg(test)]
+fn browser_logical_page_control_command(command: &str) -> bool {
+    matches!(
+        command,
+        "list_pages" | "new_page" | "select_page" | "close_page"
+    )
+}
+
+fn browser_page_scoped_command(command: &str) -> bool {
+    matches!(
+        command,
+        "click"
+            | "click_at"
+            | "drag"
+            | "emulate"
+            | "evaluate_script"
+            | "execute_3p_developer_tool"
+            | "execute_webmcp_tool"
+            | "fill"
+            | "get_console_message"
+            | "get_network_request"
+            | "handle_dialog"
+            | "hover"
+            | "lighthouse_audit"
+            | "list_3p_developer_tools"
+            | "list_console_messages"
+            | "list_network_requests"
+            | "list_webmcp_tools"
+            | "navigate_page"
+            | "performance_analyze_insight"
+            | "performance_start_trace"
+            | "performance_stop_trace"
+            | "press_key"
+            | "resize_page"
+            | "screencast_start"
+            | "screencast_stop"
+            | "take_heapsnapshot"
+            | "take_screenshot"
+            | "take_snapshot"
+            | "type_text"
+            | "upload_file"
+            | "wait_for"
+    )
+}
+
+fn browser_command_may_open_or_close_pages(command: &str) -> bool {
+    matches!(
+        command,
+        "click"
+            | "click_at"
+            | "evaluate_script"
+            | "execute_3p_developer_tool"
+            | "execute_webmcp_tool"
+            | "handle_dialog"
+            | "navigate_page"
+            | "press_key"
+    )
+}
+
+fn browser_safe_pages_markdown(pages: &[Value]) -> String {
+    let mut lines = vec!["## Pages".to_string()];
+    for page in pages {
+        let id = page.get("id").and_then(Value::as_u64).unwrap_or(0);
+        let url = page.get("url").and_then(Value::as_str).unwrap_or_default();
+        let title = page
+            .get("title")
+            .and_then(Value::as_str)
+            .filter(|title| !title.is_empty());
+        let selected = page
+            .get("selected")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let label = title.map_or_else(|| url.to_string(), |title| format!("{title} ({url})"));
+        lines.push(format!(
+            "{id}: {label}{}",
+            if selected { " [selected]" } else { "" }
+        ));
+    }
+    lines.join("\n")
+}
+
+fn rewrite_browser_page_sections(text: &str, safe_pages: &str) -> String {
+    let mut output = Vec::new();
+    let mut lines = text.lines().peekable();
+    let mut replaced_pages = false;
+    while let Some(line) = lines.next() {
+        if line.trim() == "## Pages" {
+            if !replaced_pages {
+                output.extend(safe_pages.lines().map(str::to_string));
+                replaced_pages = true;
+            }
+            while let Some(next) = lines.peek() {
+                if next.starts_with("## ") {
+                    break;
+                }
+                lines.next();
+            }
+            continue;
+        }
+        if line.trim() == "## Extension Pages" {
+            while let Some(next) = lines.peek() {
+                if next.starts_with("## ") {
+                    break;
+                }
+                lines.next();
+            }
+            continue;
+        }
+        if line.starts_with("Note: the previously selected page ")
+            || line
+                .starts_with("Note: the browser was restarted or reconnected since the last call.")
+        {
+            continue;
+        }
+        output.push(line.to_string());
+    }
+    output.join("\n")
 }
 
 fn browser_result_text(result: &Value) -> String {
@@ -642,6 +1900,7 @@ fn browser_result_text(result: &Value) -> String {
         .join("\n")
 }
 
+#[cfg(test)]
 fn browser_page_listing_text(text: &str) -> Vec<(u64, bool)> {
     text.lines()
         .filter_map(|line| {
@@ -658,6 +1917,7 @@ fn browser_page_listing_text(text: &str) -> Vec<(u64, bool)> {
         .collect()
 }
 
+#[cfg(test)]
 fn browser_page_listing(result: &Value) -> Vec<(u64, bool)> {
     browser_page_listing_text(&browser_result_text(result))
 }
@@ -676,6 +1936,7 @@ fn browser_server_args(presentation: BrowserPresentation) -> (Vec<String>, Strin
         "--allowUnrestrictedPaths=false".to_string(),
         "--viaCli=true".to_string(),
         "--experimentalStructuredContent=true".to_string(),
+        "--experimentalPageIdRouting=true".to_string(),
     ];
     if presentation.is_headless() {
         args.push(format!("--viewport={DEFAULT_HEADLESS_VIEWPORT}"));
@@ -1900,6 +3161,38 @@ mod tests {
     use crate::state::AppState;
 
     #[test]
+    fn service_worker_evaluation_cannot_bypass_page_routing_contract() {
+        let error = browser_structured_arguments_to_cli(
+            "evaluate_script",
+            &serde_json::json!({
+                "function": "() => self.location.href",
+                "serviceWorkerId": "worker-1",
+            }),
+        )
+        .expect_err("MoonDesk's pinned public contract must reject raw service-worker targets");
+        assert!(error.contains("Unknown argument 'serviceWorkerId'"));
+    }
+
+    #[test]
+    fn every_pinned_browser_command_has_an_explicit_routing_class() {
+        let contract: Value = serde_json::from_str(include_str!("browser_contract_v1_7.json"))
+            .expect("parse pinned browser contract");
+        let commands = contract
+            .get("commands")
+            .and_then(Value::as_object)
+            .expect("pinned browser commands");
+        for command in commands.keys() {
+            assert!(
+                browser_logical_page_control_command(command)
+                    || browser_page_scoped_command(command)
+                    || browser_workspace_file_command(command)
+                    || browser_global_extension_command(command),
+                "pinned browser command {command:?} has no MoonDesk routing class"
+            );
+        }
+    }
+
+    #[test]
     fn service_commands_are_reserved_for_runtime_lifecycle() {
         for command in ["start", "status", "stop"] {
             assert!(browser_service_command(command));
@@ -1915,6 +3208,305 @@ mod tests {
         assert!(external_browser_input_files_allowed(Some(Mode::Both)));
         assert!(external_browser_input_files_allowed(Some(Mode::Computer)));
         assert!(external_browser_input_files_allowed(None));
+    }
+
+    #[test]
+    fn browser_session_context_is_workspace_scoped_not_chat_scoped() {
+        let workspace_a = WorkspaceId::new();
+        let workspace_b = WorkspaceId::new();
+        let chat_a = BrowserSessionKey::openai(&workspace_a, Some("subject-a"), "chat-a");
+        let chat_b = BrowserSessionKey::openai(&workspace_a, Some("subject-a"), "chat-b");
+        let other_workspace = BrowserSessionKey::openai(&workspace_b, Some("subject-a"), "chat-a");
+
+        assert_eq!(
+            chat_a.workspace_context_name(),
+            chat_b.workspace_context_name()
+        );
+        assert_ne!(
+            chat_a.workspace_context_name(),
+            other_workspace.workspace_context_name()
+        );
+        assert!(chat_a != chat_b);
+    }
+
+    #[tokio::test]
+    async fn logical_pages_are_isolated_between_chats_in_same_workspace() {
+        let runtime = BrowserRuntime::standalone();
+        let workspace = WorkspaceId::new();
+        let chat_a = BrowserSessionKey::openai(&workspace, Some("subject-a"), "chat-a");
+        let chat_b = BrowserSessionKey::openai(&workspace, Some("subject-a"), "chat-b");
+        let context = chat_a.workspace_context_name();
+
+        let pages_a = vec![
+            UpstreamPageInfo {
+                id: 101,
+                url: "http://example.test/a1".into(),
+                title: "A1".into(),
+                selected: true,
+                isolated_context: Some(context.clone()),
+            },
+            UpstreamPageInfo {
+                id: 102,
+                url: "http://example.test/a2".into(),
+                title: "A2".into(),
+                selected: false,
+                isolated_context: Some(context.clone()),
+            },
+        ];
+        let claim_a = upstream_page_ids(&pages_a);
+        runtime
+            .reconcile_pages(&chat_a, &pages_a, Some(&claim_a))
+            .await;
+
+        let pages_all = vec![
+            pages_a[0].clone(),
+            pages_a[1].clone(),
+            UpstreamPageInfo {
+                id: 201,
+                url: "http://example.test/b1".into(),
+                title: "B1".into(),
+                selected: true,
+                isolated_context: Some(context),
+            },
+        ];
+        let claim_b = HashSet::from([201]);
+        runtime
+            .reconcile_pages(&chat_b, &pages_all, Some(&claim_b))
+            .await;
+
+        let safe_a = runtime.safe_pages_for_session(&chat_a).await;
+        let safe_b = runtime.safe_pages_for_session(&chat_b).await;
+        assert_eq!(safe_a.len(), 2);
+        assert_eq!(safe_b.len(), 1);
+        assert_eq!(safe_a[0].get("id").and_then(Value::as_u64), Some(1));
+        assert_eq!(safe_a[1].get("id").and_then(Value::as_u64), Some(2));
+        assert_eq!(safe_b[0].get("id").and_then(Value::as_u64), Some(1));
+        assert_eq!(
+            runtime.owned_upstream_page_id(&chat_a, 2).await.unwrap(),
+            102
+        );
+        assert!(runtime.owned_upstream_page_id(&chat_b, 2).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn page_results_hide_other_sessions_and_upstream_ids() {
+        let runtime = BrowserRuntime::standalone();
+        let workspace = WorkspaceId::new();
+        let chat_a = BrowserSessionKey::openai(&workspace, None, "chat-a");
+        let chat_b = BrowserSessionKey::openai(&workspace, None, "chat-b");
+        let context = chat_a.workspace_context_name();
+        let pages = vec![
+            UpstreamPageInfo {
+                id: 101,
+                url: "http://example.test/a".into(),
+                title: "Chat A".into(),
+                selected: true,
+                isolated_context: Some(context.clone()),
+            },
+            UpstreamPageInfo {
+                id: 202,
+                url: "http://example.test/b".into(),
+                title: "Chat B".into(),
+                selected: false,
+                isolated_context: Some(context),
+            },
+        ];
+        runtime
+            .reconcile_pages(&chat_a, &pages, Some(&HashSet::from([101])))
+            .await;
+        runtime
+            .reconcile_pages(&chat_b, &pages, Some(&HashSet::from([202])))
+            .await;
+
+        let mut result = serde_json::json!({
+            "content": [{
+                "type": "text",
+                "text": "## Pages\n101: Chat A (http://example.test/a) [selected] isolatedContext=secret-a\n202: Chat B (http://example.test/b) isolatedContext=secret-a"
+            }],
+            "structuredContent": {
+                "pages": [
+                    {"id":101,"url":"http://example.test/a","title":"Chat A","selected":true,"isolatedContext":"secret-a"},
+                    {"id":202,"url":"http://example.test/b","title":"Chat B","selected":false,"isolatedContext":"secret-a"}
+                ]
+            }
+        });
+        runtime
+            .sanitize_page_result_for_session(&chat_a, &mut result)
+            .await;
+
+        let visible = result
+            .pointer("/structuredContent/pages")
+            .and_then(Value::as_array)
+            .unwrap();
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].get("id").and_then(Value::as_u64), Some(1));
+        assert!(visible[0].get("isolatedContext").is_none());
+        let text = result
+            .pointer("/content/0/text")
+            .and_then(Value::as_str)
+            .unwrap();
+        assert!(text.contains("1: Chat A"));
+        assert!(!text.contains("101:"));
+        assert!(!text.contains("202:"));
+        assert!(!text.contains("Chat B"));
+        assert!(!text.contains("isolatedContext"));
+    }
+
+    #[tokio::test]
+    async fn vanished_global_recording_page_is_detected_before_reconciliation() {
+        let runtime = BrowserRuntime::standalone();
+        let workspace = WorkspaceId::new();
+        let chat = BrowserSessionKey::openai(&workspace, None, "chat-a");
+        runtime
+            .begin_performance_trace(&chat, 41)
+            .await
+            .expect("claim performance trace");
+        assert_eq!(
+            runtime.missing_global_recording_page(&[]).await,
+            Some("performance trace")
+        );
+        assert_eq!(
+            runtime
+                .missing_global_recording_page(&[UpstreamPageInfo {
+                    id: 41,
+                    url: "about:blank".into(),
+                    title: String::new(),
+                    selected: true,
+                    isolated_context: Some(chat.workspace_context_name()),
+                }])
+                .await,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn global_browser_recordings_are_session_and_page_owned() {
+        let runtime = BrowserRuntime::standalone();
+        let workspace = WorkspaceId::new();
+        let chat_a = BrowserSessionKey::openai(&workspace, None, "chat-a");
+        let chat_b = BrowserSessionKey::openai(&workspace, None, "chat-b");
+
+        runtime
+            .begin_performance_trace(&chat_a, 41)
+            .await
+            .expect("chat A claims trace");
+        assert!(runtime.begin_performance_trace(&chat_b, 52).await.is_err());
+        assert_eq!(
+            runtime
+                .performance_trace_page(&chat_a)
+                .await
+                .expect("chat A owns active trace"),
+            41
+        );
+        assert!(runtime.performance_trace_page(&chat_b).await.is_err());
+        assert!(runtime.ensure_page_can_close(&chat_a, 41).await.is_err());
+        assert!(runtime.ensure_page_can_close(&chat_a, 99).await.is_ok());
+        runtime.finish_performance_trace(&chat_a, true).await;
+        runtime
+            .require_last_trace_owner(&chat_a)
+            .await
+            .expect("chat A owns last trace recording");
+        assert!(runtime.require_last_trace_owner(&chat_b).await.is_err());
+
+        runtime
+            .begin_screencast(&chat_b, 52)
+            .await
+            .expect("chat B claims screencast");
+        assert!(runtime.begin_screencast(&chat_a, 41).await.is_err());
+        assert_eq!(
+            runtime
+                .screencast_page(&chat_b)
+                .await
+                .expect("chat B owns active screencast"),
+            52
+        );
+        assert!(runtime.screencast_page(&chat_a).await.is_err());
+        assert!(runtime.ensure_page_can_close(&chat_b, 52).await.is_err());
+        runtime.finish_screencast(&chat_b).await;
+        assert!(runtime.ensure_page_can_close(&chat_b, 52).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn releasing_workspace_drops_only_its_logical_browser_state_when_idle() {
+        let runtime = BrowserRuntime::standalone();
+        let workspace_a = WorkspaceId::new();
+        let workspace_b = WorkspaceId::new();
+        let chat_a = BrowserSessionKey::openai(&workspace_a, None, "chat-a");
+        let chat_b = BrowserSessionKey::openai(&workspace_b, None, "chat-b");
+        let pages = vec![
+            UpstreamPageInfo {
+                id: 11,
+                url: "https://a.example/".into(),
+                title: "A".into(),
+                selected: true,
+                isolated_context: Some(chat_a.workspace_context_name()),
+            },
+            UpstreamPageInfo {
+                id: 22,
+                url: "https://b.example/".into(),
+                title: "B".into(),
+                selected: false,
+                isolated_context: Some(chat_b.workspace_context_name()),
+            },
+        ];
+        runtime
+            .reconcile_pages(&chat_a, &pages, Some(&HashSet::from([11])))
+            .await;
+        runtime
+            .reconcile_pages(&chat_b, &pages, Some(&HashSet::from([22])))
+            .await;
+        runtime
+            .begin_performance_trace(&chat_a, 11)
+            .await
+            .expect("workspace A trace lease");
+
+        runtime
+            .release_workspace(&workspace_a)
+            .await
+            .expect("release idle workspace A state");
+
+        assert!(runtime.safe_pages_for_session(&chat_a).await.is_empty());
+        assert_eq!(runtime.safe_pages_for_session(&chat_b).await.len(), 1);
+        assert!(runtime.performance_trace_page(&chat_a).await.is_err());
+        assert_eq!(
+            runtime
+                .owned_upstream_page_id(&chat_b, 1)
+                .await
+                .expect("workspace B page survives release"),
+            22
+        );
+    }
+
+    #[test]
+    fn close_page_prefers_unowned_keeper_when_target_is_selected() {
+        let pages = vec![
+            UpstreamPageInfo {
+                id: 1,
+                url: "about:blank".into(),
+                title: String::new(),
+                selected: false,
+                isolated_context: None,
+            },
+            UpstreamPageInfo {
+                id: 7,
+                url: "https://project.example/".into(),
+                title: "Project".into(),
+                selected: true,
+                isolated_context: Some("moondesk-ws-a".into()),
+            },
+            UpstreamPageInfo {
+                id: 9,
+                url: "https://other.example/".into(),
+                title: "Other".into(),
+                selected: false,
+                isolated_context: Some("moondesk-ws-b".into()),
+            },
+        ];
+        assert_eq!(browser_close_survivor_page_id(&pages, 7), Some(1));
+        assert_eq!(browser_close_survivor_page_id(&pages, 9), None);
+
+        let without_keeper = vec![pages[1].clone(), pages[2].clone()];
+        assert_eq!(browser_close_survivor_page_id(&without_keeper, 7), Some(9));
     }
 
     #[test]
@@ -2106,6 +3698,7 @@ mod tests {
                 "--allowUnrestrictedPaths=false",
                 "--viaCli=true",
                 "--experimentalStructuredContent=true",
+                "--experimentalPageIdRouting=true",
             ] {
                 assert!(args.iter().any(|arg| arg == expected), "missing {expected}");
             }
@@ -2738,9 +4331,367 @@ mod tests {
             BrowserPresentation::Headless
         );
 
-        runtime.stop_if_owned(&workspace_str).await;
+        runtime.stop().await;
         let _ = std::fs::remove_file(config_path);
         let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    #[ignore = "serialized Windows shared Chromium session-routing smoke"]
+    async fn windows_shared_chromium_isolates_chat_pages_and_workspace_storage() {
+        use axum::{Router, response::Html, routing::get};
+
+        if !crate::browser::detect_browsers()
+            .into_iter()
+            .any(|browser| browser.mcp_supported)
+        {
+            eprintln!("skipping shared Chromium routing smoke: no supported browser installed");
+            return;
+        }
+
+        const SITE_HTML: &str = r#"<!doctype html>
+<html><head><meta charset="utf-8"><title>MoonDesk Routing E2E</title></head>
+<body>
+<h1 id="path"></h1>
+<button id="popup" onclick="window.open('/popup','_blank')">Open popup</button>
+<script>document.getElementById('path').textContent=location.pathname;</script>
+</body></html>"#;
+        let site = Router::new()
+            .route("/", get(|| async { Html(SITE_HTML) }))
+            .fallback(|| async { Html(SITE_HTML) });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind routing test site");
+        let address = listener.local_addr().expect("routing test site address");
+        let site_server = tokio::spawn(async move {
+            let _ = axum::serve(listener, site).await;
+        });
+        let origin = format!("http://{address}");
+
+        let root_a =
+            std::env::temp_dir().join(format!("moondesk-routing-a-{}", uuid::Uuid::new_v4()));
+        let root_b =
+            std::env::temp_dir().join(format!("moondesk-routing-b-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root_a).expect("create routing workspace A");
+        std::fs::create_dir_all(&root_b).expect("create routing workspace B");
+        let mut app = AppState::new_for_test(
+            0,
+            root_a.to_string_lossy().into_owned(),
+            root_a.join("config.toml"),
+        )
+        .expect("create routing app");
+        app.mode = Mode::Both;
+        let state = Arc::new(Mutex::new(app));
+        let runtime = BrowserRuntime::new(state);
+
+        let workspace_a = WorkspaceId::new();
+        let workspace_b = WorkspaceId::new();
+        let chat_a = BrowserSessionKey::openai(&workspace_a, Some("subject"), "chat-a");
+        let chat_b = BrowserSessionKey::openai(&workspace_a, Some("subject"), "chat-b");
+        let chat_c = BrowserSessionKey::openai(&workspace_b, Some("subject"), "chat-c");
+        let root_a_str = root_a.to_string_lossy().into_owned();
+        let root_b_str = root_b.to_string_lossy().into_owned();
+
+        let navigate_a = runtime
+            .run_for_session(
+                &chat_a,
+                &root_a_str,
+                "navigate_page",
+                &[format!("--url={origin}/a")],
+                DEFAULT_BROWSER_COMMAND_TIMEOUT,
+            )
+            .await
+            .expect("navigate chat A");
+        assert!(
+            navigate_a.success(),
+            "chat A navigation failed: {navigate_a:?}"
+        );
+        let shared_pid = runtime
+            .transport_pid()
+            .await
+            .expect("shared browser transport pid");
+
+        let set_storage = runtime
+            .run_for_session(
+                &chat_a,
+                &root_a_str,
+                "evaluate_script",
+                &["() => { localStorage.setItem('md-owner','workspace-a'); document.cookie='md-owner=workspace-a; path=/'; return 'stored'; }".into()],
+                DEFAULT_BROWSER_COMMAND_TIMEOUT,
+            )
+            .await
+            .expect("set workspace A storage");
+        assert!(set_storage.success(), "set storage failed: {set_storage:?}");
+
+        let navigate_b = runtime
+            .run_for_session(
+                &chat_b,
+                &root_a_str,
+                "navigate_page",
+                &[format!("--url={origin}/b")],
+                DEFAULT_BROWSER_COMMAND_TIMEOUT,
+            )
+            .await
+            .expect("navigate chat B");
+        assert!(
+            navigate_b.success(),
+            "chat B navigation failed: {navigate_b:?}"
+        );
+        let storage_b = runtime
+            .run_for_session(
+                &chat_b,
+                &root_a_str,
+                "evaluate_script",
+                &["() => ({storage: localStorage.getItem('md-owner') === 'workspace-a' ? 'HAS' : 'MISS', cookie: document.cookie.includes('md-owner=workspace-a') ? 'HAS' : 'MISS'})".into()],
+                DEFAULT_BROWSER_COMMAND_TIMEOUT,
+            )
+            .await
+            .expect("inspect same-workspace storage");
+        assert!(
+            storage_b.stdout.contains("HAS"),
+            "same workspace did not share storage: {}",
+            storage_b.stdout
+        );
+        assert!(
+            !storage_b.stdout.contains("MISS"),
+            "same workspace unexpectedly lost storage: {}",
+            storage_b.stdout
+        );
+
+        let navigate_c = runtime
+            .run_for_session(
+                &chat_c,
+                &root_b_str,
+                "navigate_page",
+                &[format!("--url={origin}/c")],
+                DEFAULT_BROWSER_COMMAND_TIMEOUT,
+            )
+            .await
+            .expect("navigate chat C");
+        assert!(
+            navigate_c.success(),
+            "chat C navigation failed: {navigate_c:?}"
+        );
+        assert_eq!(
+            runtime.transport_pid().await,
+            Some(shared_pid),
+            "different workspaces must reuse one chrome-devtools-mcp/Chromium runtime"
+        );
+        let storage_c = runtime
+            .run_for_session(
+                &chat_c,
+                &root_b_str,
+                "evaluate_script",
+                &["() => ({storage: localStorage.getItem('md-owner') === null ? 'MISS' : 'HAS', cookie: document.cookie.includes('md-owner=workspace-a') ? 'HAS' : 'MISS'})".into()],
+                DEFAULT_BROWSER_COMMAND_TIMEOUT,
+            )
+            .await
+            .expect("inspect cross-workspace storage");
+        assert!(
+            storage_c.stdout.contains("MISS"),
+            "different workspace unexpectedly shared storage: {}",
+            storage_c.stdout
+        );
+        assert!(
+            !storage_c.stdout.contains("\"HAS\""),
+            "different workspace leaked storage: {}",
+            storage_c.stdout
+        );
+
+        let second_a = runtime
+            .run_for_session(
+                &chat_a,
+                &root_a_str,
+                "new_page",
+                &[format!("{origin}/a2")],
+                DEFAULT_BROWSER_COMMAND_TIMEOUT,
+            )
+            .await
+            .expect("open second chat A page");
+        assert!(second_a.success(), "chat A new_page failed: {second_a:?}");
+        let pages_a = runtime
+            .run_for_session(
+                &chat_a,
+                &root_a_str,
+                "list_pages",
+                &[],
+                DEFAULT_BROWSER_COMMAND_TIMEOUT,
+            )
+            .await
+            .expect("list chat A pages");
+        assert!(
+            pages_a.stdout.contains("/a"),
+            "chat A missing first page: {}",
+            pages_a.stdout
+        );
+        assert!(
+            pages_a.stdout.contains("/a2"),
+            "chat A missing second page: {}",
+            pages_a.stdout
+        );
+        assert!(
+            !pages_a.stdout.contains("/b"),
+            "chat A saw chat B page: {}",
+            pages_a.stdout
+        );
+        assert!(
+            !pages_a.stdout.contains("/c"),
+            "chat A saw workspace B page: {}",
+            pages_a.stdout
+        );
+
+        let pages_b = runtime
+            .run_for_session(
+                &chat_b,
+                &root_a_str,
+                "list_pages",
+                &[],
+                DEFAULT_BROWSER_COMMAND_TIMEOUT,
+            )
+            .await
+            .expect("list chat B pages");
+        assert!(
+            pages_b.stdout.contains("/b"),
+            "chat B missing its page: {}",
+            pages_b.stdout
+        );
+        assert!(
+            !pages_b.stdout.contains("/a2"),
+            "chat B saw chat A page: {}",
+            pages_b.stdout
+        );
+        let cross_select = runtime
+            .run_for_session(
+                &chat_b,
+                &root_a_str,
+                "select_page",
+                &["2".into()],
+                DEFAULT_BROWSER_COMMAND_TIMEOUT,
+            )
+            .await
+            .expect_err("chat B must not select chat A logical page 2");
+        assert!(
+            cross_select.contains("does not belong to this session"),
+            "unexpected cross-session error: {cross_select}"
+        );
+
+        let snapshot = runtime
+            .run_for_session(
+                &chat_a,
+                &root_a_str,
+                "take_snapshot",
+                &[],
+                DEFAULT_BROWSER_COMMAND_TIMEOUT,
+            )
+            .await
+            .expect("snapshot chat A before popup");
+        let popup_uid = snapshot
+            .stdout
+            .lines()
+            .find(|line| line.contains("button \"Open popup\""))
+            .and_then(|line| line.split("uid=").nth(1))
+            .and_then(|value| value.split_whitespace().next())
+            .map(str::to_string)
+            .expect("popup button uid");
+        let popup = runtime
+            .run_for_session(
+                &chat_a,
+                &root_a_str,
+                "click",
+                &[popup_uid],
+                DEFAULT_BROWSER_COMMAND_TIMEOUT,
+            )
+            .await
+            .expect("open popup from chat A");
+        assert!(popup.success(), "popup click failed: {popup:?}");
+        let pages_after_popup = runtime
+            .run_for_session(
+                &chat_a,
+                &root_a_str,
+                "list_pages",
+                &[],
+                DEFAULT_BROWSER_COMMAND_TIMEOUT,
+            )
+            .await
+            .expect("list chat A pages after popup");
+        assert!(
+            pages_after_popup.stdout.contains("/popup"),
+            "popup was not attributed to chat A: {}",
+            pages_after_popup.stdout
+        );
+        let pages_b_after_popup = runtime
+            .run_for_session(
+                &chat_b,
+                &root_a_str,
+                "list_pages",
+                &[],
+                DEFAULT_BROWSER_COMMAND_TIMEOUT,
+            )
+            .await
+            .expect("list chat B pages after chat A popup");
+        assert!(
+            !pages_b_after_popup.stdout.contains("/popup"),
+            "chat B saw chat A popup: {}",
+            pages_b_after_popup.stdout
+        );
+
+        runtime
+            .release_workspace(&workspace_a)
+            .await
+            .expect("release workspace A without disturbing shared Chromium");
+        assert_eq!(
+            runtime.transport_pid().await,
+            Some(shared_pid),
+            "workspace release must not restart Chromium when cleanup succeeds"
+        );
+        assert!(runtime.safe_pages_for_session(&chat_a).await.is_empty());
+        assert!(runtime.safe_pages_for_session(&chat_b).await.is_empty());
+        let transport = runtime
+            .runtime
+            .lock()
+            .await
+            .transport
+            .clone()
+            .expect("shared transport after workspace A release");
+        let upstream_pages = runtime
+            .list_upstream_pages(
+                &transport,
+                tokio::time::Instant::now() + DEFAULT_BROWSER_COMMAND_TIMEOUT,
+                DEFAULT_BROWSER_COMMAND_TIMEOUT,
+            )
+            .await
+            .expect("inspect upstream pages after workspace A release");
+        let workspace_a_context = chat_a.workspace_context_name();
+        assert!(
+            upstream_pages.iter().all(|page| {
+                page.isolated_context.as_deref() != Some(workspace_a_context.as_str())
+            }),
+            "workspace A pages remained alive after release: {upstream_pages:?}"
+        );
+        let workspace_b_after_release = runtime
+            .run_for_session(
+                &chat_c,
+                &root_b_str,
+                "evaluate_script",
+                &["() => ({path: location.pathname, storage: localStorage.getItem('md-owner') === null ? 'MISS' : 'HAS'})".into()],
+                DEFAULT_BROWSER_COMMAND_TIMEOUT,
+            )
+            .await
+            .expect("workspace B remains usable after workspace A release");
+        assert!(
+            workspace_b_after_release.success(),
+            "workspace B failed after workspace A release: {workspace_b_after_release:?}"
+        );
+        assert!(workspace_b_after_release.stdout.contains("/c"));
+        assert!(workspace_b_after_release.stdout.contains("MISS"));
+        assert_eq!(runtime.transport_pid().await, Some(shared_pid));
+
+        runtime.stop().await;
+        site_server.abort();
+        let _ = site_server.await;
+        let _ = std::fs::remove_dir_all(root_a);
+        let _ = std::fs::remove_dir_all(root_b);
     }
 
     #[cfg(windows)]
@@ -2865,7 +4816,7 @@ mod tests {
         let second_pid = second_transport.pid().await.expect("second transport pid");
         assert_ne!(first_pid, second_pid);
 
-        second_runtime.stop_if_owned(&workspace_str).await;
+        second_runtime.stop().await;
         assert!(!second_transport.is_alive());
         assert!(
             first_transport.is_alive(),
@@ -2904,7 +4855,7 @@ mod tests {
         let replacement_pid = replacement.pid().await.expect("replacement pid");
         assert_ne!(replacement_pid, first_pid);
 
-        runtime.stop_if_owned(&workspace_str).await;
+        runtime.stop().await;
         assert!(!replacement.is_alive());
         let _ = std::fs::remove_dir_all(workspace);
     }
@@ -3029,7 +4980,7 @@ mod tests {
         );
         assert!(recovered.restarted);
 
-        runtime.stop_if_owned(&workspace_str).await;
+        runtime.stop().await;
         server.abort();
         let _ = server.await;
         let _ = std::fs::remove_dir_all(workspace);

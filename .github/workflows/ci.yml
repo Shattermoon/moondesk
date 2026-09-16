@@ -156,7 +156,11 @@ jobs:
 
       - name: Run Windows host browser session smoke
         timeout-minutes: 10
-        run: cargo +stable test --locked windows_host_browser_cli_and_mcp_view_page_share_one_session -- --ignored --test-threads 1
+        run: cargo +stable test --locked windows_host_browser_cli_and_mcp_keep_separate_logical_sessions -- --ignored --test-threads 1
+
+      - name: Run Windows shared browser routing smoke
+        timeout-minutes: 10
+        run: cargo +stable test --locked windows_shared_chromium_isolates_chat_pages_and_workspace_storage -- --ignored --test-threads 1
 
       - name: Run Windows lazy browser vision smoke
         timeout-minutes: 10

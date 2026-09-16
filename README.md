@@ -120,7 +120,9 @@ Select the connector and start working.
 
 ## Browser control
 
-MoonDesk owns a dedicated agent browser instead of attaching to your personal browser profile. It starts lazily, runs headless by default, and can be switched to visible mode for human-assisted steps such as logins or permission prompts.
+MoonDesk owns one lazy agent Chromium process instead of attaching to your personal browser profile or launching a separate browser for every project. Inside that shared Chromium, each registered workspace gets its own isolated BrowserContext for cookies and site storage, while each ChatGPT conversation gets its own MoonDesk-routed logical tab set. Different workspaces therefore do not share cookies, localStorage, IndexedDB, or service-worker state, and separate conversations cannot accidentally act on each other's selected tabs.
+
+The browser runs headless by default and can be switched to visible mode for human-assisted steps such as logins or permission prompts. Presentation belongs to the shared Chromium process, so changing it while the browser is live requires explicit confirmation because every workspace BrowserContext and logical tab is recreated. MoonDesk never attaches to or reuses your personal browser profile, cookies, or logged-in sessions.
 
 ```bash
 moondesk browser navigate_page --url=http://localhost:3000
@@ -129,7 +131,7 @@ moondesk browser take_snapshot
 moondesk browser list_console_messages
 ```
 
-Use `view_page` when the task depends on actual rendered pixels rather than only a text/accessibility snapshot.
+The `moondesk browser` CLI shares the resolved workspace's BrowserContext/login state but uses its own logical tab session, so scripted browser commands cannot steal a ChatGPT conversation's active page. Use `view_page` when the task depends on actual rendered pixels rather than only a text/accessibility snapshot.
 
 For browser-runtime invariants and implementation details, see [`docs/BROWSER_RUNTIME_ARCHITECTURE_HARDENING.md`](docs/BROWSER_RUNTIME_ARCHITECTURE_HARDENING.md).
 

@@ -455,7 +455,7 @@ function createDownloadProgressReporter(writer = process.stderr) {
 
     // A redirected stderr cannot repaint one terminal row. Emit only the completed state there so
     // logs stay compact; interactive terminals get the live in-place progress experience.
-    if (writer.isTTY === false) {
+    if (writer.isTTY !== true) {
       if (done) writer.write(`${line}\n`);
       return;
     }

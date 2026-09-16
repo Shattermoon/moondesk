@@ -17,20 +17,44 @@ function tempDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), "moondesk-install-test-"));
 }
 
-test("download progress reporter renders bounded ASCII bars", () => {
-  const messages = [];
-  const report = createDownloadProgressReporter({ warn: (message) => messages.push(message) });
+test("download progress reporter repaints one terminal line in 10% steps", () => {
+  const writes = [];
+  const report = createDownloadProgressReporter({
+    isTTY: true,
+    write(chunk) {
+      writes.push(chunk);
+    },
+  });
   const totalBytes = 10 * 1024 * 1024;
 
   report({ downloadedBytes: 0, totalBytes });
   report({ downloadedBytes: totalBytes / 10, totalBytes });
   report({ downloadedBytes: (totalBytes * 3) / 10, totalBytes });
-  report({ downloadedBytes: totalBytes, totalBytes });
+  report({ downloadedBytes: totalBytes, totalBytes, done: true });
 
-  assert.match(messages[0], /^Downloading MoonDesk .+ native binary \(10\.0 MiB\)\.\.\.$/);
-  assert.equal(messages[1], "[##------------------]  10% (1.0 MiB / 10.0 MiB)");
-  assert.equal(messages[2], "[######--------------]  30% (3.0 MiB / 10.0 MiB)");
-  assert.equal(messages[3], "[####################] 100% (10.0 MiB / 10.0 MiB)");
+  assert.equal(writes[0], "\rMoonDesk [░░░░░░░░░░]   0%  0.0 MiB / 10.0 MiB");
+  assert.equal(writes[1], "\rMoonDesk [█░░░░░░░░░]  10%  1.0 MiB / 10.0 MiB");
+  assert.equal(writes[2], "\rMoonDesk [███░░░░░░░]  30%  3.0 MiB / 10.0 MiB");
+  assert.equal(writes[3], "\rMoonDesk [██████████] 100%  10.0 MiB / 10.0 MiB\n");
+  assert.equal(writes.join("").split("\n").length, 2, "live progress should finish with one newline");
+  assert.doesNotMatch(writes.join(""), /#/);
+});
+
+test("redirected download progress emits only one completed line", () => {
+  const writes = [];
+  const report = createDownloadProgressReporter({
+    isTTY: false,
+    write(chunk) {
+      writes.push(chunk);
+    },
+  });
+  const totalBytes = 10 * 1024 * 1024;
+
+  report({ downloadedBytes: 0, totalBytes });
+  report({ downloadedBytes: totalBytes / 2, totalBytes });
+  report({ downloadedBytes: totalBytes, totalBytes, done: true });
+
+  assert.deepEqual(writes, ["MoonDesk [██████████] 100%  10.0 MiB / 10.0 MiB\n"]);
 });
 
 function makeFetch(binary, assetName, options = {}) {
@@ -118,9 +142,10 @@ test("ensureBinary reports native binary download progress while streaming", asy
     });
 
     assert.ok(progress.length >= 2, "download should report a start event and transferred bytes");
-    assert.deepEqual(progress[0], { downloadedBytes: 0, totalBytes: binary.length });
+    assert.deepEqual(progress[0], { downloadedBytes: 0, totalBytes: binary.length, done: false });
     assert.equal(progress.at(-1).downloadedBytes, binary.length);
     assert.equal(progress.at(-1).totalBytes, binary.length);
+    assert.equal(progress.at(-1).done, true);
     for (let index = 1; index < progress.length; index += 1) {
       assert.ok(
         progress[index].downloadedBytes >= progress[index - 1].downloadedBytes,

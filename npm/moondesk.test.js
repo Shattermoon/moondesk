@@ -135,10 +135,10 @@ test("managed update environment variables never leak into npm or the restarted 
   );
 });
 
-test("startup reports native binary download progress without contaminating stdout", async () => {
+test("startup repaints native binary download progress without contaminating stdout", async () => {
   const dir = tempDir();
   const stdoutLogs = [];
-  const progressMessages = [];
+  const progressWrites = [];
   try {
     const result = await orchestrateWithoutRefresh({
       cwd: dir,
@@ -146,10 +146,14 @@ test("startup reports native binary download progress without contaminating stdo
         log(message) {
           stdoutLogs.push(message);
         },
-        warn(message) {
-          progressMessages.push(message);
-        },
+        warn() {},
         error() {},
+      },
+      progressWriter: {
+        isTTY: true,
+        write(chunk) {
+          progressWrites.push(chunk);
+        },
       },
       updateStatePath: path.join(dir, "state.json"),
       updateRequestPath: path.join(dir, "request.json"),
@@ -157,7 +161,7 @@ test("startup reports native binary download progress without contaminating stdo
         const totalBytes = 8 * 1024 * 1024;
         onDownloadProgress({ downloadedBytes: 0, totalBytes });
         onDownloadProgress({ downloadedBytes: totalBytes / 2, totalBytes });
-        onDownloadProgress({ downloadedBytes: totalBytes, totalBytes });
+        onDownloadProgress({ downloadedBytes: totalBytes, totalBytes, done: true });
         return "/fake/moondesk";
       },
       cleanupOldBinaryVersionsImpl: () => {},
@@ -168,9 +172,10 @@ test("startup reports native binary download progress without contaminating stdo
 
     assert.deepEqual(result, { code: 0, signal: null });
     assert.deepEqual(stdoutLogs, []);
-    assert.match(progressMessages[0], /^Downloading MoonDesk .+ native binary \(8\.0 MiB\)\.\.\.$/);
-    assert.equal(progressMessages[1], "[##########----------]  50% (4.0 MiB / 8.0 MiB)");
-    assert.equal(progressMessages[2], "[####################] 100% (8.0 MiB / 8.0 MiB)");
+    assert.equal(progressWrites[0], "\rMoonDesk [░░░░░░░░░░]   0%  0.0 MiB / 8.0 MiB");
+    assert.equal(progressWrites[1], "\rMoonDesk [█████░░░░░]  50%  4.0 MiB / 8.0 MiB");
+    assert.equal(progressWrites[2], "\rMoonDesk [██████████] 100%  8.0 MiB / 8.0 MiB\n");
+    assert.equal(progressWrites.join("").split("\n").length, 2);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

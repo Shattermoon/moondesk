@@ -181,7 +181,7 @@ async function orchestrate(options = {}) {
   let binaryPath;
   try {
     binaryPath = await ensureBinaryImpl({
-      onDownloadProgress: createDownloadProgressReporter(logger),
+      onDownloadProgress: createDownloadProgressReporter(options.progressWriter ?? process.stderr),
     });
   } catch (error) {
     stopUpdateMonitor();

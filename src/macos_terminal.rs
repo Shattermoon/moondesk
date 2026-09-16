@@ -20,11 +20,13 @@ tell application "Terminal"
   set targetTTY to system attribute "MOONDESK_TERMINAL_TARGET_TTY"
   repeat with w in windows
     repeat with t in tabs of w
+      set tabTTY to ""
       try
-        if tty of t is targetTTY then
-          return name of current settings of t
-        end if
+        set tabTTY to tty of t
       end try
+      if tabTTY is targetTTY then
+        return name of current settings of t
+      end if
     end repeat
   end repeat
   return ""
@@ -36,12 +38,14 @@ tell application "Terminal"
   set targetTTY to system attribute "MOONDESK_TERMINAL_TARGET_TTY"
   repeat with w in windows
     repeat with t in tabs of w
+      set tabTTY to ""
       try
-        if tty of t is targetTTY then
-          set current settings of t to default settings
-          return true
-        end if
+        set tabTTY to tty of t
       end try
+      if tabTTY is targetTTY then
+        set current settings of t to default settings
+        return true
+      end if
     end repeat
   end repeat
   return false

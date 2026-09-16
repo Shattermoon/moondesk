@@ -169,8 +169,8 @@ test("startup reports native binary download progress without contaminating stdo
     assert.deepEqual(result, { code: 0, signal: null });
     assert.deepEqual(stdoutLogs, []);
     assert.match(progressMessages[0], /^Downloading MoonDesk .+ native binary \(8\.0 MiB\)\.\.\.$/);
-    assert.match(progressMessages[1], /native binary download: 50% \(4\.0 MiB \/ 8\.0 MiB\)$/);
-    assert.match(progressMessages[2], /native binary download: 100% \(8\.0 MiB \/ 8\.0 MiB\)$/);
+    assert.equal(progressMessages[1], "[##########----------]  50% (4.0 MiB / 8.0 MiB)");
+    assert.equal(progressMessages[2], "[####################] 100% (8.0 MiB / 8.0 MiB)");
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

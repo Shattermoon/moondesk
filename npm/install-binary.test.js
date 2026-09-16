@@ -7,6 +7,7 @@ const test = require("node:test");
 
 const {
   cleanupOldBinaryVersions,
+  createDownloadProgressReporter,
   ensureBinary,
   resolveTarget,
   sha256Buffer,
@@ -15,6 +16,22 @@ const {
 function tempDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), "moondesk-install-test-"));
 }
+
+test("download progress reporter renders bounded ASCII bars", () => {
+  const messages = [];
+  const report = createDownloadProgressReporter({ warn: (message) => messages.push(message) });
+  const totalBytes = 10 * 1024 * 1024;
+
+  report({ downloadedBytes: 0, totalBytes });
+  report({ downloadedBytes: totalBytes / 10, totalBytes });
+  report({ downloadedBytes: (totalBytes * 3) / 10, totalBytes });
+  report({ downloadedBytes: totalBytes, totalBytes });
+
+  assert.match(messages[0], /^Downloading MoonDesk .+ native binary \(10\.0 MiB\)\.\.\.$/);
+  assert.equal(messages[1], "[##------------------]  10% (1.0 MiB / 10.0 MiB)");
+  assert.equal(messages[2], "[######--------------]  30% (3.0 MiB / 10.0 MiB)");
+  assert.equal(messages[3], "[####################] 100% (10.0 MiB / 10.0 MiB)");
+});
 
 function makeFetch(binary, assetName, options = {}) {
   const expected = options.expected ?? sha256Buffer(binary);

@@ -436,10 +436,17 @@ function formatMiB(bytes) {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
 }
 
+function formatProgressBar(percent, width = 20) {
+  const clampedPercent = Math.max(0, Math.min(100, percent));
+  const filled = Math.round((clampedPercent / 100) * width);
+  return `[${"#".repeat(filled)}${"-".repeat(width - filled)}]`;
+}
+
 function createDownloadProgressReporter(logger = console) {
   let started = false;
   let lastPercentBucket = 0;
   let lastUnknownBytes = 0;
+  const percentReportStep = 10;
   const unknownReportStep = 5 * 1024 * 1024;
 
   // Progress is diagnostic output: keep stdout reserved for native command results.
@@ -459,11 +466,11 @@ function createDownloadProgressReporter(logger = console) {
 
     if (Number.isFinite(totalBytes) && totalBytes > 0) {
       const percent = Math.min(100, Math.floor((downloadedBytes / totalBytes) * 100));
-      const bucket = percent === 100 ? 100 : Math.floor(percent / 25) * 25;
-      if (bucket >= 25 && bucket > lastPercentBucket) {
+      const bucket = percent === 100 ? 100 : Math.floor(percent / percentReportStep) * percentReportStep;
+      if (bucket >= percentReportStep && bucket > lastPercentBucket) {
         lastPercentBucket = bucket;
         logger.warn?.(
-          `MoonDesk ${version} native binary download: ${bucket}% (${formatMiB(Math.min(downloadedBytes, totalBytes))} / ${formatMiB(totalBytes)})`,
+          `${formatProgressBar(bucket)} ${String(bucket).padStart(3)}% (${formatMiB(Math.min(downloadedBytes, totalBytes))} / ${formatMiB(totalBytes)})`,
         );
       }
       return;

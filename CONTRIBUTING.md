@@ -102,6 +102,7 @@ These tests protect the Windows upgrade/reset contract: MoonDesk-owned state use
 If your change touches process execution, Windows environment handling, browser detection, or the lazy browser runtime, run the relevant ignored integration smokes when your machine supports them:
 
 ```bash
+cargo test --locked windows_owned_shell_does_not_share_parent_console_surface -- --ignored
 cargo test --locked windows_developer_toolchain_smoke_uses_normal_host_environment -- --ignored
 cargo test --locked windows_owned_browser_runtime_is_lazy_and_recovers_after_child_exit -- --ignored --test-threads 1
 cargo test --locked windows_browser_presentation_change_requires_confirmation_and_restarts -- --ignored --test-threads 1

@@ -85,6 +85,8 @@ On Windows, run the test suite serially to match CI's process-heavy validation:
 cargo test --locked -- --test-threads 1
 ```
 
+macOS-specific changes are also compiled, linted, tested serially, and release-built on the repository's `macos-15` CI runner. When you have a physical Mac available, additionally exercise Terminal.app interactively for changes involving terminal profiles, keyboard handling, colors, or TUI cell geometry; the hosted runner cannot substitute for a live Terminal.app session.
+
 If your change touches config paths, workspace bootstrap, persistence, or Windows home-directory handling, also run the explicit persistence regressions that CI keeps as a named gate:
 
 ```powershell

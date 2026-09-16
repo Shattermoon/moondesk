@@ -85,6 +85,8 @@ On Windows, run the test suite serially to match CI's process-heavy validation:
 cargo test --locked -- --test-threads 1
 ```
 
+macOS-specific changes are also compiled, linted, tested serially, and release-built on the repository's `macos-15` CI runner. When you have a physical Mac available, additionally exercise Terminal.app interactively for changes involving terminal profiles, keyboard handling, colors, or TUI cell geometry; the hosted runner cannot substitute for a live Terminal.app session.
+
 If your change touches config paths, workspace bootstrap, persistence, or Windows home-directory handling, also run the explicit persistence regressions that CI keeps as a named gate:
 
 ```powershell
@@ -102,6 +104,7 @@ These tests protect the Windows upgrade/reset contract: MoonDesk-owned state use
 If your change touches process execution, Windows environment handling, browser detection, or the lazy browser runtime, run the relevant ignored integration smokes when your machine supports them:
 
 ```bash
+cargo test --locked windows_owned_shell_does_not_share_parent_console_surface -- --ignored
 cargo test --locked windows_developer_toolchain_smoke_uses_normal_host_environment -- --ignored
 cargo test --locked windows_owned_browser_runtime_is_lazy_and_recovers_after_child_exit -- --ignored --test-threads 1
 cargo test --locked windows_browser_presentation_change_requires_confirmation_and_restarts -- --ignored --test-threads 1

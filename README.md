@@ -192,7 +192,7 @@ Use `run_command` for short work. Use `start_command` + `poll_command` for build
 
 Workspace `AGENTS.md` instructions take priority.
 
-On macOS Terminal.app, set `MOONDESK_SKIP_MACOS_TERMINAL_PROFILE=1` to disable MoonDesk's dedicated Terminal profile behavior.
+On macOS, MoonDesk keeps your existing terminal profile instead of installing or forcing its own. Older Apple Terminal versions without reliable truecolor support use a stable 256-color compatibility palette for theme and ClippyMoon rendering; Terminal.app 2.15+ and other truecolor-capable terminals keep full RGB output. When upgrading from older MoonDesk versions, a tab still using the legacy `MoonDesk` Terminal.app profile is restored to your Terminal default settings. Set `MOONDESK_SKIP_MACOS_TERMINAL_PROFILE=1` only if you want to skip that legacy-profile migration.
 
 </details>
 

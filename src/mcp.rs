@@ -774,6 +774,17 @@ async fn handle_tools_call(
     command_jobs: &CommandJobManager,
     browser_runtime: &Option<Arc<BrowserRuntime>>,
 ) -> JsonRpcResponse {
+    // Production requests come from WorkspaceConfig, whose constructor canonicalizes existing
+    // roots. Test fixtures commonly start from std::env::temp_dir(); on macOS that can be the
+    // `/var/...` alias of `/private/var/...`, so mirror production registration before dispatch.
+    // Keep unavailable/non-directory roots unchanged so failure-path tests retain their semantics.
+    let canonical_workspace_root =
+        workspaces::canonicalize_existing_workspace_root(Path::new(workspace_root)).ok();
+    let workspace_root = canonical_workspace_root
+        .as_deref()
+        .and_then(Path::to_str)
+        .unwrap_or(workspace_root);
+
     let workspace_id = WorkspaceId::test_default();
     handle_tools_call_for_workspace(
         req,
@@ -4287,6 +4298,8 @@ mod tests {
         let workspace_root = temp_root.path().join("workspace");
         let handoff_store_root = temp_root.path().join("handoff-store");
         std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        let workspace_root = workspaces::canonicalize_existing_workspace_root(&workspace_root)
+            .expect("canonicalize workspace like production registration");
         let workspace_root_str = workspace_root.to_string_lossy().into_owned();
         let workspace_id = WorkspaceId::new();
         let command_jobs = CommandJobManager::new();

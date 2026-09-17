@@ -103,10 +103,10 @@ function cleanupOldBinaryVersions(options = {}) {
   return { removed, skipped };
 }
 
-function reportDownloadProgress(callback, downloadedBytes, totalBytes) {
+function reportDownloadProgress(callback, downloadedBytes, totalBytes, done = false) {
   if (typeof callback !== "function") return;
   try {
-    callback({ downloadedBytes, totalBytes });
+    callback({ downloadedBytes, totalBytes, done });
   } catch {
     // Download reporting is best-effort and must never make a verified install fail.
   }
@@ -126,7 +126,7 @@ async function readResponseBuffer(response, url, maxBytes, onProgress) {
     if (buffer.length > maxBytes) {
       throw new Error(`${url} exceeded the ${maxBytes}-byte download limit`);
     }
-    reportDownloadProgress(onProgress, buffer.length, totalBytes);
+    reportDownloadProgress(onProgress, buffer.length, totalBytes, true);
     return buffer;
   }
 
@@ -154,6 +154,7 @@ async function readResponseBuffer(response, url, maxBytes, onProgress) {
     reader.releaseLock?.();
   }
 
+  reportDownloadProgress(onProgress, downloadedBytes, totalBytes, true);
   return Buffer.concat(chunks, downloadedBytes);
 }
 
@@ -436,43 +437,59 @@ function formatMiB(bytes) {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
 }
 
-function createDownloadProgressReporter(logger = console) {
-  let started = false;
-  let lastPercentBucket = 0;
+function formatProgressBar(percent, width = 10) {
+  const clampedPercent = Math.max(0, Math.min(100, percent));
+  const filled = Math.round((clampedPercent / 100) * width);
+  return `[${"█".repeat(filled)}${"░".repeat(width - filled)}]`;
+}
+
+function createDownloadProgressReporter(writer = process.stderr) {
+  let lastPercentBucket = -10;
   let lastUnknownBytes = 0;
+  let lastLineLength = 0;
+  const percentReportStep = 10;
   const unknownReportStep = 5 * 1024 * 1024;
 
-  // Progress is diagnostic output: keep stdout reserved for native command results.
-  return ({ downloadedBytes, totalBytes }) => {
-    if (!started) {
-      started = true;
-      if (Number.isFinite(totalBytes) && totalBytes > 0) {
-        logger.warn?.(
-          `Downloading MoonDesk ${version} native binary (${formatMiB(totalBytes)})...`,
-        );
-      } else {
-        logger.warn?.(`Downloading MoonDesk ${version} native binary...`);
-      }
+  const render = (line, done) => {
+    if (!writer || typeof writer.write !== "function") return;
+
+    // A redirected stderr cannot repaint one terminal row. Emit only the completed state there so
+    // logs stay compact; interactive terminals get the live in-place progress experience.
+    if (writer.isTTY !== true) {
+      if (done) writer.write(`${line}\n`);
+      return;
     }
 
-    if (!Number.isFinite(downloadedBytes) || downloadedBytes <= 0) return;
+    const padding = " ".repeat(Math.max(0, lastLineLength - line.length));
+    writer.write(`\r${line}${padding}${done ? "\n" : ""}`);
+    lastLineLength = done ? 0 : line.length;
+  };
+
+  // Progress is diagnostic stderr output: stdout stays reserved for native command results.
+  return ({ downloadedBytes, totalBytes, done = false }) => {
+    if (!Number.isFinite(downloadedBytes) || downloadedBytes < 0) return;
 
     if (Number.isFinite(totalBytes) && totalBytes > 0) {
       const percent = Math.min(100, Math.floor((downloadedBytes / totalBytes) * 100));
-      const bucket = percent === 100 ? 100 : Math.floor(percent / 25) * 25;
-      if (bucket >= 25 && bucket > lastPercentBucket) {
-        lastPercentBucket = bucket;
-        logger.warn?.(
-          `MoonDesk ${version} native binary download: ${bucket}% (${formatMiB(Math.min(downloadedBytes, totalBytes))} / ${formatMiB(totalBytes)})`,
+      const bucket = percent === 100 ? 100 : Math.floor(percent / percentReportStep) * percentReportStep;
+      if (bucket > lastPercentBucket || done) {
+        lastPercentBucket = Math.max(lastPercentBucket, bucket);
+        const transferred = formatMiB(Math.min(downloadedBytes, totalBytes));
+        render(
+          `MoonDesk ${formatProgressBar(bucket)} ${String(bucket).padStart(3)}%  ${transferred} / ${formatMiB(totalBytes)}`,
+          done,
         );
       }
       return;
     }
 
-    if (downloadedBytes - lastUnknownBytes >= unknownReportStep) {
+    if (downloadedBytes === 0 || downloadedBytes - lastUnknownBytes >= unknownReportStep || done) {
       lastUnknownBytes = downloadedBytes;
-      logger.warn?.(
-        `MoonDesk ${version} native binary download: ${formatMiB(downloadedBytes)} downloaded...`,
+      render(
+        done
+          ? `MoonDesk [██████████] done  ${formatMiB(downloadedBytes)}`
+          : `MoonDesk [░░░░░░░░░░] downloading…  ${formatMiB(downloadedBytes)}`,
+        done,
       );
     }
   };
@@ -488,7 +505,7 @@ module.exports = {
 };
 
 if (require.main === module) {
-  ensureBinary({ onDownloadProgress: createDownloadProgressReporter(console) })
+  ensureBinary({ onDownloadProgress: createDownloadProgressReporter() })
     .then((binaryPath) => {
       console.log(`MoonDesk native binary ready at ${binaryPath}`);
     })

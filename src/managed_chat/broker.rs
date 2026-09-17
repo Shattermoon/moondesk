@@ -328,7 +328,9 @@ fn storage_error(error: std::io::Error) -> ManagedChatError {
 
 #[cfg(test)]
 mod tests {
-    use super::super::types::{ChatExecutionProfile, ManagedChatPurpose, ReasoningEffort};
+    use super::super::types::{
+        ChatExecutionProfile, ManagedChatOpenMode, ManagedChatPurpose, ReasoningEffort,
+    };
     use super::*;
     use crate::workspaces::WorkspaceId;
     use uuid::Uuid;
@@ -348,6 +350,8 @@ mod tests {
             },
             opening_message: format!("worker assignment\nTask marker: {marker}"),
             task_marker: marker.into(),
+            thread_key: Some("worker:test-thread".into()),
+            open_mode: ManagedChatOpenMode::NewThread,
         }
     }
 

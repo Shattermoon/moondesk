@@ -14,6 +14,7 @@ function freshState() {
     credential: null,
     bindings: {},
     launchRecords: {},
+    threadRecords: {},
     blockedCommand: null
   };
 }
@@ -102,36 +103,76 @@ function sourceWithLaunchToken(sourceUrl, token) {
   return url.toString();
 }
 
+function canonicalChatUrl(value) {
+  try {
+    const url = new URL(value);
+    if (url.origin !== 'https://chatgpt.com') return null;
+    url.hash = '';
+    return url.toString();
+  } catch {
+    return null;
+  }
+}
+
+function canonicalConversationUrl(value) {
+  const canonical = canonicalChatUrl(value);
+  if (!canonical) return null;
+  try {
+    const url = new URL(canonical);
+    return /\/c\/[^/?#]+(?:\/|$)/.test(url.pathname) ? canonical : null;
+  } catch {
+    return null;
+  }
+}
+
+async function tabMatchesRecord(tab, record) {
+  if (!tab?.id || !tab.url?.startsWith('https://chatgpt.com/')) return false;
+  if (tab.url.includes(`moondesk-launch=${encodeURIComponent(record.launchToken)}`)) return true;
+  const tabUrl = canonicalChatUrl(tab.url);
+  if (record.conversationUrl && tabUrl === canonicalChatUrl(record.conversationUrl)) return true;
+  try {
+    const response = await ensureContent(tab.id);
+    return response?.rememberedLaunch?.commandId === record.commandId ||
+      (record.threadKey && response?.rememberedLaunch?.threadKey === record.threadKey);
+  } catch {
+    return false;
+  }
+}
+
 async function recoverTab(record) {
   if (Number.isInteger(record.tabId)) {
     try {
       const tab = await chrome.tabs.get(record.tabId);
-      if (tab?.url?.startsWith('https://chatgpt.com/')) return tab;
+      if (await tabMatchesRecord(tab, record)) return tab;
     } catch {}
   }
   const tabs = await chrome.tabs.query({ url: 'https://chatgpt.com/*' });
   for (const tab of tabs) {
-    if (!tab.id) continue;
-    if (tab.url?.includes(`moondesk-launch=${encodeURIComponent(record.launchToken)}`)) return tab;
-    try {
-      const response = await ensureContent(tab.id);
-      if (response?.rememberedLaunch?.commandId === record.commandId) return tab;
-    } catch {}
+    if (await tabMatchesRecord(tab, record)) return tab;
   }
   return null;
 }
 
 async function recordForCommand(state, command, binding) {
+  const threadKey = command.launch.threadKey || `command:${command.id}`;
+  const openMode = command.launch.openMode || 'new_thread';
+  const thread = state.threadRecords?.[threadKey] || null;
   let record = state.launchRecords[command.id];
   if (!record) {
+    const existingConversation = openMode === 'existing_thread' ? canonicalChatUrl(thread?.conversationUrl) : null;
+    if (openMode === 'existing_thread' && !existingConversation) {
+      throw new Error('Existing worker thread has no confirmed ChatGPT conversation binding');
+    }
     record = {
       commandId: command.id,
       workspaceId: command.launch.workspaceId,
       taskMarker: command.launch.taskMarker,
+      threadKey,
+      openMode,
       launchToken: crypto.randomUUID(),
-      sourceUrl: binding.sourceUrl,
+      sourceUrl: openMode === 'existing_thread' ? existingConversation : binding.sourceUrl,
       tabId: null,
-      conversationUrl: null,
+      conversationUrl: existingConversation,
       phase: 'creating',
       reconcileAttempts: 0
     };
@@ -140,7 +181,8 @@ async function recordForCommand(state, command, binding) {
   }
   let tab = await recoverTab(record);
   if (!tab) {
-    tab = await chrome.tabs.create({ url: sourceWithLaunchToken(record.sourceUrl, record.launchToken), active: false });
+    const targetUrl = record.conversationUrl || record.sourceUrl;
+    tab = await chrome.tabs.create({ url: sourceWithLaunchToken(targetUrl, record.launchToken), active: false });
     record.tabId = tab.id ?? null;
     record.phase = 'created';
     await writeState(state);
@@ -182,7 +224,23 @@ async function processCommand(state, offer) {
     return;
   }
 
-  const { record, tab } = await recordForCommand(state, command, binding);
+  let recordAndTab;
+  try {
+    recordAndTab = await recordForCommand(state, command, binding);
+  } catch (error) {
+    if (String(error?.message || error).includes('no confirmed ChatGPT conversation binding')) {
+      await ack(state, command, 'failed', 'worker_thread_binding_missing');
+      state.blockedCommand = {
+        commandId: command.id,
+        workspaceId,
+        reason: 'worker_thread_binding_missing'
+      };
+      await writeState(state);
+      return;
+    }
+    throw error;
+  }
+  const { record, tab } = recordAndTab;
   if (!tab.id) throw new Error('Worker tab has no tab id');
   await waitForContent(tab.id);
 
@@ -203,8 +261,18 @@ async function processCommand(state, offer) {
   }
 
   const result = response.result || {};
-  if (result.conversationUrl) record.conversationUrl = result.conversationUrl;
+  const confirmedConversation = result.conversationUrl ? canonicalConversationUrl(result.conversationUrl) : null;
+  if (confirmedConversation) record.conversationUrl = confirmedConversation;
   if (result.state === 'succeeded') {
+    if (record.threadKey && confirmedConversation) {
+      state.threadRecords[record.threadKey] = {
+        workspaceId,
+        projectId: binding.projectId,
+        conversationUrl: confirmedConversation,
+        tabId: tab.id ?? null,
+        updatedAt: Date.now()
+      };
+    }
     record.phase = 'succeeded';
     await writeState(state);
     await ack(state, command, 'succeeded', result.reason || 'task marker confirmed');

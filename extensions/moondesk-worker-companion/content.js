@@ -12,7 +12,8 @@
         commandId: record.commandId,
         launchToken: record.launchToken,
         taskMarker: record.taskMarker,
-        workspaceId: record.workspaceId
+        workspaceId: record.workspaceId,
+        threadKey: record.threadKey || null
       }));
     } catch {}
     if (location.hash.startsWith('#moondesk-launch=')) {
@@ -40,17 +41,28 @@
       commandId,
       launchToken,
       taskMarker: launch.taskMarker,
-      workspaceId: launch.workspaceId
+      workspaceId: launch.workspaceId,
+      threadKey: launch.threadKey || null
     });
 
     if (DOM.projectIdFromPath() !== binding.projectId) {
       return { state: 'failed', reason: 'wrong_chatgpt_project' };
     }
-    if (!(await DOM.enterProject(binding.projectId))) {
-      return { state: 'failed', reason: 'project_entry_unconfirmed' };
-    }
-    if (!DOM.composerReady()) {
-      return { state: 'failed', reason: 'project_composer_not_ready' };
+    const existingThread = launch.openMode === 'existing_thread';
+    if (existingThread) {
+      if (!DOM.conversationIdFromPath()) {
+        return { state: 'failed', reason: 'existing_worker_conversation_unconfirmed' };
+      }
+      if (!DOM.composerReady()) {
+        return { state: 'failed', reason: 'worker_conversation_not_ready' };
+      }
+    } else {
+      if (!(await DOM.enterProject(binding.projectId))) {
+        return { state: 'failed', reason: 'project_entry_unconfirmed' };
+      }
+      if (!DOM.composerReady()) {
+        return { state: 'failed', reason: 'project_composer_not_ready' };
+      }
     }
 
     if (!(await DOM.selectModelSettings(launch.executionProfile))) {

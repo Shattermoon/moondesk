@@ -1,9 +1,9 @@
 use super::store;
 use super::types::{
-    BrowserAttachmentState, ChatIdentity, MessageReceipt, OperationId, ReportReceipt, SpawnReceipt,
-    TaskId, TaskState, WorkerExecutionProfile, WorkerFamily, WorkerFamilyId, WorkerId,
-    WorkerMessage, WorkerMessageId, WorkerMessageState, WorkerRecord, WorkerReport, WorkerReportId,
-    WorkerResult, WorkerState, WorkerStoreData, WorkerTask,
+    BrowserAttachmentState, ChatIdentity, MessageReceipt, OperationId, ReportReceipt, ReuseReceipt,
+    SpawnReceipt, TaskId, TaskState, WorkerExecutionProfile, WorkerFamily, WorkerFamilyId,
+    WorkerId, WorkerMessage, WorkerMessageId, WorkerMessageState, WorkerRecord, WorkerReport,
+    WorkerReportId, WorkerResult, WorkerState, WorkerStoreData, WorkerTask,
 };
 use super::{
     MAX_PENDING_MESSAGES_PER_WORKER, MAX_WORKER_ASSIGNMENT_BYTES, MAX_WORKER_MESSAGE_BYTES,
@@ -50,6 +50,16 @@ pub struct SpawnWorkerRequest {
     pub label: String,
     pub assignment: String,
     pub execution_profile: WorkerExecutionProfile,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReuseWorkerRequest {
+    pub operation_id: OperationId,
+    pub workspace_id: WorkspaceId,
+    pub anchor_identity: ChatIdentity,
+    pub worker_id: WorkerId,
+    pub assignment: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -157,6 +167,7 @@ impl WorkerBroker {
                         workers: Default::default(),
                         reports: Vec::new(),
                         spawn_requests: Default::default(),
+                        reuse_requests: Default::default(),
                         message_requests: Default::default(),
                         report_requests: Default::default(),
                     },
@@ -217,6 +228,148 @@ impl WorkerBroker {
 
         self.commit_candidate(&mut guard, candidate).await?;
         Ok(receipt)
+    }
+
+    pub async fn reuse_worker(
+        &self,
+        request: ReuseWorkerRequest,
+    ) -> Result<ReuseReceipt, WorkerBrokerError> {
+        request
+            .anchor_identity
+            .validate()
+            .map_err(WorkerBrokerError::Invalid)?;
+        if request.assignment.is_empty() || request.assignment.len() > MAX_WORKER_ASSIGNMENT_BYTES {
+            return Err(WorkerBrokerError::Invalid(format!(
+                "worker assignment must contain 1..={MAX_WORKER_ASSIGNMENT_BYTES} bytes"
+            )));
+        }
+        let fingerprint = request_fingerprint(&request)?;
+        let mut guard = self.data.lock().await;
+        let family_id = find_family_for_worker(&guard, &request.workspace_id, &request.worker_id)
+            .ok_or(WorkerBrokerError::NotFound)?;
+        let family = guard
+            .families
+            .get(&family_id)
+            .ok_or(WorkerBrokerError::NotFound)?;
+        if family.anchor_identity != request.anchor_identity {
+            return Err(WorkerBrokerError::NotFound);
+        }
+        if let Some(receipt) = family.reuse_requests.get(&request.operation_id) {
+            if receipt.request_fingerprint == fingerprint {
+                return Ok(receipt.clone());
+            }
+            return Err(WorkerBrokerError::Conflict(
+                "worker reuse operation id was reused with different input".into(),
+            ));
+        }
+        let worker = family
+            .workers
+            .get(&request.worker_id)
+            .ok_or(WorkerBrokerError::NotFound)?;
+        if worker.chat_identity.is_none() {
+            return Err(WorkerBrokerError::Conflict(
+                "worker must complete its initial claim before it can be reused".into(),
+            ));
+        }
+        if worker.state != WorkerState::Idle || worker.current_task_id.is_some() {
+            return Err(WorkerBrokerError::Conflict(
+                "worker can only be reused while idle".into(),
+            ));
+        }
+
+        let mut candidate = guard.clone();
+        let family = candidate
+            .families
+            .get_mut(&family_id)
+            .ok_or(WorkerBrokerError::NotFound)?;
+        let task_id = TaskId::new();
+        let (display_id, execution_profile) = {
+            let worker = family
+                .workers
+                .get_mut(&request.worker_id)
+                .ok_or(WorkerBrokerError::NotFound)?;
+            worker.tasks.insert(
+                task_id.clone(),
+                WorkerTask {
+                    id: task_id.clone(),
+                    assignment: request.assignment,
+                    state: TaskState::Pending,
+                    result: None,
+                    collected: false,
+                },
+            );
+            worker.current_task_id = Some(task_id.clone());
+            worker.state = WorkerState::Waking;
+            worker.attachment_state = BrowserAttachmentState::Opening;
+            (worker.display_id.clone(), worker.execution_profile.clone())
+        };
+        let receipt = ReuseReceipt {
+            request_fingerprint: fingerprint,
+            worker_id: request.worker_id,
+            task_id,
+            display_id,
+            execution_profile,
+        };
+        family
+            .reuse_requests
+            .insert(request.operation_id, receipt.clone());
+        self.commit_candidate(&mut guard, candidate).await?;
+        Ok(receipt)
+    }
+
+    pub async fn start_task(
+        &self,
+        workspace_id: &WorkspaceId,
+        worker_identity: &ChatIdentity,
+        worker_id: &WorkerId,
+        task_id: &TaskId,
+    ) -> Result<WorkerRecord, WorkerBrokerError> {
+        worker_identity
+            .validate()
+            .map_err(WorkerBrokerError::Invalid)?;
+        let mut guard = self.data.lock().await;
+        let family_id = find_family_for_worker(&guard, workspace_id, worker_id)
+            .ok_or(WorkerBrokerError::NotFound)?;
+        let worker = guard
+            .families
+            .get(&family_id)
+            .and_then(|family| family.workers.get(worker_id))
+            .ok_or(WorkerBrokerError::NotFound)?;
+        if worker.chat_identity.as_ref() != Some(worker_identity)
+            || worker.current_task_id.as_ref() != Some(task_id)
+        {
+            return Err(WorkerBrokerError::NotFound);
+        }
+        let task = worker
+            .tasks
+            .get(task_id)
+            .ok_or(WorkerBrokerError::NotFound)?;
+        match task.state {
+            TaskState::Running => return Ok(worker.clone()),
+            TaskState::Pending => {}
+            _ => {
+                return Err(WorkerBrokerError::Conflict(
+                    "worker task cannot be started from its current state".into(),
+                ));
+            }
+        }
+
+        let mut candidate = guard.clone();
+        let worker = candidate
+            .families
+            .get_mut(&family_id)
+            .and_then(|family| family.workers.get_mut(worker_id))
+            .ok_or(WorkerBrokerError::NotFound)?;
+        let task = worker
+            .tasks
+            .get_mut(task_id)
+            .ok_or(WorkerBrokerError::NotFound)?;
+        task.state = TaskState::Running;
+        worker.state = WorkerState::Running;
+        worker.attachment_state = BrowserAttachmentState::Attached;
+        let started = worker.clone();
+        self.commit_candidate(&mut guard, candidate).await?;
+        Ok(started)
     }
 
     pub async fn family_for_anchor(
@@ -291,7 +444,7 @@ impl WorkerBroker {
         worker.chat_identity = Some(worker_identity);
         worker.claim_token = None;
         worker.state = WorkerState::Running;
-        worker.attachment_state = BrowserAttachmentState::Unknown;
+        worker.attachment_state = BrowserAttachmentState::Attached;
         let task = worker
             .tasks
             .get_mut(task_id)
@@ -864,6 +1017,140 @@ mod tests {
         let task = worker.tasks.get(&spawned.task_id).expect("persisted task");
         assert_eq!(task.state, TaskState::Completed);
         assert_eq!(task.result.as_ref(), Some(&finished_result()));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn idle_worker_reuse_is_idempotent_durable_and_requires_bound_worker_start() {
+        let root = temp_root("moondesk-worker-reuse");
+        let path = root.join("worker-state-v1.json");
+        let workspace = WorkspaceId::new();
+        let anchor_identity = anchor("anchor-reuse");
+        let worker_identity = anchor("worker-reuse");
+        let broker = WorkerBroker::open(&path).expect("open worker broker");
+        let spawned = broker
+            .spawn_worker(spawn_request(
+                OperationId::new(),
+                workspace.clone(),
+                anchor_identity.clone(),
+                "first assignment",
+            ))
+            .await
+            .expect("spawn worker");
+        broker
+            .claim_worker(
+                &workspace,
+                &spawned.worker_id,
+                &spawned.task_id,
+                &spawned.claim_token,
+                worker_identity.clone(),
+            )
+            .await
+            .expect("claim worker");
+        broker
+            .finish_task(FinishTaskRequest {
+                workspace_id: workspace.clone(),
+                worker_identity: worker_identity.clone(),
+                worker_id: spawned.worker_id.clone(),
+                task_id: spawned.task_id.clone(),
+                result: finished_result(),
+            })
+            .await
+            .expect("finish first task");
+
+        let operation_id = OperationId::new();
+        let reuse_request = ReuseWorkerRequest {
+            operation_id: operation_id.clone(),
+            workspace_id: workspace.clone(),
+            anchor_identity: anchor_identity.clone(),
+            worker_id: spawned.worker_id.clone(),
+            assignment: "second assignment".into(),
+        };
+        let reused = broker
+            .reuse_worker(reuse_request.clone())
+            .await
+            .expect("reuse idle worker");
+        let retry = broker
+            .reuse_worker(reuse_request)
+            .await
+            .expect("retry same reuse");
+        assert_eq!(reused, retry);
+        assert_ne!(reused.task_id, spawned.task_id);
+        assert_eq!(reused.display_id, spawned.display_id);
+        assert_eq!(reused.execution_profile, profile());
+        drop(broker);
+
+        let reopened = WorkerBroker::open(&path).expect("reopen reused worker broker");
+        let snapshot = reopened.snapshot().await;
+        let worker = snapshot
+            .families
+            .values()
+            .next()
+            .and_then(|family| family.workers.get(&spawned.worker_id))
+            .expect("reused worker after restart");
+        assert_eq!(worker.state, WorkerState::Waking);
+        assert_eq!(worker.current_task_id.as_ref(), Some(&reused.task_id));
+        assert_eq!(
+            worker.tasks.get(&reused.task_id).map(|task| task.state),
+            Some(TaskState::Pending)
+        );
+
+        let forged = reopened
+            .start_task(
+                &workspace,
+                &anchor("different-worker-chat"),
+                &spawned.worker_id,
+                &reused.task_id,
+            )
+            .await
+            .expect_err("different chat must not start reused task");
+        assert_eq!(forged, WorkerBrokerError::NotFound);
+
+        let started = reopened
+            .start_task(
+                &workspace,
+                &worker_identity,
+                &spawned.worker_id,
+                &reused.task_id,
+            )
+            .await
+            .expect("bound worker starts reused task");
+        assert_eq!(started.state, WorkerState::Running);
+        assert_eq!(started.attachment_state, BrowserAttachmentState::Attached);
+        assert_eq!(
+            started.tasks.get(&reused.task_id).map(|task| task.state),
+            Some(TaskState::Running)
+        );
+        let start_retry = reopened
+            .start_task(
+                &workspace,
+                &worker_identity,
+                &spawned.worker_id,
+                &reused.task_id,
+            )
+            .await
+            .expect("repeated start is idempotent");
+        assert_eq!(start_retry.state, WorkerState::Running);
+
+        reopened
+            .finish_task(FinishTaskRequest {
+                workspace_id: workspace.clone(),
+                worker_identity: worker_identity.clone(),
+                worker_id: spawned.worker_id.clone(),
+                task_id: reused.task_id.clone(),
+                result: finished_result(),
+            })
+            .await
+            .expect("finish reused task");
+        let family = reopened
+            .family_for_anchor(&workspace, &anchor_identity)
+            .await
+            .expect("read family")
+            .expect("family exists");
+        assert_eq!(
+            family.workers.get(&spawned.worker_id).map(|worker| worker.state),
+            Some(WorkerState::Idle)
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 

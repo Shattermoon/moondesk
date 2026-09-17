@@ -1,6 +1,6 @@
 use super::broker::{
-    FinishTaskRequest, MessageWorkerRequest, ReportWorkerRequest, SpawnWorkerRequest, WorkerBroker,
-    WorkerBrokerError,
+    FinishTaskRequest, MessageWorkerRequest, ReportWorkerRequest, ReuseWorkerRequest,
+    SpawnWorkerRequest, WorkerBroker, WorkerBrokerError,
 };
 use super::prompt;
 use super::types::{
@@ -8,7 +8,7 @@ use super::types::{
     WorkerResult,
 };
 use crate::managed_chat::broker::{EnqueueManagedChatRequest, ManagedChatBroker};
-use crate::managed_chat::types::{ManagedChatLaunch, ManagedChatPurpose};
+use crate::managed_chat::types::{ManagedChatLaunch, ManagedChatOpenMode, ManagedChatPurpose};
 use crate::workspaces::WorkspaceId;
 use serde_json::{Value, json};
 
@@ -103,6 +103,8 @@ pub async fn handle(
                         execution_profile: execution_profile.clone(),
                         opening_message,
                         task_marker: format!("moondesk-worker-task:{}", receipt.task_id),
+                        thread_key: Some(format!("worker:{}", receipt.worker_id)),
+                        open_mode: ManagedChatOpenMode::NewThread,
                     },
                 })
                 .await
@@ -120,6 +122,53 @@ pub async fn handle(
                 "executionProfile": execution_profile,
                 "launchCommandId": launch.id,
                 "state": "provisioning"
+            }))
+        }
+        "reuse" => {
+            let assignment = required_string(arguments, "task")?.to_string();
+            let receipt = broker
+                .reuse_worker(ReuseWorkerRequest {
+                    operation_id: parse_operation_id(arguments)?,
+                    workspace_id: workspace_id.clone(),
+                    anchor_identity: caller_identity.clone(),
+                    worker_id: parse_worker_id(arguments)?,
+                    assignment: assignment.clone(),
+                })
+                .await
+                .map_err(broker_error)?;
+            let opening_message = prompt::reuse_message(
+                workspace_name,
+                &assignment,
+                &receipt.display_id,
+                &receipt.worker_id,
+                &receipt.task_id,
+                &receipt.execution_profile,
+            );
+            let launch = managed_chat_broker
+                .enqueue(EnqueueManagedChatRequest {
+                    dedupe_key: format!("worker:{}:task:{}", receipt.worker_id, receipt.task_id),
+                    launch: ManagedChatLaunch {
+                        workspace_id: workspace_id.clone(),
+                        purpose: ManagedChatPurpose::Worker,
+                        execution_profile: receipt.execution_profile.clone(),
+                        opening_message,
+                        task_marker: format!("moondesk-worker-task:{}", receipt.task_id),
+                        thread_key: Some(format!("worker:{}", receipt.worker_id)),
+                        open_mode: ManagedChatOpenMode::ExistingThread,
+                    },
+                })
+                .await
+                .map_err(|error| {
+                    format!("worker reuse was persisted but browser wake was not accepted: {error}")
+                })?;
+            Ok(json!({
+                "action": "reuse",
+                "workerId": receipt.worker_id,
+                "taskId": receipt.task_id,
+                "displayId": receipt.display_id,
+                "executionProfile": receipt.execution_profile,
+                "launchCommandId": launch.id,
+                "state": "waking"
             }))
         }
         "status" => {
@@ -200,6 +249,25 @@ pub async fn handle(
                 .map_err(broker_error)?;
             Ok(json!({
                 "action": "claim",
+                "workerId": worker.id,
+                "displayId": worker.display_id,
+                "state": worker.state,
+                "taskId": worker.current_task_id,
+                "executionProfile": worker.execution_profile
+            }))
+        }
+        "start" => {
+            let worker = broker
+                .start_task(
+                    workspace_id,
+                    caller_identity,
+                    &parse_worker_id(arguments)?,
+                    &parse_task_id(arguments)?,
+                )
+                .await
+                .map_err(broker_error)?;
+            Ok(json!({
+                "action": "start",
                 "workerId": worker.id,
                 "displayId": worker.display_id,
                 "state": worker.state,

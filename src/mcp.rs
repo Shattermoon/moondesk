@@ -19,10 +19,7 @@ use crate::command_jobs::{
     MAX_COMMAND_OUTPUT_READ_BYTES, MAX_JOB_TIMEOUT_MS, MAX_POLL_WAIT_MS,
 };
 use crate::handoff;
-use crate::managed_chat::{
-    broker::ManagedChatBroker,
-    types::ChatExecutionProfile,
-};
+use crate::managed_chat::{broker::ManagedChatBroker, types::ChatExecutionProfile};
 use crate::state::{
     AgentsPathMode, BrowserPresentation, Mode, ToolMode, load_app_config, user_home_dir,
 };
@@ -452,14 +449,14 @@ fn workers_tool_descriptor() -> Value {
     json!({
         "name": "workers",
         "title": "Coordinate workers",
-        "description": "Coordinate MoonDesk experimental workers for this exact workspace and ChatGPT conversation. The workspace is resolved from this connector; never pass or guess a workspace. Anchor actions are spawn, status, send, collect. Worker actions are claim, inbox, ack, report, finish. Worker coordination requires exact ChatGPT session metadata and fails closed when that identity is unavailable. operation_id must be a stable UUID reused when retrying the same spawn/send/report after an ambiguous response.",
+        "description": "Coordinate MoonDesk experimental workers for this exact workspace and ChatGPT conversation. The workspace is resolved from this connector; never pass or guess a workspace. Anchor actions are spawn, reuse, status, send, collect. Worker actions are claim, start, inbox, ack, report, finish. Reuse creates a new durable task on an idle claimed worker and wakes its existing ChatGPT conversation. Worker coordination requires exact ChatGPT session metadata and fails closed when that identity is unavailable. operation_id must be a stable UUID reused when retrying the same spawn/reuse/send/report after an ambiguous response.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "action": { "type": "string", "enum": ["spawn", "status", "send", "collect", "claim", "inbox", "ack", "report", "finish"] },
-                "operation_id": { "type": "string", "description": "Stable UUID for idempotent spawn/send/report operations" },
+                "action": { "type": "string", "enum": ["spawn", "reuse", "status", "send", "collect", "claim", "start", "inbox", "ack", "report", "finish"] },
+                "operation_id": { "type": "string", "description": "Stable UUID for idempotent spawn/reuse/send/report operations" },
                 "label": { "type": "string", "minLength": 1, "maxLength": 128, "description": "Short worker task label for spawn" },
-                "task": { "type": "string", "minLength": 1, "description": "Concrete assignment for spawn" },
+                "task": { "type": "string", "minLength": 1, "description": "Concrete assignment for spawn or reuse" },
                 "worker_id": { "type": "string", "description": "Worker UUID returned by spawn" },
                 "task_id": { "type": "string", "description": "Task UUID returned by spawn" },
                 "claim_token": { "type": "string", "description": "Single-use worker claim capability returned by spawn" },
@@ -3724,6 +3721,7 @@ fn handle_delete_path(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcResp
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::managed_chat::types::ManagedChatOpenMode;
     use uuid::Uuid;
 
     struct TestTempDir {
@@ -4227,8 +4225,8 @@ mod tests {
             ),
             &workspace_id,
             &workspace_root.to_string_lossy(),
-            broker,
-            managed_chat_broker,
+            broker.clone(),
+            managed_chat_broker.clone(),
         )
         .await;
         let second = second_collect
@@ -4247,6 +4245,98 @@ mod tests {
                 .get("completed")
                 .and_then(Value::as_array)
                 .is_some_and(Vec::is_empty)
+        );
+
+        let reuse_operation = Uuid::new_v4().to_string();
+        let reuse = call_workers_for_test(
+            &tool_call_request_with_session(
+                "workers",
+                json!({
+                    "action": "reuse",
+                    "operation_id": reuse_operation,
+                    "worker_id": worker_id,
+                    "task": "Perform a second focused audit on the same worker thread."
+                }),
+                "anchor-chat-a",
+            ),
+            &workspace_id,
+            &workspace_root.to_string_lossy(),
+            broker.clone(),
+            managed_chat_broker.clone(),
+        )
+        .await;
+        let reused = reuse
+            .result
+            .as_ref()
+            .and_then(|result| result.get("structuredContent"))
+            .expect("reuse structured content");
+        assert_eq!(reused.get("workerId"), Some(&json!(worker_id)));
+        assert_eq!(reused.get("state").and_then(Value::as_str), Some("waking"));
+        let reused_task_id = reused
+            .get("taskId")
+            .and_then(Value::as_str)
+            .expect("reused task id")
+            .to_string();
+        assert_ne!(reused_task_id, task_id);
+
+        let managed = managed_chat_broker.snapshot().await;
+        assert_eq!(managed.commands.len(), 2);
+        let wake = managed
+            .commands
+            .values()
+            .find(|command| command.launch.task_marker.ends_with(&reused_task_id))
+            .expect("reuse managed chat command");
+        assert_eq!(wake.launch.open_mode, ManagedChatOpenMode::ExistingThread);
+        assert_eq!(wake.launch.thread_key.as_deref(), Some(format!("worker:{worker_id}").as_str()));
+
+        let forged_start = call_workers_for_test(
+            &tool_call_request_with_session(
+                "workers",
+                json!({
+                    "action": "start",
+                    "worker_id": worker_id,
+                    "task_id": reused_task_id
+                }),
+                "different-worker-chat",
+            ),
+            &workspace_id,
+            &workspace_root.to_string_lossy(),
+            broker.clone(),
+            managed_chat_broker.clone(),
+        )
+        .await;
+        assert_eq!(
+            forged_start
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+
+        let start = call_workers_for_test(
+            &tool_call_request_with_session(
+                "workers",
+                json!({
+                    "action": "start",
+                    "worker_id": worker_id,
+                    "task_id": reused_task_id
+                }),
+                "worker-chat-a",
+            ),
+            &workspace_id,
+            &workspace_root.to_string_lossy(),
+            broker,
+            managed_chat_broker,
+        )
+        .await;
+        assert_eq!(
+            start
+                .result
+                .as_ref()
+                .and_then(|result| result.pointer("/structuredContent/state"))
+                .and_then(Value::as_str),
+            Some("running")
         );
     }
 

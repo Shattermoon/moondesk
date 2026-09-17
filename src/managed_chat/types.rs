@@ -119,6 +119,14 @@ pub enum ManagedChatPurpose {
     Worker,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagedChatOpenMode {
+    #[default]
+    NewThread,
+    ExistingThread,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ManagedChatLaunch {
@@ -127,6 +135,10 @@ pub struct ManagedChatLaunch {
     pub execution_profile: ChatExecutionProfile,
     pub opening_message: String,
     pub task_marker: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_key: Option<String>,
+    #[serde(default)]
+    pub open_mode: ManagedChatOpenMode,
 }
 
 impl ManagedChatLaunch {
@@ -142,6 +154,14 @@ impl ManagedChatLaunch {
         }
         if self.task_marker.trim().is_empty() || self.task_marker.len() > 256 {
             return Err("managed chat task marker is invalid".into());
+        }
+        if let Some(thread_key) = self.thread_key.as_deref()
+            && (thread_key.trim().is_empty() || thread_key.len() > 256)
+        {
+            return Err("managed chat thread key is invalid".into());
+        }
+        if self.open_mode == ManagedChatOpenMode::ExistingThread && self.thread_key.is_none() {
+            return Err("existing managed chat launch requires a thread key".into());
         }
         Ok(())
     }

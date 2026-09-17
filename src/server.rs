@@ -350,10 +350,7 @@ async fn companion_workspaces(
     json_response(StatusCode::OK, json!({ "workspaces": workspaces }))
 }
 
-async fn companion_profile(
-    State(state): State<ServerState>,
-    headers: HeaderMap,
-) -> Response<Body> {
+async fn companion_profile(State(state): State<ServerState>, headers: HeaderMap) -> Response<Body> {
     if !companion_origin_allowed(&headers) {
         return companion_origin_error();
     }
@@ -1331,7 +1328,8 @@ mod tests {
     use super::*;
     use crate::managed_chat::broker::EnqueueManagedChatRequest;
     use crate::managed_chat::types::{
-        ChatExecutionProfile, ManagedChatLaunch, ManagedChatPurpose, ReasoningEffort,
+        ChatExecutionProfile, ManagedChatLaunch, ManagedChatOpenMode, ManagedChatPurpose,
+        ReasoningEffort,
     };
     use crate::state::{AppState, Mode, ToolMode, rotate_workspace_secret, ui_event_channel};
     use crate::workspaces::WorkspaceConfig;
@@ -1833,6 +1831,8 @@ mod tests {
                     },
                     opening_message: "worker bootstrap".into(),
                     task_marker: "task-marker-http".into(),
+                    thread_key: Some("worker:test-http".into()),
+                    open_mode: ManagedChatOpenMode::NewThread,
                 },
             })
             .await
@@ -1901,7 +1901,10 @@ mod tests {
             .await
             .expect("redeem reconciliation command");
         assert_eq!(reconciled.status(), StatusCode::OK);
-        let reconciled_body = reconciled.bytes().await.expect("read reconcile response body");
+        let reconciled_body = reconciled
+            .bytes()
+            .await
+            .expect("read reconcile response body");
         let reconciled_json: Value =
             serde_json::from_slice(&reconciled_body).expect("reconcile response json");
         assert_eq!(
@@ -1939,7 +1942,10 @@ mod tests {
             .await
             .expect("redeem empty queue");
         assert_eq!(empty.status(), StatusCode::OK);
-        let empty_body = empty.bytes().await.expect("read empty redeem response body");
+        let empty_body = empty
+            .bytes()
+            .await
+            .expect("read empty redeem response body");
         let empty_json: Value =
             serde_json::from_slice(&empty_body).expect("empty redeem response json");
         assert!(empty_json.get("command").is_some_and(Value::is_null));

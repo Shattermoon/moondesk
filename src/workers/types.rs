@@ -113,6 +113,7 @@ pub type WorkerExecutionProfile = crate::managed_chat::types::ChatExecutionProfi
 #[serde(rename_all = "snake_case")]
 pub enum WorkerState {
     Provisioning,
+    Waking,
     Idle,
     Running,
     Retired,
@@ -219,6 +220,16 @@ pub struct SpawnReceipt {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ReuseReceipt {
+    pub request_fingerprint: String,
+    pub worker_id: WorkerId,
+    pub task_id: TaskId,
+    pub display_id: String,
+    pub execution_profile: WorkerExecutionProfile,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct MessageReceipt {
     pub request_fingerprint: String,
     pub worker_id: WorkerId,
@@ -245,6 +256,8 @@ pub struct WorkerFamily {
     pub reports: Vec<WorkerReport>,
     #[serde(default)]
     pub spawn_requests: BTreeMap<OperationId, SpawnReceipt>,
+    #[serde(default)]
+    pub reuse_requests: BTreeMap<OperationId, ReuseReceipt>,
     #[serde(default)]
     pub message_requests: BTreeMap<OperationId, MessageReceipt>,
     #[serde(default)]

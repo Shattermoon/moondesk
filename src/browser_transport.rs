@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::fmt;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -38,15 +39,29 @@ type PendingBrowserResponse = oneshot::Sender<Result<Value, BrowserTransportErro
 
 pub struct BrowserMcpTransport {
     process: Mutex<SpawnedProcess>,
+    runtime_cwd: PathBuf,
     stdin: Mutex<Option<BufWriter<tokio::process::ChildStdin>>>,
     pending: Arc<Mutex<HashMap<u64, PendingBrowserResponse>>>,
     next_request_id: AtomicU64,
     alive: Arc<AtomicBool>,
 }
 
+fn create_browser_runtime_cwd() -> std::io::Result<PathBuf> {
+    let path = std::env::temp_dir().join(format!(
+        "moondesk-browser-runtime-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::create_dir(&path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(path)
+}
+
 impl BrowserMcpTransport {
     pub async fn start(
-        workspace_root: &str,
         package_version: &str,
         server_args: &[String],
         state: Option<SharedState>,
@@ -57,38 +72,66 @@ impl BrowserMcpTransport {
         }
 
         let package = format!("chrome-devtools-mcp@{package_version}");
+        let runtime_cwd = create_browser_runtime_cwd().map_err(|error| {
+            BrowserTransportError::Disconnected(format!(
+                "Failed to create MoonDesk browser runtime directory: {error}"
+            ))
+        })?;
         let mut command = Command::new(npx_program());
         command
             .args(["-y", "-p", package.as_str(), "chrome-devtools-mcp"])
             .args(server_args)
             .env("CHROME_DEVTOOLS_MCP_NO_UPDATE_CHECKS", "1")
-            .current_dir(workspace_root);
+            .current_dir(&runtime_cwd);
 
-        let mut process = spawn_owned_program(command).map_err(|error| {
-            BrowserTransportError::Disconnected(format!(
-                "Failed to start pinned chrome-devtools-mcp: {error}"
-            ))
-        })?;
-        let stdin = process.take_stdin().ok_or_else(|| {
-            BrowserTransportError::Disconnected(
-                "chrome-devtools-mcp did not expose stdin".to_string(),
-            )
-        })?;
-        let stdout = process.take_stdout().ok_or_else(|| {
-            BrowserTransportError::Disconnected(
-                "chrome-devtools-mcp did not expose stdout".to_string(),
-            )
-        })?;
-        let stderr = process.take_stderr().ok_or_else(|| {
-            BrowserTransportError::Disconnected(
-                "chrome-devtools-mcp did not expose stderr".to_string(),
-            )
-        })?;
+        let mut process = match spawn_owned_program(command) {
+            Ok(process) => process,
+            Err(error) => {
+                let _ = std::fs::remove_dir_all(&runtime_cwd);
+                return Err(BrowserTransportError::Disconnected(format!(
+                    "Failed to start pinned chrome-devtools-mcp: {error}"
+                )));
+            }
+        };
+        let stdin = match process.take_stdin() {
+            Some(stdin) => stdin,
+            None => {
+                drop(process);
+                let _ = std::fs::remove_dir_all(&runtime_cwd);
+                return Err(BrowserTransportError::Disconnected(
+                    "chrome-devtools-mcp did not expose stdin".to_string(),
+                ));
+            }
+        };
+        let stdout = match process.take_stdout() {
+            Some(stdout) => stdout,
+            None => {
+                drop(stdin);
+                drop(process);
+                let _ = std::fs::remove_dir_all(&runtime_cwd);
+                return Err(BrowserTransportError::Disconnected(
+                    "chrome-devtools-mcp did not expose stdout".to_string(),
+                ));
+            }
+        };
+        let stderr = match process.take_stderr() {
+            Some(stderr) => stderr,
+            None => {
+                drop(stdin);
+                drop(stdout);
+                drop(process);
+                let _ = std::fs::remove_dir_all(&runtime_cwd);
+                return Err(BrowserTransportError::Disconnected(
+                    "chrome-devtools-mcp did not expose stderr".to_string(),
+                ));
+            }
+        };
 
         let pending = Arc::new(Mutex::new(HashMap::new()));
         let alive = Arc::new(AtomicBool::new(true));
         let transport = Arc::new(Self {
             process: Mutex::new(process),
+            runtime_cwd,
             stdin: Mutex::new(Some(BufWriter::new(stdin))),
             pending: pending.clone(),
             next_request_id: AtomicU64::new(1),
@@ -277,6 +320,7 @@ impl BrowserMcpTransport {
         }
 
         self.pending.lock().await.clear();
+        let _ = std::fs::remove_dir_all(&self.runtime_cwd);
         let _ = tokio::time::timeout(SHUTDOWN_WAIT, async {
             let mut stdin = self.stdin.lock().await;
             stdin.take();
@@ -493,6 +537,7 @@ mod tests {
         drop(process.take_stderr());
         let transport = BrowserMcpTransport {
             process: Mutex::new(process),
+            runtime_cwd: create_browser_runtime_cwd().expect("create transport test runtime cwd"),
             stdin: Mutex::new(Some(BufWriter::new(stdin))),
             pending: Arc::new(Mutex::new(HashMap::new())),
             next_request_id: AtomicU64::new(1),

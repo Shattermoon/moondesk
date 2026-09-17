@@ -16,8 +16,8 @@ use std::time::Duration;
 use subtle::ConstantTimeEq;
 
 use crate::browser_runtime::{
-    BrowserRuntime, DEFAULT_BROWSER_COMMAND_TIMEOUT, MAX_BROWSER_CONTROL_BODY_BYTES,
-    validate_browser_request_bounds,
+    BrowserRuntime, BrowserSessionKey, DEFAULT_BROWSER_COMMAND_TIMEOUT,
+    MAX_BROWSER_CONTROL_BODY_BYTES, validate_browser_request_bounds,
 };
 use crate::command_jobs::CommandJobManager;
 use crate::mcp::{self, JsonRpcRequest};
@@ -219,6 +219,27 @@ async fn resolve_workspace(
     let runtime = app.workspace_runtimes.get(&workspace.workspace_id)?.clone();
     let lease = runtime.try_acquire()?;
     Some((workspace, runtime, lease))
+}
+
+async fn resolve_workspace_for_cwd(
+    state: &ServerState,
+    cwd: &std::path::Path,
+) -> Option<(
+    WorkspaceRequestContext,
+    Arc<WorkspaceRuntime>,
+    WorkspaceRequestLease,
+)> {
+    let canonical = workspaces::canonicalize_existing_workspace_root(cwd).ok()?;
+    let app = state.app.lock().await;
+    let workspace = app
+        .workspaces
+        .iter()
+        .filter(|workspace| canonical == workspace.root || canonical.starts_with(&workspace.root))
+        .max_by_key(|workspace| workspace.root.components().count())?;
+    let context = WorkspaceRequestContext::from(workspace);
+    let runtime = app.workspace_runtimes.get(&workspace.id)?.clone();
+    let lease = runtime.try_acquire()?;
+    Some((context, runtime, lease))
 }
 
 fn not_found_response() -> Response<Body> {
@@ -578,9 +599,20 @@ async fn run_browser_command_from_local_host(
             ),
         );
     };
+    let Some((workspace, _workspace_runtime, _request_lease)) =
+        resolve_workspace_for_cwd(&s, &cwd).await
+    else {
+        return response_with_body(
+            StatusCode::BAD_REQUEST,
+            "application/json",
+            Body::from(r#"{"error":"cwd must belong to a registered MoonDesk workspace"}"#),
+        );
+    };
+    let browser_session = BrowserSessionKey::local_cli(&workspace.workspace_id);
 
     match runtime
-        .run(
+        .run_for_session(
+            &browser_session,
             &cwd.to_string_lossy(),
             command,
             &request.args,
@@ -1889,8 +1921,8 @@ mod tests {
 
     #[cfg(windows)]
     #[tokio::test]
-    #[ignore = "serialized Windows host browser CLI/session/vision smoke"]
-    async fn windows_host_browser_cli_and_mcp_view_page_share_one_session() {
+    #[ignore = "serialized Windows host browser CLI/MCP session-routing/vision smoke"]
+    async fn windows_host_browser_cli_and_mcp_keep_separate_logical_sessions() {
         use axum::response::Html;
         use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 
@@ -1901,11 +1933,13 @@ mod tests {
         std::fs::create_dir_all(&config_root).expect("create config dir");
         std::fs::create_dir_all(workspace_root.join("artifacts"))
             .expect("create browser output directory");
+        let external_upload_fixture = config_root.join("external-upload-fixture.txt");
+        assert!(!external_upload_fixture.starts_with(&workspace_root));
         std::fs::write(
-            workspace_root.join("upload-fixture.txt"),
-            b"MoonDesk upload fixture\n",
+            &external_upload_fixture,
+            b"MoonDesk external upload fixture\n",
         )
-        .expect("write browser upload fixture");
+        .expect("write external browser upload fixture");
 
         let mut app = AppState::new_for_test(
             8787,
@@ -2075,11 +2109,12 @@ document.getElementById('upload').addEventListener('change',event=>{document.get
         let input_uid = snapshot_uid(mobile_snapshot_text, "textbox");
         let button_uid = snapshot_uid(mobile_snapshot_text, "button \"Toggle state\"");
         let upload_uid = snapshot_uid(mobile_snapshot_text, "button \"Upload \"");
+        let external_upload_arg = external_upload_fixture.to_string_lossy().into_owned();
         let upload = host_browser_request(
             host_address,
             &workspace_root,
             "upload_file",
-            &[upload_uid.as_str(), "upload-fixture.txt"],
+            &[upload_uid.as_str(), external_upload_arg.as_str()],
         )
         .await;
         assert_eq!(upload.get("success").and_then(Value::as_bool), Some(true));
@@ -2125,7 +2160,7 @@ document.getElementById('upload').addEventListener('change',event=>{document.get
             "844",
             "agent-check",
             "ON",
-            "upload-fixture.txt",
+            "external-upload-fixture.txt",
             "true",
         ] {
             assert!(
@@ -2180,6 +2215,73 @@ document.getElementById('upload').addEventListener('change',event=>{document.get
                 .len()
                 > 0,
             "workspace screenshot output is empty"
+        );
+
+        // The local CLI owns a separate logical browser session from ChatGPT/MCP. Seed the MCP
+        // session explicitly, then prove view_page sees that page while the CLI page remains intact.
+        let mcp_client = reqwest::Client::new();
+        for (id, name, arguments) in [
+            (
+                "mcp-navigate",
+                "navigate_page",
+                json!({ "url": site_url.clone() }),
+            ),
+            (
+                "mcp-mobile",
+                "browser_command",
+                json!({
+                    "command": "emulate",
+                    "args": ["--viewport=390x844x1,mobile,touch"]
+                }),
+            ),
+        ] {
+            let body = serde_json::to_vec(&json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "tools/call",
+                "params": { "name": name, "arguments": arguments }
+            }))
+            .expect("serialize MCP browser setup request");
+            let response = mcp_client
+                .post(format!("http://{host_address}/{mcp_slug}/mcp"))
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .body(body)
+                .send()
+                .await
+                .expect("send MCP browser setup request");
+            assert_eq!(response.status(), StatusCode::OK);
+            let payload: Value = serde_json::from_slice(
+                &response
+                    .bytes()
+                    .await
+                    .expect("read MCP browser setup response"),
+            )
+            .expect("parse MCP browser setup response");
+            assert_ne!(
+                payload.pointer("/result/isError").and_then(Value::as_bool),
+                Some(true),
+                "MCP browser setup failed: {payload}"
+            );
+        }
+
+        let cli_after_mcp = host_browser_request(
+            host_address,
+            &workspace_root,
+            "evaluate_script",
+            &["() => ({value: document.querySelector('#name').value, state: document.querySelector('#state').textContent})"],
+        )
+        .await;
+        let cli_after_mcp_text = cli_after_mcp
+            .get("stdout")
+            .and_then(Value::as_str)
+            .expect("CLI post-MCP inspection stdout");
+        assert!(
+            cli_after_mcp_text.contains("agent-check"),
+            "MCP session stole the CLI page: {cli_after_mcp_text}"
+        );
+        assert!(
+            cli_after_mcp_text.contains("ON"),
+            "MCP session mutated the CLI page: {cli_after_mcp_text}"
         );
 
         let mcp_body = serde_json::to_vec(&json!({
@@ -2239,9 +2341,7 @@ document.getElementById('upload').addEventListener('change',event=>{document.get
             Some(390)
         );
 
-        runtime
-            .stop_if_owned(&workspace_root.to_string_lossy())
-            .await;
+        runtime.stop().await;
         host_server.abort();
         site_server.abort();
         let _ = host_server.await;
@@ -2249,6 +2349,54 @@ document.getElementById('upload').addEventListener('change',event=>{document.get
         let _ = std::fs::remove_file(config_path);
         let _ = std::fs::remove_dir_all(config_root);
         let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn browser_cli_cwd_prefers_most_specific_nested_workspace() {
+        let parent = unique_temp_path("moondesk-browser-cwd-parent");
+        let nested = parent.join("nested-project");
+        let nested_child = nested.join("src");
+        let config_root = unique_temp_path("moondesk-browser-cwd-config");
+        let config_path = config_root.join("config.toml");
+        std::fs::create_dir_all(&nested_child).expect("create nested workspace tree");
+        std::fs::create_dir_all(&config_root).expect("create config dir");
+
+        let mut app = AppState::new_for_test(
+            8787,
+            parent.to_string_lossy().into_owned(),
+            config_path.clone(),
+        )
+        .expect("create parent workspace app state");
+        let parent_id = app.workspaces[0].id.clone();
+        let nested_workspace =
+            WorkspaceConfig::new("Nested", &nested, crate::workspaces::generate_mcp_slug())
+                .expect("create nested workspace");
+        let nested_id = nested_workspace.id.clone();
+        app.workspace_runtimes.insert(
+            nested_id.clone(),
+            Arc::new(crate::workspaces::WorkspaceRuntime::default()),
+        );
+        app.workspaces.push(nested_workspace);
+
+        let app_state = Arc::new(Mutex::new(app));
+        let (ui_tx, _ui_rx) = ui_event_channel();
+        let server_state = ServerState {
+            app: app_state,
+            browser_runtime: None,
+            command_jobs: CommandJobManager::new(),
+            ui_events: ui_tx,
+            host_control_token: Arc::from("test-host-control-token"),
+        };
+
+        let (resolved, _runtime, _lease) = resolve_workspace_for_cwd(&server_state, &nested_child)
+            .await
+            .expect("resolve nested browser CLI cwd");
+        assert_eq!(resolved.workspace_id, nested_id);
+        assert_ne!(resolved.workspace_id, parent_id);
+
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_dir_all(config_root);
+        let _ = std::fs::remove_dir_all(parent);
     }
 
     #[tokio::test]

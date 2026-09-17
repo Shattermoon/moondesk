@@ -1,6 +1,6 @@
 ---
 name: browser
-description: Control MoonDesk's shared Chromium session without exposing the full Chrome DevTools MCP schema to the model.
+description: Control MoonDesk's shared Chromium runtime with workspace-isolated storage and conversation-owned tabs without exposing the full Chrome DevTools MCP schema to the model.
 ---
 
 # MoonDesk Browser
@@ -9,10 +9,10 @@ Use MoonDesk's browser runtime for local web-app inspection, UI testing, console
 
 ## Interfaces
 
-- **MCP `set_browser_presentation`**: available in `multi-tools` mode for the rare case where the agent needs the isolated browser to become visible for human input. Prefer headless; a live-session switch requires explicit user approval before retrying with `confirm_restart=true`.
+- **MCP `set_browser_presentation`**: available in `multi-tools` mode for the rare case where the user needs the shared agent Chromium to become visible for human input. Prefer headless; changing presentation while Chromium is live restarts the host-wide browser runtime and therefore requires explicit user approval before retrying with `confirm_restart=true`.
 - **MCP `browser_command`**: preferred for one browser action at a time and the only page-action primitive needed in Browser-only mode.
 - **MCP `view_page`**: preferred whenever appearance matters. It returns the current rendered page as model-visible pixels.
-- **`moondesk browser` CLI**: preferred in Both mode when several deterministic browser actions are easier to express as a shell script or loop. It calls the same MoonDesk native browser runtime, so it shares the same isolated agent-browser session as MCP without touching the user's personal browser profile.
+- **`moondesk browser` CLI**: preferred in Both mode when several deterministic browser actions are easier to express as a shell script or loop. It calls the same MoonDesk Chromium runtime and workspace BrowserContext, but it intentionally owns a separate local-CLI logical tab session instead of borrowing a ChatGPT conversation's active page.
 
 Do not invoke `npx chrome-devtools-mcp` directly. MoonDesk pins and manages the compatible Chrome DevTools runtime.
 
@@ -26,14 +26,16 @@ Do not invoke `npx chrome-devtools-mcp` directly. MoonDesk pins and manages the 
 6. Use `view_page` for visual judgment. Accessibility/text snapshots are structural evidence, not a substitute for seeing the rendered page.
 7. Inspect console/network/performance data when it helps the task; do not collect large traces by default.
 
-The browser starts lazily on the first operation and runs headless by default at a deterministic 1280x800 initial viewport, so normal agent work does not open a desktop Chromium window. Headless mode still supports snapshots, screenshots, `view_page`, console/network inspection, interaction, and responsive emulation. Resize or emulate the target viewport before responsive or pixel-sensitive QA. Users can switch the agent browser to visible presentation from MoonDesk's dashboard. In `multi-tools`, an agent may use `set_browser_presentation` when the user needs to see or manually interact with the isolated browser, such as a login, CAPTCHA, or permission prompt; do not switch merely for agent visual inspection because `view_page` already provides rendered pixels. Because presentation is chosen when Chromium starts, changing it while the browser is running closes the current isolated session and prior tabs, cookies/storage, page state, and snapshot UIDs are gone. The tool therefore returns `confirmation_required` without changing a live session unless the agent retries with `confirm_restart=true` after explicit user approval. Switching to visible starts a fresh empty visible session immediately; if that headful launch fails, MoonDesk reverts the setting to headless so later browser work remains usable. Keep a human-assisted session visible while its entered state is still needed. Switching back to headless closes the visible browser and the next browser action starts a fresh hidden session. Normal commands otherwise reuse the existing session. If the owned browser runtime is lost or a dispatched operation exceeds its deadline, MoonDesk invalidates that runtime before allowing another browser operation; the next call starts a fresh isolated session. MoonDesk does not automatically replay an ambiguous state-changing action, so navigate/select the target page and take a fresh snapshot after session loss.
+MoonDesk starts one host-owned Chromium lazily on the first browser operation and runs it headless by default at a deterministic 1280x800 initial viewport. The expensive Chromium/MCP process is shared, but browser ownership is not: each registered workspace gets a named isolated BrowserContext for cookies/storage, and each ChatGPT conversation gets its own logical page set inside that workspace context. MoonDesk routes page-scoped operations by the conversation's owned page ID instead of trusting Chromium's globally selected tab. Conversations in the same workspace therefore share that project's login/storage state while keeping separate tabs; different workspaces do not share cookies/localStorage/IndexedDB/service-worker state. Always use the connector that owns the project for its browser work--do not switch to another workspace connector merely because it exposes browser tools.
+
+Headless mode still supports snapshots, screenshots, `view_page`, console/network inspection, interaction, and responsive emulation. Users can switch the one agent Chromium to visible presentation from MoonDesk's dashboard. In `multi-tools`, use `set_browser_presentation` only when the user needs to see or manually interact with the browser, such as a login, CAPTCHA, or permission prompt; `view_page` already provides rendered pixels for agent inspection. Presentation is process-global. Changing it while Chromium is running closes **all** MoonDesk workspace BrowserContexts and conversation/CLI tabs, so the tool returns `confirmation_required` until the user explicitly approves that loss and the agent retries with `confirm_restart=true`. If the shared runtime is lost or a dispatched operation exceeds its deadline, MoonDesk invalidates that runtime before another browser operation can run; the next call starts a fresh Chromium generation and all callers must re-establish their page/snapshot state. MoonDesk never automatically replays an ambiguous state-changing action.
 
 ## Local dev-server verification
 
 When an agent starts a local web server, browser verification is part of completing the task rather than a separate setup step:
 
 1. Wait until the server reports its localhost URL as ready.
-2. Navigate the shared agent browser to that URL.
+2. Navigate this conversation's project browser page to that URL.
 3. Set the viewport being tested, then take a fresh snapshot.
 4. Exercise the user-visible flow with snapshot UIDs.
 5. Inspect console/network output when debugging behavior.
@@ -76,7 +78,8 @@ Prefer the CLI for orchestration, but return to `view_page` whenever the task re
 ## Safety and lifecycle
 
 - Do not run browser lifecycle commands (`start`, `status`, `stop`) through MCP `browser_command` or `moondesk browser`; the running MoonDesk host owns that lifecycle.
-- `moondesk browser` is a lightweight localhost client to the running MoonDesk host. It does not own a separate browser process; independent shell commands share the same MoonDesk-owned agent-browser session as MCP.
+- `moondesk browser` is a lightweight localhost client to the running MoonDesk host. It does not own a separate browser process. CLI calls for one workspace share that workspace's BrowserContext/storage but use a dedicated local-CLI logical tab session, separate from ChatGPT conversations.
 - ReadOnly mode permits inspection commands only; navigation, JavaScript execution, interaction, uploads, resizing, and other state-changing browser commands are blocked.
-- Treat `evaluate_script` as code execution in the currently selected page. Use it only when needed and keep the function narrowly scoped.
-- Browser file paths are local machine paths. Use verified workspace paths for uploads or file-producing commands.
+- Treat `evaluate_script` as code execution in this caller's currently active logical page. MoonDesk injects the owned upstream page ID; callers must not rely on Chromium's globally selected tab. Use scripts only when needed and keep them narrowly scoped.
+- Browser file paths are local machine paths. Relative input paths stay inside the active workspace. Browser-only mode keeps browser inputs workspace-scoped. When Computer tools are also enabled (`Both` mode), an explicit absolute input-file path (for example, `upload_file`) may reference another regular file readable by the MoonDesk user; MoonDesk stages a private copy before Chromium sees it. Input directories and file-producing/output paths remain workspace-bound.
+- Browser-global extension lifecycle operations are intentionally unavailable through the shared runtime because installing/reloading an extension would mutate every workspace. Performance traces and screencasts are globally singleton upstream resources, so MoonDesk leases them to the conversation and exact page that started them.

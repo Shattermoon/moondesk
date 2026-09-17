@@ -863,9 +863,14 @@ async fn post_mcp(
     }
 
     let workspace_root = workspace.root.to_string_lossy().into_owned();
-    let (mode, tool_mode, set_moondesk_as_co_author) = {
+    let (mode, tool_mode, set_moondesk_as_co_author, worker_broker) = {
         let app = s.app.lock().await;
-        (app.mode, app.tool_mode, app.set_moondesk_as_co_author)
+        (
+            app.mode,
+            app.tool_mode,
+            app.set_moondesk_as_co_author,
+            app.worker_broker.clone(),
+        )
     };
 
     let mut response_json: Option<Value> = None;
@@ -880,6 +885,7 @@ async fn post_mcp(
             handoff_store_root: None,
             command_jobs: &s.command_jobs,
             browser_runtime: &s.browser_runtime,
+            worker_broker,
         },
     )
     .await

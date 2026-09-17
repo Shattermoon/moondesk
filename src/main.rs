@@ -18,6 +18,7 @@ mod terminal_compat;
 mod theme;
 mod update;
 mod vision;
+mod workers;
 mod workspace_tools;
 mod workspaces;
 

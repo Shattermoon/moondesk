@@ -14,6 +14,7 @@ use uuid::Uuid;
 use crate::command_jobs::CommandJobManager;
 use crate::mascot::{self, MascotPack};
 use crate::theme;
+use crate::workers::{self, broker::WorkerBroker};
 use crate::workspaces::{self, WorkspaceConfig, WorkspaceId, WorkspaceRuntime};
 
 /// Log entry displayed in the TUI.
@@ -985,6 +986,7 @@ pub struct AppState {
     pub usage_by_model: BTreeMap<String, UsageTotals>,
     pub session_usage_totals: UsageTotals,
     pub command_jobs: CommandJobManager,
+    pub worker_broker: Arc<WorkerBroker>,
     config_path: PathBuf,
     pub server_handle: Option<tokio::task::JoinHandle<()>>,
     pub ngrok_task: Option<tokio::task::JoinHandle<()>>,
@@ -1561,6 +1563,9 @@ impl AppState {
             .iter()
             .map(|workspace| (workspace.id.clone(), Arc::new(WorkspaceRuntime::default())))
             .collect::<HashMap<_, _>>();
+        let worker_store_path = workers::store_path_for_config(&config_path)?;
+        let worker_broker =
+            Arc::new(WorkerBroker::open(worker_store_path).map_err(std::io::Error::other)?);
 
         let mut app = Self {
             theme: config.theme,
@@ -1597,6 +1602,7 @@ impl AppState {
             usage_by_model: config.usage_by_model,
             session_usage_totals: UsageTotals::default(),
             command_jobs: CommandJobManager::new(),
+            worker_broker,
             config_path,
             server_handle: None,
             ngrok_task: None,

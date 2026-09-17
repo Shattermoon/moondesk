@@ -23,6 +23,8 @@ use crate::state::{
     AgentsPathMode, BrowserPresentation, Mode, ToolMode, load_app_config, user_home_dir,
 };
 use crate::vision;
+use crate::workers::broker::WorkerBroker;
+use crate::workers::types::ChatIdentity;
 use crate::workspace_tools;
 use crate::workspaces::{self, WorkspaceAvailability, WorkspaceId};
 
@@ -80,7 +82,7 @@ impl JsonRpcResponse {
 
 // ── Handler ─────────────────────────────────────────────────
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct McpRequestContext<'a> {
     pub workspace_id: &'a WorkspaceId,
     pub workspace_root: &'a str,
@@ -90,6 +92,7 @@ pub struct McpRequestContext<'a> {
     pub handoff_store_root: Option<&'a Path>,
     pub command_jobs: &'a CommandJobManager,
     pub browser_runtime: &'a Option<Arc<BrowserRuntime>>,
+    pub worker_broker: Arc<WorkerBroker>,
 }
 
 pub async fn handle_request(
@@ -438,6 +441,34 @@ fn complete_handoff_tool_descriptor() -> Value {
     })
 }
 
+fn workers_tool_descriptor() -> Value {
+    json!({
+        "name": "workers",
+        "title": "Coordinate workers",
+        "description": "Coordinate MoonDesk experimental workers for this exact workspace and ChatGPT conversation. The workspace is resolved from this connector; never pass or guess a workspace. Anchor actions are spawn, status, send, collect. Worker actions are claim, inbox, ack, report, finish. Worker coordination requires exact ChatGPT session metadata and fails closed when that identity is unavailable. operation_id must be a stable UUID reused when retrying the same spawn/send/report after an ambiguous response.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "action": { "type": "string", "enum": ["spawn", "status", "send", "collect", "claim", "inbox", "ack", "report", "finish"] },
+                "operation_id": { "type": "string", "description": "Stable UUID for idempotent spawn/send/report operations" },
+                "label": { "type": "string", "minLength": 1, "maxLength": 128, "description": "Short worker task label for spawn" },
+                "task": { "type": "string", "minLength": 1, "description": "Concrete assignment for spawn" },
+                "worker_id": { "type": "string", "description": "Worker UUID returned by spawn" },
+                "task_id": { "type": "string", "description": "Task UUID returned by spawn" },
+                "claim_token": { "type": "string", "description": "Single-use worker claim capability returned by spawn" },
+                "message_id": { "type": "string", "description": "Inbox message UUID to acknowledge" },
+                "message": { "type": "string", "minLength": 1, "description": "Message for send or progress report for report" },
+                "result": { "type": "string", "description": "Final worker result for finish" },
+                "changes": { "type": "string", "description": "Changes made by the worker for finish" },
+                "validation": { "type": "string", "description": "Validation performed by the worker for finish" },
+                "blockers": { "type": "array", "maxItems": 100, "items": { "type": "string" }, "description": "Remaining blockers for finish" }
+            },
+            "required": ["action"]
+        },
+        "annotations": { "readOnlyHint": false, "openWorldHint": false, "destructiveHint": false }
+    })
+}
+
 fn push_handoff_tools(tools: &mut Vec<Value>) {
     tools.push(create_handoff_tool_descriptor());
     tools.push(resume_handoff_tool_descriptor());
@@ -560,6 +591,7 @@ async fn handle_tools_list(
             }));
         }
 
+        tools.push(workers_tool_descriptor());
         tools.push(json!({
             "name": "moondesk_instruction",
             "title": "Get usage instructions",
@@ -765,6 +797,18 @@ async fn handle_tools_list(
 // ── tools/call ──────────────────────────────────────────────
 
 #[cfg(test)]
+fn test_worker_broker() -> Arc<WorkerBroker> {
+    Arc::new(
+        WorkerBroker::open(
+            std::env::temp_dir()
+                .join(format!("moondesk-mcp-worker-test-{}", uuid::Uuid::new_v4()))
+                .join(crate::workers::WORKER_STORE_FILE_NAME),
+        )
+        .expect("create test worker broker"),
+    )
+}
+
+#[cfg(test)]
 async fn handle_tools_call(
     req: &JsonRpcRequest,
     workspace_root: &str,
@@ -797,6 +841,7 @@ async fn handle_tools_call(
             handoff_store_root: None,
             command_jobs,
             browser_runtime,
+            worker_broker: test_worker_broker(),
         },
     )
     .await
@@ -840,6 +885,41 @@ fn browser_session_key(req: &JsonRpcRequest, workspace_id: &WorkspaceId) -> Brow
     }
 }
 
+fn worker_chat_identity(req: &JsonRpcRequest) -> Result<ChatIdentity, String> {
+    let meta = req
+        .params
+        .get("_meta")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            "workers requires exact ChatGPT conversation identity; openai/session metadata is missing"
+                .to_string()
+        })?;
+    let session = meta
+        .get("openai/session")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty() && value.len() <= MAX_BROWSER_CALLER_META_BYTES)
+        .ok_or_else(|| {
+            "workers requires exact ChatGPT conversation identity; openai/session metadata is missing or invalid"
+                .to_string()
+        })?;
+    let subject = match meta.get("openai/subject") {
+        None => None,
+        Some(Value::String(value))
+            if !value.trim().is_empty() && value.len() <= MAX_BROWSER_CALLER_META_BYTES =>
+        {
+            Some(value.as_str())
+        }
+        Some(Value::String(value)) if value.trim().is_empty() => None,
+        Some(_) => {
+            return Err(
+                "workers rejected invalid openai/subject metadata for this ChatGPT conversation"
+                    .into(),
+            );
+        }
+    };
+    Ok(ChatIdentity::from_openai_meta(subject, session))
+}
+
 async fn handle_tools_call_for_workspace(
     req: &JsonRpcRequest,
     context: McpRequestContext<'_>,
@@ -853,6 +933,7 @@ async fn handle_tools_call_for_workspace(
         handoff_store_root,
         command_jobs,
         browser_runtime,
+        worker_broker,
     } = context;
     let params = &req.params;
     let tool_name = params
@@ -929,6 +1010,39 @@ async fn handle_tools_call_for_workspace(
             &tool_name,
         )
         .await;
+    }
+
+    if tool_name == "workers" {
+        if !mode.computer_enabled() {
+            return tool_error_response(
+                req,
+                "Tool 'workers' requires Computer or Both mode".into(),
+            );
+        }
+        if workspaces::workspace_availability(Path::new(workspace_root))
+            == WorkspaceAvailability::Unavailable
+        {
+            return tool_error_response(
+                req,
+                format!("Workspace is currently unavailable: {workspace_root}"),
+            );
+        }
+        let caller_identity = match worker_chat_identity(req) {
+            Ok(identity) => identity,
+            Err(error) => return tool_error_response(req, error),
+        };
+        let arguments = tool_arguments(req);
+        return match crate::workers::protocol::handle(
+            &arguments,
+            workspace_id,
+            &caller_identity,
+            worker_broker.as_ref(),
+        )
+        .await
+        {
+            Ok(structured) => tool_success_response_with_structured(req, String::new(), structured),
+            Err(error) => tool_error_response(req, error),
+        };
     }
 
     let workspace_dependent = matches!(
@@ -3615,6 +3729,44 @@ mod tests {
         }
     }
 
+    fn tool_call_request_with_session(
+        name: &str,
+        arguments: Value,
+        session: &str,
+    ) -> JsonRpcRequest {
+        let mut request = tool_call_request(name, arguments);
+        request.params["_meta"] = json!({
+            "openai/subject": "worker-test-subject",
+            "openai/session": session
+        });
+        request
+    }
+
+    async fn call_workers_for_test(
+        request: &JsonRpcRequest,
+        workspace_id: &WorkspaceId,
+        workspace_root: &str,
+        worker_broker: Arc<WorkerBroker>,
+    ) -> JsonRpcResponse {
+        let command_jobs = CommandJobManager::new();
+        let browser_runtime = None;
+        handle_tools_call_for_workspace(
+            request,
+            McpRequestContext {
+                workspace_id,
+                workspace_root,
+                mode: Mode::Both,
+                tool_mode: ToolMode::MultiTools,
+                set_moondesk_as_co_author: false,
+                handoff_store_root: None,
+                command_jobs: &command_jobs,
+                browser_runtime: &browser_runtime,
+                worker_broker,
+            },
+        )
+        .await
+    }
+
     fn result_text(response: &JsonRpcResponse) -> &str {
         response
             .result
@@ -3703,6 +3855,324 @@ mod tests {
         request.params["_meta"]["openai/session"] = json!("");
         let empty = browser_session_key(&request, &workspace);
         assert!(empty == fallback);
+    }
+
+    #[tokio::test]
+    async fn workers_tool_is_advertised_for_computer_mode() {
+        let request = JsonRpcRequest {
+            jsonrpc: "2.0".into(),
+            id: Some(json!("workers-list")),
+            method: "tools/list".into(),
+            params: json!({}),
+        };
+        let response = handle_tools_list(&request, Mode::Both, ToolMode::MultiTools).await;
+        let tools = response
+            .result
+            .as_ref()
+            .and_then(|result| result.get("tools"))
+            .and_then(Value::as_array)
+            .expect("tools list");
+        assert!(
+            tools
+                .iter()
+                .any(|tool| { tool.get("name").and_then(Value::as_str) == Some("workers") })
+        );
+    }
+
+    #[tokio::test]
+    async fn workers_mcp_fails_closed_without_exact_openai_session() {
+        let root = TestTempDir::new("moondesk-workers-mcp-no-session");
+        let workspace_root = root.path().join("workspace");
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        let workspace_id = WorkspaceId::new();
+        let broker = Arc::new(
+            WorkerBroker::open(root.path().join("worker-state-v1.json"))
+                .expect("open worker broker"),
+        );
+        let request = tool_call_request(
+            "workers",
+            json!({
+                "action": "spawn",
+                "operation_id": Uuid::new_v4().to_string(),
+                "label": "audit",
+                "task": "audit auth"
+            }),
+        );
+        let response = call_workers_for_test(
+            &request,
+            &workspace_id,
+            &workspace_root.to_string_lossy(),
+            broker.clone(),
+        )
+        .await;
+        assert_eq!(
+            response
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(result_text(&response).contains("openai/session"));
+        assert!(broker.snapshot().await.families.is_empty());
+    }
+
+    #[tokio::test]
+    async fn workers_mcp_binds_anchor_and_worker_to_exact_chat_sessions() {
+        let root = TestTempDir::new("moondesk-workers-mcp-identity");
+        let workspace_root = root.path().join("workspace");
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        let workspace_id = WorkspaceId::new();
+        let broker = Arc::new(
+            WorkerBroker::open(root.path().join("worker-state-v1.json"))
+                .expect("open worker broker"),
+        );
+        let operation_id = Uuid::new_v4().to_string();
+        let spawn_args = json!({
+            "action": "spawn",
+            "operation_id": operation_id,
+            "label": "auth audit",
+            "task": "Audit authentication changes without editing."
+        });
+        let spawn = call_workers_for_test(
+            &tool_call_request_with_session("workers", spawn_args.clone(), "anchor-chat-a"),
+            &workspace_id,
+            &workspace_root.to_string_lossy(),
+            broker.clone(),
+        )
+        .await;
+        let spawned = spawn
+            .result
+            .as_ref()
+            .and_then(|result| result.get("structuredContent"))
+            .expect("spawn structured content");
+        let worker_id = spawned
+            .get("workerId")
+            .and_then(Value::as_str)
+            .expect("worker id")
+            .to_string();
+        let task_id = spawned
+            .get("taskId")
+            .and_then(Value::as_str)
+            .expect("task id")
+            .to_string();
+        let claim_token = spawned
+            .get("claimToken")
+            .and_then(Value::as_str)
+            .expect("claim token")
+            .to_string();
+        assert_eq!(
+            spawned
+                .pointer("/executionProfile/reasoningEffort")
+                .and_then(Value::as_str),
+            Some("high")
+        );
+
+        let retry = call_workers_for_test(
+            &tool_call_request_with_session("workers", spawn_args, "anchor-chat-a"),
+            &workspace_id,
+            &workspace_root.to_string_lossy(),
+            broker.clone(),
+        )
+        .await;
+        let retried = retry
+            .result
+            .as_ref()
+            .and_then(|result| result.get("structuredContent"))
+            .expect("retry structured content");
+        assert_eq!(retried.get("workerId"), Some(&json!(worker_id)));
+        assert_eq!(retried.get("taskId"), Some(&json!(task_id)));
+        assert_eq!(broker.snapshot().await.families.len(), 1);
+
+        let forged_send = call_workers_for_test(
+            &tool_call_request_with_session(
+                "workers",
+                json!({
+                    "action": "send",
+                    "operation_id": Uuid::new_v4().to_string(),
+                    "worker_id": worker_id,
+                    "message": "forged anchor message"
+                }),
+                "different-anchor-chat",
+            ),
+            &workspace_id,
+            &workspace_root.to_string_lossy(),
+            broker.clone(),
+        )
+        .await;
+        assert_eq!(
+            forged_send
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+
+        let claim = call_workers_for_test(
+            &tool_call_request_with_session(
+                "workers",
+                json!({
+                    "action": "claim",
+                    "worker_id": worker_id,
+                    "task_id": task_id,
+                    "claim_token": claim_token
+                }),
+                "worker-chat-a",
+            ),
+            &workspace_id,
+            &workspace_root.to_string_lossy(),
+            broker.clone(),
+        )
+        .await;
+        assert_eq!(
+            claim
+                .result
+                .as_ref()
+                .and_then(|result| result.pointer("/structuredContent/state"))
+                .and_then(Value::as_str),
+            Some("running")
+        );
+
+        let forged_report = call_workers_for_test(
+            &tool_call_request_with_session(
+                "workers",
+                json!({
+                    "action": "report",
+                    "operation_id": Uuid::new_v4().to_string(),
+                    "worker_id": worker_id,
+                    "task_id": task_id,
+                    "message": "forged worker report"
+                }),
+                "different-worker-chat",
+            ),
+            &workspace_id,
+            &workspace_root.to_string_lossy(),
+            broker.clone(),
+        )
+        .await;
+        assert_eq!(
+            forged_report
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+
+        let report = call_workers_for_test(
+            &tool_call_request_with_session(
+                "workers",
+                json!({
+                    "action": "report",
+                    "operation_id": Uuid::new_v4().to_string(),
+                    "worker_id": worker_id,
+                    "task_id": task_id,
+                    "message": "auth audit found no regression"
+                }),
+                "worker-chat-a",
+            ),
+            &workspace_id,
+            &workspace_root.to_string_lossy(),
+            broker.clone(),
+        )
+        .await;
+        assert_eq!(
+            report
+                .result
+                .as_ref()
+                .and_then(|result| result.pointer("/structuredContent/state"))
+                .and_then(Value::as_str),
+            Some("accepted")
+        );
+
+        let finish = call_workers_for_test(
+            &tool_call_request_with_session(
+                "workers",
+                json!({
+                    "action": "finish",
+                    "worker_id": worker_id,
+                    "task_id": task_id,
+                    "result": "clean",
+                    "changes": "none",
+                    "validation": "targeted tests passed",
+                    "blockers": []
+                }),
+                "worker-chat-a",
+            ),
+            &workspace_id,
+            &workspace_root.to_string_lossy(),
+            broker.clone(),
+        )
+        .await;
+        assert_eq!(
+            finish
+                .result
+                .as_ref()
+                .and_then(|result| result.pointer("/structuredContent/state"))
+                .and_then(Value::as_str),
+            Some("completed")
+        );
+
+        let collect = call_workers_for_test(
+            &tool_call_request_with_session(
+                "workers",
+                json!({ "action": "collect" }),
+                "anchor-chat-a",
+            ),
+            &workspace_id,
+            &workspace_root.to_string_lossy(),
+            broker.clone(),
+        )
+        .await;
+        let collected = collect
+            .result
+            .as_ref()
+            .and_then(|result| result.get("structuredContent"))
+            .expect("collect structured content");
+        assert_eq!(
+            collected
+                .get("reports")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(1)
+        );
+        assert_eq!(
+            collected
+                .get("completed")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(1)
+        );
+
+        let second_collect = call_workers_for_test(
+            &tool_call_request_with_session(
+                "workers",
+                json!({ "action": "collect" }),
+                "anchor-chat-a",
+            ),
+            &workspace_id,
+            &workspace_root.to_string_lossy(),
+            broker,
+        )
+        .await;
+        let second = second_collect
+            .result
+            .as_ref()
+            .and_then(|result| result.get("structuredContent"))
+            .expect("second collect structured content");
+        assert!(
+            second
+                .get("reports")
+                .and_then(Value::as_array)
+                .is_some_and(Vec::is_empty)
+        );
+        assert!(
+            second
+                .get("completed")
+                .and_then(Value::as_array)
+                .is_some_and(Vec::is_empty)
+        );
     }
 
     #[test]
@@ -4412,6 +4882,7 @@ mod tests {
                 handoff_store_root: Some(&handoff_store_root),
                 command_jobs: &command_jobs,
                 browser_runtime: &None,
+                worker_broker: test_worker_broker(),
             },
         )
         .await;
@@ -4455,6 +4926,7 @@ mod tests {
                 handoff_store_root: Some(&handoff_store_root),
                 command_jobs: &command_jobs,
                 browser_runtime: &None,
+                worker_broker: test_worker_broker(),
             },
         )
         .await;
@@ -4486,6 +4958,7 @@ mod tests {
                 handoff_store_root: Some(&handoff_store_root),
                 command_jobs: &command_jobs,
                 browser_runtime: &None,
+                worker_broker: test_worker_broker(),
             },
         )
         .await;
@@ -4514,6 +4987,7 @@ mod tests {
                 handoff_store_root: Some(&handoff_store_root),
                 command_jobs: &command_jobs,
                 browser_runtime: &None,
+                worker_broker: test_worker_broker(),
             },
         )
         .await;
@@ -4550,6 +5024,7 @@ mod tests {
                 handoff_store_root: Some(&handoff_store_root),
                 command_jobs: &command_jobs,
                 browser_runtime: &None,
+                worker_broker: test_worker_broker(),
             },
         )
         .await;
@@ -4575,6 +5050,7 @@ mod tests {
                 handoff_store_root: Some(&handoff_store_root),
                 command_jobs: &command_jobs,
                 browser_runtime: &None,
+                worker_broker: test_worker_broker(),
             },
         )
         .await;
@@ -4599,6 +5075,7 @@ mod tests {
                 handoff_store_root: Some(&handoff_store_root),
                 command_jobs: &command_jobs,
                 browser_runtime: &None,
+                worker_broker: test_worker_broker(),
             },
         )
         .await;

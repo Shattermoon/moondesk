@@ -5,7 +5,7 @@ use super::broker::{
 use super::prompt;
 use super::types::{
     ChatIdentity, OperationId, TaskId, WorkerExecutionProfile, WorkerId, WorkerMessageId,
-    WorkerResult,
+    WorkerResult, WorkerState,
 };
 use crate::managed_chat::broker::{EnqueueManagedChatRequest, ManagedChatBroker};
 use crate::managed_chat::types::{ManagedChatLaunch, ManagedChatOpenMode, ManagedChatPurpose};
@@ -209,6 +209,55 @@ pub async fn handle(
                 "action": "status",
                 "familyId": family.id,
                 "workers": workers
+            }))
+        }
+        "retire" => {
+            let worker_id = parse_worker_id(arguments)?;
+            let family = broker
+                .family_for_anchor(workspace_id, caller_identity)
+                .await
+                .map_err(broker_error)?
+                .ok_or_else(|| "worker was not found".to_string())?;
+            let worker = family
+                .workers
+                .get(&worker_id)
+                .cloned()
+                .ok_or_else(|| "worker was not found".to_string())?;
+            let pending_task = match worker.state {
+                WorkerState::Retired | WorkerState::Idle => None,
+                WorkerState::Provisioning | WorkerState::Waking => {
+                    let task_id = worker
+                        .current_task_id
+                        .clone()
+                        .ok_or_else(|| "worker pending launch has no current task".to_string())?;
+                    let dedupe_key = format!("worker:{}:task:{}", worker_id, task_id);
+                    managed_chat_broker
+                        .cancel_pre_send_by_dedupe(&dedupe_key)
+                        .await
+                        .map_err(|error| format!("worker cannot be retired safely: {error}"))?;
+                    Some(task_id)
+                }
+                WorkerState::Running => {
+                    return Err(
+                        "running worker cannot be retired; finish or resolve its active task first"
+                            .into(),
+                    );
+                }
+            };
+            let retired = broker
+                .retire_worker(
+                    workspace_id,
+                    caller_identity,
+                    &worker_id,
+                    pending_task.as_ref(),
+                )
+                .await
+                .map_err(broker_error)?;
+            Ok(json!({
+                "action": "retire",
+                "workerId": retired.id,
+                "displayId": retired.display_id,
+                "state": retired.state
             }))
         }
         "send" => {

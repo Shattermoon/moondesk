@@ -99,6 +99,38 @@ impl ManagedChatBroker {
         Ok(removed_ids.len())
     }
 
+    pub async fn cancel_pre_send_by_dedupe(
+        &self,
+        dedupe_key: &str,
+    ) -> Result<bool, ManagedChatError> {
+        if dedupe_key.trim().is_empty() || dedupe_key.len() > 256 {
+            return Err(ManagedChatError::Invalid(
+                "managed chat dedupe key must contain 1..=256 bytes".into(),
+            ));
+        }
+        let mut guard = self.data.lock().await;
+        let Some(command_id) = guard.dedupe.get(dedupe_key).cloned() else {
+            return Ok(false);
+        };
+        let command = guard.commands.get(&command_id).ok_or_else(|| {
+            ManagedChatError::Storage("managed chat dedupe index is corrupt".into())
+        })?;
+        let safe = matches!(command.state, ManagedChatCommandState::Queued)
+            || (command.state == ManagedChatCommandState::Failed && !command.reconcile_history);
+        if !safe {
+            return Err(ManagedChatError::Conflict(
+                "managed chat launch cannot be cancelled because it may have crossed the Send boundary"
+                    .into(),
+            ));
+        }
+
+        let mut candidate = guard.clone();
+        candidate.commands.remove(&command_id);
+        candidate.dedupe.remove(dedupe_key);
+        self.commit_candidate(&mut guard, candidate).await?;
+        Ok(true)
+    }
+
     pub async fn enqueue(
         &self,
         request: EnqueueManagedChatRequest,
@@ -198,8 +230,8 @@ impl ManagedChatBroker {
             .commands
             .get_mut(&command_id)
             .ok_or(ManagedChatError::NotFound)?;
-        let reconcile_required = command.reconcile_history
-            || command.state == ManagedChatCommandState::NeedsReconcile;
+        let reconcile_required =
+            command.reconcile_history || command.state == ManagedChatCommandState::NeedsReconcile;
         let lease = ManagedChatLease {
             lease_id: ManagedChatLeaseId::new(),
             client_id: client_id.to_string(),
@@ -484,8 +516,17 @@ mod tests {
             .await
             .expect("enqueue B");
 
-        assert_eq!(broker.purge_workspace(&workspace_b).await.expect("purge B"), 1);
-        assert_eq!(broker.purge_workspace(&workspace_b).await.expect("repeat purge B"), 0);
+        assert_eq!(
+            broker.purge_workspace(&workspace_b).await.expect("purge B"),
+            1
+        );
+        assert_eq!(
+            broker
+                .purge_workspace(&workspace_b)
+                .await
+                .expect("repeat purge B"),
+            0
+        );
         let snapshot = broker.snapshot().await;
         assert_eq!(snapshot.commands.len(), 1);
         assert_eq!(snapshot.dedupe.len(), 1);
@@ -501,6 +542,110 @@ mod tests {
         let snapshot = reopened.snapshot().await;
         assert_eq!(snapshot.commands.len(), 1);
         assert_eq!(snapshot.commands.get(&command_a.id), Some(&command_a));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn pre_send_cancel_only_removes_safe_commands() {
+        let root = temp_root("moondesk-managed-chat-pre-send-cancel");
+        let broker = ManagedChatBroker::open(root.join("state.json")).expect("open broker");
+
+        broker
+            .enqueue(EnqueueManagedChatRequest {
+                dedupe_key: "safe-queued".into(),
+                launch: launch("safe-queued"),
+            })
+            .await
+            .expect("enqueue safe queued command");
+        assert!(
+            broker
+                .cancel_pre_send_by_dedupe("safe-queued")
+                .await
+                .expect("cancel queued command")
+        );
+        assert!(
+            !broker
+                .cancel_pre_send_by_dedupe("safe-queued")
+                .await
+                .expect("repeat missing cancel")
+        );
+
+        let failed = broker
+            .enqueue(EnqueueManagedChatRequest {
+                dedupe_key: "safe-failed".into(),
+                launch: launch("safe-failed"),
+            })
+            .await
+            .expect("enqueue failed command");
+        let failed_offer = broker
+            .redeem("extension-a", 1_000)
+            .await
+            .expect("redeem failed command")
+            .expect("failed lease");
+        broker
+            .acknowledge(
+                &failed.id,
+                &failed_offer
+                    .command
+                    .lease
+                    .as_ref()
+                    .expect("failed lease")
+                    .lease_id,
+                "extension-a",
+                ManagedChatAckOutcome::Failed {
+                    details: Some("model unavailable before send".into()),
+                },
+            )
+            .await
+            .expect("ack pre-send failure");
+        assert!(
+            broker
+                .cancel_pre_send_by_dedupe("safe-failed")
+                .await
+                .expect("cancel failed pre-send command")
+        );
+
+        let ambiguous = broker
+            .enqueue(EnqueueManagedChatRequest {
+                dedupe_key: "unsafe-ambiguous".into(),
+                launch: launch("unsafe-ambiguous"),
+            })
+            .await
+            .expect("enqueue ambiguous command");
+        let ambiguous_offer = broker
+            .redeem("extension-a", 2_000)
+            .await
+            .expect("redeem ambiguous command")
+            .expect("ambiguous lease");
+        broker
+            .acknowledge(
+                &ambiguous.id,
+                &ambiguous_offer
+                    .command
+                    .lease
+                    .as_ref()
+                    .expect("ambiguous lease")
+                    .lease_id,
+                "extension-a",
+                ManagedChatAckOutcome::NeedsReconcile,
+            )
+            .await
+            .expect("mark ambiguous command");
+        let error = broker
+            .cancel_pre_send_by_dedupe("unsafe-ambiguous")
+            .await
+            .expect_err("ambiguous command must not be cancelled");
+        assert!(matches!(error, ManagedChatError::Conflict(_)));
+
+        let snapshot = broker.snapshot().await;
+        assert_eq!(snapshot.commands.len(), 1);
+        assert_eq!(
+            snapshot
+                .commands
+                .get(&ambiguous.id)
+                .map(|command| command.state),
+            Some(ManagedChatCommandState::NeedsReconcile)
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 

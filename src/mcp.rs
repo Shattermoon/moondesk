@@ -449,11 +449,11 @@ fn workers_tool_descriptor() -> Value {
     json!({
         "name": "workers",
         "title": "Coordinate workers",
-        "description": "Coordinate MoonDesk experimental workers for this exact workspace and ChatGPT conversation. The workspace is resolved from this connector; never pass or guess a workspace. Anchor actions are spawn, reuse, status, send, collect. Worker actions are claim, start, inbox, ack, report, finish. Reuse creates a new durable task on an idle claimed worker and wakes its existing ChatGPT conversation. collect can wait up to 60 seconds for a report/completion so the Anchor does not need polling loops. Worker coordination requires exact ChatGPT session metadata and fails closed when that identity is unavailable. operation_id must be a stable UUID reused when retrying the same spawn/reuse/send/report after an ambiguous response.",
+        "description": "Coordinate MoonDesk experimental workers for this exact workspace and ChatGPT conversation. The workspace is resolved from this connector; never pass or guess a workspace. Anchor actions are spawn, reuse, retire, status, send, collect. Worker actions are claim, start, inbox, ack, report, finish. Reuse creates a new durable task on an idle claimed worker and wakes its existing ChatGPT conversation. Retire frees an idle worker slot or safely abandons a launch only when MoonDesk can prove the assignment never crossed the Send boundary. collect can wait up to 60 seconds for a report/completion so the Anchor does not need polling loops. Worker coordination requires exact ChatGPT session metadata and fails closed when that identity is unavailable. operation_id must be a stable UUID reused when retrying the same spawn/reuse/send/report after an ambiguous response.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "action": { "type": "string", "enum": ["spawn", "reuse", "status", "send", "collect", "claim", "start", "inbox", "ack", "report", "finish"] },
+                "action": { "type": "string", "enum": ["spawn", "reuse", "retire", "status", "send", "collect", "claim", "start", "inbox", "ack", "report", "finish"] },
                 "operation_id": { "type": "string", "description": "Stable UUID for idempotent spawn/reuse/send/report operations" },
                 "label": { "type": "string", "minLength": 1, "maxLength": 128, "description": "Short worker task label for spawn" },
                 "task": { "type": "string", "minLength": 1, "description": "Concrete assignment for spawn or reuse" },
@@ -4288,7 +4288,10 @@ mod tests {
             .find(|command| command.launch.task_marker.ends_with(&reused_task_id))
             .expect("reuse managed chat command");
         assert_eq!(wake.launch.open_mode, ManagedChatOpenMode::ExistingThread);
-        assert_eq!(wake.launch.thread_key.as_deref(), Some(format!("worker:{worker_id}").as_str()));
+        assert_eq!(
+            wake.launch.thread_key.as_deref(),
+            Some(format!("worker:{worker_id}").as_str())
+        );
 
         let forged_start = call_workers_for_test(
             &tool_call_request_with_session(
@@ -4338,6 +4341,156 @@ mod tests {
                 .and_then(|result| result.pointer("/structuredContent/state"))
                 .and_then(Value::as_str),
             Some("running")
+        );
+    }
+
+    #[tokio::test]
+    async fn workers_mcp_retire_cancels_only_pre_send_launch_and_reuses_slot() {
+        let root = TestTempDir::new("moondesk-workers-mcp-retire");
+        let workspace_root = root.path().join("workspace");
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        let workspace_id = WorkspaceId::new();
+        let broker = Arc::new(
+            WorkerBroker::open(root.path().join("worker-state-v1.json"))
+                .expect("open worker broker"),
+        );
+        let managed_chat_broker = Arc::new(
+            ManagedChatBroker::open(root.path().join("managed-chat-state-v1.json"))
+                .expect("open managed chat broker"),
+        );
+
+        let spawn = call_workers_for_test(
+            &tool_call_request_with_session(
+                "workers",
+                json!({
+                    "action": "spawn",
+                    "operation_id": Uuid::new_v4().to_string(),
+                    "label": "cancel me",
+                    "task": "This launch should be retired before Send."
+                }),
+                "anchor-retire",
+            ),
+            &workspace_id,
+            &workspace_root.to_string_lossy(),
+            broker.clone(),
+            managed_chat_broker.clone(),
+        )
+        .await;
+        let spawned = spawn
+            .result
+            .as_ref()
+            .and_then(|result| result.get("structuredContent"))
+            .expect("spawn structured content");
+        let worker_id = spawned
+            .get("workerId")
+            .and_then(Value::as_str)
+            .expect("worker id")
+            .to_string();
+        assert_eq!(
+            spawned.get("displayId").and_then(Value::as_str),
+            Some("worker-1")
+        );
+        assert_eq!(managed_chat_broker.snapshot().await.commands.len(), 1);
+
+        let retire = call_workers_for_test(
+            &tool_call_request_with_session(
+                "workers",
+                json!({ "action": "retire", "worker_id": worker_id }),
+                "anchor-retire",
+            ),
+            &workspace_id,
+            &workspace_root.to_string_lossy(),
+            broker.clone(),
+            managed_chat_broker.clone(),
+        )
+        .await;
+        assert_eq!(
+            retire
+                .result
+                .as_ref()
+                .and_then(|result| result.pointer("/structuredContent/state"))
+                .and_then(Value::as_str),
+            Some("retired")
+        );
+        assert!(managed_chat_broker.snapshot().await.commands.is_empty());
+
+        let replacement = call_workers_for_test(
+            &tool_call_request_with_session(
+                "workers",
+                json!({
+                    "action": "spawn",
+                    "operation_id": Uuid::new_v4().to_string(),
+                    "label": "replacement",
+                    "task": "Replacement task after safe retirement."
+                }),
+                "anchor-retire",
+            ),
+            &workspace_id,
+            &workspace_root.to_string_lossy(),
+            broker.clone(),
+            managed_chat_broker.clone(),
+        )
+        .await;
+        let replacement = replacement
+            .result
+            .as_ref()
+            .and_then(|result| result.get("structuredContent"))
+            .expect("replacement structured content");
+        assert_eq!(
+            replacement.get("displayId").and_then(Value::as_str),
+            Some("worker-1")
+        );
+        let replacement_worker_id = replacement
+            .get("workerId")
+            .and_then(Value::as_str)
+            .expect("replacement worker id");
+        assert_ne!(replacement_worker_id, worker_id);
+
+        let offer = managed_chat_broker
+            .redeem("extension-retire-test", 10)
+            .await
+            .expect("redeem replacement launch")
+            .expect("replacement launch offer");
+        assert!(!offer.reconcile_required);
+        let unsafe_retire = call_workers_for_test(
+            &tool_call_request_with_session(
+                "workers",
+                json!({ "action": "retire", "worker_id": replacement_worker_id }),
+                "anchor-retire",
+            ),
+            &workspace_id,
+            &workspace_root.to_string_lossy(),
+            broker.clone(),
+            managed_chat_broker.clone(),
+        )
+        .await;
+        assert_eq!(
+            unsafe_retire
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(result_text(&unsafe_retire).contains("Send boundary"));
+        let family = broker
+            .family_for_anchor(
+                &workspace_id,
+                &ChatIdentity::from_openai_meta(Some("worker-test-subject"), "anchor-retire"),
+            )
+            .await
+            .expect("read family")
+            .expect("family exists");
+        assert_eq!(
+            family
+                .workers
+                .get(
+                    &crate::workers::types::WorkerId::parse(replacement_worker_id)
+                        .expect("parse replacement worker")
+                )
+                .expect("replacement worker")
+                .state,
+            crate::workers::types::WorkerState::Provisioning
         );
     }
 

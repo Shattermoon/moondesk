@@ -295,8 +295,17 @@ impl WorkerStoreData {
                 return Err("worker family map key does not match family id".into());
             }
             family.anchor_identity.validate()?;
-            if family.workers.len() > super::MAX_WORKERS_PER_FAMILY {
-                return Err("worker family exceeds configured worker limit".into());
+            if family.workers.len() > super::MAX_WORKER_RECORDS_PER_FAMILY {
+                return Err("worker family exceeds configured worker record limit".into());
+            }
+            if family
+                .workers
+                .values()
+                .filter(|worker| worker.state != WorkerState::Retired)
+                .count()
+                > super::MAX_WORKERS_PER_FAMILY
+            {
+                return Err("worker family exceeds configured active worker limit".into());
             }
             for report in &family.reports {
                 if report.body.len() > super::MAX_WORKER_MESSAGE_BYTES {

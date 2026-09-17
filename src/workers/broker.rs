@@ -7,7 +7,7 @@ use super::types::{
 };
 use super::{
     MAX_PENDING_MESSAGES_PER_WORKER, MAX_WORKER_ASSIGNMENT_BYTES, MAX_WORKER_MESSAGE_BYTES,
-    MAX_WORKERS_PER_FAMILY,
+    MAX_WORKER_RECORDS_PER_FAMILY, MAX_WORKERS_PER_FAMILY,
 };
 use crate::workspaces::WorkspaceId;
 use serde::Serialize;
@@ -180,9 +180,19 @@ impl WorkerBroker {
             WorkerBrokerError::Storage("worker family disappeared during mutation".into())
         })?;
 
-        if family.workers.len() >= MAX_WORKERS_PER_FAMILY {
+        if family.workers.len() >= MAX_WORKER_RECORDS_PER_FAMILY {
             return Err(WorkerBrokerError::Limit(format!(
-                "worker family is limited to {MAX_WORKERS_PER_FAMILY} workers"
+                "worker family retains at most {MAX_WORKER_RECORDS_PER_FAMILY} worker records"
+            )));
+        }
+        let active_workers = family
+            .workers
+            .values()
+            .filter(|worker| worker.state != WorkerState::Retired)
+            .count();
+        if active_workers >= MAX_WORKERS_PER_FAMILY {
+            return Err(WorkerBrokerError::Limit(format!(
+                "worker family is limited to {MAX_WORKERS_PER_FAMILY} active workers"
             )));
         }
 
@@ -390,6 +400,82 @@ impl WorkerBroker {
                 &family.workspace_id == workspace_id && &family.anchor_identity == anchor_identity
             })
             .cloned())
+    }
+
+    pub async fn retire_worker(
+        &self,
+        workspace_id: &WorkspaceId,
+        anchor_identity: &ChatIdentity,
+        worker_id: &WorkerId,
+        expected_pending_task: Option<&TaskId>,
+    ) -> Result<WorkerRecord, WorkerBrokerError> {
+        anchor_identity
+            .validate()
+            .map_err(WorkerBrokerError::Invalid)?;
+        let mut guard = self.data.lock().await;
+        let family_id = find_family_for_worker(&guard, workspace_id, worker_id)
+            .ok_or(WorkerBrokerError::NotFound)?;
+        let family = guard
+            .families
+            .get(&family_id)
+            .ok_or(WorkerBrokerError::NotFound)?;
+        if &family.anchor_identity != anchor_identity {
+            return Err(WorkerBrokerError::NotFound);
+        }
+        let worker = family
+            .workers
+            .get(worker_id)
+            .ok_or(WorkerBrokerError::NotFound)?;
+        if worker.state == WorkerState::Retired {
+            return Ok(worker.clone());
+        }
+        match expected_pending_task {
+            None => {
+                if worker.state != WorkerState::Idle || worker.current_task_id.is_some() {
+                    return Err(WorkerBrokerError::Conflict(
+                        "worker can only be retired while idle or after a proven pre-send launch cancellation"
+                            .into(),
+                    ));
+                }
+            }
+            Some(task_id) => {
+                if !matches!(
+                    worker.state,
+                    WorkerState::Provisioning | WorkerState::Waking
+                ) || worker.current_task_id.as_ref() != Some(task_id)
+                    || worker
+                        .tasks
+                        .get(task_id)
+                        .is_none_or(|task| task.state != TaskState::Pending)
+                {
+                    return Err(WorkerBrokerError::Conflict(
+                        "worker pending task changed before retirement could be committed".into(),
+                    ));
+                }
+            }
+        }
+
+        let mut candidate = guard.clone();
+        let worker = candidate
+            .families
+            .get_mut(&family_id)
+            .and_then(|family| family.workers.get_mut(worker_id))
+            .ok_or(WorkerBrokerError::NotFound)?;
+        if let Some(task_id) = expected_pending_task {
+            let task = worker
+                .tasks
+                .get_mut(task_id)
+                .ok_or(WorkerBrokerError::NotFound)?;
+            task.state = TaskState::Failed;
+            worker.current_task_id = None;
+        }
+        worker.claim_token = None;
+        worker.state = WorkerState::Retired;
+        worker.attachment_state = BrowserAttachmentState::Absent;
+        let retired = worker.clone();
+        self.commit_candidate(&mut guard, candidate).await?;
+        self.updates.notify_waiters();
+        Ok(retired)
     }
 
     pub async fn purge_workspace(
@@ -764,7 +850,10 @@ impl WorkerBroker {
             if now >= deadline {
                 return Ok(updates);
             }
-            if tokio::time::timeout(deadline - now, notified).await.is_err() {
+            if tokio::time::timeout(deadline - now, notified)
+                .await
+                .is_err()
+            {
                 return Ok(CollectedUpdates {
                     reports: Vec::new(),
                     completed: Vec::new(),
@@ -1213,7 +1302,10 @@ mod tests {
             .expect("read family")
             .expect("family exists");
         assert_eq!(
-            family.workers.get(&spawned.worker_id).map(|worker| worker.state),
+            family
+                .workers
+                .get(&spawned.worker_id)
+                .map(|worker| worker.state),
             Some(WorkerState::Idle)
         );
         let _ = std::fs::remove_dir_all(root);
@@ -1247,8 +1339,17 @@ mod tests {
             .await
             .expect("spawn worker B");
 
-        assert_eq!(broker.purge_workspace(&workspace_b).await.expect("purge B"), 1);
-        assert_eq!(broker.purge_workspace(&workspace_b).await.expect("repeat purge B"), 0);
+        assert_eq!(
+            broker.purge_workspace(&workspace_b).await.expect("purge B"),
+            1
+        );
+        assert_eq!(
+            broker
+                .purge_workspace(&workspace_b)
+                .await
+                .expect("repeat purge B"),
+            0
+        );
         assert!(
             broker
                 .family_for_anchor(&workspace_a, &anchor_a)
@@ -1647,9 +1748,7 @@ mod tests {
     async fn collect_wait_wakes_on_durable_report_without_polling() {
         let root = temp_root("moondesk-worker-collect-wait");
         let path = root.join("worker-state-v1.json");
-        let broker = std::sync::Arc::new(
-            WorkerBroker::open(&path).expect("open worker broker"),
-        );
+        let broker = std::sync::Arc::new(WorkerBroker::open(&path).expect("open worker broker"));
         let workspace = WorkspaceId::new();
         let anchor_identity = anchor("anchor-collect-wait");
         let worker_identity = anchor("worker-collect-wait");
@@ -1715,6 +1814,103 @@ mod tests {
             .await
             .expect_err("oversized wait must fail");
         assert!(matches!(too_long, WorkerBrokerError::Invalid(_)));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn retiring_idle_worker_frees_display_slot_without_erasing_history() {
+        let root = temp_root("moondesk-worker-retire-slot");
+        let path = root.join("worker-state-v1.json");
+        let broker = WorkerBroker::open(&path).expect("open worker broker");
+        let workspace = WorkspaceId::new();
+        let anchor_identity = anchor("anchor-retire-slot");
+        let worker_identity = anchor("worker-retire-slot");
+
+        let first = broker
+            .spawn_worker(spawn_request(
+                OperationId::new(),
+                workspace.clone(),
+                anchor_identity.clone(),
+                "first assignment",
+            ))
+            .await
+            .expect("spawn first worker");
+        let second = broker
+            .spawn_worker(spawn_request(
+                OperationId::new(),
+                workspace.clone(),
+                anchor_identity.clone(),
+                "second assignment",
+            ))
+            .await
+            .expect("spawn second worker");
+        assert_eq!(first.display_id, "worker-1");
+        assert_eq!(second.display_id, "worker-2");
+
+        broker
+            .claim_worker(
+                &workspace,
+                &first.worker_id,
+                &first.task_id,
+                &first.claim_token,
+                worker_identity.clone(),
+            )
+            .await
+            .expect("claim first worker");
+        broker
+            .finish_task(FinishTaskRequest {
+                workspace_id: workspace.clone(),
+                worker_identity,
+                worker_id: first.worker_id.clone(),
+                task_id: first.task_id.clone(),
+                result: finished_result(),
+            })
+            .await
+            .expect("finish first worker");
+        let retired = broker
+            .retire_worker(&workspace, &anchor_identity, &first.worker_id, None)
+            .await
+            .expect("retire idle worker");
+        assert_eq!(retired.state, WorkerState::Retired);
+        assert_eq!(retired.display_id, "worker-1");
+
+        let replacement = broker
+            .spawn_worker(spawn_request(
+                OperationId::new(),
+                workspace.clone(),
+                anchor_identity.clone(),
+                "replacement assignment",
+            ))
+            .await
+            .expect("spawn replacement worker");
+        assert_eq!(replacement.display_id, "worker-1");
+        assert_ne!(replacement.worker_id, first.worker_id);
+
+        let snapshot = broker.snapshot().await;
+        let family = snapshot
+            .families
+            .values()
+            .find(|family| family.workspace_id == workspace)
+            .expect("worker family");
+        assert_eq!(family.workers.len(), 3);
+        assert_eq!(
+            family
+                .workers
+                .values()
+                .filter(|worker| worker.state != WorkerState::Retired)
+                .count(),
+            MAX_WORKERS_PER_FAMILY
+        );
+        assert_eq!(
+            family
+                .workers
+                .get(&first.worker_id)
+                .expect("retired history")
+                .tasks
+                .get(&first.task_id)
+                .and_then(|task| task.result.as_ref()),
+            Some(&finished_result())
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 

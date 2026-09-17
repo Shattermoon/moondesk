@@ -1,4 +1,5 @@
 pub(crate) mod broker;
+mod prompt;
 pub(crate) mod protocol;
 mod store;
 pub(crate) mod types;

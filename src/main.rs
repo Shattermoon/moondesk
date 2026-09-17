@@ -5,7 +5,9 @@ mod browser_transport;
 mod clippymoon_gen;
 mod command;
 mod command_jobs;
+mod companion;
 mod handoff;
+mod managed_chat;
 
 mod macos_terminal;
 mod mascot;

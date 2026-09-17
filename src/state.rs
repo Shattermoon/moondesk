@@ -12,6 +12,8 @@ use tokio::sync::{
 use uuid::Uuid;
 
 use crate::command_jobs::CommandJobManager;
+use crate::companion::CompanionAuth;
+use crate::managed_chat::{self, broker::ManagedChatBroker};
 use crate::mascot::{self, MascotPack};
 use crate::theme;
 use crate::workers::{self, broker::WorkerBroker};
@@ -987,6 +989,8 @@ pub struct AppState {
     pub session_usage_totals: UsageTotals,
     pub command_jobs: CommandJobManager,
     pub worker_broker: Arc<WorkerBroker>,
+    pub managed_chat_broker: Arc<ManagedChatBroker>,
+    pub companion_auth: Arc<CompanionAuth>,
     config_path: PathBuf,
     pub server_handle: Option<tokio::task::JoinHandle<()>>,
     pub ngrok_task: Option<tokio::task::JoinHandle<()>>,
@@ -1566,6 +1570,11 @@ impl AppState {
         let worker_store_path = workers::store_path_for_config(&config_path)?;
         let worker_broker =
             Arc::new(WorkerBroker::open(worker_store_path).map_err(std::io::Error::other)?);
+        let managed_chat_store_path = managed_chat::store_path_for_config(&config_path)?;
+        let managed_chat_broker = Arc::new(
+            ManagedChatBroker::open(managed_chat_store_path).map_err(std::io::Error::other)?,
+        );
+        let companion_auth = Arc::new(CompanionAuth::open_for_config(&config_path)?);
 
         let mut app = Self {
             theme: config.theme,
@@ -1603,6 +1612,8 @@ impl AppState {
             session_usage_totals: UsageTotals::default(),
             command_jobs: CommandJobManager::new(),
             worker_broker,
+            managed_chat_broker,
+            companion_auth,
             config_path,
             server_handle: None,
             ngrok_task: None,

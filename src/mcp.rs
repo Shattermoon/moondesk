@@ -19,6 +19,7 @@ use crate::command_jobs::{
     MAX_COMMAND_OUTPUT_READ_BYTES, MAX_JOB_TIMEOUT_MS, MAX_POLL_WAIT_MS,
 };
 use crate::handoff;
+use crate::managed_chat::broker::ManagedChatBroker;
 use crate::state::{
     AgentsPathMode, BrowserPresentation, Mode, ToolMode, load_app_config, user_home_dir,
 };
@@ -85,6 +86,7 @@ impl JsonRpcResponse {
 #[derive(Clone)]
 pub struct McpRequestContext<'a> {
     pub workspace_id: &'a WorkspaceId,
+    pub workspace_name: &'a str,
     pub workspace_root: &'a str,
     pub mode: Mode,
     pub tool_mode: ToolMode,
@@ -93,6 +95,7 @@ pub struct McpRequestContext<'a> {
     pub command_jobs: &'a CommandJobManager,
     pub browser_runtime: &'a Option<Arc<BrowserRuntime>>,
     pub worker_broker: Arc<WorkerBroker>,
+    pub managed_chat_broker: Arc<ManagedChatBroker>,
 }
 
 pub async fn handle_request(
@@ -809,6 +812,21 @@ fn test_worker_broker() -> Arc<WorkerBroker> {
 }
 
 #[cfg(test)]
+fn test_managed_chat_broker() -> Arc<ManagedChatBroker> {
+    Arc::new(
+        ManagedChatBroker::open(
+            std::env::temp_dir()
+                .join(format!(
+                    "moondesk-mcp-managed-chat-test-{}",
+                    uuid::Uuid::new_v4()
+                ))
+                .join(crate::managed_chat::MANAGED_CHAT_STORE_FILE_NAME),
+        )
+        .expect("create test managed chat broker"),
+    )
+}
+
+#[cfg(test)]
 async fn handle_tools_call(
     req: &JsonRpcRequest,
     workspace_root: &str,
@@ -834,6 +852,7 @@ async fn handle_tools_call(
         req,
         McpRequestContext {
             workspace_id: &workspace_id,
+            workspace_name: "Test Workspace",
             workspace_root,
             mode,
             tool_mode,
@@ -842,6 +861,7 @@ async fn handle_tools_call(
             command_jobs,
             browser_runtime,
             worker_broker: test_worker_broker(),
+            managed_chat_broker: test_managed_chat_broker(),
         },
     )
     .await
@@ -926,6 +946,7 @@ async fn handle_tools_call_for_workspace(
 ) -> JsonRpcResponse {
     let McpRequestContext {
         workspace_id,
+        workspace_name,
         workspace_root,
         mode,
         tool_mode,
@@ -934,6 +955,7 @@ async fn handle_tools_call_for_workspace(
         command_jobs,
         browser_runtime,
         worker_broker,
+        managed_chat_broker,
     } = context;
     let params = &req.params;
     let tool_name = params
@@ -1035,8 +1057,10 @@ async fn handle_tools_call_for_workspace(
         return match crate::workers::protocol::handle(
             &arguments,
             workspace_id,
+            workspace_name,
             &caller_identity,
             worker_broker.as_ref(),
+            managed_chat_broker.as_ref(),
         )
         .await
         {
@@ -3747,6 +3771,7 @@ mod tests {
         workspace_id: &WorkspaceId,
         workspace_root: &str,
         worker_broker: Arc<WorkerBroker>,
+        managed_chat_broker: Arc<ManagedChatBroker>,
     ) -> JsonRpcResponse {
         let command_jobs = CommandJobManager::new();
         let browser_runtime = None;
@@ -3754,6 +3779,7 @@ mod tests {
             request,
             McpRequestContext {
                 workspace_id,
+                workspace_name: "Test Workspace",
                 workspace_root,
                 mode: Mode::Both,
                 tool_mode: ToolMode::MultiTools,
@@ -3762,6 +3788,7 @@ mod tests {
                 command_jobs: &command_jobs,
                 browser_runtime: &browser_runtime,
                 worker_broker,
+                managed_chat_broker,
             },
         )
         .await
@@ -3889,6 +3916,10 @@ mod tests {
             WorkerBroker::open(root.path().join("worker-state-v1.json"))
                 .expect("open worker broker"),
         );
+        let managed_chat_broker = Arc::new(
+            ManagedChatBroker::open(root.path().join("managed-chat-state-v1.json"))
+                .expect("open managed chat broker"),
+        );
         let request = tool_call_request(
             "workers",
             json!({
@@ -3903,6 +3934,7 @@ mod tests {
             &workspace_id,
             &workspace_root.to_string_lossy(),
             broker.clone(),
+            managed_chat_broker,
         )
         .await;
         assert_eq!(
@@ -3927,6 +3959,10 @@ mod tests {
             WorkerBroker::open(root.path().join("worker-state-v1.json"))
                 .expect("open worker broker"),
         );
+        let managed_chat_broker = Arc::new(
+            ManagedChatBroker::open(root.path().join("managed-chat-state-v1.json"))
+                .expect("open managed chat broker"),
+        );
         let operation_id = Uuid::new_v4().to_string();
         let spawn_args = json!({
             "action": "spawn",
@@ -3939,6 +3975,7 @@ mod tests {
             &workspace_id,
             &workspace_root.to_string_lossy(),
             broker.clone(),
+            managed_chat_broker.clone(),
         )
         .await;
         let spawned = spawn
@@ -3967,12 +4004,34 @@ mod tests {
                 .and_then(Value::as_str),
             Some("high")
         );
+        let launch_snapshot = managed_chat_broker.snapshot().await;
+        assert_eq!(launch_snapshot.commands.len(), 1);
+        let launch_command = launch_snapshot
+            .commands
+            .values()
+            .next()
+            .expect("worker launch command");
+        assert_eq!(launch_command.launch.workspace_id, workspace_id);
+        assert_eq!(
+            launch_command.launch.execution_profile.reasoning_effort,
+            crate::managed_chat::types::ReasoningEffort::High
+        );
+        assert!(
+            launch_command
+                .launch
+                .opening_message
+                .contains("Test Workspace")
+        );
+        assert!(launch_command.launch.opening_message.contains(&worker_id));
+        assert!(launch_command.launch.opening_message.contains(&task_id));
+        assert!(launch_command.launch.opening_message.contains(&claim_token));
 
         let retry = call_workers_for_test(
             &tool_call_request_with_session("workers", spawn_args, "anchor-chat-a"),
             &workspace_id,
             &workspace_root.to_string_lossy(),
             broker.clone(),
+            managed_chat_broker.clone(),
         )
         .await;
         let retried = retry
@@ -3983,6 +4042,7 @@ mod tests {
         assert_eq!(retried.get("workerId"), Some(&json!(worker_id)));
         assert_eq!(retried.get("taskId"), Some(&json!(task_id)));
         assert_eq!(broker.snapshot().await.families.len(), 1);
+        assert_eq!(managed_chat_broker.snapshot().await.commands.len(), 1);
 
         let forged_send = call_workers_for_test(
             &tool_call_request_with_session(
@@ -3998,6 +4058,7 @@ mod tests {
             &workspace_id,
             &workspace_root.to_string_lossy(),
             broker.clone(),
+            managed_chat_broker.clone(),
         )
         .await;
         assert_eq!(
@@ -4023,6 +4084,7 @@ mod tests {
             &workspace_id,
             &workspace_root.to_string_lossy(),
             broker.clone(),
+            managed_chat_broker.clone(),
         )
         .await;
         assert_eq!(
@@ -4049,6 +4111,7 @@ mod tests {
             &workspace_id,
             &workspace_root.to_string_lossy(),
             broker.clone(),
+            managed_chat_broker.clone(),
         )
         .await;
         assert_eq!(
@@ -4075,6 +4138,7 @@ mod tests {
             &workspace_id,
             &workspace_root.to_string_lossy(),
             broker.clone(),
+            managed_chat_broker.clone(),
         )
         .await;
         assert_eq!(
@@ -4103,6 +4167,7 @@ mod tests {
             &workspace_id,
             &workspace_root.to_string_lossy(),
             broker.clone(),
+            managed_chat_broker.clone(),
         )
         .await;
         assert_eq!(
@@ -4123,6 +4188,7 @@ mod tests {
             &workspace_id,
             &workspace_root.to_string_lossy(),
             broker.clone(),
+            managed_chat_broker.clone(),
         )
         .await;
         let collected = collect
@@ -4154,6 +4220,7 @@ mod tests {
             &workspace_id,
             &workspace_root.to_string_lossy(),
             broker,
+            managed_chat_broker,
         )
         .await;
         let second = second_collect
@@ -4875,6 +4942,7 @@ mod tests {
             &tool_call_request("moondesk_instruction", json!({})),
             McpRequestContext {
                 workspace_id: &workspace_id,
+                workspace_name: "Test Workspace",
                 workspace_root: &workspace_root_str,
                 mode: Mode::Both,
                 tool_mode: ToolMode::MultiTools,
@@ -4883,6 +4951,7 @@ mod tests {
                 command_jobs: &command_jobs,
                 browser_runtime: &None,
                 worker_broker: test_worker_broker(),
+                managed_chat_broker: test_managed_chat_broker(),
             },
         )
         .await;
@@ -4919,6 +4988,7 @@ mod tests {
             ),
             McpRequestContext {
                 workspace_id: &workspace_id,
+                workspace_name: "Test Workspace",
                 workspace_root: &workspace_root_str,
                 mode: Mode::Both,
                 tool_mode: ToolMode::MultiTools,
@@ -4927,6 +4997,7 @@ mod tests {
                 command_jobs: &command_jobs,
                 browser_runtime: &None,
                 worker_broker: test_worker_broker(),
+                managed_chat_broker: test_managed_chat_broker(),
             },
         )
         .await;
@@ -4951,6 +5022,7 @@ mod tests {
             &tool_call_request("moondesk_instruction", json!({})),
             McpRequestContext {
                 workspace_id: &workspace_id,
+                workspace_name: "Test Workspace",
                 workspace_root: &workspace_root_str,
                 mode: Mode::Both,
                 tool_mode: ToolMode::MultiTools,
@@ -4959,6 +5031,7 @@ mod tests {
                 command_jobs: &command_jobs,
                 browser_runtime: &None,
                 worker_broker: test_worker_broker(),
+                managed_chat_broker: test_managed_chat_broker(),
             },
         )
         .await;
@@ -4980,6 +5053,7 @@ mod tests {
             &tool_call_request("resume_handoff", json!({ "handoff_id": handoff_id })),
             McpRequestContext {
                 workspace_id: &workspace_id,
+                workspace_name: "Test Workspace",
                 workspace_root: &workspace_root_str,
                 mode: Mode::Both,
                 tool_mode: ToolMode::MultiTools,
@@ -4988,6 +5062,7 @@ mod tests {
                 command_jobs: &command_jobs,
                 browser_runtime: &None,
                 worker_broker: test_worker_broker(),
+                managed_chat_broker: test_managed_chat_broker(),
             },
         )
         .await;
@@ -5017,6 +5092,7 @@ mod tests {
             &tool_call_request("moondesk_instruction", json!({})),
             McpRequestContext {
                 workspace_id: &workspace_id,
+                workspace_name: "Test Workspace",
                 workspace_root: &workspace_root_str,
                 mode: Mode::Both,
                 tool_mode: ToolMode::MultiTools,
@@ -5025,6 +5101,7 @@ mod tests {
                 command_jobs: &command_jobs,
                 browser_runtime: &None,
                 worker_broker: test_worker_broker(),
+                managed_chat_broker: test_managed_chat_broker(),
             },
         )
         .await;
@@ -5043,6 +5120,7 @@ mod tests {
             &tool_call_request("complete_handoff", json!({ "handoff_id": handoff_id })),
             McpRequestContext {
                 workspace_id: &workspace_id,
+                workspace_name: "Test Workspace",
                 workspace_root: &workspace_root_str,
                 mode: Mode::Both,
                 tool_mode: ToolMode::MultiTools,
@@ -5051,6 +5129,7 @@ mod tests {
                 command_jobs: &command_jobs,
                 browser_runtime: &None,
                 worker_broker: test_worker_broker(),
+                managed_chat_broker: test_managed_chat_broker(),
             },
         )
         .await;
@@ -5068,6 +5147,7 @@ mod tests {
             &tool_call_request("moondesk_instruction", json!({})),
             McpRequestContext {
                 workspace_id: &workspace_id,
+                workspace_name: "Test Workspace",
                 workspace_root: &workspace_root_str,
                 mode: Mode::Both,
                 tool_mode: ToolMode::MultiTools,
@@ -5076,6 +5156,7 @@ mod tests {
                 command_jobs: &command_jobs,
                 browser_runtime: &None,
                 worker_broker: test_worker_broker(),
+                managed_chat_broker: test_managed_chat_broker(),
             },
         )
         .await;

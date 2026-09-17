@@ -107,35 +107,8 @@ impl ChatIdentity {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ReasoningEffort {
-    Instant,
-    Low,
-    Medium,
-    High,
-    ExtraHigh,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct WorkerExecutionProfile {
-    pub model_key: String,
-    pub model_label: String,
-    pub reasoning_effort: ReasoningEffort,
-}
-
-impl WorkerExecutionProfile {
-    pub(crate) fn validate(&self) -> Result<(), String> {
-        if self.model_key.trim().is_empty() || self.model_key.len() > 128 {
-            return Err("worker model key is invalid".into());
-        }
-        if self.model_label.trim().is_empty() || self.model_label.len() > 128 {
-            return Err("worker model label is invalid".into());
-        }
-        Ok(())
-    }
-}
+pub use crate::managed_chat::types::ReasoningEffort;
+pub type WorkerExecutionProfile = crate::managed_chat::types::ChatExecutionProfile;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

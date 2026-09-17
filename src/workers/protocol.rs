@@ -2,10 +2,13 @@ use super::broker::{
     FinishTaskRequest, MessageWorkerRequest, ReportWorkerRequest, SpawnWorkerRequest, WorkerBroker,
     WorkerBrokerError,
 };
+use super::prompt;
 use super::types::{
     ChatIdentity, OperationId, ReasoningEffort, TaskId, WorkerExecutionProfile, WorkerId,
     WorkerMessageId, WorkerResult,
 };
+use crate::managed_chat::broker::{EnqueueManagedChatRequest, ManagedChatBroker};
+use crate::managed_chat::types::{ManagedChatLaunch, ManagedChatPurpose};
 use crate::workspaces::WorkspaceId;
 use serde_json::{Value, json};
 
@@ -70,23 +73,50 @@ fn broker_error(error: WorkerBrokerError) -> String {
 pub async fn handle(
     arguments: &Value,
     workspace_id: &WorkspaceId,
+    workspace_name: &str,
     caller_identity: &ChatIdentity,
     broker: &WorkerBroker,
+    managed_chat_broker: &ManagedChatBroker,
 ) -> Result<Value, String> {
     let action = required_string(arguments, "action")?;
     match action {
         "spawn" => {
+            let assignment = required_string(arguments, "task")?.to_string();
+            let execution_profile = experimental_profile();
             let receipt = broker
                 .spawn_worker(SpawnWorkerRequest {
                     operation_id: parse_operation_id(arguments)?,
                     workspace_id: workspace_id.clone(),
                     anchor_identity: caller_identity.clone(),
                     label: required_string(arguments, "label")?.to_string(),
-                    assignment: required_string(arguments, "task")?.to_string(),
-                    execution_profile: experimental_profile(),
+                    assignment: assignment.clone(),
+                    execution_profile: execution_profile.clone(),
                 })
                 .await
                 .map_err(broker_error)?;
+
+            let opening_message = prompt::bootstrap_message(
+                workspace_name,
+                &assignment,
+                &receipt,
+                &execution_profile,
+            );
+            let launch = managed_chat_broker
+                .enqueue(EnqueueManagedChatRequest {
+                    dedupe_key: format!("worker:{}:task:{}", receipt.worker_id, receipt.task_id),
+                    launch: ManagedChatLaunch {
+                        workspace_id: workspace_id.clone(),
+                        purpose: ManagedChatPurpose::Worker,
+                        execution_profile: execution_profile.clone(),
+                        opening_message,
+                        task_marker: format!("moondesk-worker-task:{}", receipt.task_id),
+                    },
+                })
+                .await
+                .map_err(|error| {
+                    format!("worker was persisted but browser launch was not accepted: {error}")
+                })?;
+
             Ok(json!({
                 "action": "spawn",
                 "familyId": receipt.family_id,
@@ -94,7 +124,8 @@ pub async fn handle(
                 "taskId": receipt.task_id,
                 "displayId": receipt.display_id,
                 "claimToken": receipt.claim_token,
-                "executionProfile": experimental_profile(),
+                "executionProfile": execution_profile,
+                "launchCommandId": launch.id,
                 "state": "provisioning"
             }))
         }

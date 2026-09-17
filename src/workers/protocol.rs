@@ -36,6 +36,15 @@ fn parse_message_id(arguments: &Value) -> Result<WorkerMessageId, String> {
     WorkerMessageId::parse(required_string(arguments, "message_id")?)
 }
 
+fn optional_u64(arguments: &Value, name: &str, default: u64) -> Result<u64, String> {
+    match arguments.get(name) {
+        Some(value) => value
+            .as_u64()
+            .ok_or_else(|| format!("Parameter {name} must be a non-negative integer")),
+        None => Ok(default),
+    }
+}
+
 fn blockers(arguments: &Value) -> Result<Vec<String>, String> {
     let Some(value) = arguments.get("blockers") else {
         return Ok(Vec::new());
@@ -222,7 +231,11 @@ pub async fn handle(
         }
         "collect" => {
             let updates = broker
-                .collect_updates(workspace_id, caller_identity)
+                .collect_updates_wait(
+                    workspace_id,
+                    caller_identity,
+                    optional_u64(arguments, "wait_ms", 0)?,
+                )
                 .await
                 .map_err(broker_error)?;
             Ok(json!({

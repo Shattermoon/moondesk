@@ -3734,4 +3734,146 @@ document.getElementById('upload').addEventListener('change',event=>{document.get
         let _ = std::fs::remove_dir_all(workspace_b_root);
         let _ = std::fs::remove_dir_all(config_root);
     }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "manual signed-in ChatGPT worker companion E2E host"]
+    async fn worker_companion_manual_e2e_host() {
+        use crate::managed_chat::types::ManagedChatCommandState;
+        use std::time::Duration;
+
+        let repo_root = std::env::current_dir().expect("resolve E2E repo root");
+        let runtime_root = repo_root.join("target").join("worker-companion-e2e");
+        if runtime_root.exists() {
+            std::fs::remove_dir_all(&runtime_root).expect("reset worker companion E2E runtime");
+        }
+        let workspace_root = runtime_root.join("workspace");
+        let config_root = runtime_root.join("config");
+        let config_path = config_root.join("config.toml");
+        std::fs::create_dir_all(&workspace_root).expect("create E2E workspace");
+        std::fs::create_dir_all(&config_root).expect("create E2E config root");
+
+        let app = AppState::new_for_test(
+            3211,
+            workspace_root.to_string_lossy().into_owned(),
+            config_path,
+        )
+        .expect("create E2E app state");
+        let pairing_token = app.companion_auth.pairing_token();
+        let workspace_id = app.workspaces[0].id.clone();
+        let managed_chat_broker = app.managed_chat_broker.clone();
+        let app_state = Arc::new(Mutex::new(app));
+        let (ui_tx, _ui_rx) = ui_event_channel();
+        let e2e_router = router(
+            app_state.clone(),
+            None,
+            CommandJobManager::new(),
+            ui_tx,
+            Arc::from("worker-companion-e2e-host-token"),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:3211")
+            .await
+            .expect("bind worker companion E2E server on 3211");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, e2e_router)
+                .await
+                .expect("serve worker companion E2E host");
+        });
+
+        println!("MOONDESK_WORKER_E2E_READY=http://127.0.0.1:3211");
+        println!("MOONDESK_WORKER_E2E_PAIRING_CODE={pairing_token}");
+        println!("MOONDESK_WORKER_E2E_WORKSPACE_ID={workspace_id}");
+        println!(
+            "MOONDESK_WORKER_E2E_CONTROLS={}",
+            runtime_root.to_string_lossy()
+        );
+        println!("Create `enqueue` after pairing/binding/profile selection; create `reuse` after launch #1 succeeds; create `stop` to exit.");
+
+        let first_marker = "moondesk-worker-e2e-first-20260917";
+        let second_marker = "moondesk-worker-e2e-reuse-20260917";
+        let thread_key = "worker:e2e-browser-thread";
+        let mut first_command_id: Option<crate::managed_chat::types::ManagedChatCommandId> = None;
+        let mut second_command_id: Option<crate::managed_chat::types::ManagedChatCommandId> = None;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30 * 60);
+
+        loop {
+            let snapshot = managed_chat_broker.snapshot().await;
+            let status = serde_json::json!({
+                "workspaceId": workspace_id,
+                "firstCommandId": first_command_id,
+                "secondCommandId": second_command_id,
+                "commands": snapshot.commands,
+            });
+            std::fs::write(
+                runtime_root.join("status.json"),
+                serde_json::to_vec_pretty(&status).expect("serialize E2E status"),
+            )
+            .expect("write E2E status");
+
+            if runtime_root.join("stop").exists() || tokio::time::Instant::now() >= deadline {
+                break;
+            }
+
+            if first_command_id.is_none() && runtime_root.join("enqueue").exists() {
+                let profile = app_state.lock().await.worker_execution_profile.clone();
+                let command = managed_chat_broker
+                    .enqueue(EnqueueManagedChatRequest {
+                        dedupe_key: "worker:e2e-browser-thread:task:first".into(),
+                        launch: ManagedChatLaunch {
+                            workspace_id: workspace_id.clone(),
+                            purpose: ManagedChatPurpose::Worker,
+                            execution_profile: profile,
+                            opening_message: format!(
+                                "MoonDesk Worker Companion signed-in browser E2E probe.\n\nMarker: {first_marker}\n\nDo not use tools and do not modify anything. Reply exactly: MoonDesk worker companion E2E first launch received."
+                            ),
+                            task_marker: first_marker.into(),
+                            thread_key: Some(thread_key.into()),
+                            open_mode: ManagedChatOpenMode::NewThread,
+                        },
+                    })
+                    .await
+                    .expect("enqueue first E2E launch");
+                println!("MOONDESK_WORKER_E2E_FIRST_COMMAND={}", command.id);
+                first_command_id = Some(command.id);
+                let _ = std::fs::remove_file(runtime_root.join("enqueue"));
+            }
+
+            if second_command_id.is_none() && runtime_root.join("reuse").exists() {
+                let first_succeeded = first_command_id.as_ref().is_some_and(|command_id| {
+                    snapshot
+                        .commands
+                        .get(command_id)
+                        .is_some_and(|command| command.state == ManagedChatCommandState::Succeeded)
+                });
+                if first_succeeded {
+                    let profile = app_state.lock().await.worker_execution_profile.clone();
+                    let command = managed_chat_broker
+                        .enqueue(EnqueueManagedChatRequest {
+                            dedupe_key: "worker:e2e-browser-thread:task:reuse".into(),
+                            launch: ManagedChatLaunch {
+                                workspace_id: workspace_id.clone(),
+                                purpose: ManagedChatPurpose::Worker,
+                                execution_profile: profile,
+                                opening_message: format!(
+                                    "MoonDesk Worker Companion reuse E2E probe.\n\nMarker: {second_marker}\n\nThis must be sent in the same existing ChatGPT conversation as the first probe. Do not use tools. Reply exactly: MoonDesk worker companion E2E reused thread received."
+                                ),
+                                task_marker: second_marker.into(),
+                                thread_key: Some(thread_key.into()),
+                                open_mode: ManagedChatOpenMode::ExistingThread,
+                            },
+                        })
+                        .await
+                        .expect("enqueue reused-thread E2E launch");
+                    println!("MOONDESK_WORKER_E2E_REUSE_COMMAND={}", command.id);
+                    second_command_id = Some(command.id);
+                    let _ = std::fs::remove_file(runtime_root.join("reuse"));
+                }
+            }
+
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+
+        server.abort();
+        let _ = server.await;
+        println!("MOONDESK_WORKER_E2E_STOPPED");
+    }
 }

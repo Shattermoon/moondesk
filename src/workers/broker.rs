@@ -15,7 +15,7 @@ use sha2::{Digest, Sha256};
 use std::fmt;
 use std::path::PathBuf;
 use subtle::ConstantTimeEq;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -109,6 +109,7 @@ pub struct CollectedUpdates {
 pub struct WorkerBroker {
     path: PathBuf,
     data: Mutex<WorkerStoreData>,
+    updates: Notify,
 }
 
 impl WorkerBroker {
@@ -118,6 +119,7 @@ impl WorkerBroker {
         Ok(Self {
             path,
             data: Mutex::new(data),
+            updates: Notify::new(),
         })
     }
 
@@ -390,6 +392,28 @@ impl WorkerBroker {
             .cloned())
     }
 
+    pub async fn purge_workspace(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<usize, WorkerBrokerError> {
+        let mut guard = self.data.lock().await;
+        let removed = guard
+            .families
+            .values()
+            .filter(|family| &family.workspace_id == workspace_id)
+            .count();
+        if removed == 0 {
+            return Ok(0);
+        }
+        let mut candidate = guard.clone();
+        candidate
+            .families
+            .retain(|_, family| &family.workspace_id != workspace_id);
+        self.commit_candidate(&mut guard, candidate).await?;
+        self.updates.notify_waiters();
+        Ok(removed)
+    }
+
     pub async fn claim_worker(
         &self,
         workspace_id: &WorkspaceId,
@@ -641,6 +665,7 @@ impl WorkerBroker {
             .report_requests
             .insert(request.operation_id, receipt.clone());
         self.commit_candidate(&mut guard, candidate).await?;
+        self.updates.notify_waiters();
         Ok(receipt)
     }
 
@@ -709,6 +734,45 @@ impl WorkerBroker {
         Ok(CollectedUpdates { reports, completed })
     }
 
+    pub async fn collect_updates_wait(
+        &self,
+        workspace_id: &WorkspaceId,
+        anchor_identity: &ChatIdentity,
+        wait_ms: u64,
+    ) -> Result<CollectedUpdates, WorkerBrokerError> {
+        const MAX_WAIT_MS: u64 = 60_000;
+        if wait_ms > MAX_WAIT_MS {
+            return Err(WorkerBrokerError::Invalid(format!(
+                "worker collect wait_ms cannot exceed {MAX_WAIT_MS}"
+            )));
+        }
+        if wait_ms == 0 {
+            return self.collect_updates(workspace_id, anchor_identity).await;
+        }
+
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(wait_ms);
+        loop {
+            // Register the waiter before inspecting durable state so a report/finish
+            // committed between the check and await cannot be missed.
+            let notified = self.updates.notified();
+            let updates = self.collect_updates(workspace_id, anchor_identity).await?;
+            if !updates.reports.is_empty() || !updates.completed.is_empty() {
+                return Ok(updates);
+            }
+
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return Ok(updates);
+            }
+            if tokio::time::timeout(deadline - now, notified).await.is_err() {
+                return Ok(CollectedUpdates {
+                    reports: Vec::new(),
+                    completed: Vec::new(),
+                });
+            }
+        }
+    }
+
     pub async fn finish_task(
         &self,
         request: FinishTaskRequest,
@@ -755,6 +819,7 @@ impl WorkerBroker {
         }
 
         self.commit_candidate(&mut guard, candidate).await?;
+        self.updates.notify_waiters();
         Ok(request.result)
     }
 
@@ -1155,6 +1220,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn purge_workspace_removes_only_owned_worker_families_and_is_idempotent() {
+        let root = temp_root("moondesk-worker-purge-workspace");
+        let path = root.join("worker-state-v1.json");
+        let broker = WorkerBroker::open(&path).expect("open worker broker");
+        let workspace_a = WorkspaceId::new();
+        let workspace_b = WorkspaceId::new();
+        let anchor_a = anchor("anchor-purge-a");
+        let anchor_b = anchor("anchor-purge-b");
+        broker
+            .spawn_worker(spawn_request(
+                OperationId::new(),
+                workspace_a.clone(),
+                anchor_a.clone(),
+                "keep workspace A",
+            ))
+            .await
+            .expect("spawn worker A");
+        broker
+            .spawn_worker(spawn_request(
+                OperationId::new(),
+                workspace_b.clone(),
+                anchor_b.clone(),
+                "purge workspace B",
+            ))
+            .await
+            .expect("spawn worker B");
+
+        assert_eq!(broker.purge_workspace(&workspace_b).await.expect("purge B"), 1);
+        assert_eq!(broker.purge_workspace(&workspace_b).await.expect("repeat purge B"), 0);
+        assert!(
+            broker
+                .family_for_anchor(&workspace_a, &anchor_a)
+                .await
+                .expect("read A")
+                .is_some()
+        );
+        assert!(
+            broker
+                .family_for_anchor(&workspace_b, &anchor_b)
+                .await
+                .expect("read B")
+                .is_none()
+        );
+        drop(broker);
+
+        let reopened = WorkerBroker::open(&path).expect("reopen worker broker");
+        assert!(
+            reopened
+                .family_for_anchor(&workspace_a, &anchor_a)
+                .await
+                .expect("read persisted A")
+                .is_some()
+        );
+        assert!(
+            reopened
+                .family_for_anchor(&workspace_b, &anchor_b)
+                .await
+                .expect("read persisted B")
+                .is_none()
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn wrong_workspace_cannot_address_worker() {
         let root = temp_root("moondesk-worker-workspace-isolation");
         let path = root.join("worker-state-v1.json");
@@ -1511,6 +1640,81 @@ mod tests {
             .expect("collect updates again");
         assert!(second.reports.is_empty());
         assert!(second.completed.is_empty());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn collect_wait_wakes_on_durable_report_without_polling() {
+        let root = temp_root("moondesk-worker-collect-wait");
+        let path = root.join("worker-state-v1.json");
+        let broker = std::sync::Arc::new(
+            WorkerBroker::open(&path).expect("open worker broker"),
+        );
+        let workspace = WorkspaceId::new();
+        let anchor_identity = anchor("anchor-collect-wait");
+        let worker_identity = anchor("worker-collect-wait");
+        let spawned = broker
+            .spawn_worker(spawn_request(
+                OperationId::new(),
+                workspace.clone(),
+                anchor_identity.clone(),
+                "wait for report",
+            ))
+            .await
+            .expect("spawn worker");
+        broker
+            .claim_worker(
+                &workspace,
+                &spawned.worker_id,
+                &spawned.task_id,
+                &spawned.claim_token,
+                worker_identity.clone(),
+            )
+            .await
+            .expect("claim worker");
+
+        let waiting_broker = broker.clone();
+        let waiting_workspace = workspace.clone();
+        let waiting_anchor = anchor_identity.clone();
+        let waiter = tokio::spawn(async move {
+            waiting_broker
+                .collect_updates_wait(&waiting_workspace, &waiting_anchor, 2_000)
+                .await
+        });
+        tokio::time::sleep(tokio::time::Duration::from_millis(25)).await;
+        broker
+            .report_worker(ReportWorkerRequest {
+                operation_id: OperationId::new(),
+                workspace_id: workspace.clone(),
+                worker_identity,
+                worker_id: spawned.worker_id,
+                task_id: spawned.task_id,
+                body: "wake the waiting Anchor".into(),
+            })
+            .await
+            .expect("store report");
+
+        let updates = tokio::time::timeout(tokio::time::Duration::from_secs(2), waiter)
+            .await
+            .expect("collect waiter should wake before timeout")
+            .expect("collect task should join")
+            .expect("collect updates");
+        assert_eq!(updates.reports.len(), 1);
+        assert_eq!(updates.reports[0].body, "wake the waiting Anchor");
+        assert!(updates.completed.is_empty());
+
+        let empty = broker
+            .collect_updates_wait(&workspace, &anchor_identity, 25)
+            .await
+            .expect("bounded empty wait");
+        assert!(empty.reports.is_empty());
+        assert!(empty.completed.is_empty());
+
+        let too_long = broker
+            .collect_updates_wait(&workspace, &anchor_identity, 60_001)
+            .await
+            .expect_err("oversized wait must fail");
+        assert!(matches!(too_long, WorkerBrokerError::Invalid(_)));
         let _ = std::fs::remove_dir_all(root);
     }
 

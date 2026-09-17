@@ -218,8 +218,13 @@ async function processCommand(state, offer) {
   const workspaceId = command?.launch?.workspaceId;
   const binding = state.bindings[workspaceId];
   if (!binding?.projectId || !binding?.sourceUrl) {
-    await ack(state, command, 'needs_reconcile');
-    state.blockedCommand = { commandId: command.id, workspaceId, reason: 'workspace_not_bound' };
+    await ack(state, command, 'failed', 'workspace_not_bound');
+    state.blockedCommand = {
+      commandId: command.id,
+      workspaceId,
+      reason: 'workspace_not_bound',
+      retryMode: offer.reconcileRequired ? 'none' : 'fresh'
+    };
     await writeState(state);
     return;
   }
@@ -323,8 +328,18 @@ async function pump() {
     const state = await readState();
     if (!state.credential) return;
     if (state.blockedCommand) {
-      const binding = state.bindings[state.blockedCommand.workspaceId];
-      if (state.blockedCommand.reason === 'workspace_not_bound' && binding?.projectId && binding?.sourceUrl) {
+      const blocked = state.blockedCommand;
+      const binding = state.bindings[blocked.workspaceId];
+      if (
+        blocked.reason === 'workspace_not_bound' &&
+        blocked.retryMode === 'fresh' &&
+        binding?.projectId &&
+        binding?.sourceUrl
+      ) {
+        await api(state, '/__moondesk/companion/v1/commands/retry', {
+          method: 'POST',
+          body: { commandId: blocked.commandId }
+        });
         state.blockedCommand = null;
         await writeState(state);
       } else {
@@ -407,7 +422,16 @@ async function bindProject({ workspaceId, context }) {
     projectUrl: context.projectUrl || null,
     boundAt: Date.now()
   };
-  if (state.blockedCommand?.workspaceId === workspaceId && state.blockedCommand.reason === 'workspace_not_bound') {
+  const blocked = state.blockedCommand;
+  if (
+    blocked?.workspaceId === workspaceId &&
+    blocked.reason === 'workspace_not_bound' &&
+    blocked.retryMode === 'fresh'
+  ) {
+    await api(state, '/__moondesk/companion/v1/commands/retry', {
+      method: 'POST',
+      body: { commandId: blocked.commandId }
+    });
     state.blockedCommand = null;
   }
   await writeState(state);

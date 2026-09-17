@@ -449,7 +449,7 @@ fn workers_tool_descriptor() -> Value {
     json!({
         "name": "workers",
         "title": "Coordinate workers",
-        "description": "Coordinate MoonDesk experimental workers for this exact workspace and ChatGPT conversation. The workspace is resolved from this connector; never pass or guess a workspace. Anchor actions are spawn, reuse, status, send, collect. Worker actions are claim, start, inbox, ack, report, finish. Reuse creates a new durable task on an idle claimed worker and wakes its existing ChatGPT conversation. Worker coordination requires exact ChatGPT session metadata and fails closed when that identity is unavailable. operation_id must be a stable UUID reused when retrying the same spawn/reuse/send/report after an ambiguous response.",
+        "description": "Coordinate MoonDesk experimental workers for this exact workspace and ChatGPT conversation. The workspace is resolved from this connector; never pass or guess a workspace. Anchor actions are spawn, reuse, status, send, collect. Worker actions are claim, start, inbox, ack, report, finish. Reuse creates a new durable task on an idle claimed worker and wakes its existing ChatGPT conversation. collect can wait up to 60 seconds for a report/completion so the Anchor does not need polling loops. Worker coordination requires exact ChatGPT session metadata and fails closed when that identity is unavailable. operation_id must be a stable UUID reused when retrying the same spawn/reuse/send/report after an ambiguous response.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -462,6 +462,7 @@ fn workers_tool_descriptor() -> Value {
                 "claim_token": { "type": "string", "description": "Single-use worker claim capability returned by spawn" },
                 "message_id": { "type": "string", "description": "Inbox message UUID to acknowledge" },
                 "message": { "type": "string", "minLength": 1, "description": "Message for send or progress report for report" },
+                "wait_ms": { "type": "integer", "minimum": 0, "maximum": 60000, "description": "For collect only: wait up to this many milliseconds for a new report or completed task instead of polling" },
                 "result": { "type": "string", "description": "Final worker result for finish" },
                 "changes": { "type": "string", "description": "Changes made by the worker for finish" },
                 "validation": { "type": "string", "description": "Validation performed by the worker for finish" },

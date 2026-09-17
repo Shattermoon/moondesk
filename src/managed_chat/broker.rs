@@ -4,6 +4,7 @@ use super::types::{
     ManagedChatLease, ManagedChatLeaseId, ManagedChatStoreData, ManagedChatTerminalResult,
 };
 use super::{DEFAULT_COMMAND_LEASE_MS, MAX_MANAGED_CHAT_COMMANDS, MAX_MANAGED_CHAT_DETAIL_BYTES};
+use crate::workspaces::WorkspaceId;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::fmt;
@@ -71,6 +72,31 @@ impl ManagedChatBroker {
     #[cfg(test)]
     pub async fn snapshot(&self) -> ManagedChatStoreData {
         self.data.lock().await.clone()
+    }
+
+    pub async fn purge_workspace(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<usize, ManagedChatError> {
+        let mut guard = self.data.lock().await;
+        let removed_ids = guard
+            .commands
+            .values()
+            .filter(|command| &command.launch.workspace_id == workspace_id)
+            .map(|command| command.id.clone())
+            .collect::<Vec<_>>();
+        if removed_ids.is_empty() {
+            return Ok(0);
+        }
+
+        let mut candidate = guard.clone();
+        for command_id in &removed_ids {
+            if let Some(command) = candidate.commands.remove(command_id) {
+                candidate.dedupe.remove(&command.dedupe_key);
+            }
+        }
+        self.commit_candidate(&mut guard, candidate).await?;
+        Ok(removed_ids.len())
     }
 
     pub async fn enqueue(
@@ -429,6 +455,52 @@ mod tests {
             .await
             .expect_err("changed input under same dedupe key must fail");
         assert!(matches!(conflict, ManagedChatError::Conflict(_)));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn purge_workspace_removes_only_owned_managed_chat_commands() {
+        let root = temp_root("moondesk-managed-chat-purge-workspace");
+        let path = root.join("state.json");
+        let broker = ManagedChatBroker::open(&path).expect("open broker");
+        let workspace_a = WorkspaceId::new();
+        let workspace_b = WorkspaceId::new();
+        let mut launch_a = launch("task-a");
+        launch_a.workspace_id = workspace_a.clone();
+        let mut launch_b = launch("task-b");
+        launch_b.workspace_id = workspace_b.clone();
+        let command_a = broker
+            .enqueue(EnqueueManagedChatRequest {
+                dedupe_key: "workspace-a-command".into(),
+                launch: launch_a,
+            })
+            .await
+            .expect("enqueue A");
+        broker
+            .enqueue(EnqueueManagedChatRequest {
+                dedupe_key: "workspace-b-command".into(),
+                launch: launch_b,
+            })
+            .await
+            .expect("enqueue B");
+
+        assert_eq!(broker.purge_workspace(&workspace_b).await.expect("purge B"), 1);
+        assert_eq!(broker.purge_workspace(&workspace_b).await.expect("repeat purge B"), 0);
+        let snapshot = broker.snapshot().await;
+        assert_eq!(snapshot.commands.len(), 1);
+        assert_eq!(snapshot.dedupe.len(), 1);
+        assert_eq!(snapshot.commands.get(&command_a.id), Some(&command_a));
+        assert_eq!(
+            snapshot.dedupe.get("workspace-a-command"),
+            Some(&command_a.id)
+        );
+        assert!(!snapshot.dedupe.contains_key("workspace-b-command"));
+        drop(broker);
+
+        let reopened = ManagedChatBroker::open(&path).expect("reopen broker");
+        let snapshot = reopened.snapshot().await;
+        assert_eq!(snapshot.commands.len(), 1);
+        assert_eq!(snapshot.commands.get(&command_a.id), Some(&command_a));
         let _ = std::fs::remove_dir_all(root);
     }
 

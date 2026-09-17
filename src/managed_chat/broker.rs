@@ -110,6 +110,7 @@ impl ManagedChatBroker {
             request_fingerprint: fingerprint,
             launch: request.launch,
             state: ManagedChatCommandState::Queued,
+            reconcile_history: false,
             lease: None,
             terminal: None,
         };
@@ -142,6 +143,7 @@ impl ManagedChatBroker {
                     .is_some_and(|lease| lease.expires_at_ms <= now_ms)
             {
                 command.state = ManagedChatCommandState::NeedsReconcile;
+                command.reconcile_history = true;
                 command.lease = None;
             }
         }
@@ -170,7 +172,8 @@ impl ManagedChatBroker {
             .commands
             .get_mut(&command_id)
             .ok_or(ManagedChatError::NotFound)?;
-        let reconcile_required = command.state == ManagedChatCommandState::NeedsReconcile;
+        let reconcile_required = command.reconcile_history
+            || command.state == ManagedChatCommandState::NeedsReconcile;
         let lease = ManagedChatLease {
             lease_id: ManagedChatLeaseId::new(),
             client_id: client_id.to_string(),
@@ -257,12 +260,59 @@ impl ManagedChatBroker {
             }
             ManagedChatAckOutcome::NeedsReconcile => {
                 command.state = ManagedChatCommandState::NeedsReconcile;
+                command.reconcile_history = true;
                 command.terminal = None;
             }
         }
         let acknowledged = command.clone();
         self.commit_candidate(&mut guard, candidate).await?;
         Ok(acknowledged)
+    }
+
+    pub async fn retry_failed(
+        &self,
+        command_id: &ManagedChatCommandId,
+    ) -> Result<ManagedChatCommand, ManagedChatError> {
+        let mut guard = self.data.lock().await;
+        let command = guard
+            .commands
+            .get(command_id)
+            .ok_or(ManagedChatError::NotFound)?;
+        if command.reconcile_history {
+            return Err(ManagedChatError::Conflict(
+                "managed chat command cannot be fresh-retried after send ambiguity; reconciliation is required"
+                    .into(),
+            ));
+        }
+        match command.state {
+            ManagedChatCommandState::Queued | ManagedChatCommandState::Leased => {
+                return Ok(command.clone());
+            }
+            ManagedChatCommandState::Failed => {}
+            ManagedChatCommandState::Succeeded => {
+                return Err(ManagedChatError::Conflict(
+                    "succeeded managed chat command cannot be retried".into(),
+                ));
+            }
+            ManagedChatCommandState::NeedsReconcile => {
+                return Err(ManagedChatError::Conflict(
+                    "managed chat command requires reconciliation and cannot be fresh-retried"
+                        .into(),
+                ));
+            }
+        }
+
+        let mut candidate = guard.clone();
+        let command = candidate
+            .commands
+            .get_mut(command_id)
+            .ok_or(ManagedChatError::NotFound)?;
+        command.state = ManagedChatCommandState::Queued;
+        command.lease = None;
+        command.terminal = None;
+        let retried = command.clone();
+        self.commit_candidate(&mut guard, candidate).await?;
+        Ok(retried)
     }
 
     async fn commit_candidate(
@@ -496,6 +546,119 @@ mod tests {
                 .expect("redeem after terminal")
                 .is_none()
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn failed_pre_send_command_can_retry_but_reconciled_command_cannot() {
+        let root = temp_root("moondesk-managed-chat-safe-retry");
+        let broker = ManagedChatBroker::open(root.join("state.json")).expect("open broker");
+
+        let pre_send = broker
+            .enqueue(EnqueueManagedChatRequest {
+                dedupe_key: "worker:one:task:pre-send-fail".into(),
+                launch: launch("task-pre-send-fail"),
+            })
+            .await
+            .expect("enqueue pre-send command");
+        let leased = broker
+            .redeem("extension-a", 100)
+            .await
+            .expect("redeem pre-send command")
+            .expect("leased pre-send command");
+        let lease_id = leased
+            .command
+            .lease
+            .as_ref()
+            .expect("pre-send lease")
+            .lease_id
+            .clone();
+        let failed = broker
+            .acknowledge(
+                &pre_send.id,
+                &lease_id,
+                "extension-a",
+                ManagedChatAckOutcome::Failed {
+                    details: Some("model_unavailable".into()),
+                },
+            )
+            .await
+            .expect("ack pre-send failure");
+        assert_eq!(failed.state, ManagedChatCommandState::Failed);
+        assert!(!failed.reconcile_history);
+
+        let retried = broker
+            .retry_failed(&pre_send.id)
+            .await
+            .expect("fresh retry pre-send failure");
+        assert_eq!(retried.state, ManagedChatCommandState::Queued);
+        assert!(retried.terminal.is_none());
+        let retry_offer = broker
+            .redeem("extension-a", 200)
+            .await
+            .expect("redeem retried command")
+            .expect("retried command offer");
+        assert!(!retry_offer.reconcile_required);
+
+        let ambiguous = broker
+            .enqueue(EnqueueManagedChatRequest {
+                dedupe_key: "worker:one:task:ambiguous".into(),
+                launch: launch("task-ambiguous"),
+            })
+            .await
+            .expect("enqueue ambiguous command");
+        let first = broker
+            .redeem("extension-a", 300)
+            .await
+            .expect("redeem ambiguous command")
+            .expect("ambiguous first lease");
+        let first_lease = first
+            .command
+            .lease
+            .as_ref()
+            .expect("ambiguous first lease")
+            .lease_id
+            .clone();
+        broker
+            .acknowledge(
+                &ambiguous.id,
+                &first_lease,
+                "extension-a",
+                ManagedChatAckOutcome::NeedsReconcile,
+            )
+            .await
+            .expect("mark ambiguous");
+        let reconcile = broker
+            .redeem("extension-a", 400)
+            .await
+            .expect("redeem reconciliation")
+            .expect("reconciliation lease");
+        assert!(reconcile.reconcile_required);
+        let reconcile_lease = reconcile
+            .command
+            .lease
+            .as_ref()
+            .expect("reconcile lease")
+            .lease_id
+            .clone();
+        let terminal_after_reconcile = broker
+            .acknowledge(
+                &ambiguous.id,
+                &reconcile_lease,
+                "extension-a",
+                ManagedChatAckOutcome::Failed {
+                    details: Some("reconcile_payload_invalid".into()),
+                },
+            )
+            .await
+            .expect("terminal failure after reconcile");
+        assert!(terminal_after_reconcile.reconcile_history);
+        let unsafe_retry = broker
+            .retry_failed(&ambiguous.id)
+            .await
+            .expect_err("fresh retry after ambiguity must fail");
+        assert!(matches!(unsafe_retry, ManagedChatError::Conflict(_)));
+
         let _ = std::fs::remove_dir_all(root);
     }
 

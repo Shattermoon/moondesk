@@ -202,6 +202,8 @@ pub struct ManagedChatCommand {
     pub request_fingerprint: String,
     pub launch: ManagedChatLaunch,
     pub state: ManagedChatCommandState,
+    #[serde(default)]
+    pub reconcile_history: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lease: Option<ManagedChatLease>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

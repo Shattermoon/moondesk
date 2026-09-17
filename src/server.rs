@@ -44,6 +44,7 @@ pub const COMPANION_WORKSPACES_ROUTE: &str = "/__moondesk/companion/v1/workspace
 pub const COMPANION_PROFILE_ROUTE: &str = "/__moondesk/companion/v1/profile";
 pub const COMPANION_REDEEM_ROUTE: &str = "/__moondesk/companion/v1/commands/redeem";
 pub const COMPANION_ACK_ROUTE: &str = "/__moondesk/companion/v1/commands/ack";
+pub const COMPANION_RETRY_ROUTE: &str = "/__moondesk/companion/v1/commands/retry";
 pub const COMPANION_TOKEN_HEADER: &str = "x-moondesk-companion-token";
 const MAX_COMPANION_BODY_BYTES: usize = 16 * 1024;
 
@@ -190,6 +191,10 @@ pub fn router(
             COMPANION_ACK_ROUTE,
             post(ack_companion_command).layer(DefaultBodyLimit::max(MAX_COMPANION_BODY_BYTES)),
         )
+        .route(
+            COMPANION_RETRY_ROUTE,
+            post(retry_companion_command).layer(DefaultBodyLimit::max(MAX_COMPANION_BODY_BYTES)),
+        )
         .merge(mcp_routes)
         .with_state(state)
 }
@@ -287,6 +292,12 @@ struct CompanionAckRequest {
     outcome: String,
     #[serde(default)]
     details: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CompanionRetryRequest {
+    command_id: String,
 }
 
 async fn pair_companion(
@@ -462,6 +473,28 @@ async fn ack_companion_command(
         .acknowledge(&command_id, &lease_id, &client_id, outcome)
         .await
     {
+        Ok(command) => json_response(StatusCode::OK, json!({ "command": command })),
+        Err(error) => managed_chat_error_response(error),
+    }
+}
+
+async fn retry_companion_command(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(request): Json<CompanionRetryRequest>,
+) -> Response<Body> {
+    if !companion_origin_allowed(&headers) {
+        return companion_origin_error();
+    }
+    if companion_client_id(&state, &headers).await.is_none() {
+        return companion_unauthorized();
+    }
+    let command_id = match ManagedChatCommandId::parse(&request.command_id) {
+        Ok(value) => value,
+        Err(error) => return json_response(StatusCode::BAD_REQUEST, json!({ "error": error })),
+    };
+    let broker = { state.app.lock().await.managed_chat_broker.clone() };
+    match broker.retry_failed(&command_id).await {
         Ok(command) => json_response(StatusCode::OK, json!({ "command": command })),
         Err(error) => managed_chat_error_response(error),
     }
@@ -1949,6 +1982,84 @@ mod tests {
         let empty_json: Value =
             serde_json::from_slice(&empty_body).expect("empty redeem response json");
         assert!(empty_json.get("command").is_some_and(Value::is_null));
+
+        let retryable = managed_chat_broker
+            .enqueue(EnqueueManagedChatRequest {
+                dedupe_key: "companion-http-retryable".into(),
+                launch: ManagedChatLaunch {
+                    workspace_id: workspace_id.clone(),
+                    purpose: ManagedChatPurpose::Worker,
+                    execution_profile: ChatExecutionProfile {
+                        model_key: "gpt-5.6-sol".into(),
+                        model_label: "GPT-5.6 Sol".into(),
+                        reasoning_effort: ReasoningEffort::High,
+                    },
+                    opening_message: "retryable worker bootstrap".into(),
+                    task_marker: "task-marker-http-retry".into(),
+                    thread_key: Some("worker:test-http-retry".into()),
+                    open_mode: ManagedChatOpenMode::NewThread,
+                },
+            })
+            .await
+            .expect("enqueue retryable companion command");
+        let retryable_offer = client
+            .post(&redeem_url)
+            .header(COMPANION_TOKEN_HEADER, &credential)
+            .send()
+            .await
+            .expect("redeem retryable command");
+        assert_eq!(retryable_offer.status(), StatusCode::OK);
+        let retryable_json = reqwest_response_json(retryable_offer).await;
+        let retryable_lease = retryable_json
+            .pointer("/command/lease/leaseId")
+            .and_then(Value::as_str)
+            .expect("retryable lease")
+            .to_string();
+        let failed_body = json!({
+            "commandId": retryable.id.to_string(),
+            "leaseId": retryable_lease,
+            "outcome": "failed",
+            "details": "model_unavailable"
+        });
+        let failed = client
+            .post(format!("http://{address}{COMPANION_ACK_ROUTE}"))
+            .header(COMPANION_TOKEN_HEADER, &credential)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(reqwest_json_body(&failed_body))
+            .send()
+            .await
+            .expect("ack retryable pre-send failure");
+        assert_eq!(failed.status(), StatusCode::OK);
+
+        let retry_body = json!({ "commandId": retryable.id.to_string() });
+        let retried = client
+            .post(format!("http://{address}{COMPANION_RETRY_ROUTE}"))
+            .header(COMPANION_TOKEN_HEADER, &credential)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(reqwest_json_body(&retry_body))
+            .send()
+            .await
+            .expect("retry failed pre-send command");
+        assert_eq!(retried.status(), StatusCode::OK);
+        let retried_json = reqwest_response_json(retried).await;
+        assert_eq!(
+            retried_json.pointer("/command/state").and_then(Value::as_str),
+            Some("queued")
+        );
+        let retry_offer = client
+            .post(&redeem_url)
+            .header(COMPANION_TOKEN_HEADER, &credential)
+            .send()
+            .await
+            .expect("redeem retried pre-send command");
+        assert_eq!(retry_offer.status(), StatusCode::OK);
+        let retry_offer_json = reqwest_response_json(retry_offer).await;
+        assert_eq!(
+            retry_offer_json
+                .get("reconcileRequired")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
 
         server.abort();
         let _ = server.await;

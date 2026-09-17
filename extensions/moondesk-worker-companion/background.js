@@ -233,7 +233,8 @@ async function processCommand(state, offer) {
       state.blockedCommand = {
         commandId: command.id,
         workspaceId,
-        reason: 'worker_thread_binding_missing'
+        reason: 'worker_thread_binding_missing',
+        retryMode: offer.reconcileRequired ? 'none' : 'fresh'
       };
       await writeState(state);
       return;
@@ -281,10 +282,16 @@ async function processCommand(state, offer) {
     return;
   }
   if (result.state === 'failed') {
+    const reason = result.reason || 'worker launch failed';
     record.phase = 'failed';
     await writeState(state);
-    await ack(state, command, 'failed', result.reason || 'worker launch failed');
-    state.blockedCommand = null;
+    await ack(state, command, 'failed', reason);
+    state.blockedCommand = {
+      commandId: command.id,
+      workspaceId,
+      reason,
+      retryMode: offer.reconcileRequired ? 'none' : 'fresh'
+    };
     await writeState(state);
     return;
   }
@@ -294,7 +301,12 @@ async function processCommand(state, offer) {
   await writeState(state);
   await ack(state, command, 'needs_reconcile');
   if (record.reconcileAttempts >= MAX_RECONCILE_ATTEMPTS) {
-    state.blockedCommand = { commandId: command.id, workspaceId, reason: result.reason || 'reconciliation_unconfirmed' };
+    state.blockedCommand = {
+      commandId: command.id,
+      workspaceId,
+      reason: result.reason || 'reconciliation_unconfirmed',
+      retryMode: 'reconcile'
+    };
     await writeState(state);
   }
 }
@@ -420,6 +432,17 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       case 'MOONDESK_BINDINGS': return currentBindings();
       case 'MOONDESK_RETRY_BLOCKED': return (async () => {
         const state = await readState();
+        const blocked = state.blockedCommand;
+        if (!blocked) return { ok: true };
+        if (blocked.retryMode === 'none') {
+          throw new Error('This worker launch crossed a possible Send boundary and cannot be fresh-retried. Reconciliation or manual inspection is required.');
+        }
+        if (blocked.retryMode === 'fresh') {
+          await api(state, '/__moondesk/companion/v1/commands/retry', {
+            method: 'POST',
+            body: { commandId: blocked.commandId }
+          });
+        }
         state.blockedCommand = null;
         await writeState(state);
         schedulePump(50);

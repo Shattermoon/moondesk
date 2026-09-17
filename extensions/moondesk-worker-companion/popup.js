@@ -152,7 +152,17 @@ async function render() {
 
   $('blocked').hidden = !status.blockedCommand;
   if (status.blockedCommand) {
+    const retryMode = status.blockedCommand.retryMode || 'reconcile';
     $('blockedText').textContent = `Worker launch ${status.blockedCommand.commandId} is paused: ${status.blockedCommand.reason}`;
+    $('retry').disabled = retryMode === 'none';
+    $('retry').textContent = retryMode === 'fresh'
+      ? 'Retry launch'
+      : retryMode === 'none'
+        ? 'Manual inspection required'
+        : 'Retry reconciliation';
+  } else {
+    $('retry').disabled = false;
+    $('retry').textContent = 'Retry reconciliation';
   }
 
   if (!connected) return;

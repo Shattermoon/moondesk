@@ -21,7 +21,7 @@ use crate::browser_runtime::{
 };
 use crate::command_jobs::CommandJobManager;
 use crate::managed_chat::broker::{ManagedChatAckOutcome, ManagedChatError};
-use crate::managed_chat::types::{ManagedChatCommandId, ManagedChatLeaseId};
+use crate::managed_chat::types::{ChatExecutionProfile, ManagedChatCommandId, ManagedChatLeaseId};
 use crate::mcp::{self, JsonRpcRequest};
 use crate::state::{
     AddWorkspaceError, CommandActivityState, FlowDirection, ServerUiEvent, SharedState,
@@ -41,6 +41,7 @@ pub const HOST_CONTROL_HEADER: &str = "x-moondesk-host-token";
 pub const COMPANION_PAIR_ROUTE: &str = "/__moondesk/companion/v1/pair";
 pub const COMPANION_STATUS_ROUTE: &str = "/__moondesk/companion/v1/status";
 pub const COMPANION_WORKSPACES_ROUTE: &str = "/__moondesk/companion/v1/workspaces";
+pub const COMPANION_PROFILE_ROUTE: &str = "/__moondesk/companion/v1/profile";
 pub const COMPANION_REDEEM_ROUTE: &str = "/__moondesk/companion/v1/commands/redeem";
 pub const COMPANION_ACK_ROUTE: &str = "/__moondesk/companion/v1/commands/ack";
 pub const COMPANION_TOKEN_HEADER: &str = "x-moondesk-companion-token";
@@ -175,6 +176,12 @@ pub fn router(
         )
         .route(COMPANION_STATUS_ROUTE, get(companion_status))
         .route(COMPANION_WORKSPACES_ROUTE, get(companion_workspaces))
+        .route(
+            COMPANION_PROFILE_ROUTE,
+            get(companion_profile)
+                .post(update_companion_profile)
+                .layer(DefaultBodyLimit::max(MAX_COMPANION_BODY_BYTES)),
+        )
         .route(
             COMPANION_REDEEM_ROUTE,
             post(redeem_companion_command).layer(DefaultBodyLimit::max(MAX_COMPANION_BODY_BYTES)),
@@ -341,6 +348,50 @@ async fn companion_workspaces(
             .collect::<Vec<_>>()
     };
     json_response(StatusCode::OK, json!({ "workspaces": workspaces }))
+}
+
+async fn companion_profile(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    if !companion_origin_allowed(&headers) {
+        return companion_origin_error();
+    }
+    if companion_client_id(&state, &headers).await.is_none() {
+        return companion_unauthorized();
+    }
+    let profile = { state.app.lock().await.worker_execution_profile.clone() };
+    json_response(StatusCode::OK, json!({ "profile": profile }))
+}
+
+async fn update_companion_profile(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(profile): Json<ChatExecutionProfile>,
+) -> Response<Body> {
+    if !companion_origin_allowed(&headers) {
+        return companion_origin_error();
+    }
+    if companion_client_id(&state, &headers).await.is_none() {
+        return companion_unauthorized();
+    }
+    if let Err(error) = profile.validate() {
+        return json_response(StatusCode::BAD_REQUEST, json!({ "error": error }));
+    }
+    {
+        let mut app = state.app.lock().await;
+        app.worker_execution_profile = profile.clone();
+        app.mark_config_dirty();
+        app.log(
+            "INFO",
+            format!(
+                "Worker execution profile: {} / {}",
+                profile.model_label,
+                profile.reasoning_effort.label()
+            ),
+        );
+    }
+    json_response(StatusCode::OK, json!({ "profile": profile }))
 }
 
 async fn redeem_companion_command(
@@ -1105,12 +1156,20 @@ async fn post_mcp(
     }
 
     let workspace_root = workspace.root.to_string_lossy().into_owned();
-    let (mode, tool_mode, set_moondesk_as_co_author, worker_broker, managed_chat_broker) = {
+    let (
+        mode,
+        tool_mode,
+        set_moondesk_as_co_author,
+        worker_execution_profile,
+        worker_broker,
+        managed_chat_broker,
+    ) = {
         let app = s.app.lock().await;
         (
             app.mode,
             app.tool_mode,
             app.set_moondesk_as_co_author,
+            app.worker_execution_profile.clone(),
             app.worker_broker.clone(),
             app.managed_chat_broker.clone(),
         )
@@ -1129,6 +1188,7 @@ async fn post_mcp(
             handoff_store_root: None,
             command_jobs: &s.command_jobs,
             browser_runtime: &s.browser_runtime,
+            worker_execution_profile,
             worker_broker,
             managed_chat_broker,
         },
@@ -1714,6 +1774,50 @@ mod tests {
                 .is_some_and(|items| items
                     .iter()
                     .any(|item| { item.get("workspaceId") == Some(&json!(workspace_id)) }))
+        );
+
+        let profile_url = format!("http://{address}{COMPANION_PROFILE_ROUTE}");
+        let initial_profile = client
+            .get(&profile_url)
+            .header(COMPANION_TOKEN_HEADER, &credential)
+            .send()
+            .await
+            .expect("read initial worker profile");
+        assert_eq!(initial_profile.status(), StatusCode::OK);
+        let initial_profile_json = reqwest_response_json(initial_profile).await;
+        assert_eq!(
+            initial_profile_json
+                .pointer("/profile/reasoningEffort")
+                .and_then(Value::as_str),
+            Some("high")
+        );
+
+        let replacement_profile = json!({
+            "modelKey": "gpt-5-6-thinking",
+            "modelLabel": "GPT-5.6 Sol",
+            "reasoningEffort": "extra_high"
+        });
+        let updated_profile = client
+            .post(&profile_url)
+            .header(COMPANION_TOKEN_HEADER, &credential)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(reqwest_json_body(&replacement_profile))
+            .send()
+            .await
+            .expect("update worker profile");
+        assert_eq!(updated_profile.status(), StatusCode::OK);
+        let updated_profile_json = reqwest_response_json(updated_profile).await;
+        assert_eq!(
+            updated_profile_json
+                .pointer("/profile/modelKey")
+                .and_then(Value::as_str),
+            Some("gpt-5-6-thinking")
+        );
+        assert_eq!(
+            updated_profile_json
+                .pointer("/profile/reasoningEffort")
+                .and_then(Value::as_str),
+            Some("extra_high")
         );
 
         let command = managed_chat_broker

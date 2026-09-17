@@ -107,7 +107,6 @@ impl ChatIdentity {
     }
 }
 
-pub use crate::managed_chat::types::ReasoningEffort;
 pub type WorkerExecutionProfile = crate::managed_chat::types::ChatExecutionProfile;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

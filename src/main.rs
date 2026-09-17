@@ -33,6 +33,7 @@ use crossterm::{
     },
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
+use managed_chat::types::ChatExecutionProfile;
 use mascot::{TUI_MASCOT_BLOCK_HEIGHT, TUI_MASCOT_BLOCK_WIDTH, render_tui_lines};
 use ratatui::{
     prelude::*,
@@ -4054,29 +4055,38 @@ async fn run_settings(
         let app = state.lock().await;
         themes.iter().position(|t| t.id == app.theme).unwrap_or(0)
     };
-    let total_rows = themes.len() + tool_modes.len() + browser_presentations.len() + 3;
+    let total_rows = themes.len() + tool_modes.len() + browser_presentations.len() + 5;
 
     loop {
         let (
             current_theme,
             current_tool_mode,
             current_browser_presentation,
+            worker_execution_profile,
             usage_totals,
             set_moondesk_as_co_author,
             ngrok_authtoken_configured,
             ngrok_domain,
+            companion_auth,
+            companion_pairing_code,
+            companion_local_url,
         ) = {
             let app = state.lock().await;
             (
                 app.current_theme(),
                 app.tool_mode,
                 app.browser_presentation,
+                app.worker_execution_profile.clone(),
                 app.all_time_usage_totals(),
                 app.set_moondesk_as_co_author,
                 app.ngrok_authtoken().is_some(),
                 app.ngrok_domain.clone(),
+                app.companion_auth.clone(),
+                app.companion_auth.pairing_token(),
+                format!("http://127.0.0.1:{}", app.port),
             )
         };
+        let companion_client_id = companion_auth.paired_client_id().await;
         terminal.draw(|f| {
             draw_settings(
                 f,
@@ -4084,6 +4094,10 @@ async fn run_settings(
                     current_theme,
                     current_tool_mode,
                     current_browser_presentation,
+                    worker_execution_profile: &worker_execution_profile,
+                    companion_pairing_code: &companion_pairing_code,
+                    companion_client_id: companion_client_id.as_deref(),
+                    companion_local_url: &companion_local_url,
                     set_moondesk_as_co_author,
                     ngrok_authtoken_configured,
                     ngrok_domain: ngrok_domain.as_deref(),
@@ -4155,6 +4169,37 @@ async fn run_settings(
                                 app.mark_config_dirty();
                             }
                         } else if selected_row == settings_action_start {
+                            let current_model = app.worker_execution_profile.model_label.clone();
+                            drop(app);
+                            if let Some(model) = run_prompt(
+                                terminal,
+                                current_theme.palette,
+                                "Worker ChatGPT model (must exactly match an available model):",
+                                &current_model,
+                            )
+                            .await?
+                            {
+                                let model = model.trim();
+                                if model.is_empty() || model.len() > 128 {
+                                    state.lock().await.log(
+                                        "WARN",
+                                        "Worker model must contain 1..=128 characters".into(),
+                                    );
+                                    continue;
+                                }
+                                let mut app = state.lock().await;
+                                app.worker_execution_profile.model_key = model.to_string();
+                                app.worker_execution_profile.model_label = model.to_string();
+                                app.log("INFO", format!("Worker model: {model}"));
+                                app.mark_config_dirty();
+                            }
+                        } else if selected_row == settings_action_start + 1 {
+                            app.worker_execution_profile.reasoning_effort =
+                                app.worker_execution_profile.reasoning_effort.next();
+                            let effort = app.worker_execution_profile.reasoning_effort;
+                            app.log("INFO", format!("Worker reasoning effort: {}", effort.label()));
+                            app.mark_config_dirty();
+                        } else if selected_row == settings_action_start + 2 {
                             app.set_moondesk_as_co_author = !app.set_moondesk_as_co_author;
                             let enabled = app.set_moondesk_as_co_author;
                             app.log(
@@ -4165,11 +4210,11 @@ async fn run_settings(
                                 ),
                             );
                             app.mark_config_dirty();
-                        } else if selected_row == settings_action_start + 1 {
+                        } else if selected_row == settings_action_start + 3 {
                             drop(app);
                             let _ =
                                 run_ngrok_auth_setup(terminal, state.clone(), None, true).await?;
-                        } else if selected_row == settings_action_start + 2 {
+                        } else if selected_row == settings_action_start + 4 {
                             let previous_domain = app.ngrok_domain.clone();
                             let current_domain = previous_domain.clone().unwrap_or_default();
                             drop(app);
@@ -4250,6 +4295,10 @@ struct SettingsView<'a> {
     current_theme: &'a theme::ThemeDef,
     current_tool_mode: ToolMode,
     current_browser_presentation: BrowserPresentation,
+    worker_execution_profile: &'a ChatExecutionProfile,
+    companion_pairing_code: &'a str,
+    companion_client_id: Option<&'a str>,
+    companion_local_url: &'a str,
     set_moondesk_as_co_author: bool,
     ngrok_authtoken_configured: bool,
     ngrok_domain: Option<&'a str>,
@@ -4264,6 +4313,10 @@ fn draw_settings(f: &mut Frame, view: SettingsView<'_>) {
         current_theme,
         current_tool_mode,
         current_browser_presentation,
+        worker_execution_profile,
+        companion_pairing_code,
+        companion_client_id,
+        companion_local_url,
         set_moondesk_as_co_author,
         ngrok_authtoken_configured,
         ngrok_domain,
@@ -4426,7 +4479,71 @@ fn draw_settings(f: &mut Frame, view: SettingsView<'_>) {
         )]));
     }
 
-    let co_author_row = themes.len() + tool_modes.len() + browser_presentations.len();
+    let worker_model_row = themes.len() + tool_modes.len() + browser_presentations.len();
+    let worker_effort_row = worker_model_row + 1;
+    let worker_model_selected = worker_model_row == selected_row;
+    let worker_effort_selected = worker_effort_row == selected_row;
+    let worker_model_style = if worker_model_selected {
+        Style::default().fg(palette.key_fg).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(palette.primary_fg)
+    };
+    let worker_effort_style = if worker_effort_selected {
+        Style::default().fg(palette.key_fg).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(palette.primary_fg)
+    };
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  Workers (experimental)",
+        Style::default().fg(palette.title_fg).add_modifier(Modifier::BOLD),
+    )));
+    if worker_model_selected {
+        selected_line_idx = lines.len();
+    }
+    lines.push(Line::from(Span::styled(
+        format!(
+            " {} [{}] Default model: {}",
+            if worker_model_selected { ">" } else { " " },
+            worker_model_row + 1,
+            worker_execution_profile.model_label
+        ),
+        worker_model_style,
+    )));
+    if worker_effort_selected {
+        selected_line_idx = lines.len();
+    }
+    lines.push(Line::from(Span::styled(
+        format!(
+            " {} [{}] Reasoning effort: {}",
+            if worker_effort_selected { ">" } else { " " },
+            worker_effort_row + 1,
+            worker_execution_profile.reasoning_effort.label()
+        ),
+        worker_effort_style,
+    )));
+    lines.push(Line::from(Span::styled(
+        format!(
+            "     Companion: {} · {}",
+            companion_client_id.map(|_| "paired").unwrap_or("not paired"),
+            companion_local_url
+        ),
+        Style::default().fg(if companion_client_id.is_some() {
+            palette.success_fg
+        } else {
+            palette.muted_fg
+        }),
+    )));
+    lines.push(Line::from(Span::styled(
+        format!("     Pairing code: {companion_pairing_code}"),
+        Style::default().fg(palette.muted_fg),
+    )));
+    lines.push(Line::from(Span::styled(
+        "     The companion verifies model + effort before it sends a worker assignment.",
+        Style::default().fg(palette.muted_fg),
+    )));
+
+    let co_author_row = worker_effort_row + 1;
     let co_author_selected = co_author_row == selected_row;
     let co_author_marker = if co_author_selected { ">" } else { " " };
     let co_author_name_style = if co_author_selected {
@@ -10064,6 +10181,10 @@ mod tests {
                             current_theme: theme,
                             current_tool_mode: tool_mode,
                             current_browser_presentation: super::BrowserPresentation::Headless,
+                            worker_execution_profile: &super::ChatExecutionProfile::default(),
+                            companion_pairing_code: "test-pairing-code",
+                            companion_client_id: None,
+                            companion_local_url: "http://127.0.0.1:3200",
                             set_moondesk_as_co_author: false,
                             ngrok_authtoken_configured: false,
                             ngrok_domain: None,
@@ -10095,6 +10216,10 @@ mod tests {
                         current_theme: theme,
                         current_tool_mode: tool_mode,
                         current_browser_presentation: super::BrowserPresentation::Visible,
+                        worker_execution_profile: &super::ChatExecutionProfile::default(),
+                        companion_pairing_code: "test-pairing-code",
+                        companion_client_id: None,
+                        companion_local_url: "http://127.0.0.1:3200",
                         set_moondesk_as_co_author: false,
                         ngrok_authtoken_configured: false,
                         ngrok_domain: None,
@@ -10142,6 +10267,10 @@ mod tests {
                         current_theme: theme,
                         current_tool_mode: tool_mode,
                         current_browser_presentation: super::BrowserPresentation::Headless,
+                        worker_execution_profile: &super::ChatExecutionProfile::default(),
+                        companion_pairing_code: "test-pairing-code",
+                        companion_client_id: None,
+                        companion_local_url: "http://127.0.0.1:3200",
                         set_moondesk_as_co_author: false,
                         ngrok_authtoken_configured: true,
                         ngrok_domain: Some("example.ngrok-free.app"),
@@ -10216,6 +10345,10 @@ mod tests {
                         current_theme: theme,
                         current_tool_mode: tool_mode,
                         current_browser_presentation: super::BrowserPresentation::Headless,
+                        worker_execution_profile: &super::ChatExecutionProfile::default(),
+                        companion_pairing_code: "test-pairing-code",
+                        companion_client_id: None,
+                        companion_local_url: "http://127.0.0.1:3200",
                         set_moondesk_as_co_author: false,
                         ngrok_authtoken_configured: false,
                         ngrok_domain: None,

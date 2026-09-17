@@ -1,0 +1,55 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>MoonDesk Worker Companion</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <main>
+    <h1>MoonDesk Workers</h1>
+    <p id="status" class="status">Checking…</p>
+
+    <section id="pairing">
+      <label>MoonDesk URL
+        <input id="baseUrl" value="http://127.0.0.1:3200" spellcheck="false" />
+      </label>
+      <label>Pairing code
+        <input id="pairingToken" type="password" autocomplete="off" spellcheck="false" />
+      </label>
+      <button id="pair">Pair companion</button>
+    </section>
+
+    <section id="binding" hidden>
+      <div id="projectContext" class="muted">Open a ChatGPT Project conversation.</div>
+      <label>MoonDesk workspace
+        <select id="workspace"></select>
+      </label>
+      <button id="bind">Bind this Project</button>
+      <div id="bindings" class="muted"></div>
+    </section>
+
+    <section id="profile" hidden>
+      <div id="currentProfile" class="muted">Worker profile unavailable.</div>
+      <button id="discoverModels">Discover available ChatGPT models</button>
+      <div id="catalogStatus" class="muted"></div>
+      <label id="modelLabel" hidden>Worker model
+        <select id="model"></select>
+      </label>
+      <label id="effortLabel" hidden>Reasoning effort
+        <select id="effort"></select>
+      </label>
+      <button id="saveProfile" hidden>Save worker profile</button>
+    </section>
+
+    <section id="blocked" hidden>
+      <p id="blockedText"></p>
+      <button id="retry">Retry reconciliation</button>
+    </section>
+
+    <p id="error" class="error"></p>
+  </main>
+  <script src="popup.js"></script>
+</body>
+</html>

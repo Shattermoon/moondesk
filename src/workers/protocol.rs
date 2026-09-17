@@ -4,8 +4,8 @@ use super::broker::{
 };
 use super::prompt;
 use super::types::{
-    ChatIdentity, OperationId, ReasoningEffort, TaskId, WorkerExecutionProfile, WorkerId,
-    WorkerMessageId, WorkerResult,
+    ChatIdentity, OperationId, TaskId, WorkerExecutionProfile, WorkerId, WorkerMessageId,
+    WorkerResult,
 };
 use crate::managed_chat::broker::{EnqueueManagedChatRequest, ManagedChatBroker};
 use crate::managed_chat::types::{ManagedChatLaunch, ManagedChatPurpose};
@@ -58,14 +58,6 @@ fn blockers(arguments: &Value) -> Result<Vec<String>, String> {
         .collect()
 }
 
-fn experimental_profile() -> WorkerExecutionProfile {
-    WorkerExecutionProfile {
-        model_key: "gpt-5.6-sol".into(),
-        model_label: "GPT-5.6 Sol".into(),
-        reasoning_effort: ReasoningEffort::High,
-    }
-}
-
 fn broker_error(error: WorkerBrokerError) -> String {
     error.to_string()
 }
@@ -75,6 +67,7 @@ pub async fn handle(
     workspace_id: &WorkspaceId,
     workspace_name: &str,
     caller_identity: &ChatIdentity,
+    execution_profile: &WorkerExecutionProfile,
     broker: &WorkerBroker,
     managed_chat_broker: &ManagedChatBroker,
 ) -> Result<Value, String> {
@@ -82,7 +75,7 @@ pub async fn handle(
     match action {
         "spawn" => {
             let assignment = required_string(arguments, "task")?.to_string();
-            let execution_profile = experimental_profile();
+            let execution_profile = execution_profile.clone();
             let receipt = broker
                 .spawn_worker(SpawnWorkerRequest {
                     operation_id: parse_operation_id(arguments)?,

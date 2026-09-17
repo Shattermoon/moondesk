@@ -19,7 +19,10 @@ use crate::command_jobs::{
     MAX_COMMAND_OUTPUT_READ_BYTES, MAX_JOB_TIMEOUT_MS, MAX_POLL_WAIT_MS,
 };
 use crate::handoff;
-use crate::managed_chat::broker::ManagedChatBroker;
+use crate::managed_chat::{
+    broker::ManagedChatBroker,
+    types::ChatExecutionProfile,
+};
 use crate::state::{
     AgentsPathMode, BrowserPresentation, Mode, ToolMode, load_app_config, user_home_dir,
 };
@@ -94,6 +97,7 @@ pub struct McpRequestContext<'a> {
     pub handoff_store_root: Option<&'a Path>,
     pub command_jobs: &'a CommandJobManager,
     pub browser_runtime: &'a Option<Arc<BrowserRuntime>>,
+    pub worker_execution_profile: ChatExecutionProfile,
     pub worker_broker: Arc<WorkerBroker>,
     pub managed_chat_broker: Arc<ManagedChatBroker>,
 }
@@ -860,6 +864,7 @@ async fn handle_tools_call(
             handoff_store_root: None,
             command_jobs,
             browser_runtime,
+            worker_execution_profile: ChatExecutionProfile::default(),
             worker_broker: test_worker_broker(),
             managed_chat_broker: test_managed_chat_broker(),
         },
@@ -954,6 +959,7 @@ async fn handle_tools_call_for_workspace(
         handoff_store_root,
         command_jobs,
         browser_runtime,
+        worker_execution_profile,
         worker_broker,
         managed_chat_broker,
     } = context;
@@ -1059,6 +1065,7 @@ async fn handle_tools_call_for_workspace(
             workspace_id,
             workspace_name,
             &caller_identity,
+            &worker_execution_profile,
             worker_broker.as_ref(),
             managed_chat_broker.as_ref(),
         )
@@ -3787,6 +3794,7 @@ mod tests {
                 handoff_store_root: None,
                 command_jobs: &command_jobs,
                 browser_runtime: &browser_runtime,
+                worker_execution_profile: ChatExecutionProfile::default(),
                 worker_broker,
                 managed_chat_broker,
             },
@@ -4950,6 +4958,7 @@ mod tests {
                 handoff_store_root: Some(&handoff_store_root),
                 command_jobs: &command_jobs,
                 browser_runtime: &None,
+                worker_execution_profile: ChatExecutionProfile::default(),
                 worker_broker: test_worker_broker(),
                 managed_chat_broker: test_managed_chat_broker(),
             },
@@ -4996,6 +5005,7 @@ mod tests {
                 handoff_store_root: Some(&handoff_store_root),
                 command_jobs: &command_jobs,
                 browser_runtime: &None,
+                worker_execution_profile: ChatExecutionProfile::default(),
                 worker_broker: test_worker_broker(),
                 managed_chat_broker: test_managed_chat_broker(),
             },
@@ -5030,6 +5040,7 @@ mod tests {
                 handoff_store_root: Some(&handoff_store_root),
                 command_jobs: &command_jobs,
                 browser_runtime: &None,
+                worker_execution_profile: ChatExecutionProfile::default(),
                 worker_broker: test_worker_broker(),
                 managed_chat_broker: test_managed_chat_broker(),
             },
@@ -5061,6 +5072,7 @@ mod tests {
                 handoff_store_root: Some(&handoff_store_root),
                 command_jobs: &command_jobs,
                 browser_runtime: &None,
+                worker_execution_profile: ChatExecutionProfile::default(),
                 worker_broker: test_worker_broker(),
                 managed_chat_broker: test_managed_chat_broker(),
             },
@@ -5100,6 +5112,7 @@ mod tests {
                 handoff_store_root: Some(&handoff_store_root),
                 command_jobs: &command_jobs,
                 browser_runtime: &None,
+                worker_execution_profile: ChatExecutionProfile::default(),
                 worker_broker: test_worker_broker(),
                 managed_chat_broker: test_managed_chat_broker(),
             },
@@ -5128,6 +5141,7 @@ mod tests {
                 handoff_store_root: Some(&handoff_store_root),
                 command_jobs: &command_jobs,
                 browser_runtime: &None,
+                worker_execution_profile: ChatExecutionProfile::default(),
                 worker_broker: test_worker_broker(),
                 managed_chat_broker: test_managed_chat_broker(),
             },
@@ -5155,6 +5169,7 @@ mod tests {
                 handoff_store_root: Some(&handoff_store_root),
                 command_jobs: &command_jobs,
                 browser_runtime: &None,
+                worker_execution_profile: ChatExecutionProfile::default(),
                 worker_broker: test_worker_broker(),
                 managed_chat_broker: test_managed_chat_broker(),
             },

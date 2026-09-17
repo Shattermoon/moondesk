@@ -146,6 +146,10 @@ impl CompanionAuth {
         })
     }
 
+    pub async fn paired_client_id(&self) -> Option<String> {
+        self.state.lock().await.client_id.clone()
+    }
+
     pub async fn authorize(&self, credential: &str) -> Option<String> {
         let guard = self.state.lock().await;
         let expected = guard.credential_hash.as_deref()?;

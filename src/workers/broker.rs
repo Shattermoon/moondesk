@@ -691,8 +691,8 @@ fn find_family_for_worker(
 
 #[cfg(test)]
 mod tests {
-    use super::super::types::ReasoningEffort;
     use super::*;
+    use crate::managed_chat::types::ReasoningEffort;
     use uuid::Uuid;
 
     fn temp_root(name: &str) -> PathBuf {

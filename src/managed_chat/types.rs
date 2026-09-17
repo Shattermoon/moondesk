@@ -61,12 +61,44 @@ pub enum ReasoningEffort {
     ExtraHigh,
 }
 
+impl ReasoningEffort {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Instant => "Instant",
+            Self::Low => "Low",
+            Self::Medium => "Medium",
+            Self::High => "High",
+            Self::ExtraHigh => "Extra High",
+        }
+    }
+
+    pub const fn next(self) -> Self {
+        match self {
+            Self::Instant => Self::Low,
+            Self::Low => Self::Medium,
+            Self::Medium => Self::High,
+            Self::High => Self::ExtraHigh,
+            Self::ExtraHigh => Self::Instant,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChatExecutionProfile {
     pub model_key: String,
     pub model_label: String,
     pub reasoning_effort: ReasoningEffort,
+}
+
+impl Default for ChatExecutionProfile {
+    fn default() -> Self {
+        Self {
+            model_key: "gpt-5.6-sol".into(),
+            model_label: "GPT-5.6 Sol".into(),
+            reasoning_effort: ReasoningEffort::High,
+        }
+    }
 }
 
 impl ChatExecutionProfile {

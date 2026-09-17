@@ -13,7 +13,9 @@ use uuid::Uuid;
 
 use crate::command_jobs::CommandJobManager;
 use crate::companion::CompanionAuth;
-use crate::managed_chat::{self, broker::ManagedChatBroker};
+use crate::managed_chat::{
+    self, broker::ManagedChatBroker, types::ChatExecutionProfile,
+};
 use crate::mascot::{self, MascotPack};
 use crate::theme;
 use crate::workers::{self, broker::WorkerBroker};
@@ -184,6 +186,8 @@ pub struct AppConfig {
     #[serde(default)]
     pub browser_presentation: BrowserPresentation,
     #[serde(default)]
+    pub worker_execution_profile: ChatExecutionProfile,
+    #[serde(default)]
     pub usage_by_model: BTreeMap<String, UsageTotals>,
 }
 
@@ -201,6 +205,7 @@ impl Default for AppConfig {
             mode: Mode::Both,
             tool_mode: ToolMode::MultiTools,
             browser_presentation: BrowserPresentation::Headless,
+            worker_execution_profile: ChatExecutionProfile::default(),
             usage_by_model: BTreeMap::new(),
         }
     }
@@ -227,6 +232,9 @@ impl AppConfig {
     }
 
     fn validate_versioned(&self) -> std::io::Result<()> {
+        self.worker_execution_profile
+            .validate()
+            .map_err(std::io::Error::other)?;
         match self.config_version {
             0 => {
                 if !self.workspaces.is_empty() {
@@ -988,6 +996,7 @@ pub struct AppState {
     pub usage_by_model: BTreeMap<String, UsageTotals>,
     pub session_usage_totals: UsageTotals,
     pub command_jobs: CommandJobManager,
+    pub worker_execution_profile: ChatExecutionProfile,
     pub worker_broker: Arc<WorkerBroker>,
     pub managed_chat_broker: Arc<ManagedChatBroker>,
     pub companion_auth: Arc<CompanionAuth>,
@@ -1611,6 +1620,7 @@ impl AppState {
             usage_by_model: config.usage_by_model,
             session_usage_totals: UsageTotals::default(),
             command_jobs: CommandJobManager::new(),
+            worker_execution_profile: config.worker_execution_profile,
             worker_broker,
             managed_chat_broker,
             companion_auth,
@@ -1822,6 +1832,7 @@ impl AppState {
             mode: self.mode,
             tool_mode: self.tool_mode,
             browser_presentation: self.browser_presentation,
+            worker_execution_profile: self.worker_execution_profile.clone(),
             usage_by_model: self.usage_by_model.clone(),
         }
         .normalized()

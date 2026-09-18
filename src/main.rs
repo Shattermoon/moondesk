@@ -8501,6 +8501,9 @@ mod tests {
         let tunnel_task = tokio::spawn(async {
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
         });
+        let companion_task = tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        });
         {
             let mut app = state.lock().await;
             app.server_running = true;
@@ -8508,6 +8511,8 @@ mod tests {
             app.ngrok_url = Some("https://test.ngrok.app".into());
             app.remote_connected = true;
             app.ngrok_task = Some(tunnel_task);
+            app.companion_bridge_port = Some(crate::server::COMPANION_BRIDGE_PORTS[0]);
+            app.companion_server_handle = Some(companion_task);
         }
 
         handle_mcp_server_exit(state.clone(), Ok(())).await;
@@ -8519,6 +8524,8 @@ mod tests {
             assert!(app.ngrok_url.is_none());
             assert!(!app.remote_connected);
             assert!(app.ngrok_task.is_none());
+            assert!(app.companion_bridge_port.is_none());
+            assert!(app.companion_server_handle.is_none());
             assert!(app.logs.iter().any(|entry| {
                 entry
                     .message

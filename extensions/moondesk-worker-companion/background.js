@@ -124,14 +124,14 @@ async function discoverBridge(state) {
   const candidates = preferred
     ? [preferred, ...BRIDGE_PORTS.map((port) => `http://127.0.0.1:${port}`).filter((url) => url !== preferred)]
     : BRIDGE_PORTS.map((port) => `http://127.0.0.1:${port}`);
-  for (const baseUrl of candidates) {
-    const discovered = await hello(baseUrl);
-    if (!discovered) continue;
-    if (state.baseUrl !== baseUrl) {
-      state.baseUrl = baseUrl;
+  const probes = await Promise.all(candidates.map(async (baseUrl) => ({ baseUrl, hello: await hello(baseUrl) })));
+  const match = probes.find((probe) => probe.hello);
+  if (match) {
+    if (state.baseUrl !== match.baseUrl) {
+      state.baseUrl = match.baseUrl;
       await writeState(state);
     }
-    return discovered;
+    return match.hello;
   }
   throw requestError('MoonDesk companion bridge was not found on this computer', 0, 'bridge_not_found');
 }

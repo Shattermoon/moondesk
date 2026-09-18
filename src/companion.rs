@@ -464,6 +464,8 @@ mod tests {
             .await
             .expect("auto pair retry is idempotent");
         assert_eq!(retry, first);
+        let persisted = fs::read_to_string(&path).expect("read persisted companion auth");
+        assert!(!persisted.contains(&credential));
 
         let wrong_credential = auth
             .auto_pair("extension-install-a", &"b".repeat(64))
@@ -486,6 +488,11 @@ mod tests {
             reopened.authorize(&credential).await.as_deref(),
             Some("extension-install-a")
         );
+        let after_restart = reopened
+            .auto_pair("extension-install-a", &credential)
+            .await
+            .expect("auto pair remains idempotent after restart");
+        assert_eq!(after_restart, first);
         let _ = fs::remove_dir_all(root);
     }
 

@@ -283,9 +283,14 @@
           toggles[0].click();
         }
         const option = await waitFor(() => {
-          const rows = versionRows().filter(
-            (node) => node.textContent.trim() === versionLabel && node.getAttribute('aria-disabled') !== 'true'
-          );
+          const rows = versionRows().filter((node) => {
+            if (node.getAttribute('aria-disabled') === 'true') return false;
+            const exactLabel = compact(node.textContent) === versionLabel ||
+              [...node.querySelectorAll('*')].some(
+                (child) => child.children.length === 0 && compact(child.textContent) === versionLabel
+              );
+            return exactLabel;
+          });
           return rows.length === 1 ? rows[0] : null;
         }, 3500);
         if (!key(option, 'Enter')) return null;
@@ -364,55 +369,90 @@
       : null;
   }
 
+  async function restoreModelPicker(ui, original) {
+    const version = await ui.version(original.version);
+    if (!version) return false;
+    const state = await ui.bucket(original.currentBucket);
+    const previous = original.choices.find((choice) => choice.bucket === original.currentBucket);
+    const selected = state?.choices.find((choice) => choice.bucket === state.currentBucket);
+    return Boolean(
+      previous &&
+      selected?.id === previous.id &&
+      selected?.effort === previous.effort
+    );
+  }
+
   async function inspectModelSettings() {
     const ui = modelPickerAccess();
-    const original = await ui.open();
+    let original = await ui.open();
     if (!original) {
       ui.close();
-      return null;
+      await sleep(200);
+      original = await ui.open();
+      if (!original) {
+        ui.close();
+        return null;
+      }
     }
 
-    const result = new Map();
-    let discoveryOk = true;
-    let restored = false;
-    try {
-      for (const version of original.versions) {
-        const state = await ui.version(version.id);
-        if (!state) {
-          discoveryOk = false;
-          break;
-        }
-        for (const choice of state.choices.filter((entry) => entry.available)) {
-          const existing = result.get(choice.familyId) || {
-            id: choice.familyId,
-            label: choice.familyLabel,
-            efforts: [],
-            aliases: [],
-            choices: []
-          };
-          if (!existing.efforts.includes(choice.effort)) existing.efforts.push(choice.effort);
-          if (!existing.aliases.includes(choice.id)) existing.aliases.push(choice.id);
-          if (!existing.choices.some((entry) => entry.id === choice.id && entry.effort === choice.effort)) {
-            existing.choices.push({ id: choice.id, effort: choice.effort });
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const result = new Map();
+      let discoveryOk = true;
+      let restored = false;
+      try {
+        for (const version of original.versions) {
+          const state = await ui.version(version.id);
+          if (!state) {
+            discoveryOk = false;
+            break;
           }
-          result.set(choice.familyId, existing);
+          for (const choice of state.choices.filter((entry) => entry.available)) {
+            const existing = result.get(choice.familyId) || {
+              id: choice.familyId,
+              label: choice.familyLabel,
+              efforts: [],
+              aliases: [],
+              choices: []
+            };
+            if (!existing.efforts.includes(choice.effort)) existing.efforts.push(choice.effort);
+            if (!existing.aliases.includes(choice.id)) existing.aliases.push(choice.id);
+            if (!existing.choices.some((entry) => entry.id === choice.id && entry.effort === choice.effort)) {
+              existing.choices.push({ id: choice.id, effort: choice.effort });
+            }
+            result.set(choice.familyId, existing);
+          }
         }
+      } finally {
+        restored = await restoreModelPicker(ui, original);
+        ui.close();
       }
-    } finally {
-      const version = await ui.version(original.version);
-      if (version) {
-        const state = await ui.bucket(original.currentBucket);
-        const previous = original.choices.find((choice) => choice.bucket === original.currentBucket);
-        const selected = state?.choices.find((choice) => choice.bucket === state.currentBucket);
-        restored = Boolean(
-          previous &&
-          selected?.id === previous.id &&
-          selected?.effort === previous.effort
-        );
+
+      if (discoveryOk && restored && result.size) return [...result.values()];
+      if (!restored || attempt === 1) return null;
+
+      // A discovery pass can race ChatGPT's picker hydration immediately after the
+      // popup opens. Retry once only after the exact original selection was restored.
+      await sleep(200);
+      const reopened = await ui.open();
+      if (!reopened) {
+        ui.close();
+        return null;
       }
-      ui.close();
+      const previous = original.choices.find((choice) => choice.bucket === original.currentBucket);
+      const selected = reopened.choices.find((choice) => choice.bucket === reopened.currentBucket);
+      if (
+        reopened.version !== original.version ||
+        reopened.currentBucket !== original.currentBucket ||
+        !previous ||
+        selected?.id !== previous.id ||
+        selected?.effort !== previous.effort
+      ) {
+        await restoreModelPicker(ui, original);
+        ui.close();
+        return null;
+      }
     }
-    return discoveryOk && restored && result.size ? [...result.values()] : null;
+    return null;
   }
 
   async function selectModelSettings(profile) {

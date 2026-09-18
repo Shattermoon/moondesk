@@ -1,4 +1,5 @@
 const $ = (id) => document.getElementById(id);
+const MODEL_CATALOG_STORAGE_KEY = 'moondeskWorkerModelCatalogV1';
 let currentContext = null;
 let workspaceList = [];
 let modelCatalog = [];
@@ -65,6 +66,25 @@ async function currentModelCatalog() {
     throw new Error(response?.error || 'Could not confirm ChatGPT model catalog');
   }
   return response.catalog;
+}
+
+async function loadCachedModelCatalog() {
+  try {
+    const stored = await chrome.storage.local.get(MODEL_CATALOG_STORAGE_KEY);
+    const cached = stored[MODEL_CATALOG_STORAGE_KEY];
+    return Array.isArray(cached?.catalog) ? cached.catalog : [];
+  } catch {
+    return [];
+  }
+}
+
+async function saveCachedModelCatalog(catalog) {
+  await chrome.storage.local.set({
+    [MODEL_CATALOG_STORAGE_KEY]: {
+      catalog,
+      updatedAt: Date.now()
+    }
+  });
 }
 
 function showError(error) {
@@ -168,6 +188,7 @@ async function render() {
   if (!connected) return;
   workspaceList = await bg({ type: 'MOONDESK_WORKSPACES' });
   currentProfile = await bg({ type: 'MOONDESK_PROFILE' });
+  modelCatalog = await loadCachedModelCatalog();
   $('currentProfile').textContent = profileText(currentProfile);
 
   const select = $('workspace');
@@ -231,10 +252,15 @@ $('discoverModels').addEventListener('click', async () => {
   $('catalogStatus').textContent = 'Inspecting ChatGPT model picker…';
   try {
     modelCatalog = await currentModelCatalog();
+    await saveCachedModelCatalog(modelCatalog);
     renderCatalog();
   } catch (error) {
-    modelCatalog = [];
-    $('catalogStatus').textContent = '';
+    if (modelCatalog.length) {
+      renderCatalog();
+      $('catalogStatus').textContent = 'Using the last confirmed model catalog; refresh failed.';
+    } else {
+      $('catalogStatus').textContent = '';
+    }
     showError(error);
   } finally {
     button.disabled = false;

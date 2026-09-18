@@ -998,8 +998,10 @@ pub struct AppState {
     pub worker_broker: Arc<WorkerBroker>,
     pub managed_chat_broker: Arc<ManagedChatBroker>,
     pub companion_auth: Arc<CompanionAuth>,
+    pub companion_bridge_port: Option<u16>,
     config_path: PathBuf,
     pub server_handle: Option<tokio::task::JoinHandle<()>>,
+    pub companion_server_handle: Option<tokio::task::JoinHandle<()>>,
     pub ngrok_task: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -1622,8 +1624,10 @@ impl AppState {
             worker_broker,
             managed_chat_broker,
             companion_auth,
+            companion_bridge_port: None,
             config_path,
             server_handle: None,
+            companion_server_handle: None,
             ngrok_task: None,
         };
         app.log("INFO", format!("ClippyMoon seed: {mascot_seed:016x}"));

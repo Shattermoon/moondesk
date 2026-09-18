@@ -73,6 +73,23 @@ pub struct CompanionPairReceipt {
     pub credential: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CompanionAutoPairError {
+    Invalid(String),
+    Conflict(String),
+    Storage(String),
+}
+
+impl std::fmt::Display for CompanionAutoPairError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Invalid(message) | Self::Conflict(message) | Self::Storage(message) => {
+                formatter.write_str(message)
+            }
+        }
+    }
+}
+
 pub struct CompanionAuth {
     path: PathBuf,
     state: Mutex<CompanionAuthState>,
@@ -146,6 +163,68 @@ impl CompanionAuth {
         })
     }
 
+    pub async fn auto_pair(
+        &self,
+        client_id: &str,
+        credential: &str,
+    ) -> Result<CompanionPairReceipt, CompanionAutoPairError> {
+        validate_client_id(client_id).map_err(CompanionAutoPairError::Invalid)?;
+        validate_credential(credential).map_err(CompanionAutoPairError::Invalid)?;
+
+        let actual_hash = secret_hash(credential);
+        let mut guard = self.state.lock().await;
+        if let Some(existing_client_id) = guard.client_id.as_deref() {
+            if existing_client_id != client_id {
+                return Err(CompanionAutoPairError::Conflict(
+                    "MoonDesk companion is already paired to another browser installation".into(),
+                ));
+            }
+            let Some(expected_hash) = guard.credential_hash.as_deref() else {
+                return Err(CompanionAutoPairError::Conflict(
+                    "MoonDesk companion credential binding is incomplete".into(),
+                ));
+            };
+            if !constant_time_equal(expected_hash.as_bytes(), actual_hash.as_bytes()) {
+                return Err(CompanionAutoPairError::Conflict(
+                    "MoonDesk companion credential no longer matches this browser installation"
+                        .into(),
+                ));
+            }
+            return Ok(CompanionPairReceipt {
+                client_id: client_id.to_string(),
+                credential: credential.to_string(),
+            });
+        }
+
+        let mut candidate = guard.clone();
+        candidate.credential_hash = Some(actual_hash);
+        candidate.client_id = Some(client_id.to_string());
+        candidate
+            .validate()
+            .map_err(CompanionAutoPairError::Invalid)?;
+
+        let path = self.path.clone();
+        let persisted = candidate.clone();
+        tokio::task::spawn_blocking(move || save_state(&path, &persisted))
+            .await
+            .map_err(|error| {
+                CompanionAutoPairError::Storage(format!(
+                    "companion auth persistence task failed: {error}"
+                ))
+            })?
+            .map_err(|error| {
+                CompanionAutoPairError::Storage(format!(
+                    "failed to persist companion auth: {error}"
+                ))
+            })?;
+        *guard = candidate;
+
+        Ok(CompanionPairReceipt {
+            client_id: client_id.to_string(),
+            credential: credential.to_string(),
+        })
+    }
+
     pub async fn paired_client_id(&self) -> Option<String> {
         self.state.lock().await.client_id.clone()
     }
@@ -166,6 +245,13 @@ fn validate_client_id(client_id: &str) -> Result<(), String> {
         return Err(format!(
             "companion client id must contain 1..={MAX_COMPANION_CLIENT_ID_BYTES} bytes"
         ));
+    }
+    Ok(())
+}
+
+fn validate_credential(credential: &str) -> Result<(), String> {
+    if credential.len() != 64 || !credential.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("companion credential must be exactly 64 hexadecimal characters".into());
     }
     Ok(())
 }
@@ -350,6 +436,54 @@ mod tests {
         let reopened = CompanionAuth::open(&path).expect("reopen companion auth");
         assert_eq!(
             reopened.authorize(&receipt.credential).await.as_deref(),
+            Some("extension-install-a")
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn automatic_pairing_is_idempotent_for_one_installation_and_rejects_takeover() {
+        let root = temp_root("moondesk-companion-auto-pair");
+        let path = root.join(COMPANION_AUTH_FILE_NAME);
+        let auth = CompanionAuth::open(&path).expect("open companion auth");
+        let credential = "a".repeat(64);
+
+        let first = auth
+            .auto_pair("extension-install-a", &credential)
+            .await
+            .expect("auto pair companion");
+        assert_eq!(first.client_id, "extension-install-a");
+        assert_eq!(first.credential, credential);
+        assert_eq!(
+            auth.authorize(&credential).await.as_deref(),
+            Some("extension-install-a")
+        );
+
+        let retry = auth
+            .auto_pair("extension-install-a", &credential)
+            .await
+            .expect("auto pair retry is idempotent");
+        assert_eq!(retry, first);
+
+        let wrong_credential = auth
+            .auto_pair("extension-install-a", &"b".repeat(64))
+            .await
+            .expect_err("same install cannot silently rotate credential");
+        assert!(matches!(
+            wrong_credential,
+            CompanionAutoPairError::Conflict(_)
+        ));
+
+        let takeover = auth
+            .auto_pair("extension-install-b", &"c".repeat(64))
+            .await
+            .expect_err("different install cannot silently take over");
+        assert!(matches!(takeover, CompanionAutoPairError::Conflict(_)));
+
+        drop(auth);
+        let reopened = CompanionAuth::open(&path).expect("reopen companion auth");
+        assert_eq!(
+            reopened.authorize(&credential).await.as_deref(),
             Some("extension-install-a")
         );
         let _ = fs::remove_dir_all(root);

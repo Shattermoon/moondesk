@@ -20,6 +20,7 @@ use crate::browser_runtime::{
     MAX_BROWSER_CONTROL_BODY_BYTES, validate_browser_request_bounds,
 };
 use crate::command_jobs::CommandJobManager;
+use crate::companion::CompanionAutoPairError;
 use crate::managed_chat::broker::{ManagedChatAckOutcome, ManagedChatError};
 use crate::managed_chat::types::{ChatExecutionProfile, ManagedChatCommandId, ManagedChatLeaseId};
 use crate::mcp::{self, JsonRpcRequest};
@@ -38,7 +39,10 @@ const MAX_HOST_CONTROL_BODY_BYTES: usize = 16 * 1024;
 pub const HOST_CONTROL_ROUTE: &str = "/__moondesk/workspaces";
 pub const HOST_BROWSER_CONTROL_ROUTE: &str = "/__moondesk/browser";
 pub const HOST_CONTROL_HEADER: &str = "x-moondesk-host-token";
+pub const COMPANION_HELLO_ROUTE: &str = "/__moondesk/companion/v1/hello";
 pub const COMPANION_PAIR_ROUTE: &str = "/__moondesk/companion/v1/pair";
+pub const COMPANION_REPAIR_ROUTE: &str = "/__moondesk/companion/v1/repair";
+pub const COMPANION_BRIDGE_PORTS: [u16; 5] = [47650, 47651, 47652, 47653, 47654];
 pub const COMPANION_STATUS_ROUTE: &str = "/__moondesk/companion/v1/status";
 pub const COMPANION_WORKSPACES_ROUTE: &str = "/__moondesk/companion/v1/workspaces";
 pub const COMPANION_PROFILE_ROUTE: &str = "/__moondesk/companion/v1/profile";
@@ -136,6 +140,54 @@ async fn validate_request_origin(
     next.run(request).await
 }
 /// Build the axum router.
+pub fn companion_bridge_router(
+    app_state: SharedState,
+    browser_runtime: Option<Arc<BrowserRuntime>>,
+    command_jobs: CommandJobManager,
+    ui_events: UiEventSender,
+    host_control_token: Arc<str>,
+) -> Router {
+    let state = ServerState {
+        app: app_state,
+        browser_runtime,
+        command_jobs,
+        ui_events,
+        host_control_token,
+    };
+
+    Router::new()
+        .route(COMPANION_HELLO_ROUTE, get(companion_hello))
+        .route(
+            COMPANION_PAIR_ROUTE,
+            post(auto_pair_companion).layer(DefaultBodyLimit::max(MAX_COMPANION_BODY_BYTES)),
+        )
+        .route(
+            COMPANION_REPAIR_ROUTE,
+            post(pair_companion).layer(DefaultBodyLimit::max(MAX_COMPANION_BODY_BYTES)),
+        )
+        .route(COMPANION_STATUS_ROUTE, get(companion_status))
+        .route(COMPANION_WORKSPACES_ROUTE, get(companion_workspaces))
+        .route(
+            COMPANION_PROFILE_ROUTE,
+            get(companion_profile)
+                .post(update_companion_profile)
+                .layer(DefaultBodyLimit::max(MAX_COMPANION_BODY_BYTES)),
+        )
+        .route(
+            COMPANION_REDEEM_ROUTE,
+            post(redeem_companion_command).layer(DefaultBodyLimit::max(MAX_COMPANION_BODY_BYTES)),
+        )
+        .route(
+            COMPANION_ACK_ROUTE,
+            post(ack_companion_command).layer(DefaultBodyLimit::max(MAX_COMPANION_BODY_BYTES)),
+        )
+        .route(
+            COMPANION_RETRY_ROUTE,
+            post(retry_companion_command).layer(DefaultBodyLimit::max(MAX_COMPANION_BODY_BYTES)),
+        )
+        .with_state(state)
+}
+
 pub fn router(
     app_state: SharedState,
     browser_runtime: Option<Arc<BrowserRuntime>>,
@@ -170,30 +222,6 @@ pub fn router(
             HOST_BROWSER_CONTROL_ROUTE,
             post(run_browser_command_from_local_host)
                 .layer(DefaultBodyLimit::max(MAX_BROWSER_CONTROL_BODY_BYTES)),
-        )
-        .route(
-            COMPANION_PAIR_ROUTE,
-            post(pair_companion).layer(DefaultBodyLimit::max(MAX_COMPANION_BODY_BYTES)),
-        )
-        .route(COMPANION_STATUS_ROUTE, get(companion_status))
-        .route(COMPANION_WORKSPACES_ROUTE, get(companion_workspaces))
-        .route(
-            COMPANION_PROFILE_ROUTE,
-            get(companion_profile)
-                .post(update_companion_profile)
-                .layer(DefaultBodyLimit::max(MAX_COMPANION_BODY_BYTES)),
-        )
-        .route(
-            COMPANION_REDEEM_ROUTE,
-            post(redeem_companion_command).layer(DefaultBodyLimit::max(MAX_COMPANION_BODY_BYTES)),
-        )
-        .route(
-            COMPANION_ACK_ROUTE,
-            post(ack_companion_command).layer(DefaultBodyLimit::max(MAX_COMPANION_BODY_BYTES)),
-        )
-        .route(
-            COMPANION_RETRY_ROUTE,
-            post(retry_companion_command).layer(DefaultBodyLimit::max(MAX_COMPANION_BODY_BYTES)),
         )
         .merge(mcp_routes)
         .with_state(state)
@@ -286,6 +314,13 @@ struct CompanionPairRequest {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct CompanionAutoPairRequest {
+    client_id: String,
+    credential: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct CompanionAckRequest {
     command_id: String,
     lease_id: String,
@@ -298,6 +333,53 @@ struct CompanionAckRequest {
 #[serde(rename_all = "camelCase")]
 struct CompanionRetryRequest {
     command_id: String,
+}
+
+async fn companion_hello(State(state): State<ServerState>, headers: HeaderMap) -> Response<Body> {
+    if !companion_origin_allowed(&headers) {
+        return companion_origin_error();
+    }
+    let auth = { state.app.lock().await.companion_auth.clone() };
+    json_response(
+        StatusCode::OK,
+        json!({
+            "app": "moondesk-worker-companion",
+            "protocolVersion": 1,
+            "paired": auth.paired_client_id().await.is_some()
+        }),
+    )
+}
+
+async fn auto_pair_companion(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(request): Json<CompanionAutoPairRequest>,
+) -> Response<Body> {
+    if !companion_origin_allowed(&headers) {
+        return companion_origin_error();
+    }
+    let auth = { state.app.lock().await.companion_auth.clone() };
+    match auth
+        .auto_pair(&request.client_id, &request.credential)
+        .await
+    {
+        Ok(receipt) => json_response(
+            StatusCode::OK,
+            json!({
+                "protocolVersion": 1,
+                "clientId": receipt.client_id
+            }),
+        ),
+        Err(CompanionAutoPairError::Invalid(error)) => {
+            json_response(StatusCode::BAD_REQUEST, json!({ "error": error }))
+        }
+        Err(CompanionAutoPairError::Conflict(error)) => {
+            json_response(StatusCode::CONFLICT, json!({ "error": error }))
+        }
+        Err(CompanionAutoPairError::Storage(error)) => {
+            json_response(StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": error }))
+        }
+    }
 }
 
 async fn pair_companion(
@@ -1698,6 +1780,176 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn public_mcp_router_does_not_expose_companion_control_routes() {
+        let workspace_root = unique_temp_path("moondesk-companion-public-router-workspace");
+        let config_root = unique_temp_path("moondesk-companion-public-router-config");
+        let config_path = config_root.join("config.toml");
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        std::fs::create_dir_all(&config_root).expect("create config dir");
+
+        let app = AppState::new_for_test(
+            8787,
+            workspace_root.to_string_lossy().into_owned(),
+            config_path.clone(),
+        )
+        .expect("create app state");
+        let app_state = Arc::new(Mutex::new(app));
+        let (ui_tx, _ui_rx) = ui_event_channel();
+        let app = router(
+            app_state,
+            None,
+            CommandJobManager::new(),
+            ui_tx,
+            Arc::from("test-host-control-token"),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind public router");
+        let address = listener.local_addr().expect("public router address");
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let client = reqwest::Client::new();
+
+        let hello = client
+            .get(format!("http://{address}{COMPANION_HELLO_ROUTE}"))
+            .send()
+            .await
+            .expect("probe companion hello on public router");
+        assert_eq!(hello.status(), StatusCode::NOT_FOUND);
+
+        let repair = client
+            .post(format!("http://{address}{COMPANION_REPAIR_ROUTE}"))
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(reqwest_json_body(&json!({
+                "pairingToken": "not-a-real-token",
+                "clientId": "extension-install-a"
+            })))
+            .send()
+            .await
+            .expect("probe companion repair on public router");
+        assert_eq!(repair.status(), StatusCode::NOT_FOUND);
+
+        server.abort();
+        let _ = server.await;
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_dir_all(config_root);
+        let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn companion_bridge_discovers_and_auto_pairs_without_manual_token() {
+        let workspace_root = unique_temp_path("moondesk-companion-bridge-workspace");
+        let config_root = unique_temp_path("moondesk-companion-bridge-config");
+        let config_path = config_root.join("config.toml");
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        std::fs::create_dir_all(&config_root).expect("create config dir");
+
+        let app = AppState::new_for_test(
+            8787,
+            workspace_root.to_string_lossy().into_owned(),
+            config_path.clone(),
+        )
+        .expect("create app state");
+        let app_state = Arc::new(Mutex::new(app));
+        let (ui_tx, _ui_rx) = ui_event_channel();
+        let app = companion_bridge_router(
+            app_state,
+            None,
+            CommandJobManager::new(),
+            ui_tx,
+            Arc::from("unused-host-token"),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind companion bridge");
+        let address = listener.local_addr().expect("companion bridge address");
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let client = reqwest::Client::new();
+
+        let hello = client
+            .get(format!("http://{address}{COMPANION_HELLO_ROUTE}"))
+            .send()
+            .await
+            .expect("discover companion bridge");
+        assert_eq!(hello.status(), StatusCode::OK);
+        let hello_json = reqwest_response_json(hello).await;
+        assert_eq!(
+            hello_json.get("app").and_then(Value::as_str),
+            Some("moondesk-worker-companion")
+        );
+        assert_eq!(
+            hello_json.get("paired").and_then(Value::as_bool),
+            Some(false)
+        );
+
+        let credential = "a".repeat(64);
+        let pair_body = json!({
+            "clientId": "extension-install-a",
+            "credential": credential
+        });
+        let pair_url = format!("http://{address}{COMPANION_PAIR_ROUTE}");
+        let pair = client
+            .post(&pair_url)
+            .header(reqwest::header::ORIGIN, "chrome-extension://moondesk-test")
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(reqwest_json_body(&pair_body))
+            .send()
+            .await
+            .expect("auto pair companion");
+        assert_eq!(pair.status(), StatusCode::OK);
+
+        let retry = client
+            .post(&pair_url)
+            .header(reqwest::header::ORIGIN, "chrome-extension://moondesk-test")
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(reqwest_json_body(&pair_body))
+            .send()
+            .await
+            .expect("retry auto pair companion");
+        assert_eq!(retry.status(), StatusCode::OK);
+
+        let status = client
+            .get(format!("http://{address}{COMPANION_STATUS_ROUTE}"))
+            .header(COMPANION_TOKEN_HEADER, &credential)
+            .send()
+            .await
+            .expect("authorize auto-paired companion");
+        assert_eq!(status.status(), StatusCode::OK);
+
+        let takeover = client
+            .post(&pair_url)
+            .header(reqwest::header::ORIGIN, "chrome-extension://other-install")
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(reqwest_json_body(&json!({
+                "clientId": "extension-install-b",
+                "credential": "b".repeat(64)
+            })))
+            .send()
+            .await
+            .expect("attempt companion takeover");
+        assert_eq!(takeover.status(), StatusCode::CONFLICT);
+
+        let web_origin = client
+            .post(&pair_url)
+            .header(reqwest::header::ORIGIN, "https://chatgpt.com")
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(reqwest_json_body(&pair_body))
+            .send()
+            .await
+            .expect("attempt web-origin auto pair");
+        assert_eq!(web_origin.status(), StatusCode::FORBIDDEN);
+
+        server.abort();
+        let _ = server.await;
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_dir_all(config_root);
+        let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
     async fn companion_http_pair_redeem_reconcile_and_ack_flow_is_authenticated() {
         let workspace_root = unique_temp_path("moondesk-companion-http-workspace");
         let config_root = unique_temp_path("moondesk-companion-http-config");
@@ -1721,12 +1973,12 @@ mod tests {
         let managed_chat_broker = app.managed_chat_broker.clone();
         let app_state = Arc::new(Mutex::new(app));
         let (ui_tx, _ui_rx) = ui_event_channel();
-        let app = router(
+        let app = companion_bridge_router(
             app_state,
             None,
             CommandJobManager::new(),
             ui_tx,
-            Arc::from("test-host-control-token"),
+            Arc::from("unused-host-token"),
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -1736,7 +1988,7 @@ mod tests {
             let _ = axum::serve(listener, app).await;
         });
         let client = reqwest::Client::new();
-        let pair_url = format!("http://{address}{COMPANION_PAIR_ROUTE}");
+        let pair_url = format!("http://{address}{COMPANION_REPAIR_ROUTE}");
         let pair_body = json!({
             "pairingToken": pairing_token,
             "clientId": "extension-install-a"
@@ -3745,8 +3997,9 @@ document.getElementById('upload').addEventListener('change',event=>{document.get
 
         let repo_root = std::env::current_dir().expect("resolve E2E repo root");
         let runtime_root = repo_root.join("target").join("worker-companion-e2e");
-        if runtime_root.exists() {
-            std::fs::remove_dir_all(&runtime_root).expect("reset worker companion E2E runtime");
+        std::fs::create_dir_all(&runtime_root).expect("create worker companion E2E runtime");
+        for control in ["enqueue", "reuse", "stop"] {
+            let _ = std::fs::remove_file(runtime_root.join(control));
         }
         let workspace_root = runtime_root.join("workspace");
         let config_root = runtime_root.join("config");
@@ -3760,36 +4013,40 @@ document.getElementById('upload').addEventListener('change',event=>{document.get
             config_path,
         )
         .expect("create E2E app state");
-        let pairing_token = app.companion_auth.pairing_token();
         let workspace_id = app.workspaces[0].id.clone();
         let managed_chat_broker = app.managed_chat_broker.clone();
         let app_state = Arc::new(Mutex::new(app));
         let (ui_tx, _ui_rx) = ui_event_channel();
-        let e2e_router = router(
+        let e2e_router = companion_bridge_router(
             app_state.clone(),
             None,
             CommandJobManager::new(),
             ui_tx,
-            Arc::from("worker-companion-e2e-host-token"),
+            Arc::from("unused-host-token"),
         );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:3211")
-            .await
-            .expect("bind worker companion E2E server on 3211");
+        let mut bound = None;
+        for port in COMPANION_BRIDGE_PORTS {
+            if let Ok(listener) = tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
+                bound = Some((port, listener));
+                break;
+            }
+        }
+        let (bridge_port, listener) =
+            bound.expect("bind worker companion E2E bridge on a companion port");
         let server = tokio::spawn(async move {
             axum::serve(listener, e2e_router)
                 .await
                 .expect("serve worker companion E2E host");
         });
 
-        println!("MOONDESK_WORKER_E2E_READY=http://127.0.0.1:3211");
-        println!("MOONDESK_WORKER_E2E_PAIRING_CODE={pairing_token}");
+        println!("MOONDESK_WORKER_E2E_READY=http://127.0.0.1:{bridge_port}");
         println!("MOONDESK_WORKER_E2E_WORKSPACE_ID={workspace_id}");
         println!(
             "MOONDESK_WORKER_E2E_CONTROLS={}",
             runtime_root.to_string_lossy()
         );
         println!(
-            "Create `enqueue` after pairing/binding/profile selection; create `reuse` after launch #1 succeeds; create `stop` to exit."
+            "The companion should auto-connect. Bind this Project once if needed, then create `enqueue`; create `reuse` after launch #1 succeeds; create `stop` to exit."
         );
 
         let first_marker = "moondesk-worker-e2e-first-20260917";

@@ -159,16 +159,22 @@ function renderCatalog() {
 async function render() {
   showError('');
   const status = await bg({ type: 'MOONDESK_STATUS' });
-  $('baseUrl').value = status.baseUrl || $('baseUrl').value;
-  const connected = Boolean(status.paired && status.connected !== false);
-  $('pairing').hidden = connected;
+  const connected = status.connected === true;
   $('binding').hidden = !connected;
   $('profile').hidden = !connected;
-  $('status').textContent = !status.paired
-    ? 'Not paired'
-    : status.connected === false
-      ? `Paired, MoonDesk offline: ${status.error || 'connection failed'}`
-      : 'Paired and connected';
+  $('manualRepair').hidden = !status.repairRequired;
+  $('manualRepair').open = Boolean(status.repairRequired);
+  $('status').textContent = connected
+    ? 'Connected'
+    : status.repairRequired
+      ? 'Manual repair required'
+      : status.errorCode === 'bridge_not_found'
+        ? 'MoonDesk companion bridge not found'
+        : 'Connecting to MoonDesk…';
+  $('bridgeStatus').textContent = status.baseUrl
+    ? `Local bridge: ${status.baseUrl}`
+    : 'Searching for local MoonDesk…';
+  if (!connected && status.error) showError(status.error);
 
   $('blocked').hidden = !status.blockedCommand;
   if (status.blockedCommand) {
@@ -220,7 +226,6 @@ $('pair').addEventListener('click', async () => {
   try {
     await bg({
       type: 'MOONDESK_PAIR',
-      baseUrl: $('baseUrl').value.trim(),
       pairingToken: $('pairingToken').value.trim()
     });
     $('pairingToken').value = '';

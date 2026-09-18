@@ -25,6 +25,7 @@ mod workspace_tools;
 mod workspaces;
 
 use browser_runtime::{BrowserPresentationChange, BrowserRuntime, DEFAULT_BROWSER_COMMAND_TIMEOUT};
+use command_jobs::CommandJobManager;
 use crossterm::{
     ExecutableCommand,
     event::{
@@ -2164,12 +2165,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Cleanup after the TUI is gone so quit never appears frozen on screen.
     // Stop accepting new MCP work first, then terminate owned command trees and
     // shared host services before finally clearing local runtime status.
-    let (server_handle, command_jobs) = {
+    let (server_handle, companion_server_handle, command_jobs) = {
         let mut app = state.lock().await;
         app.server_running = false;
-        (app.server_handle.take(), app.command_jobs.clone())
+        app.companion_bridge_port = None;
+        (
+            app.server_handle.take(),
+            app.companion_server_handle.take(),
+            app.command_jobs.clone(),
+        )
     };
     if let Some(handle) = server_handle {
+        handle.abort();
+        let _ = handle.await;
+    }
+    if let Some(handle) = companion_server_handle {
         handle.abort();
         let _ = handle.await;
     }
@@ -4083,7 +4093,9 @@ async fn run_settings(
                 app.ngrok_domain.clone(),
                 app.companion_auth.clone(),
                 app.companion_auth.pairing_token(),
-                format!("http://127.0.0.1:{}", app.port),
+                app.companion_bridge_port
+                    .map(|port| format!("http://127.0.0.1:{port}"))
+                    .unwrap_or_else(|| "unavailable".into()),
             )
         };
         let companion_client_id = companion_auth.paired_client_id().await;
@@ -4546,7 +4558,7 @@ fn draw_settings(f: &mut Frame, view: SettingsView<'_>) {
         }),
     )));
     lines.push(Line::from(Span::styled(
-        format!("     Pairing code: {companion_pairing_code}"),
+        format!("     Manual repair code: {companion_pairing_code}"),
         Style::default().fg(palette.muted_fg),
     )));
     lines.push(Line::from(Span::styled(
@@ -4889,9 +4901,10 @@ async fn wait_for_local_server_ready(port: u16) -> bool {
 }
 
 async fn handle_mcp_server_exit(state: SharedState, result: Result<(), std::io::Error>) {
-    {
+    let companion_handle = {
         let mut app = state.lock().await;
         app.server_running = false;
+        app.companion_bridge_port = None;
         match result {
             Ok(()) => app.log("WARN", "MCP server exited".into()),
             Err(error) => app.log("ERROR", format!("MCP server failed: {error}")),
@@ -4902,8 +4915,64 @@ async fn handle_mcp_server_exit(state: SharedState, result: Result<(), std::io::
                 "Stopping ngrok because the local MCP server is unavailable".into(),
             );
         }
+        app.companion_server_handle.take()
+    };
+    if let Some(handle) = companion_handle {
+        handle.abort();
+        let _ = handle.await;
     }
     ngrok::stop(state).await;
+}
+
+async fn start_companion_bridge(
+    state: SharedState,
+    browser_runtime: Option<Arc<BrowserRuntime>>,
+    command_jobs: CommandJobManager,
+    ui_events: UiEventSender,
+    host_control_token: Arc<str>,
+) -> Result<u16, String> {
+    let mut last_error = None;
+    for port in server::COMPANION_BRIDGE_PORTS {
+        match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
+            Ok(listener) => {
+                let router = server::companion_bridge_router(
+                    state.clone(),
+                    browser_runtime,
+                    command_jobs,
+                    ui_events,
+                    host_control_token,
+                );
+                let bridge_state = state.clone();
+                let handle = tokio::spawn(async move {
+                    let result = axum::serve(listener, router).await;
+                    let mut app = bridge_state.lock().await;
+                    app.companion_bridge_port = None;
+                    match result {
+                        Ok(()) => app.log("WARN", "Worker companion bridge exited".into()),
+                        Err(error) => {
+                            app.log("ERROR", format!("Worker companion bridge failed: {error}"))
+                        }
+                    }
+                });
+                let mut app = state.lock().await;
+                app.companion_bridge_port = Some(port);
+                app.companion_server_handle = Some(handle);
+                app.log(
+                    "INFO",
+                    format!("Worker companion bridge started on 127.0.0.1:{port}"),
+                );
+                return Ok(port);
+            }
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(format!(
+        "could not bind any worker companion bridge port ({:?}): {}",
+        server::COMPANION_BRIDGE_PORTS,
+        last_error
+            .map(|error| error.to_string())
+            .unwrap_or_else(|| "no port candidates".into())
+    ))
 }
 
 async fn start_services(
@@ -4953,9 +5022,9 @@ async fn start_services(
     let router = server::router(
         state.clone(),
         browser_runtime.clone(),
-        command_jobs,
-        ui_events,
-        host_control_token,
+        command_jobs.clone(),
+        ui_events.clone(),
+        host_control_token.clone(),
     );
     let server_state = state.clone();
     let handle = tokio::spawn(async move {
@@ -4989,6 +5058,21 @@ async fn start_services(
         "INFO",
         format!("Local MCP health check passed on 127.0.0.1:{port}"),
     );
+
+    if let Err(error) = start_companion_bridge(
+        state.clone(),
+        browser_runtime.clone(),
+        command_jobs,
+        ui_events,
+        host_control_token,
+    )
+    .await
+    {
+        state.lock().await.log(
+            "WARN",
+            format!("Worker companion bridge unavailable: {error}"),
+        );
+    }
 
     // Start ngrok only after the local HTTP server has answered its health probe.
     let ngrok_start_error = match ngrok::start(state.clone()).await {
@@ -10312,7 +10396,7 @@ mod tests {
         assert!(rendered.contains("Reasoning effort: High"));
         assert!(rendered.contains("Companion: paired"));
         assert!(rendered.contains("http://127.0.0.1:3200"));
-        assert!(rendered.contains("Pairing code: test-pairing-code"));
+        assert!(rendered.contains("Manual repair code: test-pairing-code"));
     }
 
     #[test]

@@ -125,14 +125,15 @@ Select the connector and start working.
 
 Workers let one ChatGPT conversation act as the **Anchor** and delegate independent tasks to at most **two durable worker conversations** in the same MoonDesk workspace. Worker identity is bound to the route-resolved workspace plus ChatGPT's exact session metadata; a different conversation in the same workspace does not inherit Anchor or worker authority.
 
-### Install and pair the companion
+### Install the companion
 
 1. Open `chrome://extensions`, enable **Developer mode**, and choose **Load unpacked**.
 2. Select `extensions/moondesk-worker-companion`.
-3. Open MoonDesk **Settings** and find **Workers (experimental)**.
-4. Open the companion popup, keep the local MoonDesk URL (normally `http://127.0.0.1:3200`), paste the one-time pairing code from Settings, and pair it.
-5. From a conversation inside the ChatGPT Project that owns this MoonDesk connector, choose the MoonDesk workspace and click **Bind this Project**.
-6. Click **Discover available ChatGPT models**, choose a confirmed model and reasoning effort, and save the worker profile.
+3. Start MoonDesk. The extension discovers MoonDesk's dedicated loopback-only companion bridge and pairs automatically; there is no per-chat token step.
+4. From a conversation inside the ChatGPT Project that owns this MoonDesk connector, choose the MoonDesk workspace and click **Bind this Project** once.
+5. Click **Discover available ChatGPT models**, choose a confirmed model and reasoning effort, and save the worker profile.
+
+The companion credential and Project/workspace binding survive Chrome and MoonDesk restarts. New conversations inside the already-bound ChatGPT Project do not need to pair or bind again. MoonDesk keeps a manual repair code in Settings only for rare recovery cases such as replacing the extension installation while an older installation is still paired.
 
 The last confirmed model catalog is stored in extension-local storage, so reopening the popup does not require rediscovery. MoonDesk still re-verifies the actual model and effort in ChatGPT before sending every worker assignment.
 

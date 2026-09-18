@@ -10,16 +10,17 @@
   <main>
     <h1>MoonDesk Workers</h1>
     <p id="status" class="status">Checking…</p>
+    <div id="bridgeStatus" class="muted">Searching for local MoonDesk…</div>
 
-    <section id="pairing">
-      <label>MoonDesk URL
-        <input id="baseUrl" value="http://127.0.0.1:3200" spellcheck="false" />
-      </label>
-      <label>Pairing code
-        <input id="pairingToken" type="password" autocomplete="off" spellcheck="false" />
-      </label>
-      <button id="pair">Pair companion</button>
-    </section>
+    <details id="manualRepair">
+      <summary>Manual repair</summary>
+      <section id="pairing">
+        <label>Manual repair code
+          <input id="pairingToken" type="password" autocomplete="off" spellcheck="false" />
+        </label>
+        <button id="pair">Repair companion pairing</button>
+      </section>
+    </details>
 
     <section id="binding" hidden>
       <div id="projectContext" class="muted">Open a ChatGPT Project conversation.</div>

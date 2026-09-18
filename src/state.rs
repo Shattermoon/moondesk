@@ -13,9 +13,7 @@ use uuid::Uuid;
 
 use crate::command_jobs::CommandJobManager;
 use crate::companion::CompanionAuth;
-use crate::managed_chat::{
-    self, broker::ManagedChatBroker, types::ChatExecutionProfile,
-};
+use crate::managed_chat::{self, broker::ManagedChatBroker, types::ChatExecutionProfile};
 use crate::mascot::{self, MascotPack};
 use crate::theme;
 use crate::workers::{self, broker::WorkerBroker};
@@ -2411,7 +2409,10 @@ pub async fn remove_workspace(
         .await
         .err();
     let worker_cleanup_error = worker_broker.purge_workspace(workspace_id).await.err();
-    let managed_chat_cleanup_error = managed_chat_broker.purge_workspace(workspace_id).await.err();
+    let managed_chat_cleanup_error = managed_chat_broker
+        .purge_workspace(workspace_id)
+        .await
+        .err();
 
     {
         let mut app = state.lock().await;
@@ -2467,8 +2468,7 @@ pub async fn remove_workspace(
         let retry_workspace_id = workspace_id.clone();
         tokio::spawn(async move {
             let mut worker_error = worker_cleanup_error.map(|error| error.to_string());
-            let mut managed_chat_error =
-                managed_chat_cleanup_error.map(|error| error.to_string());
+            let mut managed_chat_error = managed_chat_cleanup_error.map(|error| error.to_string());
             for attempt in 1..=WORKSPACE_CLEANUP_RETRY_ATTEMPTS {
                 tokio::time::sleep(WORKSPACE_CLEANUP_RETRY_DELAY).await;
                 if worker_error.is_some() {
@@ -4510,10 +4510,14 @@ toolMode = "multiTools"
                 app.managed_chat_broker.clone(),
             )
         };
-        let primary_anchor =
-            crate::workers::types::ChatIdentity::from_openai_meta(Some("remove-test"), "primary-anchor");
-        let secondary_anchor =
-            crate::workers::types::ChatIdentity::from_openai_meta(Some("remove-test"), "secondary-anchor");
+        let primary_anchor = crate::workers::types::ChatIdentity::from_openai_meta(
+            Some("remove-test"),
+            "primary-anchor",
+        );
+        let secondary_anchor = crate::workers::types::ChatIdentity::from_openai_meta(
+            Some("remove-test"),
+            "secondary-anchor",
+        );
         worker_broker
             .spawn_worker(crate::workers::broker::SpawnWorkerRequest {
                 operation_id: crate::workers::types::OperationId::new(),
@@ -4538,7 +4542,11 @@ toolMode = "multiTools"
             .expect("seed secondary worker family");
         for (workspace_id, dedupe_key, marker) in [
             (primary_id.clone(), "remove-test-primary", "primary-marker"),
-            (added.id.clone(), "remove-test-secondary", "secondary-marker"),
+            (
+                added.id.clone(),
+                "remove-test-secondary",
+                "secondary-marker",
+            ),
         ] {
             managed_chat_broker
                 .enqueue(crate::managed_chat::broker::EnqueueManagedChatRequest {
@@ -4546,7 +4554,8 @@ toolMode = "multiTools"
                     launch: crate::managed_chat::types::ManagedChatLaunch {
                         workspace_id,
                         purpose: crate::managed_chat::types::ManagedChatPurpose::Worker,
-                        execution_profile: crate::managed_chat::types::ChatExecutionProfile::default(),
+                        execution_profile:
+                            crate::managed_chat::types::ChatExecutionProfile::default(),
                         opening_message: format!("workspace removal probe {marker}"),
                         task_marker: marker.into(),
                         thread_key: Some(format!("worker:{marker}")),

@@ -470,6 +470,28 @@ fn workers_tool_descriptor() -> Value {
             },
             "required": ["action"]
         },
+        "outputSchema": {
+            "type": "object",
+            "properties": {
+                "action": { "type": "string" },
+                "state": { "type": "string" },
+                "familyId": { "type": ["string", "null"] },
+                "workerId": { "type": "string" },
+                "taskId": { "type": ["string", "null"] },
+                "displayId": { "type": "string" },
+                "claimToken": { "type": "string" },
+                "launchCommandId": { "type": "string" },
+                "executionProfile": { "type": "object" },
+                "family": { "type": ["object", "null"] },
+                "workers": { "type": "array" },
+                "messageId": { "type": "string" },
+                "reportId": { "type": "string" },
+                "messages": { "type": "array" },
+                "reports": { "type": "array" },
+                "completed": { "type": "array" },
+                "result": {}
+            }
+        },
         "annotations": { "readOnlyHint": false, "openWorldHint": false, "destructiveHint": false }
     })
 }
@@ -596,7 +618,9 @@ async fn handle_tools_list(
             }));
         }
 
-        tools.push(workers_tool_descriptor());
+        if tool_mode.write_tools_enabled() {
+            tools.push(workers_tool_descriptor());
+        }
         tools.push(json!({
             "name": "moondesk_instruction",
             "title": "Get usage instructions",
@@ -1044,6 +1068,9 @@ async fn handle_tools_call_for_workspace(
                 req,
                 "Tool 'workers' requires Computer or Both mode".into(),
             );
+        }
+        if tool_mode.read_only() {
+            return read_only_blocked_response(req, &tool_name);
         }
         if workspaces::workspace_availability(Path::new(workspace_root))
             == WorkspaceAvailability::Unavailable
@@ -3914,6 +3941,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn workers_tool_is_hidden_and_blocked_in_read_only_mode() {
+        let list_request = JsonRpcRequest {
+            jsonrpc: "2.0".into(),
+            id: Some(json!("workers-read-only-list")),
+            method: "tools/list".into(),
+            params: json!({}),
+        };
+        let list_response = handle_tools_list(&list_request, Mode::Both, ToolMode::ReadOnly).await;
+        let tools = list_response
+            .result
+            .as_ref()
+            .and_then(|result| result.get("tools"))
+            .and_then(Value::as_array)
+            .expect("tools list");
+        assert!(
+            tools
+                .iter()
+                .all(|tool| tool.get("name").and_then(Value::as_str) != Some("workers"))
+        );
+
+        let root = TestTempDir::new("moondesk-workers-read-only");
+        let workspace_root = root.path().join("workspace");
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        let request = tool_call_request_with_session(
+            "workers",
+            json!({ "action": "status" }),
+            "read-only-anchor",
+        );
+        let command_jobs = CommandJobManager::new();
+        let browser_runtime = None;
+        let response = handle_tools_call(
+            &request,
+            &workspace_root.to_string_lossy(),
+            Mode::Both,
+            ToolMode::ReadOnly,
+            false,
+            &command_jobs,
+            &browser_runtime,
+        )
+        .await;
+        assert_eq!(
+            response
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(result_text(&response).contains("read-only"));
+    }
+
+    #[tokio::test]
     async fn workers_mcp_fails_closed_without_exact_openai_session() {
         let root = TestTempDir::new("moondesk-workers-mcp-no-session");
         let workspace_root = root.path().join("workspace");
@@ -5835,6 +5914,7 @@ mod tests {
                 "poll_command",
                 "read_command_output",
                 "cancel_command",
+                "workers",
                 "moondesk_instruction",
                 "create_handoff",
                 "resume_handoff",
@@ -5938,6 +6018,7 @@ mod tests {
             ("poll_command", "output"),
             ("read_command_output", "text"),
             ("cancel_command", "state"),
+            ("workers", "action"),
             ("moondesk_instruction", "instructionText"),
             ("create_handoff", "handoffId"),
             ("resume_handoff", "drift"),

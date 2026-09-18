@@ -2043,7 +2043,9 @@ mod tests {
         assert_eq!(retried.status(), StatusCode::OK);
         let retried_json = reqwest_response_json(retried).await;
         assert_eq!(
-            retried_json.pointer("/command/state").and_then(Value::as_str),
+            retried_json
+                .pointer("/command/state")
+                .and_then(Value::as_str),
             Some("queued")
         );
         let retry_offer = client
@@ -3786,7 +3788,9 @@ document.getElementById('upload').addEventListener('change',event=>{document.get
             "MOONDESK_WORKER_E2E_CONTROLS={}",
             runtime_root.to_string_lossy()
         );
-        println!("Create `enqueue` after pairing/binding/profile selection; create `reuse` after launch #1 succeeds; create `stop` to exit.");
+        println!(
+            "Create `enqueue` after pairing/binding/profile selection; create `reuse` after launch #1 succeeds; create `stop` to exit."
+        );
 
         let first_marker = "moondesk-worker-e2e-first-20260917";
         let second_marker = "moondesk-worker-e2e-reuse-20260917";

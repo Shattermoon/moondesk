@@ -4197,7 +4197,10 @@ async fn run_settings(
                             app.worker_execution_profile.reasoning_effort =
                                 app.worker_execution_profile.reasoning_effort.next();
                             let effort = app.worker_execution_profile.reasoning_effort;
-                            app.log("INFO", format!("Worker reasoning effort: {}", effort.label()));
+                            app.log(
+                                "INFO",
+                                format!("Worker reasoning effort: {}", effort.label()),
+                            );
                             app.mark_config_dirty();
                         } else if selected_row == settings_action_start + 2 {
                             app.set_moondesk_as_co_author = !app.set_moondesk_as_co_author;
@@ -4484,19 +4487,25 @@ fn draw_settings(f: &mut Frame, view: SettingsView<'_>) {
     let worker_model_selected = worker_model_row == selected_row;
     let worker_effort_selected = worker_effort_row == selected_row;
     let worker_model_style = if worker_model_selected {
-        Style::default().fg(palette.key_fg).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(palette.key_fg)
+            .add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(palette.primary_fg)
     };
     let worker_effort_style = if worker_effort_selected {
-        Style::default().fg(palette.key_fg).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(palette.key_fg)
+            .add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(palette.primary_fg)
     };
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         "  Workers (experimental)",
-        Style::default().fg(palette.title_fg).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(palette.title_fg)
+            .add_modifier(Modifier::BOLD),
     )));
     if worker_model_selected {
         selected_line_idx = lines.len();
@@ -4525,7 +4534,9 @@ fn draw_settings(f: &mut Frame, view: SettingsView<'_>) {
     lines.push(Line::from(Span::styled(
         format!(
             "     Companion: {} · {}",
-            companion_client_id.map(|_| "paired").unwrap_or("not paired"),
+            companion_client_id
+                .map(|_| "paired")
+                .unwrap_or("not paired"),
             companion_local_url
         ),
         Style::default().fg(if companion_client_id.is_some() {
@@ -10248,6 +10259,63 @@ mod tests {
     }
 
     #[test]
+    fn settings_renders_worker_profile_and_companion_status() {
+        let usage = super::UsageTotals::default();
+        let theme = super::theme::resolve(super::theme::DEFAULT_THEME_ID);
+        let tool_mode = super::ToolMode::all()[0];
+        let worker_row = super::theme::all().len()
+            + super::ToolMode::all().len()
+            + super::BrowserPresentation::all().len();
+        let profile = super::ChatExecutionProfile {
+            model_key: "gpt-5-6-thinking".into(),
+            model_label: "GPT-5.6 Sol".into(),
+            reasoning_effort: super::managed_chat::types::ReasoningEffort::High,
+        };
+        let backend = TestBackend::new(110, 36);
+        let mut terminal = Terminal::new(backend).expect("create worker settings terminal");
+
+        terminal
+            .draw(|frame| {
+                super::draw_settings(
+                    frame,
+                    super::SettingsView {
+                        current_theme: theme,
+                        current_tool_mode: tool_mode,
+                        current_browser_presentation: super::BrowserPresentation::Headless,
+                        worker_execution_profile: &profile,
+                        companion_pairing_code: "test-pairing-code",
+                        companion_client_id: Some("extension-install-a"),
+                        companion_local_url: "http://127.0.0.1:3200",
+                        set_moondesk_as_co_author: false,
+                        ngrok_authtoken_configured: false,
+                        ngrok_domain: None,
+                        config_path: r"C:\Users\tester\.moondesk\config.toml",
+                        usage_totals: &usage,
+                        selected_row: worker_row,
+                        confirm_reset_token_billing: false,
+                    },
+                )
+            })
+            .expect("render worker settings");
+
+        let buffer = terminal.backend().buffer();
+        let mut rendered = String::new();
+        for row in 0..buffer.area.height {
+            for column in 0..buffer.area.width {
+                rendered.push_str(buffer[(column, row)].symbol());
+            }
+            rendered.push('\n');
+        }
+
+        assert!(rendered.contains("Workers (experimental)"));
+        assert!(rendered.contains("Default model: GPT-5.6 Sol"));
+        assert!(rendered.contains("Reasoning effort: High"));
+        assert!(rendered.contains("Companion: paired"));
+        assert!(rendered.contains("http://127.0.0.1:3200"));
+        assert!(rendered.contains("Pairing code: test-pairing-code"));
+    }
+
+    #[test]
     fn settings_exposes_masked_ngrok_authtoken_action() {
         let usage = super::UsageTotals::default();
         let theme = super::theme::resolve(super::theme::DEFAULT_THEME_ID);
@@ -10255,7 +10323,7 @@ mod tests {
         let auth_token_row = super::theme::all().len()
             + super::ToolMode::all().len()
             + super::BrowserPresentation::all().len()
-            + 1;
+            + 3;
         let backend = TestBackend::new(100, 32);
         let mut terminal = Terminal::new(backend).expect("create ngrok auth settings terminal");
 

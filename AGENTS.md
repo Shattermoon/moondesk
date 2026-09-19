@@ -35,7 +35,7 @@ MoonDesk combines a local MCP server, filesystem tools, developer-shell executio
 - Dedicated workspace file tools must preserve filesystem-aware workspace boundaries.
 - Do not replace canonicalization, symlink/junction/reparse-point handling, or filesystem checks with lexical prefix checks.
 - A workspace must never gain access to another workspace's root, secret MCP slug, command jobs, preserved output, connection state, or workspace-local quotas/history.
-- The Chromium/MCP process is intentionally host-shared, but browser authority is layered: cookies/storage are isolated per workspace BrowserContext, and tabs/active-page state are owned by the calling MCP conversation or local-CLI session. Do not collapse those scopes back into one global selected page.
+- The MoonDesk-owned Chromium process and native CDP connection are intentionally host-shared, but browser authority is layered: cookies/storage are isolated per workspace BrowserContext, and tabs/active-page state are owned by the calling MCP conversation or local-CLI session. Do not collapse those scopes back into one global selected page.
 - Keep browser actions on the connector that owns the project. A different workspace connector sharing the host Chromium is not authority to inspect or mutate another workspace's logical browser session.
 
 ### Shell and process ownership
@@ -47,10 +47,10 @@ MoonDesk combines a local MCP server, filesystem tools, developer-shell executio
 
 ### Browser ownership
 
-- Preserve one MoonDesk-owned lazy Chromium/MCP runtime for the host, with workspace-isolated BrowserContexts and conversation/CLI-owned logical pages routed by explicit upstream page IDs.
+- Preserve one MoonDesk-owned lazy Chromium runtime for the host. MoonDesk provisions a pinned, verified Chrome for Testing build and controls it directly over the Chrome DevTools Protocol; do not reintroduce a Node/Playwright/MCP browser-control sidecar without an explicit architecture decision.
 - Never attach to or inherit the user's personal browser profile, cookies, or login state. Same-workspace conversations may share that workspace BrowserContext's login/storage state; different workspaces must not.
 - Do not let callers supply or use raw upstream page IDs or BrowserContext names as authority. MoonDesk owns page mapping, logical page IDs, popup attribution, and result filtering.
-- Browser-global state must be either disabled or explicitly leased. Extension lifecycle mutation is disabled in the shared runtime; singleton performance traces/screencasts must remain bound to the session and exact page that started them.
+- Browser-global state must be either disabled or explicitly leased. Native performance tracing is browser-global and must remain bound to the session and exact page that started it. Do not expose browser-global mutation merely because CDP makes it possible.
 - Presentation changes are Chromium-process-global. If a change would destroy a live runtime, preserve explicit confirmation semantics and clearly communicate that all workspace contexts/conversation tabs will be lost.
 - Workspace removal must retire that workspace's owned browser pages without silently retaining reachable state; if safe cleanup cannot be completed, reset the shared runtime fail-closed.
 - When browser behavior changes, test the actual rendered/browser path where relevant; metadata-only assertions are not substitutes for visual/runtime verification.

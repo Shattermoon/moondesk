@@ -54,10 +54,9 @@ jobs:
           node --check npm/install-binary.js
           node --check npm/update-manager.js
           node --check .github/scripts/verify-npm-package.mjs
+          node --check .github/scripts/verify-managed-browser-manifest.mjs
           node --test npm/install-binary.test.js npm/update-manager.test.js npm/moondesk.test.js
-          browser_pin="$(sed -n 's/.*CHROME_DEVTOOLS_PACKAGE_VERSION: &str = "\([^"]*\)".*/\1/p' src/browser_runtime.rs)"
-          test -n "$browser_pin"
-          npx -y "chrome-devtools-mcp@$browser_pin" --help >/dev/null
+          node .github/scripts/verify-managed-browser-manifest.mjs
           node -e "const p=require('./package.json'); const s=p.scripts||{}; if (s.preinstall||s.install||s.postinstall) process.exit(1)"
           node -e "const p=require('./package.json'); if (Object.keys(p.bin||{}).length !== 1 || p.bin.moondesk !== 'npm/moondesk.js') throw new Error('MoonDesk must expose exactly one CLI bin'); for (const f of ['npm/moondesk.js','npm/install-binary.js','npm/update-manager.js','skills/browser/SKILL.md']) if (!p.files?.includes(f)) throw new Error('missing packaged runtime file: '+f)"
           node .github/scripts/verify-npm-package.mjs
@@ -162,6 +161,14 @@ jobs:
         timeout-minutes: 10
         run: cargo +stable test --locked windows_shared_chromium_isolates_chat_pages_and_workspace_storage -- --ignored --test-threads 1
 
+      - name: Run Windows stale trace recovery smoke
+        timeout-minutes: 10
+        run: cargo +stable test --locked windows_dead_browser_clears_stale_trace_lease_before_next_session -- --ignored --test-threads 1
+
+      - name: Run Windows vanished trace-page recovery smoke
+        timeout-minutes: 10
+        run: cargo +stable test --locked windows_vanished_trace_page_resets_runtime_before_other_session -- --ignored --test-threads 1
+
       - name: Run Windows lazy browser vision smoke
         timeout-minutes: 10
         run: cargo +stable test --locked windows_view_page_returns_native_mcp_image_content -- --ignored --test-threads 1
@@ -191,7 +198,6 @@ jobs:
           node --check npm/moondesk.js
           node --check npm/install-binary.js
           node --check npm/update-manager.js
+          node --check .github/scripts/verify-managed-browser-manifest.mjs
           node --test npm/install-binary.test.js npm/update-manager.test.js npm/moondesk.test.js
-          browser_pin="$(sed -n 's/.*CHROME_DEVTOOLS_PACKAGE_VERSION: &str = "\([^"]*\)".*/\1/p' src/browser_runtime.rs)"
-          test -n "$browser_pin"
-          npx -y "chrome-devtools-mcp@$browser_pin" --help >/dev/null
+          node .github/scripts/verify-managed-browser-manifest.mjs

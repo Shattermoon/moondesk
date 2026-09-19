@@ -21,7 +21,7 @@ Never include a real MoonDesk workspace MCP URL, ngrok authtoken, npm credential
 MoonDesk currently requires:
 
 - Rust **1.88 or newer** (`edition = 2024`)
-- Node.js **`^20.19.0 || ^22.12.0 || >=23`** for the npm wrapper/runtime (Node 21 and Node 22.0-22.11 are unsupported by the pinned browser runtime)
+- Node.js **`^20.19.0 || ^22.12.0 || >=23`** for the supported npm wrapper/bootstrap runtime
 - Git
 
 For the closest match to CI, use the current stable Rust toolchain with `rustfmt` and `clippy`. CI validates the npm runtime at Node 20.19.0, Node 22.12.0, and Node 24.
@@ -29,8 +29,8 @@ For the closest match to CI, use the current stable Rust toolchain with `rustfmt
 Some optional integration tests require platform-specific software:
 
 - Windows tests may require PowerShell and standard developer tools.
-- Browser tests require a locally installed supported Chromium browser.
-- Browser control uses a pinned `chrome-devtools-mcp@1.7.0` stdio child owned directly by MoonDesk. MoonDesk starts it lazily on the first browser operation rather than during host startup and owns its complete process tree for deterministic shutdown/cancellation.
+- Browser tests can use MoonDesk's managed Chrome for Testing runtime. On first browser use MoonDesk downloads the pinned platform artifact, verifies its exact size and SHA-256, records a verified inventory of the installed browser files, installs it atomically into MoonDesk's browser cache, and then revalidates that inventory before reuse so missing or damaged support files trigger reprovisioning.
+- Browser control is native Rust CDP: MoonDesk owns Chromium directly, connects to its browser-level DevTools WebSocket, and starts the runtime lazily on the first browser operation rather than during host startup.
 - Running MoonDesk end-to-end through a public MCP endpoint requires ngrok configuration.
 
 ## Getting the repository running
@@ -101,7 +101,7 @@ cargo test --locked state::tests::missing_workspace_registry_logs_launch_directo
 
 These tests protect the Windows upgrade/reset contract: MoonDesk-owned state uses one canonical profile location; an older conflicting `HOME` config migrates at most once without overriding canonical state; migration preserves the complete existing workspace registry (IDs, names, roots, and connector slugs); a racing canonical creation wins without deleting the legacy source; a completed migration marker prevents stale legacy state from being imported again after a later reset; deleting the live config is not undone even if an automatic save was already staged; and a fresh launch clearly records when workspace #1 was recreated from the launch directory.
 
-If your change touches process execution, Windows environment handling, browser detection, or the lazy browser runtime, run the relevant ignored integration smokes when your machine supports them:
+If your change touches process execution, Windows environment handling, managed-browser provisioning, or the lazy browser runtime, run the relevant ignored integration smokes when your machine supports them:
 
 ```bash
 cargo test --locked windows_owned_shell_does_not_share_parent_console_surface -- --ignored
@@ -112,10 +112,12 @@ cargo test --locked windows_agent_can_request_visible_browser_with_restart_confi
 cargo test --locked windows_browser_timeout_cancels_dispatched_mutation -- --ignored --test-threads 1
 cargo test --locked windows_host_browser_cli_and_mcp_keep_separate_logical_sessions -- --ignored --test-threads 1
 cargo test --locked windows_shared_chromium_isolates_chat_pages_and_workspace_storage -- --ignored --test-threads 1
+cargo test --locked windows_dead_browser_clears_stale_trace_lease_before_next_session -- --ignored --test-threads 1
+cargo test --locked windows_vanished_trace_page_resets_runtime_before_other_session -- --ignored --test-threads 1
 cargo test --locked windows_view_page_returns_native_mcp_image_content -- --ignored --test-threads 1
 ```
 
-The browser smokes verify that help/configuration does not launch Chrome, the MoonDesk-owned stdio runtime starts only on first use, the default runtime is headless while still supporting the real rendered-pixel path, and the browser never inherits a personal profile. The shared-routing smoke proves one Chromium/MCP process can serve multiple workspaces while each workspace gets isolated BrowserContext storage and each MCP conversation gets its own logical tabs; same-workspace conversations share project storage without sharing active-page authority, cross-workspace cookies/storage remain isolated, popup ownership stays with the initiating conversation, and raw upstream page IDs cannot be used to cross session boundaries. The host-browser smoke proves `moondesk browser` uses the same Chromium and workspace BrowserContext but a separate local-CLI logical tab session. Owned-child loss is recovered with a fresh generation, a dispatched timed-out mutation cannot continue after MoonDesk returns, responsive viewport emulation works, and `view_page` exercises the actual routed page pixels. Presentation changes are process-global and must never discard a live shared Chromium runtime without explicit user confirmation that all workspace contexts/conversation tabs will be lost. Do not weaken or delete environment-specific tests merely to make them run where their stated prerequisites are missing.
+The browser smokes verify that help/configuration does not launch Chromium, the MoonDesk-owned native CDP runtime starts only on first use without a headless startup window/context, the default runtime is headless while still supporting the real rendered-pixel path, and the browser never inherits a personal profile. The shared-routing smoke proves one managed Chromium process can serve multiple workspaces while each workspace gets isolated BrowserContext storage and each MCP conversation gets its own logical tabs; same-workspace conversations share project storage without sharing active-page authority, cross-workspace cookies/storage remain isolated, popup ownership stays with the initiating conversation, and raw CDP target/page IDs cannot be used to cross session boundaries. The host-browser smoke proves `moondesk browser` uses the same Chromium and workspace BrowserContext but a separate local-CLI logical tab session. Owned-child/CDP loss is recovered with a fresh generation, stale or vanished browser-global trace ownership is cleared fail-closed before another session can proceed, a dispatched timed-out mutation cannot continue after MoonDesk returns, responsive viewport emulation works, and `view_page` exercises the actual routed page pixels. Empty-cache browser validation should exercise managed-browser download, exact size/SHA-256 verification, safe extraction, atomic publication, and first launch. Presentation changes are process-global and must never discard a live shared Chromium runtime without explicit user confirmation that all workspace contexts/conversation tabs will be lost. Do not weaken or delete environment-specific tests merely to make them run where their stated prerequisites are missing.
 
 ## npm wrapper and distribution checks
 
@@ -128,7 +130,9 @@ node --check npm/moondesk.js
 node --check npm/install-binary.js
 node --check npm/update-manager.js
 node --check .github/scripts/verify-npm-package.mjs
+node --check .github/scripts/verify-managed-browser-manifest.mjs
 node --test npm/install-binary.test.js npm/update-manager.test.js npm/moondesk.test.js
+node .github/scripts/verify-managed-browser-manifest.mjs
 node .github/scripts/verify-npm-package.mjs
 ```
 

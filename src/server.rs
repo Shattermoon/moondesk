@@ -2136,8 +2136,9 @@ document.getElementById('upload').addEventListener('change',event=>{document.get
         .await;
         assert_eq!(click.get("success").and_then(Value::as_bool), Some(true));
 
-        let end = host_browser_request(host_address, &workspace_root, "press_key", &["End"]).await;
-        assert_eq!(end.get("success").and_then(Value::as_bool), Some(true));
+        let scroll =
+            host_browser_request(host_address, &workspace_root, "scroll", &["0", "1400"]).await;
+        assert_eq!(scroll.get("success").and_then(Value::as_bool), Some(true));
 
         let inspect_script = "() => ({width: innerWidth, height: innerHeight, value: document.querySelector('#name').value, state: document.querySelector('#state').textContent, uploaded: document.querySelector('#file-name').textContent, scrolled: scrollY > 500})";
         let inspection = host_browser_request(

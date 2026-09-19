@@ -128,7 +128,7 @@ async function orchestrate(options = {}) {
   const nodeVersion = options.nodeVersion ?? process.versions.node;
   if (!isSupportedNodeVersion(nodeVersion)) {
     logger.error(
-      `MoonDesk requires Node.js ${SUPPORTED_NODE_RANGE} because the pinned browser runtime does not support Node.js ${nodeVersion}.`,
+      `MoonDesk requires Node.js ${SUPPORTED_NODE_RANGE} for its supported npm bootstrap and self-update runtime; detected Node.js ${nodeVersion}.`,
     );
     return { code: 1, signal: null };
   }

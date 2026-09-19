@@ -9,9 +9,10 @@ use tiktoken_rs::o200k_base_singleton;
 
 use crate::browser_contract::browser_structured_arguments_to_cli;
 use crate::browser_runtime::{
-    BrowserPresentationChange, BrowserRuntime, BrowserSessionKey, DEFAULT_BROWSER_COMMAND_TIMEOUT,
-    MAX_BROWSER_ARG_BYTES, MAX_BROWSER_ARGS, MAX_BROWSER_COMMAND_BYTES, MAX_BROWSER_TIMEOUT_MS,
-    canonical_browser_flag_name, validate_browser_request_bounds,
+    BrowserCommandOutput, BrowserPresentationChange, BrowserRuntime, BrowserSessionKey,
+    DEFAULT_BROWSER_COMMAND_TIMEOUT, MAX_BROWSER_ARG_BYTES, MAX_BROWSER_ARGS,
+    MAX_BROWSER_COMMAND_BYTES, MAX_BROWSER_TIMEOUT_MS, canonical_browser_flag_name,
+    validate_browser_request_bounds,
 };
 use crate::command;
 use crate::command_jobs::{
@@ -253,6 +254,69 @@ fn local_tool_output_schema(name: &str) -> Option<Value> {
             );
             properties.insert("retryable".to_string(), json!({ "type": "boolean" }));
         }
+        "browser_state" => {
+            properties.insert("presentation".to_string(), json!({ "type": "string" }));
+            properties.insert("browserRunning".to_string(), json!({ "type": "boolean" }));
+            properties.insert(
+                "tabs".to_string(),
+                json!({ "type": "array", "items": { "type": "object" } }),
+            );
+            properties.insert(
+                "selectedTab".to_string(),
+                json!({ "type": ["object", "null"] }),
+            );
+            properties.insert(
+                "selectedTabId".to_string(),
+                json!({ "type": ["integer", "null"] }),
+            );
+            properties.insert("capabilities".to_string(), json!({ "type": "object" }));
+        }
+        "browser_tabs" | "browser_navigate" | "browser_dom" | "browser_viewport" => {
+            properties.insert("stdout".to_string(), json!({ "type": "string" }));
+            properties.insert("stderr".to_string(), json!({ "type": "string" }));
+            properties.insert("exitCode".to_string(), json!({ "type": "integer" }));
+            properties.insert("restarted".to_string(), json!({ "type": "boolean" }));
+            properties.insert(
+                "tabs".to_string(),
+                json!({ "type": "array", "items": { "type": "object" } }),
+            );
+            properties.insert(
+                "selectedTab".to_string(),
+                json!({ "type": ["object", "null"] }),
+            );
+            properties.insert(
+                "selectedTabId".to_string(),
+                json!({ "type": ["integer", "null"] }),
+            );
+        }
+        "browser_cua" => {
+            properties.insert("stdout".to_string(), json!({ "type": "string" }));
+            properties.insert("stderr".to_string(), json!({ "type": "string" }));
+            properties.insert("exitCode".to_string(), json!({ "type": "integer" }));
+            properties.insert("restarted".to_string(), json!({ "type": "boolean" }));
+            properties.insert(
+                "tabs".to_string(),
+                json!({ "type": "array", "items": { "type": "object" } }),
+            );
+            properties.insert(
+                "selectedTab".to_string(),
+                json!({ "type": ["object", "null"] }),
+            );
+            properties.insert(
+                "selectedTabId".to_string(),
+                json!({ "type": ["integer", "null"] }),
+            );
+            for field in ["width", "height", "encodedBytes"] {
+                properties.insert(
+                    field.to_string(),
+                    json!({ "type": "integer", "minimum": 0 }),
+                );
+            }
+            properties.insert("mimeType".to_string(), json!({ "type": "string" }));
+            properties.insert("resized".to_string(), json!({ "type": "boolean" }));
+            properties.insert("fullPage".to_string(), json!({ "type": "boolean" }));
+            properties.insert("cleanupWarning".to_string(), json!({ "type": "string" }));
+        }
         "browser_command" => {
             properties.insert("stdout".to_string(), json!({ "type": "string" }));
             properties.insert("stderr".to_string(), json!({ "type": "string" }));
@@ -442,6 +506,157 @@ fn push_handoff_tools(tools: &mut Vec<Value>) {
     tools.push(create_handoff_tool_descriptor());
     tools.push(resume_handoff_tool_descriptor());
     tools.push(complete_handoff_tool_descriptor());
+}
+
+fn push_browser_facade_tools(tools: &mut Vec<Value>, read_only: bool) {
+    let tab_actions = if read_only {
+        vec!["list", "selected"]
+    } else {
+        vec!["list", "selected", "new", "select", "close"]
+    };
+    let dom_actions = if read_only {
+        vec!["snapshot", "wait"]
+    } else {
+        vec![
+            "snapshot",
+            "click",
+            "fill",
+            "fill_form",
+            "hover",
+            "drag",
+            "evaluate",
+            "dialog",
+            "wait",
+            "upload",
+        ]
+    };
+    let cua_actions = if read_only {
+        vec!["screenshot"]
+    } else {
+        vec!["screenshot", "click", "type", "keypress", "scroll"]
+    };
+    let viewport_actions = if read_only {
+        vec!["get"]
+    } else {
+        vec!["get", "set"]
+    };
+
+    tools.push(json!({
+        "name": "browser_state",
+        "title": "Get browser state",
+        "description": "Read MoonDesk's Codex-style agent-browser state without launching Chromium. Returns the configured headless/visible presentation, whether the shared runtime is live, this conversation's owned tabs, the selected logical tab, and the high-level capability groups available through MoonDesk. Use this for ambient browser context before deciding which browser action to take.",
+        "inputSchema": { "type": "object", "properties": {} },
+        "annotations": { "readOnlyHint": true, "openWorldHint": false, "destructiveHint": false }
+    }));
+    tools.push(json!({
+        "name": "browser_tabs",
+        "title": "Control browser tabs",
+        "description": "Codex-style tab control for this conversation's logical browser session. List or inspect the selected tab, open a new isolated-workspace tab, select one of this conversation's logical tab IDs, or close one. MoonDesk never exposes raw upstream Chrome page IDs or another conversation's tabs.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "action": { "type": "string", "enum": tab_actions },
+                "url": { "type": "string", "description": "URL for action=new. Defaults to about:blank." },
+                "tab_id": { "type": "integer", "minimum": 1, "description": "Conversation-local logical tab ID for action=select or close." },
+                "background": { "type": "boolean", "description": "Open a new tab in the background (default false)." },
+                "timeout_ms": { "type": "integer", "minimum": 1, "maximum": MAX_BROWSER_TIMEOUT_MS, "description": "Maximum browser operation runtime in milliseconds." }
+            },
+            "required": ["action"]
+        },
+        "annotations": { "readOnlyHint": read_only, "openWorldHint": true, "destructiveHint": !read_only }
+    }));
+    if !read_only {
+        tools.push(json!({
+            "name": "browser_navigate",
+            "title": "Navigate browser",
+            "description": "Navigate the selected MoonDesk browser tab using Codex-style page actions: goto a URL, go back, go forward, or reload. The selected tab remains conversation-owned and workspace-isolated.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string", "enum": ["goto", "back", "forward", "reload"] },
+                    "url": { "type": "string", "description": "Target URL for action=goto." },
+                    "timeout_ms": { "type": "integer", "minimum": 1, "maximum": MAX_BROWSER_TIMEOUT_MS },
+                    "ignore_cache": { "type": "boolean", "description": "Ignore cache for action=reload." },
+                    "init_script": { "type": "string", "description": "JavaScript injected into each new document for the next navigation." }
+                },
+                "required": ["action"]
+            },
+            "annotations": { "readOnlyHint": false, "openWorldHint": true, "destructiveHint": true }
+        }));
+    }
+    tools.push(json!({
+        "name": "browser_dom",
+        "title": "Control browser DOM",
+        "description": "DOM-oriented browser control analogous to Codex Browser's Playwright/DOM path. Take an accessibility snapshot, click/fill/hover/drag by the latest snapshot UID, fill a form in one call, evaluate page JavaScript, wait for text, or upload a file. Prefer this for ordinary web UI interactions; use browser_cua when visual/coordinate control is more appropriate.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "action": { "type": "string", "enum": dom_actions },
+                "uid": { "type": "string" },
+                "value": { "type": "string" },
+                "from_uid": { "type": "string" },
+                "to_uid": { "type": "string" },
+                "function": { "type": "string" },
+                "args": { "type": "array", "maxItems": MAX_BROWSER_ARGS, "items": { "type": "string", "maxLength": MAX_BROWSER_ARG_BYTES } },
+                "text": { "type": "array", "minItems": 1, "maxItems": MAX_BROWSER_ARGS, "items": { "type": "string", "minLength": 1, "maxLength": MAX_BROWSER_ARG_BYTES } },
+                "elements": { "type": "array", "minItems": 1, "maxItems": MAX_BROWSER_ARGS, "items": { "type": "object", "properties": { "uid": { "type": "string" }, "value": { "type": "string" } }, "required": ["uid", "value"] } },
+                "file_path": { "type": "string" },
+                "dialog_action": { "type": "string", "enum": ["accept", "dismiss"], "description": "dialog only: accept or dismiss the active JavaScript dialog." },
+                "prompt_text": { "type": "string", "description": "dialog only: optional prompt response text used when accepting a prompt dialog." },
+                "include_snapshot": { "type": "boolean" },
+                "dbl_click": { "type": "boolean" },
+                "verbose": { "type": "boolean" },
+                "timeout_ms": { "type": "integer", "minimum": 1, "maximum": MAX_BROWSER_TIMEOUT_MS, "description": "Maximum browser operation runtime in milliseconds. Omit it to use MoonDesk's default timeout." }
+            },
+            "required": ["action"]
+        },
+        "annotations": { "readOnlyHint": read_only, "openWorldHint": true, "destructiveHint": !read_only }
+    }));
+    tools.push(json!({
+        "name": "browser_cua",
+        "title": "Control browser visually",
+        "description": "Visual/coordinate browser control analogous to Codex Browser's computer-use path. Capture rendered page pixels, click at viewport coordinates, type into the focused control, press keys, or scroll the current page. Use this for canvas, custom editors, visual builders, maps, and other interfaces where DOM UIDs are unreliable.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "action": { "type": "string", "enum": cua_actions },
+                "x": { "type": "number" },
+                "y": { "type": "number" },
+                "dbl_click": { "type": "boolean" },
+                "include_snapshot": { "type": "boolean" },
+                "text": { "type": "string", "maxLength": MAX_BROWSER_ARG_BYTES },
+                "submit_key": { "type": "string" },
+                "key": { "type": "string" },
+                "delta_x": { "type": "number" },
+                "delta_y": { "type": "number" },
+                "full_page": { "type": "boolean" },
+                "quality": { "type": "integer", "minimum": vision::MIN_JPEG_QUALITY, "maximum": vision::MAX_JPEG_QUALITY },
+                "timeout_ms": { "type": "integer", "minimum": 1, "maximum": MAX_BROWSER_TIMEOUT_MS }
+            },
+            "required": ["action"]
+        },
+        "annotations": { "readOnlyHint": read_only, "openWorldHint": true, "destructiveHint": !read_only }
+    }));
+    tools.push(json!({
+        "name": "browser_viewport",
+        "title": "Control browser viewport",
+        "description": "Get or set the selected tab's browser viewport. A plain desktop size uses Chromium window resizing; supplying DPR/mobile/touch/landscape requests exact device emulation so responsive QA is deterministic even when a visible desktop window would otherwise clamp narrow dimensions.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "action": { "type": "string", "enum": viewport_actions },
+                "width": { "type": "integer", "minimum": 1 },
+                "height": { "type": "integer", "minimum": 1 },
+                "dpr": { "type": "number", "exclusiveMinimum": 0 },
+                "mobile": { "type": "boolean" },
+                "touch": { "type": "boolean" },
+                "landscape": { "type": "boolean" },
+                "timeout_ms": { "type": "integer", "minimum": 1, "maximum": MAX_BROWSER_TIMEOUT_MS }
+            },
+            "required": ["action"]
+        },
+        "annotations": { "readOnlyHint": read_only, "openWorldHint": true, "destructiveHint": !read_only }
+    }));
 }
 
 async fn handle_tools_list(
@@ -724,14 +939,15 @@ async fn handle_tools_list(
                 "annotations": { "readOnlyHint": false, "openWorldHint": false, "destructiveHint": true }
             }));
         }
+        push_browser_facade_tools(&mut tools, browser_read_only);
         tools.push(json!({
             "name": "browser_command",
             "title": "Run browser command",
-            "description": "Run one Chrome DevTools browser operation through MoonDesk's shared lazy Chromium runtime. MoonDesk keeps one Chromium/MCP process for efficiency, gives each workspace an isolated BrowserContext for cookies/storage, and gives each MCP conversation its own logical tab set. Page-scoped operations are routed server-side to this conversation's owned page rather than to Chromium's globally selected tab; list/select/close expose only conversation-local logical page IDs. Keep browser work on the connector that owns the project instead of switching to another workspace connector. The browser is headless by default and can be made visible with set_browser_presentation. Use resize_page for normal desktop sizes; use emulate with --viewport=<width>x<height>x<dpr>[,mobile][,touch] for exact responsive testing, then take a fresh snapshot before using UIDs. Browser-global extension lifecycle commands are intentionally blocked. In read-only mode MoonDesk permits only bounded inspection commands, requires lighthouse_audit to use explicit --mode=snapshot, and rejects state-changing actions or browser file-output flags. Relative browser input paths stay inside the active workspace. Browser-only mode keeps browser inputs workspace-scoped. When Computer tools are also enabled (Both mode), an explicit absolute input-file path may reference another regular file readable by the MoonDesk user and is privately staged before Chromium sees it. Browser input directories and file-producing/output paths remain workspace-bound. MoonDesk manages start/status/stop automatically.",
+            "description": "Advanced compatibility/debug escape hatch for running one MoonDesk-native Chrome DevTools Protocol operation. Prefer browser_state, browser_tabs, browser_navigate, browser_dom, browser_cua, and browser_viewport for normal agent browsing. MoonDesk keeps one managed Chromium process for efficiency, gives each workspace an isolated BrowserContext for cookies/storage, and gives each MCP conversation its own logical tab set. Page-scoped operations are routed server-side to this conversation's owned page rather than to Chromium's globally selected tab; list/select/close expose only conversation-local logical page IDs. Keep browser work on the connector that owns the project instead of switching to another workspace connector. The browser is headless by default and can be made visible with set_browser_presentation. Use resize_page for normal desktop sizes; use emulate with --viewport=<width>x<height>x<dpr>[,mobile][,touch] for exact responsive testing, then take a fresh snapshot before using UIDs. Adapter-specific extension lifecycle, Lighthouse wrapper, WebMCP/third-party discovery, and screencast commands are intentionally not part of the native CDP surface. In read-only mode MoonDesk permits only bounded native inspection commands and rejects state-changing actions or browser file-output flags. Relative browser input paths stay inside the active workspace. Browser-only mode keeps browser inputs workspace-scoped. When Computer tools are also enabled (Both mode), an explicit absolute input-file path may reference another regular file readable by the MoonDesk user and is privately staged before Chromium sees it. Browser file-producing/output paths remain workspace-bound. MoonDesk manages start/status/stop automatically.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "command": { "type": "string", "minLength": 1, "maxLength": MAX_BROWSER_COMMAND_BYTES, "description": "chrome-devtools CLI command name, for example take_snapshot, emulate, or resize_page" },
+                    "command": { "type": "string", "minLength": 1, "maxLength": MAX_BROWSER_COMMAND_BYTES, "description": "MoonDesk native browser command name, for example take_snapshot, emulate, or resize_page" },
                     "args": { "type": "array", "maxItems": MAX_BROWSER_ARGS, "items": { "type": "string", "maxLength": MAX_BROWSER_ARG_BYTES }, "description": "Command arguments in CLI order. Use --flag=value for optional flags when convenient." },
                     "timeout_ms": { "type": "integer", "minimum": 1, "maximum": MAX_BROWSER_TIMEOUT_MS, "description": "Maximum end-to-end browser request runtime in milliseconds" }
                 },
@@ -862,10 +1078,12 @@ async fn handle_tools_call_for_workspace(
         .to_string();
 
     let connector_browser_tool = connector_expanded_browser_tool(&tool_name);
+    let facade_browser_tool = browser_facade_tool(&tool_name);
     if matches!(
         tool_name.as_str(),
         "set_browser_presentation" | "browser_command" | "view_page"
     ) || connector_browser_tool
+        || facade_browser_tool
     {
         if workspaces::workspace_availability(Path::new(workspace_root))
             == WorkspaceAvailability::Unavailable
@@ -888,6 +1106,17 @@ async fn handle_tools_call_for_workspace(
             return handle_set_browser_presentation(req, browser_runtime).await;
         }
         let browser_session = browser_session_key(req, workspace_id);
+        if facade_browser_tool {
+            return handle_browser_facade_tool(
+                req,
+                &tool_name,
+                &browser_session,
+                workspace_root,
+                tool_mode,
+                browser_runtime,
+            )
+            .await;
+        }
         if tool_name == "browser_command" {
             return handle_browser_command(
                 req,
@@ -2112,7 +2341,7 @@ Always specify the branch explicitly when using `git push`."#
 
     if mode.browser_enabled() {
         lines.push(
-            "Browser mode exposes a stable browser surface instead of forwarding the full Chrome DevTools MCP catalog. Use browser_command for browser actions and view_page for actual rendered pixels. MoonDesk starts one host-owned Chromium lazily, headless by default at a deterministic 1280x800 initial viewport, in a temporary agent profile that never inherits the user's personal cookies or logged-in browser state. Inside that Chromium, each MoonDesk workspace gets an isolated BrowserContext for cookies/storage and each MCP conversation gets its own logical page set; page operations are routed to this conversation's owned page rather than whatever tab Chromium globally selected. Keep browser actions on the connector that owns the project; do not switch to another workspace connector merely because it exposes browser tools. `moondesk browser` shares the same Chromium and workspace BrowserContext but intentionally has its own local-CLI logical tab session instead of stealing an MCP conversation's active page. Headless presentation still supports rendered-pixel inspection through view_page and screenshots; resize or emulate the target viewport before responsive or pixel-sensitive QA. Presentation is global to Chromium, so changing it while the browser is running closes all MoonDesk workspace contexts and conversation tabs; take fresh pages/snapshots afterward. For local web-app verification, navigate to the dev server, set the target viewport before taking interaction UIDs, use resize_page for normal desktop sizes and emulate --viewport=<width>x<height>x<dpr>[,mobile][,touch] for exact tablet/mobile QA, then take_snapshot. Navigation, viewport emulation, substantial DOM changes, and presentation changes can invalidate UIDs, so take a fresh snapshot before further element interactions. Accessibility/text snapshots are useful for structure but do not replace view_page for visual judgment. MoonDesk manages browser start/status/stop automatically; do not invoke lifecycle commands through browser_command or call npx chrome-devtools-mcp directly. Relative browser input paths stay inside the active workspace. Browser-only mode keeps browser inputs workspace-scoped. When Computer tools are also enabled (Both mode), an explicit absolute input-file path may reference another regular file readable by the MoonDesk user and is privately staged before Chromium sees it. Browser input directories and file-producing/output paths remain workspace-bound."
+            "Browser mode exposes a Codex-style capability surface instead of making Chrome DevTools commands the normal interaction model. Start with browser_state for ambient state; use browser_tabs for conversation-owned tabs, browser_navigate for page navigation, browser_dom for DOM/snapshot interactions, browser_cua for rendered-pixel and coordinate interactions, and browser_viewport for viewport inspection/emulation. browser_command remains an advanced compatibility/debug escape hatch, and view_page remains a direct rendered-pixel helper. MoonDesk starts one host-owned managed Chromium lazily, headless by default at a deterministic 1280x800 initial viewport, in a temporary agent profile that never inherits the user's personal cookies or logged-in browser state. On an empty cache MoonDesk provisions its pinned Chrome for Testing build with exact size/SHA-256 verification and controls it directly through native Rust CDP. Inside that Chromium, each MoonDesk workspace gets an isolated BrowserContext for cookies/storage and each MCP conversation gets its own logical page set; page operations are routed to this conversation's owned page rather than whatever tab Chromium globally selected. Keep browser actions on the connector that owns the project; do not switch to another workspace connector merely because it exposes browser tools. `moondesk browser` shares the same Chromium and workspace BrowserContext but intentionally has its own local-CLI logical tab session instead of stealing an MCP conversation's active page. Headless and visible presentation are two modes of the same agent Chromium and both support the same tab, DOM, visual CUA, viewport, console/network, and screenshot capabilities. Use browser_cua action=screenshot or view_page whenever appearance matters. Presentation is global to Chromium, so changing it while the browser is running closes all MoonDesk workspace contexts and conversation tabs; take fresh pages/snapshots afterward. For local web-app verification, navigate to the dev server with browser_navigate, set the target size with browser_viewport before taking DOM UIDs, then use browser_dom action=snapshot. Navigation, viewport changes, substantial DOM changes, and presentation changes can invalidate UIDs, so take a fresh browser_dom snapshot before further UID interactions. Prefer browser_dom for ordinary controls and forms; use browser_cua for canvas/custom editors/maps or other visual interfaces where DOM UIDs are unreliable. Accessibility/text snapshots are structural evidence and do not replace browser_cua screenshots or view_page for visual judgment. MoonDesk manages browser start/status/stop automatically; do not invoke lifecycle commands through browser_command or launch a separate DevTools adapter. Prefer the capability facade for normal work and drop to browser_command only for advanced DevTools functionality not represented by the facade. Relative browser input paths stay inside the active workspace. Browser-only mode keeps browser inputs workspace-scoped. When Computer tools are also enabled (Both mode), an explicit absolute input-file path may reference another regular file readable by the MoonDesk user and is privately staged before Chromium sees it. Browser file-producing/output paths remain workspace-bound."
                 .to_string(),
         );
         if tool_mode.write_tools_enabled() {
@@ -2123,7 +2352,7 @@ Always specify the branch explicitly when using `git push`."#
         }
         if mode.computer_enabled() && tool_mode.run_command_enabled() {
             lines.push(
-                "For repetitive deterministic browser flows in Both mode, use the `moondesk browser <command> ...` subcommand from scripts or loops; it is a lightweight client to the same running MoonDesk host/session rather than a second browser executable. Run `moondesk browser skill` when you need the workflow reference. Prefer browser_command for one-off actions and return to view_page whenever appearance matters."
+                "For repetitive deterministic browser flows in Both mode, use the `moondesk browser <command> ...` subcommand from scripts or loops; it is a lightweight client to the same running MoonDesk host/session rather than a second browser executable. Run `moondesk browser skill` when you need the workflow reference. For interactive agent work prefer browser_state/browser_tabs/browser_navigate/browser_dom/browser_cua/browser_viewport; use browser_command only for advanced DevTools operations that the facade does not expose."
                     .to_string(),
             );
         }
@@ -2619,7 +2848,7 @@ fn handle_view_images(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcResp
     )
 }
 
-const CONNECTOR_PINNED_BROWSER_TOOLS: &[&str] = &[
+const CONNECTOR_NATIVE_BROWSER_TOOLS: &[&str] = &[
     "click",
     "close_page",
     "drag",
@@ -2630,13 +2859,11 @@ const CONNECTOR_PINNED_BROWSER_TOOLS: &[&str] = &[
     "get_network_request",
     "handle_dialog",
     "hover",
-    "lighthouse_audit",
     "list_console_messages",
     "list_network_requests",
     "list_pages",
     "navigate_page",
     "new_page",
-    "performance_analyze_insight",
     "performance_start_trace",
     "performance_stop_trace",
     "press_key",
@@ -2650,8 +2877,20 @@ const CONNECTOR_PINNED_BROWSER_TOOLS: &[&str] = &[
 ];
 
 fn connector_expanded_browser_tool(tool_name: &str) -> bool {
-    CONNECTOR_PINNED_BROWSER_TOOLS.contains(&tool_name)
+    CONNECTOR_NATIVE_BROWSER_TOOLS.contains(&tool_name)
         || matches!(tool_name, "fill_form" | "wait_for")
+}
+
+fn browser_facade_tool(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "browser_state"
+            | "browser_tabs"
+            | "browser_navigate"
+            | "browser_dom"
+            | "browser_cua"
+            | "browser_viewport"
+    )
 }
 
 fn browser_arg_uses_flag(args: &[String], flag: &str) -> bool {
@@ -2663,55 +2902,16 @@ fn browser_arg_uses_flag(args: &[String], flag: &str) -> bool {
         .any(|actual| actual == expected)
 }
 
-fn browser_all_flag_values_equal(args: &[String], flag: &str, expected_value: &str) -> bool {
-    let Some(expected_flag) = canonical_browser_flag_name(flag) else {
-        return false;
-    };
-    let mut found = false;
-    let mut index = 0;
-    while index < args.len() {
-        let arg = &args[index];
-        if canonical_browser_flag_name(arg).as_deref() != Some(expected_flag.as_str()) {
-            index += 1;
-            continue;
-        }
-        found = true;
-        let value = if let Some((_, value)) = arg.split_once('=') {
-            Some(value)
-        } else {
-            args.get(index + 1)
-                .filter(|value| !value.starts_with('-'))
-                .map(String::as_str)
-        };
-        if !value.is_some_and(|value| value.eq_ignore_ascii_case(expected_value)) {
-            return false;
-        }
-        if !arg.contains('=') {
-            index += 1;
-        }
-        index += 1;
-    }
-    found
-}
-
 fn browser_command_allowed_read_only(command: &str, args: &[String]) -> bool {
     match command {
         "list_pages"
         | "get_console_message"
         | "list_console_messages"
-        | "list_network_requests"
-        | "performance_analyze_insight" => true,
+        | "list_network_requests" => true,
         "take_snapshot" => !browser_arg_uses_flag(args, "--filePath"),
         "get_network_request" => {
             !browser_arg_uses_flag(args, "--requestFilePath")
                 && !browser_arg_uses_flag(args, "--responseFilePath")
-        }
-        // Upstream v1.7 defaults Lighthouse to navigation mode, which reloads the page and is
-        // explicitly marked readOnlyHint=false. ReadOnly only permits the non-navigating snapshot
-        // form, and never permits report output to disk.
-        "lighthouse_audit" => {
-            !browser_arg_uses_flag(args, "--outputDirPath")
-                && browser_all_flag_values_equal(args, "--mode", "snapshot")
         }
         _ => false,
     }
@@ -2748,6 +2948,1136 @@ fn browser_command_output_response(
             "restarted": output.restarted,
         }),
     )
+}
+
+fn browser_facade_argument_keys(
+    arguments: &Value,
+    allowed: &[&str],
+    tool_name: &str,
+) -> Result<(), String> {
+    let Some(object) = arguments.as_object() else {
+        return Err(format!("{tool_name} arguments must be an object"));
+    };
+    if let Some(key) = object.keys().find(|key| !allowed.contains(&key.as_str())) {
+        return Err(format!("{tool_name} contains unknown argument '{key}'"));
+    }
+    Ok(())
+}
+
+fn browser_facade_timeout_ms(arguments: &Value) -> Result<u64, String> {
+    match arguments.get("timeout_ms") {
+        None => Ok(DEFAULT_BROWSER_COMMAND_TIMEOUT.as_millis() as u64),
+        Some(value) => match value.as_u64() {
+            Some(value @ 1..=MAX_BROWSER_TIMEOUT_MS) => Ok(value),
+            _ => Err(format!(
+                "timeout_ms must be an integer between 1 and {MAX_BROWSER_TIMEOUT_MS}"
+            )),
+        },
+    }
+}
+
+fn browser_required_u64_argument(arguments: &Value, name: &str) -> Result<u64, String> {
+    arguments
+        .get(name)
+        .and_then(Value::as_u64)
+        .ok_or_else(|| format!("Missing or invalid required parameter: {name}"))
+}
+
+fn browser_required_number_argument(arguments: &Value, name: &str) -> Result<f64, String> {
+    arguments
+        .get(name)
+        .and_then(Value::as_f64)
+        .ok_or_else(|| format!("Missing or invalid required parameter: {name}"))
+}
+
+fn browser_optional_number_argument(arguments: &Value, name: &str) -> Result<Option<f64>, String> {
+    match arguments.get(name) {
+        None => Ok(None),
+        Some(value) => value
+            .as_f64()
+            .map(Some)
+            .ok_or_else(|| format!("Parameter {name} must be a number")),
+    }
+}
+
+fn browser_selected_tab(tabs: &[Value]) -> Option<Value> {
+    tabs.iter()
+        .find(|tab| tab.get("selected").and_then(Value::as_bool) == Some(true))
+        .cloned()
+}
+
+fn browser_facade_text(output: &BrowserCommandOutput) -> String {
+    [output.stdout.trim(), output.stderr.trim()]
+        .into_iter()
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+async fn browser_facade_output_response(
+    req: &JsonRpcRequest,
+    command: &str,
+    output: BrowserCommandOutput,
+    runtime: &BrowserRuntime,
+    browser_session: &BrowserSessionKey,
+) -> JsonRpcResponse {
+    if !output.success() {
+        let details = output.failure_details();
+        return tool_error_response(
+            req,
+            if details.is_empty() {
+                format!("Browser action '{command}' failed")
+            } else {
+                format!("Browser action '{command}' failed:\n{details}")
+            },
+        );
+    }
+    let tabs = runtime.session_pages(browser_session).await;
+    let selected_tab = browser_selected_tab(&tabs);
+    let selected_tab_id = selected_tab
+        .as_ref()
+        .and_then(|tab| tab.get("id"))
+        .and_then(Value::as_u64);
+    tool_success_response_with_structured(
+        req,
+        browser_facade_text(&output),
+        json!({
+            "stdout": output.stdout,
+            "stderr": output.stderr,
+            "exitCode": output.exit_code,
+            "restarted": output.restarted,
+            "tabs": tabs,
+            "selectedTab": selected_tab,
+            "selectedTabId": selected_tab_id,
+        }),
+    )
+}
+
+async fn run_browser_facade_command(
+    runtime: &BrowserRuntime,
+    browser_session: &BrowserSessionKey,
+    workspace_root: &str,
+    command: &str,
+    arguments: Value,
+    timeout_ms: u64,
+) -> Result<BrowserCommandOutput, String> {
+    let cli_args = browser_structured_arguments_to_cli(command, &arguments)?;
+    validate_browser_request_bounds(command, &cli_args, timeout_ms)?;
+    runtime
+        .run_for_session(
+            browser_session,
+            workspace_root,
+            command,
+            &cli_args,
+            std::time::Duration::from_millis(timeout_ms),
+        )
+        .await
+}
+
+fn browser_facade_proxy_request(
+    req: &JsonRpcRequest,
+    name: &str,
+    arguments: Value,
+) -> JsonRpcRequest {
+    JsonRpcRequest {
+        jsonrpc: req.jsonrpc.clone(),
+        id: req.id.clone(),
+        method: req.method.clone(),
+        params: json!({ "name": name, "arguments": arguments }),
+    }
+}
+
+async fn handle_browser_state(
+    req: &JsonRpcRequest,
+    browser_session: &BrowserSessionKey,
+    browser_runtime: &Option<Arc<BrowserRuntime>>,
+) -> JsonRpcResponse {
+    let arguments = tool_arguments(req);
+    if let Err(error) = browser_facade_argument_keys(&arguments, &[], "browser_state") {
+        return tool_error_response(req, error);
+    }
+    let Some(runtime) = browser_runtime else {
+        return tool_error_response(
+            req,
+            "Browser runtime is unavailable. Restart MoonDesk in Browser or Both mode.".to_string(),
+        );
+    };
+    let presentation = runtime.presentation().await;
+    let running = runtime.is_running().await;
+    let tabs = runtime.session_pages(browser_session).await;
+    let selected_tab = browser_selected_tab(&tabs);
+    let selected_tab_id = selected_tab
+        .as_ref()
+        .and_then(|tab| tab.get("id"))
+        .and_then(Value::as_u64);
+    let text = format!(
+        "Agent browser · {} · {} · {} tab(s)",
+        presentation.label(),
+        if running {
+            "running"
+        } else {
+            "starts on demand"
+        },
+        tabs.len()
+    );
+    tool_success_response_with_structured(
+        req,
+        text,
+        json!({
+            "presentation": presentation.config_value(),
+            "browserRunning": running,
+            "tabs": tabs,
+            "selectedTab": selected_tab,
+            "selectedTabId": selected_tab_id,
+            "capabilities": {
+                "tabs": true,
+                "navigation": true,
+                "dom": true,
+                "visualCua": true,
+                "viewport": true,
+                "headless": true,
+                "visible": true,
+                "advancedDevtools": true,
+                "workspaceIsolatedStorage": true,
+                "conversationOwnedTabs": true,
+            }
+        }),
+    )
+}
+
+async fn handle_browser_tabs(
+    req: &JsonRpcRequest,
+    browser_session: &BrowserSessionKey,
+    workspace_root: &str,
+    tool_mode: ToolMode,
+    browser_runtime: &Option<Arc<BrowserRuntime>>,
+) -> JsonRpcResponse {
+    let arguments = tool_arguments(req);
+    let action = match required_string_argument(&arguments, "action") {
+        Ok(action) => action,
+        Err(error) => return tool_error_response(req, error),
+    };
+    if tool_mode.read_only() && !matches!(action, "list" | "selected") {
+        return tool_error_response(
+            req,
+            format!("browser_tabs action '{action}' is blocked in read-only mode"),
+        );
+    }
+    let timeout_ms = match browser_facade_timeout_ms(&arguments) {
+        Ok(timeout) => timeout,
+        Err(error) => return tool_error_response(req, error),
+    };
+    let Some(runtime) = browser_runtime else {
+        return tool_error_response(
+            req,
+            "Browser runtime is unavailable. Restart MoonDesk in Browser or Both mode.".to_string(),
+        );
+    };
+
+    let command_arguments = match action {
+        "list" | "selected" => {
+            if let Err(error) =
+                browser_facade_argument_keys(&arguments, &["action", "timeout_ms"], "browser_tabs")
+            {
+                return tool_error_response(req, error);
+            }
+            json!({})
+        }
+        "new" => {
+            if let Err(error) = browser_facade_argument_keys(
+                &arguments,
+                &["action", "url", "background", "timeout_ms"],
+                "browser_tabs",
+            ) {
+                return tool_error_response(req, error);
+            }
+            let url = match optional_string_argument(&arguments, "url") {
+                Ok(Some(url)) => url,
+                Ok(None) => "about:blank",
+                Err(error) => return tool_error_response(req, error),
+            };
+            let background = match optional_bool_argument(&arguments, "background", false) {
+                Ok(value) => value,
+                Err(error) => return tool_error_response(req, error),
+            };
+            json!({ "url": url, "background": background })
+        }
+        "select" | "close" => {
+            if let Err(error) = browser_facade_argument_keys(
+                &arguments,
+                &["action", "tab_id", "timeout_ms"],
+                "browser_tabs",
+            ) {
+                return tool_error_response(req, error);
+            }
+            let tab_id = match browser_required_u64_argument(&arguments, "tab_id") {
+                Ok(tab_id) if tab_id > 0 => tab_id,
+                Ok(_) => return tool_error_response(req, "tab_id must be at least 1".to_string()),
+                Err(error) => return tool_error_response(req, error),
+            };
+            json!({ "pageId": tab_id })
+        }
+        _ => {
+            return tool_error_response(
+                req,
+                "browser_tabs action must be list, selected, new, select, or close".to_string(),
+            );
+        }
+    };
+    let command = match action {
+        "list" | "selected" => "list_pages",
+        "new" => "new_page",
+        "select" => "select_page",
+        "close" => "close_page",
+        _ => {
+            return tool_error_response(
+                req,
+                "browser_tabs action must be list, selected, new, select, or close".to_string(),
+            );
+        }
+    };
+    let output = match run_browser_facade_command(
+        runtime,
+        browser_session,
+        workspace_root,
+        command,
+        command_arguments,
+        timeout_ms,
+    )
+    .await
+    {
+        Ok(output) => output,
+        Err(error) => return tool_error_response(req, format!("Browser tabs failed: {error}")),
+    };
+    browser_facade_output_response(req, action, output, runtime, browser_session).await
+}
+
+async fn handle_browser_navigate(
+    req: &JsonRpcRequest,
+    browser_session: &BrowserSessionKey,
+    workspace_root: &str,
+    tool_mode: ToolMode,
+    browser_runtime: &Option<Arc<BrowserRuntime>>,
+) -> JsonRpcResponse {
+    if tool_mode.read_only() {
+        return read_only_blocked_response(req, "browser_navigate");
+    }
+    let arguments = tool_arguments(req);
+    if let Err(error) = browser_facade_argument_keys(
+        &arguments,
+        &["action", "url", "timeout_ms", "ignore_cache", "init_script"],
+        "browser_navigate",
+    ) {
+        return tool_error_response(req, error);
+    }
+    let action = match required_string_argument(&arguments, "action") {
+        Ok(action) => action,
+        Err(error) => return tool_error_response(req, error),
+    };
+    let timeout_ms = match browser_facade_timeout_ms(&arguments) {
+        Ok(timeout) => timeout,
+        Err(error) => return tool_error_response(req, error),
+    };
+    let mut command_arguments = Map::new();
+    command_arguments.insert(
+        "type".to_string(),
+        Value::String(
+            match action {
+                "goto" => "url",
+                "back" => "back",
+                "forward" => "forward",
+                "reload" => "reload",
+                _ => {
+                    return tool_error_response(
+                        req,
+                        "browser_navigate action must be goto, back, forward, or reload"
+                            .to_string(),
+                    );
+                }
+            }
+            .to_string(),
+        ),
+    );
+    if action == "goto" {
+        let url = match required_string_argument(&arguments, "url") {
+            Ok(url) if !url.trim().is_empty() => url,
+            Ok(_) => return tool_error_response(req, "url must not be empty".to_string()),
+            Err(error) => return tool_error_response(req, error),
+        };
+        command_arguments.insert("url".to_string(), Value::String(url.to_string()));
+    } else if arguments.get("url").is_some() {
+        return tool_error_response(req, "url is only valid for action=goto".to_string());
+    }
+    if let Some(value) = arguments.get("ignore_cache") {
+        if action != "reload" {
+            return tool_error_response(
+                req,
+                "ignore_cache is only valid for action=reload".to_string(),
+            );
+        }
+        let value = value
+            .as_bool()
+            .ok_or_else(|| "ignore_cache must be a boolean".to_string());
+        match value {
+            Ok(value) => {
+                command_arguments.insert("ignoreCache".to_string(), Value::Bool(value));
+            }
+            Err(error) => return tool_error_response(req, error),
+        }
+    }
+    if let Some(value) = arguments.get("init_script") {
+        if action != "goto" {
+            return tool_error_response(
+                req,
+                "init_script is only valid for action=goto".to_string(),
+            );
+        }
+        let Some(value) = value.as_str() else {
+            return tool_error_response(req, "init_script must be a string".to_string());
+        };
+        command_arguments.insert("initScript".to_string(), Value::String(value.to_string()));
+    }
+    let Some(runtime) = browser_runtime else {
+        return tool_error_response(
+            req,
+            "Browser runtime is unavailable. Restart MoonDesk in Browser or Both mode.".to_string(),
+        );
+    };
+    let output = match run_browser_facade_command(
+        runtime,
+        browser_session,
+        workspace_root,
+        "navigate_page",
+        Value::Object(command_arguments),
+        timeout_ms,
+    )
+    .await
+    {
+        Ok(output) => output,
+        Err(error) => {
+            return tool_error_response(req, format!("Browser navigation failed: {error}"));
+        }
+    };
+    browser_facade_output_response(req, action, output, runtime, browser_session).await
+}
+
+async fn handle_browser_dom(
+    req: &JsonRpcRequest,
+    browser_session: &BrowserSessionKey,
+    workspace_root: &str,
+    tool_mode: ToolMode,
+    browser_runtime: &Option<Arc<BrowserRuntime>>,
+) -> JsonRpcResponse {
+    let arguments = tool_arguments(req);
+    let action = match required_string_argument(&arguments, "action") {
+        Ok(action) => action,
+        Err(error) => return tool_error_response(req, error),
+    };
+    if tool_mode.read_only() && !matches!(action, "snapshot" | "wait") {
+        return tool_error_response(
+            req,
+            format!("browser_dom action '{action}' is blocked in read-only mode"),
+        );
+    }
+    let Some(runtime) = browser_runtime else {
+        return tool_error_response(
+            req,
+            "Browser runtime is unavailable. Restart MoonDesk in Browser or Both mode.".to_string(),
+        );
+    };
+
+    if action == "fill_form" {
+        if let Err(error) = browser_facade_argument_keys(
+            &arguments,
+            &["action", "elements", "include_snapshot"],
+            "browser_dom",
+        ) {
+            return tool_error_response(req, error);
+        }
+        let proxy = browser_facade_proxy_request(
+            req,
+            "fill_form",
+            json!({
+                "elements": arguments.get("elements").cloned().unwrap_or(Value::Null),
+                "includeSnapshot": arguments.get("include_snapshot").cloned().unwrap_or(Value::Bool(false)),
+            }),
+        );
+        return handle_connector_fill_form(
+            &proxy,
+            browser_session,
+            workspace_root,
+            tool_mode,
+            browser_runtime,
+        )
+        .await;
+    }
+    if action == "wait" {
+        if let Err(error) = browser_facade_argument_keys(
+            &arguments,
+            &["action", "text", "timeout_ms"],
+            "browser_dom",
+        ) {
+            return tool_error_response(req, error);
+        }
+        let timeout_ms = match browser_facade_timeout_ms(&arguments) {
+            Ok(timeout) => timeout,
+            Err(error) => return tool_error_response(req, error),
+        };
+        let proxy = browser_facade_proxy_request(
+            req,
+            "wait_for",
+            json!({
+                "text": arguments.get("text").cloned().unwrap_or(Value::Null),
+                "timeout": timeout_ms,
+            }),
+        );
+        return handle_connector_wait_for(&proxy, browser_session, workspace_root, browser_runtime)
+            .await;
+    }
+
+    let timeout_ms = match browser_facade_timeout_ms(&arguments) {
+        Ok(timeout) => timeout,
+        Err(error) => return tool_error_response(req, error),
+    };
+    let (command, command_arguments) = match action {
+        "snapshot" => {
+            if let Err(error) = browser_facade_argument_keys(
+                &arguments,
+                &["action", "verbose", "timeout_ms"],
+                "browser_dom",
+            ) {
+                return tool_error_response(req, error);
+            }
+            let verbose = match optional_bool_argument(&arguments, "verbose", false) {
+                Ok(value) => value,
+                Err(error) => return tool_error_response(req, error),
+            };
+            ("take_snapshot", json!({ "verbose": verbose }))
+        }
+        "click" => {
+            if let Err(error) = browser_facade_argument_keys(
+                &arguments,
+                &[
+                    "action",
+                    "uid",
+                    "dbl_click",
+                    "include_snapshot",
+                    "timeout_ms",
+                ],
+                "browser_dom",
+            ) {
+                return tool_error_response(req, error);
+            }
+            let uid = match required_string_argument(&arguments, "uid") {
+                Ok(uid) => uid,
+                Err(error) => return tool_error_response(req, error),
+            };
+            let dbl_click = match optional_bool_argument(&arguments, "dbl_click", false) {
+                Ok(value) => value,
+                Err(error) => return tool_error_response(req, error),
+            };
+            let include_snapshot =
+                match optional_bool_argument(&arguments, "include_snapshot", false) {
+                    Ok(value) => value,
+                    Err(error) => return tool_error_response(req, error),
+                };
+            (
+                "click",
+                json!({ "uid": uid, "dblClick": dbl_click, "includeSnapshot": include_snapshot }),
+            )
+        }
+        "fill" => {
+            if let Err(error) = browser_facade_argument_keys(
+                &arguments,
+                &["action", "uid", "value", "include_snapshot", "timeout_ms"],
+                "browser_dom",
+            ) {
+                return tool_error_response(req, error);
+            }
+            let uid = match required_string_argument(&arguments, "uid") {
+                Ok(uid) => uid,
+                Err(error) => return tool_error_response(req, error),
+            };
+            let value = match required_string_argument(&arguments, "value") {
+                Ok(value) => value,
+                Err(error) => return tool_error_response(req, error),
+            };
+            let include_snapshot =
+                match optional_bool_argument(&arguments, "include_snapshot", false) {
+                    Ok(value) => value,
+                    Err(error) => return tool_error_response(req, error),
+                };
+            (
+                "fill",
+                json!({ "uid": uid, "value": value, "includeSnapshot": include_snapshot }),
+            )
+        }
+        "hover" => {
+            if let Err(error) = browser_facade_argument_keys(
+                &arguments,
+                &["action", "uid", "include_snapshot", "timeout_ms"],
+                "browser_dom",
+            ) {
+                return tool_error_response(req, error);
+            }
+            let uid = match required_string_argument(&arguments, "uid") {
+                Ok(uid) => uid,
+                Err(error) => return tool_error_response(req, error),
+            };
+            let include_snapshot =
+                match optional_bool_argument(&arguments, "include_snapshot", false) {
+                    Ok(value) => value,
+                    Err(error) => return tool_error_response(req, error),
+                };
+            (
+                "hover",
+                json!({ "uid": uid, "includeSnapshot": include_snapshot }),
+            )
+        }
+        "drag" => {
+            if let Err(error) = browser_facade_argument_keys(
+                &arguments,
+                &[
+                    "action",
+                    "from_uid",
+                    "to_uid",
+                    "include_snapshot",
+                    "timeout_ms",
+                ],
+                "browser_dom",
+            ) {
+                return tool_error_response(req, error);
+            }
+            let from_uid = match required_string_argument(&arguments, "from_uid") {
+                Ok(uid) => uid,
+                Err(error) => return tool_error_response(req, error),
+            };
+            let to_uid = match required_string_argument(&arguments, "to_uid") {
+                Ok(uid) => uid,
+                Err(error) => return tool_error_response(req, error),
+            };
+            let include_snapshot =
+                match optional_bool_argument(&arguments, "include_snapshot", false) {
+                    Ok(value) => value,
+                    Err(error) => return tool_error_response(req, error),
+                };
+            (
+                "drag",
+                json!({
+                    "from_uid": from_uid,
+                    "to_uid": to_uid,
+                    "includeSnapshot": include_snapshot
+                }),
+            )
+        }
+        "evaluate" => {
+            if let Err(error) = browser_facade_argument_keys(
+                &arguments,
+                &["action", "function", "args", "timeout_ms"],
+                "browser_dom",
+            ) {
+                return tool_error_response(req, error);
+            }
+            let function = match required_string_argument(&arguments, "function") {
+                Ok(function) => function,
+                Err(error) => return tool_error_response(req, error),
+            };
+            let mut value = json!({ "function": function });
+            if let Some(args) = arguments.get("args") {
+                value["args"] = args.clone();
+            }
+            ("evaluate_script", value)
+        }
+        "dialog" => {
+            if let Err(error) = browser_facade_argument_keys(
+                &arguments,
+                &["action", "dialog_action", "prompt_text", "timeout_ms"],
+                "browser_dom",
+            ) {
+                return tool_error_response(req, error);
+            }
+            let dialog_action = match required_string_argument(&arguments, "dialog_action") {
+                Ok(value) if matches!(value, "accept" | "dismiss") => value,
+                Ok(_) => {
+                    return tool_error_response(
+                        req,
+                        "dialog_action must be accept or dismiss".to_string(),
+                    );
+                }
+                Err(error) => return tool_error_response(req, error),
+            };
+            let mut value = json!({ "action": dialog_action });
+            if let Some(prompt_text) = arguments.get("prompt_text") {
+                let Some(prompt_text) = prompt_text.as_str() else {
+                    return tool_error_response(req, "prompt_text must be a string".to_string());
+                };
+                value["promptText"] = Value::String(prompt_text.to_string());
+            }
+            ("handle_dialog", value)
+        }
+        "upload" => {
+            if let Err(error) = browser_facade_argument_keys(
+                &arguments,
+                &[
+                    "action",
+                    "uid",
+                    "file_path",
+                    "include_snapshot",
+                    "timeout_ms",
+                ],
+                "browser_dom",
+            ) {
+                return tool_error_response(req, error);
+            }
+            let uid = match required_string_argument(&arguments, "uid") {
+                Ok(uid) => uid,
+                Err(error) => return tool_error_response(req, error),
+            };
+            let file_path = match required_string_argument(&arguments, "file_path") {
+                Ok(path) => path,
+                Err(error) => return tool_error_response(req, error),
+            };
+            let include_snapshot =
+                match optional_bool_argument(&arguments, "include_snapshot", false) {
+                    Ok(value) => value,
+                    Err(error) => return tool_error_response(req, error),
+                };
+            (
+                "upload_file",
+                json!({
+                    "uid": uid,
+                    "filePath": file_path,
+                    "includeSnapshot": include_snapshot
+                }),
+            )
+        }
+        _ => {
+            return tool_error_response(
+                req,
+                "browser_dom action must be snapshot, click, fill, fill_form, hover, drag, evaluate, dialog, wait, or upload".to_string(),
+            );
+        }
+    };
+    let output = match run_browser_facade_command(
+        runtime,
+        browser_session,
+        workspace_root,
+        command,
+        command_arguments,
+        timeout_ms,
+    )
+    .await
+    {
+        Ok(output) => output,
+        Err(error) => {
+            return tool_error_response(req, format!("Browser DOM action failed: {error}"));
+        }
+    };
+    browser_facade_output_response(req, action, output, runtime, browser_session).await
+}
+
+async fn handle_browser_cua(
+    req: &JsonRpcRequest,
+    browser_session: &BrowserSessionKey,
+    workspace_root: &str,
+    tool_mode: ToolMode,
+    browser_runtime: &Option<Arc<BrowserRuntime>>,
+) -> JsonRpcResponse {
+    let arguments = tool_arguments(req);
+    let action = match required_string_argument(&arguments, "action") {
+        Ok(action) => action,
+        Err(error) => return tool_error_response(req, error),
+    };
+    if tool_mode.read_only() && action != "screenshot" {
+        return tool_error_response(
+            req,
+            format!("browser_cua action '{action}' is blocked in read-only mode"),
+        );
+    }
+    if action == "screenshot" {
+        if let Err(error) = browser_facade_argument_keys(
+            &arguments,
+            &["action", "full_page", "quality"],
+            "browser_cua",
+        ) {
+            return tool_error_response(req, error);
+        }
+        let mut screenshot_arguments = Map::new();
+        if let Some(value) = arguments.get("full_page") {
+            screenshot_arguments.insert("full_page".to_string(), value.clone());
+        }
+        if let Some(value) = arguments.get("quality") {
+            screenshot_arguments.insert("quality".to_string(), value.clone());
+        }
+        let proxy =
+            browser_facade_proxy_request(req, "view_page", Value::Object(screenshot_arguments));
+        return handle_view_page(&proxy, browser_session, workspace_root, browser_runtime).await;
+    }
+
+    let timeout_ms = match browser_facade_timeout_ms(&arguments) {
+        Ok(timeout) => timeout,
+        Err(error) => return tool_error_response(req, error),
+    };
+    let Some(runtime) = browser_runtime else {
+        return tool_error_response(
+            req,
+            "Browser runtime is unavailable. Restart MoonDesk in Browser or Both mode.".to_string(),
+        );
+    };
+    if action == "scroll" {
+        if let Err(error) = browser_facade_argument_keys(
+            &arguments,
+            &["action", "delta_x", "delta_y", "timeout_ms"],
+            "browser_cua",
+        ) {
+            return tool_error_response(req, error);
+        }
+        let delta_x = match browser_optional_number_argument(&arguments, "delta_x") {
+            Ok(value) => value.unwrap_or(0.0),
+            Err(error) => return tool_error_response(req, error),
+        };
+        let delta_y = match browser_optional_number_argument(&arguments, "delta_y") {
+            Ok(value) => value.unwrap_or(0.0),
+            Err(error) => return tool_error_response(req, error),
+        };
+        if delta_x == 0.0 && delta_y == 0.0 {
+            return tool_error_response(
+                req,
+                "browser_cua scroll requires non-zero delta_x or delta_y".to_string(),
+            );
+        }
+        let output = match runtime
+            .scroll_for_session(
+                browser_session,
+                delta_x,
+                delta_y,
+                std::time::Duration::from_millis(timeout_ms),
+            )
+            .await
+        {
+            Ok(output) => output,
+            Err(error) => {
+                return tool_error_response(req, format!("Browser visual action failed: {error}"));
+            }
+        };
+        return browser_facade_output_response(req, action, output, runtime, browser_session).await;
+    }
+    let (command, command_arguments) = match action {
+        "click" => {
+            if let Err(error) = browser_facade_argument_keys(
+                &arguments,
+                &[
+                    "action",
+                    "x",
+                    "y",
+                    "dbl_click",
+                    "include_snapshot",
+                    "timeout_ms",
+                ],
+                "browser_cua",
+            ) {
+                return tool_error_response(req, error);
+            }
+            let x = match browser_required_number_argument(&arguments, "x") {
+                Ok(value) => value,
+                Err(error) => return tool_error_response(req, error),
+            };
+            let y = match browser_required_number_argument(&arguments, "y") {
+                Ok(value) => value,
+                Err(error) => return tool_error_response(req, error),
+            };
+            let dbl_click = match optional_bool_argument(&arguments, "dbl_click", false) {
+                Ok(value) => value,
+                Err(error) => return tool_error_response(req, error),
+            };
+            let include_snapshot =
+                match optional_bool_argument(&arguments, "include_snapshot", false) {
+                    Ok(value) => value,
+                    Err(error) => return tool_error_response(req, error),
+                };
+            (
+                "click_at",
+                json!({
+                    "x": x,
+                    "y": y,
+                    "dblClick": dbl_click,
+                    "includeSnapshot": include_snapshot
+                }),
+            )
+        }
+        "type" => {
+            if let Err(error) = browser_facade_argument_keys(
+                &arguments,
+                &["action", "text", "submit_key", "timeout_ms"],
+                "browser_cua",
+            ) {
+                return tool_error_response(req, error);
+            }
+            let text = match required_string_argument(&arguments, "text") {
+                Ok(text) => text,
+                Err(error) => return tool_error_response(req, error),
+            };
+            let mut value = json!({ "text": text });
+            if let Some(submit_key) = arguments.get("submit_key") {
+                value["submitKey"] = submit_key.clone();
+            }
+            ("type_text", value)
+        }
+        "keypress" => {
+            if let Err(error) = browser_facade_argument_keys(
+                &arguments,
+                &["action", "key", "include_snapshot", "timeout_ms"],
+                "browser_cua",
+            ) {
+                return tool_error_response(req, error);
+            }
+            let key = match required_string_argument(&arguments, "key") {
+                Ok(key) => key,
+                Err(error) => return tool_error_response(req, error),
+            };
+            let include_snapshot =
+                match optional_bool_argument(&arguments, "include_snapshot", false) {
+                    Ok(value) => value,
+                    Err(error) => return tool_error_response(req, error),
+                };
+            (
+                "press_key",
+                json!({ "key": key, "includeSnapshot": include_snapshot }),
+            )
+        }
+        _ => {
+            return tool_error_response(
+                req,
+                "browser_cua action must be screenshot, click, type, keypress, or scroll"
+                    .to_string(),
+            );
+        }
+    };
+    let output = match run_browser_facade_command(
+        runtime,
+        browser_session,
+        workspace_root,
+        command,
+        command_arguments,
+        timeout_ms,
+    )
+    .await
+    {
+        Ok(output) => output,
+        Err(error) => {
+            return tool_error_response(req, format!("Browser visual action failed: {error}"));
+        }
+    };
+    browser_facade_output_response(req, action, output, runtime, browser_session).await
+}
+
+async fn handle_browser_viewport(
+    req: &JsonRpcRequest,
+    browser_session: &BrowserSessionKey,
+    workspace_root: &str,
+    tool_mode: ToolMode,
+    browser_runtime: &Option<Arc<BrowserRuntime>>,
+) -> JsonRpcResponse {
+    let arguments = tool_arguments(req);
+    let action = match required_string_argument(&arguments, "action") {
+        Ok(action) => action,
+        Err(error) => return tool_error_response(req, error),
+    };
+    if tool_mode.read_only() && action != "get" {
+        return tool_error_response(
+            req,
+            format!("browser_viewport action '{action}' is blocked in read-only mode"),
+        );
+    }
+    let timeout_ms = match browser_facade_timeout_ms(&arguments) {
+        Ok(timeout) => timeout,
+        Err(error) => return tool_error_response(req, error),
+    };
+    let Some(runtime) = browser_runtime else {
+        return tool_error_response(
+            req,
+            "Browser runtime is unavailable. Restart MoonDesk in Browser or Both mode.".to_string(),
+        );
+    };
+    let (command, command_arguments) = match action {
+        "get" => {
+            if let Err(error) = browser_facade_argument_keys(
+                &arguments,
+                &["action", "timeout_ms"],
+                "browser_viewport",
+            ) {
+                return tool_error_response(req, error);
+            }
+            (
+                "evaluate_script",
+                json!({
+                    "function": "() => ({ width: window.innerWidth, height: window.innerHeight, devicePixelRatio: window.devicePixelRatio, scrollX: window.scrollX, scrollY: window.scrollY })"
+                }),
+            )
+        }
+        "set" => {
+            if let Err(error) = browser_facade_argument_keys(
+                &arguments,
+                &[
+                    "action",
+                    "width",
+                    "height",
+                    "dpr",
+                    "mobile",
+                    "touch",
+                    "landscape",
+                    "timeout_ms",
+                ],
+                "browser_viewport",
+            ) {
+                return tool_error_response(req, error);
+            }
+            let width = match browser_required_u64_argument(&arguments, "width") {
+                Ok(value @ 1..=16_384) => value,
+                Ok(_) => {
+                    return tool_error_response(
+                        req,
+                        "width must be between 1 and 16384".to_string(),
+                    );
+                }
+                Err(error) => return tool_error_response(req, error),
+            };
+            let height = match browser_required_u64_argument(&arguments, "height") {
+                Ok(value @ 1..=16_384) => value,
+                Ok(_) => {
+                    return tool_error_response(
+                        req,
+                        "height must be between 1 and 16384".to_string(),
+                    );
+                }
+                Err(error) => return tool_error_response(req, error),
+            };
+            let dpr = match browser_optional_number_argument(&arguments, "dpr") {
+                Ok(Some(value)) if value > 0.0 && value <= 10.0 => Some(value),
+                Ok(Some(_)) => {
+                    return tool_error_response(
+                        req,
+                        "dpr must be greater than 0 and at most 10".to_string(),
+                    );
+                }
+                Ok(None) => None,
+                Err(error) => return tool_error_response(req, error),
+            };
+            let mobile = match optional_bool_argument(&arguments, "mobile", false) {
+                Ok(value) => value,
+                Err(error) => return tool_error_response(req, error),
+            };
+            let touch = match optional_bool_argument(&arguments, "touch", false) {
+                Ok(value) => value,
+                Err(error) => return tool_error_response(req, error),
+            };
+            let landscape = match optional_bool_argument(&arguments, "landscape", false) {
+                Ok(value) => value,
+                Err(error) => return tool_error_response(req, error),
+            };
+            if dpr.is_some() || mobile || touch || landscape {
+                let mut viewport = format!("{width}x{height}x{}", dpr.unwrap_or(1.0));
+                if mobile {
+                    viewport.push_str(",mobile");
+                }
+                if touch {
+                    viewport.push_str(",touch");
+                }
+                if landscape {
+                    viewport.push_str(",landscape");
+                }
+                ("emulate", json!({ "viewport": viewport }))
+            } else {
+                ("resize_page", json!({ "width": width, "height": height }))
+            }
+        }
+        _ => {
+            return tool_error_response(
+                req,
+                "browser_viewport action must be get or set".to_string(),
+            );
+        }
+    };
+    let output = match run_browser_facade_command(
+        runtime,
+        browser_session,
+        workspace_root,
+        command,
+        command_arguments,
+        timeout_ms,
+    )
+    .await
+    {
+        Ok(output) => output,
+        Err(error) => {
+            return tool_error_response(req, format!("Browser viewport action failed: {error}"));
+        }
+    };
+    browser_facade_output_response(req, action, output, runtime, browser_session).await
+}
+
+async fn handle_browser_facade_tool(
+    req: &JsonRpcRequest,
+    tool_name: &str,
+    browser_session: &BrowserSessionKey,
+    workspace_root: &str,
+    tool_mode: ToolMode,
+    browser_runtime: &Option<Arc<BrowserRuntime>>,
+) -> JsonRpcResponse {
+    match tool_name {
+        "browser_state" => handle_browser_state(req, browser_session, browser_runtime).await,
+        "browser_tabs" => {
+            handle_browser_tabs(
+                req,
+                browser_session,
+                workspace_root,
+                tool_mode,
+                browser_runtime,
+            )
+            .await
+        }
+        "browser_navigate" => {
+            handle_browser_navigate(
+                req,
+                browser_session,
+                workspace_root,
+                tool_mode,
+                browser_runtime,
+            )
+            .await
+        }
+        "browser_dom" => {
+            handle_browser_dom(
+                req,
+                browser_session,
+                workspace_root,
+                tool_mode,
+                browser_runtime,
+            )
+            .await
+        }
+        "browser_cua" => {
+            handle_browser_cua(
+                req,
+                browser_session,
+                workspace_root,
+                tool_mode,
+                browser_runtime,
+            )
+            .await
+        }
+        "browser_viewport" => {
+            handle_browser_viewport(
+                req,
+                browser_session,
+                workspace_root,
+                tool_mode,
+                browser_runtime,
+            )
+            .await
+        }
+        _ => tool_error_response(req, format!("Unknown browser facade tool: {tool_name}")),
+    }
 }
 
 async fn handle_connector_fill_form(
@@ -3629,6 +4959,17 @@ mod tests {
             })
             .and_then(Value::as_str)
             .expect("missing result text")
+    }
+
+    #[cfg(windows)]
+    fn browser_stdout(response: &JsonRpcResponse) -> &str {
+        response
+            .result
+            .as_ref()
+            .and_then(|result| result.get("structuredContent"))
+            .and_then(|structured| structured.get("stdout"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
     }
 
     fn assert_no_text_content(response: &JsonRpcResponse) {
@@ -5030,6 +6371,12 @@ mod tests {
                 "edit",
                 "delete",
                 "set_browser_presentation",
+                "browser_state",
+                "browser_tabs",
+                "browser_navigate",
+                "browser_dom",
+                "browser_cua",
+                "browser_viewport",
                 "browser_command",
                 "view_page",
             ]
@@ -5067,9 +6414,9 @@ mod tests {
                 description.contains("Browser-only mode keeps browser inputs workspace-scoped")
             );
             assert!(description.contains("When Computer tools are also enabled (Both mode)"));
-            assert!(description.contains(
-                "Browser input directories and file-producing/output paths remain workspace-bound"
-            ));
+            assert!(
+                description.contains("Browser file-producing/output paths remain workspace-bound")
+            );
         }
     }
 
@@ -5201,6 +6548,11 @@ mod tests {
                 "view_image",
                 "view_images",
                 "search",
+                "browser_state",
+                "browser_tabs",
+                "browser_dom",
+                "browser_cua",
+                "browser_viewport",
                 "browser_command",
                 "view_page",
             ]
@@ -5602,18 +6954,6 @@ mod tests {
                 "{command}"
             );
         }
-        assert!(browser_command_allowed_read_only(
-            "lighthouse_audit",
-            &["--mode=snapshot".to_string()]
-        ));
-        assert!(browser_command_allowed_read_only(
-            "lighthouse_audit",
-            &["--MODE".to_string(), "snapshot".to_string()]
-        ));
-        assert!(!browser_command_allowed_read_only(
-            "lighthouse_audit",
-            &no_args
-        ));
         for command in [
             "take_screenshot",
             "new_page",
@@ -5623,6 +6963,8 @@ mod tests {
             "type_text",
             "resize_page",
             "evaluate_script",
+            "performance_analyze_insight",
+            "lighthouse_audit",
         ] {
             assert!(
                 !browser_command_allowed_read_only(command, &no_args),
@@ -5681,11 +7023,46 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             names,
-            vec!["moondesk_instruction", "browser_command", "view_page"]
+            vec![
+                "moondesk_instruction",
+                "browser_state",
+                "browser_tabs",
+                "browser_dom",
+                "browser_cua",
+                "browser_viewport",
+                "browser_command",
+                "view_page",
+            ]
         );
         for removed_raw_tool in ["click", "navigate_page", "resize_page", "take_screenshot"] {
             assert!(!names.contains(&removed_raw_tool));
         }
+        let read_only_tools = response
+            .result
+            .as_ref()
+            .and_then(|result| result.get("tools"))
+            .and_then(Value::as_array)
+            .expect("read-only browser tools");
+        let action_values = |tool_name: &str| {
+            read_only_tools
+                .iter()
+                .find(|tool| tool.get("name").and_then(Value::as_str) == Some(tool_name))
+                .and_then(|tool| tool.pointer("/inputSchema/properties/action/enum"))
+                .and_then(Value::as_array)
+                .expect("facade action enum")
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(action_values("browser_tabs"), vec!["list", "selected"]);
+        assert_eq!(action_values("browser_dom"), vec!["snapshot", "wait"]);
+        assert_eq!(action_values("browser_cua"), vec!["screenshot"]);
+        assert_eq!(action_values("browser_viewport"), vec!["get"]);
+        assert!(
+            read_only_tools
+                .iter()
+                .all(|tool| tool.get("name").and_then(Value::as_str) != Some("browser_navigate"))
+        );
         let browser_command = response
             .result
             .as_ref()
@@ -5711,6 +7088,53 @@ mod tests {
         );
 
         let writable = handle_tools_list(&req, Mode::Browser, ToolMode::MultiTools).await;
+        let writable_tools = writable
+            .result
+            .as_ref()
+            .and_then(|result| result.get("tools"))
+            .and_then(Value::as_array)
+            .expect("writable browser tools");
+        assert!(
+            writable_tools.iter().any(|tool| {
+                tool.get("name").and_then(Value::as_str) == Some("browser_navigate")
+            })
+        );
+        let browser_dom = writable_tools
+            .iter()
+            .find(|tool| tool.get("name").and_then(Value::as_str) == Some("browser_dom"))
+            .expect("browser_dom descriptor");
+        assert_eq!(
+            browser_dom
+                .pointer("/inputSchema/properties/timeout_ms/minimum")
+                .and_then(Value::as_u64),
+            Some(1)
+        );
+        assert!(
+            browser_facade_timeout_ms(&json!({ "timeout_ms": 0 })).is_err(),
+            "browser_dom schema and runtime must both reject zero timeout"
+        );
+        for (tool_name, expected_actions) in [
+            (
+                "browser_tabs",
+                vec!["list", "selected", "new", "select", "close"],
+            ),
+            (
+                "browser_cua",
+                vec!["screenshot", "click", "type", "keypress", "scroll"],
+            ),
+            ("browser_viewport", vec!["get", "set"]),
+        ] {
+            let actions = writable_tools
+                .iter()
+                .find(|tool| tool.get("name").and_then(Value::as_str) == Some(tool_name))
+                .and_then(|tool| tool.pointer("/inputSchema/properties/action/enum"))
+                .and_then(Value::as_array)
+                .expect("writable facade action enum")
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>();
+            assert_eq!(actions, expected_actions, "{tool_name}");
+        }
         let writable_browser_command = writable
             .result
             .as_ref()
@@ -5764,6 +7188,137 @@ mod tests {
                 .map(Vec::len),
             Some(2)
         );
+    }
+
+    #[tokio::test]
+    async fn browser_facade_state_is_ambient_and_does_not_start_chromium() {
+        use crate::state::AppState;
+        use tokio::sync::Mutex;
+
+        let workspace_root =
+            std::env::temp_dir().join(format!("moondesk-browser-facade-state-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace_root).expect("create browser facade workspace");
+        let workspace_root_str = workspace_root.to_string_lossy().into_owned();
+        let config_path = workspace_root.join("config.toml");
+        let app = AppState::new_for_test(0, workspace_root_str.clone(), config_path.clone())
+            .expect("create browser facade app");
+        let state = Arc::new(Mutex::new(app));
+        let runtime = Arc::new(BrowserRuntime::new(state));
+        let browser_runtime = Some(runtime.clone());
+        let command_jobs = CommandJobManager::new();
+
+        let response = handle_tools_call(
+            &tool_call_request("browser_state", json!({})),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &browser_runtime,
+        )
+        .await;
+        let structured = response
+            .result
+            .as_ref()
+            .and_then(|result| result.get("structuredContent"))
+            .expect("browser state structured result");
+        assert_eq!(
+            structured.get("presentation").and_then(Value::as_str),
+            Some("headless")
+        );
+        assert_eq!(
+            structured.get("browserRunning").and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            structured
+                .get("tabs")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(0)
+        );
+        assert_eq!(
+            structured
+                .pointer("/capabilities/visualCua")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(!runtime.is_running().await);
+
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn browser_facade_read_only_blocks_mutations_before_runtime_dispatch() {
+        let workspace_root =
+            std::env::temp_dir().join(format!("moondesk-browser-facade-ro-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace_root)
+            .expect("create browser facade read-only workspace");
+        let workspace_root_str = workspace_root.to_string_lossy().into_owned();
+        let command_jobs = CommandJobManager::new();
+
+        for (tool_name, arguments, action) in [
+            (
+                "browser_tabs",
+                json!({ "action": "new", "url": "https://example.com" }),
+                "new",
+            ),
+            (
+                "browser_dom",
+                json!({ "action": "click", "uid": "1_1" }),
+                "click",
+            ),
+            (
+                "browser_cua",
+                json!({ "action": "click", "x": 10, "y": 20 }),
+                "click",
+            ),
+            (
+                "browser_viewport",
+                json!({ "action": "set", "width": 390, "height": 844 }),
+                "set",
+            ),
+        ] {
+            let response = handle_tools_call(
+                &tool_call_request(tool_name, arguments),
+                &workspace_root_str,
+                Mode::Browser,
+                ToolMode::ReadOnly,
+                false,
+                &command_jobs,
+                &None,
+            )
+            .await;
+            assert_eq!(
+                response
+                    .result
+                    .as_ref()
+                    .and_then(|result| result.get("isError"))
+                    .and_then(Value::as_bool),
+                Some(true),
+                "{tool_name}"
+            );
+            assert!(
+                result_text(&response).contains(&format!("action '{action}' is blocked")),
+                "{tool_name}: {}",
+                result_text(&response)
+            );
+        }
+
+        let navigate = handle_tools_call(
+            &tool_call_request("browser_navigate", json!({ "action": "back" })),
+            &workspace_root_str,
+            Mode::Browser,
+            ToolMode::ReadOnly,
+            false,
+            &command_jobs,
+            &None,
+        )
+        .await;
+        assert!(result_text(&navigate).contains("disabled in read-only mode"));
+
+        let _ = std::fs::remove_dir_all(workspace_root);
     }
 
     #[tokio::test]
@@ -5885,22 +7440,22 @@ mod tests {
 
     #[tokio::test]
     async fn connector_expanded_browser_tools_route_through_the_stable_browser_contract() {
-        assert_eq!(CONNECTOR_PINNED_BROWSER_TOOLS.len(), 27);
-        for tool_name in CONNECTOR_PINNED_BROWSER_TOOLS {
+        assert_eq!(CONNECTOR_NATIVE_BROWSER_TOOLS.len(), 25);
+        for tool_name in CONNECTOR_NATIVE_BROWSER_TOOLS {
             assert!(
                 crate::browser_contract::is_browser_command(tool_name),
-                "connector tool {tool_name} must remain in the pinned browser contract"
+                "connector tool {tool_name} must remain in MoonDesk's native browser contract"
             );
             assert!(connector_expanded_browser_tool(tool_name));
         }
         assert!(connector_expanded_browser_tool("fill_form"));
         assert!(connector_expanded_browser_tool("wait_for"));
         assert!(
-            crate::browser_contract::is_browser_command("install_extension"),
-            "test requires a contract-only command"
+            crate::browser_contract::is_browser_command("click_at"),
+            "test requires a native contract-only command"
         );
         assert!(
-            !connector_expanded_browser_tool("install_extension"),
+            !connector_expanded_browser_tool("click_at"),
             "contract-only capabilities must not become hidden top-level tools"
         );
 
@@ -6013,7 +7568,7 @@ mod tests {
         assert!(result_text(&unrelated_unknown).contains("Unknown tool"));
 
         let contract_only = handle_tools_call(
-            &tool_call_request("install_extension", json!({ "path": "extension" })),
+            &tool_call_request("click_at", json!({ "x": 1, "y": 1 })),
             &workspace_root_str,
             Mode::Both,
             ToolMode::MultiTools,
@@ -6033,16 +7588,6 @@ mod tests {
     async fn windows_agent_can_request_visible_browser_with_restart_confirmation() {
         use crate::state::AppState;
         use tokio::sync::Mutex;
-
-        if !crate::browser::detect_browsers()
-            .into_iter()
-            .any(|browser| browser.mcp_supported)
-        {
-            eprintln!(
-                "skipping agent presentation smoke: no supported Chromium browser is installed"
-            );
-            return;
-        }
 
         let workspace_root = std::env::temp_dir().join(format!(
             "moondesk-agent-browser-presentation-{}",
@@ -6226,7 +7771,6 @@ mod tests {
     #[tokio::test]
     #[ignore = "serialized Windows browser vision smoke"]
     async fn windows_view_page_returns_native_mcp_image_content() {
-        use crate::browser;
         use crate::state::AppState;
         use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
         use image::GenericImageView;
@@ -6261,14 +7805,6 @@ mod tests {
                     actual.0
                 );
             }
-        }
-
-        if !browser::detect_browsers()
-            .into_iter()
-            .any(|browser| browser.mcp_supported)
-        {
-            eprintln!("skipping browser vision smoke: no supported Chromium browser is installed");
-            return;
         }
 
         let workspace_root =
@@ -6812,6 +8348,306 @@ mod tests {
             managed_view_page_files(),
             before,
             "full-page view_page must clean its managed screenshot"
+        );
+
+        let facade_state = handle_tools_call(
+            &tool_call_request("browser_state", json!({})),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        let facade_state_structured = facade_state
+            .result
+            .as_ref()
+            .and_then(|result| result.get("structuredContent"))
+            .expect("facade browser_state structured content");
+        assert_eq!(
+            facade_state_structured
+                .get("browserRunning")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(
+            facade_state_structured
+                .get("selectedTabId")
+                .and_then(Value::as_u64)
+                .is_some(),
+            "live facade state should expose the selected logical tab"
+        );
+
+        let facade_tabs = handle_tools_call(
+            &tool_call_request("browser_tabs", json!({ "action": "list" })),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        let facade_tabs_structured = facade_tabs
+            .result
+            .as_ref()
+            .and_then(|result| result.get("structuredContent"))
+            .expect("facade browser_tabs structured content");
+        assert!(
+            facade_tabs_structured
+                .get("tabs")
+                .and_then(Value::as_array)
+                .is_some_and(|tabs| !tabs.is_empty()),
+            "browser_tabs should expose this conversation's logical tabs"
+        );
+
+        let facade_viewport_set = handle_tools_call(
+            &tool_call_request(
+                "browser_viewport",
+                json!({ "action": "set", "width": 800, "height": 600 }),
+            ),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        assert_ne!(
+            facade_viewport_set
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true),
+            "browser_viewport set should succeed: {}",
+            browser_stdout(&facade_viewport_set)
+        );
+        let facade_viewport_get = handle_tools_call(
+            &tool_call_request("browser_viewport", json!({ "action": "get" })),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        let facade_viewport_stdout = facade_viewport_get
+            .result
+            .as_ref()
+            .and_then(|result| result.get("structuredContent"))
+            .and_then(|structured| structured.get("stdout"))
+            .and_then(Value::as_str)
+            .expect("facade viewport stdout");
+        assert!(
+            facade_viewport_stdout.contains("800") && facade_viewport_stdout.contains("600"),
+            "unexpected browser_viewport get output: {facade_viewport_stdout}"
+        );
+
+        let facade_page = handle_tools_call(
+            &tool_call_request(
+                "browser_navigate",
+                json!({
+                    "action": "goto",
+                    "url": "data:text/html,<body style='margin:0;height:2200px'><button id='cua' style='position:fixed;left:20px;top:20px;width:200px;height:80px' onclick=\"document.body.dataset.clicked='yes'\">Visual click</button><div style='height:2200px'></div></body>"
+                }),
+            ),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        assert_ne!(
+            facade_page
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true),
+            "browser_navigate should succeed: {}",
+            result_text(&facade_page)
+        );
+
+        let facade_snapshot = handle_tools_call(
+            &tool_call_request("browser_dom", json!({ "action": "snapshot" })),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        assert!(
+            browser_stdout(&facade_snapshot).contains("Visual click"),
+            "browser_dom snapshot should see the deterministic button: {}",
+            browser_stdout(&facade_snapshot)
+        );
+
+        let facade_click = handle_tools_call(
+            &tool_call_request(
+                "browser_cua",
+                json!({ "action": "click", "x": 80, "y": 60 }),
+            ),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        assert_ne!(
+            facade_click
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true),
+            "coordinate CUA click should succeed: {:?}",
+            facade_click.result
+        );
+
+        let facade_verify_click = handle_tools_call(
+            &tool_call_request(
+                "browser_dom",
+                json!({
+                    "action": "evaluate",
+                    "function": "() => document.body.dataset.clicked || 'no'"
+                }),
+            ),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        assert!(
+            browser_stdout(&facade_verify_click).contains("yes"),
+            "coordinate CUA click should trigger the button: {}",
+            browser_stdout(&facade_verify_click)
+        );
+
+        let facade_scroll = handle_tools_call(
+            &tool_call_request("browser_cua", json!({ "action": "scroll", "delta_y": 500 })),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        assert_ne!(
+            facade_scroll
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true),
+            "visual CUA scroll should succeed: {}",
+            browser_stdout(&facade_scroll)
+        );
+
+        let facade_screenshot = handle_tools_call(
+            &tool_call_request("browser_cua", json!({ "action": "screenshot" })),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        let facade_screenshot_result = facade_screenshot
+            .result
+            .as_ref()
+            .expect("browser_cua screenshot result");
+        assert_ne!(
+            facade_screenshot_result
+                .get("isError")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            facade_screenshot_result
+                .get("content")
+                .and_then(Value::as_array)
+                .and_then(|content| content.first())
+                .and_then(|content| content.get("type"))
+                .and_then(Value::as_str),
+            Some("image"),
+            "browser_cua screenshot should return native image content"
+        );
+
+        std::fs::create_dir_all(workspace_root.join("reports"))
+            .expect("create native browser reports directory");
+        let trace = runtime
+            .run_for_session(
+                &browser_session,
+                &workspace_root_str,
+                "performance_start_trace",
+                &[
+                    "--reload=false".to_string(),
+                    "--autoStop=true".to_string(),
+                    "--filePath=reports/native-trace.json".to_string(),
+                ],
+                DEFAULT_BROWSER_COMMAND_TIMEOUT,
+            )
+            .await
+            .expect("capture native CDP performance trace");
+        assert!(
+            trace.success(),
+            "native performance trace failed: stdout={} stderr={}",
+            trace.stdout,
+            trace.stderr
+        );
+        let trace_path = workspace_root.join("reports").join("native-trace.json");
+        let trace_json: Value = serde_json::from_slice(
+            &std::fs::read(&trace_path).expect("read native performance trace"),
+        )
+        .expect("decode native performance trace JSON");
+        assert!(
+            trace_json
+                .get("traceEvents")
+                .and_then(Value::as_array)
+                .is_some_and(|events| !events.is_empty()),
+            "native performance trace should contain trace events"
+        );
+
+        let heap = runtime
+            .run_for_session(
+                &browser_session,
+                &workspace_root_str,
+                "take_heapsnapshot",
+                &["--filePath=reports/native-heap.heapsnapshot".to_string()],
+                DEFAULT_BROWSER_COMMAND_TIMEOUT,
+            )
+            .await
+            .expect("capture native CDP heap snapshot");
+        assert!(
+            heap.success(),
+            "native heap snapshot failed: stdout={} stderr={}",
+            heap.stdout,
+            heap.stderr
+        );
+        let heap_path = workspace_root
+            .join("reports")
+            .join("native-heap.heapsnapshot");
+        assert!(
+            std::fs::metadata(&heap_path)
+                .expect("heap snapshot metadata")
+                .len()
+                > 1_000,
+            "native heap snapshot should contain V8 heap data"
         );
 
         runtime.stop().await;
@@ -7523,10 +9359,23 @@ mod tests {
         assert!(instruction_text.contains("Keep search/write/edit/delete workspace-scoped"));
         assert!(instruction_text.contains("use view_image or view_images"));
         assert!(instruction_text.contains("model receives the pixels through its vision input"));
-        assert!(instruction_text.contains("view_page for actual rendered pixels"));
-        assert!(instruction_text.contains("do not replace view_page for visual judgment"));
+        assert!(instruction_text.contains("Codex-style capability surface"));
+        assert!(instruction_text.contains("browser_state for ambient state"));
         assert!(
-            instruction_text.contains("starts one host-owned Chromium lazily, headless by default")
+            instruction_text.contains("browser_cua for rendered-pixel and coordinate interactions")
+        );
+        assert!(
+            instruction_text
+                .contains("browser_command remains an advanced compatibility/debug escape hatch")
+        );
+        assert!(
+            instruction_text.contains(
+                "do not replace browser_cua screenshots or view_page for visual judgment"
+            )
+        );
+        assert!(
+            instruction_text
+                .contains("starts one host-owned managed Chromium lazily, headless by default")
         );
         assert!(instruction_text.contains(
             "use set_browser_presentation only when browser visibility itself is needed"
@@ -7535,7 +9384,10 @@ mod tests {
         assert!(instruction_text.contains("retrying with confirm_restart=true"));
         assert!(instruction_text.contains("each MCP conversation gets its own logical page set"));
         assert!(instruction_text.contains("never inherits the user's personal cookies"));
-        assert!(instruction_text.contains("emulate --viewport=<width>x<height>x<dpr>"));
+        assert!(
+            instruction_text
+                .contains("set the target size with browser_viewport before taking DOM UIDs")
+        );
         assert!(
             instruction_text.contains("do not invoke lifecycle commands through browser_command")
         );

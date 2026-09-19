@@ -1,0 +1,423 @@
+{
+  "version": "native-cdp-1",
+  "commands": {
+    "click": [
+      {
+        "name": "uid",
+        "type": "string",
+        "required": true
+      },
+      {
+        "name": "dblClick",
+        "type": "boolean",
+        "required": false
+      },
+      {
+        "name": "includeSnapshot",
+        "type": "boolean",
+        "required": false
+      }
+    ],
+    "click_at": [
+      {
+        "name": "x",
+        "type": "number",
+        "required": true
+      },
+      {
+        "name": "y",
+        "type": "number",
+        "required": true
+      },
+      {
+        "name": "dblClick",
+        "type": "boolean",
+        "required": false
+      },
+      {
+        "name": "includeSnapshot",
+        "type": "boolean",
+        "required": false
+      }
+    ],
+    "close_page": [
+      {
+        "name": "pageId",
+        "type": "number",
+        "required": true
+      }
+    ],
+    "drag": [
+      {
+        "name": "from_uid",
+        "type": "string",
+        "required": true
+      },
+      {
+        "name": "to_uid",
+        "type": "string",
+        "required": true
+      },
+      {
+        "name": "includeSnapshot",
+        "type": "boolean",
+        "required": false
+      }
+    ],
+    "emulate": [
+      {
+        "name": "networkConditions",
+        "type": "string",
+        "required": false,
+        "enum": [
+          "Offline",
+          "Slow 3G",
+          "Fast 3G",
+          "Slow 4G",
+          "Fast 4G"
+        ]
+      },
+      {
+        "name": "cpuThrottlingRate",
+        "type": "number",
+        "required": false
+      },
+      {
+        "name": "geolocation",
+        "type": "string",
+        "required": false
+      },
+      {
+        "name": "userAgent",
+        "type": "string",
+        "required": false
+      },
+      {
+        "name": "colorScheme",
+        "type": "string",
+        "required": false,
+        "enum": [
+          "dark",
+          "light",
+          "auto"
+        ]
+      },
+      {
+        "name": "viewport",
+        "type": "string",
+        "required": false
+      },
+      {
+        "name": "extraHttpHeaders",
+        "type": "string",
+        "required": false
+      }
+    ],
+    "evaluate_script": [
+      {
+        "name": "function",
+        "type": "string",
+        "required": true
+      },
+      {
+        "name": "args",
+        "type": "array",
+        "required": false
+      },
+      {
+        "name": "filePath",
+        "type": "string",
+        "required": false
+      }
+    ],
+    "fill": [
+      {
+        "name": "uid",
+        "type": "string",
+        "required": true
+      },
+      {
+        "name": "value",
+        "type": "string",
+        "required": true
+      },
+      {
+        "name": "includeSnapshot",
+        "type": "boolean",
+        "required": false
+      }
+    ],
+    "get_console_message": [
+      {
+        "name": "msgid",
+        "type": "number",
+        "required": true
+      }
+    ],
+    "get_network_request": [
+      {
+        "name": "reqid",
+        "type": "number",
+        "required": true
+      }
+    ],
+    "handle_dialog": [
+      {
+        "name": "action",
+        "type": "string",
+        "required": true,
+        "enum": [
+          "accept",
+          "dismiss"
+        ]
+      },
+      {
+        "name": "promptText",
+        "type": "string",
+        "required": false
+      }
+    ],
+    "hover": [
+      {
+        "name": "uid",
+        "type": "string",
+        "required": true
+      },
+      {
+        "name": "includeSnapshot",
+        "type": "boolean",
+        "required": false
+      }
+    ],
+    "list_console_messages": [
+      {
+        "name": "pageSize",
+        "type": "integer",
+        "required": false
+      },
+      {
+        "name": "pageIdx",
+        "type": "integer",
+        "required": false
+      },
+      {
+        "name": "types",
+        "type": "array",
+        "required": false
+      }
+    ],
+    "list_network_requests": [
+      {
+        "name": "pageSize",
+        "type": "integer",
+        "required": false
+      },
+      {
+        "name": "pageIdx",
+        "type": "integer",
+        "required": false
+      },
+      {
+        "name": "resourceTypes",
+        "type": "array",
+        "required": false
+      }
+    ],
+    "list_pages": [],
+    "navigate_page": [
+      {
+        "name": "type",
+        "type": "string",
+        "required": false,
+        "enum": [
+          "url",
+          "back",
+          "forward",
+          "reload"
+        ]
+      },
+      {
+        "name": "url",
+        "type": "string",
+        "required": false
+      },
+      {
+        "name": "ignoreCache",
+        "type": "boolean",
+        "required": false
+      },
+      {
+        "name": "initScript",
+        "type": "string",
+        "required": false
+      }
+    ],
+    "new_page": [
+      {
+        "name": "url",
+        "type": "string",
+        "required": true
+      },
+      {
+        "name": "background",
+        "type": "boolean",
+        "required": false
+      }
+    ],
+    "performance_start_trace": [
+      {
+        "name": "reload",
+        "type": "boolean",
+        "required": false,
+        "default": true
+      },
+      {
+        "name": "autoStop",
+        "type": "boolean",
+        "required": false,
+        "default": true
+      },
+      {
+        "name": "filePath",
+        "type": "string",
+        "required": false
+      }
+    ],
+    "performance_stop_trace": [
+      {
+        "name": "filePath",
+        "type": "string",
+        "required": false
+      }
+    ],
+    "press_key": [
+      {
+        "name": "key",
+        "type": "string",
+        "required": true
+      },
+      {
+        "name": "includeSnapshot",
+        "type": "boolean",
+        "required": false
+      }
+    ],
+    "resize_page": [
+      {
+        "name": "width",
+        "type": "number",
+        "required": true
+      },
+      {
+        "name": "height",
+        "type": "number",
+        "required": true
+      }
+    ],
+    "scroll": [
+      {
+        "name": "deltaX",
+        "type": "number",
+        "required": true
+      },
+      {
+        "name": "deltaY",
+        "type": "number",
+        "required": true
+      }
+    ],
+    "select_page": [
+      {
+        "name": "pageId",
+        "type": "number",
+        "required": true
+      },
+      {
+        "name": "bringToFront",
+        "type": "boolean",
+        "required": false
+      }
+    ],
+    "take_heapsnapshot": [
+      {
+        "name": "filePath",
+        "type": "string",
+        "required": true
+      }
+    ],
+    "take_screenshot": [
+      {
+        "name": "format",
+        "type": "string",
+        "required": false,
+        "enum": [
+          "png",
+          "jpeg",
+          "webp"
+        ],
+        "default": "png"
+      },
+      {
+        "name": "quality",
+        "type": "number",
+        "required": false
+      },
+      {
+        "name": "uid",
+        "type": "string",
+        "required": false
+      },
+      {
+        "name": "fullPage",
+        "type": "boolean",
+        "required": false
+      },
+      {
+        "name": "filePath",
+        "type": "string",
+        "required": false
+      }
+    ],
+    "take_snapshot": [
+      {
+        "name": "verbose",
+        "type": "boolean",
+        "required": false
+      },
+      {
+        "name": "filePath",
+        "type": "string",
+        "required": false
+      }
+    ],
+    "type_text": [
+      {
+        "name": "text",
+        "type": "string",
+        "required": true
+      },
+      {
+        "name": "submitKey",
+        "type": "string",
+        "required": false
+      }
+    ],
+    "upload_file": [
+      {
+        "name": "uid",
+        "type": "string",
+        "required": true
+      },
+      {
+        "name": "filePath",
+        "type": "string",
+        "required": true
+      },
+      {
+        "name": "includeSnapshot",
+        "type": "boolean",
+        "required": false
+      }
+    ]
+  }
+}

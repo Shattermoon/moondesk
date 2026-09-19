@@ -1,27 +1,22 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
-use serde_json::Value;
+use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
-use tokio::process::Command;
 use tokio::sync::Mutex;
 
+use crate::browser_cdp::{BrowserCdpTransport, BrowserTransportError};
 pub use crate::browser_contract::canonical_browser_flag_name;
 use crate::browser_contract::{
-    BrowserOutputFormat, ParsedBrowserInvocation, browser_structured_arguments_to_cli,
-    parse_browser_cli_invocation,
+    BrowserOutputFormat, ParsedBrowserInvocation, browser_command_help,
+    browser_structured_arguments_to_cli, parse_browser_cli_invocation,
 };
-use crate::browser_transport::{BrowserMcpTransport, BrowserTransportError};
 use crate::state::{BrowserPresentation, Mode, SharedState};
 use crate::workspaces::WorkspaceId;
 
-// Keep this exact pin until MoonDesk's browser command contract is deliberately migrated and
-// re-tested. The checked-in browser_contract_v1_7.json is generated from this exact package.
-pub const CHROME_DEVTOOLS_PACKAGE_VERSION: &str = "1.7.0";
 pub const DEFAULT_BROWSER_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
 pub const MAX_BROWSER_TIMEOUT_MS: u64 = 120_000;
 pub const MAX_BROWSER_COMMAND_BYTES: usize = 128;
@@ -29,7 +24,6 @@ pub const MAX_BROWSER_ARGS: usize = 64;
 pub const MAX_BROWSER_ARG_BYTES: usize = 8 * 1024;
 pub const MAX_BROWSER_CONTROL_BODY_BYTES: usize = 128 * 1024;
 const MAX_CAPTURED_OUTPUT_BYTES: usize = 256 * 1024;
-const DEFAULT_HEADLESS_VIEWPORT: &str = "1280x800";
 const BROWSER_PRESENTATION_LOCK_TIMEOUT: Duration = Duration::from_millis(250);
 const BROWSER_WORKSPACE_RELEASE_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -175,8 +169,6 @@ struct BrowserRoutingState {
     sessions: HashMap<BrowserSessionKey, BrowserLogicalSession>,
     upstream_owners: HashMap<u64, (BrowserSessionKey, u64)>,
     active_trace: Option<BrowserPageLease>,
-    last_trace_owner: Option<BrowserSessionKey>,
-    active_screencast: Option<BrowserPageLease>,
 }
 
 impl BrowserRoutingState {
@@ -184,14 +176,12 @@ impl BrowserRoutingState {
         self.sessions.clear();
         self.upstream_owners.clear();
         self.active_trace = None;
-        self.last_trace_owner = None;
-        self.active_screencast = None;
     }
 }
 
 #[derive(Default)]
 struct BrowserRuntimeState {
-    transport: Option<Arc<BrowserMcpTransport>>,
+    transport: Option<Arc<BrowserCdpTransport>>,
     has_started: bool,
     generation: u64,
     routing: BrowserRoutingState,
@@ -206,12 +196,12 @@ struct UpstreamPageInfo {
     isolated_context: Option<String>,
 }
 
-/// Shared, lazy Chrome DevTools runtime owned directly by the MoonDesk host.
+/// Shared, lazy native CDP browser runtime owned directly by the MoonDesk host.
 ///
-/// Constructing this value never launches Chromium. The first browser operation starts one pinned
-/// `chrome-devtools-mcp` stdio child in a MoonDesk-owned process tree. Workspaces get isolated
-/// BrowserContexts inside that Chromium process, while each MCP conversation and local CLI caller
-/// owns a logical page set routed by MoonDesk rather than by upstream global page selection.
+/// Constructing this value never launches Chromium. The first browser operation starts one
+/// MoonDesk-owned Chromium process and connects to its browser-level DevTools WebSocket directly.
+/// Workspaces get isolated BrowserContexts inside that Chromium process, while each MCP
+/// conversation and local CLI caller owns a logical page set routed by MoonDesk.
 pub struct BrowserRuntime {
     state: Option<SharedState>,
     runtime: Mutex<BrowserRuntimeState>,
@@ -349,6 +339,13 @@ impl BrowserRuntime {
             .await
             .map_err(|_| total_timeout_message(operation_timeout))?;
         let (transport, restarted) = self.ensure_transport(deadline).await?;
+        self.ensure_session_not_blocked_by_performance_trace(
+            session,
+            &transport,
+            deadline,
+            operation_timeout,
+        )
+        .await?;
         let page_id = self
             .ensure_active_upstream_page(session, &transport, deadline, operation_timeout)
             .await?;
@@ -367,6 +364,51 @@ impl BrowserRuntime {
             )
             .await?;
         let parsed = parse_browser_cli_invocation("take_snapshot", &[])?;
+        browser_output_from_result(result, parsed, restarted)
+    }
+
+    pub(crate) async fn scroll_for_session(
+        &self,
+        session: &BrowserSessionKey,
+        delta_x: f64,
+        delta_y: f64,
+        timeout: Duration,
+    ) -> Result<BrowserCommandOutput, String> {
+        if timeout.is_zero() {
+            return Err("Browser command timeout must be at least 1 ms".to_string());
+        }
+        if !delta_x.is_finite() || !delta_y.is_finite() || (delta_x == 0.0 && delta_y == 0.0) {
+            return Err("Browser scroll requires finite non-zero delta_x or delta_y".to_string());
+        }
+        let deadline = tokio::time::Instant::now() + timeout;
+        let _operation = tokio::time::timeout_at(deadline, self.operation.lock())
+            .await
+            .map_err(|_| total_timeout_message(timeout))?;
+        let (transport, restarted) = self.ensure_transport(deadline).await?;
+        self.ensure_session_not_blocked_by_performance_trace(
+            session, &transport, deadline, timeout,
+        )
+        .await?;
+        let page_id = self
+            .ensure_active_upstream_page(session, &transport, deadline, timeout)
+            .await?;
+        let result = self
+            .call_transport_tool(
+                &transport,
+                "scroll",
+                serde_json::json!({
+                    "pageId": page_id,
+                    "deltaX": delta_x,
+                    "deltaY": delta_y,
+                }),
+                deadline,
+                timeout,
+            )
+            .await?;
+        let parsed = ParsedBrowserInvocation {
+            arguments: Map::new(),
+            output_format: BrowserOutputFormat::Json,
+        };
         browser_output_from_result(result, parsed, restarted)
     }
 
@@ -391,6 +433,10 @@ impl BrowserRuntime {
             .await
             .map_err(|_| total_timeout_message(timeout))?;
         let (transport, restarted) = self.ensure_transport(deadline).await?;
+        self.ensure_session_not_blocked_by_performance_trace(
+            session, &transport, deadline, timeout,
+        )
+        .await?;
         let page_id = self
             .ensure_active_upstream_page(session, &transport, deadline, timeout)
             .await?;
@@ -447,11 +493,6 @@ impl BrowserRuntime {
                     .to_string(),
             );
         }
-        if browser_global_extension_command(command) {
-            return Err(format!(
-                "Browser command '{command}' is browser-global and is disabled in MoonDesk's shared Chromium runtime so one workspace cannot mutate another workspace's browser environment"
-            ));
-        }
         if timeout.is_zero() {
             return Err("Browser command timeout must be at least 1 ms".to_string());
         }
@@ -459,7 +500,7 @@ impl BrowserRuntime {
             .iter()
             .any(|arg| matches!(arg.as_str(), "--help" | "-h"))
         {
-            return run_cli_help(workspace_root, command, args, timeout).await;
+            return run_cli_help(command);
         }
 
         let deadline = tokio::time::Instant::now() + timeout;
@@ -493,17 +534,20 @@ impl BrowserRuntime {
             .map_err(|error| format!("Browser staging task failed: {error}"))??;
         let parsed = parse_browser_cli_invocation(command, &prepared.args)?;
 
-        // Upstream chrome-devtools-mcp still owns one global selected-page pointer. MoonDesk never
-        // trusts that pointer for caller routing: this lock serializes reconciliation and each
-        // page-scoped call receives the caller's owned upstream pageId explicitly.
+        // MoonDesk owns browser authority. This lock serializes logical-page reconciliation and
+        // every page-scoped call is routed to the exact conversation-owned CDP target/session;
+        // Chromium's visible selected tab is never caller authority.
         let _operation = tokio::time::timeout_at(deadline, self.operation.lock())
             .await
             .map_err(|_| total_timeout_message(timeout))?;
         if tokio::time::Instant::now() >= deadline {
             return Err(total_timeout_message(timeout));
         }
-
         let (transport, restarted) = self.ensure_transport(deadline).await?;
+        self.ensure_session_not_blocked_by_performance_trace(
+            session, &transport, deadline, timeout,
+        )
+        .await?;
         let mut arguments = parsed.arguments.clone();
         let mut result = match command {
             "list_pages" => {
@@ -620,17 +664,13 @@ impl BrowserRuntime {
                 let mut page_id = self
                     .ensure_active_upstream_page(session, &transport, deadline, timeout)
                     .await?;
-                if matches!(command, "performance_stop_trace" | "screencast_stop") {
+                if command == "performance_stop_trace" {
                     let pages = self
                         .list_upstream_pages(&transport, deadline, timeout)
                         .await?;
                     self.ensure_global_recording_pages_present(&transport, &pages)
                         .await?;
-                }
-                if command == "performance_stop_trace" {
                     page_id = self.performance_trace_page(session).await?;
-                } else if command == "screencast_stop" {
-                    page_id = self.screencast_page(session).await?;
                 }
                 let before_ids = if browser_command_may_open_or_close_pages(command) {
                     let pages = self
@@ -649,10 +689,15 @@ impl BrowserRuntime {
                     );
                 }
                 arguments.insert("pageId".to_string(), Value::from(page_id));
-                if command == "performance_analyze_insight" {
-                    self.require_last_trace_owner(session).await?;
-                }
                 let trace_auto_stop = if command == "performance_start_trace" {
+                    let pages = self
+                        .list_upstream_pages(&transport, deadline, timeout)
+                        .await?;
+                    self.ensure_global_recording_pages_present(&transport, &pages)
+                        .await?;
+                    self.reconcile_pages(session, &pages, None).await;
+                    self.ensure_performance_trace_isolated(session, &transport, &pages, deadline)
+                        .await?;
                     self.begin_performance_trace(session, page_id).await?;
                     Some(
                         arguments
@@ -663,10 +708,6 @@ impl BrowserRuntime {
                 } else {
                     None
                 };
-                let started_screencast = command == "screencast_start";
-                if started_screencast {
-                    self.begin_screencast(session, page_id).await?;
-                }
                 let result = match self
                     .call_transport_tool(
                         &transport,
@@ -680,27 +721,34 @@ impl BrowserRuntime {
                     Ok(result) => result,
                     Err(error) => {
                         if trace_auto_stop.is_some() {
-                            self.finish_performance_trace(session, false).await;
-                        }
-                        if started_screencast {
-                            self.finish_screencast(session).await;
+                            self.finish_performance_trace(session).await;
                         }
                         return Err(error);
                     }
                 };
                 let browser_error = browser_result_is_error(&result);
-                if let Some(auto_stop) = trace_auto_stop {
-                    if browser_error || auto_stop {
-                        self.finish_performance_trace(session, !browser_error && auto_stop)
-                            .await;
-                    }
-                } else if command == "performance_stop_trace" && !browser_error {
-                    self.finish_performance_trace(session, true).await;
-                }
-                if (started_screencast && browser_error)
-                    || (command == "screencast_stop" && !browser_error)
+                if browser_error
+                    && matches!(
+                        command,
+                        "performance_start_trace" | "performance_stop_trace"
+                    )
                 {
-                    self.finish_screencast(session).await;
+                    let detail = browser_result_text(&result);
+                    self.invalidate_transport(
+                        &transport,
+                        "browser-global performance trace state could not be proven clean after a trace error",
+                    )
+                    .await;
+                    return Err(format!(
+                        "Browser performance trace failed: {detail}. MoonDesk reset the shared browser runtime because browser-global trace state could not be proven clean; retry from a fresh page/snapshot."
+                    ));
+                }
+                if let Some(auto_stop) = trace_auto_stop {
+                    if auto_stop {
+                        self.finish_performance_trace(session).await;
+                    }
+                } else if command == "performance_stop_trace" {
+                    self.finish_performance_trace(session).await;
                 }
                 if !browser_error && let Some(before_ids) = before_ids {
                     let pages = self
@@ -713,16 +761,6 @@ impl BrowserRuntime {
                         .await;
                 }
                 result
-            }
-            _ if browser_workspace_file_command(command) => {
-                self.call_transport_tool(
-                    &transport,
-                    command,
-                    Value::Object(arguments),
-                    deadline,
-                    timeout,
-                )
-                .await?
             }
             _ => {
                 return Err(format!(
@@ -767,7 +805,7 @@ impl BrowserRuntime {
     async fn ensure_active_upstream_page(
         &self,
         session: &BrowserSessionKey,
-        transport: &Arc<BrowserMcpTransport>,
+        transport: &Arc<BrowserCdpTransport>,
         deadline: tokio::time::Instant,
         timeout: Duration,
     ) -> Result<u64, String> {
@@ -867,20 +905,12 @@ impl BrowserRuntime {
         {
             return Some("performance trace");
         }
-        if runtime
-            .routing
-            .active_screencast
-            .as_ref()
-            .is_some_and(|active| !existing.contains(&active.upstream_page_id))
-        {
-            return Some("screencast");
-        }
         None
     }
 
     async fn ensure_global_recording_pages_present(
         &self,
-        transport: &Arc<BrowserMcpTransport>,
+        transport: &Arc<BrowserCdpTransport>,
         pages: &[UpstreamPageInfo],
     ) -> Result<(), String> {
         let Some(kind) = self.missing_global_recording_page(pages).await else {
@@ -909,22 +939,12 @@ impl BrowserRuntime {
                 "Stop the active performance trace before closing its browser page".to_string(),
             );
         }
-        if runtime
-            .routing
-            .active_screencast
-            .as_ref()
-            .is_some_and(|active| {
-                active.owner == *session && active.upstream_page_id == upstream_page_id
-            })
-        {
-            return Err("Stop the active screencast before closing its browser page".to_string());
-        }
         Ok(())
     }
 
     async fn select_surviving_upstream_page_before_close(
         &self,
-        transport: &Arc<BrowserMcpTransport>,
+        transport: &Arc<BrowserCdpTransport>,
         target_page_id: u64,
         deadline: tokio::time::Instant,
         timeout: Duration,
@@ -952,6 +972,105 @@ impl BrowserRuntime {
                 "Could not select MoonDesk's surviving browser page before close: {}",
                 browser_result_text(&selected)
             ));
+        }
+        Ok(())
+    }
+
+    async fn ensure_session_not_blocked_by_performance_trace(
+        &self,
+        session: &BrowserSessionKey,
+        transport: &Arc<BrowserCdpTransport>,
+        deadline: tokio::time::Instant,
+        timeout: Duration,
+    ) -> Result<(), String> {
+        let active_owner = {
+            let runtime = self.runtime.lock().await;
+            runtime
+                .routing
+                .active_trace
+                .as_ref()
+                .map(|active| active.owner.clone())
+        };
+        let Some(active_owner) = active_owner else {
+            return Ok(());
+        };
+
+        let pages = self
+            .list_upstream_pages(transport, deadline, timeout)
+            .await?;
+        self.ensure_global_recording_pages_present(transport, &pages)
+            .await?;
+        if active_owner != *session {
+            return Err(
+                "Another browser session owns the active performance trace; browser actions are temporarily blocked so browser-global trace data cannot mix session authority"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+
+    async fn ensure_performance_trace_isolated(
+        &self,
+        session: &BrowserSessionKey,
+        transport: &Arc<BrowserCdpTransport>,
+        pages: &[UpstreamPageInfo],
+        deadline: tokio::time::Instant,
+    ) -> Result<(), String> {
+        let workspace_context = session.workspace_context_name();
+        let contexts = transport.managed_context_names().await;
+        if contexts.len() != 1 || contexts.first() != Some(&workspace_context) {
+            return Err(
+                "Performance tracing is browser-global and is available only when this session's workspace is the sole active MoonDesk BrowserContext"
+                    .to_string(),
+            );
+        }
+
+        if !transport
+            .browser_contexts_match_managed(deadline)
+            .await
+            .map_err(|error| format!("Could not verify browser-global trace isolation: {error}"))?
+        {
+            return Err(
+                "Performance tracing is browser-global and cannot start while Chromium has an untracked or missing BrowserContext"
+                    .to_string(),
+            );
+        }
+        if transport
+            .has_unmanaged_page_targets(deadline)
+            .await
+            .map_err(|error| format!("Could not verify browser-global trace isolation: {error}"))?
+        {
+            return Err(
+                "Performance tracing is browser-global and cannot start while Chromium has any unowned/default-context page target"
+                    .to_string(),
+            );
+        }
+
+        let runtime = self.runtime.lock().await;
+        if runtime
+            .routing
+            .sessions
+            .keys()
+            .any(|owner| owner != session && owner.workspace_key == session.workspace_key)
+        {
+            return Err(
+                "Performance tracing is browser-global and cannot start after another browser session has used this workspace BrowserContext; restart the shared browser runtime first so session-scoped background state cannot contribute trace data"
+                    .to_string(),
+            );
+        }
+        for page in pages.iter().filter(|page| page.isolated_context.is_some()) {
+            if page.isolated_context.as_deref() != Some(workspace_context.as_str())
+                || !runtime
+                    .routing
+                    .upstream_owners
+                    .get(&page.id)
+                    .is_some_and(|(owner, _)| owner == session)
+            {
+                return Err(
+                    "Performance tracing is browser-global and cannot start while another browser session owns or may own a managed page"
+                        .to_string(),
+                );
+            }
         }
         Ok(())
     }
@@ -990,7 +1109,7 @@ impl BrowserRuntime {
         }
     }
 
-    async fn finish_performance_trace(&self, session: &BrowserSessionKey, recorded: bool) {
+    async fn finish_performance_trace(&self, session: &BrowserSessionKey) {
         let mut runtime = self.runtime.lock().await;
         if runtime
             .routing
@@ -999,76 +1118,12 @@ impl BrowserRuntime {
             .is_some_and(|active| active.owner == *session)
         {
             runtime.routing.active_trace = None;
-            if recorded {
-                runtime.routing.last_trace_owner = Some(session.clone());
-            }
-        }
-    }
-
-    async fn require_last_trace_owner(&self, session: &BrowserSessionKey) -> Result<(), String> {
-        let runtime = self.runtime.lock().await;
-        match runtime.routing.last_trace_owner.as_ref() {
-            Some(owner) if owner == session => Ok(()),
-            Some(_) => Err(
-                "The most recent performance trace belongs to another browser session; record a trace in this session before analyzing insights"
-                    .to_string(),
-            ),
-            None => Err(
-                "No performance trace is available for this browser session; record one before analyzing insights"
-                    .to_string(),
-            ),
-        }
-    }
-
-    async fn begin_screencast(
-        &self,
-        session: &BrowserSessionKey,
-        upstream_page_id: u64,
-    ) -> Result<(), String> {
-        let mut runtime = self.runtime.lock().await;
-        if let Some(active) = runtime.routing.active_screencast.as_ref() {
-            return Err(if active.owner == *session {
-                "This browser session already owns the active screencast; stop it before starting another"
-                    .to_string()
-            } else {
-                "Another browser session currently owns the shared Chromium screencast; retry after it stops"
-                    .to_string()
-            });
-        }
-        runtime.routing.active_screencast = Some(BrowserPageLease {
-            owner: session.clone(),
-            upstream_page_id,
-        });
-        Ok(())
-    }
-
-    async fn screencast_page(&self, session: &BrowserSessionKey) -> Result<u64, String> {
-        let runtime = self.runtime.lock().await;
-        match runtime.routing.active_screencast.as_ref() {
-            Some(active) if active.owner == *session => Ok(active.upstream_page_id),
-            Some(_) => Err(
-                "Another browser session owns the active screencast; this session cannot stop it"
-                    .to_string(),
-            ),
-            None => Err("This browser session has no active screencast".to_string()),
-        }
-    }
-
-    async fn finish_screencast(&self, session: &BrowserSessionKey) {
-        let mut runtime = self.runtime.lock().await;
-        if runtime
-            .routing
-            .active_screencast
-            .as_ref()
-            .is_some_and(|active| active.owner == *session)
-        {
-            runtime.routing.active_screencast = None;
         }
     }
 
     async fn list_upstream_pages_result(
         &self,
-        transport: &Arc<BrowserMcpTransport>,
+        transport: &Arc<BrowserCdpTransport>,
         deadline: tokio::time::Instant,
         timeout: Duration,
     ) -> Result<Value, String> {
@@ -1092,7 +1147,7 @@ impl BrowserRuntime {
 
     async fn list_upstream_pages(
         &self,
-        transport: &Arc<BrowserMcpTransport>,
+        transport: &Arc<BrowserCdpTransport>,
         deadline: tokio::time::Instant,
         timeout: Duration,
     ) -> Result<Vec<UpstreamPageInfo>, String> {
@@ -1104,7 +1159,7 @@ impl BrowserRuntime {
 
     async fn pages_from_result_or_list(
         &self,
-        transport: &Arc<BrowserMcpTransport>,
+        transport: &Arc<BrowserCdpTransport>,
         result: &Value,
         deadline: tokio::time::Instant,
         timeout: Duration,
@@ -1195,7 +1250,7 @@ impl BrowserRuntime {
         }
     }
 
-    async fn safe_pages_for_session(&self, session: &BrowserSessionKey) -> Vec<Value> {
+    pub(crate) async fn session_pages(&self, session: &BrowserSessionKey) -> Vec<Value> {
         let runtime = self.runtime.lock().await;
         let Some(logical) = runtime.routing.sessions.get(session) else {
             return Vec::new();
@@ -1219,7 +1274,7 @@ impl BrowserRuntime {
         session: &BrowserSessionKey,
         result: &mut Value,
     ) {
-        let safe_pages = self.safe_pages_for_session(session).await;
+        let safe_pages = self.session_pages(session).await;
         let had_structured_pages = result
             .pointer("/structuredContent/pages")
             .and_then(Value::as_array)
@@ -1249,7 +1304,7 @@ impl BrowserRuntime {
 
     async fn call_transport_tool(
         &self,
-        transport: &Arc<BrowserMcpTransport>,
+        transport: &Arc<BrowserCdpTransport>,
         command: &str,
         arguments: Value,
         deadline: tokio::time::Instant,
@@ -1276,7 +1331,7 @@ impl BrowserRuntime {
     async fn ensure_transport(
         &self,
         deadline: tokio::time::Instant,
-    ) -> Result<(Arc<BrowserMcpTransport>, bool), String> {
+    ) -> Result<(Arc<BrowserCdpTransport>, bool), String> {
         let (stale, has_started) = {
             let mut runtime = self.runtime.lock().await;
             if let Some(transport) = runtime.transport.as_ref()
@@ -1295,20 +1350,15 @@ impl BrowserRuntime {
         } else {
             BrowserPresentation::default()
         };
-        let (server_args, browser_name) = browser_server_args(presentation);
-        let transport = BrowserMcpTransport::start(
-            CHROME_DEVTOOLS_PACKAGE_VERSION,
-            &server_args,
-            self.state.clone(),
-            deadline,
-        )
-        .await
-        .map_err(|error| match error {
-            BrowserTransportError::Timeout => {
-                "Browser runtime startup exhausted the caller's total timeout".to_string()
-            }
-            other => format!("Could not start isolated MoonDesk browser runtime: {other}"),
-        })?;
+        let transport = BrowserCdpTransport::start(presentation, self.state.clone(), deadline)
+            .await
+            .map_err(|error| match error {
+                BrowserTransportError::Timeout => {
+                    "Browser runtime startup exhausted the caller's total timeout".to_string()
+                }
+                other => format!("Could not start isolated MoonDesk browser runtime: {other}"),
+            })?;
+        let browser_name = transport.browser_name().to_string();
 
         let generation = {
             let mut runtime = self.runtime.lock().await;
@@ -1332,7 +1382,7 @@ impl BrowserRuntime {
         Ok((transport, has_started))
     }
 
-    async fn invalidate_transport(&self, expected: &Arc<BrowserMcpTransport>, reason: &str) {
+    async fn invalidate_transport(&self, expected: &Arc<BrowserCdpTransport>, reason: &str) {
         let transport = {
             let mut runtime = self.runtime.lock().await;
             let matches = runtime
@@ -1447,7 +1497,7 @@ impl BrowserRuntime {
     /// invalidate the shared runtime so removed-workspace state cannot remain reachable.
     pub async fn release_workspace(&self, workspace_id: &WorkspaceId) -> Result<(), String> {
         let _operation = self.operation.lock().await;
-        let (transport, trace_page, screencast_page, mut page_ids) = {
+        let (transport, trace_page, mut page_ids) = {
             let runtime = self.runtime.lock().await;
             let transport = runtime
                 .transport
@@ -1460,12 +1510,6 @@ impl BrowserRuntime {
                 .as_ref()
                 .filter(|active| active.owner.belongs_to_workspace(workspace_id))
                 .map(|active| active.upstream_page_id);
-            let screencast_page = runtime
-                .routing
-                .active_screencast
-                .as_ref()
-                .filter(|active| active.owner.belongs_to_workspace(workspace_id))
-                .map(|active| active.upstream_page_id);
             let page_ids = runtime
                 .routing
                 .upstream_owners
@@ -1474,7 +1518,7 @@ impl BrowserRuntime {
                     owner.belongs_to_workspace(workspace_id).then_some(*page_id)
                 })
                 .collect::<Vec<_>>();
-            (transport, trace_page, screencast_page, page_ids)
+            (transport, trace_page, page_ids)
         };
         page_ids.sort_unstable();
 
@@ -1503,32 +1547,6 @@ impl BrowserRuntime {
                         cleanup_error = Some(format!(
                             "could not stop workspace performance trace: {error}"
                         ));
-                    }
-                }
-            }
-            if cleanup_error.is_none()
-                && let Some(page_id) = screencast_page
-            {
-                match self
-                    .call_transport_tool(
-                        transport,
-                        "screencast_stop",
-                        serde_json::json!({ "pageId": page_id }),
-                        deadline,
-                        BROWSER_WORKSPACE_RELEASE_TIMEOUT,
-                    )
-                    .await
-                {
-                    Ok(result) if browser_result_is_error(&result) => {
-                        cleanup_error = Some(format!(
-                            "could not stop workspace screencast: {}",
-                            browser_result_text(&result)
-                        ));
-                    }
-                    Ok(_) => {}
-                    Err(error) => {
-                        cleanup_error =
-                            Some(format!("could not stop workspace screencast: {error}"));
                     }
                 }
             }
@@ -1575,6 +1593,14 @@ impl BrowserRuntime {
                     }
                 }
             }
+            if cleanup_error.is_none() {
+                let context_name = browser_workspace_context_name(workspace_id.as_str());
+                if let Err(error) = transport.dispose_context(&context_name, deadline).await {
+                    cleanup_error = Some(format!(
+                        "could not dispose removed-workspace browser context: {error}"
+                    ));
+                }
+            }
         }
 
         if let Some(error) = cleanup_error {
@@ -1605,23 +1631,16 @@ impl BrowserRuntime {
         {
             runtime.routing.active_trace = None;
         }
-        if runtime
-            .routing
-            .last_trace_owner
-            .as_ref()
-            .is_some_and(|owner| owner.belongs_to_workspace(workspace_id))
-        {
-            runtime.routing.last_trace_owner = None;
-        }
-        if runtime
-            .routing
-            .active_screencast
-            .as_ref()
-            .is_some_and(|active| active.owner.belongs_to_workspace(workspace_id))
-        {
-            runtime.routing.active_screencast = None;
-        }
         Ok(())
+    }
+
+    /// Return the configured presentation for MoonDesk's one host-owned agent browser.
+    pub(crate) async fn presentation(&self) -> BrowserPresentation {
+        if let Some(state) = &self.state {
+            state.lock().await.browser_presentation
+        } else {
+            BrowserPresentation::default()
+        }
     }
 
     /// Return whether MoonDesk currently owns a live browser transport.
@@ -1677,7 +1696,7 @@ fn upstream_pages_from_result(result: &Value) -> Result<Vec<UpstreamPageInfo>, S
         .pointer("/structuredContent/pages")
         .and_then(Value::as_array)
         .ok_or_else(|| {
-            "chrome-devtools-mcp did not return structured page metadata; the pinned browser contract may have changed"
+            "MoonDesk's native browser engine did not return structured page metadata; the browser contract may have changed"
                 .to_string()
         })?;
     pages
@@ -1738,34 +1757,6 @@ fn browser_close_survivor_page_id(pages: &[UpstreamPageInfo], target_page_id: u6
         .map(|page| page.id)
 }
 
-fn browser_workspace_file_command(command: &str) -> bool {
-    matches!(
-        command,
-        "close_heapsnapshot"
-            | "compare_heapsnapshots"
-            | "get_heapsnapshot_class_nodes"
-            | "get_heapsnapshot_details"
-            | "get_heapsnapshot_dominators"
-            | "get_heapsnapshot_duplicate_strings"
-            | "get_heapsnapshot_edges"
-            | "get_heapsnapshot_object_details"
-            | "get_heapsnapshot_retainers"
-            | "get_heapsnapshot_retaining_paths"
-            | "get_heapsnapshot_summary"
-    )
-}
-
-fn browser_global_extension_command(command: &str) -> bool {
-    matches!(
-        command,
-        "install_extension"
-            | "list_extensions"
-            | "reload_extension"
-            | "trigger_extension_action"
-            | "uninstall_extension"
-    )
-}
-
 #[cfg(test)]
 fn browser_logical_page_control_command(command: &str) -> bool {
     matches!(
@@ -1782,46 +1773,31 @@ fn browser_page_scoped_command(command: &str) -> bool {
             | "drag"
             | "emulate"
             | "evaluate_script"
-            | "execute_3p_developer_tool"
-            | "execute_webmcp_tool"
             | "fill"
             | "get_console_message"
             | "get_network_request"
             | "handle_dialog"
             | "hover"
-            | "lighthouse_audit"
-            | "list_3p_developer_tools"
             | "list_console_messages"
             | "list_network_requests"
-            | "list_webmcp_tools"
             | "navigate_page"
-            | "performance_analyze_insight"
             | "performance_start_trace"
             | "performance_stop_trace"
             | "press_key"
             | "resize_page"
-            | "screencast_start"
-            | "screencast_stop"
+            | "scroll"
             | "take_heapsnapshot"
             | "take_screenshot"
             | "take_snapshot"
             | "type_text"
             | "upload_file"
-            | "wait_for"
     )
 }
 
 fn browser_command_may_open_or_close_pages(command: &str) -> bool {
     matches!(
         command,
-        "click"
-            | "click_at"
-            | "evaluate_script"
-            | "execute_3p_developer_tool"
-            | "execute_webmcp_tool"
-            | "handle_dialog"
-            | "navigate_page"
-            | "press_key"
+        "click" | "click_at" | "evaluate_script" | "navigate_page" | "press_key"
     )
 }
 
@@ -1920,36 +1896,6 @@ fn browser_page_listing_text(text: &str) -> Vec<(u64, bool)> {
 #[cfg(test)]
 fn browser_page_listing(result: &Value) -> Vec<(u64, bool)> {
     browser_page_listing_text(&browser_result_text(result))
-}
-
-fn browser_server_args(presentation: BrowserPresentation) -> (Vec<String>, String) {
-    let mut args = vec![
-        format!("--headless={}", presentation.is_headless()),
-        "--isolated=true".to_string(),
-        "--screenshotFormat=jpeg".to_string(),
-        "--screenshotQuality=82".to_string(),
-        "--screenshotMaxWidth=1920".to_string(),
-        "--screenshotMaxHeight=4096".to_string(),
-        "--usageStatistics=false".to_string(),
-        "--performanceCrux=false".to_string(),
-        "--redactNetworkHeaders=true".to_string(),
-        "--allowUnrestrictedPaths=false".to_string(),
-        "--viaCli=true".to_string(),
-        "--experimentalStructuredContent=true".to_string(),
-        "--experimentalPageIdRouting=true".to_string(),
-    ];
-    if presentation.is_headless() {
-        args.push(format!("--viewport={DEFAULT_HEADLESS_VIEWPORT}"));
-    }
-    let mut browser_name = "default Chromium browser".to_string();
-    if let Some(browser) = crate::browser::detect_browsers()
-        .into_iter()
-        .find(|browser| browser.mcp_supported && Path::new(&browser.path).is_file())
-    {
-        args.push(format!("--executablePath={}", browser.path));
-        browser_name = browser.name;
-    }
-    (args, browser_name)
 }
 
 fn browser_output_from_result(
@@ -2071,38 +2017,13 @@ fn total_timeout_message(timeout: Duration) -> String {
     )
 }
 
-async fn run_cli_help(
-    workspace_root: &str,
-    command_name: &str,
-    args: &[String],
-    timeout: Duration,
-) -> Result<BrowserCommandOutput, String> {
-    let package = format!("chrome-devtools-mcp@{CHROME_DEVTOOLS_PACKAGE_VERSION}");
-    let mut command = Command::new(npx_program());
-    command
-        .args(["-y", "-p", package.as_str(), "chrome-devtools"])
-        .arg(command_name)
-        .args(args)
-        .env("CHROME_DEVTOOLS_MCP_NO_UPDATE_CHECKS", "1")
-        .current_dir(workspace_root)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    let output = tokio::time::timeout(timeout, command.output())
-        .await
-        .map_err(|_| format!("Browser help timed out after {} ms", timeout.as_millis()))?
-        .map_err(|error| format!("Failed to run pinned browser help: {error}"))?;
+fn run_cli_help(command_name: &str) -> Result<BrowserCommandOutput, String> {
     Ok(BrowserCommandOutput {
-        stdout: bounded_output(&output.stdout),
-        stderr: bounded_output(&output.stderr),
-        exit_code: output.status.code().unwrap_or(-1),
+        stdout: bounded_text(&browser_command_help(command_name)?),
+        stderr: String::new(),
+        exit_code: 0,
         restarted: false,
     })
-}
-
-fn npx_program() -> &'static str {
-    if cfg!(windows) { "npx.cmd" } else { "npx" }
 }
 
 fn bounded_text(text: &str) -> String {
@@ -2164,9 +2085,7 @@ pub fn validate_browser_request_bounds(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BrowserPathKind {
     InputFile,
-    InputDirectory,
     OutputFile,
-    OutputDirectory,
 }
 
 #[derive(Clone, Debug)]
@@ -2223,36 +2142,7 @@ impl PreparedBrowserInvocation {
                         visible: actual_destination,
                     });
                 }
-                BrowserPathKind::OutputDirectory => {
-                    if !output.staged_requested_path.is_dir() {
-                        return Err(format!(
-                            "Browser command completed without producing the staged output directory {}",
-                            output.staged_requested_path.display()
-                        ));
-                    }
-                    let destination = validate_workspace_output_destination(
-                        &self.workspace_root,
-                        &output.destination,
-                        BrowserPathKind::OutputDirectory,
-                    )?;
-                    std::fs::create_dir_all(&destination).map_err(|error| {
-                        format!(
-                            "Could not create browser output directory {}: {error}",
-                            destination.display()
-                        )
-                    })?;
-                    copy_directory_contents_strict(
-                        &output.staged_requested_path,
-                        &destination,
-                        &self.workspace_root,
-                        deadline,
-                    )?;
-                    self.rewrites.push(BrowserPathRewrite {
-                        staged: output.staged_requested_path,
-                        visible: destination,
-                    });
-                }
-                BrowserPathKind::InputFile | BrowserPathKind::InputDirectory => {
+                BrowserPathKind::InputFile => {
                     return Err(
                         "Internal browser staging error: input registered as output".to_string()
                     );
@@ -2277,49 +2167,17 @@ fn browser_path_flag_kind(command: &str, flag: &str) -> Option<BrowserPathKind> 
         ("evaluate_script", "filepath")
         | ("performance_start_trace", "filepath")
         | ("performance_stop_trace", "filepath")
-        | ("screencast_start", "filepath")
         | ("take_screenshot", "filepath")
         | ("take_snapshot", "filepath")
         | ("take_heapsnapshot", "filepath") => Some(BrowserPathKind::OutputFile),
-        ("close_heapsnapshot", "filepath")
-        | ("get_heapsnapshot_class_nodes", "filepath")
-        | ("get_heapsnapshot_details", "filepath")
-        | ("get_heapsnapshot_dominators", "filepath")
-        | ("get_heapsnapshot_duplicate_strings", "filepath")
-        | ("get_heapsnapshot_edges", "filepath")
-        | ("get_heapsnapshot_object_details", "filepath")
-        | ("get_heapsnapshot_retainers", "filepath")
-        | ("get_heapsnapshot_retaining_paths", "filepath")
-        | ("get_heapsnapshot_summary", "filepath")
-        | ("upload_file", "filepath")
-        | ("compare_heapsnapshots", "basefilepath")
-        | ("compare_heapsnapshots", "currentfilepath") => Some(BrowserPathKind::InputFile),
-        ("get_network_request", "requestfilepath")
-        | ("get_network_request", "responsefilepath") => Some(BrowserPathKind::OutputFile),
-        ("lighthouse_audit", "outputdirpath") => Some(BrowserPathKind::OutputDirectory),
-        ("install_extension", "path") => Some(BrowserPathKind::InputDirectory),
+        ("upload_file", "filepath") => Some(BrowserPathKind::InputFile),
         _ => None,
     }
 }
 
 fn positional_browser_paths(command: &str) -> &'static [(usize, BrowserPathKind, &'static str)] {
-    use BrowserPathKind::{InputDirectory, InputFile, OutputFile};
+    use BrowserPathKind::{InputFile, OutputFile};
     match command {
-        "close_heapsnapshot"
-        | "get_heapsnapshot_class_nodes"
-        | "get_heapsnapshot_details"
-        | "get_heapsnapshot_dominators"
-        | "get_heapsnapshot_duplicate_strings"
-        | "get_heapsnapshot_edges"
-        | "get_heapsnapshot_object_details"
-        | "get_heapsnapshot_retainers"
-        | "get_heapsnapshot_retaining_paths"
-        | "get_heapsnapshot_summary" => &[(0, InputFile, "filepath")],
-        "compare_heapsnapshots" => &[
-            (0, InputFile, "basefilepath"),
-            (1, InputFile, "currentfilepath"),
-        ],
-        "install_extension" => &[(0, InputDirectory, "path")],
         "take_heapsnapshot" => &[(0, OutputFile, "filepath")],
         "upload_file" => &[(1, InputFile, "filepath")],
         _ => &[],
@@ -2360,7 +2218,6 @@ fn metadata_is_link_like(metadata: &std::fs::Metadata) -> bool {
 fn validate_workspace_input(
     workspace_root: &Path,
     raw_path: &str,
-    kind: BrowserPathKind,
     allow_external_absolute_input_files: bool,
 ) -> Result<PathBuf, String> {
     if raw_path.trim().is_empty() {
@@ -2392,8 +2249,7 @@ fn validate_workspace_input(
         )
     })?;
     let canonical = crate::command::normalize_windows_verbatim_path(canonical);
-    let expects_directory = matches!(kind, BrowserPathKind::InputDirectory);
-    if (expects_directory && !canonical.is_dir()) || (!expects_directory && !canonical.is_file()) {
+    if !canonical.is_file() {
         return Err(format!(
             "Browser input path has the wrong type: {}",
             candidate.display()
@@ -2401,11 +2257,8 @@ fn validate_workspace_input(
     }
     // Relative browser inputs remain workspace-scoped. Explicit absolute files follow the same
     // local-read contract as MoonDesk's read/vision tools: if the user can read the regular file,
-    // MoonDesk may stage a private copy for the isolated browser. Directories stay workspace-bound
-    // because they expose a broader filesystem tree than a single explicitly addressed file.
-    let external_absolute_file = allow_external_absolute_input_files
-        && explicitly_absolute
-        && matches!(kind, BrowserPathKind::InputFile);
+    // MoonDesk may stage a private copy for the isolated browser.
+    let external_absolute_file = allow_external_absolute_input_files && explicitly_absolute;
     if !path_within(workspace_root, &canonical) && !external_absolute_file {
         return Err(format!(
             "Browser path is outside the active workspace: {}",
@@ -2418,7 +2271,6 @@ fn validate_workspace_input(
 fn validate_workspace_output_destination(
     workspace_root: &Path,
     requested: &Path,
-    kind: BrowserPathKind,
 ) -> Result<PathBuf, String> {
     let candidate = if requested.is_absolute() {
         requested.to_path_buf()
@@ -2445,10 +2297,7 @@ fn validate_workspace_output_destination(
             )
         })?;
         let canonical = crate::command::normalize_windows_verbatim_path(canonical);
-        let expects_directory = matches!(kind, BrowserPathKind::OutputDirectory);
-        if (expects_directory && !canonical.is_dir())
-            || (!expects_directory && !canonical.is_file())
-        {
+        if !canonical.is_file() {
             return Err(format!(
                 "Browser output path has the wrong type: {}",
                 candidate.display()
@@ -2651,165 +2500,6 @@ fn publish_browser_output_file(
     result
 }
 
-fn copy_directory_tree_strict(
-    source: &Path,
-    destination: &Path,
-    workspace_root: &Path,
-    deadline: Option<tokio::time::Instant>,
-) -> Result<(), String> {
-    fn copy_one(
-        source: &Path,
-        destination: &Path,
-        workspace_root: &Path,
-        source_root: &Path,
-        visited: &mut std::collections::HashSet<PathBuf>,
-        deadline: Option<tokio::time::Instant>,
-    ) -> Result<(), String> {
-        ensure_browser_deadline(deadline)?;
-        let metadata = std::fs::symlink_metadata(source).map_err(|error| {
-            format!(
-                "Could not inspect staged browser input {}: {error}",
-                source.display()
-            )
-        })?;
-        if metadata_is_link_like(&metadata) {
-            return Err(format!(
-                "Browser input directory contains a symlink or reparse point: {}",
-                source.display()
-            ));
-        }
-        let canonical = source.canonicalize().map_err(|error| {
-            format!(
-                "Could not resolve browser input {}: {error}",
-                source.display()
-            )
-        })?;
-        let canonical = crate::command::normalize_windows_verbatim_path(canonical);
-        if !path_within(workspace_root, &canonical) || !path_within(source_root, &canonical) {
-            return Err(format!(
-                "Browser input directory traversal escaped its validated root: {}",
-                source.display()
-            ));
-        }
-        if metadata.is_dir() {
-            if !visited.insert(canonical.clone()) {
-                return Err(format!(
-                    "Browser input directory contains a filesystem cycle: {}",
-                    source.display()
-                ));
-            }
-            create_private_browser_directory(destination).map_err(|error| {
-                format!(
-                    "Could not create staged browser input directory {}: {error}",
-                    destination.display()
-                )
-            })?;
-            for entry in std::fs::read_dir(source).map_err(|error| {
-                format!(
-                    "Could not read browser input directory {}: {error}",
-                    source.display()
-                )
-            })? {
-                let entry = entry.map_err(|error| {
-                    format!("Could not read browser input directory entry: {error}")
-                })?;
-                copy_one(
-                    &entry.path(),
-                    &destination.join(entry.file_name()),
-                    workspace_root,
-                    source_root,
-                    visited,
-                    deadline,
-                )?;
-            }
-            visited.remove(&canonical);
-            return Ok(());
-        }
-        if !metadata.is_file() {
-            return Err(format!(
-                "Browser input directory contains an unsupported filesystem entry: {}",
-                source.display()
-            ));
-        }
-        copy_browser_file_with_deadline(source, destination, deadline).map_err(|error| {
-            format!(
-                "Could not stage browser input file {}: {error}",
-                source.display()
-            )
-        })
-    }
-
-    let source_root = source.to_path_buf();
-    let mut visited = std::collections::HashSet::new();
-    copy_one(
-        source,
-        destination,
-        workspace_root,
-        &source_root,
-        &mut visited,
-        deadline,
-    )
-}
-
-fn copy_directory_contents_strict(
-    source: &Path,
-    destination: &Path,
-    workspace_root: &Path,
-    deadline: Option<tokio::time::Instant>,
-) -> Result<(), String> {
-    ensure_browser_deadline(deadline)?;
-    for entry in std::fs::read_dir(source).map_err(|error| {
-        format!(
-            "Could not read staged browser output directory {}: {error}",
-            source.display()
-        )
-    })? {
-        let entry =
-            entry.map_err(|error| format!("Could not read staged browser output: {error}"))?;
-        let source_path = entry.path();
-        let destination_path = destination.join(entry.file_name());
-        let metadata = std::fs::symlink_metadata(&source_path).map_err(|error| {
-            format!(
-                "Could not inspect staged browser output {}: {error}",
-                source_path.display()
-            )
-        })?;
-        if metadata_is_link_like(&metadata) {
-            return Err(format!(
-                "Browser output contained an unexpected symlink or reparse point: {}",
-                source_path.display()
-            ));
-        }
-        if metadata.is_dir() {
-            let validated = validate_workspace_output_destination(
-                workspace_root,
-                &destination_path,
-                BrowserPathKind::OutputDirectory,
-            )?;
-            std::fs::create_dir_all(&validated).map_err(|error| {
-                format!(
-                    "Could not create browser output directory {}: {error}",
-                    validated.display()
-                )
-            })?;
-            copy_directory_contents_strict(&source_path, &validated, workspace_root, deadline)?;
-        } else if metadata.is_file() {
-            let validated = validate_workspace_output_destination(
-                workspace_root,
-                &destination_path,
-                BrowserPathKind::OutputFile,
-            )?;
-            publish_browser_output_file(&source_path, &validated, deadline)?;
-        } else {
-            return Err(format!(
-                "Browser output contained an unsupported filesystem entry: {}",
-                source_path.display()
-            ));
-        }
-    }
-    Ok(())
-}
-
 fn resolve_staged_output_file(output: &BrowserOutputStage) -> Result<PathBuf, String> {
     if output.staged_requested_path.is_file() {
         return Ok(output.staged_requested_path.clone());
@@ -2861,7 +2551,7 @@ fn destination_for_staged_output(
         adjusted.set_extension(actual_staged.extension().unwrap_or_default());
         adjusted
     };
-    validate_workspace_output_destination(workspace_root, &destination, BrowserPathKind::OutputFile)
+    validate_workspace_output_destination(workspace_root, &destination)
 }
 
 struct BrowserPathStager<'a> {
@@ -2886,7 +2576,6 @@ impl<'a> BrowserPathStager<'a> {
 
 fn stage_browser_path(
     workspace_root: &Path,
-    command: &str,
     raw_path: &str,
     kind: BrowserPathKind,
     allow_external_absolute_input_files: bool,
@@ -2894,13 +2583,6 @@ fn stage_browser_path(
     deadline: Option<tokio::time::Instant>,
 ) -> Result<PathBuf, String> {
     ensure_browser_deadline(deadline)?;
-    if command == "screencast_start" && matches!(kind, BrowserPathKind::OutputFile) {
-        return Err(
-            "MoonDesk does not accept an explicit screencast output path because the pinned browser runtime keeps that file open until a later screencast_stop command"
-                .to_string(),
-        );
-    }
-
     if matches!(kind, BrowserPathKind::OutputFile) {
         let raw = PathBuf::from(raw_path);
         let candidate = if raw.is_absolute() {
@@ -2917,11 +2599,10 @@ fn stage_browser_path(
     }
 
     match kind {
-        BrowserPathKind::InputFile | BrowserPathKind::InputDirectory => {
+        BrowserPathKind::InputFile => {
             let source = validate_workspace_input(
                 workspace_root,
                 raw_path,
-                kind,
                 allow_external_absolute_input_files,
             )?;
             let root = ensure_browser_staging_root(&mut stager.staging_root)?;
@@ -2935,26 +2616,21 @@ fn stage_browser_path(
                 format!("Browser input path has no filename: {}", source.display())
             })?;
             let staged = stage_dir.join(name);
-            if matches!(kind, BrowserPathKind::InputDirectory) {
-                copy_directory_tree_strict(&source, &staged, workspace_root, deadline)?;
-            } else {
-                copy_browser_file_with_deadline(&source, &staged, deadline).map_err(|error| {
-                    format!(
-                        "Could not stage browser input file {}: {error}",
-                        source.display()
-                    )
-                })?;
-            }
+            copy_browser_file_with_deadline(&source, &staged, deadline).map_err(|error| {
+                format!(
+                    "Could not stage browser input file {}: {error}",
+                    source.display()
+                )
+            })?;
             stager.rewrites.push(BrowserPathRewrite {
                 staged: staged.clone(),
                 visible: source,
             });
             Ok(staged)
         }
-        BrowserPathKind::OutputFile | BrowserPathKind::OutputDirectory => {
+        BrowserPathKind::OutputFile => {
             let requested = PathBuf::from(raw_path);
-            let destination =
-                validate_workspace_output_destination(workspace_root, &requested, kind)?;
+            let destination = validate_workspace_output_destination(workspace_root, &requested)?;
             let root = ensure_browser_staging_root(&mut stager.staging_root)?;
             let current_slot = stager.slot;
             stager.slot += 1;
@@ -2969,11 +2645,6 @@ fn stage_browser_path(
                 )
             })?;
             let staged_requested_path = stage_dir.join(name);
-            if matches!(kind, BrowserPathKind::OutputDirectory) {
-                create_private_browser_directory(&staged_requested_path).map_err(|error| {
-                    format!("Could not create staged browser output directory: {error}")
-                })?;
-            }
             stager.outputs.push(BrowserOutputStage {
                 stage_dir,
                 staged_requested_path: staged_requested_path.clone(),
@@ -3061,7 +2732,6 @@ fn prepare_browser_invocation_with_managed_temp_deadline(
         }
         let staged = stage_browser_path(
             &workspace_root,
-            command,
             &value,
             kind,
             allow_external_absolute_input_files,
@@ -3096,7 +2766,6 @@ fn prepare_browser_invocation_with_managed_temp_deadline(
             if let Some((prefix, raw_value)) = arg.split_once('=') {
                 let staged = stage_browser_path(
                     &workspace_root,
-                    command,
                     raw_value,
                     kind,
                     allow_external_absolute_input_files,
@@ -3114,7 +2783,6 @@ fn prepare_browser_invocation_with_managed_temp_deadline(
                 }
                 let staged = stage_browser_path(
                     &workspace_root,
-                    command,
                     &raw_value,
                     kind,
                     allow_external_absolute_input_files,
@@ -3174,9 +2842,9 @@ mod tests {
     }
 
     #[test]
-    fn every_pinned_browser_command_has_an_explicit_routing_class() {
-        let contract: Value = serde_json::from_str(include_str!("browser_contract_v1_7.json"))
-            .expect("parse pinned browser contract");
+    fn every_native_browser_command_has_an_explicit_routing_class() {
+        let contract: Value = serde_json::from_str(include_str!("browser_contract.json"))
+            .expect("parse native browser contract");
         let commands = contract
             .get("commands")
             .and_then(Value::as_object)
@@ -3184,10 +2852,8 @@ mod tests {
         for command in commands.keys() {
             assert!(
                 browser_logical_page_control_command(command)
-                    || browser_page_scoped_command(command)
-                    || browser_workspace_file_command(command)
-                    || browser_global_extension_command(command),
-                "pinned browser command {command:?} has no MoonDesk routing class"
+                    || browser_page_scoped_command(command),
+                "native browser command {command:?} has no MoonDesk routing class"
             );
         }
     }
@@ -3274,8 +2940,8 @@ mod tests {
             .reconcile_pages(&chat_b, &pages_all, Some(&claim_b))
             .await;
 
-        let safe_a = runtime.safe_pages_for_session(&chat_a).await;
-        let safe_b = runtime.safe_pages_for_session(&chat_b).await;
+        let safe_a = runtime.session_pages(&chat_a).await;
+        let safe_b = runtime.session_pages(&chat_b).await;
         assert_eq!(safe_a.len(), 2);
         assert_eq!(safe_b.len(), 1);
         assert_eq!(safe_a[0].get("id").and_then(Value::as_u64), Some(1));
@@ -3380,7 +3046,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn global_browser_recordings_are_session_and_page_owned() {
+    async fn performance_trace_is_session_and_page_owned() {
         let runtime = BrowserRuntime::standalone();
         let workspace = WorkspaceId::new();
         let chat_a = BrowserSessionKey::openai(&workspace, None, "chat-a");
@@ -3401,29 +3067,22 @@ mod tests {
         assert!(runtime.performance_trace_page(&chat_b).await.is_err());
         assert!(runtime.ensure_page_can_close(&chat_a, 41).await.is_err());
         assert!(runtime.ensure_page_can_close(&chat_a, 99).await.is_ok());
-        runtime.finish_performance_trace(&chat_a, true).await;
-        runtime
-            .require_last_trace_owner(&chat_a)
-            .await
-            .expect("chat A owns last trace recording");
-        assert!(runtime.require_last_trace_owner(&chat_b).await.is_err());
 
+        runtime.finish_performance_trace(&chat_a).await;
+        assert!(runtime.performance_trace_page(&chat_a).await.is_err());
+        assert!(runtime.ensure_page_can_close(&chat_a, 41).await.is_ok());
         runtime
-            .begin_screencast(&chat_b, 52)
+            .begin_performance_trace(&chat_b, 52)
             .await
-            .expect("chat B claims screencast");
-        assert!(runtime.begin_screencast(&chat_a, 41).await.is_err());
+            .expect("chat B can claim trace after chat A stops");
         assert_eq!(
             runtime
-                .screencast_page(&chat_b)
+                .performance_trace_page(&chat_b)
                 .await
-                .expect("chat B owns active screencast"),
+                .expect("chat B owns active trace"),
             52
         );
-        assert!(runtime.screencast_page(&chat_a).await.is_err());
-        assert!(runtime.ensure_page_can_close(&chat_b, 52).await.is_err());
-        runtime.finish_screencast(&chat_b).await;
-        assert!(runtime.ensure_page_can_close(&chat_b, 52).await.is_ok());
+        runtime.finish_performance_trace(&chat_b).await;
     }
 
     #[tokio::test]
@@ -3465,8 +3124,8 @@ mod tests {
             .await
             .expect("release idle workspace A state");
 
-        assert!(runtime.safe_pages_for_session(&chat_a).await.is_empty());
-        assert_eq!(runtime.safe_pages_for_session(&chat_b).await.len(), 1);
+        assert!(runtime.session_pages(&chat_a).await.is_empty());
+        assert_eq!(runtime.session_pages(&chat_b).await.len(), 1);
         assert!(runtime.performance_trace_page(&chat_a).await.is_err());
         assert_eq!(
             runtime
@@ -3551,7 +3210,7 @@ mod tests {
     }
 
     #[test]
-    fn browser_cli_response_rendering_matches_pinned_upstream_contract() {
+    fn browser_cli_response_rendering_matches_native_contract() {
         let json_output = browser_output_from_result(
             serde_json::json!({
                 "isError": false,
@@ -3679,39 +3338,11 @@ mod tests {
     }
 
     #[test]
-    fn browser_server_args_enforce_isolated_safe_runtime_and_presentation() {
-        for (presentation, expected_headless) in [
-            (BrowserPresentation::Headless, "--headless=true"),
-            (BrowserPresentation::Visible, "--headless=false"),
-        ] {
-            let (args, _browser_name) = browser_server_args(presentation);
-            for expected in [
-                expected_headless,
-                "--isolated=true",
-                "--screenshotFormat=jpeg",
-                "--screenshotQuality=82",
-                "--screenshotMaxWidth=1920",
-                "--screenshotMaxHeight=4096",
-                "--usageStatistics=false",
-                "--performanceCrux=false",
-                "--redactNetworkHeaders=true",
-                "--allowUnrestrictedPaths=false",
-                "--viaCli=true",
-                "--experimentalStructuredContent=true",
-                "--experimentalPageIdRouting=true",
-            ] {
-                assert!(args.iter().any(|arg| arg == expected), "missing {expected}");
-            }
-            assert!(!args.iter().any(|arg| arg.starts_with("--userDataDir=")));
-            if presentation.is_headless() {
-                assert!(
-                    args.iter()
-                        .any(|arg| arg == &format!("--viewport={DEFAULT_HEADLESS_VIEWPORT}"))
-                );
-            } else {
-                assert!(!args.iter().any(|arg| arg.starts_with("--viewport=")));
-            }
-        }
+    fn browser_command_help_is_owned_locally() {
+        let help = run_cli_help("list_pages").expect("render native browser help");
+        assert!(help.success());
+        assert!(help.stdout.contains("MoonDesk browser command: list_pages"));
+        assert!(!help.stdout.contains("chrome-devtools-mcp"));
     }
 
     #[tokio::test]
@@ -3988,23 +3619,6 @@ mod tests {
                 .contains("outside the active workspace")
         );
 
-        let outside_directory = workspace
-            .parent()
-            .expect("workspace parent")
-            .join(format!("outside-dir-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&outside_directory).expect("create outside directory fixture");
-        let external_directory = prepare_browser_invocation_with_policy(
-            &workspace_str,
-            "install_extension",
-            &[outside_directory.to_string_lossy().into_owned()],
-            true,
-        );
-        assert!(
-            external_directory
-                .expect_err("external browser input directories must remain workspace-bound")
-                .contains("outside the active workspace")
-        );
-
         let traversal = prepare_browser_invocation(
             &workspace_str,
             "take_screenshot",
@@ -4037,19 +3651,7 @@ mod tests {
             ],
         );
         assert!(duplicate_path.is_err());
-        let screencast_path = prepare_browser_invocation(
-            &workspace_str,
-            "screencast_start",
-            &["--filePath=reports/cast.mp4".to_string()],
-        );
-        assert!(
-            screencast_path
-                .expect_err("long-lived screencast output path must be rejected")
-                .contains("keeps that file open")
-        );
-
         let _ = std::fs::remove_file(outside);
-        let _ = std::fs::remove_dir_all(outside_directory);
         let _ = std::fs::remove_dir_all(workspace);
     }
 
@@ -4318,6 +3920,11 @@ mod tests {
         assert!(visible_transport.is_alive());
         assert!(state.lock().await.browser_runtime_running);
 
+        // Visible Chrome startup details vary by host: some builds retain an unrelated
+        // startup page/context while others do not. Browser-global trace isolation is covered by
+        // the dedicated routing/trace smokes; this presentation test should only assert that the
+        // confirmed restart changes presentation without conflating that with Chrome's optional
+        // startup-target behavior.
         let back_to_headless = runtime
             .set_presentation(BrowserPresentation::Headless, true)
             .await;
@@ -4341,14 +3948,6 @@ mod tests {
     #[ignore = "serialized Windows shared Chromium session-routing smoke"]
     async fn windows_shared_chromium_isolates_chat_pages_and_workspace_storage() {
         use axum::{Router, response::Html, routing::get};
-
-        if !crate::browser::detect_browsers()
-            .into_iter()
-            .any(|browser| browser.mcp_supported)
-        {
-            eprintln!("skipping shared Chromium routing smoke: no supported browser installed");
-            return;
-        }
 
         const SITE_HTML: &str = r#"<!doctype html>
 <html><head><meta charset="utf-8"><title>MoonDesk Routing E2E</title></head>
@@ -4459,6 +4058,21 @@ mod tests {
             storage_b.stdout
         );
 
+        let cross_session_trace = runtime
+            .run_for_session(
+                &chat_a,
+                &root_a_str,
+                "performance_start_trace",
+                &["--reload=false".into()],
+                DEFAULT_BROWSER_COMMAND_TIMEOUT,
+            )
+            .await
+            .expect_err("browser-global trace must not mix same-workspace conversations");
+        assert!(
+            cross_session_trace.contains("another browser session"),
+            "unexpected cross-session trace isolation error: {cross_session_trace}"
+        );
+
         let navigate_c = runtime
             .run_for_session(
                 &chat_c,
@@ -4476,7 +4090,7 @@ mod tests {
         assert_eq!(
             runtime.transport_pid().await,
             Some(shared_pid),
-            "different workspaces must reuse one chrome-devtools-mcp/Chromium runtime"
+            "different workspaces must reuse one MoonDesk-owned Chromium runtime"
         );
         let storage_c = runtime
             .run_for_session(
@@ -4497,6 +4111,21 @@ mod tests {
             !storage_c.stdout.contains("\"HAS\""),
             "different workspace leaked storage: {}",
             storage_c.stdout
+        );
+
+        let cross_workspace_trace = runtime
+            .run_for_session(
+                &chat_a,
+                &root_a_str,
+                "performance_start_trace",
+                &["--reload=false".into()],
+                DEFAULT_BROWSER_COMMAND_TIMEOUT,
+            )
+            .await
+            .expect_err("browser-global trace must not run across workspace contexts");
+        assert!(
+            cross_workspace_trace.contains("browser-global"),
+            "unexpected cross-workspace trace isolation error: {cross_workspace_trace}"
         );
 
         let second_a = runtime
@@ -4645,8 +4274,8 @@ mod tests {
             Some(shared_pid),
             "workspace release must not restart Chromium when cleanup succeeds"
         );
-        assert!(runtime.safe_pages_for_session(&chat_a).await.is_empty());
-        assert!(runtime.safe_pages_for_session(&chat_b).await.is_empty());
+        assert!(runtime.session_pages(&chat_a).await.is_empty());
+        assert!(runtime.session_pages(&chat_b).await.is_empty());
         let transport = runtime
             .runtime
             .lock()
@@ -4686,6 +4315,65 @@ mod tests {
         assert!(workspace_b_after_release.stdout.contains("/c"));
         assert!(workspace_b_after_release.stdout.contains("MISS"));
         assert_eq!(runtime.transport_pid().await, Some(shared_pid));
+
+        let trace_page = runtime
+            .active_upstream_page_id(&chat_c)
+            .await
+            .expect("workspace B active trace page");
+        let trace_deadline = tokio::time::Instant::now() + DEFAULT_BROWSER_COMMAND_TIMEOUT;
+        let out_of_band_trace = transport
+            .call_tool(
+                "performance_start_trace",
+                serde_json::json!({
+                    "pageId": trace_page,
+                    "reload": false,
+                    "autoStop": false,
+                }),
+                trace_deadline,
+            )
+            .await
+            .expect("create deliberate transport/runtime trace-state mismatch");
+        assert!(
+            !browser_result_is_error(&out_of_band_trace),
+            "out-of-band trace start failed: {}",
+            browser_result_text(&out_of_band_trace)
+        );
+
+        let ambiguous_trace = runtime
+            .run_for_session(
+                &chat_c,
+                &root_b_str,
+                "performance_start_trace",
+                &["--reload=false".into(), "--autoStop=false".into()],
+                DEFAULT_BROWSER_COMMAND_TIMEOUT,
+            )
+            .await
+            .expect_err("ambiguous browser-global trace state must reset the shared runtime");
+        assert!(
+            ambiguous_trace.contains("reset the shared browser runtime"),
+            "unexpected ambiguous trace error: {ambiguous_trace}"
+        );
+        assert!(
+            !transport.is_alive(),
+            "ambiguous trace state must invalidate the old Chromium generation"
+        );
+        assert!(runtime.performance_trace_page(&chat_c).await.is_err());
+
+        let recovered_after_trace_reset = runtime
+            .run_for_session(
+                &chat_c,
+                &root_b_str,
+                "list_pages",
+                &[],
+                DEFAULT_BROWSER_COMMAND_TIMEOUT,
+            )
+            .await
+            .expect("browser should recover after ambiguous trace reset");
+        assert!(recovered_after_trace_reset.success());
+        assert!(
+            recovered_after_trace_reset.restarted,
+            "trace-state reset must surface as a browser generation restart"
+        );
 
         runtime.stop().await;
         site_server.abort();
@@ -4740,6 +4428,21 @@ mod tests {
             .expect("first transport");
         let first_pid = first_transport.pid().await.expect("first transport pid");
         assert!(first_transport.is_alive());
+        let isolation_deadline = tokio::time::Instant::now() + DEFAULT_BROWSER_COMMAND_TIMEOUT;
+        assert!(
+            first_transport
+                .browser_contexts_match_managed(isolation_deadline)
+                .await
+                .expect("compare managed browser contexts after headless startup"),
+            "headless startup must not leave an untracked BrowserContext alive"
+        );
+        assert!(
+            !first_transport
+                .has_unmanaged_page_targets(isolation_deadline)
+                .await
+                .expect("inspect unmanaged pages after headless startup"),
+            "headless startup must not leave an unowned page alive"
+        );
 
         let opened = runtime
             .run(
@@ -4857,6 +4560,187 @@ mod tests {
 
         runtime.stop().await;
         assert!(!replacement.is_alive());
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    #[ignore = "serialized Windows stale trace recovery smoke"]
+    async fn windows_dead_browser_clears_stale_trace_lease_before_next_session() {
+        let workspace = std::env::temp_dir().join(format!(
+            "moondesk-browser-stale-trace-recovery-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workspace).expect("create stale-trace workspace");
+        let workspace_str = workspace.to_string_lossy().into_owned();
+        let runtime = BrowserRuntime::standalone();
+        let workspace_id = WorkspaceId::new();
+        let chat_a = BrowserSessionKey::openai(&workspace_id, None, "chat-a");
+        let chat_b = BrowserSessionKey::openai(&workspace_id, None, "chat-b");
+
+        let warm = runtime
+            .run_for_session(
+                &chat_a,
+                &workspace_str,
+                "list_pages",
+                &[],
+                DEFAULT_BROWSER_COMMAND_TIMEOUT,
+            )
+            .await
+            .expect("chat A starts browser");
+        assert!(warm.success(), "chat A list_pages failed: {warm:?}");
+
+        let trace = runtime
+            .run_for_session(
+                &chat_a,
+                &workspace_str,
+                "performance_start_trace",
+                &["--reload=false".into(), "--autoStop=false".into()],
+                DEFAULT_BROWSER_COMMAND_TIMEOUT,
+            )
+            .await
+            .expect("chat A starts manual trace");
+        assert!(trace.success(), "manual trace start failed: {trace:?}");
+        assert!(runtime.performance_trace_page(&chat_a).await.is_ok());
+        let blocked = runtime
+            .run_for_session(
+                &chat_b,
+                &workspace_str,
+                "list_pages",
+                &[],
+                DEFAULT_BROWSER_COMMAND_TIMEOUT,
+            )
+            .await
+            .expect_err("chat B must be blocked while chat A owns the manual trace");
+        assert!(
+            blocked.contains("owns the active performance trace"),
+            "unexpected trace ownership error: {blocked}"
+        );
+
+        let dead_transport = runtime
+            .runtime
+            .lock()
+            .await
+            .transport
+            .clone()
+            .expect("active browser transport");
+        dead_transport.shutdown().await;
+        assert!(!dead_transport.is_alive());
+
+        let recovered = runtime
+            .run_for_session(
+                &chat_b,
+                &workspace_str,
+                "list_pages",
+                &[],
+                DEFAULT_BROWSER_COMMAND_TIMEOUT,
+            )
+            .await
+            .expect("dead browser should recover before stale trace authority is enforced");
+        assert!(recovered.success(), "chat B recovery failed: {recovered:?}");
+        assert!(recovered.restarted);
+        assert!(runtime.performance_trace_page(&chat_a).await.is_err());
+
+        runtime.stop().await;
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    #[ignore = "serialized Windows vanished trace-page recovery smoke"]
+    async fn windows_vanished_trace_page_resets_runtime_before_other_session() {
+        let workspace = std::env::temp_dir().join(format!(
+            "moondesk-browser-vanished-trace-page-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workspace).expect("create vanished-trace workspace");
+        let workspace_str = workspace.to_string_lossy().into_owned();
+        let runtime = BrowserRuntime::standalone();
+        let workspace_id = WorkspaceId::new();
+        let chat_a = BrowserSessionKey::openai(&workspace_id, None, "chat-a");
+        let chat_b = BrowserSessionKey::openai(&workspace_id, None, "chat-b");
+
+        let warm = runtime
+            .run_for_session(
+                &chat_a,
+                &workspace_str,
+                "list_pages",
+                &[],
+                DEFAULT_BROWSER_COMMAND_TIMEOUT,
+            )
+            .await
+            .expect("chat A starts browser");
+        assert!(warm.success(), "chat A list_pages failed: {warm:?}");
+
+        let trace = runtime
+            .run_for_session(
+                &chat_a,
+                &workspace_str,
+                "performance_start_trace",
+                &["--reload=false".into(), "--autoStop=false".into()],
+                DEFAULT_BROWSER_COMMAND_TIMEOUT,
+            )
+            .await
+            .expect("chat A starts manual trace");
+        assert!(trace.success(), "manual trace start failed: {trace:?}");
+        let trace_page = runtime
+            .performance_trace_page(&chat_a)
+            .await
+            .expect("trace owner page");
+
+        let transport = runtime
+            .runtime
+            .lock()
+            .await
+            .transport
+            .clone()
+            .expect("active browser transport");
+        let close_deadline = tokio::time::Instant::now() + DEFAULT_BROWSER_COMMAND_TIMEOUT;
+        let closed = transport
+            .call_tool(
+                "close_page",
+                serde_json::json!({ "pageId": trace_page }),
+                close_deadline,
+            )
+            .await
+            .expect("force-close trace page below MoonDesk routing");
+        assert!(
+            !browser_result_is_error(&closed),
+            "forced trace page close failed: {}",
+            browser_result_text(&closed)
+        );
+
+        let reset = runtime
+            .run_for_session(
+                &chat_b,
+                &workspace_str,
+                "list_pages",
+                &[],
+                DEFAULT_BROWSER_COMMAND_TIMEOUT,
+            )
+            .await
+            .expect_err("vanished trace page must reset shared browser state");
+        assert!(
+            reset.contains("page owning the active performance trace disappeared"),
+            "unexpected vanished trace page error: {reset}"
+        );
+        assert!(!transport.is_alive());
+        assert!(runtime.performance_trace_page(&chat_a).await.is_err());
+
+        let recovered = runtime
+            .run_for_session(
+                &chat_b,
+                &workspace_str,
+                "list_pages",
+                &[],
+                DEFAULT_BROWSER_COMMAND_TIMEOUT,
+            )
+            .await
+            .expect("chat B should recover after fail-closed reset");
+        assert!(recovered.success(), "chat B recovery failed: {recovered:?}");
+        assert!(recovered.restarted);
+
+        runtime.stop().await;
         let _ = std::fs::remove_dir_all(workspace);
     }
 
@@ -4984,10 +4868,5 @@ mod tests {
         server.abort();
         let _ = server.await;
         let _ = std::fs::remove_dir_all(workspace);
-    }
-
-    #[test]
-    fn pinned_runtime_version_is_explicit() {
-        assert_eq!(CHROME_DEVTOOLS_PACKAGE_VERSION, "1.7.0");
     }
 }

@@ -1,305 +1,255 @@
-# Browser Runtime Architecture Hardening
-
-Status: PR #42 runtime hardening implemented; extended by the shared-Chromium workspace/conversation routing follow-up
+# Browser runtime architecture
 
 ## Purpose
 
-This document captures the browser-runtime architecture review performed after Ashpeak's second review of PR #42. The goal is not merely to clear individual review comments. The goal is to preserve MoonDesk's intended browser product model while removing lifecycle, timeout, security, compatibility, and performance weaknesses introduced by relying on the experimental detached `chrome-devtools-mcp@1.7.0` CLI daemon as MoonDesk's internal transport.
+MoonDesk provides one browser capability surface to agents while keeping browser process ownership,
+workspace storage, conversation tabs, and local file access under MoonDesk's authority.
 
-The findings below describe the pre-hardening baseline at commit `2608f37`. They are retained as the rationale for the refactor. The current branch implementation no longer uses the detached CLI daemon for normal browser operations.
+The current browser runtime is **native Rust CDP**. MoonDesk does not use Playwright,
+`chrome-devtools-mcp`, Browser Use, or a Node/Python browser sidecar for normal browser control.
+Those earlier adapter designs are historical implementation context, not runtime dependencies.
 
-## Implementation status
-
-The hardening work described in this document is implemented on the current branch:
-
-- **Owned runtime transport - done.** `BrowserRuntime` lazily starts exact `chrome-devtools-mcp@1.7.0` as a direct stdio MCP child. MoonDesk owns the complete process tree using the same Windows Job Object / Unix process-group lifecycle primitives used by command execution. Daemon session IDs, daemon PID files, and `start/status/stop` subprocess orchestration are removed.
-- **Post-dispatch timeout cancellation - done.** A timed-out MCP request invalidates and terminates the exact owned MCP/Chromium tree while browser serialization is still held. The Windows regression `windows_browser_timeout_cancels_dispatched_mutation` proves a delayed mutation that was genuinely dispatched cannot occur after MoonDesk returns timeout.
-- **Crash/runtime-loss recovery - done.** A dead owned child is discarded and the next browser operation starts a fresh isolated runtime. MoonDesk does not automatically replay the ambiguous operation that observed the loss.
-- **Host-file navigation boundary - done.** MoonDesk owns URL validation for `navigate_page` and `new_page`; local filesystem paths and unsafe local/internal schemes such as `file:`, `view-source:file:`, `chrome:`, and `javascript:` fail before reaching Chromium. Normal HTTP(S), localhost, `data:`, safe `view-source:https:`, and HTTP(S)-origin `blob:` navigation remain available.
-- **Node compatibility contract - done.** The npm engine range, wrapper preflight, installer diagnostics, README, contributor docs, and CI matrix now match exact `chrome-devtools-mcp@1.7.0` support: `^20.19.0 || ^22.12.0 || >=23`. CI also launches the exact pinned browser runtime with `--help` at supported boundary/latest versions so wrapper-only tests cannot hide a future engine mismatch.
-- **Single deadline model - done.** Direct stdio removes the upstream CLI client's hidden 60-second socket deadline. MoonDesk's absolute request deadline now governs queueing, runtime startup, MCP stdin lock/write/newline/flush, response wait, staging, and output publication. A blocked child stdin fails as `Timeout`; cleanup terminates the owned process tree before dropping buffered stdin so shutdown cannot wait behind a stuck writer.
-- **Bounded MCP framing - done.** Browser stdout is read as newline-delimited JSON-RPC with a 16 MiB frame ceiling before allocation/parsing can grow without bound. Oversized or malformed protocol frames invalidate the transport and fail pending requests explicitly. Stderr is consumed with a bounded per-line buffer while oversized tails are discarded at ingestion.
-- **Staging/output deadline hardening - done.** Potentially large staging work runs off Tokio workers; file copying checks the operation deadline in bounded chunks; file output is copied to a randomized sibling temporary file and atomically published only while the deadline remains valid. On Unix the staging root/directories are created as `0700` and staged/temp files as `0600` before the first byte is copied, preventing transient permission broadening. Existing traversal, symlink/reparse-point, and outside-workspace checks remain fail-closed.
-- **Pinned command contract - done.** `src/browser_contract_v1_7.json` records all 50 commands from exact v1.7 generated CLI metadata, and `src/browser_contract.rs` parses the existing `command + args[]` surface into MCP tool arguments while preserving aliases, booleans, arrays, enums/defaults, and MoonDesk-owned `--output-format`.
-- **CLI response parity - done.** MoonDesk mirrors v1.7 CLI rendering for markdown, structured JSON, MCP tool errors, and image responses rather than depending on the detached CLI renderer. Oversized JSON remains syntactically valid by returning a bounded `_moondesk.truncated` envelope with the original/limit byte counts instead of splicing plaintext into serialized JSON.
-- **Deferred trace-output semantics - fail-closed.** `performance_start_trace --autoStop=false --filePath=...` is rejected by MoonDesk's command contract before transport startup/dispatch because exact v1.7 does not write that start-call path. Manual traces remain supported by starting without `filePath` and supplying `--filePath` to `performance_stop_trace`.
-- **Capability parity - done.** The direct MCP server keeps the old CLI safety/runtime defaults; feature-gated extension tooling is not silently enabled.
-- **Stable product surface - preserved and deliberately extended.** The public architecture remains one `moondesk` executable and one lazy host-owned Chromium/MCP process, but browser authority is no longer one host-global session. MoonDesk enables pinned v1.7 page-ID routing, creates one named isolated BrowserContext per workspace, and keeps a logical page namespace per MCP conversation/local-CLI caller. Same-workspace callers may share project cookies/storage without sharing selected-page authority; different workspaces get separate cookie/storage contexts. `browser_command`, `view_page`, connector-expanded browser tools, and the CLI all route through this ownership layer. Raw upstream page IDs and BrowserContext names are not caller authority. Presentation remains process-global and a live change requires explicit confirmation because it destroys every workspace context and logical tab. Browser-global extension lifecycle operations are blocked, while singleton performance traces/screencasts are leased to the exact caller and page that started them.
-
-Two cleanup ideas from the audit are intentionally **not required for this PR**: fully moving every path/read-only metadata table into the checked-in command registry, and splitting `browser_runtime.rs` into a deeper module tree. The current path and ReadOnly policies remain centralized enough to be fail-closed and are covered by regression tests; those structural cleanups can be performed separately without reopening lifecycle semantics.
-
-## Product invariants to preserve
-
-MoonDesk should continue to provide:
-
-- one `moondesk` executable;
-- a lazy browser runtime that starts only on first browser use and is headless by default;
-- one host-owned lazy Chromium/MCP process shared for efficiency, with one isolated BrowserContext per workspace and one logical page set per MCP conversation/local-CLI caller;
-- explicit upstream `pageId` routing owned by MoonDesk, so no caller acts on "whatever tab is globally selected" and no caller can use another session's raw upstream page ID;
-- hidden/headless and visible presentation as launch modes of that same Chromium runtime, never parallel browser architectures; a presentation change that would discard the live runtime requires explicit user confirmation that every workspace context/logical tab is lost;
-- a clean temporary Chromium profile that never attaches to the user's personal browser profile, cookies, extensions, or history; workspace BrowserContexts provide project-local cookies/storage inside that profile;
-- a deliberately small MCP browser surface (`set_browser_presentation`, `browser_command`, and `view_page`) rather than dynamically forwarding the full upstream Chrome DevTools MCP schema; presentation control remains MoonDesk-owned, unavailable in ReadOnly, and cannot discard a live session without explicit restart confirmation;
-- safe workspace staging/copy-back for browser file inputs/outputs while keeping upstream unrestricted filesystem access disabled;
-- ReadOnly browser policy enforced by MoonDesk rather than trusting upstream defaults;
-- automatic recovery after a browser/runtime loss, but without replaying ambiguous state-changing actions.
-
-The Chromium process is host-shared, but its control/storage scopes are explicit: filesystem and command tooling remain workspace-scoped; browser cookies/storage are BrowserContext-scoped per workspace; and tabs/active-page authority are logical-session scoped per MCP conversation or local CLI. Presentation and a few upstream recording facilities remain process-global, so MoonDesk either requires explicit host-wide confirmation (presentation), disables the global facility (extension lifecycle), or leases it to one session/page at a time (performance tracing and screencast).
-
-## Current architecture and why it is fragile
-
-At PR HEAD `2608f37`, BrowserRuntime uses the following internal chain:
+## Runtime shape
 
 ```text
-MoonDesk BrowserRuntime
-    -> launches `npx chrome-devtools <command>` for each operation
-    -> CLI sends one socket/named-pipe request
-    -> detached, unref'd chrome-devtools CLI daemon
-    -> daemon owns a stdio chrome-devtools-mcp server
-    -> server owns isolated Chromium
+agent / moondesk browser CLI
+        |
+        v
+MoonDesk browser capability layer
+  - browser_state
+  - browser_tabs
+  - browser_navigate
+  - browser_dom
+  - browser_cua
+  - browser_viewport
+  - browser_command / view_page
+        |
+        v
+BrowserRuntime
+  - request deadline + serialization
+  - workspace/session authority
+  - logical-page mapping
+  - popup attribution
+  - file staging/output publication
+  - presentation/restart policy
+        |
+        v
+BrowserCdpTransport (Rust)
+  - owned Chromium process tree
+  - browser-level CDP WebSocket
+  - request/response correlation
+  - flattened target sessions
+  - CDP event history
+        |
+        v
+MoonDesk-managed Chrome for Testing
+  - one browser process per MoonDesk host
+  - one BrowserContext per MoonDesk workspace
+  - conversation/CLI-owned logical page sets
 ```
 
-This is a poor ownership boundary for MoonDesk because MoonDesk is already the persistent host process. The detached CLI daemon exists primarily so independent shell commands can share state; MoonDesk does not need another persistence layer between its host and the actual MCP server.
+Constructing `BrowserRuntime` never starts Chromium. The first real browser operation starts the
+runtime lazily. `browser_state` can report ambient state without launching the browser.
+
+## Managed browser provisioning
 
-The implemented replacement is:
+MoonDesk pins the browser artifacts in `browser/managed-browser.json`. The manifest records the
+Chrome for Testing version, platform URL, exact archive size, SHA-256 digest, and expected executable
+path for every MoonDesk release platform.
 
-```text
-ChatGPT connector / `moondesk browser`
-        -> MoonDesk host
-        -> BrowserRuntime
-             - resolve workspace + caller identity
-             - workspace BrowserContext name
-             - conversation/CLI logical page ownership
-             - logical page ID -> upstream pageId routing
-             - command contract / argument translation
-             - ReadOnly + URL policy
-             - workspace staging
-             - deadline + cancellation ownership
-             - direct owned MCP stdio transport
-        -> one pinned chrome-devtools-mcp server child
-        -> one isolated Chromium
-             -> BrowserContext workspace A -> session-owned tabs
-             -> BrowserContext workspace B -> session-owned tabs
-```
+On first browser use:
+
+1. MoonDesk checks for an already verified managed browser.
+2. If it is absent or fails verification, MoonDesk acquires a cross-process installation lock.
+3. The pinned archive is downloaded over HTTPS from the Chrome for Testing origin.
+4. MoonDesk enforces the pinned content length and a hard archive-size ceiling while streaming.
+5. The complete archive SHA-256 is verified before extraction.
+6. ZIP entries are constrained to the staging root; unsafe paths and escaping symlinks fail closed.
+7. The browser is extracted to a randomized staging directory.
+8. The expected executable is verified and MoonDesk records a verified inventory of every regular browser file plus required symlinks, including file sizes, SHA-256 digests, modification metadata, and Unix permission bits where applicable.
+9. The staged install is atomically published. A previous install is retained as a backup until the
+   new verification marker is safely written, so a failed replacement can be rolled back.
+10. Subsequent browser starts always re-hash the executable and cheaply verify the complete install inventory. Missing or size-changed support files and Unix permission changes fail verification immediately; support files whose modification metadata changed are re-hashed before reuse. A malformed verification marker or damaged cached browser is therefore reprovisioned instead of being retried indefinitely.
 
-This is not a restoration of the deleted legacy browser architecture. MoonDesk should not restore raw schema forwarding, personal remote-debug attachment, old browser picker state, or dynamic upstream tool exposure. Only the process-ownership principle is reused: MoonDesk owns the exact subprocess tree that implements its browser runtime.
+The normal npm package therefore stays small. Chromium is a managed first-use runtime artifact rather
+than hundreds of megabytes embedded in each npm tarball.
 
-## Shared-Chromium routing follow-up
+`MOONDESK_BROWSER_PATH` is an explicit developer/test override. Normal production startup uses the
+verified managed browser, not a detected personal Chrome installation.
 
-The follow-up architecture keeps the process-sharing benefit of PR #42 without retaining host-global browser-control semantics:
+## CDP ownership
 
-- exact `chrome-devtools-mcp@1.7.0` runs with `--experimentalPageIdRouting=true`;
-- each persisted MoonDesk workspace UUID maps to a MoonDesk-owned named `isolatedContext` / BrowserContext;
-- ChatGPT calls use bounded, hashed `_meta["openai/session"]` plus optional `_meta["openai/subject"]` as the logical browser-session identity; raw provider identifiers are not retained or logged;
-- clients without a stable provider session ID use a workspace-local fallback session, while `moondesk browser` uses a dedicated local-CLI session;
-- `list_pages`, `select_page`, and `close_page` expose only MoonDesk logical page IDs; upstream page IDs and context names are filtered from caller-visible page listings;
-- popup/new-tab adoption is differential (before/after target sets) and context-checked, preventing one conversation from claiming another conversation's unowned tab;
-- the shared MCP child starts from a neutral MoonDesk-owned temporary directory rather than whichever workspace first used the browser;
-- workspace removal closes only that workspace's owned pages and retires its logical routing; cleanup failure invalidates the whole shared runtime fail-closed;
-- browser-global extension lifecycle commands are blocked; performance tracing and screencast ownership are bound to one logical session and exact upstream page, with runtime invalidation if an owning page disappears unexpectedly.
+MoonDesk starts Chromium with a private temporary user-data directory and an ephemeral loopback
+DevTools endpoint. It reads Chromium's `DevToolsActivePort` file, connects to the browser WebSocket,
+and owns the WebSocket and Chromium process tree for the complete runtime generation. Headless
+Chromium is launched with `--no-startup-window` so Chrome does not create an unrelated startup
+`about:blank` BrowserContext/page before MoonDesk creates the first workspace context. MoonDesk
+still retires any unexpected headless startup target/context defensively before publishing the
+transport.
 
-The resulting hierarchy is **host process -> shared Chromium -> workspace BrowserContext -> caller logical session -> owned pages**.
+CDP request IDs, target IDs, session IDs, BrowserContext IDs, and raw event data are internal
+implementation details. They are not caller authority.
 
-## Confirmed blockers
+For page-scoped operations MoonDesk attaches with flattened target sessions and enables the required
+Page, Runtime, DOM, Network, and Log domains. Headless pages receive deterministic device metrics so
+the initial agent viewport is 1280x800 regardless of host window-manager behavior.
 
-### 1. Dispatched operations survive MoonDesk timeout
+## Isolation and logical tabs
 
-Ashpeak's finding is valid. `tokio::time::timeout` currently cancels only MoonDesk's local future and the short-lived CLI process. Exact upstream v1.7 runs `mcpClient.callTool()` inside a detached daemon and does not cancel it when the CLI socket closes.
+The browser process is host-shared for efficiency, but authority is deliberately split into two
+levels:
 
-A state-changing click/fill/navigation/evaluate action can therefore complete after MoonDesk has returned a timeout. Releasing MoonDesk's operation mutex at that point can admit a second command while the first is still running upstream.
+- **Workspace BrowserContext** — cookies, localStorage, IndexedDB, service workers, and other browser
+  storage are shared only by conversations belonging to the same MoonDesk workspace.
+- **Logical browser session** — tabs, active-tab authority, and logical page IDs belong to the exact
+  MCP conversation or the local `moondesk browser` CLI session.
 
-Required invariant:
+MoonDesk maps workspace UUIDs to internal BrowserContexts and maps upstream CDP targets to
+conversation-local page IDs. Callers cannot supply BrowserContext names or use raw target/page IDs
+to cross those boundaries.
 
-> If an operation times out after dispatch, MoonDesk must invalidate and terminate the exact runtime that is executing it before releasing browser serialization or returning control to the caller.
+When an action creates a popup/new page, reconciliation attributes newly observed targets to the
+conversation that initiated the action. Newly created targets are allowed a short metadata-settle
+window so a popup is not exposed as a permanently blank logical tab merely because Chrome reported
+the target before its URL/title update.
 
-With a directly owned stdio child, timeout recovery should terminate the owned MCP/Chromium process tree, wait for teardown, clear readiness, and only then release the operation lock.
+Removing a workspace closes its pages and disposes the entire BrowserContext. If safe cleanup cannot
+be completed, MoonDesk resets the shared runtime fail-closed rather than retaining reachable browser
+state from the removed workspace.
 
-### 2. Detached daemon ownership is not durable across host death/start timeout
+## Capability surface
 
-Ashpeak's second finding is also valid. The current random `session_id` is in-memory only, while the upstream daemon is detached. Abrupt MoonDesk termination can leave an orphan daemon/browser that a later host can no longer identify. A start timeout can similarly leave a daemon in the current session namespace before `owned_daemon_pid` is committed, causing the same runtime to classify its own daemon as unowned.
+Normal agent browsing uses the stable high-level facade:
 
-A direct owned stdio child removes the need for daemon session IDs, daemon PID files, durable daemon lease recovery, `status/start/stop` CLI subprocesses, and stale namespace adoption logic. On normal host death, stdio EOF and OS process-tree ownership should tear down the runtime; on Windows a kill-on-close job object provides an additional hard ownership boundary.
+- `browser_state` — presentation, runtime status, conversation tabs, selected tab, capabilities.
+- `browser_tabs` — list/select/open/close conversation-owned tabs.
+- `browser_navigate` — goto/back/forward/reload.
+- `browser_dom` — accessibility snapshots, UID click/fill/form/hover/drag, evaluation, waits, upload.
+- `browser_cua` — rendered screenshots and physical coordinate mouse/keyboard/wheel input.
+- `browser_viewport` — viewport inspection and deterministic emulation.
+- `set_browser_presentation` — headless/visible process presentation with restart confirmation.
+- `view_page` — direct rendered-pixel helper.
+- `browser_command` — lower-level native-CDP operations when the facade is insufficient.
 
-### 3. `file://` bypasses the workspace filesystem boundary
+`src/browser_contract.json` is MoonDesk's native low-level command contract. It contains only
+commands and arguments implemented by the Raw-CDP engine. Unsupported compatibility flags are not
+accepted and silently ignored.
 
-This issue was discovered during the architecture audit and is not covered by the existing review threads.
+The native advanced surface includes console/network inspection, emulation, screenshots,
+performance trace capture, and V8 heap snapshots. Adapter-specific extension lifecycle commands,
+Lighthouse wrapper commands, WebMCP/third-party-tool discovery, trace-insight wrappers, and
+screencast commands from the retired `chrome-devtools-mcp` integration are intentionally not
+advertised as native MoonDesk capabilities.
 
-The current staging layer protects explicit browser path arguments such as `upload_file`, screenshot output, heap snapshots, Lighthouse output, and network body output. It does not protect filesystem access encoded as a browser URL.
+## DOM and computer-use paths
+
+MoonDesk intentionally supports both structural and visual control.
 
-A real probe against exact v1.7 with unrestricted upstream paths disabled successfully navigated the isolated browser to a harmless `file:///C:/...` path outside the MoonDesk workspace, and `take_snapshot` returned the file contents.
+### DOM path
+
+`take_snapshot` uses Chrome's accessibility/DOM data and assigns opaque MoonDesk UIDs to elements.
+UIDs are generation-scoped; navigation, substantial DOM changes, viewport/emulation changes, and
+runtime restarts can invalidate them. Agents should take a fresh snapshot before continuing UID
+interactions after those transitions.
 
-Required invariant:
-
-> Browser navigation must not provide a second filesystem API that bypasses MoonDesk workspace policy.
-
-MoonDesk must own URL validation for URL-bearing browser commands. At minimum, local/browser-internal schemes such as `file:`, `filesystem:`, `view-source:file:`, `chrome:`, `chrome-extension:`, and equivalent unsafe local-resource forms must fail closed unless MoonDesk deliberately introduces a safe workspace-backed local-file navigation abstraction later.
-
-HTTP(S), localhost development URLs, and other explicitly supported schemes should remain available.
-
-### 4. Node 18 support contradicts the pinned browser runtime
-
-MoonDesk currently declares `node >=18` and runs npm compatibility tests on Node 18. Exact `chrome-devtools-mcp@1.7.0` declares:
-
-```text
-^20.19.0 || ^22.12.0 || >=23
-```
-
-A real Node 18.20.8 run fails at startup on unsupported JavaScript syntax after npm emits the engine warning. Therefore Browser mode is not actually functional on a MoonDesk installation that the package currently advertises as supported.
-
-Required invariant:
-
-> MoonDesk's advertised runtime support must match all first-class product features.
-
-Preferred fix: raise MoonDesk's Node engine floor and CI/runtime documentation to a version supported by the pinned browser dependency. If MoonDesk intentionally keeps Node 18 for Computer-only mode, Browser mode must perform an explicit compatibility preflight and the documentation/package metadata must make the feature split clear; a silent first-use failure is not acceptable.
-
-### 5. MoonDesk's 120s timeout conflicts with upstream CLI's 60s daemon timeout
-
-MoonDesk advertises a browser request budget up to 120 seconds. Exact upstream v1.7's CLI socket client hardcodes a 60-second send-command timeout. That means the current effective chain is:
-
-```text
-MoonDesk deadline: 120s
-upstream CLI request deadline: 60s
-upstream detached daemon: may keep executing after client timeout
-```
-
-This is both a contract mismatch and another source of late mutations. Direct stdio transport should use only MoonDesk's deadline model and remove this hidden 60-second layer.
-
-### 6. Synchronous staging/copy work is not truly deadline-preemptible
-
-Current browser staging and output publication perform synchronous filesystem work (`std::fs::copy`, recursive directory copying, output commit) inside the async request future. Tokio deadlines cannot preempt a blocking filesystem call.
-
-Required invariant:
-
-- potentially large staging/copy operations must not block Tokio worker threads;
-- no output should be published to the workspace after the operation has timed out or been invalidated;
-- publication should remain transactional/fail-closed.
-
-Implementation should move blocking filesystem work to bounded blocking tasks and check the operation deadline before final workspace publication. Large output publication may require chunked/deadline-aware copying or a clearly defined post-execution commit budget.
-
-### 7. Generic retry can replay non-idempotent operations
-
-Current BrowserRuntime retries a command after a connectivity failure by restarting the browser runtime and sending the same command again. For state-changing operations, a connection failure after execution but before response creates ambiguous completion. Retrying can duplicate side effects. After a full browser restart, UID-based actions are also semantically stale.
-
-Required invariant:
-
-> MoonDesk must never automatically replay an operation whose execution may already have occurred.
-
-On runtime loss during/after dispatch, invalidate/restart the runtime and return a session-lost error requiring the caller to take a fresh snapshot / re-establish page state. If automatic retry remains at all, it must be limited to a small explicit set of context-free, demonstrably idempotent inspection operations.
-
-## Additional architectural findings
-
-### Per-operation CLI process overhead
-
-Even with a warm detached daemon, every browser operation currently launches a fresh `npx`/Node CLI process. Local measurements of repeated warm `list_pages` calls were roughly 1.4-1.9 seconds each. A directly owned MCP child removes this avoidable process-launch tax and should materially improve agent browser latency.
-
-### `browser_runtime.rs` has accumulated too many responsibilities
-
-The file now combines lifecycle, process execution, daemon ownership, deadline handling, path parsing, workspace security, staging, output publication, CLI error interpretation, PID discovery, platform details, and integration tests.
-
-As part of or immediately after the transport refactor, prefer a structure such as:
-
-```text
-src/browser/
-    mod.rs
-    runtime.rs
-    transport.rs
-    contract.rs
-    policy.rs
-    staging.rs
-```
-
-The migration can remain incremental to keep the PR reviewable.
-
-### MoonDesk needs an owned browser command contract
-
-The MCP surface is stable at the tool-name level, but `browser_command` currently exposes the pinned v1.7 experimental CLI's command/argument vocabulary directly. v1.8 has already demonstrated that upstream command argument shapes can change.
-
-MoonDesk should own a checked-in command registry for the supported pinned contract. It should define, per command:
-
-- required positional arguments;
-- optional argument names and value types;
-- path input/output metadata;
-- URL-bearing arguments;
-- ReadOnly classification;
-- whether an operation is context/session dependent;
-- whether a command is safe to auto-retry (default false).
-
-That registry should drive argument parsing/translation, ReadOnly policy, path staging, URL policy, help/validation, and future upstream migrations.
-
-## Implementation record
-
-### Phase A - replace detached CLI daemon transport ? completed
-
-1. Introduce a lazy owned `BrowserTransport` that starts exact `chrome-devtools-mcp@1.7.0` as a direct stdio MCP server child with the current safe isolated server flags.
-2. Own its full process tree using MoonDesk's existing process-ownership infrastructure; ensure host exit/drop cannot leave descendants alive.
-3. Perform MCP initialize once per runtime generation and keep the child alive across browser operations.
-4. Keep BrowserRuntime operation serialization around routing/reconciliation and upstream process-global facilities, but route every page-scoped operation by explicit owned `pageId`; Chromium's global selected-page pointer is never authority.
-5. On timeout/cancellation after dispatch, terminate the runtime tree, clear state, wait for teardown, and return timeout/session-lost without replay.
-6. Remove daemon session ID/PID-file/start/status/stop logic once the new transport is proven.
-
-### Phase B - command contract and policy ? completed for merge scope
-
-1. Add a checked-in v1.7 command registry and parser that converts MoonDesk's existing `command + args[]` contract into upstream MCP tool `arguments`.
-2. Preserve current CLI argument compatibility where practical so users do not need to change `moondesk browser` scripts.
-3. Move path metadata from scattered match statements into the command contract.
-4. Add URL metadata/policy and block unsafe local/internal schemes.
-5. Keep ReadOnly fail-closed and derived from MoonDesk contract metadata, with explicit special handling where necessary (for example Lighthouse snapshot-only).
-
-### Phase C - staging/output deadline hardening ? completed
-
-1. Move potentially blocking staging/copy work off Tokio worker threads.
-2. Ensure no workspace output is committed after timeout/runtime invalidation.
-3. Keep symlink/reparse-point, traversal, and outside-workspace rejection behavior.
-4. Preserve managed `view_page` temp output handling.
-
-### Phase D - compatibility cleanup ? completed
-
-1. Align `package.json`, README, CI, release docs, and tests with the real Node floor required by Browser mode.
-2. Add a browser-runtime compatibility smoke for the minimum supported Node version so wrapper-only tests cannot hide future upstream engine changes.
-
-## Required regressions before merge
-
-At minimum:
-
-- timeout after tool dispatch kills the owned runtime and proves the page cannot mutate afterward;
-- a second request cannot enter while timeout cleanup is still terminating the previous runtime;
-- abrupt parent/runtime teardown leaves no owned MCP/Chromium descendants;
-- startup timeout/failure cannot leave an unrecoverable detached browser process;
-- `file://` navigation outside the workspace is rejected before reaching Chromium;
-- browser URL policy rejects unsafe local/internal schemes and preserves normal HTTP(S)/localhost navigation;
-- no automatic replay of ambiguous state-changing commands after transport loss;
-- workspace upload and file-producing command staging/copy-back remain green;
-- outside-workspace/traversal/symlink/reparse-point path tests remain green;
-- ReadOnly inspection policy remains green, including Lighthouse snapshot-only behavior;
-- `view_page` still returns native bounded image content and cleans managed temp files;
-- one Chromium/MCP runtime remains host-shared while real-browser tests prove workspace BrowserContext storage isolation, same-workspace conversation tab isolation, popup ownership, logical page-ID filtering, and a separate local-CLI tab session;
-- two MoonDesk hosts remain independent at the process/runtime level;
-- minimum supported Node version can actually launch the pinned browser runtime;
-- Windows and Linux Clippy/test matrices remain clean.
-
-## Merge criterion
-
-PR #42 is merge-ready only when MoonDesk, not the detached experimental upstream CLI daemon, is the authoritative lifecycle owner of the browser runtime; browser timeouts cannot leave late mutations; browser navigation cannot bypass workspace filesystem policy; the advertised Node/runtime contract is truthful; and the full real-browser regression matrix passes on the exact PR HEAD.
-
-## Validation record
-
-Validated locally on the final implementation state before push:
-
-| Validation | Result |
-| --- | --- |
-| Windows Rust tests | **311 passed, 0 failed, 7 ignored** |
-| Windows all-target Clippy (`-D warnings`) | **PASS** |
-| Windows strict production Clippy (`unwrap` / `expect` / `panic` / `unreachable` denied) | **PASS** |
-| Windows developer-tool smoke | **PASS** |
-| Windows owned-browser lifecycle/recovery smoke | **PASS** |
-| Windows dispatched-timeout late-mutation smoke | **PASS** |
-| Windows host CLI + MCP shared-session / workspace staging smoke | **PASS** |
-| Windows native `view_page` vision smoke | **PASS** |
-| Linux stable Rust 1.98.0 format + both Clippy gates | **PASS** |
-| Linux Rust tests | **309 passed, 0 failed** |
-| Unix private staging permissions (`0700` root/dirs, `0600` staged file) | **PASS** |
-| Node 20.19 npm tests + package verification | **59/59 + exact 7-file package** |
-| Node 22.12 npm tests + package verification | **59/59 + exact 7-file package** |
-| Node 24 npm tests + package verification | **59/59 + exact 7-file package** |
-| Pinned `chrome-devtools-mcp@1.7.0 --help` on Node 20.19, Node 22.12, and Node 24 | **PASS** |
-
-GitHub CI must still pass on the pushed PR HEAD before review threads are considered fully closed.
+### Visual computer-use path
+
+Visual input is not implemented as JavaScript shims. Coordinate click, key input, typing, drag, and
+scroll are dispatched through CDP Input commands. In particular, scrolling uses a real
+`mouseWheel` event rather than `window.scrollBy`, preserving browser input semantics for visual
+interfaces.
+
+Viewport screenshots capture the current viewport; full-page screenshots explicitly opt into
+capture beyond the viewport. `view_page` and `browser_cua action=screenshot` return native image
+content to the model.
+
+## Presentation
+
+Headless and visible modes are two launch presentations of the **same** browser architecture and expose the same page-local browser capability set. Browser-global operations such as performance tracing remain subject to the recording-isolation rules below and can be rejected when another managed context/session or an unowned/default-context page is present.
+
+Presentation is process-global. Changing it while Chromium is live requires explicit confirmation
+because Chromium must restart and every temporary workspace BrowserContext, logical tab, page state,
+and snapshot UID is lost. MoonDesk does not run separate parallel "headless browser" and "visible
+browser" backends.
+
+## Deadlines, cancellation, and recovery
+
+Each operation has one MoonDesk-owned absolute deadline covering queueing, browser startup, CDP
+requests, staging, and output publication.
+
+A transport timeout/disconnect invalidates the affected runtime generation so an ambiguous
+state-changing operation cannot continue invisibly after MoonDesk reports failure. The next browser
+operation starts a fresh generation. MoonDesk does not automatically replay an ambiguous mutation.
+
+Operation-level conditions are different from transport loss. For example, a `wait_for` text
+timeout returns a normal browser-tool error and does not kill a healthy Chromium/CDP connection.
+
+## Browser-global recording state
+
+CDP performance tracing is browser-global. MoonDesk therefore starts a trace only when the requesting workspace is the sole active managed BrowserContext, the requester is the only logical browser session that has used that BrowserContext in the current Chromium generation, every managed page belongs to the requester, and Chromium has no unowned/default-context page target that could contribute unrelated trace data. The active trace is then leased to the exact session and page that started it. Other browser sessions are blocked from browser actions until the trace stops, another conversation cannot stop or replace the trace, and the owning page cannot be closed while recording is active. A trace protocol error resets the shared browser runtime rather than leaving browser-global recording state ambiguous.
+
+If the page owning the active trace disappears unexpectedly, MoonDesk invalidates the shared
+runtime rather than risking recording-state leakage across logical sessions.
+
+## Local file boundary
+
+Browser file access is mediated by MoonDesk, not handed arbitrary host paths.
+
+- Relative browser input files remain workspace-scoped.
+- In Both/CLI mode, an explicitly addressed absolute regular input file readable by the MoonDesk
+  user may be copied into a private temporary staging directory before Chromium sees it.
+- Output files remain workspace-bound.
+- Existing output targets and parents are canonicalized and checked for symlink/reparse-point
+  escapes.
+- Browser output is written to randomized staging paths and atomically published to the workspace
+  only while the request deadline remains valid.
+- The exact MoonDesk-owned temporary path used by `view_page` receives a narrow managed exception;
+  ordinary browser commands cannot use that exception.
+
+The native contract has no browser directory-input or directory-output commands, so the retired
+extension/Lighthouse directory staging machinery is intentionally absent.
+
+## Security properties
+
+The browser design preserves these invariants:
+
+- no personal browser profile, cookies, or login state are inherited;
+- the DevTools endpoint is loopback-only and tied to MoonDesk's private temporary profile;
+- raw BrowserContext/target/session IDs are not exposed as caller authority;
+- BrowserContext storage is isolated across MoonDesk workspaces;
+- active-page authority is isolated across conversations;
+- browser outputs cannot escape the active workspace;
+- browser inputs cannot use symlinks/reparse points to bypass file validation;
+- browser process descendants remain MoonDesk-owned and are terminated on invalidation/shutdown;
+- browser install archives are pinned and cryptographically verified before use.
+
+## Regression coverage
+
+The browser unit/integration suite covers, among other things:
+
+- ambient `browser_state` without Chromium startup;
+- native command-contract parsing and read-only policy;
+- workspace-scoped file staging/output publication;
+- conversation logical-page isolation;
+- BrowserContext storage isolation across workspaces;
+- popup ownership and metadata settling;
+- local CLI vs MCP logical-session separation;
+- lazy headless startup without an unrelated startup window/context, defensive startup-context retirement, and recovery after owned-child loss;
+- timeout cancellation of dispatched mutations;
+- headless/visible presentation confirmation and restart;
+- exact viewport emulation;
+- DOM UIDs and form interactions;
+- physical coordinate CUA and mouse-wheel scrolling;
+- rendered viewport/full-page image capture;
+- native performance traces and V8 heap snapshots;
+- empty-cache managed-browser download, verification, extraction, and first launch.
+
+The Windows browser smokes are serialized because they intentionally exercise real process/runtime
+ownership rather than mocks.
+
+## Historical note
+
+MoonDesk previously used `chrome-devtools-mcp@1.7.0` as an internal browser-control transport. The
+stable capability facade and workspace/conversation authority model were retained, but the transport
+was replaced with MoonDesk's native CDP engine. The old Node/MCP transport, local personal-browser
+detection, and its 50-command compatibility registry are not part of the current runtime.

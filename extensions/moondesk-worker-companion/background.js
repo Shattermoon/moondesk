@@ -242,6 +242,48 @@ function canonicalConversationUrl(value) {
   }
 }
 
+function sourceUrlForCommand(binding, openMode, existingConversation) {
+  if (openMode === 'existing_thread') return existingConversation;
+  return canonicalChatUrl(binding?.projectUrl) || binding?.sourceUrl || null;
+}
+
+function shouldAdoptConversation(offer, result) {
+  return !offer?.reconcileRequired || result?.state === 'succeeded';
+}
+
+function successfulResultNeedsConversationReconcile(result, confirmedConversation) {
+  return result?.state === 'succeeded' && !confirmedConversation;
+}
+
+function projectIdFromChatUrl(value) {
+  try {
+    const url = new URL(value);
+    if (url.origin !== 'https://chatgpt.com') return null;
+    const match = /^\/g\/(g-p-[0-9a-f]{32})(?:-[^/]+)?(?:\/|$)/i.exec(url.pathname);
+    return match?.[1]?.toLowerCase() || null;
+  } catch {
+    return null;
+  }
+}
+
+function threadRecordOwnedByBinding(thread, workspaceId, projectId) {
+  return Boolean(
+    thread &&
+    thread.workspaceId === workspaceId &&
+    thread.projectId === projectId
+  );
+}
+
+function rememberedLaunchMatchesRecord(record, rememberedLaunch) {
+  if (!rememberedLaunch) return false;
+  if (rememberedLaunch.commandId === record.commandId) return true;
+  return Boolean(
+    record.openMode === 'existing_thread' &&
+    record.threadKey &&
+    rememberedLaunch.threadKey === record.threadKey
+  );
+}
+
 async function tabMatchesRecord(tab, record) {
   if (!tab?.id || !tab.url?.startsWith('https://chatgpt.com/')) return false;
   if (tab.url.includes(`moondesk-launch=${encodeURIComponent(record.launchToken)}`)) return true;
@@ -249,8 +291,7 @@ async function tabMatchesRecord(tab, record) {
   if (record.conversationUrl && tabUrl === canonicalChatUrl(record.conversationUrl)) return true;
   try {
     const response = await ensureContent(tab.id);
-    return response?.rememberedLaunch?.commandId === record.commandId ||
-      (record.threadKey && response?.rememberedLaunch?.threadKey === record.threadKey);
+    return rememberedLaunchMatchesRecord(record, response?.rememberedLaunch);
   } catch {
     return false;
   }
@@ -270,15 +311,62 @@ async function recoverTab(record) {
   return null;
 }
 
+async function recoverThreadRecord(state, threadKey, workspaceId, binding) {
+  const candidates = Object.values(state.launchRecords || {}).filter((record) =>
+    record?.threadKey === threadKey &&
+    record?.workspaceId === workspaceId &&
+    record?.phase === 'succeeded'
+  );
+  let recovered = null;
+  for (const candidate of candidates) {
+    const tab = await recoverTab(candidate);
+    if (!tab) continue;
+    const conversationUrl = canonicalConversationUrl(tab.url);
+    if (!conversationUrl || projectIdFromChatUrl(conversationUrl) !== binding.projectId) continue;
+    const next = {
+      workspaceId,
+      projectId: binding.projectId,
+      conversationUrl,
+      tabId: tab.id ?? null,
+      updatedAt: Date.now()
+    };
+    if (recovered && recovered.conversationUrl !== next.conversationUrl) return null;
+    recovered = next;
+  }
+  if (recovered) {
+    state.threadRecords[threadKey] = recovered;
+    await writeState(state);
+  }
+  return recovered;
+}
+
 async function recordForCommand(state, command, binding) {
   const threadKey = command.launch.threadKey || `command:${command.id}`;
   const openMode = command.launch.openMode || 'new_thread';
-  const thread = state.threadRecords?.[threadKey] || null;
+  let thread = state.threadRecords?.[threadKey] || null;
+  if (
+    openMode === 'existing_thread' &&
+    !threadRecordOwnedByBinding(thread, command.launch.workspaceId, binding.projectId)
+  ) {
+    thread = await recoverThreadRecord(
+      state,
+      threadKey,
+      command.launch.workspaceId,
+      binding
+    );
+  }
   let record = state.launchRecords[command.id];
   if (!record) {
-    const existingConversation = openMode === 'existing_thread' ? canonicalChatUrl(thread?.conversationUrl) : null;
+    const threadOwnedByBinding = threadRecordOwnedByBinding(
+      thread,
+      command.launch.workspaceId,
+      binding.projectId
+    );
+    const existingConversation = openMode === 'existing_thread' && threadOwnedByBinding
+      ? canonicalChatUrl(thread.conversationUrl)
+      : null;
     if (openMode === 'existing_thread' && !existingConversation) {
-      throw new Error('Existing worker thread has no confirmed ChatGPT conversation binding');
+      throw new Error('Existing worker thread has no confirmed ChatGPT conversation binding for this workspace and Project');
     }
     record = {
       commandId: command.id,
@@ -287,7 +375,7 @@ async function recordForCommand(state, command, binding) {
       threadKey,
       openMode,
       launchToken: crypto.randomUUID(),
-      sourceUrl: openMode === 'existing_thread' ? existingConversation : binding.sourceUrl,
+      sourceUrl: sourceUrlForCommand(binding, openMode, existingConversation),
       tabId: null,
       conversationUrl: existingConversation,
       phase: 'creating',
@@ -327,7 +415,7 @@ async function ack(state, command, outcome, details = null) {
   if (!leaseId) throw new Error('Managed chat command is missing lease');
   const payload = { commandId: command.id, leaseId, outcome };
   if (details !== null && outcome !== 'needs_reconcile') payload.details = String(details).slice(0, 1000);
-  return api(state, '/__moondesk/companion/v1/ack', { method: 'POST', body: payload });
+  return api(state, '/__moondesk/companion/v1/commands/ack', { method: 'POST', body: payload });
 }
 
 async function processCommand(state, offer) {
@@ -385,7 +473,25 @@ async function processCommand(state, offer) {
 
   const result = response.result || {};
   const confirmedConversation = result.conversationUrl ? canonicalConversationUrl(result.conversationUrl) : null;
-  if (confirmedConversation) record.conversationUrl = confirmedConversation;
+  if (successfulResultNeedsConversationReconcile(result, confirmedConversation)) {
+    record.phase = 'uncertain';
+    record.reconcileAttempts = (record.reconcileAttempts || 0) + 1;
+    await writeState(state);
+    await ack(state, command, 'needs_reconcile');
+    if (record.reconcileAttempts >= MAX_RECONCILE_ATTEMPTS) {
+      state.blockedCommand = {
+        commandId: command.id,
+        workspaceId,
+        reason: 'worker_conversation_url_unconfirmed',
+        retryMode: 'reconcile'
+      };
+      await writeState(state);
+    }
+    return;
+  }
+  if (confirmedConversation && shouldAdoptConversation(offer, result)) {
+    record.conversationUrl = confirmedConversation;
+  }
   if (result.state === 'succeeded') {
     if (record.threadKey && confirmedConversation) {
       state.threadRecords[record.threadKey] = {

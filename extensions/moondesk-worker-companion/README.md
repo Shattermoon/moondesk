@@ -4,7 +4,7 @@ This unpacked Chrome extension is the browser-side transport for MoonDesk Worker
 
 It intentionally owns only a small surface:
 
-- pair with the local MoonDesk host using a one-time pairing code;
+- automatically discover and pair with the local MoonDesk companion bridge on loopback ports 47650-47654;
 - bind one ChatGPT Project conversation to one MoonDesk workspace UUID;
 - redeem durable managed-chat launch commands;
 - open/recover a worker ChatGPT tab;
@@ -17,9 +17,12 @@ It does **not** record transcripts, spawn nested workers, mirror agent state, or
 ## Local install
 
 1. Build/run the matching experimental MoonDesk branch.
-2. Open `chrome://extensions` and enable Developer mode.
-3. Choose **Load unpacked** and select `extensions/moondesk-worker-companion`.
-4. Open the extension popup, enter the local MoonDesk URL (default `http://127.0.0.1:3200`) and the pairing code shown by MoonDesk.
-5. Open an existing conversation inside the ChatGPT Project for a workspace and bind it in the popup.
+2. Open `chrome://extensions`, enable Developer mode, and choose **Load unpacked**.
+3. Select `extensions/moondesk-worker-companion`.
+4. Open the extension popup. The extension should automatically discover and pair with the local MoonDesk companion bridge. Manual repair is only a fallback when the stored installation credential can no longer be accepted.
+5. Open an existing conversation inside the ChatGPT Project you want to associate with the workspace.
+6. In the extension popup, select the workspace and click **Bind** once.
 
-Workers remain experimental until the real-browser model-picker and crash/reconciliation matrix pass.
+The existing conversation is used only to establish the Project binding. A fresh worker thread starts from the bound Project home; later tasks for the same durable worker thread reuse the confirmed worker conversation.
+
+Workers remain experimental until the real-browser model-picker, launch/reuse, and crash/reconciliation matrix pass.

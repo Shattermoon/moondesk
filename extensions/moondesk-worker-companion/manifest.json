@@ -24,6 +24,12 @@
   "content_scripts": [
     {
       "matches": ["https://chatgpt.com/*"],
+      "js": ["model-state-main.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": ["https://chatgpt.com/*"],
       "js": ["chatgpt-dom.js", "content.js"],
       "run_at": "document_idle"
     }

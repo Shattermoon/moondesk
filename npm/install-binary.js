@@ -28,10 +28,71 @@ const supportedTargets = new Set([
   "win32-x64",
 ]);
 
+const MIN_LINUX_GLIBC_VERSION = "2.34";
+const UNSUPPORTED_RUNTIME_ERROR_CODE = "MOONDESK_UNSUPPORTED_RUNTIME";
+
+function unsupportedRuntimeError(message) {
+  const error = new Error(message);
+  error.code = UNSUPPORTED_RUNTIME_ERROR_CODE;
+  return error;
+}
+
+function parseLibcVersion(value) {
+  if (typeof value !== "string") return null;
+  const match = /^(\d+)\.(\d+)(?:\.(\d+))?$/.exec(value.trim());
+  if (!match) return null;
+  return match.slice(1).map((part) => Number(part ?? 0));
+}
+
+function compareLibcVersions(left, right) {
+  const a = parseLibcVersion(left);
+  const b = parseLibcVersion(right);
+  if (!a || !b) return null;
+  for (let index = 0; index < Math.max(a.length, b.length); index += 1) {
+    const leftPart = a[index] ?? 0;
+    const rightPart = b[index] ?? 0;
+    if (leftPart < rightPart) return -1;
+    if (leftPart > rightPart) return 1;
+  }
+  return 0;
+}
+
+function detectedLinuxGlibcVersion(processReport = process.report) {
+  try {
+    if (!processReport || typeof processReport.getReport !== "function") return null;
+    const version = processReport.getReport().header?.glibcVersionRuntime;
+    return typeof version === "string" ? version : null;
+  } catch {
+    return null;
+  }
+}
+
+function assertLinuxRuntimeCompatibility(platform = process.platform, options = {}) {
+  if (platform !== "linux") return null;
+
+  const glibcVersion = Object.prototype.hasOwnProperty.call(options, "glibcVersion")
+    ? options.glibcVersion
+    : detectedLinuxGlibcVersion(options.processReport);
+
+  if (!parseLibcVersion(glibcVersion)) {
+    throw unsupportedRuntimeError(
+      `MoonDesk prebuilt Linux binaries require detectable glibc ${MIN_LINUX_GLIBC_VERSION} or newer; musl-based or unknown-libc environments such as Alpine are not currently supported.`,
+    );
+  }
+
+  if (compareLibcVersions(glibcVersion, MIN_LINUX_GLIBC_VERSION) < 0) {
+    throw unsupportedRuntimeError(
+      `MoonDesk prebuilt Linux binaries require glibc ${MIN_LINUX_GLIBC_VERSION} or newer; detected glibc ${glibcVersion}.`,
+    );
+  }
+
+  return glibcVersion;
+}
+
 function resolveTarget(platform = process.platform, arch = process.arch) {
   const target = `${platform}-${arch}`;
   if (!supportedTargets.has(target)) {
-    throw new Error(
+    throw unsupportedRuntimeError(
       `MoonDesk does not provide a prebuilt binary for ${target}. Supported targets: ${Array.from(supportedTargets).join(", ")}`,
     );
   }
@@ -343,6 +404,7 @@ async function acquireInstallLock(
 
 async function ensureBinary(options = {}) {
   const targetInfo = resolveTarget(options.platform, options.arch);
+  assertLinuxRuntimeCompatibility(targetInfo.platform, options);
   const installDir = options.installDir ?? defaultInstallDir(targetInfo.target);
   const releaseBaseUrl = options.releaseBaseUrl ?? defaultReleaseBaseUrl;
   const fetchImpl = options.fetchImpl ?? globalThis.fetch;
@@ -496,6 +558,9 @@ function createDownloadProgressReporter(writer = process.stderr) {
 }
 
 module.exports = {
+  MIN_LINUX_GLIBC_VERSION,
+  UNSUPPORTED_RUNTIME_ERROR_CODE,
+  assertLinuxRuntimeCompatibility,
   cleanupOldBinaryVersions,
   createDownloadProgressReporter,
   ensureBinary,

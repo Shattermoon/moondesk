@@ -29,6 +29,7 @@ For the closest match to CI, use the current stable Rust toolchain with `rustfmt
 Some optional integration tests require platform-specific software:
 
 - Windows tests may require PowerShell and standard developer tools.
+- Prebuilt Linux releases target x64/arm64 glibc systems with glibc 2.34 or newer. The npm bootstrap rejects musl/older-glibc hosts before download, and the release matrix rejects Linux binaries whose GLIBC symbol requirement rises above 2.34.
 - Browser tests can use MoonDesk's managed Chrome for Testing runtime. On first browser use MoonDesk downloads the pinned platform artifact, verifies its exact size and SHA-256, records a verified inventory of the installed browser files, installs it atomically into MoonDesk's browser cache, and then revalidates that inventory before reuse so missing or damaged support files trigger reprovisioning.
 - Browser control is native Rust CDP: MoonDesk owns Chromium directly, connects to its browser-level DevTools WebSocket, and starts the runtime lazily on the first browser operation rather than during host startup.
 - Running MoonDesk end-to-end through a public MCP endpoint requires ngrok configuration.

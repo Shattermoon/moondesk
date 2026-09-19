@@ -12,6 +12,7 @@ const {
   orchestrate,
   runNative,
 } = require("./moondesk");
+const { UNSUPPORTED_RUNTIME_ERROR_CODE } = require("./install-binary");
 const { UPDATE_EXIT_CODE, changelogNoticePath, currentVersion } = require("./update-manager");
 
 function tempDir() {
@@ -69,6 +70,31 @@ test("unsupported Node exits before MoonDesk performs startup side effects", asy
   assert.equal(errors.length, 1);
   assert.match(errors[0], /\^20\.19\.0 \|\| \^22\.12\.0 \|\| >=23/);
   assert.match(errors[0], /22\.11\.0/);
+});
+
+test("unsupported native runtime reports compatibility without misleading network advice", async () => {
+  const dir = tempDir();
+  const errors = [];
+  try {
+    const result = await orchestrate({
+      logger: { log() {}, warn() {}, error(message) { errors.push(message); } },
+      updateStatePath: path.join(dir, "state.json"),
+      updateRequestPath: path.join(dir, "request.json"),
+      startUpdateMonitorImpl: () => () => {},
+      ensureBinaryImpl: async () => {
+        const error = new Error("MoonDesk prebuilt Linux binaries require glibc 2.34 or newer");
+        error.code = UNSUPPORTED_RUNTIME_ERROR_CODE;
+        throw error;
+      },
+    });
+
+    assert.deepEqual(result, { code: 1, signal: null });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /require glibc 2\.34 or newer/);
+    assert.doesNotMatch(errors[0], /network/i);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("browser subcommand arguments are forwarded unchanged to native MoonDesk", async () => {

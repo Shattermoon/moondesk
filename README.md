@@ -52,7 +52,7 @@ Your code stays on your machine unless a tool you run sends it somewhere else.
 | **Permissions** | Use full local tools or a reduced read-only mode. |
 | **Verified installs** | Download the matching native binary on first run and verify it against the release SHA-256. |
 
-MoonDesk runs on **Windows, macOS, and Linux**.
+MoonDesk runs on **Windows, macOS, and Linux**. Prebuilt Linux binaries are currently provided for x64/arm64 systems with **glibc 2.34 or newer**; musl-based distributions such as Alpine are not yet supported.
 
 ## Why MoonDesk?
 

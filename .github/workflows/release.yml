@@ -429,6 +429,26 @@ jobs:
           cp "${{ matrix.binary }}" "dist/${{ matrix.asset }}"
           chmod 755 "dist/${{ matrix.asset }}"
 
+      - name: Verify Linux glibc compatibility ceiling
+        if: startsWith(matrix.runner, 'ubuntu-')
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary="dist/${{ matrix.asset }}"
+          versions="$(objdump -T "$binary" | grep -oE 'GLIBC_[0-9]+(\.[0-9]+)+' || true)"
+          if [ -z "$versions" ]; then
+            echo "::error::Could not determine GLIBC symbol requirements for $binary."
+            exit 1
+          fi
+          max_glibc="$(printf '%s\n' "$versions" | sed 's/^GLIBC_//' | sort -Vu | tail -n 1)"
+          max_supported="2.34"
+          highest="$(printf '%s\n%s\n' "$max_supported" "$max_glibc" | sort -V | tail -n 1)"
+          if [ "$highest" != "$max_supported" ]; then
+            echo "::error::$binary now requires GLIBC $max_glibc, above MoonDesk's supported GLIBC $max_supported floor."
+            exit 1
+          fi
+          echo "$binary requires at most GLIBC $max_glibc (supported floor: $max_supported)."
+
       - name: Smoke-test binary and ClippyMoon export
         shell: bash
         run: |

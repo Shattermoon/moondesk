@@ -6,6 +6,8 @@ const path = require("node:path");
 const test = require("node:test");
 
 const {
+  MIN_LINUX_GLIBC_VERSION,
+  assertLinuxRuntimeCompatibility,
   cleanupOldBinaryVersions,
   createDownloadProgressReporter,
   ensureBinary,
@@ -94,6 +96,44 @@ test("resolveTarget rejects unsupported targets", () => {
     () => resolveTarget("plan9", "mips"),
     /does not provide a prebuilt binary/,
   );
+});
+
+test("Linux native bootstrap rejects musl and glibc older than the release floor", () => {
+  assert.equal(MIN_LINUX_GLIBC_VERSION, "2.34");
+  assert.equal(assertLinuxRuntimeCompatibility("win32"), null);
+  assert.equal(assertLinuxRuntimeCompatibility("linux", { glibcVersion: "2.34" }), "2.34");
+  assert.equal(assertLinuxRuntimeCompatibility("linux", { glibcVersion: "2.39" }), "2.39");
+  assert.throws(
+    () => assertLinuxRuntimeCompatibility("linux", { glibcVersion: "2.33" }),
+    /require glibc 2\.34 or newer; detected glibc 2\.33/,
+  );
+  assert.throws(
+    () => assertLinuxRuntimeCompatibility("linux", { glibcVersion: null }),
+    /musl-based or unknown-libc environments such as Alpine are not currently supported/,
+  );
+});
+
+test("ensureBinary checks Linux libc compatibility before touching the network", async () => {
+  const dir = tempDir();
+  let fetchCalled = false;
+  try {
+    await assert.rejects(
+      ensureBinary({
+        platform: "linux",
+        arch: "x64",
+        glibcVersion: "2.31",
+        installDir: dir,
+        fetchImpl: async () => {
+          fetchCalled = true;
+          throw new Error("network should not be reached");
+        },
+      }),
+      /require glibc 2\.34 or newer; detected glibc 2\.31/,
+    );
+    assert.equal(fetchCalled, false);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("ensureBinary downloads, verifies, and reuses a cached binary", async () => {

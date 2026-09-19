@@ -120,9 +120,11 @@ Select the connector and start working.
 
 ## Browser control
 
-MoonDesk owns one lazy agent Chromium process instead of attaching to your personal browser profile or launching a separate browser for every project. Inside that shared Chromium, each registered workspace gets its own isolated BrowserContext for cookies and site storage, while each ChatGPT conversation gets its own MoonDesk-routed logical tab set. Different workspaces therefore do not share cookies, localStorage, IndexedDB, or service-worker state, and separate conversations cannot accidentally act on each other's selected tabs.
+MoonDesk owns one lazy managed Chromium process instead of attaching to your personal browser profile or launching a separate browser for every project. On first browser use it provisions a pinned Chrome for Testing build for the current platform, verifies the exact archive size and SHA-256, installs it atomically into MoonDesk's browser cache, and controls it directly from Rust over the Chrome DevTools Protocol (CDP)—no Playwright, `chrome-devtools-mcp`, or separate browser-control service is required. Inside that shared Chromium, each registered workspace gets its own isolated BrowserContext for cookies and site storage, while each ChatGPT conversation gets its own MoonDesk-routed logical tab set. Different workspaces therefore do not share cookies, localStorage, IndexedDB, or service-worker state, and separate conversations cannot accidentally act on each other's selected tabs.
 
-The browser runs headless by default and can be switched to visible mode for human-assisted steps such as logins or permission prompts. Presentation belongs to the shared Chromium process, so changing it while the browser is live requires explicit confirmation because every workspace BrowserContext and logical tab is recreated. MoonDesk never attaches to or reuses your personal browser profile, cookies, or logged-in sessions.
+The browser runs headless by default and can be switched to visible mode for human-assisted steps such as logins or permission prompts. Headless and visible are two presentations of the same agent browser and expose the same tabs, navigation, DOM controls, visual computer-use controls, viewport management, screenshots, and advanced DevTools capabilities. Presentation belongs to the shared Chromium process, so changing it while the browser is live requires explicit confirmation because every workspace BrowserContext and logical tab is recreated. MoonDesk never attaches to or reuses your personal browser profile, cookies, or logged-in sessions.
+
+For normal agent work MoonDesk exposes a Codex-style capability facade: `browser_state` for ambient state, `browser_tabs` for conversation-owned tabs, `browser_navigate` for goto/back/forward/reload, `browser_dom` for accessibility/DOM interactions, `browser_cua` for rendered screenshots plus physical coordinate/keyboard/wheel input, and `browser_viewport` for responsive/device sizing. `browser_command` remains available as an advanced native-CDP escape hatch for console/network inspection, emulation, performance traces, V8 heap snapshots, screenshots, and lower-level page operations that are not represented by the facade.
 
 ```bash
 moondesk browser navigate_page --url=http://localhost:3000
@@ -131,7 +133,7 @@ moondesk browser take_snapshot
 moondesk browser list_console_messages
 ```
 
-The `moondesk browser` CLI shares the resolved workspace's BrowserContext/login state but uses its own logical tab session, so scripted browser commands cannot steal a ChatGPT conversation's active page. Use `view_page` when the task depends on actual rendered pixels rather than only a text/accessibility snapshot.
+The `moondesk browser` CLI is the deterministic low-level scripting path. It shares the resolved workspace's BrowserContext/login state but uses its own logical tab session, so scripted browser commands cannot steal a ChatGPT conversation's active page. For interactive agent work prefer the capability facade; use `browser_cua action=screenshot` or `view_page` when the task depends on actual rendered pixels rather than only a text/accessibility snapshot.
 
 For browser-runtime invariants and implementation details, see [`docs/BROWSER_RUNTIME_ARCHITECTURE_HARDENING.md`](docs/BROWSER_RUNTIME_ARCHITECTURE_HARDENING.md).
 
@@ -172,7 +174,7 @@ Use read-only mode when mutation is unnecessary, and use a VM or container for u
 
 **Commands:** `run_command`, `start_command`, `list_commands`, `poll_command`, `read_command_output`, `cancel_command`
 
-**Browser:** `set_browser_presentation`, `browser_command`, `view_page`
+**Browser:** `browser_state`, `browser_tabs`, `browser_navigate`, `browser_dom`, `browser_cua`, `browser_viewport`, `set_browser_presentation`, `view_page`, plus advanced `browser_command`
 
 Use `run_command` for short work. Use `start_command` + `poll_command` for builds, tests, installs, dev servers, and other long-running jobs.
 
@@ -217,7 +219,7 @@ If Windows Security or another antivirus quarantines the verified executable, up
 | Tunnel | ngrok |
 | MCP server | Custom implementation |
 | MCP protocol | `2025-11-25` |
-| Browser runtime | pinned `chrome-devtools-mcp@1.7.0` |
+| Browser runtime | MoonDesk-managed Chrome for Testing + native Rust CDP |
 | Distribution | npm + verified native binaries |
 
 ## Contributing

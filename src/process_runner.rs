@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
-use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
+use tokio::process::{Child, ChildStderr, ChildStdout, Command};
 use tokio::time::{Duration, timeout};
 
 const READ_CHUNK_BYTES: usize = 8 * 1024;
@@ -45,10 +45,6 @@ pub struct SpawnedProcess {
 impl SpawnedProcess {
     pub fn pid(&self) -> Option<u32> {
         self.child.id()
-    }
-
-    pub fn take_stdin(&mut self) -> Option<ChildStdin> {
-        self.child.stdin.take()
     }
 
     pub fn take_stdout(&mut self) -> Option<ChildStdout> {

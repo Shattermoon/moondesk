@@ -41,7 +41,7 @@ test("package exposes one MoonDesk CLI and keeps browser as a subcommand", () =>
   assert.equal(pkg.files.includes("skills/browser/SKILL.md"), true);
 });
 
-test("supported Node runtime matches the pinned browser dependency contract", () => {
+test("supported Node runtime matches the npm bootstrap contract", () => {
   const pkg = require("../package.json");
   assert.equal(SUPPORTED_NODE_RANGE, "^20.19.0 || ^22.12.0 || >=23");
   assert.equal(pkg.engines.node, SUPPORTED_NODE_RANGE);

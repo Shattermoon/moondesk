@@ -776,13 +776,13 @@ jobs:
             npm publish --access public --provenance
           fi
 
-          for attempt in $(seq 1 12); do
+          for attempt in $(seq 1 60); do
             published_version="$(npm view "${package_name}@${version}" version 2>/dev/null || true)"
             if [ "$published_version" = "$version" ]; then
               break
             fi
-            if [ "$attempt" -eq 12 ]; then
-              echo "::error::${package_name}@${version} was not visible after one minute."
+            if [ "$attempt" -eq 60 ]; then
+              echo "::error::${package_name}@${version} was not visible after five minutes."
               exit 1
             fi
             sleep 5
@@ -800,7 +800,7 @@ jobs:
           printf '%s\n' '{"name":"moondesk-release-verification","private":true}' > "$audit_dir/package.json"
           cd "$audit_dir"
           npm install --ignore-scripts --no-audit --no-fund "${package_name}@${version}"
-          for attempt in $(seq 1 24); do
+          for attempt in $(seq 1 60); do
             if audit_output="$(npm audit signatures 2>&1)"; then
               printf '%s\n' "$audit_output"
               break
@@ -814,12 +814,12 @@ jobs:
               exit "$audit_status"
             fi
 
-            if [ "$attempt" -eq 24 ]; then
-              echo "::error::npm provenance attestation for ${package_name}@${version} was not visible after two minutes."
+            if [ "$attempt" -eq 60 ]; then
+              echo "::error::npm provenance attestation for ${package_name}@${version} was not visible after five minutes."
               exit "$audit_status"
             fi
 
-            echo "npm provenance attestation is not visible yet; retrying signature audit in 5 seconds (${attempt}/24)."
+            echo "npm provenance attestation is not visible yet; retrying signature audit in 5 seconds (${attempt}/60)."
             sleep 5
           done
 

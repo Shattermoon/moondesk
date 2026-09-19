@@ -4961,6 +4961,7 @@ mod tests {
             .expect("missing result text")
     }
 
+    #[cfg(windows)]
     fn browser_stdout(response: &JsonRpcResponse) -> &str {
         response
             .result

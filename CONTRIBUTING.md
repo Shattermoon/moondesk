@@ -128,7 +128,9 @@ node --check npm/moondesk.js
 node --check npm/install-binary.js
 node --check npm/update-manager.js
 node --check .github/scripts/verify-npm-package.mjs
+node --check .github/scripts/verify-managed-browser-manifest.mjs
 node --test npm/install-binary.test.js npm/update-manager.test.js npm/moondesk.test.js
+node .github/scripts/verify-managed-browser-manifest.mjs
 node .github/scripts/verify-npm-package.mjs
 ```
 

@@ -24,7 +24,7 @@ MoonDesk currently requires:
 - Node.js **`^20.19.0 || ^22.12.0 || >=23`** for the supported npm wrapper/bootstrap runtime
 - Git
 
-For the closest match to CI, use the current stable Rust toolchain with `rustfmt` and `clippy`. CI validates the npm runtime at Node 20.19.0, Node 22.12.0, and Node 24.
+For the closest match to CI, use the current stable Rust toolchain with `rustfmt` and `clippy`. CI also checks all targets on the declared Rust 1.88 MSRV and validates the npm runtime at Node 20.19.0, Node 22.12.0, Node 24, and Node 26.
 
 Some optional integration tests require platform-specific software:
 

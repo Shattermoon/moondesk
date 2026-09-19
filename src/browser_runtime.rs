@@ -339,6 +339,13 @@ impl BrowserRuntime {
             .await
             .map_err(|_| total_timeout_message(operation_timeout))?;
         let (transport, restarted) = self.ensure_transport(deadline).await?;
+        self.ensure_session_not_blocked_by_performance_trace(
+            session,
+            &transport,
+            deadline,
+            operation_timeout,
+        )
+        .await?;
         let page_id = self
             .ensure_active_upstream_page(session, &transport, deadline, operation_timeout)
             .await?;
@@ -378,6 +385,10 @@ impl BrowserRuntime {
             .await
             .map_err(|_| total_timeout_message(timeout))?;
         let (transport, restarted) = self.ensure_transport(deadline).await?;
+        self.ensure_session_not_blocked_by_performance_trace(
+            session, &transport, deadline, timeout,
+        )
+        .await?;
         let page_id = self
             .ensure_active_upstream_page(session, &transport, deadline, timeout)
             .await?;
@@ -422,6 +433,10 @@ impl BrowserRuntime {
             .await
             .map_err(|_| total_timeout_message(timeout))?;
         let (transport, restarted) = self.ensure_transport(deadline).await?;
+        self.ensure_session_not_blocked_by_performance_trace(
+            session, &transport, deadline, timeout,
+        )
+        .await?;
         let page_id = self
             .ensure_active_upstream_page(session, &transport, deadline, timeout)
             .await?;
@@ -528,8 +543,11 @@ impl BrowserRuntime {
         if tokio::time::Instant::now() >= deadline {
             return Err(total_timeout_message(timeout));
         }
-
         let (transport, restarted) = self.ensure_transport(deadline).await?;
+        self.ensure_session_not_blocked_by_performance_trace(
+            session, &transport, deadline, timeout,
+        )
+        .await?;
         let mut arguments = parsed.arguments.clone();
         let mut result = match command {
             "list_pages" => {
@@ -672,6 +690,14 @@ impl BrowserRuntime {
                 }
                 arguments.insert("pageId".to_string(), Value::from(page_id));
                 let trace_auto_stop = if command == "performance_start_trace" {
+                    let pages = self
+                        .list_upstream_pages(&transport, deadline, timeout)
+                        .await?;
+                    self.ensure_global_recording_pages_present(&transport, &pages)
+                        .await?;
+                    self.reconcile_pages(session, &pages, None).await;
+                    self.ensure_performance_trace_isolated(session, &transport, &pages, deadline)
+                        .await?;
                     self.begin_performance_trace(session, page_id).await?;
                     Some(
                         arguments
@@ -701,11 +727,27 @@ impl BrowserRuntime {
                     }
                 };
                 let browser_error = browser_result_is_error(&result);
+                if browser_error
+                    && matches!(
+                        command,
+                        "performance_start_trace" | "performance_stop_trace"
+                    )
+                {
+                    let detail = browser_result_text(&result);
+                    self.invalidate_transport(
+                        &transport,
+                        "browser-global performance trace state could not be proven clean after a trace error",
+                    )
+                    .await;
+                    return Err(format!(
+                        "Browser performance trace failed: {detail}. MoonDesk reset the shared browser runtime because browser-global trace state could not be proven clean; retry from a fresh page/snapshot."
+                    ));
+                }
                 if let Some(auto_stop) = trace_auto_stop {
-                    if browser_error || auto_stop {
+                    if auto_stop {
                         self.finish_performance_trace(session).await;
                     }
-                } else if command == "performance_stop_trace" && !browser_error {
+                } else if command == "performance_stop_trace" {
                     self.finish_performance_trace(session).await;
                 }
                 if !browser_error && let Some(before_ids) = before_ids {
@@ -930,6 +972,105 @@ impl BrowserRuntime {
                 "Could not select MoonDesk's surviving browser page before close: {}",
                 browser_result_text(&selected)
             ));
+        }
+        Ok(())
+    }
+
+    async fn ensure_session_not_blocked_by_performance_trace(
+        &self,
+        session: &BrowserSessionKey,
+        transport: &Arc<BrowserCdpTransport>,
+        deadline: tokio::time::Instant,
+        timeout: Duration,
+    ) -> Result<(), String> {
+        let active_owner = {
+            let runtime = self.runtime.lock().await;
+            runtime
+                .routing
+                .active_trace
+                .as_ref()
+                .map(|active| active.owner.clone())
+        };
+        let Some(active_owner) = active_owner else {
+            return Ok(());
+        };
+
+        let pages = self
+            .list_upstream_pages(transport, deadline, timeout)
+            .await?;
+        self.ensure_global_recording_pages_present(transport, &pages)
+            .await?;
+        if active_owner != *session {
+            return Err(
+                "Another browser session owns the active performance trace; browser actions are temporarily blocked so browser-global trace data cannot mix session authority"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+
+    async fn ensure_performance_trace_isolated(
+        &self,
+        session: &BrowserSessionKey,
+        transport: &Arc<BrowserCdpTransport>,
+        pages: &[UpstreamPageInfo],
+        deadline: tokio::time::Instant,
+    ) -> Result<(), String> {
+        let workspace_context = session.workspace_context_name();
+        let contexts = transport.managed_context_names().await;
+        if contexts.len() != 1 || contexts.first() != Some(&workspace_context) {
+            return Err(
+                "Performance tracing is browser-global and is available only when this session's workspace is the sole active MoonDesk BrowserContext"
+                    .to_string(),
+            );
+        }
+
+        if !transport
+            .browser_contexts_match_managed(deadline)
+            .await
+            .map_err(|error| format!("Could not verify browser-global trace isolation: {error}"))?
+        {
+            return Err(
+                "Performance tracing is browser-global and cannot start while Chromium has an untracked or missing BrowserContext"
+                    .to_string(),
+            );
+        }
+        if transport
+            .has_unmanaged_page_targets(deadline)
+            .await
+            .map_err(|error| format!("Could not verify browser-global trace isolation: {error}"))?
+        {
+            return Err(
+                "Performance tracing is browser-global and cannot start while Chromium has any unowned/default-context page target"
+                    .to_string(),
+            );
+        }
+
+        let runtime = self.runtime.lock().await;
+        if runtime
+            .routing
+            .sessions
+            .keys()
+            .any(|owner| owner != session && owner.workspace_key == session.workspace_key)
+        {
+            return Err(
+                "Performance tracing is browser-global and cannot start after another browser session has used this workspace BrowserContext; restart the shared browser runtime first so session-scoped background state cannot contribute trace data"
+                    .to_string(),
+            );
+        }
+        for page in pages.iter().filter(|page| page.isolated_context.is_some()) {
+            if page.isolated_context.as_deref() != Some(workspace_context.as_str())
+                || !runtime
+                    .routing
+                    .upstream_owners
+                    .get(&page.id)
+                    .is_some_and(|(owner, _)| owner == session)
+            {
+                return Err(
+                    "Performance tracing is browser-global and cannot start while another browser session owns or may own a managed page"
+                        .to_string(),
+                );
+            }
         }
         Ok(())
     }
@@ -2930,7 +3071,6 @@ mod tests {
         runtime.finish_performance_trace(&chat_a).await;
         assert!(runtime.performance_trace_page(&chat_a).await.is_err());
         assert!(runtime.ensure_page_can_close(&chat_a, 41).await.is_ok());
-
         runtime
             .begin_performance_trace(&chat_b, 52)
             .await
@@ -3780,6 +3920,20 @@ mod tests {
         assert!(visible_transport.is_alive());
         assert!(state.lock().await.browser_runtime_running);
 
+        let visible_trace = runtime
+            .run(
+                &workspace_str,
+                "performance_start_trace",
+                &["--reload=false".into()],
+                DEFAULT_BROWSER_COMMAND_TIMEOUT,
+            )
+            .await
+            .expect_err("visible startup page must keep browser-global tracing fail-closed");
+        assert!(
+            visible_trace.contains("browser-global"),
+            "unexpected visible trace isolation error: {visible_trace}"
+        );
+
         let back_to_headless = runtime
             .set_presentation(BrowserPresentation::Headless, true)
             .await;
@@ -3913,6 +4067,21 @@ mod tests {
             storage_b.stdout
         );
 
+        let cross_session_trace = runtime
+            .run_for_session(
+                &chat_a,
+                &root_a_str,
+                "performance_start_trace",
+                &["--reload=false".into()],
+                DEFAULT_BROWSER_COMMAND_TIMEOUT,
+            )
+            .await
+            .expect_err("browser-global trace must not mix same-workspace conversations");
+        assert!(
+            cross_session_trace.contains("another browser session"),
+            "unexpected cross-session trace isolation error: {cross_session_trace}"
+        );
+
         let navigate_c = runtime
             .run_for_session(
                 &chat_c,
@@ -3951,6 +4120,21 @@ mod tests {
             !storage_c.stdout.contains("\"HAS\""),
             "different workspace leaked storage: {}",
             storage_c.stdout
+        );
+
+        let cross_workspace_trace = runtime
+            .run_for_session(
+                &chat_a,
+                &root_a_str,
+                "performance_start_trace",
+                &["--reload=false".into()],
+                DEFAULT_BROWSER_COMMAND_TIMEOUT,
+            )
+            .await
+            .expect_err("browser-global trace must not run across workspace contexts");
+        assert!(
+            cross_workspace_trace.contains("browser-global"),
+            "unexpected cross-workspace trace isolation error: {cross_workspace_trace}"
         );
 
         let second_a = runtime
@@ -4141,6 +4325,65 @@ mod tests {
         assert!(workspace_b_after_release.stdout.contains("MISS"));
         assert_eq!(runtime.transport_pid().await, Some(shared_pid));
 
+        let trace_page = runtime
+            .active_upstream_page_id(&chat_c)
+            .await
+            .expect("workspace B active trace page");
+        let trace_deadline = tokio::time::Instant::now() + DEFAULT_BROWSER_COMMAND_TIMEOUT;
+        let out_of_band_trace = transport
+            .call_tool(
+                "performance_start_trace",
+                serde_json::json!({
+                    "pageId": trace_page,
+                    "reload": false,
+                    "autoStop": false,
+                }),
+                trace_deadline,
+            )
+            .await
+            .expect("create deliberate transport/runtime trace-state mismatch");
+        assert!(
+            !browser_result_is_error(&out_of_band_trace),
+            "out-of-band trace start failed: {}",
+            browser_result_text(&out_of_band_trace)
+        );
+
+        let ambiguous_trace = runtime
+            .run_for_session(
+                &chat_c,
+                &root_b_str,
+                "performance_start_trace",
+                &["--reload=false".into(), "--autoStop=false".into()],
+                DEFAULT_BROWSER_COMMAND_TIMEOUT,
+            )
+            .await
+            .expect_err("ambiguous browser-global trace state must reset the shared runtime");
+        assert!(
+            ambiguous_trace.contains("reset the shared browser runtime"),
+            "unexpected ambiguous trace error: {ambiguous_trace}"
+        );
+        assert!(
+            !transport.is_alive(),
+            "ambiguous trace state must invalidate the old Chromium generation"
+        );
+        assert!(runtime.performance_trace_page(&chat_c).await.is_err());
+
+        let recovered_after_trace_reset = runtime
+            .run_for_session(
+                &chat_c,
+                &root_b_str,
+                "list_pages",
+                &[],
+                DEFAULT_BROWSER_COMMAND_TIMEOUT,
+            )
+            .await
+            .expect("browser should recover after ambiguous trace reset");
+        assert!(recovered_after_trace_reset.success());
+        assert!(
+            recovered_after_trace_reset.restarted,
+            "trace-state reset must surface as a browser generation restart"
+        );
+
         runtime.stop().await;
         site_server.abort();
         let _ = site_server.await;
@@ -4194,6 +4437,21 @@ mod tests {
             .expect("first transport");
         let first_pid = first_transport.pid().await.expect("first transport pid");
         assert!(first_transport.is_alive());
+        let isolation_deadline = tokio::time::Instant::now() + DEFAULT_BROWSER_COMMAND_TIMEOUT;
+        assert!(
+            first_transport
+                .browser_contexts_match_managed(isolation_deadline)
+                .await
+                .expect("compare managed browser contexts after headless startup"),
+            "headless startup must not leave an untracked BrowserContext alive"
+        );
+        assert!(
+            !first_transport
+                .has_unmanaged_page_targets(isolation_deadline)
+                .await
+                .expect("inspect unmanaged pages after headless startup"),
+            "headless startup must not leave an unowned page alive"
+        );
 
         let opened = runtime
             .run(
@@ -4311,6 +4569,187 @@ mod tests {
 
         runtime.stop().await;
         assert!(!replacement.is_alive());
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    #[ignore = "serialized Windows stale trace recovery smoke"]
+    async fn windows_dead_browser_clears_stale_trace_lease_before_next_session() {
+        let workspace = std::env::temp_dir().join(format!(
+            "moondesk-browser-stale-trace-recovery-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workspace).expect("create stale-trace workspace");
+        let workspace_str = workspace.to_string_lossy().into_owned();
+        let runtime = BrowserRuntime::standalone();
+        let workspace_id = WorkspaceId::new();
+        let chat_a = BrowserSessionKey::openai(&workspace_id, None, "chat-a");
+        let chat_b = BrowserSessionKey::openai(&workspace_id, None, "chat-b");
+
+        let warm = runtime
+            .run_for_session(
+                &chat_a,
+                &workspace_str,
+                "list_pages",
+                &[],
+                DEFAULT_BROWSER_COMMAND_TIMEOUT,
+            )
+            .await
+            .expect("chat A starts browser");
+        assert!(warm.success(), "chat A list_pages failed: {warm:?}");
+
+        let trace = runtime
+            .run_for_session(
+                &chat_a,
+                &workspace_str,
+                "performance_start_trace",
+                &["--reload=false".into(), "--autoStop=false".into()],
+                DEFAULT_BROWSER_COMMAND_TIMEOUT,
+            )
+            .await
+            .expect("chat A starts manual trace");
+        assert!(trace.success(), "manual trace start failed: {trace:?}");
+        assert!(runtime.performance_trace_page(&chat_a).await.is_ok());
+        let blocked = runtime
+            .run_for_session(
+                &chat_b,
+                &workspace_str,
+                "list_pages",
+                &[],
+                DEFAULT_BROWSER_COMMAND_TIMEOUT,
+            )
+            .await
+            .expect_err("chat B must be blocked while chat A owns the manual trace");
+        assert!(
+            blocked.contains("owns the active performance trace"),
+            "unexpected trace ownership error: {blocked}"
+        );
+
+        let dead_transport = runtime
+            .runtime
+            .lock()
+            .await
+            .transport
+            .clone()
+            .expect("active browser transport");
+        dead_transport.shutdown().await;
+        assert!(!dead_transport.is_alive());
+
+        let recovered = runtime
+            .run_for_session(
+                &chat_b,
+                &workspace_str,
+                "list_pages",
+                &[],
+                DEFAULT_BROWSER_COMMAND_TIMEOUT,
+            )
+            .await
+            .expect("dead browser should recover before stale trace authority is enforced");
+        assert!(recovered.success(), "chat B recovery failed: {recovered:?}");
+        assert!(recovered.restarted);
+        assert!(runtime.performance_trace_page(&chat_a).await.is_err());
+
+        runtime.stop().await;
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    #[ignore = "serialized Windows vanished trace-page recovery smoke"]
+    async fn windows_vanished_trace_page_resets_runtime_before_other_session() {
+        let workspace = std::env::temp_dir().join(format!(
+            "moondesk-browser-vanished-trace-page-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workspace).expect("create vanished-trace workspace");
+        let workspace_str = workspace.to_string_lossy().into_owned();
+        let runtime = BrowserRuntime::standalone();
+        let workspace_id = WorkspaceId::new();
+        let chat_a = BrowserSessionKey::openai(&workspace_id, None, "chat-a");
+        let chat_b = BrowserSessionKey::openai(&workspace_id, None, "chat-b");
+
+        let warm = runtime
+            .run_for_session(
+                &chat_a,
+                &workspace_str,
+                "list_pages",
+                &[],
+                DEFAULT_BROWSER_COMMAND_TIMEOUT,
+            )
+            .await
+            .expect("chat A starts browser");
+        assert!(warm.success(), "chat A list_pages failed: {warm:?}");
+
+        let trace = runtime
+            .run_for_session(
+                &chat_a,
+                &workspace_str,
+                "performance_start_trace",
+                &["--reload=false".into(), "--autoStop=false".into()],
+                DEFAULT_BROWSER_COMMAND_TIMEOUT,
+            )
+            .await
+            .expect("chat A starts manual trace");
+        assert!(trace.success(), "manual trace start failed: {trace:?}");
+        let trace_page = runtime
+            .performance_trace_page(&chat_a)
+            .await
+            .expect("trace owner page");
+
+        let transport = runtime
+            .runtime
+            .lock()
+            .await
+            .transport
+            .clone()
+            .expect("active browser transport");
+        let close_deadline = tokio::time::Instant::now() + DEFAULT_BROWSER_COMMAND_TIMEOUT;
+        let closed = transport
+            .call_tool(
+                "close_page",
+                serde_json::json!({ "pageId": trace_page }),
+                close_deadline,
+            )
+            .await
+            .expect("force-close trace page below MoonDesk routing");
+        assert!(
+            !browser_result_is_error(&closed),
+            "forced trace page close failed: {}",
+            browser_result_text(&closed)
+        );
+
+        let reset = runtime
+            .run_for_session(
+                &chat_b,
+                &workspace_str,
+                "list_pages",
+                &[],
+                DEFAULT_BROWSER_COMMAND_TIMEOUT,
+            )
+            .await
+            .expect_err("vanished trace page must reset shared browser state");
+        assert!(
+            reset.contains("page owning the active performance trace disappeared"),
+            "unexpected vanished trace page error: {reset}"
+        );
+        assert!(!transport.is_alive());
+        assert!(runtime.performance_trace_page(&chat_a).await.is_err());
+
+        let recovered = runtime
+            .run_for_session(
+                &chat_b,
+                &workspace_str,
+                "list_pages",
+                &[],
+                DEFAULT_BROWSER_COMMAND_TIMEOUT,
+            )
+            .await
+            .expect("chat B should recover after fail-closed reset");
+        assert!(recovered.success(), "chat B recovery failed: {recovered:?}");
+        assert!(recovered.restarted);
+
+        runtime.stop().await;
         let _ = std::fs::remove_dir_all(workspace);
     }
 

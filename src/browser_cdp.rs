@@ -472,11 +472,16 @@ impl BrowserCdpTransport {
                 "--disable-breakpad",
             ]);
         if presentation.is_headless() {
-            command.arg("--headless=new").arg(format!(
-                "--window-size={DEFAULT_VIEWPORT_WIDTH},{DEFAULT_VIEWPORT_HEIGHT}"
-            ));
+            command
+                .arg("--headless=new")
+                .arg("--no-startup-window")
+                .arg(format!(
+                    "--window-size={DEFAULT_VIEWPORT_WIDTH},{DEFAULT_VIEWPORT_HEIGHT}"
+                ));
+        } else {
+            command.arg("about:blank");
         }
-        command.arg("about:blank").current_dir(&runtime_cwd);
+        command.current_dir(&runtime_cwd);
 
         let mut process = match spawn_owned_program(command) {
             Ok(process) => process,
@@ -543,6 +548,87 @@ impl BrowserCdpTransport {
 
     pub fn browser_name(&self) -> &str {
         &self.browser_name
+    }
+
+    pub async fn managed_context_names(&self) -> Vec<String> {
+        self.state
+            .lock()
+            .await
+            .contexts_by_name
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    pub async fn browser_contexts_match_managed(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<bool, BrowserTransportError> {
+        let managed_context_ids = {
+            let state = self.state.lock().await;
+            state
+                .context_names_by_id
+                .keys()
+                .cloned()
+                .collect::<std::collections::HashSet<_>>()
+        };
+        let contexts = self
+            .connection
+            .call("Target.getBrowserContexts", json!({}), None, deadline)
+            .await?;
+        let actual_context_ids = contexts
+            .get("browserContextIds")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect::<std::collections::HashSet<_>>();
+        Ok(actual_context_ids == managed_context_ids)
+    }
+
+    pub async fn has_unmanaged_page_targets(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<bool, BrowserTransportError> {
+        let managed_context_ids = {
+            let state = self.state.lock().await;
+            state
+                .context_names_by_id
+                .keys()
+                .cloned()
+                .collect::<std::collections::HashSet<_>>()
+        };
+        let settle_deadline = std::cmp::min(
+            deadline,
+            tokio::time::Instant::now() + Duration::from_millis(750),
+        );
+        loop {
+            let targets = self
+                .connection
+                .call("Target.getTargets", json!({}), None, deadline)
+                .await?;
+            let unmanaged_pages = targets
+                .get("targetInfos")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter(|target| {
+                    target.get("type").and_then(Value::as_str) == Some("page")
+                        && !target
+                            .get("browserContextId")
+                            .and_then(Value::as_str)
+                            .is_some_and(|context_id| managed_context_ids.contains(context_id))
+                })
+                .collect::<Vec<_>>();
+            if unmanaged_pages.is_empty() {
+                return Ok(false);
+            }
+            if tokio::time::Instant::now() >= settle_deadline {
+                return Ok(true);
+            }
+            tokio::time::sleep(STARTUP_POLL_INTERVAL).await;
+        }
     }
 
     #[cfg(all(test, windows))]
@@ -654,33 +740,79 @@ impl BrowserCdpTransport {
         &self,
         deadline: tokio::time::Instant,
     ) -> Result<(), BrowserTransportError> {
-        let targets = self
-            .connection
-            .call("Target.getTargets", json!({}), None, deadline)
-            .await?;
-        let target_infos = targets
-            .get("targetInfos")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        for target in target_infos {
-            if target.get("type").and_then(Value::as_str) != Some("page") {
-                continue;
-            }
-            let Some(target_id) = target.get("targetId").and_then(Value::as_str) else {
-                continue;
-            };
-            let _ = self
+        let settle_deadline = std::cmp::min(
+            deadline,
+            tokio::time::Instant::now() + Duration::from_millis(750),
+        );
+        loop {
+            let targets = self
                 .connection
-                .call(
-                    "Target.closeTarget",
-                    json!({ "targetId": target_id }),
-                    None,
-                    deadline,
-                )
-                .await;
+                .call("Target.getTargets", json!({}), None, deadline)
+                .await?;
+            let page_targets = targets
+                .get("targetInfos")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter(|target| target.get("type").and_then(Value::as_str) == Some("page"))
+                .collect::<Vec<_>>();
+            if page_targets.is_empty() {
+                return Ok(());
+            }
+
+            // Chrome for Testing can launch its initial about:blank inside a generated
+            // BrowserContext. Closing only that target leaves the context alive and Chromium can
+            // later recreate a blank page inside it, which would become foreign browser-global
+            // state. Dispose startup BrowserContexts themselves; only fall back to closing the
+            // target when Chromium reports the default context without an ID.
+            let startup_context_ids = page_targets
+                .iter()
+                .filter_map(|target| target.get("browserContextId").and_then(Value::as_str))
+                .map(str::to_string)
+                .collect::<std::collections::HashSet<_>>();
+            let default_context_target_ids = page_targets
+                .iter()
+                .filter(|target| {
+                    target
+                        .get("browserContextId")
+                        .and_then(Value::as_str)
+                        .is_none()
+                })
+                .filter_map(|target| target.get("targetId").and_then(Value::as_str))
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+
+            for context_id in startup_context_ids {
+                let _ = self
+                    .connection
+                    .call(
+                        "Target.disposeBrowserContext",
+                        json!({ "browserContextId": context_id }),
+                        None,
+                        deadline,
+                    )
+                    .await;
+            }
+            for target_id in default_context_target_ids {
+                let _ = self
+                    .connection
+                    .call(
+                        "Target.closeTarget",
+                        json!({ "targetId": target_id }),
+                        None,
+                        deadline,
+                    )
+                    .await;
+            }
+
+            if tokio::time::Instant::now() >= settle_deadline {
+                return Err(BrowserTransportError::Protocol(
+                    "Chromium retained an unowned startup page after MoonDesk attempted to retire its startup BrowserContext"
+                        .to_string(),
+                ));
+            }
+            tokio::time::sleep(STARTUP_POLL_INTERVAL).await;
         }
-        Ok(())
     }
 
     async fn ensure_context(

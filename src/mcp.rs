@@ -606,7 +606,7 @@ fn push_browser_facade_tools(tools: &mut Vec<Value>, read_only: bool) {
                 "include_snapshot": { "type": "boolean" },
                 "dbl_click": { "type": "boolean" },
                 "verbose": { "type": "boolean" },
-                "timeout_ms": { "type": "integer", "minimum": 0, "maximum": MAX_BROWSER_TIMEOUT_MS }
+                "timeout_ms": { "type": "integer", "minimum": 1, "maximum": MAX_BROWSER_TIMEOUT_MS, "description": "Maximum browser operation runtime in milliseconds. Omit it to use MoonDesk's default timeout." }
             },
             "required": ["action"]
         },
@@ -2964,15 +2964,11 @@ fn browser_facade_argument_keys(
     Ok(())
 }
 
-fn browser_facade_timeout_ms(arguments: &Value, allow_zero: bool) -> Result<u64, String> {
+fn browser_facade_timeout_ms(arguments: &Value) -> Result<u64, String> {
     match arguments.get("timeout_ms") {
         None => Ok(DEFAULT_BROWSER_COMMAND_TIMEOUT.as_millis() as u64),
         Some(value) => match value.as_u64() {
-            Some(0) if allow_zero => Ok(0),
             Some(value @ 1..=MAX_BROWSER_TIMEOUT_MS) => Ok(value),
-            _ if allow_zero => Err(format!(
-                "timeout_ms must be an integer between 0 and {MAX_BROWSER_TIMEOUT_MS}"
-            )),
             _ => Err(format!(
                 "timeout_ms must be an integer between 1 and {MAX_BROWSER_TIMEOUT_MS}"
             )),
@@ -3167,7 +3163,7 @@ async fn handle_browser_tabs(
             format!("browser_tabs action '{action}' is blocked in read-only mode"),
         );
     }
-    let timeout_ms = match browser_facade_timeout_ms(&arguments, false) {
+    let timeout_ms = match browser_facade_timeout_ms(&arguments) {
         Ok(timeout) => timeout,
         Err(error) => return tool_error_response(req, error),
     };
@@ -3278,7 +3274,7 @@ async fn handle_browser_navigate(
         Ok(action) => action,
         Err(error) => return tool_error_response(req, error),
     };
-    let timeout_ms = match browser_facade_timeout_ms(&arguments, false) {
+    let timeout_ms = match browser_facade_timeout_ms(&arguments) {
         Ok(timeout) => timeout,
         Err(error) => return tool_error_response(req, error),
     };
@@ -3423,19 +3419,23 @@ async fn handle_browser_dom(
         ) {
             return tool_error_response(req, error);
         }
+        let timeout_ms = match browser_facade_timeout_ms(&arguments) {
+            Ok(timeout) => timeout,
+            Err(error) => return tool_error_response(req, error),
+        };
         let proxy = browser_facade_proxy_request(
             req,
             "wait_for",
             json!({
                 "text": arguments.get("text").cloned().unwrap_or(Value::Null),
-                "timeout": arguments.get("timeout_ms").cloned().unwrap_or(Value::from(0)),
+                "timeout": timeout_ms,
             }),
         );
         return handle_connector_wait_for(&proxy, browser_session, workspace_root, browser_runtime)
             .await;
     }
 
-    let timeout_ms = match browser_facade_timeout_ms(&arguments, false) {
+    let timeout_ms = match browser_facade_timeout_ms(&arguments) {
         Ok(timeout) => timeout,
         Err(error) => return tool_error_response(req, error),
     };
@@ -3714,7 +3714,7 @@ async fn handle_browser_cua(
         return handle_view_page(&proxy, browser_session, workspace_root, browser_runtime).await;
     }
 
-    let timeout_ms = match browser_facade_timeout_ms(&arguments, false) {
+    let timeout_ms = match browser_facade_timeout_ms(&arguments) {
         Ok(timeout) => timeout,
         Err(error) => return tool_error_response(req, error),
     };
@@ -3889,7 +3889,7 @@ async fn handle_browser_viewport(
             format!("browser_viewport action '{action}' is blocked in read-only mode"),
         );
     }
-    let timeout_ms = match browser_facade_timeout_ms(&arguments, false) {
+    let timeout_ms = match browser_facade_timeout_ms(&arguments) {
         Ok(timeout) => timeout,
         Err(error) => return tool_error_response(req, error),
     };
@@ -7098,6 +7098,20 @@ mod tests {
             writable_tools.iter().any(|tool| {
                 tool.get("name").and_then(Value::as_str) == Some("browser_navigate")
             })
+        );
+        let browser_dom = writable_tools
+            .iter()
+            .find(|tool| tool.get("name").and_then(Value::as_str) == Some("browser_dom"))
+            .expect("browser_dom descriptor");
+        assert_eq!(
+            browser_dom
+                .pointer("/inputSchema/properties/timeout_ms/minimum")
+                .and_then(Value::as_u64),
+            Some(1)
+        );
+        assert!(
+            browser_facade_timeout_ms(&json!({ "timeout_ms": 0 })).is_err(),
+            "browser_dom schema and runtime must both reject zero timeout"
         );
         for (tool_name, expected_actions) in [
             (

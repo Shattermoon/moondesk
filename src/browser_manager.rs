@@ -1,8 +1,8 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, UNIX_EPOCH};
 
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
@@ -46,6 +46,26 @@ struct BrowserInstallMarker {
     executable: String,
     executable_sha256: String,
     executable_size: u64,
+    files: Vec<BrowserInstallFile>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BrowserInstallFile {
+    path: String,
+    kind: BrowserInstallFileKind,
+    size: u64,
+    sha256: Option<String>,
+    modified_ns: Option<u64>,
+    unix_mode: Option<u32>,
+    symlink_target: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum BrowserInstallFileKind {
+    File,
+    Symlink,
 }
 
 pub fn platform_key() -> Result<&'static str, String> {
@@ -157,6 +177,314 @@ fn install_dir_at(root: &Path, manifest: &BrowserManifest, platform: &str) -> Pa
     root.join(&manifest.version).join(platform)
 }
 
+fn marker_relative_path(path: &Path) -> Result<String, String> {
+    let mut parts = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(value) => parts.push(
+                value
+                    .to_str()
+                    .ok_or_else(|| {
+                        format!(
+                            "Managed-browser install contains a non-UTF-8 path: {}",
+                            path.display()
+                        )
+                    })?
+                    .to_string(),
+            ),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(format!(
+                    "Managed-browser install contains an unsafe relative path: {}",
+                    path.display()
+                ));
+            }
+        }
+    }
+    if parts.is_empty() {
+        return Err("Managed-browser install contains an empty relative path".to_string());
+    }
+    Ok(parts.join("/"))
+}
+
+fn marker_path(value: &str) -> Option<PathBuf> {
+    let path = Path::new(value);
+    if path.as_os_str().is_empty()
+        || path.is_absolute()
+        || path
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_) | Component::CurDir))
+    {
+        return None;
+    }
+    Some(path.to_path_buf())
+}
+
+fn modified_ns(metadata: &std::fs::Metadata) -> Option<u64> {
+    metadata
+        .modified()
+        .ok()?
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_nanos()
+        .try_into()
+        .ok()
+}
+
+fn unix_mode(metadata: &std::fs::Metadata) -> Option<u32> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        Some(metadata.permissions().mode() & 0o777)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        None
+    }
+}
+
+fn valid_sha256(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn collect_install_files(root: &Path) -> Result<Vec<BrowserInstallFile>, String> {
+    let mut files = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        let entries = std::fs::read_dir(&directory).map_err(|error| {
+            format!(
+                "Could not inspect managed-browser directory {}: {error}",
+                directory.display()
+            )
+        })?;
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                format!(
+                    "Could not inspect managed-browser directory entry in {}: {error}",
+                    directory.display()
+                )
+            })?;
+            let path = entry.path();
+            let metadata = std::fs::symlink_metadata(&path).map_err(|error| {
+                format!(
+                    "Could not inspect managed-browser install entry {}: {error}",
+                    path.display()
+                )
+            })?;
+            let relative = path.strip_prefix(root).map_err(|_| {
+                format!(
+                    "Managed-browser install entry escaped its root: {}",
+                    path.display()
+                )
+            })?;
+            let relative = marker_relative_path(relative)?;
+            if metadata.file_type().is_dir() {
+                pending.push(path);
+            } else if metadata.file_type().is_file() {
+                files.push(BrowserInstallFile {
+                    path: relative,
+                    kind: BrowserInstallFileKind::File,
+                    size: metadata.len(),
+                    sha256: Some(sha256_file(&path)?),
+                    modified_ns: modified_ns(&metadata),
+                    unix_mode: unix_mode(&metadata),
+                    symlink_target: None,
+                });
+            } else if metadata.file_type().is_symlink() {
+                let target = std::fs::read_link(&path).map_err(|error| {
+                    format!(
+                        "Could not inspect managed-browser symlink {}: {error}",
+                        path.display()
+                    )
+                })?;
+                let target = target.to_str().ok_or_else(|| {
+                    format!(
+                        "Managed-browser symlink has a non-UTF-8 target: {}",
+                        path.display()
+                    )
+                })?;
+                files.push(BrowserInstallFile {
+                    path: relative,
+                    kind: BrowserInstallFileKind::Symlink,
+                    size: 0,
+                    sha256: None,
+                    modified_ns: None,
+                    unix_mode: None,
+                    symlink_target: Some(target.to_string()),
+                });
+            } else {
+                return Err(format!(
+                    "Managed-browser install contains an unsupported filesystem entry: {}",
+                    path.display()
+                ));
+            }
+        }
+    }
+    files.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(files)
+}
+
+fn installed_entry_paths(root: &Path) -> Result<HashSet<String>, String> {
+    let mut paths = HashSet::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        let entries = std::fs::read_dir(&directory).map_err(|error| {
+            format!(
+                "Could not inspect managed-browser directory {}: {error}",
+                directory.display()
+            )
+        })?;
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                format!(
+                    "Could not inspect managed-browser directory entry in {}: {error}",
+                    directory.display()
+                )
+            })?;
+            let path = entry.path();
+            let metadata = std::fs::symlink_metadata(&path).map_err(|error| {
+                format!(
+                    "Could not inspect managed-browser install entry {}: {error}",
+                    path.display()
+                )
+            })?;
+            let relative = path.strip_prefix(root).map_err(|_| {
+                format!(
+                    "Managed-browser install entry escaped its root: {}",
+                    path.display()
+                )
+            })?;
+            let relative = marker_relative_path(relative)?;
+            if metadata.file_type().is_dir() {
+                pending.push(path);
+            } else if metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+                if relative != ".moondesk-browser-install.json" {
+                    paths.insert(relative);
+                }
+            } else {
+                return Err(format!(
+                    "Managed-browser install contains an unsupported filesystem entry: {}",
+                    path.display()
+                ));
+            }
+        }
+    }
+    Ok(paths)
+}
+
+fn install_files_match(
+    root: &Path,
+    files: &[BrowserInstallFile],
+    executable: &Path,
+) -> Result<bool, String> {
+    if files.is_empty() {
+        return Ok(false);
+    }
+    let expected_paths = files
+        .iter()
+        .map(|entry| entry.path.clone())
+        .collect::<HashSet<_>>();
+    if expected_paths.len() != files.len() || installed_entry_paths(root)? != expected_paths {
+        return Ok(false);
+    }
+    let canonical_root = std::fs::canonicalize(root).map_err(|error| {
+        format!(
+            "Could not canonicalize managed-browser install {}: {error}",
+            root.display()
+        )
+    })?;
+    let executable_relative = executable
+        .strip_prefix(root)
+        .ok()
+        .and_then(|path| marker_relative_path(path).ok());
+
+    for expected in files {
+        let Some(relative) = marker_path(&expected.path) else {
+            return Ok(false);
+        };
+        let path = root.join(&relative);
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => {
+                return Err(format!(
+                    "Could not inspect managed-browser install entry {}: {error}",
+                    path.display()
+                ));
+            }
+        };
+
+        match expected.kind {
+            BrowserInstallFileKind::File => {
+                let Some(expected_sha256) = expected.sha256.as_deref() else {
+                    return Ok(false);
+                };
+                if !valid_sha256(expected_sha256)
+                    || expected.symlink_target.is_some()
+                    || expected.unix_mode != unix_mode(&metadata)
+                    || !metadata.file_type().is_file()
+                    || metadata.len() != expected.size
+                {
+                    return Ok(false);
+                }
+                let canonical = std::fs::canonicalize(&path).map_err(|error| {
+                    format!(
+                        "Could not canonicalize managed-browser install entry {}: {error}",
+                        path.display()
+                    )
+                })?;
+                if !canonical.starts_with(&canonical_root) {
+                    return Ok(false);
+                }
+                let must_hash = executable_relative.as_deref() == Some(expected.path.as_str())
+                    || expected.modified_ns.is_none()
+                    || modified_ns(&metadata) != expected.modified_ns;
+                if must_hash && !sha256_file(&path)?.eq_ignore_ascii_case(expected_sha256) {
+                    return Ok(false);
+                }
+            }
+            BrowserInstallFileKind::Symlink => {
+                if !metadata.file_type().is_symlink()
+                    || expected.size != 0
+                    || expected.sha256.is_some()
+                    || expected.modified_ns.is_some()
+                    || expected.unix_mode.is_some()
+                {
+                    return Ok(false);
+                }
+                let Some(expected_target) = expected.symlink_target.as_deref() else {
+                    return Ok(false);
+                };
+                let actual_target = std::fs::read_link(&path).map_err(|error| {
+                    format!(
+                        "Could not inspect managed-browser symlink {}: {error}",
+                        path.display()
+                    )
+                })?;
+                if actual_target != Path::new(expected_target) {
+                    return Ok(false);
+                }
+                let Some(parent) = path.parent() else {
+                    return Ok(false);
+                };
+                let canonical_parent = std::fs::canonicalize(parent).map_err(|error| {
+                    format!(
+                        "Could not canonicalize managed-browser symlink parent {}: {error}",
+                        parent.display()
+                    )
+                })?;
+                if !canonical_parent.starts_with(&canonical_root)
+                    || !lexical_path_within(root, parent, &actual_target)
+                {
+                    return Ok(false);
+                }
+            }
+        }
+    }
+    Ok(true)
+}
+
 fn installed_from(
     manifest: &BrowserManifest,
     platform: &str,
@@ -192,7 +520,7 @@ fn installed_from_root(
             ));
         }
     };
-    if marker.schema_version != 1
+    if marker.schema_version != 2
         || marker.version != manifest.version
         || marker.platform != platform
         || !marker.archive_sha256.eq_ignore_ascii_case(&artifact.sha256)
@@ -210,8 +538,20 @@ fn installed_from_root(
     if metadata.len() != marker.executable_size {
         return Ok(None);
     }
-    let executable_sha256 = sha256_file(&executable)?;
-    if !executable_sha256.eq_ignore_ascii_case(&marker.executable_sha256) {
+    let executable_relative = marker_relative_path(Path::new(&artifact.executable))?;
+    let executable_entry = marker
+        .files
+        .iter()
+        .find(|entry| entry.path == executable_relative);
+    if !executable_entry.is_some_and(|entry| {
+        entry.kind == BrowserInstallFileKind::File
+            && entry.size == marker.executable_size
+            && entry
+                .sha256
+                .as_deref()
+                .is_some_and(|sha256| sha256.eq_ignore_ascii_case(&marker.executable_sha256))
+    }) || !install_files_match(&root, &marker.files, &executable)?
+    {
         return Ok(None);
     }
 
@@ -283,21 +623,32 @@ pub async fn ensure_browser() -> Result<ManagedBrowser, String> {
             ));
         }
         ensure_executable_permissions(&executable)?;
-        let executable_metadata = std::fs::metadata(&executable).map_err(|error| {
+        let files = collect_install_files(&staging_dir)?;
+        let executable_relative = marker_relative_path(Path::new(&artifact.executable))?;
+        let executable_entry = files
+            .iter()
+            .find(|entry| entry.path == executable_relative)
+            .ok_or_else(|| {
+                format!(
+                    "Managed-browser install inventory is missing executable {}",
+                    artifact.executable
+                )
+            })?;
+        let executable_sha256 = executable_entry.sha256.clone().ok_or_else(|| {
             format!(
-                "Could not inspect staged managed-browser executable {}: {error}",
-                executable.display()
+                "Managed-browser executable {} is not a regular file",
+                artifact.executable
             )
         })?;
-        let executable_sha256 = sha256_file(&executable)?;
         let marker = BrowserInstallMarker {
-            schema_version: 1,
+            schema_version: 2,
             version: manifest.version.clone(),
             platform: platform.to_string(),
             archive_sha256: artifact.sha256.clone(),
             executable: artifact.executable.clone(),
             executable_sha256,
-            executable_size: executable_metadata.len(),
+            executable_size: executable_entry.size,
+            files,
         };
         let marker_json = serde_json::to_string_pretty(&marker).map_err(|error| {
             format!("Could not encode managed-browser verification marker: {error}")
@@ -740,7 +1091,7 @@ mod tests {
     }
 
     #[test]
-    fn cached_browser_rejects_executable_tampering() {
+    fn cached_browser_rejects_install_tampering() {
         let root = std::env::temp_dir().join(format!(
             "moondesk-browser-integrity-{}",
             uuid::Uuid::new_v4().simple()
@@ -768,25 +1119,35 @@ mod tests {
         .unwrap_or_else(|error| panic!("create test browser cache: {error}"));
         std::fs::write(&executable, b"verified-browser")
             .unwrap_or_else(|error| panic!("write test browser: {error}"));
-        let metadata = std::fs::metadata(&executable)
-            .unwrap_or_else(|error| panic!("test browser metadata: {error}"));
+        let support_file = install_root.join("chrome/resources.pak");
+        std::fs::write(&support_file, b"verified-resource")
+            .unwrap_or_else(|error| panic!("write test browser support file: {error}"));
+        let files = collect_install_files(&install_root)
+            .unwrap_or_else(|error| panic!("inventory test browser: {error}"));
+        let executable_relative = marker_relative_path(Path::new(&artifact.executable))
+            .unwrap_or_else(|error| panic!("test executable path: {error}"));
+        let executable_entry = files
+            .iter()
+            .find(|entry| entry.path == executable_relative)
+            .unwrap_or_else(|| panic!("test executable inventory entry"));
         let marker = BrowserInstallMarker {
-            schema_version: 1,
+            schema_version: 2,
             version: manifest.version.clone(),
             platform: "test-platform".to_string(),
             archive_sha256: artifact.sha256.clone(),
             executable: artifact.executable.clone(),
-            executable_sha256: sha256_file(&executable)
-                .unwrap_or_else(|error| panic!("hash test browser: {error}")),
-            executable_size: metadata.len(),
+            executable_sha256: executable_entry
+                .sha256
+                .clone()
+                .unwrap_or_else(|| panic!("test executable hash")),
+            executable_size: executable_entry.size,
+            files,
         };
         let marker_json = serde_json::to_string(&marker)
             .unwrap_or_else(|error| panic!("encode test marker: {error}"));
-        write_atomic_text(
-            &install_root.join(".moondesk-browser-install.json"),
-            &marker_json,
-        )
-        .unwrap_or_else(|error| panic!("write test marker: {error}"));
+        let marker_file = install_root.join(".moondesk-browser-install.json");
+        write_atomic_text(&marker_file, &marker_json)
+            .unwrap_or_else(|error| panic!("write test marker: {error}"));
 
         assert!(
             installed_from_root(&root, &manifest, "test-platform", &artifact)
@@ -794,12 +1155,156 @@ mod tests {
                 .is_some()
         );
 
+        std::fs::write(&marker_file, "{broken-json")
+            .unwrap_or_else(|error| panic!("corrupt test browser marker: {error}"));
+        assert!(
+            installed_from_root(&root, &manifest, "test-platform", &artifact)
+                .unwrap_or_else(|error| panic!("verify corrupt install marker: {error}"))
+                .is_none()
+        );
+        std::fs::write(&marker_file, &marker_json)
+            .unwrap_or_else(|error| panic!("restore test browser marker: {error}"));
+
+        let mut malformed_marker = marker.clone();
+        let support_relative = marker_relative_path(
+            support_file
+                .strip_prefix(&install_root)
+                .unwrap_or_else(|_| panic!("test support file relative path")),
+        )
+        .unwrap_or_else(|error| panic!("test support marker path: {error}"));
+        malformed_marker
+            .files
+            .iter_mut()
+            .find(|entry| entry.path == support_relative)
+            .unwrap_or_else(|| panic!("test support inventory entry"))
+            .sha256 = None;
+        let malformed_marker_json = serde_json::to_string(&malformed_marker)
+            .unwrap_or_else(|error| panic!("encode malformed test marker: {error}"));
+        std::fs::write(&marker_file, malformed_marker_json)
+            .unwrap_or_else(|error| panic!("write malformed test browser marker: {error}"));
+        assert!(
+            installed_from_root(&root, &manifest, "test-platform", &artifact)
+                .unwrap_or_else(|error| panic!("verify malformed install marker: {error}"))
+                .is_none()
+        );
+        std::fs::write(&marker_file, &marker_json)
+            .unwrap_or_else(|error| panic!("restore valid test browser marker: {error}"));
+
+        std::fs::remove_file(&support_file)
+            .unwrap_or_else(|error| panic!("remove test browser support file: {error}"));
+        assert!(
+            installed_from_root(&root, &manifest, "test-platform", &artifact)
+                .unwrap_or_else(|error| panic!("verify missing support file: {error}"))
+                .is_none()
+        );
+
+        std::fs::write(&support_file, b"verified-resource")
+            .unwrap_or_else(|error| panic!("restore test browser support file: {error}"));
+        assert!(
+            installed_from_root(&root, &manifest, "test-platform", &artifact)
+                .unwrap_or_else(|error| panic!("verify restored support file: {error}"))
+                .is_some()
+        );
+
+        let unexpected_file = install_root.join("chrome/unexpected.dat");
+        std::fs::write(&unexpected_file, b"unexpected")
+            .unwrap_or_else(|error| panic!("write unexpected browser file: {error}"));
+        assert!(
+            installed_from_root(&root, &manifest, "test-platform", &artifact)
+                .unwrap_or_else(|error| panic!("verify unexpected support file: {error}"))
+                .is_none()
+        );
+        std::fs::remove_file(&unexpected_file)
+            .unwrap_or_else(|error| panic!("remove unexpected browser file: {error}"));
+
+        assert_eq!(b"verified-resource".len(), b"tampered-resource".len());
+        std::thread::sleep(Duration::from_millis(5));
+        std::fs::write(&support_file, b"tampered-resource")
+            .unwrap_or_else(|error| panic!("same-size tamper browser support file: {error}"));
+        assert!(
+            installed_from_root(&root, &manifest, "test-platform", &artifact)
+                .unwrap_or_else(|error| panic!("verify same-size support tamper: {error}"))
+                .is_none()
+        );
+        std::thread::sleep(Duration::from_millis(5));
+        std::fs::write(&support_file, b"verified-resource")
+            .unwrap_or_else(|error| panic!("restore same-size browser support file: {error}"));
+        assert!(
+            installed_from_root(&root, &manifest, "test-platform", &artifact)
+                .unwrap_or_else(|error| panic!("verify restored same-size support file: {error}"))
+                .is_some()
+        );
+
+        std::fs::write(&support_file, b"damaged-resource-with-different-size")
+            .unwrap_or_else(|error| panic!("tamper test browser support file: {error}"));
+        assert!(
+            installed_from_root(&root, &manifest, "test-platform", &artifact)
+                .unwrap_or_else(|error| panic!("verify damaged support file: {error}"))
+                .is_none()
+        );
+
+        std::fs::write(&support_file, b"verified-resource")
+            .unwrap_or_else(|error| panic!("restore test browser support file again: {error}"));
+
         std::fs::write(&executable, b"tampered-browser")
             .unwrap_or_else(|error| panic!("tamper test browser: {error}"));
         assert!(
             installed_from_root(&root, &manifest, "test-platform", &artifact)
                 .unwrap_or_else(|error| panic!("reverify test browser: {error}"))
                 .is_none()
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cached_browser_inventory_tracks_required_symlinks() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let root = std::env::temp_dir().join(format!(
+            "moondesk-browser-symlink-integrity-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let real_dir = root.join("chrome/real");
+        std::fs::create_dir_all(&real_dir)
+            .unwrap_or_else(|error| panic!("create symlink test browser: {error}"));
+        let executable = real_dir.join("chrome");
+        std::fs::write(&executable, b"browser")
+            .unwrap_or_else(|error| panic!("write symlink test browser: {error}"));
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755))
+            .unwrap_or_else(|error| panic!("set symlink test browser mode: {error}"));
+        let link = root.join("chrome/current");
+        symlink(Path::new("real"), &link)
+            .unwrap_or_else(|error| panic!("create browser symlink: {error}"));
+
+        let files = collect_install_files(&root)
+            .unwrap_or_else(|error| panic!("inventory symlink test browser: {error}"));
+        let link_entry = files
+            .iter()
+            .find(|entry| entry.path == "chrome/current")
+            .unwrap_or_else(|| panic!("browser symlink inventory entry"));
+        assert_eq!(link_entry.kind, BrowserInstallFileKind::Symlink);
+        assert_eq!(link_entry.symlink_target.as_deref(), Some("real"));
+        assert!(
+            install_files_match(&root, &files, &executable)
+                .unwrap_or_else(|error| panic!("verify symlink test browser: {error}"))
+        );
+
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o644))
+            .unwrap_or_else(|error| panic!("remove symlink test browser execute mode: {error}"));
+        assert!(
+            !install_files_match(&root, &files, &executable)
+                .unwrap_or_else(|error| panic!("verify browser mode tamper: {error}"))
+        );
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755))
+            .unwrap_or_else(|error| panic!("restore symlink test browser mode: {error}"));
+
+        std::fs::remove_file(&link)
+            .unwrap_or_else(|error| panic!("remove browser symlink: {error}"));
+        assert!(
+            !install_files_match(&root, &files, &executable)
+                .unwrap_or_else(|error| panic!("verify missing browser symlink: {error}"))
         );
 
         let _ = std::fs::remove_dir_all(root);

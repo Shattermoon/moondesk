@@ -66,10 +66,10 @@ On first browser use:
 5. The complete archive SHA-256 is verified before extraction.
 6. ZIP entries are constrained to the staging root; unsafe paths and escaping symlinks fail closed.
 7. The browser is extracted to a randomized staging directory.
-8. The expected executable is verified and hashed.
+8. The expected executable is verified and MoonDesk records a verified inventory of every regular browser file plus required symlinks, including file sizes, SHA-256 digests, modification metadata, and Unix permission bits where applicable.
 9. The staged install is atomically published. A previous install is retained as a backup until the
    new verification marker is safely written, so a failed replacement can be rolled back.
-10. Subsequent browser starts re-check the executable size and SHA-256 against the install marker.
+10. Subsequent browser starts always re-hash the executable and cheaply verify the complete install inventory. Missing or size-changed support files and Unix permission changes fail verification immediately; support files whose modification metadata changed are re-hashed before reuse. A malformed verification marker or damaged cached browser is therefore reprovisioned instead of being retried indefinitely.
 
 The normal npm package therefore stays small. Chromium is a managed first-use runtime artifact rather
 than hundreds of megabytes embedded in each npm tarball.
@@ -81,7 +81,11 @@ verified managed browser, not a detected personal Chrome installation.
 
 MoonDesk starts Chromium with a private temporary user-data directory and an ephemeral loopback
 DevTools endpoint. It reads Chromium's `DevToolsActivePort` file, connects to the browser WebSocket,
-and owns the WebSocket and Chromium process tree for the complete runtime generation.
+and owns the WebSocket and Chromium process tree for the complete runtime generation. Headless
+Chromium is launched with `--no-startup-window` so Chrome does not create an unrelated startup
+`about:blank` BrowserContext/page before MoonDesk creates the first workspace context. MoonDesk
+still retires any unexpected headless startup target/context defensively before publishing the
+transport.
 
 CDP request IDs, target IDs, session IDs, BrowserContext IDs, and raw event data are internal
 implementation details. They are not caller authority.
@@ -161,8 +165,7 @@ content to the model.
 
 ## Presentation
 
-Headless and visible modes are two launch presentations of the **same** browser architecture and
-expose the same browser capability set.
+Headless and visible modes are two launch presentations of the **same** browser architecture and expose the same page-local browser capability set. Browser-global operations such as performance tracing remain subject to the recording-isolation rules below and can be rejected when another managed context/session or an unowned/default-context page is present.
 
 Presentation is process-global. Changing it while Chromium is live requires explicit confirmation
 because Chromium must restart and every temporary workspace BrowserContext, logical tab, page state,
@@ -183,9 +186,7 @@ timeout returns a normal browser-tool error and does not kill a healthy Chromium
 
 ## Browser-global recording state
 
-CDP performance tracing is browser-global. MoonDesk therefore leases the active trace to the exact
-logical session and page that started it. Another conversation cannot stop or replace that trace,
-and the owning page cannot be closed until the trace is stopped.
+CDP performance tracing is browser-global. MoonDesk therefore starts a trace only when the requesting workspace is the sole active managed BrowserContext, the requester is the only logical browser session that has used that BrowserContext in the current Chromium generation, every managed page belongs to the requester, and Chromium has no unowned/default-context page target that could contribute unrelated trace data. The active trace is then leased to the exact session and page that started it. Other browser sessions are blocked from browser actions until the trace stops, another conversation cannot stop or replace the trace, and the owning page cannot be closed while recording is active. A trace protocol error resets the shared browser runtime rather than leaving browser-global recording state ambiguous.
 
 If the page owning the active trace disappears unexpectedly, MoonDesk invalidates the shared
 runtime rather than risking recording-state leakage across logical sessions.
@@ -233,7 +234,7 @@ The browser unit/integration suite covers, among other things:
 - BrowserContext storage isolation across workspaces;
 - popup ownership and metadata settling;
 - local CLI vs MCP logical-session separation;
-- lazy startup and recovery after owned-child loss;
+- lazy headless startup without an unrelated startup window/context, defensive startup-context retirement, and recovery after owned-child loss;
 - timeout cancellation of dispatched mutations;
 - headless/visible presentation confirmation and restart;
 - exact viewport emulation;

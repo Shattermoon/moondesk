@@ -161,6 +161,14 @@ jobs:
         timeout-minutes: 10
         run: cargo +stable test --locked windows_shared_chromium_isolates_chat_pages_and_workspace_storage -- --ignored --test-threads 1
 
+      - name: Run Windows stale trace recovery smoke
+        timeout-minutes: 10
+        run: cargo +stable test --locked windows_dead_browser_clears_stale_trace_lease_before_next_session -- --ignored --test-threads 1
+
+      - name: Run Windows vanished trace-page recovery smoke
+        timeout-minutes: 10
+        run: cargo +stable test --locked windows_vanished_trace_page_resets_runtime_before_other_session -- --ignored --test-threads 1
+
       - name: Run Windows lazy browser vision smoke
         timeout-minutes: 10
         run: cargo +stable test --locked windows_view_page_returns_native_mcp_image_content -- --ignored --test-threads 1

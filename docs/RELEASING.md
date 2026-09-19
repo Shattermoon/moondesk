@@ -67,7 +67,7 @@ If `main` advances while a normal release matrix is building, the older release 
 
 If a matrix build fails, no new tag, GitHub Release, or npm version is created.
 
-If GitHub Release creation succeeds but npm later encounters a transient problem, rerunning the failed npm job is the fastest recovery. npm can acknowledge a successful publish before the registry version and provenance endpoints become queryable, so the tag-context publisher allows up to five minutes for registry/provenance propagation before failing. If recovery is not done before another PR merges, the next release automatically repairs the missing modern npm version first and then continues with the newly merged release. npm versions are always checked before publishing, so repair is idempotent rather than attempting to republish an immutable version.
+If GitHub Release creation succeeds but npm later encounters a transient problem, rerunning the failed npm job is the fastest recovery. npm can acknowledge a successful publish before the registry version and provenance endpoints become queryable, so the tag-context publisher allows up to five minutes for registry-version visibility and then up to five minutes for provenance/signature visibility (roughly ten minutes of propagation waiting in the worst case) before failing. If recovery is not done before another PR merges, the next release automatically repairs the missing modern npm version first and then continues with the newly merged release. npm versions are always checked before publishing, so repair is idempotent rather than attempting to republish an immutable version.
 
 ## npm Trusted Publishing
 

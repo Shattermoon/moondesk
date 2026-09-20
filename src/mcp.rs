@@ -8057,6 +8057,68 @@ mod tests {
             .expect("connector wait_for stdout");
         assert!(waited_stdout.contains("ready-text"), "{waited_stdout}");
 
+        let scheduled_block = handle_tools_call(
+            &tool_call_request(
+                "evaluate_script",
+                json!({
+                    "function": "() => { setTimeout(() => { const end = performance.now() + 1000; while (performance.now() < end) {} }, 0); return 'scheduled'; }"
+                }),
+            ),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        assert!(
+            browser_stdout(&scheduled_block).contains("scheduled"),
+            "failed to schedule browser main-thread block: {}",
+            browser_stdout(&scheduled_block)
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let blocked_wait = handle_tools_call(
+            &tool_call_request(
+                "wait_for",
+                json!({ "text": ["blocked-wait-never-appears"], "timeout": 50 }),
+            ),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::ReadOnly,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        assert!(
+            result_text(&blocked_wait).contains("Timed out after waiting 50ms"),
+            "explicit wait timeout during a slow CDP evaluation must stay a semantic timeout: {}",
+            result_text(&blocked_wait)
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(1_050)).await;
+        let after_blocked_wait = handle_tools_call(
+            &tool_call_request("list_pages", json!({})),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        assert_eq!(
+            after_blocked_wait
+                .result
+                .as_ref()
+                .and_then(|result| result.get("structuredContent"))
+                .and_then(|structured| structured.get("restarted"))
+                .and_then(Value::as_bool),
+            Some(false),
+            "semantic wait timeout must not invalidate the shared browser runtime"
+        );
+
         let metadata_only_wait = handle_tools_call(
             &tool_call_request("wait_for", json!({ "text": ["uid="], "timeout": 250 })),
             &workspace_root_str,

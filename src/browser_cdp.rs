@@ -192,7 +192,10 @@ impl CdpConnection {
                     "MoonDesk Chromium CDP response channel closed".to_string(),
                 ));
             }
-            Err(_) => return Err(BrowserTransportError::Timeout),
+            Err(_) => {
+                self.pending.lock().await.remove(&id);
+                return Err(BrowserTransportError::Timeout);
+            }
         };
 
         if let Some(error) = response.get("error") {
@@ -2427,11 +2430,22 @@ impl BrowserCdpTransport {
                     .collect::<Vec<_>>()
                     .join(" && ")
             );
-            let visible = self
+            let visible = match self
                 .evaluate_value(&session_id, &expression, wait_deadline)
-                .await?
-                .as_bool()
-                .unwrap_or(false);
+                .await
+            {
+                Ok(value) => value.as_bool().unwrap_or(false),
+                // An explicit wait timeout is a page-level outcome, not proof that the shared
+                // browser transport is unhealthy. Keep Chromium alive when the WebSocket still is.
+                Err(BrowserTransportError::Timeout)
+                    if requested_timeout_ms != 0 && self.connection.is_alive() =>
+                {
+                    return Ok(tool_error(format!(
+                        "Timed out after waiting {requested_timeout_ms}ms for requested text"
+                    )));
+                }
+                Err(error) => return Err(error),
+            };
             if visible {
                 return self.take_snapshot(arguments, deadline).await;
             }

@@ -4399,6 +4399,65 @@ async fn handle_set_browser_presentation(
     }
 }
 
+fn normalize_connector_browser_arguments(
+    command: &str,
+    mut arguments: Value,
+) -> Result<(Value, Option<u64>), String> {
+    let Some(object) = arguments.as_object_mut() else {
+        return Err("Browser tool arguments must be an object".to_string());
+    };
+
+    let timeout_ms = if matches!(command, "new_page" | "navigate_page") {
+        match object.remove("timeout") {
+            None => None,
+            Some(value) => match value.as_u64() {
+                Some(0) => None,
+                Some(value @ 1..=MAX_BROWSER_TIMEOUT_MS) => Some(value),
+                _ => {
+                    return Err(format!(
+                        "timeout must be an integer between 0 and {MAX_BROWSER_TIMEOUT_MS} ms"
+                    ));
+                }
+            },
+        }
+    } else {
+        None
+    };
+
+    if command == "new_page" && object.contains_key("isolatedContext") {
+        return Err(
+            "new_page isolatedContext is managed by MoonDesk and cannot be supplied by callers"
+                .to_string(),
+        );
+    }
+
+    if command == "navigate_page"
+        && let Some(value) = object.remove("handleBeforeUnload")
+    {
+        match value.as_str() {
+            Some("accept") => {}
+            Some("dismiss") => {
+                return Err(
+                    "navigate_page handleBeforeUnload='dismiss' is not supported by MoonDesk's managed browser; use handle_dialog when explicit dialog control is required"
+                        .to_string(),
+                );
+            }
+            _ => {
+                return Err(
+                    "navigate_page handleBeforeUnload must be either 'accept' or 'dismiss'"
+                        .to_string(),
+                );
+            }
+        }
+    }
+
+    if command == "take_screenshot" && !object.contains_key("format") {
+        object.insert("format".to_string(), Value::String("jpeg".to_string()));
+    }
+
+    Ok((arguments, timeout_ms))
+}
+
 async fn handle_connector_browser_command(
     req: &JsonRpcRequest,
     browser_session: &BrowserSessionKey,
@@ -4407,20 +4466,29 @@ async fn handle_connector_browser_command(
     browser_runtime: &Option<Arc<BrowserRuntime>>,
     command: &str,
 ) -> JsonRpcResponse {
-    let args = match browser_structured_arguments_to_cli(command, &tool_arguments(req)) {
+    let (arguments, timeout_ms) =
+        match normalize_connector_browser_arguments(command, tool_arguments(req)) {
+            Ok(arguments) => arguments,
+            Err(error) => return tool_error_response(req, error),
+        };
+    let args = match browser_structured_arguments_to_cli(command, &arguments) {
         Ok(args) => args,
         Err(error) => return tool_error_response(req, error),
     };
+    let mut browser_arguments = json!({
+        "command": command,
+        "args": args,
+    });
+    if let Some(timeout_ms) = timeout_ms {
+        browser_arguments["timeout_ms"] = json!(timeout_ms);
+    }
     let proxied = JsonRpcRequest {
         jsonrpc: req.jsonrpc.clone(),
         id: req.id.clone(),
         method: req.method.clone(),
         params: json!({
             "name": "browser_command",
-            "arguments": {
-                "command": command,
-                "args": args,
-            }
+            "arguments": browser_arguments
         }),
     };
     handle_browser_command(
@@ -7459,6 +7527,53 @@ mod tests {
             "contract-only capabilities must not become hidden top-level tools"
         );
 
+        let (new_page_args, new_page_timeout) = normalize_connector_browser_arguments(
+            "new_page",
+            json!({ "url": "about:blank", "timeout": 750 }),
+        )
+        .expect("normalize connector new_page timeout");
+        assert_eq!(new_page_timeout, Some(750));
+        assert!(new_page_args.get("timeout").is_none());
+        assert!(
+            normalize_connector_browser_arguments(
+                "new_page",
+                json!({ "url": "about:blank", "isolatedContext": "caller-owned" })
+            )
+            .expect_err("caller-controlled context must stay rejected")
+            .contains("managed by MoonDesk")
+        );
+
+        let (navigate_args, navigate_timeout) = normalize_connector_browser_arguments(
+            "navigate_page",
+            json!({
+                "type": "url",
+                "url": "about:blank",
+                "timeout": 1_250,
+                "handleBeforeUnload": "accept"
+            }),
+        )
+        .expect("normalize connector navigation compatibility arguments");
+        assert_eq!(navigate_timeout, Some(1_250));
+        assert!(navigate_args.get("timeout").is_none());
+        assert!(navigate_args.get("handleBeforeUnload").is_none());
+        assert!(
+            normalize_connector_browser_arguments(
+                "navigate_page",
+                json!({ "type": "reload", "handleBeforeUnload": "dismiss" })
+            )
+            .expect_err("unsupported beforeunload dismissal must be explicit")
+            .contains("not supported")
+        );
+
+        let (screenshot_args, screenshot_timeout) =
+            normalize_connector_browser_arguments("take_screenshot", json!({}))
+                .expect("normalize connector screenshot defaults");
+        assert_eq!(screenshot_timeout, None);
+        assert_eq!(
+            screenshot_args.get("format").and_then(Value::as_str),
+            Some("jpeg")
+        );
+
         let workspace_root =
             std::env::temp_dir().join(format!("moondesk-browser-adapter-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&workspace_root).expect("create browser adapter workspace");
@@ -7856,7 +7971,9 @@ mod tests {
                 "navigate_page",
                 json!({
                     "type": "url",
-                    "url": "data:text/html,<input aria-label='first'><input aria-label='second'><select aria-label='choice'><option value='one'>One</option><option value='two'>Two label</option></select><input aria-label='check' type='checkbox'><input aria-label='radio' type='radio' name='choice-radio'><div id='status'>waiting</div><script>setTimeout(()=>document.getElementById('status').textContent='ready-text',300)</script>"
+                    "url": "data:text/html,<input aria-label='first'><input aria-label='second'><select aria-label='choice'><option value='one'>One</option><option value='two'>Two label</option></select><input aria-label='check' type='checkbox'><input aria-label='radio' type='radio' name='choice-radio'><div id='status'>waiting</div><script>setTimeout(()=>document.getElementById('status').textContent='ready-text',300)</script>",
+                    "timeout": 5_000,
+                    "handleBeforeUnload": "accept"
                 }),
             ),
             &workspace_root_str,

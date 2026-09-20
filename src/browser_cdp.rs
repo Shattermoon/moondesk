@@ -1474,6 +1474,35 @@ impl BrowserCdpTransport {
             })
     }
 
+    async fn resolve_element_object(
+        &self,
+        page_id: u64,
+        uid: &str,
+        deadline: tokio::time::Instant,
+    ) -> Result<(String, String), BrowserTransportError> {
+        let backend_node_id = self.element_backend_node(page_id, uid).await?;
+        let session_id = self.ensure_page_session(page_id, deadline).await?;
+        let resolved = self
+            .connection
+            .call(
+                "DOM.resolveNode",
+                json!({ "backendNodeId": backend_node_id }),
+                Some(&session_id),
+                deadline,
+            )
+            .await?;
+        let object_id = resolved
+            .pointer("/object/objectId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                BrowserTransportError::Protocol(format!(
+                    "Element uid {uid} could not be resolved in the page"
+                ))
+            })?
+            .to_string();
+        Ok((session_id, object_id))
+    }
+
     async fn element_center(
         &self,
         page_id: u64,
@@ -1651,31 +1680,14 @@ impl BrowserCdpTransport {
         select: bool,
         deadline: tokio::time::Instant,
     ) -> Result<String, BrowserTransportError> {
-        let backend_node_id = self.element_backend_node(page_id, uid).await?;
-        let session_id = self.ensure_page_session(page_id, deadline).await?;
-        let resolved = self
-            .connection
-            .call(
-                "DOM.resolveNode",
-                json!({ "backendNodeId": backend_node_id }),
-                Some(&session_id),
-                deadline,
-            )
-            .await?;
-        let object_id = resolved
-            .pointer("/object/objectId")
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                BrowserTransportError::Protocol(format!(
-                    "Element uid {uid} could not be resolved in the page"
-                ))
-            })?;
+        let (session_id, object_id) = self.resolve_element_object(page_id, uid, deadline).await?;
         let function = if select {
             "function(){ this.focus(); if (typeof this.select === 'function') this.select(); }"
         } else {
             "function(){ this.focus(); }"
         };
-        self.connection
+        let result = self
+            .connection
             .call(
                 "Runtime.callFunctionOn",
                 json!({
@@ -1686,7 +1698,17 @@ impl BrowserCdpTransport {
                 Some(&session_id),
                 deadline,
             )
-            .await?;
+            .await;
+        let _ = self
+            .connection
+            .call(
+                "Runtime.releaseObject",
+                json!({ "objectId": object_id }),
+                Some(&session_id),
+                deadline,
+            )
+            .await;
+        result?;
         Ok(session_id)
     }
 
@@ -1698,16 +1720,159 @@ impl BrowserCdpTransport {
         let page_id = self.page_id_from_arguments(arguments).await?;
         let uid = required_str(arguments, "uid")?;
         let value = required_str(arguments, "value")?;
-        let session_id = self.focus_element(page_id, uid, true, deadline).await?;
-        self.connection
+        let (session_id, object_id) = self.resolve_element_object(page_id, uid, deadline).await?;
+        let metadata = self
+            .connection
             .call(
-                "Input.insertText",
-                json!({ "text": value }),
+                "Runtime.callFunctionOn",
+                json!({
+                    "objectId": object_id,
+                    "functionDeclaration": "function(){ return { tag: (this.tagName || '').toLowerCase(), type: (this.type || '').toLowerCase(), role: (this.getAttribute && this.getAttribute('role') || '').toLowerCase(), checked: !!this.checked, ariaChecked: this.getAttribute && this.getAttribute('aria-checked') }; }",
+                    "returnByValue": true,
+                }),
                 Some(&session_id),
                 deadline,
             )
             .await?;
-        let mut result = tool_success_text(format!("Filled element {uid}."));
+        let element = metadata
+            .pointer("/result/value")
+            .cloned()
+            .unwrap_or(Value::Null);
+        let tag = element
+            .get("tag")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let input_type = element
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let role = element
+            .get("role")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+
+        let operation = if tag == "select" {
+            let selected = self
+                .connection
+                .call(
+                    "Runtime.callFunctionOn",
+                    json!({
+                        "objectId": object_id,
+                        "functionDeclaration": "function(value){ const options = Array.from(this.options || []); const option = options.find((item) => item.value === value) || options.find((item) => (item.textContent || '').trim() === value); if (!option) return { ok: false, error: 'No matching option' }; const setter = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value')?.set; if (setter) setter.call(this, option.value); else this.value = option.value; this.dispatchEvent(new Event('input', { bubbles: true })); this.dispatchEvent(new Event('change', { bubbles: true })); return { ok: true, value: this.value }; }",
+                        "arguments": [{ "value": value }],
+                        "returnByValue": true,
+                        "userGesture": true,
+                    }),
+                    Some(&session_id),
+                    deadline,
+                )
+                .await?;
+            let selected = selected
+                .pointer("/result/value")
+                .cloned()
+                .unwrap_or(Value::Null);
+            if selected.get("ok").and_then(Value::as_bool) != Some(true) {
+                Ok(tool_error(format!(
+                    "Select element {uid} has no option matching '{value}'"
+                )))
+            } else {
+                Ok(tool_success_text(format!("Filled element {uid}.")))
+            }
+        } else if input_type == "checkbox"
+            || input_type == "radio"
+            || matches!(role, "checkbox" | "switch" | "radio")
+        {
+            let desired = match value.to_ascii_lowercase().as_str() {
+                "true" => true,
+                "false" if input_type != "radio" && role != "radio" => false,
+                "false" => {
+                    let _ = self
+                        .connection
+                        .call(
+                            "Runtime.releaseObject",
+                            json!({ "objectId": object_id }),
+                            Some(&session_id),
+                            deadline,
+                        )
+                        .await;
+                    return Ok(tool_error(format!(
+                        "Radio element {uid} only accepts the value 'true'"
+                    )));
+                }
+                _ => {
+                    let _ = self
+                        .connection
+                        .call(
+                            "Runtime.releaseObject",
+                            json!({ "objectId": object_id }),
+                            Some(&session_id),
+                            deadline,
+                        )
+                        .await;
+                    return Ok(tool_error(format!(
+                        "Boolean element {uid} requires value 'true' or 'false'"
+                    )));
+                }
+            };
+            let toggled = self
+                .connection
+                .call(
+                    "Runtime.callFunctionOn",
+                    json!({
+                        "objectId": object_id,
+                        "functionDeclaration": "function(desired){ const aria = this.getAttribute && this.getAttribute('aria-checked'); const before = typeof this.checked === 'boolean' ? this.checked : aria === 'true'; if (before !== desired && typeof this.click === 'function') this.click(); const afterAria = this.getAttribute && this.getAttribute('aria-checked'); const after = typeof this.checked === 'boolean' ? this.checked : afterAria === 'true'; return { ok: after === desired, checked: after }; }",
+                        "arguments": [{ "value": desired }],
+                        "returnByValue": true,
+                        "userGesture": true,
+                    }),
+                    Some(&session_id),
+                    deadline,
+                )
+                .await?;
+            let toggled = toggled
+                .pointer("/result/value")
+                .cloned()
+                .unwrap_or(Value::Null);
+            if toggled.get("ok").and_then(Value::as_bool) == Some(true) {
+                Ok(tool_success_text(format!("Filled element {uid}.")))
+            } else {
+                Ok(tool_error(format!(
+                    "Element {uid} could not be changed to {desired}"
+                )))
+            }
+        } else {
+            let _ = self
+                .connection
+                .call(
+                    "Runtime.releaseObject",
+                    json!({ "objectId": object_id.clone() }),
+                    Some(&session_id),
+                    deadline,
+                )
+                .await;
+            let session_id = self.focus_element(page_id, uid, true, deadline).await?;
+            self.connection
+                .call(
+                    "Input.insertText",
+                    json!({ "text": value }),
+                    Some(&session_id),
+                    deadline,
+                )
+                .await?;
+            Ok(tool_success_text(format!("Filled element {uid}.")))
+        };
+
+        let _ = self
+            .connection
+            .call(
+                "Runtime.releaseObject",
+                json!({ "objectId": object_id }),
+                Some(&session_id),
+                deadline,
+            )
+            .await;
+
+        let mut result = operation?;
         if arguments
             .get("includeSnapshot")
             .and_then(Value::as_bool)
@@ -1867,22 +2032,101 @@ impl BrowserCdpTransport {
         let page_id = self.page_id_from_arguments(arguments).await?;
         let session_id = self.ensure_page_session(page_id, deadline).await?;
         let function = required_str(arguments, "function")?;
-        let encoded_args = arguments
+        let element_uids = arguments
             .get("args")
             .and_then(Value::as_array)
-            .map(|args| {
-                args.iter()
-                    .map(|value| {
-                        serde_json::to_string(value).unwrap_or_else(|_| "null".to_string())
-                    })
-                    .collect::<Vec<_>>()
-                    .join(",")
-            })
+            .cloned()
             .unwrap_or_default();
-        let expression = format!("({function})({encoded_args})");
-        let value = self
-            .evaluate_value(&session_id, &expression, deadline)
-            .await?;
+
+        let value = if element_uids.is_empty() {
+            let expression = format!("({function})()");
+            self.evaluate_value(&session_id, &expression, deadline)
+                .await?
+        } else {
+            let mut object_ids = Vec::with_capacity(element_uids.len());
+            for (index, uid) in element_uids.iter().enumerate() {
+                let Some(uid) = uid.as_str() else {
+                    for object_id in &object_ids {
+                        let _ = self
+                            .connection
+                            .call(
+                                "Runtime.releaseObject",
+                                json!({ "objectId": object_id }),
+                                Some(&session_id),
+                                deadline,
+                            )
+                            .await;
+                    }
+                    return Err(BrowserTransportError::Protocol(format!(
+                        "evaluate_script args[{index}] must be an element uid"
+                    )));
+                };
+                match self.resolve_element_object(page_id, uid, deadline).await {
+                    Ok((_, object_id)) => object_ids.push(object_id),
+                    Err(error) => {
+                        for object_id in &object_ids {
+                            let _ = self
+                                .connection
+                                .call(
+                                    "Runtime.releaseObject",
+                                    json!({ "objectId": object_id }),
+                                    Some(&session_id),
+                                    deadline,
+                                )
+                                .await;
+                        }
+                        return Err(error);
+                    }
+                }
+            }
+
+            let call_arguments = object_ids
+                .iter()
+                .map(|object_id| json!({ "objectId": object_id }))
+                .collect::<Vec<_>>();
+            let function_declaration =
+                format!("function(...args){{ return ({function})(...args); }}");
+            let called = self
+                .connection
+                .call(
+                    "Runtime.callFunctionOn",
+                    json!({
+                        "objectId": object_ids[0],
+                        "functionDeclaration": function_declaration,
+                        "arguments": call_arguments,
+                        "awaitPromise": true,
+                        "returnByValue": true,
+                        "userGesture": true,
+                    }),
+                    Some(&session_id),
+                    deadline,
+                )
+                .await;
+            for object_id in &object_ids {
+                let _ = self
+                    .connection
+                    .call(
+                        "Runtime.releaseObject",
+                        json!({ "objectId": object_id }),
+                        Some(&session_id),
+                        deadline,
+                    )
+                    .await;
+            }
+            let called = called?;
+            if let Some(exception) = called.get("exceptionDetails") {
+                let message = exception
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .unwrap_or("JavaScript evaluation failed");
+                return Err(BrowserTransportError::Protocol(message.to_string()));
+            }
+            called
+                .pointer("/result/value")
+                .cloned()
+                .unwrap_or(Value::Null)
+        };
+
         let text = serde_json::to_string(&value).map_err(|error| {
             BrowserTransportError::Protocol(format!("Could not encode JavaScript result: {error}"))
         })?;

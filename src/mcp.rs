@@ -7856,7 +7856,7 @@ mod tests {
                 "navigate_page",
                 json!({
                     "type": "url",
-                    "url": "data:text/html,<input aria-label='first'><input aria-label='second'><div id='status'>waiting</div><script>setTimeout(()=>document.getElementById('status').textContent='ready-text',300)</script>"
+                    "url": "data:text/html,<input aria-label='first'><input aria-label='second'><select aria-label='choice'><option value='one'>One</option><option value='two'>Two label</option></select><input aria-label='check' type='checkbox'><input aria-label='radio' type='radio' name='choice-radio'><div id='status'>waiting</div><script>setTimeout(()=>document.getElementById('status').textContent='ready-text',300)</script>"
                 }),
             ),
             &workspace_root_str,
@@ -7897,7 +7897,7 @@ mod tests {
         let uid_for = |label: &str| {
             snapshot_stdout
                 .lines()
-                .find(|line| line.contains(&format!("textbox \"{label}\"")))
+                .find(|line| line.contains(&format!("\"{label}\"")))
                 .and_then(|line| line.trim().strip_prefix("uid="))
                 .and_then(|line| line.split_whitespace().next())
                 .map(str::to_string)
@@ -7905,6 +7905,32 @@ mod tests {
         };
         let first_uid = uid_for("first");
         let second_uid = uid_for("second");
+        let choice_uid = uid_for("choice");
+        let check_uid = uid_for("check");
+        let radio_uid = uid_for("radio");
+
+        let element_argument = handle_tools_call(
+            &tool_call_request(
+                "evaluate_script",
+                json!({
+                    "function": "(element) => ({ tag: element.tagName, label: element.getAttribute('aria-label') })",
+                    "args": [first_uid.clone()]
+                }),
+            ),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        let element_argument_stdout = browser_stdout(&element_argument);
+        assert!(
+            element_argument_stdout.contains("\"tag\":\"INPUT\"")
+                && element_argument_stdout.contains("\"label\":\"first\""),
+            "evaluate_script args must resolve snapshot UIDs to DOM elements: {element_argument_stdout}"
+        );
 
         let filled = handle_tools_call(
             &tool_call_request(
@@ -7912,7 +7938,10 @@ mod tests {
                 json!({
                     "elements": [
                         { "uid": first_uid, "value": "-1" },
-                        { "uid": second_uid, "value": "beta" }
+                        { "uid": second_uid, "value": "beta" },
+                        { "uid": choice_uid, "value": "Two label" },
+                        { "uid": check_uid, "value": "true" },
+                        { "uid": radio_uid, "value": "true" }
                     ],
                     "includeSnapshot": true
                 }),
@@ -7939,7 +7968,7 @@ mod tests {
             &tool_call_request(
                 "evaluate_script",
                 json!({
-                    "function": "() => ({first: document.querySelector('[aria-label=first]').value, second: document.querySelector('[aria-label=second]').value})"
+                    "function": "() => ({first: document.querySelector('[aria-label=first]').value, second: document.querySelector('[aria-label=second]').value, choice: document.querySelector('[aria-label=choice]').value, check: document.querySelector('[aria-label=check]').checked, radio: document.querySelector('[aria-label=radio]').checked})"
                 }),
             ),
             &workspace_root_str,
@@ -7959,6 +7988,18 @@ mod tests {
             .expect("connector-expanded evaluate_script stdout");
         assert!(evaluated_stdout.contains("-1"), "{evaluated_stdout}");
         assert!(evaluated_stdout.contains("beta"), "{evaluated_stdout}");
+        assert!(
+            evaluated_stdout.contains("\"choice\":\"two\""),
+            "{evaluated_stdout}"
+        );
+        assert!(
+            evaluated_stdout.contains("\"check\":true"),
+            "{evaluated_stdout}"
+        );
+        assert!(
+            evaluated_stdout.contains("\"radio\":true"),
+            "{evaluated_stdout}"
+        );
 
         let refreshed_snapshot = handle_tools_call(
             &tool_call_request("take_snapshot", json!({})),

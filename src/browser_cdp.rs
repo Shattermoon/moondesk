@@ -4205,10 +4205,10 @@ fn browser_string_filter(arguments: &Value, name: &str) -> HashSet<String> {
         .collect()
 }
 
-fn selected_main_frame_navigation<'a>(
-    events: &'a [CdpEvent],
+fn selected_main_frame_navigation(
+    events: &[CdpEvent],
     include_preserved: bool,
-) -> Option<&'a CdpEvent> {
+) -> Option<&CdpEvent> {
     let navigations = events
         .iter()
         .filter(|event| {

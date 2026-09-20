@@ -126,12 +126,15 @@ If you touch `npm/`, `package.json`, release scripts, update behavior, binary bo
 
 ```bash
 node --check .github/scripts/npm-oidc-preflight.mjs
+node --check .github/scripts/pr-changelog.mjs
+node --check .github/scripts/pr-changelog.test.mjs
 node --check .github/scripts/verify-npm-provenance.mjs
 node --check npm/moondesk.js
 node --check npm/install-binary.js
 node --check npm/update-manager.js
 node --check .github/scripts/verify-npm-package.mjs
 node --check .github/scripts/verify-managed-browser-manifest.mjs
+node --test .github/scripts/pr-changelog.test.mjs
 node --test npm/install-binary.test.js npm/update-manager.test.js npm/moondesk.test.js
 node .github/scripts/verify-managed-browser-manifest.mjs
 node .github/scripts/verify-npm-package.mjs
@@ -220,13 +223,14 @@ A good MoonDesk PR should:
 
 - explain the user-visible problem or goal;
 - explain the important implementation choice when it is not obvious;
+- include exactly one `## Changelog` section with release-note-quality bullets, or exactly `No user-visible changelog.` for an internal-only change;
 - list the validation performed;
 - call out platform-specific behavior or untested environments;
 - include screenshots/GIFs for meaningful TUI changes when useful;
 - avoid unrelated formatting, dependency, or refactor churn;
 - leave the working tree free of generated artifacts.
 
-Draft PRs intentionally do not run the normal review CI automatically. Mark the PR ready for review when it is ready for the full checks.
+Draft PRs intentionally do not run the normal review CI automatically. Mark the PR ready for review when it is ready for the full checks. Ready-for-review PRs also run a lightweight metadata check that validates the `## Changelog` section, and editing the PR description reruns that check without requiring a code change.
 
 When responding to automated review feedback, verify the finding against the current code before changing anything. Do not apply suggestions mechanically if they would regress existing behavior or conflict with the architecture above.
 
@@ -261,7 +265,7 @@ Maintainers can explicitly override the bump by applying exactly one of:
 - `release:minor`
 - `release:major`
 
-The automated release pipeline validates the merged source, creates a versioned candidate, builds and smoke-tests all supported release targets, creates the GitHub Release/checksums, publishes npm through Trusted Publishing/OIDC, verifies provenance, and performs a fresh-install bootstrap test.
+The automated release pipeline validates the merged source and the merged PR's `## Changelog`, creates a versioned candidate, builds and smoke-tests all supported release targets, renders the GitHub Release notes from that validated changelog, creates/verifies release assets and checksums, publishes npm through Trusted Publishing/OIDC, verifies provenance, and performs a fresh-install bootstrap test.
 
 See [`docs/RELEASING.md`](docs/RELEASING.md) before modifying release automation.
 
@@ -284,6 +288,7 @@ Before requesting review, confirm:
 - [ ] Platform-specific smokes were run where applicable, or the PR states what could not be tested.
 - [ ] No secrets, real workspace URLs, generated binaries, temp profiles, or export artifacts were committed.
 - [ ] README/docs reflect user-visible changes.
+- [ ] The PR has one valid `## Changelog` section, or exactly `No user-visible changelog.` for an internal-only change.
 - [ ] Package versions were not manually bumped for a normal PR.
 
 Thanks for helping make MoonDesk safer, more reliable, and easier to use.

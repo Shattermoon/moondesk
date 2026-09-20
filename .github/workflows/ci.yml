@@ -49,12 +49,15 @@ jobs:
         run: |
           set -euo pipefail
           node --check .github/scripts/npm-oidc-preflight.mjs
+          node --check .github/scripts/pr-changelog.mjs
+          node --check .github/scripts/pr-changelog.test.mjs
           node --check .github/scripts/verify-npm-provenance.mjs
           node --check npm/moondesk.js
           node --check npm/install-binary.js
           node --check npm/update-manager.js
           node --check .github/scripts/verify-npm-package.mjs
           node --check .github/scripts/verify-managed-browser-manifest.mjs
+          node --test .github/scripts/pr-changelog.test.mjs
           node --test npm/install-binary.test.js npm/update-manager.test.js npm/moondesk.test.js
           node .github/scripts/verify-managed-browser-manifest.mjs
           node -e "const p=require('./package.json'); const s=p.scripts||{}; if (s.preinstall||s.install||s.postinstall) process.exit(1)"

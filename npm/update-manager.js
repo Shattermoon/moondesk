@@ -364,11 +364,35 @@ function normalizeChangelogLine(line) {
   return value;
 }
 
+function structuredChangelogLines(body) {
+  const lines = body.split(/\r?\n/);
+  const headingIndex = lines.findIndex((line) => /^ {0,3}##[ \t]+Changelog[ \t]*$/.test(line));
+  if (headingIndex < 0) return null;
+
+  const changelog = [];
+  for (let index = headingIndex + 1; index < lines.length; index += 1) {
+    const line = lines[index];
+    if (/^ {0,3}#{1,2}(?:[ \t]+\S|[ \t]*$)/.test(line)) break;
+    changelog.push(line);
+  }
+  return changelog;
+}
+
 function normalizeReleaseNotes(body) {
   if (typeof body !== "string") return [];
+  const structured = structuredChangelogLines(body);
+  if (
+    structured &&
+    structured.some((line) => line.trim() === "No user-visible changelog.")
+  ) {
+    return [];
+  }
+
   const notes = [];
   const seen = new Set();
-  for (const line of body.split(/\r?\n/)) {
+  const lines = structured ?? body.split(/\r?\n/);
+  for (const line of lines) {
+    if (structured && !/^ {0,3}[-*+][ \t]+\S/.test(line)) continue;
     const note = normalizeChangelogLine(line);
     if (!note || seen.has(note)) continue;
     seen.add(note);

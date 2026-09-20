@@ -7975,7 +7975,7 @@ mod tests {
                 "navigate_page",
                 json!({
                     "type": "url",
-                    "url": "data:text/html,<input aria-label='first'><input aria-label='second'><select aria-label='choice'><option value='one'>One</option><option value='two'>Two label</option></select><input aria-label='check' type='checkbox'><input aria-label='radio' type='radio' name='choice-radio'><div id='status'>waiting</div><script>setTimeout(()=>document.getElementById('status').textContent='ready-text',300)</script>",
+                    "url": "data:text/html,<input aria-label='first'><input aria-label='second'><select aria-label='choice'><option value='one'>One</option><option value='two'>Two label</option></select><input aria-label='check' type='checkbox'><input aria-label='radio' type='radio' name='choice-radio'><button aria-label='manual-dialog' onclick=\"window.manualDialogResult=prompt('manual-dialog','default')\">Dialog</button><button aria-label='hover-target' onmouseenter=\"window.hovered=true\">Hover</button><button aria-label='drag-source' onmousedown=\"window.dragStarted=true\">Drag source</button><button aria-label='drag-target' style='margin-left:120px' onmousemove=\"if(event.buttons===1)window.dragged=true\" onmouseup=\"window.dragEnded=true\">Drag target</button><input aria-label='keyboard-dialog' onkeydown=\"if(event.key==='Enter')window.keyboardDialogResult=prompt('keyboard-dialog','default')\"><input aria-label='type-dialog' oninput=\"if(this.value==='dialog')window.typeDialogResult=prompt('type-dialog','default')\"><div id='status'>waiting</div><script>setTimeout(()=>document.getElementById('status').textContent='ready-text',300)</script>",
                     "timeout": 5_000,
                     "handleBeforeUnload": "accept"
                 }),
@@ -8029,6 +8029,12 @@ mod tests {
         let choice_uid = uid_for("choice");
         let check_uid = uid_for("check");
         let radio_uid = uid_for("radio");
+        let manual_dialog_uid = uid_for("manual-dialog");
+        let hover_uid = uid_for("hover-target");
+        let drag_source_uid = uid_for("drag-source");
+        let drag_target_uid = uid_for("drag-target");
+        let keyboard_dialog_uid = uid_for("keyboard-dialog");
+        let type_dialog_uid = uid_for("type-dialog");
 
         let element_argument = handle_tools_call(
             &tool_call_request(
@@ -8051,6 +8057,301 @@ mod tests {
             element_argument_stdout.contains("\"tag\":\"INPUT\"")
                 && element_argument_stdout.contains("\"label\":\"first\""),
             "evaluate_script args must resolve snapshot UIDs to DOM elements: {element_argument_stdout}"
+        );
+
+        let dialog_click = handle_tools_call(
+            &tool_call_request("click", json!({ "uid": manual_dialog_uid })),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        assert_ne!(
+            dialog_click
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true),
+            "click that opens a dialog must return without invalidating the browser: {}",
+            result_text(&dialog_click)
+        );
+
+        let handled_dialog = handle_tools_call(
+            &tool_call_request(
+                "handle_dialog",
+                json!({ "action": "accept", "promptText": "manual-ok" }),
+            ),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        assert_ne!(
+            handled_dialog
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true),
+            "handle_dialog should accept the dialog opened by click: {}",
+            result_text(&handled_dialog)
+        );
+
+        let manual_dialog_result = handle_tools_call(
+            &tool_call_request(
+                "evaluate_script",
+                json!({ "function": "() => window.manualDialogResult" }),
+            ),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        assert!(
+            browser_stdout(&manual_dialog_result).contains("manual-ok"),
+            "prompt result should reflect handle_dialog input: {}",
+            browser_stdout(&manual_dialog_result)
+        );
+
+        let hovered = handle_tools_call(
+            &tool_call_request("hover", json!({ "uid": hover_uid })),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        assert_ne!(
+            hovered
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true),
+            "hover should complete in Chromium: {}",
+            result_text(&hovered)
+        );
+        let hover_state = handle_tools_call(
+            &tool_call_request(
+                "evaluate_script",
+                json!({ "function": "() => window.hovered === true" }),
+            ),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        assert!(
+            browser_stdout(&hover_state).contains("true"),
+            "hover must dispatch a real mouse-enter path: {}",
+            browser_stdout(&hover_state)
+        );
+
+        let dragged = handle_tools_call(
+            &tool_call_request(
+                "drag",
+                json!({
+                    "from_uid": drag_source_uid,
+                    "to_uid": drag_target_uid
+                }),
+            ),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        assert_ne!(
+            dragged
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true),
+            "drag should complete in Chromium: {}",
+            result_text(&dragged)
+        );
+        let drag_state = handle_tools_call(
+            &tool_call_request(
+                "evaluate_script",
+                json!({ "function": "() => ({ started: !!window.dragStarted, moved: !!window.dragged, ended: !!window.dragEnded })" }),
+            ),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        let drag_state_stdout = browser_stdout(&drag_state);
+        assert!(
+            drag_state_stdout.contains("\"started\":true")
+                && drag_state_stdout.contains("\"moved\":true")
+                && drag_state_stdout.contains("\"ended\":true"),
+            "drag must deliver pressed movement and release to the target: {drag_state_stdout}"
+        );
+
+        let keyboard_focus = handle_tools_call(
+            &tool_call_request("click", json!({ "uid": keyboard_dialog_uid })),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        assert_ne!(
+            keyboard_focus
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true),
+            "keyboard fixture focus click should succeed"
+        );
+        let keyboard_prompt = handle_tools_call(
+            &tool_call_request("press_key", json!({ "key": "ENTER" })),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        assert_ne!(
+            keyboard_prompt
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true),
+            "press_key that opens a dialog must return cleanly: {}",
+            result_text(&keyboard_prompt)
+        );
+        let handled_keyboard_prompt = handle_tools_call(
+            &tool_call_request(
+                "handle_dialog",
+                json!({ "action": "accept", "promptText": "keyboard-ok" }),
+            ),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        assert_ne!(
+            handled_keyboard_prompt
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true),
+            "keyboard dialog should be handleable: {}",
+            result_text(&handled_keyboard_prompt)
+        );
+
+        let type_focus = handle_tools_call(
+            &tool_call_request("click", json!({ "uid": type_dialog_uid })),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        assert_ne!(
+            type_focus
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true),
+            "type fixture focus click should succeed"
+        );
+        let type_prompt = handle_tools_call(
+            &tool_call_request("type_text", json!({ "text": "dialog" })),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        assert_ne!(
+            type_prompt
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true),
+            "type_text that opens a dialog must return cleanly: {}",
+            result_text(&type_prompt)
+        );
+        let handled_type_prompt = handle_tools_call(
+            &tool_call_request(
+                "handle_dialog",
+                json!({ "action": "accept", "promptText": "type-ok" }),
+            ),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        assert_ne!(
+            handled_type_prompt
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true),
+            "type_text dialog should be handleable: {}",
+            result_text(&handled_type_prompt)
+        );
+        let dialog_input_state = handle_tools_call(
+            &tool_call_request(
+                "evaluate_script",
+                json!({ "function": "() => ({ keyboard: window.keyboardDialogResult, typed: window.typeDialogResult })" }),
+            ),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        let dialog_input_stdout = browser_stdout(&dialog_input_state);
+        assert!(
+            dialog_input_stdout.contains("\"keyboard\":\"keyboard-ok\"")
+                && dialog_input_stdout.contains("\"typed\":\"type-ok\""),
+            "keyboard/text dialog results were not preserved: {dialog_input_stdout}"
         );
 
         let emitted_warning = handle_tools_call(

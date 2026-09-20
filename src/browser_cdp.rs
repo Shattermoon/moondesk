@@ -1666,6 +1666,56 @@ impl BrowserCdpTransport {
         })
     }
 
+    async fn dispatch_input_sequence(
+        &self,
+        session_id: &str,
+        calls: Vec<(&'static str, Value)>,
+        deadline: tokio::time::Instant,
+    ) -> Result<bool, BrowserTransportError> {
+        let baseline_event_id = self
+            .connection
+            .events_for_session(session_id)
+            .await
+            .last()
+            .map(|event| event.id)
+            .unwrap_or(0);
+        let connection = self.connection.clone();
+        let owned_session_id = session_id.to_string();
+        let mut task = tokio::spawn(async move {
+            for (method, params) in calls {
+                connection
+                    .call(method, params, Some(&owned_session_id), deadline)
+                    .await?;
+            }
+            Ok::<(), BrowserTransportError>(())
+        });
+
+        loop {
+            tokio::select! {
+                result = &mut task => {
+                    return match result {
+                        Ok(result) => {
+                            result?;
+                            Ok(false)
+                        }
+                        Err(error) => Err(BrowserTransportError::Protocol(format!(
+                            "Browser input dispatch task failed: {error}"
+                        ))),
+                    };
+                }
+                _ = tokio::time::sleep(Duration::from_millis(10)) => {
+                    let events = self.connection.events_for_session(session_id).await;
+                    if events.iter().any(|event| {
+                        event.id > baseline_event_id
+                            && event.method == "Page.javascriptDialogOpening"
+                    }) {
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+    }
+
     async fn dispatch_click(
         &self,
         session_id: &str,
@@ -1673,46 +1723,40 @@ impl BrowserCdpTransport {
         y: f64,
         click_count: u64,
         deadline: tokio::time::Instant,
-    ) -> Result<(), BrowserTransportError> {
-        self.connection
-            .call(
-                "Input.dispatchMouseEvent",
-                json!({ "type": "mouseMoved", "x": x, "y": y }),
-                Some(session_id),
-                deadline,
-            )
-            .await?;
-        self.connection
-            .call(
-                "Input.dispatchMouseEvent",
-                json!({
-                    "type": "mousePressed",
-                    "x": x,
-                    "y": y,
-                    "button": "left",
-                    "buttons": 1,
-                    "clickCount": click_count,
-                }),
-                Some(session_id),
-                deadline,
-            )
-            .await?;
-        self.connection
-            .call(
-                "Input.dispatchMouseEvent",
-                json!({
-                    "type": "mouseReleased",
-                    "x": x,
-                    "y": y,
-                    "button": "left",
-                    "buttons": 0,
-                    "clickCount": click_count,
-                }),
-                Some(session_id),
-                deadline,
-            )
-            .await?;
-        Ok(())
+    ) -> Result<bool, BrowserTransportError> {
+        self.dispatch_input_sequence(
+            session_id,
+            vec![
+                (
+                    "Input.dispatchMouseEvent",
+                    json!({ "type": "mouseMoved", "x": x, "y": y }),
+                ),
+                (
+                    "Input.dispatchMouseEvent",
+                    json!({
+                        "type": "mousePressed",
+                        "x": x,
+                        "y": y,
+                        "button": "left",
+                        "buttons": 1,
+                        "clickCount": click_count,
+                    }),
+                ),
+                (
+                    "Input.dispatchMouseEvent",
+                    json!({
+                        "type": "mouseReleased",
+                        "x": x,
+                        "y": y,
+                        "button": "left",
+                        "buttons": 0,
+                        "clickCount": click_count,
+                    }),
+                ),
+            ],
+            deadline,
+        )
+        .await
     }
 
     async fn click_element(
@@ -1733,13 +1777,21 @@ impl BrowserCdpTransport {
         } else {
             1
         };
-        self.dispatch_click(&session_id, x, y, click_count, deadline)
+        let dialog_opened = self
+            .dispatch_click(&session_id, x, y, click_count, deadline)
             .await?;
-        let mut result = tool_success_text(format!("Clicked element {uid}."));
-        if arguments
-            .get("includeSnapshot")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
+        let mut result = if dialog_opened {
+            tool_success_text(format!(
+                "Clicked element {uid}. A browser dialog opened; use handle_dialog to continue."
+            ))
+        } else {
+            tool_success_text(format!("Clicked element {uid}."))
+        };
+        if !dialog_opened
+            && arguments
+                .get("includeSnapshot")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
         {
             let snapshot = self.take_snapshot(arguments, deadline).await?;
             append_tool_content(&mut result, &snapshot);
@@ -1765,13 +1817,21 @@ impl BrowserCdpTransport {
         } else {
             1
         };
-        self.dispatch_click(&session_id, x, y, click_count, deadline)
+        let dialog_opened = self
+            .dispatch_click(&session_id, x, y, click_count, deadline)
             .await?;
-        let mut result = tool_success_text(format!("Clicked at ({x}, {y})."));
-        if arguments
-            .get("includeSnapshot")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
+        let mut result = if dialog_opened {
+            tool_success_text(format!(
+                "Clicked at ({x}, {y}). A browser dialog opened; use handle_dialog to continue."
+            ))
+        } else {
+            tool_success_text(format!("Clicked at ({x}, {y})."))
+        };
+        if !dialog_opened
+            && arguments
+                .get("includeSnapshot")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
         {
             let snapshot = self.take_snapshot(arguments, deadline).await?;
             append_tool_content(&mut result, &snapshot);
@@ -1999,19 +2059,28 @@ impl BrowserCdpTransport {
         let uid = required_str(arguments, "uid")?;
         let (x, y) = self.element_center(page_id, uid, deadline).await?;
         let session_id = self.ensure_page_session(page_id, deadline).await?;
-        self.connection
-            .call(
-                "Input.dispatchMouseEvent",
-                json!({ "type": "mouseMoved", "x": x, "y": y }),
-                Some(&session_id),
+        let dialog_opened = self
+            .dispatch_input_sequence(
+                &session_id,
+                vec![(
+                    "Input.dispatchMouseEvent",
+                    json!({ "type": "mouseMoved", "x": x, "y": y }),
+                )],
                 deadline,
             )
             .await?;
-        let mut result = tool_success_text(format!("Hovered element {uid}."));
-        if arguments
-            .get("includeSnapshot")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
+        let mut result = if dialog_opened {
+            tool_success_text(format!(
+                "Hovered element {uid}. A browser dialog opened; use handle_dialog to continue."
+            ))
+        } else {
+            tool_success_text(format!("Hovered element {uid}."))
+        };
+        if !dialog_opened
+            && arguments
+                .get("includeSnapshot")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
         {
             let snapshot = self.take_snapshot(arguments, deadline).await?;
             append_tool_content(&mut result, &snapshot);
@@ -2030,16 +2099,12 @@ impl BrowserCdpTransport {
         let (from_x, from_y) = self.element_center(page_id, from_uid, deadline).await?;
         let (to_x, to_y) = self.element_center(page_id, to_uid, deadline).await?;
         let session_id = self.ensure_page_session(page_id, deadline).await?;
-        self.connection
-            .call(
+        let mut calls = vec![
+            (
                 "Input.dispatchMouseEvent",
                 json!({ "type": "mouseMoved", "x": from_x, "y": from_y }),
-                Some(&session_id),
-                deadline,
-            )
-            .await?;
-        self.connection
-            .call(
+            ),
+            (
                 "Input.dispatchMouseEvent",
                 json!({
                     "type": "mousePressed",
@@ -2048,48 +2113,48 @@ impl BrowserCdpTransport {
                     "button": "left",
                     "buttons": 1,
                 }),
-                Some(&session_id),
-                deadline,
-            )
-            .await?;
+            ),
+        ];
         for step in 1..=4 {
             let t = f64::from(step) / 4.0;
             let x = from_x + ((to_x - from_x) * t);
             let y = from_y + ((to_y - from_y) * t);
-            self.connection
-                .call(
-                    "Input.dispatchMouseEvent",
-                    json!({
-                        "type": "mouseMoved",
-                        "x": x,
-                        "y": y,
-                        "button": "left",
-                        "buttons": 1,
-                    }),
-                    Some(&session_id),
-                    deadline,
-                )
-                .await?;
-        }
-        self.connection
-            .call(
+            calls.push((
                 "Input.dispatchMouseEvent",
                 json!({
-                    "type": "mouseReleased",
-                    "x": to_x,
-                    "y": to_y,
+                    "type": "mouseMoved",
+                    "x": x,
+                    "y": y,
                     "button": "left",
-                    "buttons": 0,
+                    "buttons": 1,
                 }),
-                Some(&session_id),
-                deadline,
-            )
+            ));
+        }
+        calls.push((
+            "Input.dispatchMouseEvent",
+            json!({
+                "type": "mouseReleased",
+                "x": to_x,
+                "y": to_y,
+                "button": "left",
+                "buttons": 0,
+            }),
+        ));
+        let dialog_opened = self
+            .dispatch_input_sequence(&session_id, calls, deadline)
             .await?;
-        let mut result = tool_success_text(format!("Dragged {from_uid} to {to_uid}."));
-        if arguments
-            .get("includeSnapshot")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
+        let mut result = if dialog_opened {
+            tool_success_text(format!(
+                "Dragged {from_uid} toward {to_uid}. A browser dialog opened; use handle_dialog to continue."
+            ))
+        } else {
+            tool_success_text(format!("Dragged {from_uid} to {to_uid}."))
+        };
+        if !dialog_opened
+            && arguments
+                .get("includeSnapshot")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
         {
             let snapshot = self.take_snapshot(arguments, deadline).await?;
             append_tool_content(&mut result, &snapshot);
@@ -2428,16 +2493,24 @@ impl BrowserCdpTransport {
         let page_id = self.page_id_from_arguments(arguments).await?;
         let session_id = self.ensure_page_session(page_id, deadline).await?;
         let text = required_str(arguments, "text")?;
-        self.connection
-            .call(
-                "Input.insertText",
-                json!({ "text": text }),
-                Some(&session_id),
+        let text_dialog_opened = self
+            .dispatch_input_sequence(
+                &session_id,
+                vec![("Input.insertText", json!({ "text": text }))],
                 deadline,
             )
             .await?;
-        if let Some(key) = arguments.get("submitKey").and_then(Value::as_str) {
-            self.dispatch_key(&session_id, key, deadline).await?;
+        if text_dialog_opened {
+            return Ok(tool_success_text(
+                "Typed text. A browser dialog opened; use handle_dialog to continue.".to_string(),
+            ));
+        }
+        if let Some(key) = arguments.get("submitKey").and_then(Value::as_str)
+            && self.dispatch_key(&session_id, key, deadline).await?
+        {
+            return Ok(tool_success_text(format!(
+                "Typed text and submitted {key}. A browser dialog opened; use handle_dialog to continue."
+            )));
         }
         Ok(tool_success_text("Typed text.".to_string()))
     }
@@ -2450,12 +2523,19 @@ impl BrowserCdpTransport {
         let page_id = self.page_id_from_arguments(arguments).await?;
         let session_id = self.ensure_page_session(page_id, deadline).await?;
         let key = required_str(arguments, "key")?;
-        self.dispatch_key(&session_id, key, deadline).await?;
-        let mut result = tool_success_text(format!("Pressed {key}."));
-        if arguments
-            .get("includeSnapshot")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
+        let dialog_opened = self.dispatch_key(&session_id, key, deadline).await?;
+        let mut result = if dialog_opened {
+            tool_success_text(format!(
+                "Pressed {key}. A browser dialog opened; use handle_dialog to continue."
+            ))
+        } else {
+            tool_success_text(format!("Pressed {key}."))
+        };
+        if !dialog_opened
+            && arguments
+                .get("includeSnapshot")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
         {
             let snapshot = self.take_snapshot(arguments, deadline).await?;
             append_tool_content(&mut result, &snapshot);
@@ -2468,7 +2548,7 @@ impl BrowserCdpTransport {
         session_id: &str,
         raw_key: &str,
         deadline: tokio::time::Instant,
-    ) -> Result<(), BrowserTransportError> {
+    ) -> Result<bool, BrowserTransportError> {
         let parsed = ParsedKey::parse(raw_key)?;
         let mut down = json!({
             "type": "rawKeyDown",
@@ -2484,25 +2564,25 @@ impl BrowserCdpTransport {
             down["text"] = Value::String(text.clone());
             down["unmodifiedText"] = Value::String(text);
         }
-        self.connection
-            .call("Input.dispatchKeyEvent", down, Some(session_id), deadline)
-            .await?;
-        self.connection
-            .call(
-                "Input.dispatchKeyEvent",
-                json!({
-                    "type": "keyUp",
-                    "key": parsed.key,
-                    "code": parsed.code,
-                    "modifiers": parsed.modifiers,
-                    "windowsVirtualKeyCode": parsed.windows_virtual_key_code.unwrap_or(0),
-                    "nativeVirtualKeyCode": parsed.windows_virtual_key_code.unwrap_or(0),
-                }),
-                Some(session_id),
-                deadline,
-            )
-            .await?;
-        Ok(())
+        self.dispatch_input_sequence(
+            session_id,
+            vec![
+                ("Input.dispatchKeyEvent", down),
+                (
+                    "Input.dispatchKeyEvent",
+                    json!({
+                        "type": "keyUp",
+                        "key": parsed.key,
+                        "code": parsed.code,
+                        "modifiers": parsed.modifiers,
+                        "windowsVirtualKeyCode": parsed.windows_virtual_key_code.unwrap_or(0),
+                        "nativeVirtualKeyCode": parsed.windows_virtual_key_code.unwrap_or(0),
+                    }),
+                ),
+            ],
+            deadline,
+        )
+        .await
     }
 
     async fn scroll(
@@ -2532,20 +2612,28 @@ impl BrowserCdpTransport {
             .and_then(Value::as_f64)
             .map(|height| height / 2.0)
             .unwrap_or(0.0);
-        self.connection
-            .call(
-                "Input.dispatchMouseEvent",
-                json!({
-                    "type": "mouseWheel",
-                    "x": x,
-                    "y": y,
-                    "deltaX": delta_x,
-                    "deltaY": delta_y,
-                }),
-                Some(&session_id),
+        let dialog_opened = self
+            .dispatch_input_sequence(
+                &session_id,
+                vec![(
+                    "Input.dispatchMouseEvent",
+                    json!({
+                        "type": "mouseWheel",
+                        "x": x,
+                        "y": y,
+                        "deltaX": delta_x,
+                        "deltaY": delta_y,
+                    }),
+                )],
                 deadline,
             )
             .await?;
+        if dialog_opened {
+            return Ok(tool_success_text(
+                "Scrolled the page. A browser dialog opened; use handle_dialog to continue."
+                    .to_string(),
+            ));
+        }
         let initial_x = metrics.get("x").and_then(Value::as_f64).unwrap_or(0.0);
         let initial_y = metrics.get("y").and_then(Value::as_f64).unwrap_or(0.0);
         let settle_deadline = std::cmp::min(

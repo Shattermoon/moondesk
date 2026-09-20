@@ -1183,6 +1183,94 @@ impl BrowserCdpTransport {
         Ok(page_id)
     }
 
+    async fn handle_active_javascript_dialog(
+        &self,
+        session_id: &str,
+        dialog_action: Option<&str>,
+        last_handled_dialog_id: &mut u64,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), BrowserTransportError> {
+        let events = self.connection.events_for_session(session_id).await;
+        let mut active_dialog_id = None;
+        for event in &events {
+            match event.method.as_str() {
+                "Page.javascriptDialogOpening" => active_dialog_id = Some(event.id),
+                "Page.javascriptDialogClosed" => active_dialog_id = None,
+                _ => {}
+            }
+        }
+        let Some(dialog_id) = active_dialog_id else {
+            return Ok(());
+        };
+        if dialog_id <= *last_handled_dialog_id {
+            return Ok(());
+        }
+
+        let action = dialog_action.unwrap_or("accept");
+        let mut response = json!({ "accept": action != "dismiss" });
+        if !matches!(action, "accept" | "dismiss") {
+            response["promptText"] = Value::String(action.to_string());
+        }
+        self.connection
+            .call(
+                "Page.handleJavaScriptDialog",
+                response,
+                Some(session_id),
+                deadline,
+            )
+            .await?;
+        *last_handled_dialog_id = dialog_id;
+        Ok(())
+    }
+
+    async fn call_with_dialog_handling(
+        &self,
+        method: &str,
+        params: Value,
+        session_id: &str,
+        dialog_action: Option<&str>,
+        deadline: tokio::time::Instant,
+    ) -> Result<Value, BrowserTransportError> {
+        let mut last_handled_dialog_id = 0;
+        self.handle_active_javascript_dialog(
+            session_id,
+            dialog_action,
+            &mut last_handled_dialog_id,
+            deadline,
+        )
+        .await?;
+
+        let call = self
+            .connection
+            .call(method, params, Some(session_id), deadline);
+        tokio::pin!(call);
+
+        loop {
+            tokio::select! {
+                result = &mut call => {
+                    let result = result?;
+                    self.handle_active_javascript_dialog(
+                        session_id,
+                        dialog_action,
+                        &mut last_handled_dialog_id,
+                        deadline,
+                    )
+                    .await?;
+                    return Ok(result);
+                }
+                _ = tokio::time::sleep(Duration::from_millis(10)) => {
+                    self.handle_active_javascript_dialog(
+                        session_id,
+                        dialog_action,
+                        &mut last_handled_dialog_id,
+                        deadline,
+                    )
+                    .await?;
+                }
+            }
+        }
+    }
+
     async fn navigate_page(
         &self,
         arguments: &Value,
@@ -1194,6 +1282,10 @@ impl BrowserCdpTransport {
             .get("type")
             .and_then(Value::as_str)
             .unwrap_or("url");
+        let beforeunload_action = arguments
+            .get("handleBeforeUnload")
+            .and_then(Value::as_str)
+            .unwrap_or("accept");
         if navigation_type != "url" && arguments.get("initScript").is_some() {
             return Ok(tool_error(
                 "initScript is only supported for URL navigation".to_string(),
@@ -1218,11 +1310,11 @@ impl BrowserCdpTransport {
             "url" => {
                 let url = required_str(arguments, "url")?;
                 let result = self
-                    .connection
-                    .call(
+                    .call_with_dialog_handling(
                         "Page.navigate",
                         json!({ "url": url }),
-                        Some(&session_id),
+                        &session_id,
+                        Some(beforeunload_action),
                         deadline,
                     )
                     .await?;
@@ -1242,19 +1334,19 @@ impl BrowserCdpTransport {
                 }
             }
             "reload" => {
-                self.connection
-                    .call(
-                        "Page.reload",
-                        json!({
-                            "ignoreCache": arguments
-                                .get("ignoreCache")
-                                .and_then(Value::as_bool)
-                                .unwrap_or(false)
-                        }),
-                        Some(&session_id),
-                        deadline,
-                    )
-                    .await?;
+                self.call_with_dialog_handling(
+                    "Page.reload",
+                    json!({
+                        "ignoreCache": arguments
+                            .get("ignoreCache")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false)
+                    }),
+                    &session_id,
+                    Some(beforeunload_action),
+                    deadline,
+                )
+                .await?;
             }
             "back" | "forward" => {
                 let history = self
@@ -1290,14 +1382,14 @@ impl BrowserCdpTransport {
                         "No navigation history entry is available".to_string(),
                     ));
                 };
-                self.connection
-                    .call(
-                        "Page.navigateToHistoryEntry",
-                        json!({ "entryId": entry_id }),
-                        Some(&session_id),
-                        deadline,
-                    )
-                    .await?;
+                self.call_with_dialog_handling(
+                    "Page.navigateToHistoryEntry",
+                    json!({ "entryId": entry_id }),
+                    &session_id,
+                    Some(beforeunload_action),
+                    deadline,
+                )
+                .await?;
             }
             other => {
                 return Ok(tool_error(format!(
@@ -1305,7 +1397,8 @@ impl BrowserCdpTransport {
                 )));
             }
         }
-        self.wait_document_ready(&session_id, deadline).await?;
+        self.wait_document_ready(&session_id, Some(beforeunload_action), deadline)
+            .await?;
         if let Some(identifier) = init_script_id.as_deref() {
             self.connection
                 .call(
@@ -1323,6 +1416,7 @@ impl BrowserCdpTransport {
     async fn wait_document_ready(
         &self,
         session_id: &str,
+        dialog_action: Option<&str>,
         deadline: tokio::time::Instant,
     ) -> Result<(), BrowserTransportError> {
         loop {
@@ -1330,14 +1424,14 @@ impl BrowserCdpTransport {
                 return Err(BrowserTransportError::Timeout);
             }
             let result = self
-                .connection
-                .call(
+                .call_with_dialog_handling(
                     "Runtime.evaluate",
                     json!({
                         "expression": "document.readyState",
                         "returnByValue": true,
                     }),
-                    Some(session_id),
+                    session_id,
+                    dialog_action,
                     deadline,
                 )
                 .await?;
@@ -2032,6 +2126,7 @@ impl BrowserCdpTransport {
         let page_id = self.page_id_from_arguments(arguments).await?;
         let session_id = self.ensure_page_session(page_id, deadline).await?;
         let function = required_str(arguments, "function")?;
+        let dialog_action = arguments.get("dialogAction").and_then(Value::as_str);
         let element_uids = arguments
             .get("args")
             .and_then(Value::as_array)
@@ -2040,8 +2135,31 @@ impl BrowserCdpTransport {
 
         let value = if element_uids.is_empty() {
             let expression = format!("({function})()");
-            self.evaluate_value(&session_id, &expression, deadline)
-                .await?
+            let called = self
+                .call_with_dialog_handling(
+                    "Runtime.evaluate",
+                    json!({
+                        "expression": expression,
+                        "awaitPromise": true,
+                        "returnByValue": true,
+                        "userGesture": true,
+                    }),
+                    &session_id,
+                    dialog_action,
+                    deadline,
+                )
+                .await?;
+            if let Some(exception) = called.get("exceptionDetails") {
+                let message = exception
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .unwrap_or("JavaScript evaluation failed");
+                return Err(BrowserTransportError::Protocol(message.to_string()));
+            }
+            called
+                .pointer("/result/value")
+                .cloned()
+                .unwrap_or(Value::Null)
         } else {
             let mut object_ids = Vec::with_capacity(element_uids.len());
             for (index, uid) in element_uids.iter().enumerate() {
@@ -2087,8 +2205,7 @@ impl BrowserCdpTransport {
             let function_declaration =
                 format!("function(...args){{ return ({function})(...args); }}");
             let called = self
-                .connection
-                .call(
+                .call_with_dialog_handling(
                     "Runtime.callFunctionOn",
                     json!({
                         "objectId": object_ids[0],
@@ -2098,7 +2215,8 @@ impl BrowserCdpTransport {
                         "returnByValue": true,
                         "userGesture": true,
                     }),
-                    Some(&session_id),
+                    &session_id,
+                    dialog_action,
                     deadline,
                 )
                 .await;
@@ -3324,7 +3442,7 @@ impl BrowserCdpTransport {
                 *self.trace.lock().await = None;
                 return Err(error);
             }
-            if let Err(error) = self.wait_document_ready(&session_id, deadline).await {
+            if let Err(error) = self.wait_document_ready(&session_id, None, deadline).await {
                 let _ = self
                     .connection
                     .call("Tracing.end", json!({}), None, deadline)

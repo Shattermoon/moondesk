@@ -128,6 +128,11 @@
         "name": "filePath",
         "type": "string",
         "required": false
+      },
+      {
+        "name": "dialogAction",
+        "type": "string",
+        "required": false
       }
     ],
     "fill": [
@@ -270,6 +275,15 @@
         "name": "initScript",
         "type": "string",
         "required": false
+      },
+      {
+        "name": "handleBeforeUnload",
+        "type": "string",
+        "required": false,
+        "enum": [
+          "accept",
+          "dismiss"
+        ]
       }
     ],
     "new_page": [

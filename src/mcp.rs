@@ -4431,26 +4431,6 @@ fn normalize_connector_browser_arguments(
         );
     }
 
-    if command == "navigate_page"
-        && let Some(value) = object.remove("handleBeforeUnload")
-    {
-        match value.as_str() {
-            Some("accept") => {}
-            Some("dismiss") => {
-                return Err(
-                    "navigate_page handleBeforeUnload='dismiss' is not supported by MoonDesk's managed browser; use handle_dialog when explicit dialog control is required"
-                        .to_string(),
-                );
-            }
-            _ => {
-                return Err(
-                    "navigate_page handleBeforeUnload must be either 'accept' or 'dismiss'"
-                        .to_string(),
-                );
-            }
-        }
-    }
-
     if command == "take_screenshot" && !object.contains_key("format") {
         object.insert("format".to_string(), Value::String("jpeg".to_string()));
     }
@@ -7555,14 +7535,23 @@ mod tests {
         .expect("normalize connector navigation compatibility arguments");
         assert_eq!(navigate_timeout, Some(1_250));
         assert!(navigate_args.get("timeout").is_none());
-        assert!(navigate_args.get("handleBeforeUnload").is_none());
-        assert!(
-            normalize_connector_browser_arguments(
-                "navigate_page",
-                json!({ "type": "reload", "handleBeforeUnload": "dismiss" })
-            )
-            .expect_err("unsupported beforeunload dismissal must be explicit")
-            .contains("not supported")
+        assert_eq!(
+            navigate_args
+                .get("handleBeforeUnload")
+                .and_then(Value::as_str),
+            Some("accept")
+        );
+        let (dismiss_args, dismiss_timeout) = normalize_connector_browser_arguments(
+            "navigate_page",
+            json!({ "type": "reload", "handleBeforeUnload": "dismiss" }),
+        )
+        .expect("beforeunload dismissal should reach the native CDP handler");
+        assert_eq!(dismiss_timeout, None);
+        assert_eq!(
+            dismiss_args
+                .get("handleBeforeUnload")
+                .and_then(Value::as_str),
+            Some("dismiss")
         );
 
         let (screenshot_args, screenshot_timeout) =
@@ -8049,6 +8038,93 @@ mod tests {
             "evaluate_script args must resolve snapshot UIDs to DOM elements: {element_argument_stdout}"
         );
 
+        let default_dialog = handle_tools_call(
+            &tool_call_request(
+                "evaluate_script",
+                json!({
+                    "function": "() => { alert('native-default-dialog'); return 'after-alert'; }"
+                }),
+            ),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        assert!(
+            browser_stdout(&default_dialog).contains("after-alert"),
+            "evaluate_script should accept dialogs by default: {}",
+            browser_stdout(&default_dialog)
+        );
+
+        let prompt_dialog = handle_tools_call(
+            &tool_call_request(
+                "evaluate_script",
+                json!({
+                    "function": "() => prompt('native-prompt', 'default')",
+                    "dialogAction": "typed-by-native"
+                }),
+            ),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        assert!(
+            browser_stdout(&prompt_dialog).contains("typed-by-native"),
+            "evaluate_script prompt text was not delivered: {}",
+            browser_stdout(&prompt_dialog)
+        );
+
+        let dismissed_dialog = handle_tools_call(
+            &tool_call_request(
+                "evaluate_script",
+                json!({
+                    "function": "() => confirm('native-dismiss')",
+                    "dialogAction": "dismiss"
+                }),
+            ),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        assert!(
+            browser_stdout(&dismissed_dialog).contains("false"),
+            "evaluate_script dialog dismissal was not observed: {}",
+            browser_stdout(&dismissed_dialog)
+        );
+
+        let accepted_dialog = handle_tools_call(
+            &tool_call_request(
+                "evaluate_script",
+                json!({
+                    "function": "() => confirm('native-accept')",
+                    "dialogAction": "accept"
+                }),
+            ),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        assert!(
+            browser_stdout(&accepted_dialog).contains("true"),
+            "evaluate_script dialog acceptance was not observed: {}",
+            browser_stdout(&accepted_dialog)
+        );
+
         let filled = handle_tools_call(
             &tool_call_request(
                 "fill_form",
@@ -8362,6 +8438,142 @@ mod tests {
                 .and_then(Value::as_bool),
             Some(false),
             "ordinary wait timeout must not restart the shared browser runtime"
+        );
+
+        let beforeunload_page = handle_tools_call(
+            &tool_call_request(
+                "navigate_page",
+                json!({
+                    "type": "url",
+                    "url": "data:text/html,<button aria-label='arm' onclick=\"window.onbeforeunload=()=>'';document.title='armed'\">Arm</button>",
+                    "timeout": 5_000
+                }),
+            ),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        assert_ne!(
+            beforeunload_page
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true),
+            "beforeunload fixture navigation should succeed: {}",
+            result_text(&beforeunload_page)
+        );
+        let beforeunload_snapshot = handle_tools_call(
+            &tool_call_request("take_snapshot", json!({})),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        let arm_uid = browser_stdout(&beforeunload_snapshot)
+            .lines()
+            .find(|line| line.contains("button \"arm\""))
+            .and_then(|line| line.trim().strip_prefix("uid="))
+            .and_then(|line| line.split_whitespace().next())
+            .expect("beforeunload arm button uid")
+            .to_string();
+        let armed = handle_tools_call(
+            &tool_call_request("click", json!({ "uid": arm_uid })),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        assert_ne!(
+            armed
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true),
+            "arming beforeunload should succeed"
+        );
+
+        let dismissed_navigation = handle_tools_call(
+            &tool_call_request(
+                "navigate_page",
+                json!({
+                    "type": "url",
+                    "url": "data:text/html,<title>dismiss-target</title>dismiss-target",
+                    "handleBeforeUnload": "dismiss",
+                    "timeout": 5_000
+                }),
+            ),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        assert!(
+            result_text(&dismissed_navigation).contains("Navigation failed")
+                || result_text(&dismissed_navigation).contains("ERR_ABORTED"),
+            "dismissing beforeunload should abort navigation cleanly: {}",
+            result_text(&dismissed_navigation)
+        );
+        let after_dismiss = handle_tools_call(
+            &tool_call_request(
+                "evaluate_script",
+                json!({ "function": "() => document.title" }),
+            ),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        assert!(
+            browser_stdout(&after_dismiss).contains("armed"),
+            "dismissed beforeunload should keep the original page: {}",
+            browser_stdout(&after_dismiss)
+        );
+
+        let accepted_navigation = handle_tools_call(
+            &tool_call_request(
+                "navigate_page",
+                json!({
+                    "type": "url",
+                    "url": "data:text/html,<title>accepted-target</title>accepted-target",
+                    "handleBeforeUnload": "accept",
+                    "timeout": 5_000
+                }),
+            ),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        assert_ne!(
+            accepted_navigation
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true),
+            "accepting beforeunload should allow navigation: {}",
+            result_text(&accepted_navigation)
         );
 
         let navigate = runtime

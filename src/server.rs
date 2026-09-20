@@ -1975,17 +1975,34 @@ mod tests {
 <label>Name <input id="name" placeholder="Type here"></label>
 <button id="toggle" type="button">Toggle state</button><strong id="state">OFF</strong>
 <label>Upload <input id="upload" type="file"></label><strong id="file-name">NONE</strong>
+<button id="chooser" type="button" onclick="document.getElementById('hidden-upload').click()">Choose hidden upload</button><input id="hidden-upload" type="file" style="display:none"><strong id="hidden-file-name">NONE</strong>
 <div class="spacer"></div><div id="bottom">BOTTOM MARKER</div></main>
 <script>
 console.log('MOONDESK_E2E_READY');
 fetch('/ping').then(r=>r.text()).then(value=>console.log('MOONDESK_E2E_PING:'+value));
+fetch('/echo',{method:'POST',headers:{'content-type':'text/plain'},body:'request-body'}).then(r=>r.text()).then(value=>console.log('MOONDESK_E2E_ECHO:'+value));
 document.getElementById('toggle').addEventListener('click',()=>{const s=document.getElementById('state');s.textContent=s.textContent==='OFF'?'ON':'OFF';});
 document.getElementById('upload').addEventListener('change',event=>{document.getElementById('file-name').textContent=event.target.files?.[0]?.name||'NONE';});
+document.getElementById('hidden-upload').addEventListener('change',event=>{document.getElementById('hidden-file-name').textContent=event.target.files?.[0]?.name||'NONE';});
 </script>
 </body></html>"#;
+        const SECOND_HTML: &str = r#"<!doctype html><html><head><title>MoonDesk Second Page</title></head><body><h1>SECOND PAGE</h1><script>console.log('MOONDESK_SECOND_READY');fetch('/second-ping').then(r=>r.text()).then(value=>console.log('MOONDESK_SECOND_PING:'+value));</script></body></html>"#;
         let site_app = Router::new()
             .route("/", get(|| async { Html(SITE_HTML) }))
-            .route("/ping", get(|| async { "pong" }));
+            .route("/ping", get(|| async { "pong" }))
+            .route("/echo", post(|body: String| async move { body }))
+            .route(
+                "/header",
+                get(|headers: HeaderMap| async move {
+                    headers
+                        .get("x-moondesk-test")
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or("NONE")
+                        .to_string()
+                }),
+            )
+            .route("/second", get(|| async { Html(SECOND_HTML) }))
+            .route("/second-ping", get(|| async { "second-pong" }));
         let site_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind local test site");
@@ -2109,6 +2126,7 @@ document.getElementById('upload').addEventListener('change',event=>{document.get
         let input_uid = snapshot_uid(mobile_snapshot_text, "textbox");
         let button_uid = snapshot_uid(mobile_snapshot_text, "button \"Toggle state\"");
         let upload_uid = snapshot_uid(mobile_snapshot_text, "button \"Upload \"");
+        let chooser_uid = snapshot_uid(mobile_snapshot_text, "button \"Choose hidden upload\"");
         let external_upload_arg = external_upload_fixture.to_string_lossy().into_owned();
         let upload = host_browser_request(
             host_address,
@@ -2118,6 +2136,18 @@ document.getElementById('upload').addEventListener('change',event=>{document.get
         )
         .await;
         assert_eq!(upload.get("success").and_then(Value::as_bool), Some(true));
+        let chooser_upload = host_browser_request(
+            host_address,
+            &workspace_root,
+            "upload_file",
+            &[chooser_uid.as_str(), external_upload_arg.as_str()],
+        )
+        .await;
+        assert_eq!(
+            chooser_upload.get("success").and_then(Value::as_bool),
+            Some(true),
+            "custom upload button should use the intercepted file chooser: {chooser_upload}"
+        );
 
         let fill = host_browser_request(
             host_address,
@@ -2140,7 +2170,7 @@ document.getElementById('upload').addEventListener('change',event=>{document.get
             host_browser_request(host_address, &workspace_root, "scroll", &["0", "1400"]).await;
         assert_eq!(scroll.get("success").and_then(Value::as_bool), Some(true));
 
-        let inspect_script = "() => ({width: innerWidth, height: innerHeight, value: document.querySelector('#name').value, state: document.querySelector('#state').textContent, uploaded: document.querySelector('#file-name').textContent, scrolled: scrollY > 500})";
+        let inspect_script = "() => ({width: innerWidth, height: innerHeight, value: document.querySelector('#name').value, state: document.querySelector('#state').textContent, uploaded: document.querySelector('#file-name').textContent, chooserUploaded: document.querySelector('#hidden-file-name').textContent, scrolled: scrollY > 500})";
         let inspection = host_browser_request(
             host_address,
             &workspace_root,
@@ -2169,6 +2199,13 @@ document.getElementById('upload').addEventListener('change',event=>{document.get
                 "inspection did not contain {expected:?}: {inspection_text}"
             );
         }
+        assert!(
+            inspection_text
+                .matches("external-upload-fixture.txt")
+                .count()
+                >= 2,
+            "both the direct file input and custom chooser button should receive the upload: {inspection_text}"
+        );
 
         let console =
             host_browser_request(host_address, &workspace_root, "list_console_messages", &[]).await;
@@ -2192,6 +2229,180 @@ document.getElementById('upload').addEventListener('change',event=>{document.get
         assert!(
             network_text.contains("/ping"),
             "browser network inspection missed the local project request: {network_text}"
+        );
+        assert!(
+            network_text.contains("/echo") && network_text.contains("[200]"),
+            "browser network inspection missed the completed POST request: {network_text}"
+        );
+        let echo_reqid = network_text
+            .lines()
+            .find(|line| line.contains("/echo"))
+            .and_then(|line| line.split_once(':'))
+            .and_then(|(id, _)| id.trim().parse::<u64>().ok())
+            .expect("echo request id from network listing");
+        let echo_reqid_arg = format!("--reqid={echo_reqid}");
+
+        let network_detail = host_browser_request(
+            host_address,
+            &workspace_root,
+            "get_network_request",
+            &[echo_reqid_arg.as_str()],
+        )
+        .await;
+        assert_eq!(
+            network_detail.get("success").and_then(Value::as_bool),
+            Some(true)
+        );
+        let network_detail_text = network_detail
+            .get("stdout")
+            .and_then(Value::as_str)
+            .expect("network request detail stdout");
+        for expected in [
+            "Status: 200",
+            "### Request Body",
+            "request-body",
+            "### Response Body",
+        ] {
+            assert!(
+                network_detail_text.contains(expected),
+                "network request detail missed {expected:?}: {network_detail_text}"
+            );
+        }
+
+        let no_selected_network =
+            host_browser_request(host_address, &workspace_root, "get_network_request", &[]).await;
+        assert_eq!(
+            no_selected_network.get("success").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(
+            no_selected_network
+                .get("stdout")
+                .and_then(Value::as_str)
+                .is_some_and(|text| text.contains("Nothing is currently selected")),
+            "omitted reqid should preserve the public compatibility response: {no_selected_network}"
+        );
+
+        let exported_network = host_browser_request(
+            host_address,
+            &workspace_root,
+            "get_network_request",
+            &[
+                echo_reqid_arg.as_str(),
+                "--requestFilePath=artifacts/echo-request.txt",
+                "--responseFilePath=artifacts/echo-response.txt",
+            ],
+        )
+        .await;
+        assert_eq!(
+            exported_network.get("success").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace_root.join("artifacts/echo-request.txt"))
+                .expect("read exported request body"),
+            "request-body"
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace_root.join("artifacts/echo-response.txt"))
+                .expect("read exported response body"),
+            "request-body"
+        );
+
+        let set_headers = host_browser_request(
+            host_address,
+            &workspace_root,
+            "emulate",
+            &[r#"--extraHttpHeaders={"X-MoonDesk-Test":"active"}"#],
+        )
+        .await;
+        assert_eq!(
+            set_headers.get("success").and_then(Value::as_bool),
+            Some(true)
+        );
+        let header_active = host_browser_request(
+            host_address,
+            &workspace_root,
+            "evaluate_script",
+            &["async () => await fetch('/header').then(r => r.text())"],
+        )
+        .await;
+        assert!(
+            header_active
+                .get("stdout")
+                .and_then(Value::as_str)
+                .is_some_and(|text| text.contains("active")),
+            "emulated extra header was not applied: {header_active}"
+        );
+
+        let clear_headers = host_browser_request(
+            host_address,
+            &workspace_root,
+            "emulate",
+            &["--extraHttpHeaders="],
+        )
+        .await;
+        assert_eq!(
+            clear_headers.get("success").and_then(Value::as_bool),
+            Some(true)
+        );
+        let header_cleared = host_browser_request(
+            host_address,
+            &workspace_root,
+            "evaluate_script",
+            &["async () => await fetch('/header').then(r => r.text())"],
+        )
+        .await;
+        assert!(
+            header_cleared
+                .get("stdout")
+                .and_then(Value::as_str)
+                .is_some_and(|text| text.contains("NONE")),
+            "empty extraHttpHeaders must clear the persisted header set: {header_cleared}"
+        );
+
+        let offline = host_browser_request(
+            host_address,
+            &workspace_root,
+            "emulate",
+            &["--networkConditions=Offline"],
+        )
+        .await;
+        assert_eq!(offline.get("success").and_then(Value::as_bool), Some(true));
+        let offline_fetch = host_browser_request(
+            host_address,
+            &workspace_root,
+            "evaluate_script",
+            &["async () => { try { return await fetch('/ping').then(r => r.text()); } catch (_) { return 'offline'; } }"],
+        )
+        .await;
+        assert!(
+            offline_fetch
+                .get("stdout")
+                .and_then(Value::as_str)
+                .is_some_and(|text| text.contains("offline")),
+            "Offline emulation did not block the local request: {offline_fetch}"
+        );
+
+        let reset_emulation =
+            host_browser_request(host_address, &workspace_root, "emulate", &[]).await;
+        assert_eq!(
+            reset_emulation.get("success").and_then(Value::as_bool),
+            Some(true)
+        );
+        let online_fetch = host_browser_request(
+            host_address,
+            &workspace_root,
+            "evaluate_script",
+            &["async () => await fetch('/ping').then(r => r.text())"],
+        )
+        .await;
+        assert!(
+            online_fetch
+                .get("stdout")
+                .and_then(Value::as_str)
+                .is_some_and(|text| text.contains("pong")),
+            "omitting networkConditions must disable prior throttling: {online_fetch}"
         );
 
         let screenshot = host_browser_request(
@@ -2283,6 +2494,85 @@ document.getElementById('upload').addEventListener('change',event=>{document.get
         assert!(
             cli_after_mcp_text.contains("ON"),
             "MCP session mutated the CLI page: {cli_after_mcp_text}"
+        );
+
+        let second_url = format!("http://{site_address}/second");
+        let second_navigation_arg = format!("--url={second_url}");
+        let second_navigation = host_browser_request(
+            host_address,
+            &workspace_root,
+            "navigate_page",
+            &[second_navigation_arg.as_str()],
+        )
+        .await;
+        assert_eq!(
+            second_navigation.get("success").and_then(Value::as_bool),
+            Some(true)
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let current_console =
+            host_browser_request(host_address, &workspace_root, "list_console_messages", &[]).await;
+        let current_console_text = current_console
+            .get("stdout")
+            .and_then(Value::as_str)
+            .expect("current-navigation console stdout");
+        assert!(
+            current_console_text.contains("MOONDESK_SECOND_READY"),
+            "current console inspection missed the second navigation: {current_console_text}"
+        );
+        assert!(
+            !current_console_text.contains("MOONDESK_E2E_READY"),
+            "default console inspection leaked the previous navigation: {current_console_text}"
+        );
+
+        let preserved_console = host_browser_request(
+            host_address,
+            &workspace_root,
+            "list_console_messages",
+            &["--includePreservedMessages=true"],
+        )
+        .await;
+        let preserved_console_text = preserved_console
+            .get("stdout")
+            .and_then(Value::as_str)
+            .expect("preserved console stdout");
+        assert!(
+            preserved_console_text.contains("MOONDESK_SECOND_READY")
+                && preserved_console_text.contains("MOONDESK_E2E_READY"),
+            "preserved console inspection did not retain recent navigations: {preserved_console_text}"
+        );
+
+        let current_network =
+            host_browser_request(host_address, &workspace_root, "list_network_requests", &[]).await;
+        let current_network_text = current_network
+            .get("stdout")
+            .and_then(Value::as_str)
+            .expect("current-navigation network stdout");
+        assert!(
+            current_network_text.contains("/second-ping") && current_network_text.contains("[200]"),
+            "current network inspection missed the completed second-page request: {current_network_text}"
+        );
+        assert!(
+            !current_network_text.contains("/ping "),
+            "default network inspection leaked the previous navigation: {current_network_text}"
+        );
+
+        let preserved_network = host_browser_request(
+            host_address,
+            &workspace_root,
+            "list_network_requests",
+            &["--includePreservedRequests=true"],
+        )
+        .await;
+        let preserved_network_text = preserved_network
+            .get("stdout")
+            .and_then(Value::as_str)
+            .expect("preserved network stdout");
+        assert!(
+            preserved_network_text.contains("/second-ping")
+                && preserved_network_text.contains("/ping "),
+            "preserved network inspection did not retain recent navigations: {preserved_network_text}"
         );
 
         let mcp_body = serde_json::to_vec(&json!({

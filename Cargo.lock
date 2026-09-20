@@ -1608,6 +1608,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "crossterm",
+ "flate2",
  "fs2",
  "futures-util",
  "globset",

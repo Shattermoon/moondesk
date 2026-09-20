@@ -4399,6 +4399,52 @@ async fn handle_set_browser_presentation(
     }
 }
 
+fn normalize_connector_browser_arguments(
+    command: &str,
+    mut arguments: Value,
+) -> Result<(Value, Option<u64>), String> {
+    let Some(object) = arguments.as_object_mut() else {
+        return Err("Browser tool arguments must be an object".to_string());
+    };
+
+    let timeout_ms = if matches!(command, "new_page" | "navigate_page") {
+        match object.remove("timeout") {
+            None => None,
+            Some(value) => match value.as_u64() {
+                Some(0) => None,
+                Some(value @ 1..=MAX_BROWSER_TIMEOUT_MS) => Some(value),
+                _ => {
+                    return Err(format!(
+                        "timeout must be an integer between 0 and {MAX_BROWSER_TIMEOUT_MS} ms"
+                    ));
+                }
+            },
+        }
+    } else {
+        None
+    };
+
+    if command == "new_page" && object.contains_key("isolatedContext") {
+        return Err(
+            "new_page isolatedContext is managed by MoonDesk and cannot be supplied by callers"
+                .to_string(),
+        );
+    }
+
+    if command == "list_console_messages" && object.contains_key("serviceWorkerId") {
+        return Err(
+            "list_console_messages serviceWorkerId filtering is unavailable in MoonDesk's shared browser because raw service-worker IDs are not scoped to the caller's logical browser session"
+                .to_string(),
+        );
+    }
+
+    if command == "take_screenshot" && !object.contains_key("format") {
+        object.insert("format".to_string(), Value::String("jpeg".to_string()));
+    }
+
+    Ok((arguments, timeout_ms))
+}
+
 async fn handle_connector_browser_command(
     req: &JsonRpcRequest,
     browser_session: &BrowserSessionKey,
@@ -4407,20 +4453,29 @@ async fn handle_connector_browser_command(
     browser_runtime: &Option<Arc<BrowserRuntime>>,
     command: &str,
 ) -> JsonRpcResponse {
-    let args = match browser_structured_arguments_to_cli(command, &tool_arguments(req)) {
+    let (arguments, timeout_ms) =
+        match normalize_connector_browser_arguments(command, tool_arguments(req)) {
+            Ok(arguments) => arguments,
+            Err(error) => return tool_error_response(req, error),
+        };
+    let args = match browser_structured_arguments_to_cli(command, &arguments) {
         Ok(args) => args,
         Err(error) => return tool_error_response(req, error),
     };
+    let mut browser_arguments = json!({
+        "command": command,
+        "args": args,
+    });
+    if let Some(timeout_ms) = timeout_ms {
+        browser_arguments["timeout_ms"] = json!(timeout_ms);
+    }
     let proxied = JsonRpcRequest {
         jsonrpc: req.jsonrpc.clone(),
         id: req.id.clone(),
         method: req.method.clone(),
         params: json!({
             "name": "browser_command",
-            "arguments": {
-                "command": command,
-                "args": args,
-            }
+            "arguments": browser_arguments
         }),
     };
     handle_browser_command(
@@ -7459,6 +7514,70 @@ mod tests {
             "contract-only capabilities must not become hidden top-level tools"
         );
 
+        let (new_page_args, new_page_timeout) = normalize_connector_browser_arguments(
+            "new_page",
+            json!({ "url": "about:blank", "timeout": 750 }),
+        )
+        .expect("normalize connector new_page timeout");
+        assert_eq!(new_page_timeout, Some(750));
+        assert!(new_page_args.get("timeout").is_none());
+        assert!(
+            normalize_connector_browser_arguments(
+                "new_page",
+                json!({ "url": "about:blank", "isolatedContext": "caller-owned" })
+            )
+            .expect_err("caller-controlled context must stay rejected")
+            .contains("managed by MoonDesk")
+        );
+        assert!(
+            normalize_connector_browser_arguments(
+                "list_console_messages",
+                json!({ "serviceWorkerId": "worker-1" })
+            )
+            .expect_err("raw service worker filtering must stay session-safe")
+            .contains("not scoped")
+        );
+
+        let (navigate_args, navigate_timeout) = normalize_connector_browser_arguments(
+            "navigate_page",
+            json!({
+                "type": "url",
+                "url": "about:blank",
+                "timeout": 1_250,
+                "handleBeforeUnload": "accept"
+            }),
+        )
+        .expect("normalize connector navigation compatibility arguments");
+        assert_eq!(navigate_timeout, Some(1_250));
+        assert!(navigate_args.get("timeout").is_none());
+        assert_eq!(
+            navigate_args
+                .get("handleBeforeUnload")
+                .and_then(Value::as_str),
+            Some("accept")
+        );
+        let (dismiss_args, dismiss_timeout) = normalize_connector_browser_arguments(
+            "navigate_page",
+            json!({ "type": "reload", "handleBeforeUnload": "dismiss" }),
+        )
+        .expect("beforeunload dismissal should reach the native CDP handler");
+        assert_eq!(dismiss_timeout, None);
+        assert_eq!(
+            dismiss_args
+                .get("handleBeforeUnload")
+                .and_then(Value::as_str),
+            Some("dismiss")
+        );
+
+        let (screenshot_args, screenshot_timeout) =
+            normalize_connector_browser_arguments("take_screenshot", json!({}))
+                .expect("normalize connector screenshot defaults");
+        assert_eq!(screenshot_timeout, None);
+        assert_eq!(
+            screenshot_args.get("format").and_then(Value::as_str),
+            Some("jpeg")
+        );
+
         let workspace_root =
             std::env::temp_dir().join(format!("moondesk-browser-adapter-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&workspace_root).expect("create browser adapter workspace");
@@ -7856,7 +7975,9 @@ mod tests {
                 "navigate_page",
                 json!({
                     "type": "url",
-                    "url": "data:text/html,<input aria-label='first'><input aria-label='second'><div id='status'>waiting</div><script>setTimeout(()=>document.getElementById('status').textContent='ready-text',300)</script>"
+                    "url": "data:text/html,<input aria-label='first'><input aria-label='second'><select aria-label='choice'><option value='one'>One</option><option value='two'>Two label</option></select><input aria-label='check' type='checkbox'><input aria-label='radio' type='radio' name='choice-radio'><button aria-label='manual-dialog' onclick=\"window.manualDialogResult=prompt('manual-dialog','default')\">Dialog</button><button aria-label='hover-target' onmouseenter=\"window.hovered=true\">Hover</button><button aria-label='drag-source' onmousedown=\"window.dragStarted=true\">Drag source</button><button aria-label='drag-target' style='margin-left:120px' onmousemove=\"if(event.buttons===1)window.dragged=true\" onmouseup=\"window.dragEnded=true\">Drag target</button><input aria-label='keyboard-dialog' onkeydown=\"if(event.key==='Enter')window.keyboardDialogResult=prompt('keyboard-dialog','default')\"><input aria-label='type-dialog' oninput=\"if(this.value==='dialog')window.typeDialogResult=prompt('type-dialog','default')\"><div id='status'>waiting</div><script>setTimeout(()=>document.getElementById('status').textContent='ready-text',300)</script>",
+                    "timeout": 5_000,
+                    "handleBeforeUnload": "accept"
                 }),
             ),
             &workspace_root_str,
@@ -7897,7 +8018,7 @@ mod tests {
         let uid_for = |label: &str| {
             snapshot_stdout
                 .lines()
-                .find(|line| line.contains(&format!("textbox \"{label}\"")))
+                .find(|line| line.contains(&format!("\"{label}\"")))
                 .and_then(|line| line.trim().strip_prefix("uid="))
                 .and_then(|line| line.split_whitespace().next())
                 .map(str::to_string)
@@ -7905,6 +8026,493 @@ mod tests {
         };
         let first_uid = uid_for("first");
         let second_uid = uid_for("second");
+        let choice_uid = uid_for("choice");
+        let check_uid = uid_for("check");
+        let radio_uid = uid_for("radio");
+        let manual_dialog_uid = uid_for("manual-dialog");
+        let hover_uid = uid_for("hover-target");
+        let drag_source_uid = uid_for("drag-source");
+        let drag_target_uid = uid_for("drag-target");
+        let keyboard_dialog_uid = uid_for("keyboard-dialog");
+        let type_dialog_uid = uid_for("type-dialog");
+
+        let element_argument = handle_tools_call(
+            &tool_call_request(
+                "evaluate_script",
+                json!({
+                    "function": "(element) => ({ tag: element.tagName, label: element.getAttribute('aria-label') })",
+                    "args": [first_uid.clone()]
+                }),
+            ),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        let element_argument_stdout = browser_stdout(&element_argument);
+        assert!(
+            element_argument_stdout.contains("\"tag\":\"INPUT\"")
+                && element_argument_stdout.contains("\"label\":\"first\""),
+            "evaluate_script args must resolve snapshot UIDs to DOM elements: {element_argument_stdout}"
+        );
+
+        let dialog_click = handle_tools_call(
+            &tool_call_request("click", json!({ "uid": manual_dialog_uid })),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        assert_ne!(
+            dialog_click
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true),
+            "click that opens a dialog must return without invalidating the browser: {}",
+            result_text(&dialog_click)
+        );
+
+        let handled_dialog = handle_tools_call(
+            &tool_call_request(
+                "handle_dialog",
+                json!({ "action": "accept", "promptText": "manual-ok" }),
+            ),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        assert_ne!(
+            handled_dialog
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true),
+            "handle_dialog should accept the dialog opened by click: {}",
+            result_text(&handled_dialog)
+        );
+
+        let manual_dialog_result = handle_tools_call(
+            &tool_call_request(
+                "evaluate_script",
+                json!({ "function": "() => window.manualDialogResult" }),
+            ),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        assert!(
+            browser_stdout(&manual_dialog_result).contains("manual-ok"),
+            "prompt result should reflect handle_dialog input: {}",
+            browser_stdout(&manual_dialog_result)
+        );
+
+        let hovered = handle_tools_call(
+            &tool_call_request("hover", json!({ "uid": hover_uid })),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        assert_ne!(
+            hovered
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true),
+            "hover should complete in Chromium: {}",
+            result_text(&hovered)
+        );
+        let hover_state = handle_tools_call(
+            &tool_call_request(
+                "evaluate_script",
+                json!({ "function": "() => window.hovered === true" }),
+            ),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        assert!(
+            browser_stdout(&hover_state).contains("true"),
+            "hover must dispatch a real mouse-enter path: {}",
+            browser_stdout(&hover_state)
+        );
+
+        let dragged = handle_tools_call(
+            &tool_call_request(
+                "drag",
+                json!({
+                    "from_uid": drag_source_uid,
+                    "to_uid": drag_target_uid
+                }),
+            ),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        assert_ne!(
+            dragged
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true),
+            "drag should complete in Chromium: {}",
+            result_text(&dragged)
+        );
+        let drag_state = handle_tools_call(
+            &tool_call_request(
+                "evaluate_script",
+                json!({ "function": "() => ({ started: !!window.dragStarted, moved: !!window.dragged, ended: !!window.dragEnded })" }),
+            ),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        let drag_state_stdout = browser_stdout(&drag_state);
+        assert!(
+            drag_state_stdout.contains("\"started\":true")
+                && drag_state_stdout.contains("\"moved\":true")
+                && drag_state_stdout.contains("\"ended\":true"),
+            "drag must deliver pressed movement and release to the target: {drag_state_stdout}"
+        );
+
+        let keyboard_focus = handle_tools_call(
+            &tool_call_request("click", json!({ "uid": keyboard_dialog_uid })),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        assert_ne!(
+            keyboard_focus
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true),
+            "keyboard fixture focus click should succeed"
+        );
+        let keyboard_prompt = handle_tools_call(
+            &tool_call_request("press_key", json!({ "key": "ENTER" })),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        assert_ne!(
+            keyboard_prompt
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true),
+            "press_key that opens a dialog must return cleanly: {}",
+            result_text(&keyboard_prompt)
+        );
+        let handled_keyboard_prompt = handle_tools_call(
+            &tool_call_request(
+                "handle_dialog",
+                json!({ "action": "accept", "promptText": "keyboard-ok" }),
+            ),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        assert_ne!(
+            handled_keyboard_prompt
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true),
+            "keyboard dialog should be handleable: {}",
+            result_text(&handled_keyboard_prompt)
+        );
+
+        let type_focus = handle_tools_call(
+            &tool_call_request("click", json!({ "uid": type_dialog_uid })),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        assert_ne!(
+            type_focus
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true),
+            "type fixture focus click should succeed"
+        );
+        let type_prompt = handle_tools_call(
+            &tool_call_request("type_text", json!({ "text": "dialog" })),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        assert_ne!(
+            type_prompt
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true),
+            "type_text that opens a dialog must return cleanly: {}",
+            result_text(&type_prompt)
+        );
+        let handled_type_prompt = handle_tools_call(
+            &tool_call_request(
+                "handle_dialog",
+                json!({ "action": "accept", "promptText": "type-ok" }),
+            ),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        assert_ne!(
+            handled_type_prompt
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true),
+            "type_text dialog should be handleable: {}",
+            result_text(&handled_type_prompt)
+        );
+        let dialog_input_state = handle_tools_call(
+            &tool_call_request(
+                "evaluate_script",
+                json!({ "function": "() => ({ keyboard: window.keyboardDialogResult, typed: window.typeDialogResult })" }),
+            ),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        let dialog_input_stdout = browser_stdout(&dialog_input_state);
+        assert!(
+            dialog_input_stdout.contains("\"keyboard\":\"keyboard-ok\"")
+                && dialog_input_stdout.contains("\"typed\":\"type-ok\""),
+            "keyboard/text dialog results were not preserved: {dialog_input_stdout}"
+        );
+
+        let emitted_warning = handle_tools_call(
+            &tool_call_request(
+                "evaluate_script",
+                json!({
+                    "function": "() => { console.warn('native-warning-filter'); return 'warned'; }"
+                }),
+            ),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        assert!(
+            browser_stdout(&emitted_warning).contains("warned"),
+            "failed to emit native warning fixture: {}",
+            browser_stdout(&emitted_warning)
+        );
+        let warning_messages = handle_tools_call(
+            &tool_call_request("list_console_messages", json!({ "types": ["warn"] })),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::ReadOnly,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        let warning_stdout = browser_stdout(&warning_messages);
+        assert!(
+            warning_stdout.contains("[warn]") && warning_stdout.contains("native-warning-filter"),
+            "public warn filter should match Chrome warning events: {warning_stdout}"
+        );
+
+        let invalid_screenshot_quality = handle_tools_call(
+            &tool_call_request("take_screenshot", json!({ "quality": 101 })),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        assert!(
+            result_text(&invalid_screenshot_quality)
+                .contains("Screenshot quality must be between 0 and 100"),
+            "invalid screenshot quality should fail cleanly: {}",
+            result_text(&invalid_screenshot_quality)
+        );
+
+        let incompatible_screenshot = handle_tools_call(
+            &tool_call_request(
+                "take_screenshot",
+                json!({ "uid": first_uid.clone(), "fullPage": true }),
+            ),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        assert!(
+            result_text(&incompatible_screenshot)
+                .contains("fullPage=true is incompatible with uid"),
+            "element and full-page screenshot modes must remain mutually exclusive: {}",
+            result_text(&incompatible_screenshot)
+        );
+
+        let default_dialog = handle_tools_call(
+            &tool_call_request(
+                "evaluate_script",
+                json!({
+                    "function": "() => { alert('native-default-dialog'); return 'after-alert'; }"
+                }),
+            ),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        assert!(
+            browser_stdout(&default_dialog).contains("after-alert"),
+            "evaluate_script should accept dialogs by default: {}",
+            browser_stdout(&default_dialog)
+        );
+
+        let prompt_dialog = handle_tools_call(
+            &tool_call_request(
+                "evaluate_script",
+                json!({
+                    "function": "() => prompt('native-prompt', 'default')",
+                    "dialogAction": "typed-by-native"
+                }),
+            ),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        assert!(
+            browser_stdout(&prompt_dialog).contains("typed-by-native"),
+            "evaluate_script prompt text was not delivered: {}",
+            browser_stdout(&prompt_dialog)
+        );
+
+        let dismissed_dialog = handle_tools_call(
+            &tool_call_request(
+                "evaluate_script",
+                json!({
+                    "function": "() => confirm('native-dismiss')",
+                    "dialogAction": "dismiss"
+                }),
+            ),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        assert!(
+            browser_stdout(&dismissed_dialog).contains("false"),
+            "evaluate_script dialog dismissal was not observed: {}",
+            browser_stdout(&dismissed_dialog)
+        );
+
+        let accepted_dialog = handle_tools_call(
+            &tool_call_request(
+                "evaluate_script",
+                json!({
+                    "function": "() => confirm('native-accept')",
+                    "dialogAction": "accept"
+                }),
+            ),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        assert!(
+            browser_stdout(&accepted_dialog).contains("true"),
+            "evaluate_script dialog acceptance was not observed: {}",
+            browser_stdout(&accepted_dialog)
+        );
 
         let filled = handle_tools_call(
             &tool_call_request(
@@ -7912,7 +8520,10 @@ mod tests {
                 json!({
                     "elements": [
                         { "uid": first_uid, "value": "-1" },
-                        { "uid": second_uid, "value": "beta" }
+                        { "uid": second_uid, "value": "beta" },
+                        { "uid": choice_uid, "value": "Two label" },
+                        { "uid": check_uid, "value": "true" },
+                        { "uid": radio_uid, "value": "true" }
                     ],
                     "includeSnapshot": true
                 }),
@@ -7939,7 +8550,7 @@ mod tests {
             &tool_call_request(
                 "evaluate_script",
                 json!({
-                    "function": "() => ({first: document.querySelector('[aria-label=first]').value, second: document.querySelector('[aria-label=second]').value})"
+                    "function": "() => ({first: document.querySelector('[aria-label=first]').value, second: document.querySelector('[aria-label=second]').value, choice: document.querySelector('[aria-label=choice]').value, check: document.querySelector('[aria-label=check]').checked, radio: document.querySelector('[aria-label=radio]').checked})"
                 }),
             ),
             &workspace_root_str,
@@ -7959,6 +8570,34 @@ mod tests {
             .expect("connector-expanded evaluate_script stdout");
         assert!(evaluated_stdout.contains("-1"), "{evaluated_stdout}");
         assert!(evaluated_stdout.contains("beta"), "{evaluated_stdout}");
+        assert!(
+            evaluated_stdout.contains("\"choice\":\"two\""),
+            "{evaluated_stdout}"
+        );
+        assert!(
+            evaluated_stdout.contains("\"check\":true"),
+            "{evaluated_stdout}"
+        );
+        assert!(
+            evaluated_stdout.contains("\"radio\":true"),
+            "{evaluated_stdout}"
+        );
+
+        let verbose_snapshot = handle_tools_call(
+            &tool_call_request("take_snapshot", json!({ "verbose": true })),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::ReadOnly,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        let verbose_snapshot_stdout = browser_stdout(&verbose_snapshot);
+        assert!(
+            verbose_snapshot_stdout.contains("checked="),
+            "verbose accessibility snapshots should expose AX properties: {verbose_snapshot_stdout}"
+        );
 
         let refreshed_snapshot = handle_tools_call(
             &tool_call_request("take_snapshot", json!({})),
@@ -8057,6 +8696,100 @@ mod tests {
             .expect("connector wait_for stdout");
         assert!(waited_stdout.contains("ready-text"), "{waited_stdout}");
 
+        let waited_any = handle_tools_call(
+            &tool_call_request(
+                "wait_for",
+                json!({
+                    "text": ["definitely-missing-alternative", "ready-text"],
+                    "timeout": 3_000
+                }),
+            ),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::ReadOnly,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        assert_ne!(
+            waited_any
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true),
+            "wait_for must resolve when any requested text appears: {}",
+            result_text(&waited_any)
+        );
+        assert!(
+            browser_stdout(&waited_any).contains("ready-text"),
+            "wait_for any-text success should return a fresh page snapshot: {}",
+            browser_stdout(&waited_any)
+        );
+
+        let scheduled_block = handle_tools_call(
+            &tool_call_request(
+                "evaluate_script",
+                json!({
+                    "function": "() => { setTimeout(() => { const end = performance.now() + 1000; while (performance.now() < end) {} }, 0); return 'scheduled'; }"
+                }),
+            ),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        assert!(
+            browser_stdout(&scheduled_block).contains("scheduled"),
+            "failed to schedule browser main-thread block: {}",
+            browser_stdout(&scheduled_block)
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let blocked_wait = handle_tools_call(
+            &tool_call_request(
+                "wait_for",
+                json!({ "text": ["blocked-wait-never-appears"], "timeout": 50 }),
+            ),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::ReadOnly,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        assert!(
+            result_text(&blocked_wait).contains("Timed out after waiting 50ms"),
+            "explicit wait timeout during a slow CDP evaluation must stay a semantic timeout: {}",
+            result_text(&blocked_wait)
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(1_050)).await;
+        let after_blocked_wait = handle_tools_call(
+            &tool_call_request("list_pages", json!({})),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        assert_eq!(
+            after_blocked_wait
+                .result
+                .as_ref()
+                .and_then(|result| result.get("structuredContent"))
+                .and_then(|structured| structured.get("restarted"))
+                .and_then(Value::as_bool),
+            Some(false),
+            "semantic wait timeout must not invalidate the shared browser runtime"
+        );
+
         let metadata_only_wait = handle_tools_call(
             &tool_call_request("wait_for", json!({ "text": ["uid="], "timeout": 250 })),
             &workspace_root_str,
@@ -8110,6 +8843,142 @@ mod tests {
                 .and_then(Value::as_bool),
             Some(false),
             "ordinary wait timeout must not restart the shared browser runtime"
+        );
+
+        let beforeunload_page = handle_tools_call(
+            &tool_call_request(
+                "navigate_page",
+                json!({
+                    "type": "url",
+                    "url": "data:text/html,<button aria-label='arm' onclick=\"window.onbeforeunload=()=>'';document.title='armed'\">Arm</button>",
+                    "timeout": 5_000
+                }),
+            ),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        assert_ne!(
+            beforeunload_page
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true),
+            "beforeunload fixture navigation should succeed: {}",
+            result_text(&beforeunload_page)
+        );
+        let beforeunload_snapshot = handle_tools_call(
+            &tool_call_request("take_snapshot", json!({})),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        let arm_uid = browser_stdout(&beforeunload_snapshot)
+            .lines()
+            .find(|line| line.contains("button \"arm\""))
+            .and_then(|line| line.trim().strip_prefix("uid="))
+            .and_then(|line| line.split_whitespace().next())
+            .expect("beforeunload arm button uid")
+            .to_string();
+        let armed = handle_tools_call(
+            &tool_call_request("click", json!({ "uid": arm_uid })),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        assert_ne!(
+            armed
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true),
+            "arming beforeunload should succeed"
+        );
+
+        let dismissed_navigation = handle_tools_call(
+            &tool_call_request(
+                "navigate_page",
+                json!({
+                    "type": "url",
+                    "url": "data:text/html,<title>dismiss-target</title>dismiss-target",
+                    "handleBeforeUnload": "dismiss",
+                    "timeout": 5_000
+                }),
+            ),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        assert!(
+            result_text(&dismissed_navigation).contains("Navigation failed")
+                || result_text(&dismissed_navigation).contains("ERR_ABORTED"),
+            "dismissing beforeunload should abort navigation cleanly: {}",
+            result_text(&dismissed_navigation)
+        );
+        let after_dismiss = handle_tools_call(
+            &tool_call_request(
+                "evaluate_script",
+                json!({ "function": "() => document.title" }),
+            ),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        assert!(
+            browser_stdout(&after_dismiss).contains("armed"),
+            "dismissed beforeunload should keep the original page: {}",
+            browser_stdout(&after_dismiss)
+        );
+
+        let accepted_navigation = handle_tools_call(
+            &tool_call_request(
+                "navigate_page",
+                json!({
+                    "type": "url",
+                    "url": "data:text/html,<title>accepted-target</title>accepted-target",
+                    "handleBeforeUnload": "accept",
+                    "timeout": 5_000
+                }),
+            ),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        assert_ne!(
+            accepted_navigation
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true),
+            "accepting beforeunload should allow navigation: {}",
+            result_text(&accepted_navigation)
         );
 
         let navigate = runtime
@@ -8621,6 +9490,47 @@ mod tests {
                 .and_then(Value::as_array)
                 .is_some_and(|events| !events.is_empty()),
             "native performance trace should contain trace events"
+        );
+
+        let compressed_trace = runtime
+            .run_for_session(
+                &browser_session,
+                &workspace_root_str,
+                "performance_start_trace",
+                &[
+                    "--reload=false".to_string(),
+                    "--autoStop=true".to_string(),
+                    "--filePath=reports/native-trace.json.gz".to_string(),
+                ],
+                DEFAULT_BROWSER_COMMAND_TIMEOUT,
+            )
+            .await
+            .expect("capture compressed native CDP performance trace");
+        assert!(
+            compressed_trace.success(),
+            "compressed native performance trace failed: stdout={} stderr={}",
+            compressed_trace.stdout,
+            compressed_trace.stderr
+        );
+        let compressed_trace_path = workspace_root.join("reports").join("native-trace.json.gz");
+        let compressed_bytes =
+            std::fs::read(&compressed_trace_path).expect("read compressed performance trace");
+        assert!(
+            compressed_bytes.starts_with(&[0x1f, 0x8b]),
+            "compressed trace must be a gzip stream"
+        );
+        let mut decoder = flate2::read::GzDecoder::new(compressed_bytes.as_slice());
+        let mut decompressed = Vec::new();
+        std::io::Read::read_to_end(&mut decoder, &mut decompressed)
+            .expect("decompress native performance trace");
+        let compressed_trace_json: Value = serde_json::from_slice(&decompressed)
+            .expect("decode compressed performance trace JSON");
+        assert!(
+            compressed_trace_json
+                .get("traceEvents")
+                .and_then(Value::as_array)
+                .is_some_and(|events| !events.is_empty()),
+            "compressed native performance trace should contain trace events"
         );
 
         let heap = runtime

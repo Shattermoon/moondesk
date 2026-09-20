@@ -4431,6 +4431,13 @@ fn normalize_connector_browser_arguments(
         );
     }
 
+    if command == "list_console_messages" && object.contains_key("serviceWorkerId") {
+        return Err(
+            "list_console_messages serviceWorkerId filtering is unavailable in MoonDesk's shared browser because raw service-worker IDs are not scoped to the caller's logical browser session"
+                .to_string(),
+        );
+    }
+
     if command == "take_screenshot" && !object.contains_key("format") {
         object.insert("format".to_string(), Value::String("jpeg".to_string()));
     }
@@ -7522,6 +7529,14 @@ mod tests {
             .expect_err("caller-controlled context must stay rejected")
             .contains("managed by MoonDesk")
         );
+        assert!(
+            normalize_connector_browser_arguments(
+                "list_console_messages",
+                json!({ "serviceWorkerId": "worker-1" })
+            )
+            .expect_err("raw service worker filtering must stay session-safe")
+            .contains("not scoped")
+        );
 
         let (navigate_args, navigate_timeout) = normalize_connector_browser_arguments(
             "navigate_page",
@@ -8038,6 +8053,79 @@ mod tests {
             "evaluate_script args must resolve snapshot UIDs to DOM elements: {element_argument_stdout}"
         );
 
+        let emitted_warning = handle_tools_call(
+            &tool_call_request(
+                "evaluate_script",
+                json!({
+                    "function": "() => { console.warn('native-warning-filter'); return 'warned'; }"
+                }),
+            ),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        assert!(
+            browser_stdout(&emitted_warning).contains("warned"),
+            "failed to emit native warning fixture: {}",
+            browser_stdout(&emitted_warning)
+        );
+        let warning_messages = handle_tools_call(
+            &tool_call_request("list_console_messages", json!({ "types": ["warn"] })),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::ReadOnly,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        let warning_stdout = browser_stdout(&warning_messages);
+        assert!(
+            warning_stdout.contains("[warn]") && warning_stdout.contains("native-warning-filter"),
+            "public warn filter should match Chrome warning events: {warning_stdout}"
+        );
+
+        let invalid_screenshot_quality = handle_tools_call(
+            &tool_call_request("take_screenshot", json!({ "quality": 101 })),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        assert!(
+            result_text(&invalid_screenshot_quality)
+                .contains("Screenshot quality must be between 0 and 100"),
+            "invalid screenshot quality should fail cleanly: {}",
+            result_text(&invalid_screenshot_quality)
+        );
+
+        let incompatible_screenshot = handle_tools_call(
+            &tool_call_request(
+                "take_screenshot",
+                json!({ "uid": first_uid.clone(), "fullPage": true }),
+            ),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        assert!(
+            result_text(&incompatible_screenshot)
+                .contains("fullPage=true is incompatible with uid"),
+            "element and full-page screenshot modes must remain mutually exclusive: {}",
+            result_text(&incompatible_screenshot)
+        );
+
         let default_dialog = handle_tools_call(
             &tool_call_request(
                 "evaluate_script",
@@ -8192,6 +8280,22 @@ mod tests {
         assert!(
             evaluated_stdout.contains("\"radio\":true"),
             "{evaluated_stdout}"
+        );
+
+        let verbose_snapshot = handle_tools_call(
+            &tool_call_request("take_snapshot", json!({ "verbose": true })),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::ReadOnly,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        let verbose_snapshot_stdout = browser_stdout(&verbose_snapshot);
+        assert!(
+            verbose_snapshot_stdout.contains("checked="),
+            "verbose accessibility snapshots should expose AX properties: {verbose_snapshot_stdout}"
         );
 
         let refreshed_snapshot = handle_tools_call(
@@ -9085,6 +9189,47 @@ mod tests {
                 .and_then(Value::as_array)
                 .is_some_and(|events| !events.is_empty()),
             "native performance trace should contain trace events"
+        );
+
+        let compressed_trace = runtime
+            .run_for_session(
+                &browser_session,
+                &workspace_root_str,
+                "performance_start_trace",
+                &[
+                    "--reload=false".to_string(),
+                    "--autoStop=true".to_string(),
+                    "--filePath=reports/native-trace.json.gz".to_string(),
+                ],
+                DEFAULT_BROWSER_COMMAND_TIMEOUT,
+            )
+            .await
+            .expect("capture compressed native CDP performance trace");
+        assert!(
+            compressed_trace.success(),
+            "compressed native performance trace failed: stdout={} stderr={}",
+            compressed_trace.stdout,
+            compressed_trace.stderr
+        );
+        let compressed_trace_path = workspace_root.join("reports").join("native-trace.json.gz");
+        let compressed_bytes =
+            std::fs::read(&compressed_trace_path).expect("read compressed performance trace");
+        assert!(
+            compressed_bytes.starts_with(&[0x1f, 0x8b]),
+            "compressed trace must be a gzip stream"
+        );
+        let mut decoder = flate2::read::GzDecoder::new(compressed_bytes.as_slice());
+        let mut decompressed = Vec::new();
+        std::io::Read::read_to_end(&mut decoder, &mut decompressed)
+            .expect("decompress native performance trace");
+        let compressed_trace_json: Value = serde_json::from_slice(&decompressed)
+            .expect("decode compressed performance trace JSON");
+        assert!(
+            compressed_trace_json
+                .get("traceEvents")
+                .and_then(Value::as_array)
+                .is_some_and(|events| !events.is_empty()),
+            "compressed native performance trace should contain trace events"
         );
 
         let heap = runtime

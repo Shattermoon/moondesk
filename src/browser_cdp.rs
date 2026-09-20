@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use base64::Engine as _;
+use flate2::{Compression, write::GzEncoder};
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Map, Value, json};
@@ -23,8 +24,7 @@ const DEVTOOLS_ACTIVE_PORT_FILE: &str = "DevToolsActivePort";
 const STARTUP_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const SHUTDOWN_WAIT: Duration = Duration::from_secs(5);
 const MAX_EVENT_HISTORY: usize = 5_000;
-const DEFAULT_EVENT_PAGE_SIZE: usize = 50;
-const MAX_EVENT_PAGE_SIZE: usize = 200;
+const MAX_EVENT_PAGE_SIZE: usize = MAX_EVENT_HISTORY;
 const MAX_TRACE_BYTES: usize = 256 * 1024 * 1024;
 const MAX_HEAP_SNAPSHOT_BYTES: usize = 512 * 1024 * 1024;
 const DEFAULT_VIEWPORT_WIDTH: u64 = 1_280;
@@ -1521,14 +1521,26 @@ impl BrowserCdpTransport {
             if let Some(value) = value.filter(|value| !value.is_empty()) {
                 line.push_str(&format!(" value=\"{}\"", escape_snapshot_text(value)));
             }
-            if verbose
-                && let Some(description) = ax_value_string(node.get("description"))
+            if verbose {
+                if let Some(description) = ax_value_string(node.get("description"))
                     .filter(|description| !description.is_empty())
-            {
-                line.push_str(&format!(
-                    " description=\"{}\"",
-                    escape_snapshot_text(description)
-                ));
+                {
+                    line.push_str(&format!(
+                        " description=\"{}\"",
+                        escape_snapshot_text(description)
+                    ));
+                }
+                if let Some(properties) = node.get("properties").and_then(Value::as_array) {
+                    for property in properties {
+                        let Some(name) = property.get("name").and_then(Value::as_str) else {
+                            continue;
+                        };
+                        let Some(value) = ax_property_value(property.get("value")) else {
+                            continue;
+                        };
+                        line.push_str(&format!(" {name}={value}"));
+                    }
+                }
             }
             if !line.is_empty() {
                 lines.push(line);
@@ -2273,18 +2285,129 @@ impl BrowserCdpTransport {
         let uid = required_str(arguments, "uid")?;
         let file_path = required_str(arguments, "filePath")?;
         let backend_node_id = self.element_backend_node(page_id, uid).await?;
-        let session_id = self.ensure_page_session(page_id, deadline).await?;
-        self.connection
+        let (session_id, object_id) = self.resolve_element_object(page_id, uid, deadline).await?;
+        let metadata = self
+            .connection
             .call(
-                "DOM.setFileInputFiles",
+                "Runtime.callFunctionOn",
                 json!({
-                    "files": [file_path],
-                    "backendNodeId": backend_node_id,
+                    "objectId": object_id,
+                    "functionDeclaration": "function(){ return { tag: (this.tagName || '').toLowerCase(), type: (this.type || '').toLowerCase() }; }",
+                    "returnByValue": true,
                 }),
                 Some(&session_id),
                 deadline,
             )
-            .await?;
+            .await;
+        let _ = self
+            .connection
+            .call(
+                "Runtime.releaseObject",
+                json!({ "objectId": object_id }),
+                Some(&session_id),
+                deadline,
+            )
+            .await;
+        let metadata = metadata?;
+        let element = metadata
+            .pointer("/result/value")
+            .cloned()
+            .unwrap_or(Value::Null);
+        let is_file_input = element.get("tag").and_then(Value::as_str) == Some("input")
+            && element.get("type").and_then(Value::as_str) == Some("file");
+
+        if is_file_input {
+            self.connection
+                .call(
+                    "DOM.setFileInputFiles",
+                    json!({
+                        "files": [file_path],
+                        "backendNodeId": backend_node_id,
+                    }),
+                    Some(&session_id),
+                    deadline,
+                )
+                .await?;
+        } else {
+            self.connection
+                .call(
+                    "Page.setInterceptFileChooserDialog",
+                    json!({ "enabled": true }),
+                    Some(&session_id),
+                    deadline,
+                )
+                .await?;
+            let baseline_event_id = self
+                .connection
+                .events_for_session(&session_id)
+                .await
+                .last()
+                .map(|event| event.id)
+                .unwrap_or(0);
+
+            let chooser_result: Result<Option<u64>, BrowserTransportError> = async {
+                let (x, y) = self.element_center(page_id, uid, deadline).await?;
+                self.dispatch_click(&session_id, x, y, 1, deadline).await?;
+                let chooser_deadline = std::cmp::min(
+                    deadline,
+                    tokio::time::Instant::now() + Duration::from_secs(2),
+                );
+                loop {
+                    let events = self.connection.events_for_session(&session_id).await;
+                    if let Some(backend_node_id) = events
+                        .iter()
+                        .filter(|event| {
+                            event.id > baseline_event_id && event.method == "Page.fileChooserOpened"
+                        })
+                        .find_map(|event| event.params.get("backendNodeId").and_then(Value::as_u64))
+                    {
+                        return Ok(Some(backend_node_id));
+                    }
+                    if tokio::time::Instant::now() >= chooser_deadline {
+                        return Ok(None);
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
+            .await;
+
+            let disable_result = self
+                .connection
+                .call(
+                    "Page.setInterceptFileChooserDialog",
+                    json!({ "enabled": false }),
+                    Some(&session_id),
+                    deadline,
+                )
+                .await;
+
+            let chooser_backend_node_id = match chooser_result {
+                Ok(Some(backend_node_id)) => backend_node_id,
+                Ok(None) => {
+                    disable_result?;
+                    return Ok(tool_error(format!(
+                        "Element {uid} did not open a file chooser"
+                    )));
+                }
+                Err(error) => {
+                    let _ = disable_result;
+                    return Err(error);
+                }
+            };
+            disable_result?;
+            self.connection
+                .call(
+                    "DOM.setFileInputFiles",
+                    json!({
+                        "files": [file_path],
+                        "backendNodeId": chooser_backend_node_id,
+                    }),
+                    Some(&session_id),
+                    deadline,
+                )
+                .await?;
+        }
+
         let mut result = tool_success_text(format!("Uploaded file to element {uid}."));
         if arguments
             .get("includeSnapshot")
@@ -2674,17 +2797,41 @@ impl BrowserCdpTransport {
             .get("format")
             .and_then(Value::as_str)
             .unwrap_or("png");
+        if !matches!(format, "png" | "jpeg" | "webp") {
+            return Ok(tool_error(format!(
+                "Unsupported screenshot format '{format}'"
+            )));
+        }
+        let full_page = arguments
+            .get("fullPage")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let uid = arguments.get("uid").and_then(Value::as_str);
+        if full_page && uid.is_some() {
+            return Ok(tool_error(
+                "take_screenshot fullPage=true is incompatible with uid".to_string(),
+            ));
+        }
+        let quality = arguments.get("quality").and_then(Value::as_f64);
+        if let Some(quality) = quality
+            && (!quality.is_finite() || !(0.0..=100.0).contains(&quality))
+        {
+            return Ok(tool_error(
+                "Screenshot quality must be between 0 and 100".to_string(),
+            ));
+        }
+
         let mut capture = Map::new();
         capture.insert("format".to_string(), Value::String(format.to_string()));
         capture.insert("fromSurface".to_string(), Value::Bool(true));
         capture.insert("captureBeyondViewport".to_string(), Value::Bool(false));
-        if let Some(quality) = arguments.get("quality").and_then(Value::as_f64)
+        if let Some(quality) = quality
             && matches!(format, "jpeg" | "webp")
         {
             capture.insert("quality".to_string(), Value::from(quality.round() as i64));
         }
 
-        if let Some(uid) = arguments.get("uid").and_then(Value::as_str) {
+        if let Some(uid) = uid {
             let backend_node_id = self.element_backend_node(page_id, uid).await?;
             let model = self
                 .connection
@@ -2712,11 +2859,7 @@ impl BrowserCdpTransport {
                 "clip".to_string(),
                 json!({ "x": x, "y": y, "width": width, "height": height, "scale": 1 }),
             );
-        } else if arguments
-            .get("fullPage")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-        {
+        } else if full_page {
             capture.insert("captureBeyondViewport".to_string(), Value::Bool(true));
             let metrics = self
                 .connection
@@ -2941,7 +3084,8 @@ impl BrowserCdpTransport {
             let Some((level, text)) = entry else {
                 continue;
             };
-            if !type_filter.is_empty() && !type_filter.contains(&level.to_ascii_lowercase()) {
+            let level = browser_console_type(&level);
+            if !type_filter.is_empty() && !type_filter.contains(level) {
                 continue;
             }
             messages.push(json!({
@@ -3572,21 +3716,7 @@ impl BrowserCdpTransport {
                     "source": "MoonDesk native CDP",
                 }
             });
-            let mut file = std::fs::File::create(file_path).map_err(|error| {
-                BrowserTransportError::Protocol(format!(
-                    "Could not create performance trace at {file_path}: {error}"
-                ))
-            })?;
-            serde_json::to_writer(&mut file, &trace).map_err(|error| {
-                BrowserTransportError::Protocol(format!(
-                    "Could not encode performance trace: {error}"
-                ))
-            })?;
-            file.sync_all().map_err(|error| {
-                BrowserTransportError::Protocol(format!(
-                    "Could not sync performance trace at {file_path}: {error}"
-                ))
-            })?;
+            write_performance_trace_file(file_path, &trace)?;
             Ok(tool_success_text(format!("Saved to {file_path}.")))
         } else {
             Ok(tool_success_structured(
@@ -3920,6 +4050,17 @@ fn ax_value_string(value: Option<&Value>) -> Option<&str> {
         .and_then(Value::as_str)
 }
 
+fn ax_property_value(value: Option<&Value>) -> Option<String> {
+    let value = value?.get("value")?;
+    Some(match value {
+        Value::String(value) => format!("\"{}\"", escape_snapshot_text(value)),
+        Value::Bool(value) => value.to_string(),
+        Value::Number(value) => value.to_string(),
+        Value::Null => "null".to_string(),
+        other => value_to_compact_text(other),
+    })
+}
+
 fn escape_snapshot_text(value: &str) -> String {
     value
         .replace('\\', "\\\\")
@@ -3955,6 +4096,14 @@ fn quad_bounds(quad: &[Value]) -> Option<(f64, f64, f64, f64)> {
     let width = max_x - min_x;
     let height = max_y - min_y;
     (width > 0.0 && height > 0.0).then_some((min_x, min_y, width, height))
+}
+
+fn browser_console_type(level: &str) -> &str {
+    if level.eq_ignore_ascii_case("warning") {
+        "warn"
+    } else {
+        level
+    }
 }
 
 fn browser_string_filter(arguments: &Value, name: &str) -> HashSet<String> {
@@ -4025,16 +4174,17 @@ fn browser_pagination(
     arguments: &Value,
     total: usize,
 ) -> Result<(usize, usize, usize, usize), BrowserTransportError> {
-    let page_size = arguments
-        .get("pageSize")
-        .and_then(Value::as_u64)
-        .map(|value| usize::try_from(value).unwrap_or(usize::MAX))
-        .unwrap_or(DEFAULT_EVENT_PAGE_SIZE);
-    if page_size == 0 || page_size > MAX_EVENT_PAGE_SIZE {
-        return Err(BrowserTransportError::Protocol(format!(
-            "pageSize must be between 1 and {MAX_EVENT_PAGE_SIZE}"
-        )));
-    }
+    let page_size = if let Some(value) = arguments.get("pageSize").and_then(Value::as_u64) {
+        let page_size = usize::try_from(value).unwrap_or(usize::MAX);
+        if page_size == 0 || page_size > MAX_EVENT_PAGE_SIZE {
+            return Err(BrowserTransportError::Protocol(format!(
+                "pageSize must be between 1 and {MAX_EVENT_PAGE_SIZE}"
+            )));
+        }
+        page_size
+    } else {
+        total
+    };
     let page_idx = arguments
         .get("pageIdx")
         .and_then(Value::as_u64)
@@ -4097,6 +4247,51 @@ fn browser_network_body_preview(bytes: &[u8]) -> String {
         }
         Err(_) => format!("<binary body: {} bytes>", bytes.len()),
     }
+}
+
+fn write_performance_trace_file(
+    file_path: &str,
+    trace: &Value,
+) -> Result<(), BrowserTransportError> {
+    let file = std::fs::File::create(file_path).map_err(|error| {
+        BrowserTransportError::Protocol(format!(
+            "Could not create performance trace at {file_path}: {error}"
+        ))
+    })?;
+    let gzip = Path::new(file_path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("gz"));
+
+    if gzip {
+        let mut encoder = GzEncoder::new(file, Compression::default());
+        serde_json::to_writer(&mut encoder, trace).map_err(|error| {
+            BrowserTransportError::Protocol(format!(
+                "Could not encode compressed performance trace: {error}"
+            ))
+        })?;
+        let file = encoder.finish().map_err(|error| {
+            BrowserTransportError::Protocol(format!(
+                "Could not finish compressed performance trace at {file_path}: {error}"
+            ))
+        })?;
+        file.sync_all().map_err(|error| {
+            BrowserTransportError::Protocol(format!(
+                "Could not sync performance trace at {file_path}: {error}"
+            ))
+        })?;
+    } else {
+        let mut file = file;
+        serde_json::to_writer(&mut file, trace).map_err(|error| {
+            BrowserTransportError::Protocol(format!("Could not encode performance trace: {error}"))
+        })?;
+        file.sync_all().map_err(|error| {
+            BrowserTransportError::Protocol(format!(
+                "Could not sync performance trace at {file_path}: {error}"
+            ))
+        })?;
+    }
+    Ok(())
 }
 
 fn network_profile(name: &str) -> (bool, f64, f64, f64) {
@@ -4269,6 +4464,32 @@ mod tests {
         assert_eq!(key.key, "A");
         assert_eq!(key.code, "KeyA");
         assert_eq!(key.modifiers, 10);
+    }
+
+    #[test]
+    fn browser_console_warning_matches_public_warn_type() {
+        assert_eq!(browser_console_type("warning"), "warn");
+        assert_eq!(browser_console_type("WARN"), "WARN");
+        assert_eq!(browser_console_type("error"), "error");
+    }
+
+    #[test]
+    fn browser_pagination_returns_all_when_page_size_is_omitted() {
+        assert_eq!(
+            browser_pagination(&json!({}), 137).expect("default browser pagination"),
+            (0, 137, 0, 137)
+        );
+        assert_eq!(
+            browser_pagination(&json!({ "pageSize": 25, "pageIdx": 2 }), 137)
+                .expect("explicit browser pagination"),
+            (2, 25, 50, 75)
+        );
+        assert!(
+            browser_pagination(&json!({ "pageSize": MAX_EVENT_PAGE_SIZE + 1 }), 500)
+                .expect_err("explicit oversized page size must stay bounded")
+                .to_string()
+                .contains("pageSize")
+        );
     }
 
     #[test]

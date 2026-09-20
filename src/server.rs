@@ -1975,6 +1975,7 @@ mod tests {
 <label>Name <input id="name" placeholder="Type here"></label>
 <button id="toggle" type="button">Toggle state</button><strong id="state">OFF</strong>
 <label>Upload <input id="upload" type="file"></label><strong id="file-name">NONE</strong>
+<button id="chooser" type="button" onclick="document.getElementById('hidden-upload').click()">Choose hidden upload</button><input id="hidden-upload" type="file" style="display:none"><strong id="hidden-file-name">NONE</strong>
 <div class="spacer"></div><div id="bottom">BOTTOM MARKER</div></main>
 <script>
 console.log('MOONDESK_E2E_READY');
@@ -1982,6 +1983,7 @@ fetch('/ping').then(r=>r.text()).then(value=>console.log('MOONDESK_E2E_PING:'+va
 fetch('/echo',{method:'POST',headers:{'content-type':'text/plain'},body:'request-body'}).then(r=>r.text()).then(value=>console.log('MOONDESK_E2E_ECHO:'+value));
 document.getElementById('toggle').addEventListener('click',()=>{const s=document.getElementById('state');s.textContent=s.textContent==='OFF'?'ON':'OFF';});
 document.getElementById('upload').addEventListener('change',event=>{document.getElementById('file-name').textContent=event.target.files?.[0]?.name||'NONE';});
+document.getElementById('hidden-upload').addEventListener('change',event=>{document.getElementById('hidden-file-name').textContent=event.target.files?.[0]?.name||'NONE';});
 </script>
 </body></html>"#;
         const SECOND_HTML: &str = r#"<!doctype html><html><head><title>MoonDesk Second Page</title></head><body><h1>SECOND PAGE</h1><script>console.log('MOONDESK_SECOND_READY');fetch('/second-ping').then(r=>r.text()).then(value=>console.log('MOONDESK_SECOND_PING:'+value));</script></body></html>"#;
@@ -2124,6 +2126,7 @@ document.getElementById('upload').addEventListener('change',event=>{document.get
         let input_uid = snapshot_uid(mobile_snapshot_text, "textbox");
         let button_uid = snapshot_uid(mobile_snapshot_text, "button \"Toggle state\"");
         let upload_uid = snapshot_uid(mobile_snapshot_text, "button \"Upload \"");
+        let chooser_uid = snapshot_uid(mobile_snapshot_text, "button \"Choose hidden upload\"");
         let external_upload_arg = external_upload_fixture.to_string_lossy().into_owned();
         let upload = host_browser_request(
             host_address,
@@ -2133,6 +2136,18 @@ document.getElementById('upload').addEventListener('change',event=>{document.get
         )
         .await;
         assert_eq!(upload.get("success").and_then(Value::as_bool), Some(true));
+        let chooser_upload = host_browser_request(
+            host_address,
+            &workspace_root,
+            "upload_file",
+            &[chooser_uid.as_str(), external_upload_arg.as_str()],
+        )
+        .await;
+        assert_eq!(
+            chooser_upload.get("success").and_then(Value::as_bool),
+            Some(true),
+            "custom upload button should use the intercepted file chooser: {chooser_upload}"
+        );
 
         let fill = host_browser_request(
             host_address,
@@ -2155,7 +2170,7 @@ document.getElementById('upload').addEventListener('change',event=>{document.get
             host_browser_request(host_address, &workspace_root, "scroll", &["0", "1400"]).await;
         assert_eq!(scroll.get("success").and_then(Value::as_bool), Some(true));
 
-        let inspect_script = "() => ({width: innerWidth, height: innerHeight, value: document.querySelector('#name').value, state: document.querySelector('#state').textContent, uploaded: document.querySelector('#file-name').textContent, scrolled: scrollY > 500})";
+        let inspect_script = "() => ({width: innerWidth, height: innerHeight, value: document.querySelector('#name').value, state: document.querySelector('#state').textContent, uploaded: document.querySelector('#file-name').textContent, chooserUploaded: document.querySelector('#hidden-file-name').textContent, scrolled: scrollY > 500})";
         let inspection = host_browser_request(
             host_address,
             &workspace_root,
@@ -2184,6 +2199,13 @@ document.getElementById('upload').addEventListener('change',event=>{document.get
                 "inspection did not contain {expected:?}: {inspection_text}"
             );
         }
+        assert!(
+            inspection_text
+                .matches("external-upload-fixture.txt")
+                .count()
+                >= 2,
+            "both the direct file input and custom chooser button should receive the upload: {inspection_text}"
+        );
 
         let console =
             host_browser_request(host_address, &workspace_root, "list_console_messages", &[]).await;

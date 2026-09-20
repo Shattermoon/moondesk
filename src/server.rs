@@ -1983,9 +1983,12 @@ document.getElementById('toggle').addEventListener('click',()=>{const s=document
 document.getElementById('upload').addEventListener('change',event=>{document.getElementById('file-name').textContent=event.target.files?.[0]?.name||'NONE';});
 </script>
 </body></html>"#;
+        const SECOND_HTML: &str = r#"<!doctype html><html><head><title>MoonDesk Second Page</title></head><body><h1>SECOND PAGE</h1><script>console.log('MOONDESK_SECOND_READY');fetch('/second-ping').then(r=>r.text()).then(value=>console.log('MOONDESK_SECOND_PING:'+value));</script></body></html>"#;
         let site_app = Router::new()
             .route("/", get(|| async { Html(SITE_HTML) }))
-            .route("/ping", get(|| async { "pong" }));
+            .route("/ping", get(|| async { "pong" }))
+            .route("/second", get(|| async { Html(SECOND_HTML) }))
+            .route("/second-ping", get(|| async { "second-pong" }));
         let site_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind local test site");
@@ -2283,6 +2286,85 @@ document.getElementById('upload').addEventListener('change',event=>{document.get
         assert!(
             cli_after_mcp_text.contains("ON"),
             "MCP session mutated the CLI page: {cli_after_mcp_text}"
+        );
+
+        let second_url = format!("http://{site_address}/second");
+        let second_navigation_arg = format!("--url={second_url}");
+        let second_navigation = host_browser_request(
+            host_address,
+            &workspace_root,
+            "navigate_page",
+            &[second_navigation_arg.as_str()],
+        )
+        .await;
+        assert_eq!(
+            second_navigation.get("success").and_then(Value::as_bool),
+            Some(true)
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let current_console =
+            host_browser_request(host_address, &workspace_root, "list_console_messages", &[]).await;
+        let current_console_text = current_console
+            .get("stdout")
+            .and_then(Value::as_str)
+            .expect("current-navigation console stdout");
+        assert!(
+            current_console_text.contains("MOONDESK_SECOND_READY"),
+            "current console inspection missed the second navigation: {current_console_text}"
+        );
+        assert!(
+            !current_console_text.contains("MOONDESK_E2E_READY"),
+            "default console inspection leaked the previous navigation: {current_console_text}"
+        );
+
+        let preserved_console = host_browser_request(
+            host_address,
+            &workspace_root,
+            "list_console_messages",
+            &["--includePreservedMessages=true"],
+        )
+        .await;
+        let preserved_console_text = preserved_console
+            .get("stdout")
+            .and_then(Value::as_str)
+            .expect("preserved console stdout");
+        assert!(
+            preserved_console_text.contains("MOONDESK_SECOND_READY")
+                && preserved_console_text.contains("MOONDESK_E2E_READY"),
+            "preserved console inspection did not retain recent navigations: {preserved_console_text}"
+        );
+
+        let current_network =
+            host_browser_request(host_address, &workspace_root, "list_network_requests", &[]).await;
+        let current_network_text = current_network
+            .get("stdout")
+            .and_then(Value::as_str)
+            .expect("current-navigation network stdout");
+        assert!(
+            current_network_text.contains("/second-ping") && current_network_text.contains("[200]"),
+            "current network inspection missed the completed second-page request: {current_network_text}"
+        );
+        assert!(
+            !current_network_text.contains("/ping "),
+            "default network inspection leaked the previous navigation: {current_network_text}"
+        );
+
+        let preserved_network = host_browser_request(
+            host_address,
+            &workspace_root,
+            "list_network_requests",
+            &["--includePreservedRequests=true"],
+        )
+        .await;
+        let preserved_network_text = preserved_network
+            .get("stdout")
+            .and_then(Value::as_str)
+            .expect("preserved network stdout");
+        assert!(
+            preserved_network_text.contains("/second-ping")
+                && preserved_network_text.contains("/ping "),
+            "preserved network inspection did not retain recent navigations: {preserved_network_text}"
         );
 
         let mcp_body = serde_json::to_vec(&json!({

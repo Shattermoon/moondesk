@@ -204,6 +204,11 @@
         "name": "types",
         "type": "array",
         "required": false
+      },
+      {
+        "name": "includePreservedMessages",
+        "type": "boolean",
+        "required": false
       }
     ],
     "list_network_requests": [
@@ -220,6 +225,11 @@
       {
         "name": "resourceTypes",
         "type": "array",
+        "required": false
+      },
+      {
+        "name": "includePreservedRequests",
+        "type": "boolean",
         "required": false
       }
     ],

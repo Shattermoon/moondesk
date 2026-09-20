@@ -2731,9 +2731,14 @@ impl BrowserCdpTransport {
         let page_id = self.page_id_from_arguments(arguments).await?;
         let session_id = self.ensure_page_session(page_id, deadline).await?;
         let type_filter = browser_string_filter(arguments, "types");
+        let include_preserved = arguments
+            .get("includePreservedMessages")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let events = self.connection.events_for_session(&session_id).await;
+        let cutoff = console_history_cutoff(&events, include_preserved);
         let mut messages = Vec::new();
-        for event in events {
+        for event in events.into_iter().filter(|event| event.id >= cutoff) {
             let entry = match event.method.as_str() {
                 "Runtime.consoleAPICalled" => {
                     let level = event
@@ -2861,9 +2866,14 @@ impl BrowserCdpTransport {
         let page_id = self.page_id_from_arguments(arguments).await?;
         let session_id = self.ensure_page_session(page_id, deadline).await?;
         let resource_filter = browser_string_filter(arguments, "resourceTypes");
+        let include_preserved = arguments
+            .get("includePreservedRequests")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let events = self.connection.events_for_session(&session_id).await;
+        let cutoff = network_history_cutoff(&events, include_preserved);
         let mut seen = HashMap::<String, Value>::new();
-        for event in events {
+        for event in events.iter().filter(|event| event.id >= cutoff) {
             if event.method != "Network.requestWillBeSent" {
                 continue;
             }
@@ -2900,9 +2910,62 @@ impl BrowserCdpTransport {
                     "method": method,
                     "url": url,
                     "resourceType": resource_type,
+                    "status": Value::Null,
+                    "statusText": Value::Null,
+                    "failureText": Value::Null,
                 }),
             );
         }
+
+        for event in events.iter().filter(|event| event.id >= cutoff) {
+            let Some(request_id) = event.params.get("requestId").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(request) = seen.get_mut(request_id).and_then(Value::as_object_mut) else {
+                continue;
+            };
+            match event.method.as_str() {
+                "Network.responseReceived" => {
+                    let response = event.params.get("response").unwrap_or(&Value::Null);
+                    if let Some(status) = response.get("status").cloned() {
+                        request.insert("status".to_string(), status);
+                    }
+                    if let Some(status_text) = response.get("statusText").cloned() {
+                        request.insert("statusText".to_string(), status_text);
+                    }
+                    if let Some(mime_type) = response.get("mimeType").cloned() {
+                        request.insert("mimeType".to_string(), mime_type);
+                    }
+                    if let Some(protocol) = response.get("protocol").cloned() {
+                        request.insert("protocol".to_string(), protocol);
+                    }
+                    if let Some(from_disk_cache) = response.get("fromDiskCache").cloned() {
+                        request.insert("fromDiskCache".to_string(), from_disk_cache);
+                    }
+                    if let Some(from_service_worker) = response.get("fromServiceWorker").cloned() {
+                        request.insert("fromServiceWorker".to_string(), from_service_worker);
+                    }
+                }
+                "Network.loadingFailed" => {
+                    if let Some(error_text) = event.params.get("errorText").cloned() {
+                        request.insert("failureText".to_string(), error_text);
+                    }
+                    if let Some(canceled) = event.params.get("canceled").cloned() {
+                        request.insert("canceled".to_string(), canceled);
+                    }
+                    if let Some(blocked_reason) = event.params.get("blockedReason").cloned() {
+                        request.insert("blockedReason".to_string(), blocked_reason);
+                    }
+                }
+                "Network.loadingFinished" => {
+                    if let Some(encoded_length) = event.params.get("encodedDataLength").cloned() {
+                        request.insert("encodedDataLength".to_string(), encoded_length);
+                    }
+                }
+                _ => {}
+            }
+        }
+
         let mut requests = seen.into_values().collect::<Vec<_>>();
         requests.sort_by_key(|request| request.get("id").and_then(Value::as_u64).unwrap_or(0));
 
@@ -2911,8 +2974,20 @@ impl BrowserCdpTransport {
         let text = page
             .iter()
             .map(|request| {
+                let status = request
+                    .get("failureText")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                    .map(|value| format!("failed: {value}"))
+                    .or_else(|| {
+                        request
+                            .get("status")
+                            .and_then(Value::as_f64)
+                            .map(|value| format!("{value:.0}"))
+                    })
+                    .unwrap_or_else(|| "pending".to_string());
                 format!(
-                    "{}: {} {} [{}] requestId={}",
+                    "{}: {} {} [{}] [{}] requestId={}",
                     request.get("id").and_then(Value::as_u64).unwrap_or(0),
                     request
                         .get("method")
@@ -2922,6 +2997,7 @@ impl BrowserCdpTransport {
                         .get("url")
                         .and_then(Value::as_str)
                         .unwrap_or_default(),
+                    status,
                     request
                         .get("resourceType")
                         .and_then(Value::as_str)
@@ -3529,6 +3605,59 @@ fn browser_string_filter(arguments: &Value, name: &str) -> HashSet<String> {
         .filter_map(Value::as_str)
         .map(|value| value.to_ascii_lowercase())
         .collect()
+}
+
+fn selected_main_frame_navigation<'a>(
+    events: &'a [CdpEvent],
+    include_preserved: bool,
+) -> Option<&'a CdpEvent> {
+    let navigations = events
+        .iter()
+        .filter(|event| {
+            event.method == "Page.frameNavigated"
+                && event
+                    .params
+                    .pointer("/frame/parentId")
+                    .and_then(Value::as_str)
+                    .is_none()
+        })
+        .collect::<Vec<_>>();
+    if navigations.is_empty() {
+        return None;
+    }
+    let index = if include_preserved {
+        navigations.len().saturating_sub(3)
+    } else {
+        navigations.len() - 1
+    };
+    navigations.get(index).copied()
+}
+
+fn console_history_cutoff(events: &[CdpEvent], include_preserved: bool) -> u64 {
+    selected_main_frame_navigation(events, include_preserved).map_or(0, |event| event.id)
+}
+
+fn network_history_cutoff(events: &[CdpEvent], include_preserved: bool) -> u64 {
+    let Some(navigation) = selected_main_frame_navigation(events, include_preserved) else {
+        return 0;
+    };
+    let Some(loader_id) = navigation
+        .params
+        .pointer("/frame/loaderId")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+    else {
+        return navigation.id;
+    };
+    events
+        .iter()
+        .filter(|event| {
+            event.method == "Network.requestWillBeSent"
+                && event.params.get("loaderId").and_then(Value::as_str) == Some(loader_id)
+        })
+        .map(|event| event.id)
+        .min()
+        .unwrap_or(navigation.id)
 }
 
 fn browser_pagination(

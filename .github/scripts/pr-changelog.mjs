@@ -11,15 +11,22 @@ function normalizeMarkdown(value) {
   return String(value ?? "").replace(/\r\n?/g, "\n");
 }
 
-function visibleLineMap(lines) {
-  const visible = new Array(lines.length).fill(true);
+function trimBlankLines(lines) {
+  let start = 0;
+  let end = lines.length;
+  while (start < end && lines[start].trim() === "") start += 1;
+  while (end > start && lines[end - 1].trim() === "") end -= 1;
+  return lines.slice(start, end).join("\n");
+}
+
+function markdownLineRecords(lines) {
+  const records = [];
   let fence = null;
+  let inHtmlComment = false;
 
-  for (let index = 0; index < lines.length; index += 1) {
-    const line = lines[index];
-
+  for (const line of lines) {
     if (fence) {
-      visible[index] = false;
+      records.push({ visible: "", rendered: line });
       const trimmed = line.trim();
       const marker = fence.character.repeat(fence.length);
       if (trimmed.startsWith(marker) && /^(`{3,}|~{3,})\s*$/.test(trimmed)) {
@@ -28,24 +35,57 @@ function visibleLineMap(lines) {
       continue;
     }
 
-    const match = /^\s*(`{3,}|~{3,})/.exec(line);
-    if (match) {
-      const token = match[1];
-      fence = { character: token[0], length: token.length };
-      visible[index] = false;
+    let visible = "";
+    let cursor = 0;
+    while (cursor < line.length) {
+      if (inHtmlComment) {
+        const commentEnd = line.indexOf("-->", cursor);
+        if (commentEnd < 0) {
+          cursor = line.length;
+          break;
+        }
+        inHtmlComment = false;
+        cursor = commentEnd + 3;
+        continue;
+      }
+
+      const commentStart = line.indexOf("<!--", cursor);
+      if (commentStart < 0) {
+        visible += line.slice(cursor);
+        break;
+      }
+      visible += line.slice(cursor, commentStart);
+      const commentEnd = line.indexOf("-->", commentStart + 4);
+      if (commentEnd < 0) {
+        inHtmlComment = true;
+        cursor = line.length;
+        break;
+      }
+      cursor = commentEnd + 3;
     }
+
+    visible = visible.replace(/[ \t]+$/, "");
+    const fenceMatch = /^ {0,3}(`{3,}|~{3,})/.exec(visible);
+    if (fenceMatch) {
+      const token = fenceMatch[1];
+      fence = { character: token[0], length: token.length };
+      records.push({ visible: "", rendered: visible });
+      continue;
+    }
+
+    records.push({ visible, rendered: visible });
   }
 
-  return visible;
+  return records;
 }
 
 export function extractChangelog(body) {
   const lines = normalizeMarkdown(body).split("\n");
-  const visible = visibleLineMap(lines);
+  const records = markdownLineRecords(lines);
   const headings = [];
 
   for (let index = 0; index < lines.length; index += 1) {
-    if (visible[index] && /^ {0,3}##[ \t]+Changelog[ \t]*$/.test(lines[index])) {
+    if (/^ {0,3}##[ \t]+Changelog[ \t]*$/.test(records[index].visible)) {
       headings.push(index);
     }
   }
@@ -60,13 +100,15 @@ export function extractChangelog(body) {
   const start = headings[0] + 1;
   let end = lines.length;
   for (let index = start; index < lines.length; index += 1) {
-    if (visible[index] && /^ {0,3}#{1,2}(?:[ \t]+\S|[ \t]*$)/.test(lines[index])) {
+    if (/^ {0,3}#{1,2}(?:[ \t]+\S|[ \t]*$)/.test(records[index].visible)) {
       end = index;
       break;
     }
   }
 
-  const changelog = lines.slice(start, end).join("\n").trim();
+  const changelog = trimBlankLines(
+    records.slice(start, end).map((record) => record.rendered),
+  );
   if (!changelog) {
     throw new Error("`## Changelog` must not be empty.");
   }
@@ -83,10 +125,8 @@ export function validateChangelog(body) {
   }
 
   const lines = changelog.split("\n");
-  const visible = visibleLineMap(lines);
-  const hasBullet = lines.some(
-    (line, index) => visible[index] && /^ {0,3}[-*+][ \t]+\S/.test(line),
-  );
+  const records = markdownLineRecords(lines);
+  const hasBullet = records.some((record) => /^[-*+][ \t]+\S/.test(record.visible));
   if (!hasBullet) {
     throw new Error(
       "`## Changelog` must contain at least one Markdown bullet or exactly " +
@@ -105,7 +145,7 @@ export function releaseMetadataFingerprint(pr) {
   const canonical = JSON.stringify({
     number: Number(pr.number),
     title: String(pr.title ?? ""),
-    body: normalizeMarkdown(pr.body ?? ""),
+    changelog: validateChangelog(pr.body ?? ""),
     html_url: String(pr.html_url ?? ""),
     user_login: String(pr.user?.login ?? ""),
   });

@@ -392,7 +392,7 @@ function normalizeReleaseNotes(body) {
   const seen = new Set();
   const lines = structured ?? body.split(/\r?\n/);
   for (const line of lines) {
-    if (structured && !/^ {0,3}[-*+][ \t]+\S/.test(line)) continue;
+    if (structured && !/^[-*+][ \t]+\S/.test(line)) continue;
     const note = normalizeChangelogLine(line);
     if (!note || seen.has(note)) continue;
     seen.add(note);

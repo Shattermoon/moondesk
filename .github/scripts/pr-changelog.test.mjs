@@ -48,6 +48,26 @@ test("ignores changelog-looking headings inside fenced and indented code blocks"
   assert.equal(validateChangelog(body), "- Real user-visible change.");
 });
 
+test("HTML comments cannot supply changelog headings or bullets", () => {
+  const body = `<!--
+## Changelog
+- Hidden heading and bullet.
+-->
+
+## Changelog
+
+<!--
+- Hidden release note.
+-->
+- Visible release note. <!-- hidden suffix -->
+`;
+  assert.equal(validateChangelog(body), "- Visible release note.");
+  assert.throws(
+    () => validateChangelog("## Changelog\n\n<!--\n- Hidden release note.\n-->"),
+    /must not be empty/,
+  );
+});
+
 test("requires exactly one non-empty changelog section", () => {
   assert.throws(() => validateChangelog("## Summary\nNothing"), /exactly one/);
   assert.throws(() => validateChangelog("## Changelog\n\n## Validation\n- ok"), /must not be empty/);
@@ -64,6 +84,10 @@ test("requires release-note bullets or the explicit internal-only sentence", () 
   );
   assert.throws(
     () => validateChangelog("## Changelog\nFixed a thing."),
+    /Markdown bullet/,
+  );
+  assert.throws(
+    () => validateChangelog("## Changelog\n  - Nested-only change."),
     /Markdown bullet/,
   );
   assert.equal(
@@ -108,6 +132,20 @@ test("release metadata fingerprint is stable across line endings and changes wit
     body: "## Changelog\n\n- Better notes.\n",
   };
   assert.equal(releaseMetadataFingerprint(base), releaseMetadataFingerprint(normalized));
+  assert.equal(
+    releaseMetadataFingerprint(base),
+    releaseMetadataFingerprint({
+      ...normalized,
+      body: `## Summary
+A bot may rewrite this non-release section.
+
+${normalized.body}
+
+## Validation
+- Updated after the release gate.
+`,
+    }),
+  );
   assert.notEqual(
     releaseMetadataFingerprint(base),
     releaseMetadataFingerprint({ ...normalized, title: "fix: changed after merge" }),

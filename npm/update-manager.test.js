@@ -219,6 +219,7 @@ test("structured release notes expose only the validated changelog section", () 
 Context that belongs on the release page but not in the terminal changelog.
 
 - Release notes now use validated PR changelog bullets.
+  - Nested implementation detail that should not become a separate update item.
 - Release recovery refreshes the same notes.
 
 ## Pull request

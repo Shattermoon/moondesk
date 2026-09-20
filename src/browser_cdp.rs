@@ -2428,7 +2428,7 @@ impl BrowserCdpTransport {
                         serde_json::to_string(text).unwrap_or_else(|_| "\"\"".to_string())
                     ))
                     .collect::<Vec<_>>()
-                    .join(" && ")
+                    .join(" || ")
             );
             let visible = match self
                 .evaluate_value(&session_id, &expression, wait_deadline)

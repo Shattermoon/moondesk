@@ -8057,6 +8057,38 @@ mod tests {
             .expect("connector wait_for stdout");
         assert!(waited_stdout.contains("ready-text"), "{waited_stdout}");
 
+        let waited_any = handle_tools_call(
+            &tool_call_request(
+                "wait_for",
+                json!({
+                    "text": ["definitely-missing-alternative", "ready-text"],
+                    "timeout": 3_000
+                }),
+            ),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::ReadOnly,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        assert_ne!(
+            waited_any
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true),
+            "wait_for must resolve when any requested text appears: {}",
+            result_text(&waited_any)
+        );
+        assert!(
+            browser_stdout(&waited_any).contains("ready-text"),
+            "wait_for any-text success should return a fresh page snapshot: {}",
+            browser_stdout(&waited_any)
+        );
+
         let scheduled_block = handle_tools_call(
             &tool_call_request(
                 "evaluate_script",

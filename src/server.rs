@@ -1989,6 +1989,16 @@ document.getElementById('upload').addEventListener('change',event=>{document.get
             .route("/", get(|| async { Html(SITE_HTML) }))
             .route("/ping", get(|| async { "pong" }))
             .route("/echo", post(|body: String| async move { body }))
+            .route(
+                "/header",
+                get(|headers: HeaderMap| async move {
+                    headers
+                        .get("x-moondesk-test")
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or("NONE")
+                        .to_string()
+                }),
+            )
             .route("/second", get(|| async { Html(SECOND_HTML) }))
             .route("/second-ping", get(|| async { "second-pong" }));
         let site_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -2275,6 +2285,102 @@ document.getElementById('upload').addEventListener('change',event=>{document.get
             std::fs::read_to_string(workspace_root.join("artifacts/echo-response.txt"))
                 .expect("read exported response body"),
             "request-body"
+        );
+
+        let set_headers = host_browser_request(
+            host_address,
+            &workspace_root,
+            "emulate",
+            &[r#"--extraHttpHeaders={"X-MoonDesk-Test":"active"}"#],
+        )
+        .await;
+        assert_eq!(
+            set_headers.get("success").and_then(Value::as_bool),
+            Some(true)
+        );
+        let header_active = host_browser_request(
+            host_address,
+            &workspace_root,
+            "evaluate_script",
+            &["async () => await fetch('/header').then(r => r.text())"],
+        )
+        .await;
+        assert!(
+            header_active
+                .get("stdout")
+                .and_then(Value::as_str)
+                .is_some_and(|text| text.contains("active")),
+            "emulated extra header was not applied: {header_active}"
+        );
+
+        let clear_headers = host_browser_request(
+            host_address,
+            &workspace_root,
+            "emulate",
+            &["--extraHttpHeaders="],
+        )
+        .await;
+        assert_eq!(
+            clear_headers.get("success").and_then(Value::as_bool),
+            Some(true)
+        );
+        let header_cleared = host_browser_request(
+            host_address,
+            &workspace_root,
+            "evaluate_script",
+            &["async () => await fetch('/header').then(r => r.text())"],
+        )
+        .await;
+        assert!(
+            header_cleared
+                .get("stdout")
+                .and_then(Value::as_str)
+                .is_some_and(|text| text.contains("NONE")),
+            "empty extraHttpHeaders must clear the persisted header set: {header_cleared}"
+        );
+
+        let offline = host_browser_request(
+            host_address,
+            &workspace_root,
+            "emulate",
+            &["--networkConditions=Offline"],
+        )
+        .await;
+        assert_eq!(offline.get("success").and_then(Value::as_bool), Some(true));
+        let offline_fetch = host_browser_request(
+            host_address,
+            &workspace_root,
+            "evaluate_script",
+            &["async () => { try { return await fetch('/ping').then(r => r.text()); } catch (_) { return 'offline'; } }"],
+        )
+        .await;
+        assert!(
+            offline_fetch
+                .get("stdout")
+                .and_then(Value::as_str)
+                .is_some_and(|text| text.contains("offline")),
+            "Offline emulation did not block the local request: {offline_fetch}"
+        );
+
+        let reset_emulation =
+            host_browser_request(host_address, &workspace_root, "emulate", &[]).await;
+        assert_eq!(
+            reset_emulation.get("success").and_then(Value::as_bool),
+            Some(true)
+        );
+        let online_fetch = host_browser_request(
+            host_address,
+            &workspace_root,
+            "evaluate_script",
+            &["async () => await fetch('/ping').then(r => r.text())"],
+        )
+        .await;
+        assert!(
+            online_fetch
+                .get("stdout")
+                .and_then(Value::as_str)
+                .is_some_and(|text| text.contains("pong")),
+            "omitting networkConditions must disable prior throttling: {online_fetch}"
         );
 
         let screenshot = host_browser_request(

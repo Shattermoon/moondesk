@@ -2553,7 +2553,9 @@ impl BrowserCdpTransport {
                 )
                 .await?;
         }
-        if let Some(geolocation) = arguments.get("geolocation").and_then(Value::as_str) {
+        if let Some(geolocation) = arguments.get("geolocation").and_then(Value::as_str)
+            && !geolocation.trim().is_empty()
+        {
             let mut parts = geolocation.split(',').map(str::trim);
             let latitude = parts.next().and_then(|value| value.parse::<f64>().ok());
             let longitude = parts.next().and_then(|value| value.parse::<f64>().ok());
@@ -2562,6 +2564,15 @@ impl BrowserCdpTransport {
                     "geolocation must be formatted as latitude,longitude".to_string(),
                 ));
             };
+            if parts.next().is_some()
+                || !(-90.0..=90.0).contains(&latitude)
+                || !(-180.0..=180.0).contains(&longitude)
+            {
+                return Ok(tool_error(
+                    "geolocation must contain latitude between -90 and 90 and longitude between -180 and 180"
+                        .to_string(),
+                ));
+            }
             self.connection
                 .call(
                     "Emulation.setGeolocationOverride",
@@ -2574,16 +2585,34 @@ impl BrowserCdpTransport {
                     deadline,
                 )
                 .await?;
+        } else {
+            self.connection
+                .call(
+                    "Emulation.clearGeolocationOverride",
+                    json!({}),
+                    Some(&session_id),
+                    deadline,
+                )
+                .await?;
         }
         if let Some(headers) = arguments.get("extraHttpHeaders").and_then(Value::as_str) {
-            let parsed: Value = serde_json::from_str(headers).map_err(|error| {
-                BrowserTransportError::Protocol(format!(
-                    "extraHttpHeaders must be a JSON object: {error}"
-                ))
-            })?;
-            if !parsed.is_object() {
+            let parsed = if headers.trim().is_empty() {
+                json!({})
+            } else {
+                serde_json::from_str::<Value>(headers).map_err(|error| {
+                    BrowserTransportError::Protocol(format!(
+                        "extraHttpHeaders must be a JSON object: {error}"
+                    ))
+                })?
+            };
+            let Some(parsed_headers) = parsed.as_object() else {
                 return Ok(tool_error(
                     "extraHttpHeaders must be a JSON object".to_string(),
+                ));
+            };
+            if parsed_headers.values().any(|value| !value.is_string()) {
+                return Ok(tool_error(
+                    "extraHttpHeaders values must all be strings".to_string(),
                 ));
             }
             self.connection
@@ -2595,32 +2624,42 @@ impl BrowserCdpTransport {
                 )
                 .await?;
         }
-        if let Some(network) = arguments.get("networkConditions").and_then(Value::as_str) {
-            let (offline, latency, down, up) = network_profile(network);
-            self.connection
-                .call(
-                    "Network.emulateNetworkConditions",
-                    json!({
-                        "offline": offline,
-                        "latency": latency,
-                        "downloadThroughput": down,
-                        "uploadThroughput": up,
-                    }),
-                    Some(&session_id),
-                    deadline,
-                )
-                .await?;
+        let network = arguments
+            .get("networkConditions")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let (offline, latency, down, up) = network_profile(network);
+        self.connection
+            .call(
+                "Network.emulateNetworkConditions",
+                json!({
+                    "offline": offline,
+                    "latency": latency,
+                    "downloadThroughput": down,
+                    "uploadThroughput": up,
+                }),
+                Some(&session_id),
+                deadline,
+            )
+            .await?;
+
+        let rate = arguments
+            .get("cpuThrottlingRate")
+            .and_then(Value::as_f64)
+            .unwrap_or(1.0);
+        if !rate.is_finite() || !(1.0..=20.0).contains(&rate) {
+            return Ok(tool_error(
+                "cpuThrottlingRate must be between 1 and 20".to_string(),
+            ));
         }
-        if let Some(rate) = arguments.get("cpuThrottlingRate").and_then(Value::as_f64) {
-            self.connection
-                .call(
-                    "Emulation.setCPUThrottlingRate",
-                    json!({ "rate": rate }),
-                    Some(&session_id),
-                    deadline,
-                )
-                .await?;
-        }
+        self.connection
+            .call(
+                "Emulation.setCPUThrottlingRate",
+                json!({ "rate": rate }),
+                Some(&session_id),
+                deadline,
+            )
+            .await?;
         Ok(tool_success_text("Browser emulation updated.".to_string()))
     }
 

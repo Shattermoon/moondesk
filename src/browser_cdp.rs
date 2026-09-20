@@ -2829,10 +2829,8 @@ impl BrowserCdpTransport {
     ) -> Result<Value, BrowserTransportError> {
         let page_id = self.page_id_from_arguments(arguments).await?;
         let session_id = self.ensure_page_session(page_id, deadline).await?;
-        let requested = arguments
-            .get("msgid")
-            .and_then(Value::as_u64)
-            .or_else(|| arguments.get("messageId").and_then(Value::as_u64))
+        let requested = optional_u64(arguments, "msgid")
+            .or_else(|| optional_u64(arguments, "messageId"))
             .ok_or_else(|| {
                 BrowserTransportError::Protocol(
                     "get_console_message requires a numeric message id".to_string(),
@@ -3028,27 +3026,234 @@ impl BrowserCdpTransport {
     ) -> Result<Value, BrowserTransportError> {
         let page_id = self.page_id_from_arguments(arguments).await?;
         let session_id = self.ensure_page_session(page_id, deadline).await?;
-        let requested = arguments
-            .get("reqid")
-            .and_then(Value::as_u64)
-            .or_else(|| arguments.get("requestId").and_then(Value::as_u64))
-            .ok_or_else(|| {
-                BrowserTransportError::Protocol(
-                    "get_network_request requires a numeric request id".to_string(),
-                )
-            })?;
-        let event = self
-            .connection
-            .events_for_session(&session_id)
-            .await
-            .into_iter()
+        let requested =
+            optional_u64(arguments, "reqid").or_else(|| optional_u64(arguments, "requestId"));
+        let Some(requested) = requested else {
+            return Ok(tool_success_text(
+                "Nothing is currently selected in the DevTools Network panel.".to_string(),
+            ));
+        };
+
+        let events = self.connection.events_for_session(&session_id).await;
+        let event = events
+            .iter()
             .find(|event| event.id == requested && event.method == "Network.requestWillBeSent");
         let Some(event) = event else {
             return Ok(tool_error(format!(
                 "Network request {requested} was not found"
             )));
         };
-        Ok(tool_success_text(value_to_compact_text(&event.params)))
+        let request_id = event
+            .params
+            .get("requestId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                BrowserTransportError::Protocol(format!(
+                    "Network request {requested} is missing its Chrome request id"
+                ))
+            })?;
+        let request = event.params.get("request").unwrap_or(&Value::Null);
+        let method = request
+            .get("method")
+            .and_then(Value::as_str)
+            .unwrap_or("GET");
+        let url = request
+            .get("url")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+
+        let response_event = events.iter().rev().find(|candidate| {
+            candidate.id >= event.id
+                && candidate.method == "Network.responseReceived"
+                && candidate.params.get("requestId").and_then(Value::as_str) == Some(request_id)
+        });
+        let failure_event = events.iter().rev().find(|candidate| {
+            candidate.id >= event.id
+                && candidate.method == "Network.loadingFailed"
+                && candidate.params.get("requestId").and_then(Value::as_str) == Some(request_id)
+        });
+        let response = response_event
+            .and_then(|candidate| candidate.params.get("response"))
+            .unwrap_or(&Value::Null);
+
+        let mut request_body = request
+            .get("postData")
+            .and_then(Value::as_str)
+            .map(|value| value.as_bytes().to_vec());
+        if request_body.is_none() && !matches!(method, "GET" | "HEAD") {
+            match self
+                .connection
+                .call(
+                    "Network.getRequestPostData",
+                    json!({ "requestId": request_id }),
+                    Some(&session_id),
+                    deadline,
+                )
+                .await
+            {
+                Ok(result) => {
+                    request_body = result
+                        .get("postData")
+                        .and_then(Value::as_str)
+                        .map(|value| value.as_bytes().to_vec());
+                }
+                Err(BrowserTransportError::Protocol(_)) => {}
+                Err(error) => return Err(error),
+            }
+        }
+
+        let mut response_body = None;
+        if response_event.is_some() {
+            match self
+                .connection
+                .call(
+                    "Network.getResponseBody",
+                    json!({ "requestId": request_id }),
+                    Some(&session_id),
+                    deadline,
+                )
+                .await
+            {
+                Ok(result) => {
+                    if let Some(body) = result.get("body").and_then(Value::as_str) {
+                        if result
+                            .get("base64Encoded")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false)
+                        {
+                            response_body = Some(
+                                base64::engine::general_purpose::STANDARD
+                                    .decode(body)
+                                    .map_err(|error| {
+                                        BrowserTransportError::Protocol(format!(
+                                            "Could not decode response body for request {requested}: {error}"
+                                        ))
+                                    })?,
+                            );
+                        } else {
+                            response_body = Some(body.as_bytes().to_vec());
+                        }
+                    }
+                }
+                Err(BrowserTransportError::Protocol(_)) => {}
+                Err(error) => return Err(error),
+            }
+        }
+
+        let request_file_path = arguments.get("requestFilePath").and_then(Value::as_str);
+        if let Some(path) = request_file_path {
+            std::fs::write(path, request_body.as_deref().unwrap_or_default()).map_err(|error| {
+                BrowserTransportError::Protocol(format!(
+                    "Could not write browser request body to {path}: {error}"
+                ))
+            })?;
+        }
+
+        let response_file_path = arguments.get("responseFilePath").and_then(Value::as_str);
+        if let Some(path) = response_file_path {
+            let unavailable = b"<not available anymore>".as_slice();
+            std::fs::write(path, response_body.as_deref().unwrap_or(unavailable)).map_err(
+                |error| {
+                    BrowserTransportError::Protocol(format!(
+                        "Could not write browser response body to {path}: {error}"
+                    ))
+                },
+            )?;
+        }
+
+        let request_headers =
+            browser_network_headers(request.get("headers").and_then(Value::as_object));
+        let response_headers =
+            browser_network_headers(response.get("headers").and_then(Value::as_object));
+
+        let mut lines = vec![format!("## Request {url}")];
+        if let Some(status) = response.get("status").and_then(Value::as_f64) {
+            lines.push(format!("Status: {status:.0}"));
+        } else if failure_event.is_some() {
+            lines.push("Status: failed".to_string());
+        } else {
+            lines.push("Status: pending".to_string());
+        }
+
+        lines.push("### Request Headers".to_string());
+        if request_headers.is_empty() {
+            lines.push("<none>".to_string());
+        } else {
+            lines.extend(
+                request_headers
+                    .iter()
+                    .map(|(name, value)| format!("- {name}:{value}")),
+            );
+        }
+
+        if request_body.is_some() || request_file_path.is_some() {
+            lines.push("### Request Body".to_string());
+            if let Some(path) = request_file_path {
+                lines.push(format!("Saved to {path}."));
+            } else if let Some(body) = request_body.as_deref() {
+                lines.push(browser_network_body_preview(body));
+            }
+        }
+
+        lines.push("### Response Headers".to_string());
+        if response_headers.is_empty() {
+            lines.push("<none>".to_string());
+        } else {
+            lines.extend(
+                response_headers
+                    .iter()
+                    .map(|(name, value)| format!("- {name}:{value}")),
+            );
+        }
+
+        lines.push("### Response Body".to_string());
+        if let Some(path) = response_file_path {
+            lines.push(format!("Saved to {path}."));
+        } else if let Some(body) = response_body.as_deref() {
+            lines.push(browser_network_body_preview(body));
+        } else {
+            lines.push("<not available anymore>".to_string());
+        }
+
+        if let Some(failure) = failure_event {
+            lines.push("### Request failed with".to_string());
+            lines.push(
+                failure
+                    .params
+                    .get("errorText")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown network error")
+                    .to_string(),
+            );
+        }
+
+        let status = response.get("status").cloned().unwrap_or(Value::Null);
+        let status_text = response.get("statusText").cloned().unwrap_or(Value::Null);
+        let mime_type = response.get("mimeType").cloned().unwrap_or(Value::Null);
+        let failure_text = failure_event
+            .and_then(|failure| failure.params.get("errorText"))
+            .cloned()
+            .unwrap_or(Value::Null);
+
+        Ok(tool_success_structured(
+            lines.join("\n"),
+            json!({
+                "request": {
+                    "id": requested,
+                    "requestId": request_id,
+                    "method": method,
+                    "url": url,
+                },
+                "response": {
+                    "status": status,
+                    "statusText": status_text,
+                    "mimeType": mime_type,
+                },
+                "failureText": failure_text,
+                "requestBodySavedTo": request_file_path,
+                "responseBodySavedTo": response_file_path,
+            }),
+        ))
     }
 
     async fn performance_start_trace(
@@ -3529,22 +3734,21 @@ fn required_str<'a>(value: &'a Value, name: &str) -> Result<&'a str, BrowserTran
     })
 }
 
-fn required_u64(value: &Value, name: &str) -> Result<u64, BrowserTransportError> {
-    value
-        .get(name)
-        .and_then(Value::as_u64)
-        .or_else(|| {
+fn optional_u64(value: &Value, name: &str) -> Option<u64> {
+    value.get(name).and_then(|value| {
+        value.as_u64().or_else(|| {
             value
-                .get(name)
-                .and_then(Value::as_f64)
+                .as_f64()
                 .filter(|number| number.is_finite() && number.fract() == 0.0 && *number >= 0.0)
                 .map(|number| number as u64)
         })
-        .ok_or_else(|| {
-            BrowserTransportError::Protocol(format!(
-                "Missing or invalid browser parameter '{name}'"
-            ))
-        })
+    })
+}
+
+fn required_u64(value: &Value, name: &str) -> Result<u64, BrowserTransportError> {
+    optional_u64(value, name).ok_or_else(|| {
+        BrowserTransportError::Protocol(format!("Missing or invalid browser parameter '{name}'"))
+    })
 }
 
 fn required_f64(value: &Value, name: &str) -> Result<f64, BrowserTransportError> {
@@ -3686,6 +3890,56 @@ fn browser_pagination(
 
 fn value_to_compact_text(value: &Value) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| "<unserializable>".to_string())
+}
+
+fn browser_network_header_value(name: &str, value: &Value) -> String {
+    if matches!(
+        name.to_ascii_lowercase().as_str(),
+        "authorization"
+            | "proxy-authorization"
+            | "cookie"
+            | "set-cookie"
+            | "x-api-key"
+            | "x-auth-token"
+            | "sec-ch-ua"
+            | "sec-ch-ua-mobile"
+            | "sec-ch-ua-platform"
+            | "priority"
+    ) {
+        return "<redacted>".to_string();
+    }
+    value
+        .as_str()
+        .map(str::to_string)
+        .unwrap_or_else(|| value_to_compact_text(value))
+}
+
+fn browser_network_headers(headers: Option<&Map<String, Value>>) -> Vec<(String, String)> {
+    let mut ordered = BTreeMap::new();
+    if let Some(headers) = headers {
+        for (name, value) in headers {
+            ordered.insert(name.clone(), browser_network_header_value(name, value));
+        }
+    }
+    ordered.into_iter().collect()
+}
+
+fn browser_network_body_preview(bytes: &[u8]) -> String {
+    const MAX_PREVIEW_BYTES: usize = 64 * 1024;
+    if bytes.is_empty() {
+        return "<empty>".to_string();
+    }
+    let shown = &bytes[..bytes.len().min(MAX_PREVIEW_BYTES)];
+    match std::str::from_utf8(shown) {
+        Ok(text) => {
+            if bytes.len() > MAX_PREVIEW_BYTES {
+                format!("{text}\n<truncated; {} bytes total>", bytes.len())
+            } else {
+                text.to_string()
+            }
+        }
+        Err(_) => format!("<binary body: {} bytes>", bytes.len()),
+    }
 }
 
 fn network_profile(name: &str) -> (bool, f64, f64, f64) {

@@ -158,7 +158,17 @@
       {
         "name": "reqid",
         "type": "number",
-        "required": true
+        "required": false
+      },
+      {
+        "name": "requestFilePath",
+        "type": "string",
+        "required": false
+      },
+      {
+        "name": "responseFilePath",
+        "type": "string",
+        "required": false
       }
     ],
     "handle_dialog": [

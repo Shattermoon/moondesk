@@ -2165,6 +2165,8 @@ impl PreparedBrowserInvocation {
 fn browser_path_flag_kind(command: &str, flag: &str) -> Option<BrowserPathKind> {
     match (command, flag) {
         ("evaluate_script", "filepath")
+        | ("get_network_request", "requestfilepath")
+        | ("get_network_request", "responsefilepath")
         | ("performance_start_trace", "filepath")
         | ("performance_stop_trace", "filepath")
         | ("take_screenshot", "filepath")

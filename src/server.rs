@@ -1979,6 +1979,7 @@ mod tests {
 <script>
 console.log('MOONDESK_E2E_READY');
 fetch('/ping').then(r=>r.text()).then(value=>console.log('MOONDESK_E2E_PING:'+value));
+fetch('/echo',{method:'POST',headers:{'content-type':'text/plain'},body:'request-body'}).then(r=>r.text()).then(value=>console.log('MOONDESK_E2E_ECHO:'+value));
 document.getElementById('toggle').addEventListener('click',()=>{const s=document.getElementById('state');s.textContent=s.textContent==='OFF'?'ON':'OFF';});
 document.getElementById('upload').addEventListener('change',event=>{document.getElementById('file-name').textContent=event.target.files?.[0]?.name||'NONE';});
 </script>
@@ -1987,6 +1988,7 @@ document.getElementById('upload').addEventListener('change',event=>{document.get
         let site_app = Router::new()
             .route("/", get(|| async { Html(SITE_HTML) }))
             .route("/ping", get(|| async { "pong" }))
+            .route("/echo", post(|body: String| async move { body }))
             .route("/second", get(|| async { Html(SECOND_HTML) }))
             .route("/second-ping", get(|| async { "second-pong" }));
         let site_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -2195,6 +2197,84 @@ document.getElementById('upload').addEventListener('change',event=>{document.get
         assert!(
             network_text.contains("/ping"),
             "browser network inspection missed the local project request: {network_text}"
+        );
+        assert!(
+            network_text.contains("/echo") && network_text.contains("[200]"),
+            "browser network inspection missed the completed POST request: {network_text}"
+        );
+        let echo_reqid = network_text
+            .lines()
+            .find(|line| line.contains("/echo"))
+            .and_then(|line| line.split_once(':'))
+            .and_then(|(id, _)| id.trim().parse::<u64>().ok())
+            .expect("echo request id from network listing");
+        let echo_reqid_arg = format!("--reqid={echo_reqid}");
+
+        let network_detail = host_browser_request(
+            host_address,
+            &workspace_root,
+            "get_network_request",
+            &[echo_reqid_arg.as_str()],
+        )
+        .await;
+        assert_eq!(
+            network_detail.get("success").and_then(Value::as_bool),
+            Some(true)
+        );
+        let network_detail_text = network_detail
+            .get("stdout")
+            .and_then(Value::as_str)
+            .expect("network request detail stdout");
+        for expected in [
+            "Status: 200",
+            "### Request Body",
+            "request-body",
+            "### Response Body",
+        ] {
+            assert!(
+                network_detail_text.contains(expected),
+                "network request detail missed {expected:?}: {network_detail_text}"
+            );
+        }
+
+        let no_selected_network =
+            host_browser_request(host_address, &workspace_root, "get_network_request", &[]).await;
+        assert_eq!(
+            no_selected_network.get("success").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(
+            no_selected_network
+                .get("stdout")
+                .and_then(Value::as_str)
+                .is_some_and(|text| text.contains("Nothing is currently selected")),
+            "omitted reqid should preserve the public compatibility response: {no_selected_network}"
+        );
+
+        let exported_network = host_browser_request(
+            host_address,
+            &workspace_root,
+            "get_network_request",
+            &[
+                echo_reqid_arg.as_str(),
+                "--requestFilePath=artifacts/echo-request.txt",
+                "--responseFilePath=artifacts/echo-response.txt",
+            ],
+        )
+        .await;
+        assert_eq!(
+            exported_network.get("success").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace_root.join("artifacts/echo-request.txt"))
+                .expect("read exported request body"),
+            "request-body"
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace_root.join("artifacts/echo-response.txt"))
+                .expect("read exported response body"),
+            "request-body"
         );
 
         let screenshot = host_browser_request(

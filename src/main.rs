@@ -42,6 +42,7 @@ use state::{
     UiEventReceiver, UiEventSender, UsageTotals, add_workspace, app_config_path,
     flow_anim_lit_count, flush_config, legacy_windows_app_config_path, normalize_ngrok_domain,
     remove_workspace, rename_workspace, rotate_workspace_secret, ui_event_channel, user_home_dir,
+    workspace_registry_needs_bootstrap,
 };
 use std::io::{Write, stdout};
 use std::path::PathBuf;
@@ -257,6 +258,7 @@ enum AppExit {
 struct DashboardWorkspaceRow {
     id: WorkspaceId,
     name: String,
+    availability: WorkspaceAvailability,
     connected: bool,
 }
 
@@ -318,6 +320,7 @@ impl UiSnapshot {
                 .map(|workspace| DashboardWorkspaceRow {
                     id: workspace.id.clone(),
                     name: workspace.name.clone(),
+                    availability: workspace_availability(&workspace.root),
                     connected: app
                         .workspace_runtimes
                         .get(&workspace.id)
@@ -1721,6 +1724,28 @@ fn parse_port_value(value: Option<&str>) -> Result<u16, String> {
     Ok(port)
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum BootstrapWorkspaceRoot {
+    Use(PathBuf),
+    ChooseFolder { reason: String },
+}
+
+fn bootstrap_workspace_root(
+    root: &std::path::Path,
+    explicitly_configured: bool,
+) -> Result<BootstrapWorkspaceRoot, String> {
+    match workspaces::canonicalize_workspace_registration_root(root) {
+        Ok(root) => Ok(BootstrapWorkspaceRoot::Use(root)),
+        Err(error)
+            if !explicitly_configured
+                && workspaces::workspace_availability(root) == WorkspaceAvailability::Protected =>
+        {
+            Ok(BootstrapWorkspaceRoot::ChooseFolder { reason: error })
+        }
+        Err(error) => Err(error),
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct HostRuntimeRegistration {
@@ -1846,6 +1871,7 @@ async fn attach_workspace_to_running_host(
     port: u16,
     root: &std::path::Path,
 ) -> Result<HostAttachResult, String> {
+    workspaces::canonicalize_workspace_registration_root(root)?;
     let registration = read_host_runtime_registration(port)?;
     let body = serde_json::to_vec(&serde_json::json!({
         "root": root.to_string_lossy(),
@@ -2099,15 +2125,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok()
         .filter(|value| !value.trim().is_empty());
     let port = parse_port_value(port_value.as_deref()).map_err(std::io::Error::other)?;
-    let workspace_root = match std::env::var("WORKSPACE_ROOT") {
-        Ok(path) => path,
-        Err(_) => std::env::current_dir()?.to_string_lossy().into_owned(),
-    };
+    let (mut workspace_root, workspace_root_explicitly_configured) =
+        match std::env::var("WORKSPACE_ROOT") {
+            Ok(path) => (path, true),
+            Err(_) => (
+                std::env::current_dir()?.to_string_lossy().into_owned(),
+                false,
+            ),
+        };
 
     // Attaching another project is a non-interactive client action, so do it
     // before any terminal-profile bootstrap. This keeps `cd project && moondesk`
     // fast on macOS as well as Windows/Linux when a host is already running.
     if port_hosts_moondesk(port).await {
+        if let Err(error) = workspaces::canonicalize_workspace_registration_root(
+            std::path::Path::new(&workspace_root),
+        ) {
+            println!(
+                "MoonDesk is already running on port {port}; the current directory was not attached: {error}"
+            );
+            return Ok(());
+        }
         match attach_workspace_to_running_host(port, std::path::Path::new(&workspace_root)).await {
             Ok(result) => {
                 if result.already_registered {
@@ -2128,6 +2166,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "MoonDesk is already running on port {port}, but this directory could not be attached automatically: {error}. Open [w] Workspaces in the running MoonDesk host to add it manually."
                 ))
                 .into());
+            }
+        }
+    }
+
+    if workspace_registry_needs_bootstrap()? {
+        match bootstrap_workspace_root(
+            std::path::Path::new(&workspace_root),
+            workspace_root_explicitly_configured,
+        )
+        .map_err(std::io::Error::other)?
+        {
+            BootstrapWorkspaceRoot::Use(root) => {
+                workspace_root = root.to_string_lossy().into_owned();
+            }
+            BootstrapWorkspaceRoot::ChooseFolder { reason } => {
+                eprintln!(
+                    "MoonDesk will not create a workspace from the current directory: {reason}"
+                );
+                eprintln!("Choose the project folder MoonDesk should use instead.");
+                loop {
+                    let Some(selected) = pick_workspace_folder()
+                        .await
+                        .map_err(std::io::Error::other)?
+                    else {
+                        return Err(std::io::Error::other(
+                            "MoonDesk needs a workspace folder before first launch; folder selection was cancelled",
+                        )
+                        .into());
+                    };
+                    match workspaces::canonicalize_workspace_registration_root(&selected) {
+                        Ok(root) => {
+                            workspace_root = root.to_string_lossy().into_owned();
+                            break;
+                        }
+                        Err(error) => {
+                            eprintln!("MoonDesk cannot use that folder as a workspace: {error}");
+                        }
+                    }
+                }
             }
         }
     }
@@ -3501,7 +3578,11 @@ async fn run_workspaces(
         {
             revealed = None;
         }
-        let selected_url = workspace_public_mcp_url(public_base.as_deref(), &selected_row.config);
+        let selected_url = if selected_row.availability == WorkspaceAvailability::Protected {
+            None
+        } else {
+            workspace_public_mcp_url(public_base.as_deref(), &selected_row.config)
+        };
 
         let mut hit_areas = WorkspaceHitAreas::default();
         terminal.draw(|f| {
@@ -3822,6 +3903,7 @@ fn draw_workspaces(f: &mut Frame, view: WorkspacesView<'_>, hit_areas: &mut Work
         .map(|(offset, row)| {
             let index = list_start + offset;
             let status = match (row.availability, row.connected, row.accepting_requests) {
+                (WorkspaceAvailability::Protected, _, _) => "BLOCKED",
                 (WorkspaceAvailability::Unavailable, _, _) => "UNAVAILABLE",
                 (_, _, false) => "DRAINING",
                 (_, true, true) => "CONNECTED",
@@ -3892,9 +3974,16 @@ fn draw_workspaces(f: &mut Frame, view: WorkspacesView<'_>, hit_areas: &mut Work
     let row = &rows[selected];
     let availability = match row.availability {
         WorkspaceAvailability::Available => "Available",
+        WorkspaceAvailability::Protected => "Blocked (protected system directory)",
         WorkspaceAvailability::Unavailable => "Unavailable",
     };
-    let connection = if row.connected { "Connected" } else { "Ready" };
+    let connection = if row.availability == WorkspaceAvailability::Protected {
+        "Blocked"
+    } else if row.connected {
+        "Connected"
+    } else {
+        "Ready"
+    };
     let url = match (selected_url, reveal_url) {
         (Some(url), true) => url.to_string(),
         (Some(_), false) => MCP_URL_MASK.to_string(),
@@ -6692,17 +6781,20 @@ fn draw_inline_workspaces(
             )
         } else {
             let workspace = &app.workspaces[index - 1];
-            let symbol = if workspace.connected { "●" } else { "○" };
-            let status = if workspace.connected {
-                " connected"
-            } else {
-                " idle"
+            let (symbol, status, style) = match workspace.availability {
+                WorkspaceAvailability::Protected => {
+                    ("!", " blocked", Style::default().fg(palette.danger_fg))
+                }
+                WorkspaceAvailability::Unavailable => {
+                    ("○", " unavailable", Style::default().fg(palette.muted_fg))
+                }
+                WorkspaceAvailability::Available if workspace.connected => {
+                    ("●", " connected", Style::default().fg(palette.success_fg))
+                }
+                WorkspaceAvailability::Available => {
+                    ("○", " idle", Style::default().fg(palette.muted_fg))
+                }
             };
-            let style = Style::default().fg(if workspace.connected {
-                palette.success_fg
-            } else {
-                palette.muted_fg
-            });
             let available_width = row_width.saturating_sub(4 + status.chars().count());
             let (name, _) = truncate_with_ellipsis(&workspace.name, available_width.max(1), false);
             (symbol, style, format!("{name}{status}"))
@@ -7962,11 +8054,12 @@ fn draw_ui(f: &mut Frame, context: UiRenderContext<'_>) {
 mod tests {
     use super::state::{CommandActivity, LogEntry};
     use super::{
-        AppState, BottomPanelAreas, BottomPanelHitMaps, BrowserPresentationChange, DashboardFocus,
-        DashboardHitAreas, DashboardSecretHit, DashboardSecretTarget, DashboardWorkspaceRow,
-        InterruptState, ObservabilityCutoff, PanelItemHit, PanelScrollView, TimedSecretClick,
-        UiRenderContext, UiSnapshot, WorkspaceFilter, WorkspaceHitAreas, WorkspaceId,
-        WorkspaceUiAction, active_reveal_remaining, apply_workspace_observability_filter,
+        AppState, BootstrapWorkspaceRoot, BottomPanelAreas, BottomPanelHitMaps,
+        BrowserPresentationChange, DashboardFocus, DashboardHitAreas, DashboardSecretHit,
+        DashboardSecretTarget, DashboardWorkspaceRow, InterruptState, ObservabilityCutoff,
+        PanelItemHit, PanelScrollView, TimedSecretClick, UiRenderContext, UiSnapshot,
+        WorkspaceAvailability, WorkspaceFilter, WorkspaceHitAreas, WorkspaceId, WorkspaceUiAction,
+        active_reveal_remaining, apply_workspace_observability_filter, bootstrap_workspace_root,
         browser_headless_fallback_succeeded, cycle_dashboard_focus, dashboard_secret_target_at,
         draw_changelog_notice, draw_prompt, draw_quit_confirm, draw_ui, draw_update_confirm,
         handle_mcp_server_exit, item_under_cursor, key_is_clipboard_paste, key_is_interrupt,
@@ -8090,6 +8183,7 @@ mod tests {
             .map(|(id, name, connected)| DashboardWorkspaceRow {
                 id: id.clone(),
                 name: (*name).to_string(),
+                availability: WorkspaceAvailability::Available,
                 connected: *connected,
             })
             .collect();
@@ -8648,6 +8742,63 @@ mod tests {
         server.abort();
         let _ = server.await;
         drop(runtime_guard);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn attach_workspace_client_rejects_protected_root_before_host_contact() {
+        let current = super::workspaces::canonicalize_existing_workspace_root(
+            &std::env::current_dir().expect("resolve current directory"),
+        )
+        .expect("canonicalize current directory");
+        let protected_root = current
+            .ancestors()
+            .last()
+            .expect("current directory must have a filesystem root")
+            .to_path_buf();
+        let error = super::attach_workspace_to_running_host(49_322, &protected_root)
+            .await
+            .expect_err("protected cwd must be rejected before host registration lookup");
+        assert!(error.contains("protected operating-system directory"));
+    }
+
+    #[test]
+    fn implicit_protected_bootstrap_asks_for_folder_but_explicit_root_fails() {
+        let current = super::workspaces::canonicalize_existing_workspace_root(
+            &std::env::current_dir().expect("resolve current directory"),
+        )
+        .expect("canonicalize current directory");
+        let protected_root = current
+            .ancestors()
+            .last()
+            .expect("current directory must have a filesystem root")
+            .to_path_buf();
+
+        let implicit = bootstrap_workspace_root(&protected_root, false)
+            .expect("implicit protected root should request recovery");
+        assert!(matches!(
+            implicit,
+            BootstrapWorkspaceRoot::ChooseFolder { .. }
+        ));
+
+        let explicit = bootstrap_workspace_root(&protected_root, true)
+            .expect_err("explicit protected root must fail instead of opening UI");
+        assert!(explicit.contains("protected operating-system directory"));
+    }
+
+    #[test]
+    fn safe_bootstrap_root_is_canonicalized_without_prompting() {
+        let root =
+            std::env::temp_dir().join(format!("moondesk-safe-bootstrap-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("create safe bootstrap root");
+        let expected = super::workspaces::canonicalize_existing_workspace_root(&root)
+            .expect("canonicalize safe bootstrap root");
+
+        assert_eq!(
+            bootstrap_workspace_root(&root, false).expect("accept safe bootstrap root"),
+            BootstrapWorkspaceRoot::Use(expected)
+        );
+
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -9422,6 +9573,7 @@ mod tests {
         let present = vec![DashboardWorkspaceRow {
             id: workspace,
             name: "SiteGPT".into(),
+            availability: WorkspaceAvailability::Available,
             connected: true,
         }];
         assert!(!reconcile_workspace_filter(&mut filter, &present));
@@ -9603,6 +9755,25 @@ mod tests {
     }
 
     #[test]
+    fn protected_workspace_is_labeled_blocked_in_dashboard() {
+        let mut snapshot = test_dashboard_snapshot("moondesk-dashboard-protected-workspace-test");
+        let workspace = test_workspace_id(49);
+        configure_dashboard_workspaces(&mut snapshot, &[(workspace, "System32", false)]);
+        snapshot.workspaces[0].availability = WorkspaceAvailability::Protected;
+
+        let rendered = render_dashboard(
+            &snapshot,
+            140,
+            44,
+            DashboardFocus::Workspaces,
+            &WorkspaceFilter::All,
+            None,
+            None,
+        );
+        assert!(rendered.text.contains("System32 blocked"));
+    }
+
+    #[test]
     fn narrow_dashboard_hides_inline_workspace_pane_and_keeps_status_summary() {
         let mut snapshot = test_dashboard_snapshot("moondesk-dashboard-narrow-test");
         let workspace_a = test_workspace_id(50);
@@ -9649,6 +9820,7 @@ mod tests {
             .map(|(id, name, connected)| DashboardWorkspaceRow {
                 id: id.clone(),
                 name: name.clone(),
+                availability: WorkspaceAvailability::Available,
                 connected: *connected,
             })
             .collect();

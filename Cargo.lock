@@ -1547,7 +1547,7 @@ dependencies = [
 
 [[package]]
 name = "moondesk"
-version = "0.13.5"
+version = "0.13.6"
 dependencies = [
  "axum",
  "base64 0.22.1",

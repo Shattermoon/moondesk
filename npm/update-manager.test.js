@@ -213,6 +213,37 @@ test("GitHub release notes normalize into concise terminal changelog items", () 
   ]);
 });
 
+test("structured release notes expose only the validated changelog section", () => {
+  const notes = normalizeReleaseNotes(`## Changelog
+
+Context that belongs on the release page but not in the terminal changelog.
+
+- Release notes now use validated PR changelog bullets.
+  - Nested implementation detail that should not become a separate update item.
+- Release recovery refreshes the same notes.
+
+## Pull request
+
+- [#63 fix: enforce release changelog](https://github.com/Shattermoon/moondesk/pull/63) by @nkcbuilds
+
+**Full Changelog**: https://github.com/Shattermoon/moondesk/compare/v0.13.3...v0.13.4`);
+  assert.deepEqual(notes, [
+    "Release notes now use validated PR changelog bullets.",
+    "Release recovery refreshes the same notes.",
+  ]);
+});
+
+test("structured internal-only release notes stay out of the update changelog", () => {
+  const notes = normalizeReleaseNotes(`## Changelog
+
+No user-visible changelog.
+
+## Pull request
+
+- [#64 ci: internal release plumbing](https://github.com/Shattermoon/moondesk/pull/64)`);
+  assert.deepEqual(notes, []);
+});
+
 test("release-note normalization is bounded, de-duplicated, and ignores markdown noise", () => {
   assert.deepEqual(normalizeReleaseNotes(""), []);
   assert.deepEqual(normalizeReleaseNotes(null), []);
@@ -291,7 +322,7 @@ test("skipped releases are folded into one bounded changelog", async () => {
       draft: false,
       prerelease: false,
       html_url: "https://github.com/Shattermoon/moondesk/releases/tag/v0.9.1",
-      body: "## What's Changed\n* fix: polish updater behavior by @nkcbuilds in https://github.com/Shattermoon/moondesk/pull/102",
+      body: "## Changelog\n\n- Polish updater behavior.\n\n## Pull request\n\n- [#102 fix: polish updater behavior](https://github.com/Shattermoon/moondesk/pull/102) by @nkcbuilds\n\n**Full Changelog**: https://github.com/Shattermoon/moondesk/compare/v0.9.0...v0.9.1",
     },
     {
       tag_name: "v0.9.0",
@@ -315,7 +346,7 @@ test("skipped releases are folded into one bounded changelog", async () => {
   });
 
   assert.deepEqual(changelog.releaseNotes, [
-    "v0.9.1: Polish updater behavior",
+    "v0.9.1: Polish updater behavior.",
     "v0.9.0: Add changelog UI",
   ]);
   assert.equal(

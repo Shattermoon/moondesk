@@ -122,17 +122,17 @@ Also:
 
 A proper changelog is important for MoonDesk. User-visible changes must not be merged with only implementation-oriented commit messages and no usable release explanation.
 
-MoonDesk currently creates GitHub Releases with `--generate-notes`; the application then consumes release notes as the update changelog. There is no checked-in root `CHANGELOG.md` source of truth today. Do **not** invent or maintain a parallel `CHANGELOG.md` unless the project deliberately changes that release architecture.
+MoonDesk uses the merged PR's validated `## Changelog` section as the source for GitHub Release notes, and the application then consumes those release notes as the update changelog. PR metadata CI validates the section before merge, the release gate validates it again on the exact merged PR, and release recovery rewrites the GitHub Release body from the same source before npm publication continues. There is no checked-in root `CHANGELOG.md` source of truth today. Do **not** invent or maintain a parallel `CHANGELOG.md` unless the project deliberately changes that release architecture.
 
 For every user-visible feature, fix, behavior change, compatibility change, or meaningful performance/reliability improvement:
 
-1. Make the PR title / eventual squash-commit subject concise, human-readable, and suitable for generated release notes.
+1. Make the PR title / eventual squash-commit subject concise and human-readable; it is linked alongside the rendered changelog in each GitHub Release.
 2. Include a `## Changelog` section in the PR description with release-note-quality bullets.
 3. Describe the user-visible outcome first. Mention important compatibility, migration, security, platform, or recovery behavior when users need to know it.
 4. Do not fill the changelog with internal symbol names, test names, implementation trivia, or a raw commit dump unless those details materially help users.
 5. Keep wording specific enough that a user can understand what changed and why it matters.
 6. If the change is truly internal-only, write `No user-visible changelog.` rather than silently omitting the section.
-7. When preparing or repairing a release, inspect the generated GitHub Release notes and ensure they accurately represent the merged changes before treating the release/changelog as complete.
+7. When preparing or repairing a release, inspect the rendered GitHub Release notes and ensure they accurately represent the merged changes before treating the release/changelog as complete.
 
 Good changelog bullets look like:
 

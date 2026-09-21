@@ -152,12 +152,22 @@ test("managed update environment variables never leak into npm or the restarted 
   assert.deepEqual(
     cleanManagedUpdateEnv({
       PATH: "/bin",
+      HOME: "shell-home",
+      USERPROFILE: "user-profile",
+      HOMEDRIVE: "home-drive",
+      HOMEPATH: "home-path",
       MOONDESK_NPM_MANAGED: "stale",
       MOONDESK_UPDATE_REQUEST_PATH: "stale-request",
       MOONDESK_UPDATE_STATE_PATH: "stale-state",
       MOONDESK_CHANGELOG_NOTICE_PATH: "stale-changelog",
     }),
-    { PATH: "/bin" },
+    {
+      PATH: "/bin",
+      HOME: "shell-home",
+      USERPROFILE: "user-profile",
+      HOMEDRIVE: "home-drive",
+      HOMEPATH: "home-path",
+    },
   );
 });
 
@@ -261,6 +271,10 @@ test("validated update exit installs the exact version, verifies it, and restart
   const baseEnv = {
     PATH: "/bin",
     KEEP_ME: "yes",
+    HOME: "shell-home",
+    USERPROFILE: "user-profile",
+    HOMEDRIVE: "home-drive",
+    HOMEPATH: "home-path",
     MOONDESK_NPM_MANAGED: "stale",
     MOONDESK_UPDATE_REQUEST_PATH: "stale-request",
     MOONDESK_UPDATE_STATE_PATH: "stale-state",
@@ -290,6 +304,10 @@ test("validated update exit installs the exact version, verifies it, and restart
         assert.deepEqual(args, ["arg-one"]);
         assert.equal(options.cwd, dir);
         assert.equal(options.env.KEEP_ME, "yes");
+        assert.equal(options.env.HOME, "shell-home");
+        assert.equal(options.env.USERPROFILE, "user-profile");
+        assert.equal(options.env.HOMEDRIVE, "home-drive");
+        assert.equal(options.env.HOMEPATH, "home-path");
         assert.equal(options.env.MOONDESK_NPM_MANAGED, "1");
         assert.equal(options.env.MOONDESK_UPDATE_STATE_PATH, statePath);
         assert.equal(options.env.MOONDESK_UPDATE_REQUEST_PATH, requestPath);
@@ -311,6 +329,10 @@ test("validated update exit installs the exact version, verifies it, and restart
         assert.equal(version, targetVersion);
         assert.equal(options.cwd, dir);
         assert.equal(options.env.KEEP_ME, "yes");
+        assert.equal(options.env.HOME, "shell-home");
+        assert.equal(options.env.USERPROFILE, "user-profile");
+        assert.equal(options.env.HOMEDRIVE, "home-drive");
+        assert.equal(options.env.HOMEPATH, "home-path");
         assert.equal(options.env.MOONDESK_NPM_MANAGED, undefined);
         assert.equal(options.env.MOONDESK_UPDATE_REQUEST_PATH, undefined);
         assert.equal(options.env.MOONDESK_UPDATE_STATE_PATH, undefined);
@@ -331,6 +353,10 @@ test("validated update exit installs the exact version, verifies it, and restart
         assert.deepEqual(args, ["arg-one"]);
         assert.equal(options.cwd, dir);
         assert.equal(options.env.KEEP_ME, "yes");
+        assert.equal(options.env.HOME, "shell-home");
+        assert.equal(options.env.USERPROFILE, "user-profile");
+        assert.equal(options.env.HOMEDRIVE, "home-drive");
+        assert.equal(options.env.HOMEPATH, "home-path");
         assert.equal(options.env.MOONDESK_NPM_MANAGED, undefined);
         return { code: 0, signal: null };
       },

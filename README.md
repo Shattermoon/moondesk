@@ -141,6 +141,8 @@ For browser-runtime invariants and implementation details, see [`docs/BROWSER_RU
 
 Each workspace keeps its own root, secret connector URL, command jobs, retained output, history, and handoff state. Use `[w] Workspaces` to add, rename, inspect, copy, rotate, or remove projects.
 
+MoonDesk refuses filesystem roots and protected operating-system directories as workspace roots. If an older config already contains one, MoonDesk keeps it visible as **BLOCKED** while disabling its connector and workspace tools; add or select a valid project workspace, then remove the blocked entry. Launching `moondesk` from a protected directory never auto-attaches it to a running host, and a fresh interactive launch asks you to choose a project folder instead.
+
 Handoffs are explicit checkpoints. `create_handoff` saves the task goal, completed work, decisions, validation, blockers, next steps, Git state, and current MoonDesk jobs. `resume_handoff` reloads the checkpoint and checks for drift; `complete_handoff` marks the continuation finished.
 
 > [!CAUTION]

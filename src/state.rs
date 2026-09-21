@@ -270,7 +270,7 @@ impl AppConfig {
             return Ok((config, had_existing_workspace));
         }
 
-        let root = workspaces::canonicalize_existing_workspace_root(legacy_workspace_root)
+        let root = workspaces::canonicalize_workspace_registration_root(legacy_workspace_root)
             .map_err(std::io::Error::other)?;
         let mcp_slug = match config.mcp_slug.take() {
             Some(slug) if !slug.is_empty() => slug,
@@ -1219,6 +1219,10 @@ pub fn load_app_config() -> std::io::Result<AppConfig> {
     AppConfig::load_from_path(&path)
 }
 
+pub fn workspace_registry_needs_bootstrap() -> std::io::Result<bool> {
+    Ok(load_app_config()?.config_version != CURRENT_CONFIG_VERSION)
+}
+
 pub fn normalize_ngrok_domain(value: &str) -> Result<Option<String>, String> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -1622,6 +1626,12 @@ impl AppState {
     }
 
     pub fn public_mcp_url(&self) -> Option<String> {
+        if self.workspaces.first().is_some_and(|workspace| {
+            workspaces::workspace_availability(&workspace.root)
+                == workspaces::WorkspaceAvailability::Protected
+        }) {
+            return None;
+        }
         let base = self.ngrok_url.clone().or_else(|| {
             self.ngrok_domain
                 .as_ref()
@@ -4654,6 +4664,129 @@ toolMode = "multiTools"
         let _ = std::fs::remove_file(blocked_parent);
         let _ = std::fs::remove_dir_all(secondary_root);
         let _ = std::fs::remove_dir_all(primary_root);
+    }
+
+    #[tokio::test]
+    async fn primary_workspace_can_be_removed_and_secondary_is_promoted() {
+        let (app, primary_root, config_path) = test_app("moondesk-primary-workspace-remove");
+        let primary_id = app.workspaces[0].id.clone();
+        let state = Arc::new(Mutex::new(app));
+        let secondary_root = std::env::temp_dir().join(format!(
+            "moondesk-primary-workspace-remove-secondary-{}",
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&secondary_root).expect("create secondary workspace");
+        let added = add_workspace(&state, "Secondary".into(), secondary_root.clone())
+            .await
+            .expect("add secondary workspace");
+
+        remove_workspace(&state, &primary_id)
+            .await
+            .expect("remove primary workspace");
+
+        {
+            let app = state.lock().await;
+            assert_eq!(app.workspaces.len(), 1);
+            assert_eq!(app.workspaces[0].id, added.id);
+            assert_eq!(app.mcp_slug, added.mcp_slug);
+            assert_eq!(app.workspace_root, added.root.to_string_lossy());
+        }
+        let saved = AppConfig::load_from_path(&config_path).expect("reload persisted registry");
+        assert_eq!(saved.workspaces.len(), 1);
+        assert_eq!(saved.workspaces[0].id, added.id);
+
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_dir_all(secondary_root);
+        let _ = std::fs::remove_dir_all(primary_root);
+    }
+
+    #[test]
+    fn fresh_registry_bootstrap_rejects_protected_launch_root() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let config_root =
+            std::env::temp_dir().join(format!("moondesk-protected-bootstrap-{unique}"));
+        std::fs::create_dir_all(&config_root).expect("create config root");
+        let config_path = config_root.join(APP_CONFIG_FILE_NAME);
+        let current = workspaces::canonicalize_existing_workspace_root(
+            &std::env::current_dir().expect("resolve current directory"),
+        )
+        .expect("canonicalize current directory");
+        let protected_root = current
+            .ancestors()
+            .last()
+            .expect("current directory must have a filesystem root")
+            .to_path_buf();
+
+        let error = match AppState::from_config_path(
+            8787,
+            protected_root.to_string_lossy().into_owned(),
+            config_path.clone(),
+        ) {
+            Ok(_) => panic!("protected launch root must not bootstrap a workspace registry"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("protected operating-system directory")
+        );
+        assert!(!config_path.exists());
+
+        let _ = std::fs::remove_dir_all(config_root);
+    }
+
+    #[test]
+    fn persisted_protected_workspace_loads_for_removal_but_hides_primary_connector_url() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let config_root =
+            std::env::temp_dir().join(format!("moondesk-protected-workspace-recovery-{unique}"));
+        std::fs::create_dir_all(&config_root).expect("create config root");
+        let config_path = config_root.join(APP_CONFIG_FILE_NAME);
+        let current = workspaces::canonicalize_existing_workspace_root(
+            &std::env::current_dir().expect("resolve current directory"),
+        )
+        .expect("canonicalize current directory");
+        let protected_root = current
+            .ancestors()
+            .last()
+            .expect("current directory must have a filesystem root")
+            .to_path_buf();
+        let workspace = WorkspaceConfig {
+            id: WorkspaceId::new(),
+            name: "Protected".into(),
+            root: protected_root.clone(),
+            mcp_slug: workspaces::generate_mcp_slug(),
+        };
+        let config = AppConfig {
+            config_version: CURRENT_CONFIG_VERSION,
+            workspaces: vec![workspace],
+            ngrok_domain: Some("protected-test.ngrok-free.dev".into()),
+            ..AppConfig::default()
+        };
+        config
+            .save_to_path(&config_path)
+            .expect("save protected registry");
+
+        let app = AppState::from_config_path(
+            8787,
+            config_root.to_string_lossy().into_owned(),
+            config_path.clone(),
+        )
+        .expect("existing protected registry must load so the user can remove it");
+        assert_eq!(
+            workspaces::workspace_availability(&app.workspaces[0].root),
+            workspaces::WorkspaceAvailability::Protected
+        );
+        assert!(app.public_mcp_url().is_none());
+
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_dir_all(config_root);
     }
 
     #[tokio::test]

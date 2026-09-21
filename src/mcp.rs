@@ -1040,6 +1040,18 @@ fn read_call_requires_workspace(req: &JsonRpcRequest, tool_name: &str) -> bool {
 
 const MAX_BROWSER_CALLER_META_BYTES: usize = 512;
 
+fn workspace_access_error(workspace_root: &str) -> Option<String> {
+    match workspaces::workspace_availability(Path::new(workspace_root)) {
+        WorkspaceAvailability::Available => None,
+        WorkspaceAvailability::Protected => Some(format!(
+            "Workspace is blocked because it is a protected operating-system directory: {workspace_root}"
+        )),
+        WorkspaceAvailability::Unavailable => Some(format!(
+            "Workspace is currently unavailable: {workspace_root}"
+        )),
+    }
+}
+
 fn browser_session_key(req: &JsonRpcRequest, workspace_id: &WorkspaceId) -> BrowserSessionKey {
     let meta = req.params.get("_meta").and_then(Value::as_object);
     let session = meta
@@ -1085,13 +1097,8 @@ async fn handle_tools_call_for_workspace(
     ) || connector_browser_tool
         || facade_browser_tool
     {
-        if workspaces::workspace_availability(Path::new(workspace_root))
-            == WorkspaceAvailability::Unavailable
-        {
-            return tool_error_response(
-                req,
-                format!("Workspace is currently unavailable: {workspace_root}"),
-            );
+        if let Some(error) = workspace_access_error(workspace_root) {
+            return tool_error_response(req, error);
         }
         if !mode.browser_enabled() {
             return tool_error_response(
@@ -1172,14 +1179,8 @@ async fn handle_tools_call_for_workspace(
             | "run_command"
             | "start_command"
     ) || read_call_requires_workspace(req, &tool_name);
-    if workspace_dependent
-        && workspaces::workspace_availability(Path::new(workspace_root))
-            == WorkspaceAvailability::Unavailable
-    {
-        return tool_error_response(
-            req,
-            format!("Workspace is currently unavailable: {workspace_root}"),
-        );
+    if workspace_dependent && let Some(error) = workspace_access_error(workspace_root) {
+        return tool_error_response(req, error);
     }
 
     if matches!(
@@ -10866,6 +10867,40 @@ mod tests {
         assert!(!sample.contains('\u{FFFD}'));
         assert!(writer.estimate_tokens() > 0);
     }
+    #[tokio::test]
+    async fn protected_workspace_blocks_workspace_tools() {
+        let current = workspaces::canonicalize_existing_workspace_root(
+            &std::env::current_dir().expect("resolve current directory"),
+        )
+        .expect("canonicalize current directory");
+        let protected_root = current
+            .ancestors()
+            .last()
+            .expect("current directory must have a filesystem root")
+            .to_path_buf();
+        let protected_root_str = protected_root.to_string_lossy().into_owned();
+        let manager = CommandJobManager::new();
+
+        let read = handle_tools_call(
+            &tool_call_request("read", json!({ "path": "README.md" })),
+            &protected_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &manager,
+            &None,
+        )
+        .await;
+        assert_eq!(
+            read.result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(result_text(&read).contains("protected operating-system directory"));
+    }
+
     #[tokio::test]
     async fn unavailable_workspace_blocks_filesystem_tools_without_disabling_job_management() {
         let missing_root =

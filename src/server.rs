@@ -26,7 +26,8 @@ use crate::state::{
     UiEventSender, add_workspace,
 };
 use crate::workspaces::{
-    self, WorkspaceId, WorkspaceRequestContext, WorkspaceRequestLease, WorkspaceRuntime,
+    self, WorkspaceAvailability, WorkspaceId, WorkspaceRequestContext, WorkspaceRequestLease,
+    WorkspaceRuntime,
 };
 use uuid::Uuid;
 
@@ -214,9 +215,15 @@ async fn resolve_workspace(
     Arc<WorkspaceRuntime>,
     WorkspaceRequestLease,
 )> {
-    let app = state.app.lock().await;
-    let workspace = workspaces::resolve_workspace_by_slug(&app.workspaces, slug)?;
-    let runtime = app.workspace_runtimes.get(&workspace.workspace_id)?.clone();
+    let (workspace, runtime) = {
+        let app = state.app.lock().await;
+        let workspace = workspaces::resolve_workspace_by_slug(&app.workspaces, slug)?;
+        let runtime = app.workspace_runtimes.get(&workspace.workspace_id)?.clone();
+        (workspace, runtime)
+    };
+    if workspaces::workspace_availability(&workspace.root) == WorkspaceAvailability::Protected {
+        return None;
+    }
     let lease = runtime.try_acquire()?;
     Some((workspace, runtime, lease))
 }
@@ -230,14 +237,26 @@ async fn resolve_workspace_for_cwd(
     WorkspaceRequestLease,
 )> {
     let canonical = workspaces::canonicalize_existing_workspace_root(cwd).ok()?;
-    let app = state.app.lock().await;
-    let workspace = app
-        .workspaces
-        .iter()
-        .filter(|workspace| canonical == workspace.root || canonical.starts_with(&workspace.root))
-        .max_by_key(|workspace| workspace.root.components().count())?;
-    let context = WorkspaceRequestContext::from(workspace);
-    let runtime = app.workspace_runtimes.get(&workspace.id)?.clone();
+    if workspaces::workspace_availability(&canonical) == WorkspaceAvailability::Protected {
+        return None;
+    }
+    let (context, runtime) = {
+        let app = state.app.lock().await;
+        let workspace = app
+            .workspaces
+            .iter()
+            .filter(|workspace| {
+                canonical == workspace.root || canonical.starts_with(&workspace.root)
+            })
+            .max_by_key(|workspace| workspace.root.components().count())?;
+        (
+            WorkspaceRequestContext::from(workspace),
+            app.workspace_runtimes.get(&workspace.id)?.clone(),
+        )
+    };
+    if workspaces::workspace_availability(&context.root) == WorkspaceAvailability::Protected {
+        return None;
+    }
     let lease = runtime.try_acquire()?;
     Some((context, runtime, lease))
 }
@@ -686,7 +705,7 @@ async fn register_workspace_from_local_host(
 
     let requested_root = PathBuf::from(request.root);
     let canonical_root = match tokio::task::spawn_blocking(move || {
-        workspaces::canonicalize_existing_workspace_root(&requested_root)
+        workspaces::canonicalize_workspace_registration_root(&requested_root)
     })
     .await
     {
@@ -1510,6 +1529,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn protected_persisted_workspace_is_not_routable_by_slug_or_browser_cwd() {
+        let workspace_root = unique_temp_path("moondesk-protected-route-workspace");
+        let config_root = unique_temp_path("moondesk-protected-route-config");
+        let config_path = config_root.join("config.toml");
+        std::fs::create_dir_all(&workspace_root).expect("create workspace root");
+        std::fs::create_dir_all(&config_root).expect("create config root");
+        let current = workspaces::canonicalize_existing_workspace_root(
+            &std::env::current_dir().expect("resolve current directory"),
+        )
+        .expect("canonicalize current directory");
+        let protected_root = current
+            .ancestors()
+            .last()
+            .expect("current directory must have a filesystem root")
+            .to_path_buf();
+
+        let mut app = AppState::new_for_test(
+            8787,
+            workspace_root.to_string_lossy().into_owned(),
+            config_path.clone(),
+        )
+        .expect("create app state");
+        let slug = app.workspaces[0].mcp_slug.clone();
+        app.workspaces[0].root = protected_root.clone();
+        let app_state = Arc::new(Mutex::new(app));
+        let (ui_tx, _ui_rx) = ui_event_channel();
+        let server_state = ServerState {
+            app: app_state,
+            browser_runtime: None,
+            command_jobs: CommandJobManager::new(),
+            ui_events: ui_tx,
+            host_control_token: Arc::from("test-host-control-token"),
+        };
+
+        assert!(resolve_workspace(&server_state, &slug).await.is_none());
+        assert!(
+            resolve_workspace_for_cwd(&server_state, &protected_root)
+                .await
+                .is_none()
+        );
+
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_dir_all(config_root);
+        let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
     async fn host_workspace_registration_is_authenticated_and_idempotent() {
         let workspace_a = unique_temp_path("moondesk-host-register-a");
         let workspace_b = unique_temp_path("moondesk-host-register-b");
@@ -1553,6 +1619,28 @@ mod tests {
             HOST_CONTROL_HEADER,
             HeaderValue::from_static("test-host-control-token"),
         );
+
+        let current = workspaces::canonicalize_existing_workspace_root(
+            &std::env::current_dir().expect("resolve current directory"),
+        )
+        .expect("canonicalize current directory");
+        let protected_root = current
+            .ancestors()
+            .last()
+            .expect("current directory must have a filesystem root")
+            .to_path_buf();
+        let protected_request = Bytes::from(
+            serde_json::to_vec(&json!({"root": protected_root.to_string_lossy()}))
+                .expect("serialize protected registration request"),
+        );
+        let protected = register_workspace_from_local_host(
+            State(server_state.clone()),
+            headers.clone(),
+            protected_request,
+        )
+        .await;
+        assert_eq!(protected.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(app_state.lock().await.workspaces.len(), 1);
 
         let oversized_name = "x".repeat(workspaces::MAX_WORKSPACE_NAME_CHARS + 1);
         let invalid_name_request = Bytes::from(

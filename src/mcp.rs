@@ -18,6 +18,7 @@ use crate::command_jobs::{
     CommandJobManager, CommandJobSnapshot, DEFAULT_JOB_TIMEOUT_MS, DEFAULT_POLL_WAIT_MS,
     MAX_COMMAND_OUTPUT_READ_BYTES, MAX_JOB_TIMEOUT_MS, MAX_POLL_WAIT_MS,
 };
+use crate::companion::CompanionAuth;
 use crate::handoff;
 use crate::managed_chat::{broker::ManagedChatBroker, types::ChatExecutionProfile};
 use crate::state::{
@@ -95,8 +96,11 @@ pub struct McpRequestContext<'a> {
     pub command_jobs: &'a CommandJobManager,
     pub browser_runtime: &'a Option<Arc<BrowserRuntime>>,
     pub worker_execution_profile: ChatExecutionProfile,
+    pub worker_target_count: usize,
     pub worker_broker: Arc<WorkerBroker>,
     pub managed_chat_broker: Arc<ManagedChatBroker>,
+    pub companion_auth: Option<Arc<CompanionAuth>>,
+    pub inbound_request_id: Option<String>,
 }
 
 pub async fn handle_request(
@@ -449,7 +453,7 @@ fn workers_tool_descriptor() -> Value {
     json!({
         "name": "workers",
         "title": "Coordinate workers",
-        "description": "Coordinate MoonDesk experimental workers for this exact workspace and ChatGPT conversation. The workspace is resolved from this connector; never pass or guess a workspace. Anchor actions are spawn, reuse, retire, status, send, collect. Worker actions are claim, start, inbox, ack, report, finish. Reuse creates a new durable task on an idle claimed worker and wakes its existing ChatGPT conversation. Retire frees an idle worker slot or safely abandons a launch only when MoonDesk can prove the assignment never crossed the Send boundary. collect can wait up to 60 seconds for a report/completion so the Anchor does not need polling loops. Worker coordination requires exact ChatGPT session metadata and fails closed when that identity is unavailable. operation_id must be a stable UUID reused when retrying the same spawn/reuse/send/report after an ambiguous response.",
+        "description": "Coordinate MoonDesk experimental workers for this exact workspace and ChatGPT conversation. The workspace is resolved from this connector; never pass or guess a workspace. Anchor actions are spawn, reuse, retire, status, send, collect. Worker actions are claim, start, inbox, ack, report, finish. Call status before creating a worker group: targetWorkerCount is the user's configured concurrency target, recommendedWorkerCount is the product recommendation, and maxWorkerCount is the hard ceiling. Respect an explicit user-requested count when it is within the maximum; otherwise use targetWorkerCount. Reuse creates a new durable task on an idle claimed worker and wakes its existing ChatGPT conversation. Retire frees an idle worker slot or safely abandons a launch only when MoonDesk can prove the assignment never crossed the Send boundary. collect can wait up to 60 seconds for a report/completion so the Anchor does not need polling loops. Worker coordination requires exact ChatGPT session metadata and fails closed when that identity is unavailable. operation_id must be a stable UUID reused when retrying the same spawn/reuse/send/report after an ambiguous response.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -484,6 +488,9 @@ fn workers_tool_descriptor() -> Value {
                 "executionProfile": { "type": "object" },
                 "family": { "type": ["object", "null"] },
                 "workers": { "type": "array" },
+                "targetWorkerCount": { "type": "integer" },
+                "recommendedWorkerCount": { "type": "integer" },
+                "maxWorkerCount": { "type": "integer" },
                 "messageId": { "type": "string" },
                 "reportId": { "type": "string" },
                 "messages": { "type": "array" },
@@ -887,8 +894,11 @@ async fn handle_tools_call(
             command_jobs,
             browser_runtime,
             worker_execution_profile: ChatExecutionProfile::default(),
+            worker_target_count: crate::workers::RECOMMENDED_WORKERS_PER_FAMILY,
             worker_broker: test_worker_broker(),
             managed_chat_broker: test_managed_chat_broker(),
+            companion_auth: None,
+            inbound_request_id: None,
         },
     )
     .await
@@ -982,8 +992,11 @@ async fn handle_tools_call_for_workspace(
         command_jobs,
         browser_runtime,
         worker_execution_profile,
+        worker_target_count,
         worker_broker,
         managed_chat_broker,
+        companion_auth,
+        inbound_request_id,
     } = context;
     let params = &req.params;
     let tool_name = params
@@ -1064,27 +1077,87 @@ async fn handle_tools_call_for_workspace(
 
     if tool_name == "workers" {
         if !mode.computer_enabled() {
-            return tool_error_response(
+            return tool_error_response_text_only(
                 req,
                 "Tool 'workers' requires Computer or Both mode".into(),
             );
         }
         if tool_mode.read_only() {
-            return read_only_blocked_response(req, &tool_name);
+            return tool_error_response_text_only(
+                req,
+                format!("Tool '{tool_name}' is disabled in read-only mode"),
+            );
         }
         if workspaces::workspace_availability(Path::new(workspace_root))
             == WorkspaceAvailability::Unavailable
         {
-            return tool_error_response(
+            return tool_error_response_text_only(
                 req,
                 format!("Workspace is currently unavailable: {workspace_root}"),
             );
         }
         let caller_identity = match worker_chat_identity(req) {
             Ok(identity) => identity,
-            Err(error) => return tool_error_response(req, error),
+            Err(error) => return tool_error_response_text_only(req, error),
         };
         let arguments = tool_arguments(req);
+        let anchor_route = if arguments.get("action").and_then(Value::as_str) == Some("spawn") {
+            match companion_auth.as_ref() {
+                Some(auth) => {
+                    let route = if let Some(request_id) = inbound_request_id.as_deref() {
+                        auth.correlation_for(request_id).await
+                    } else {
+                        None
+                    };
+                    if let Some(route) = route {
+                        if let Err(error) = auth
+                            .remember_anchor_affinity(&caller_identity.session_digest, &route)
+                            .await
+                        {
+                            return tool_error_response_text_only(req, error);
+                        }
+                        Some(route)
+                    } else if let Some(route) = auth
+                        .anchor_affinity_for(&caller_identity.session_digest)
+                        .await
+                    {
+                        Some(route)
+                    } else {
+                        let routing_started_ms = crate::companion::unix_time_ms();
+                        match auth
+                            .wait_for_generating_anchor_after(
+                                routing_started_ms,
+                                std::time::Duration::from_millis(3_200),
+                            )
+                            .await
+                        {
+                            Ok(Some(route)) => {
+                                if let Err(error) = auth
+                                    .remember_anchor_affinity(
+                                        &caller_identity.session_digest,
+                                        &route,
+                                    )
+                                    .await
+                                {
+                                    return tool_error_response_text_only(req, error);
+                                }
+                                Some(route)
+                            }
+                            Ok(None) => {
+                                return tool_error_response_text_only(
+                                    req,
+                                    "workers spawn could not identify the originating ChatGPT Anchor after waiting for fresh companion presence; no exact request correlation, remembered Anchor affinity, or unique actively-generating paired conversation was available".into(),
+                                );
+                            }
+                            Err(error) => return tool_error_response_text_only(req, error),
+                        }
+                    }
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
         return match crate::workers::protocol::handle(
             &arguments,
             workspace_id,
@@ -1092,12 +1165,16 @@ async fn handle_tools_call_for_workspace(
             &caller_identity,
             &worker_execution_profile,
             worker_broker.as_ref(),
-            managed_chat_broker.as_ref(),
+            crate::workers::protocol::WorkerLaunchContext {
+                managed_chat_broker: managed_chat_broker.as_ref(),
+                anchor_route: anchor_route.as_ref(),
+                worker_target_count,
+            },
         )
         .await
         {
             Ok(structured) => tool_success_response_with_structured(req, String::new(), structured),
-            Err(error) => tool_error_response(req, error),
+            Err(error) => tool_error_response_text_only(req, error),
         };
     }
 
@@ -2139,6 +2216,16 @@ fn tool_message_structured(message: String) -> Value {
     json!({ "message": message })
 }
 
+fn tool_error_response_text_only(req: &JsonRpcRequest, text: String) -> JsonRpcResponse {
+    JsonRpcResponse::success(
+        req.id.clone(),
+        json!({
+            "content": [{ "type": "text", "text": text }],
+            "isError": true
+        }),
+    )
+}
+
 fn tool_success_response_with_structured(
     req: &JsonRpcRequest,
     text: String,
@@ -2319,6 +2406,10 @@ Always specify the branch explicitly when using `git push`."#
     }
 
     if tool_mode.write_tools_enabled() {
+        lines.push(
+            "Experimental Workers are exposed through the workers tool in multi-tools mode. If MoonDesk has been upgraded to a Workers-capable build but this ChatGPT conversation does not show a workers tool, the conversation may be holding an older cached connector schema: refresh/reconnect the MoonDesk Custom Connector and start a new conversation instead of simulating worker orchestration through browser or shell tools."
+                .to_string(),
+        );
         lines.push(
             "Session handoffs are manual and explicit. Call create_handoff only when the user asks for a handoff, says they are moving to another chat, or otherwise explicitly requests session continuation state; do not create handoffs silently or periodically in the background. MoonDesk stores the checkpoint outside the workspace and automatically captures Git and running command-job state. In the next session, use resume_handoff with the handoff ID shown below, verify any reported drift before editing, and call complete_handoff once that continuation is genuinely finished. Never put credentials, tokens, passwords, private keys, or other secrets in handoff text."
                 .to_string(),
@@ -3821,15 +3912,18 @@ mod tests {
                 command_jobs: &command_jobs,
                 browser_runtime: &browser_runtime,
                 worker_execution_profile: ChatExecutionProfile::default(),
+                worker_target_count: crate::workers::RECOMMENDED_WORKERS_PER_FAMILY,
                 worker_broker,
                 managed_chat_broker,
+                companion_auth: None,
+                inbound_request_id: None,
             },
         )
         .await
     }
 
     fn result_text(response: &JsonRpcResponse) -> &str {
-        response
+        if let Some(text) = response
             .result
             .as_ref()
             .and_then(|result| result.get("structuredContent"))
@@ -3841,6 +3935,21 @@ mod tests {
                     .or_else(|| structured.get("instructionText"))
             })
             .and_then(Value::as_str)
+        {
+            return text;
+        }
+        response
+            .result
+            .as_ref()
+            .and_then(|result| result.get("content"))
+            .and_then(Value::as_array)
+            .and_then(|content| {
+                content.iter().find_map(|entry| {
+                    (entry.get("type").and_then(Value::as_str) == Some("text"))
+                        .then(|| entry.get("text").and_then(Value::as_str))
+                        .flatten()
+                })
+            })
             .expect("missing result text")
     }
 
@@ -3993,6 +4102,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn workers_status_exposes_configured_recommended_and_max_counts() {
+        let root = TestTempDir::new("moondesk-workers-mcp-counts");
+        let workspace_root = root.path().join("workspace");
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        let workspace_id = WorkspaceId::new();
+        let broker = Arc::new(
+            WorkerBroker::open(root.path().join("worker-state-v1.json"))
+                .expect("open worker broker"),
+        );
+        let managed_chat_broker = Arc::new(
+            ManagedChatBroker::open(root.path().join("managed-chat-state-v1.json"))
+                .expect("open managed chat broker"),
+        );
+        let response = call_workers_for_test(
+            &tool_call_request_with_session(
+                "workers",
+                json!({ "action": "status" }),
+                "anchor-counts",
+            ),
+            &workspace_id,
+            &workspace_root.to_string_lossy(),
+            broker,
+            managed_chat_broker,
+        )
+        .await;
+        let structured = response
+            .result
+            .as_ref()
+            .and_then(|result| result.get("structuredContent"))
+            .expect("workers status structured output");
+        assert_eq!(structured.get("targetWorkerCount"), Some(&json!(4)));
+        assert_eq!(structured.get("recommendedWorkerCount"), Some(&json!(4)));
+        assert_eq!(structured.get("maxWorkerCount"), Some(&json!(8)));
+    }
+
+    #[tokio::test]
     async fn workers_mcp_fails_closed_without_exact_openai_session() {
         let root = TestTempDir::new("moondesk-workers-mcp-no-session");
         let workspace_root = root.path().join("workspace");
@@ -4032,7 +4177,461 @@ mod tests {
             Some(true)
         );
         assert!(result_text(&response).contains("openai/session"));
+        let result = response.result.as_ref().expect("workers error result");
+        assert!(
+            result.get("structuredContent").is_none(),
+            "tool errors must not emit structuredContent that violates a tool output schema"
+        );
+        assert_eq!(
+            result.pointer("/content/0/type").and_then(Value::as_str),
+            Some("text")
+        );
         assert!(broker.snapshot().await.families.is_empty());
+    }
+
+    #[tokio::test]
+    async fn workers_mcp_spawn_prefers_exact_request_correlation() {
+        let root = TestTempDir::new("moondesk-workers-mcp-generating-route");
+        let workspace_root = root.path().join("workspace");
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        let workspace_id = WorkspaceId::new();
+        let broker = Arc::new(
+            WorkerBroker::open(root.path().join("worker-state-v1.json"))
+                .expect("open worker broker"),
+        );
+        let managed_chat_broker = Arc::new(
+            ManagedChatBroker::open(root.path().join("managed-chat-state-v1.json"))
+                .expect("open managed chat broker"),
+        );
+        let companion_auth = Arc::new(
+            CompanionAuth::open(root.path().join("companion-auth-v1.json"))
+                .expect("open companion auth"),
+        );
+        companion_auth
+            .auto_pair(
+                "chrome-install",
+                &"a".repeat(64),
+                Some("chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            )
+            .await
+            .expect("pair chrome");
+        companion_auth
+            .auto_pair(
+                "edge-install",
+                &"b".repeat(64),
+                Some("chrome-extension://bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+            )
+            .await
+            .expect("pair edge");
+
+        let request_id = "wfr_exact_worker_spawn";
+        let wrong_correlation_conversation = "6aad7eb1-4b10-83ee-97bd-d98b338864de";
+        companion_auth
+            .observe_correlations(
+                "chrome-install",
+                crate::companion::CompanionCorrelationUpdate {
+                    conversation_id: wrong_correlation_conversation.into(),
+                    conversation_url: format!(
+                        "https://chatgpt.com/c/{wrong_correlation_conversation}"
+                    ),
+                    project_id: None,
+                    project_url: None,
+                    request_ids: vec![request_id.into()],
+                },
+                100,
+            )
+            .await
+            .expect("publish stale browser correlation");
+
+        companion_auth
+            .update_presence(
+                "chrome-install",
+                crate::companion::CompanionPresenceUpdate {
+                    browser_label: Some("Chrome".into()),
+                    tabs: vec![crate::companion::CompanionTabPresence {
+                        conversation_id: wrong_correlation_conversation.into(),
+                        conversation_url: format!(
+                            "https://chatgpt.com/c/{wrong_correlation_conversation}"
+                        ),
+                        project_id: None,
+                        project_url: None,
+                        active: true,
+                        window_focused: true,
+                        generating: false,
+                    }],
+                },
+                crate::companion::unix_time_ms().saturating_add(10_000),
+            )
+            .await
+            .expect("chrome presence");
+
+        let anchor_conversation = "7bbd8fc2-5c21-94ff-a8ce-e09c449975ef";
+        companion_auth
+            .update_presence(
+                "edge-install",
+                crate::companion::CompanionPresenceUpdate {
+                    browser_label: Some("Edge".into()),
+                    tabs: vec![crate::companion::CompanionTabPresence {
+                        conversation_id: anchor_conversation.into(),
+                        conversation_url: format!("https://chatgpt.com/c/{anchor_conversation}"),
+                        project_id: None,
+                        project_url: None,
+                        active: false,
+                        window_focused: false,
+                        generating: true,
+                    }],
+                },
+                crate::companion::unix_time_ms().saturating_add(10_000),
+            )
+            .await
+            .expect("edge generating presence");
+
+        let opaque_openai_session = "opaque-openai-session-not-browser-url";
+        let request = tool_call_request_with_session(
+            "workers",
+            json!({
+                "action": "spawn",
+                "operation_id": Uuid::new_v4().to_string(),
+                "label": "correlation proof",
+                "task": "Inspect without editing."
+            }),
+            opaque_openai_session,
+        );
+        let command_jobs = CommandJobManager::new();
+        let browser_runtime = None;
+        let response = handle_tools_call_for_workspace(
+            &request,
+            McpRequestContext {
+                workspace_id: &workspace_id,
+                workspace_name: "Totally Different Workspace Label",
+                workspace_root: &workspace_root.to_string_lossy(),
+                mode: Mode::Both,
+                tool_mode: ToolMode::MultiTools,
+                set_moondesk_as_co_author: false,
+                handoff_store_root: None,
+                command_jobs: &command_jobs,
+                browser_runtime: &browser_runtime,
+                worker_execution_profile: ChatExecutionProfile::default(),
+                worker_target_count: crate::workers::RECOMMENDED_WORKERS_PER_FAMILY,
+                worker_broker: broker,
+                managed_chat_broker: managed_chat_broker.clone(),
+                companion_auth: Some(companion_auth),
+                inbound_request_id: Some(request_id.into()),
+            },
+        )
+        .await;
+        assert_ne!(
+            response
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+
+        let snapshot = managed_chat_broker.snapshot().await;
+        let command = snapshot
+            .commands
+            .values()
+            .next()
+            .expect("managed worker launch");
+        assert_eq!(command.target_client_id.as_deref(), Some("chrome-install"));
+        assert_eq!(
+            command
+                .anchor_context
+                .as_ref()
+                .map(|context| context.conversation_id.as_str()),
+            Some(wrong_correlation_conversation)
+        );
+        assert_eq!(
+            command.launch.anchor_session_digest.as_deref(),
+            Some(ChatIdentity::session_digest_for(opaque_openai_session).as_str())
+        );
+        assert_ne!(
+            command.launch.anchor_session_digest.as_deref(),
+            Some(ChatIdentity::session_digest_for(anchor_conversation).as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn workers_mcp_spawn_uses_generating_anchor_even_when_focus_is_elsewhere() {
+        let root = TestTempDir::new("moondesk-workers-mcp-focused-fallback");
+        let workspace_root = root.path().join("workspace");
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        let workspace_id = WorkspaceId::new();
+        let broker = Arc::new(
+            WorkerBroker::open(root.path().join("worker-state-v1.json"))
+                .expect("open worker broker"),
+        );
+        let managed_chat_broker = Arc::new(
+            ManagedChatBroker::open(root.path().join("managed-chat-state-v1.json"))
+                .expect("open managed chat broker"),
+        );
+        let companion_auth = Arc::new(
+            CompanionAuth::open(root.path().join("companion-auth-v1.json"))
+                .expect("open companion auth"),
+        );
+        companion_auth
+            .auto_pair(
+                "chrome-install",
+                &"a".repeat(64),
+                Some("chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            )
+            .await
+            .expect("pair chrome");
+        companion_auth
+            .auto_pair(
+                "edge-install",
+                &"b".repeat(64),
+                Some("chrome-extension://bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+            )
+            .await
+            .expect("pair edge");
+
+        let chrome_conversation = "6aad7eb1-4b10-83ee-97bd-d98b338864de";
+        companion_auth
+            .update_presence(
+                "chrome-install",
+                crate::companion::CompanionPresenceUpdate {
+                    browser_label: Some("Chrome".into()),
+                    tabs: vec![crate::companion::CompanionTabPresence {
+                        conversation_id: chrome_conversation.into(),
+                        conversation_url: format!("https://chatgpt.com/c/{chrome_conversation}"),
+                        project_id: None,
+                        project_url: None,
+                        active: true,
+                        window_focused: true,
+                        generating: false,
+                    }],
+                },
+                crate::companion::unix_time_ms().saturating_add(10_000),
+            )
+            .await
+            .expect("chrome presence");
+
+        let edge_conversation = "7bbd8fc2-5c21-94ff-a8ce-e09c449975ef";
+        companion_auth
+            .update_presence(
+                "edge-install",
+                crate::companion::CompanionPresenceUpdate {
+                    browser_label: Some("Edge".into()),
+                    tabs: vec![crate::companion::CompanionTabPresence {
+                        conversation_id: edge_conversation.into(),
+                        conversation_url: format!("https://chatgpt.com/c/{edge_conversation}"),
+                        project_id: None,
+                        project_url: None,
+                        active: true,
+                        window_focused: false,
+                        generating: true,
+                    }],
+                },
+                crate::companion::unix_time_ms().saturating_add(10_000),
+            )
+            .await
+            .expect("edge presence");
+
+        let request = tool_call_request_with_session(
+            "workers",
+            json!({
+                "action": "spawn",
+                "operation_id": Uuid::new_v4().to_string(),
+                "label": "focused fallback",
+                "task": "Report the workspace name without editing."
+            }),
+            "opaque-anchor-session",
+        );
+        let command_jobs = CommandJobManager::new();
+        let browser_runtime = None;
+        let response = handle_tools_call_for_workspace(
+            &request,
+            McpRequestContext {
+                workspace_id: &workspace_id,
+                workspace_name: "MoonDesk",
+                workspace_root: &workspace_root.to_string_lossy(),
+                mode: Mode::Both,
+                tool_mode: ToolMode::MultiTools,
+                set_moondesk_as_co_author: false,
+                handoff_store_root: None,
+                command_jobs: &command_jobs,
+                browser_runtime: &browser_runtime,
+                worker_execution_profile: ChatExecutionProfile::default(),
+                worker_target_count: crate::workers::RECOMMENDED_WORKERS_PER_FAMILY,
+                worker_broker: broker,
+                managed_chat_broker: managed_chat_broker.clone(),
+                companion_auth: Some(companion_auth),
+                inbound_request_id: Some("request_without_page_correlation".into()),
+            },
+        )
+        .await;
+        assert_ne!(
+            response
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+
+        let snapshot = managed_chat_broker.snapshot().await;
+        let command = snapshot
+            .commands
+            .values()
+            .next()
+            .expect("managed worker launch");
+        assert_eq!(command.target_client_id.as_deref(), Some("edge-install"));
+        assert_eq!(
+            command
+                .anchor_context
+                .as_ref()
+                .map(|context| context.conversation_id.as_str()),
+            Some(edge_conversation)
+        );
+    }
+
+    #[tokio::test]
+    async fn workers_mcp_reuses_anchor_affinity_while_other_workers_are_generating() {
+        let root = TestTempDir::new("moondesk-workers-mcp-anchor-affinity");
+        let workspace_root = root.path().join("workspace");
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        let workspace_id = WorkspaceId::new();
+        let broker = Arc::new(
+            WorkerBroker::open(root.path().join("worker-state-v1.json"))
+                .expect("open worker broker"),
+        );
+        let managed_chat_broker = Arc::new(
+            ManagedChatBroker::open(root.path().join("managed-chat-state-v1.json"))
+                .expect("open managed chat broker"),
+        );
+        let companion_auth = Arc::new(
+            CompanionAuth::open(root.path().join("companion-auth-v1.json"))
+                .expect("open companion auth"),
+        );
+        companion_auth
+            .auto_pair(
+                "anchor-browser",
+                &"a".repeat(64),
+                Some("chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            )
+            .await
+            .expect("pair anchor browser");
+        companion_auth
+            .auto_pair(
+                "other-browser",
+                &"b".repeat(64),
+                Some("chrome-extension://bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+            )
+            .await
+            .expect("pair other browser");
+
+        let anchor_conversation = "6aad7eb1-4b10-83ee-97bd-d98b338864de";
+        let worker_conversation = "7bbd8fc2-5c21-94ff-a8ce-e09c449975ef";
+        let anchor_tab = crate::companion::CompanionTabPresence {
+            conversation_id: anchor_conversation.into(),
+            conversation_url: format!("https://chatgpt.com/c/{anchor_conversation}"),
+            project_id: None,
+            project_url: None,
+            active: true,
+            window_focused: false,
+            generating: true,
+        };
+        companion_auth
+            .update_presence(
+                "anchor-browser",
+                crate::companion::CompanionPresenceUpdate {
+                    browser_label: Some("Edge".into()),
+                    tabs: vec![anchor_tab.clone()],
+                },
+                crate::companion::unix_time_ms(),
+            )
+            .await
+            .expect("anchor presence");
+        companion_auth
+            .update_presence(
+                "other-browser",
+                crate::companion::CompanionPresenceUpdate {
+                    browser_label: Some("Chrome".into()),
+                    tabs: vec![crate::companion::CompanionTabPresence {
+                        conversation_id: worker_conversation.into(),
+                        conversation_url: format!("https://chatgpt.com/c/{worker_conversation}"),
+                        project_id: None,
+                        project_url: None,
+                        active: true,
+                        window_focused: true,
+                        generating: true,
+                    }],
+                },
+                crate::companion::unix_time_ms(),
+            )
+            .await
+            .expect("worker presence");
+
+        let anchor_session = "opaque-anchor-session-for-affinity";
+        companion_auth
+            .remember_anchor_affinity(
+                &ChatIdentity::session_digest_for(anchor_session),
+                &crate::companion::CompanionAnchorRoute {
+                    client_id: "anchor-browser".into(),
+                    tab: anchor_tab,
+                },
+            )
+            .await
+            .expect("remember Anchor affinity");
+
+        let request = tool_call_request_with_session(
+            "workers",
+            json!({
+                "action": "spawn",
+                "operation_id": Uuid::new_v4().to_string(),
+                "label": "second worker",
+                "task": "Report workspace identity without editing."
+            }),
+            anchor_session,
+        );
+        let command_jobs = CommandJobManager::new();
+        let browser_runtime = None;
+        let response = handle_tools_call_for_workspace(
+            &request,
+            McpRequestContext {
+                workspace_id: &workspace_id,
+                workspace_name: "MoonDesk",
+                workspace_root: &workspace_root.to_string_lossy(),
+                mode: Mode::Both,
+                tool_mode: ToolMode::MultiTools,
+                set_moondesk_as_co_author: false,
+                handoff_store_root: None,
+                command_jobs: &command_jobs,
+                browser_runtime: &browser_runtime,
+                worker_execution_profile: ChatExecutionProfile::default(),
+                worker_target_count: crate::workers::RECOMMENDED_WORKERS_PER_FAMILY,
+                worker_broker: broker,
+                managed_chat_broker: managed_chat_broker.clone(),
+                companion_auth: Some(companion_auth),
+                inbound_request_id: Some("uncorrelated-second-spawn".into()),
+            },
+        )
+        .await;
+        assert_ne!(
+            response
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        let snapshot = managed_chat_broker.snapshot().await;
+        let command = snapshot
+            .commands
+            .values()
+            .next()
+            .expect("managed worker launch");
+        assert_eq!(command.target_client_id.as_deref(), Some("anchor-browser"));
+        assert_eq!(
+            command
+                .anchor_context
+                .as_ref()
+                .map(|context| context.conversation_id.as_str()),
+            Some(anchor_conversation)
+        );
     }
 
     #[tokio::test]
@@ -4531,6 +5130,21 @@ mod tests {
             .expect("redeem replacement launch")
             .expect("replacement launch offer");
         assert!(!offer.reconcile_required);
+        let replacement_lease = offer
+            .command
+            .lease
+            .as_ref()
+            .expect("replacement launch lease")
+            .lease_id
+            .clone();
+        managed_chat_broker
+            .mark_send_started(
+                &offer.command.id,
+                &replacement_lease,
+                "extension-retire-test",
+            )
+            .await
+            .expect("cross replacement Send boundary");
         let unsafe_retire = call_workers_for_test(
             &tool_call_request_with_session(
                 "workers",
@@ -5282,8 +5896,11 @@ mod tests {
                 command_jobs: &command_jobs,
                 browser_runtime: &None,
                 worker_execution_profile: ChatExecutionProfile::default(),
+                worker_target_count: crate::workers::RECOMMENDED_WORKERS_PER_FAMILY,
                 worker_broker: test_worker_broker(),
                 managed_chat_broker: test_managed_chat_broker(),
+                companion_auth: None,
+                inbound_request_id: None,
             },
         )
         .await;
@@ -5294,6 +5911,11 @@ mod tests {
             .and_then(|structured| structured.get("instructionText"))
             .and_then(Value::as_str)
             .expect("initial instruction text");
+        assert!(
+            initial_instruction_text
+                .contains("Experimental Workers are exposed through the workers tool")
+        );
+        assert!(initial_instruction_text.contains("older cached connector schema"));
         assert!(initial_instruction_text.contains("Session handoffs are manual and explicit"));
         assert!(
             initial_instruction_text.contains("do not create handoffs silently or periodically")
@@ -5329,8 +5951,11 @@ mod tests {
                 command_jobs: &command_jobs,
                 browser_runtime: &None,
                 worker_execution_profile: ChatExecutionProfile::default(),
+                worker_target_count: crate::workers::RECOMMENDED_WORKERS_PER_FAMILY,
                 worker_broker: test_worker_broker(),
                 managed_chat_broker: test_managed_chat_broker(),
+                companion_auth: None,
+                inbound_request_id: None,
             },
         )
         .await;
@@ -5364,8 +5989,11 @@ mod tests {
                 command_jobs: &command_jobs,
                 browser_runtime: &None,
                 worker_execution_profile: ChatExecutionProfile::default(),
+                worker_target_count: crate::workers::RECOMMENDED_WORKERS_PER_FAMILY,
                 worker_broker: test_worker_broker(),
                 managed_chat_broker: test_managed_chat_broker(),
+                companion_auth: None,
+                inbound_request_id: None,
             },
         )
         .await;
@@ -5396,8 +6024,11 @@ mod tests {
                 command_jobs: &command_jobs,
                 browser_runtime: &None,
                 worker_execution_profile: ChatExecutionProfile::default(),
+                worker_target_count: crate::workers::RECOMMENDED_WORKERS_PER_FAMILY,
                 worker_broker: test_worker_broker(),
                 managed_chat_broker: test_managed_chat_broker(),
+                companion_auth: None,
+                inbound_request_id: None,
             },
         )
         .await;
@@ -5436,8 +6067,11 @@ mod tests {
                 command_jobs: &command_jobs,
                 browser_runtime: &None,
                 worker_execution_profile: ChatExecutionProfile::default(),
+                worker_target_count: crate::workers::RECOMMENDED_WORKERS_PER_FAMILY,
                 worker_broker: test_worker_broker(),
                 managed_chat_broker: test_managed_chat_broker(),
+                companion_auth: None,
+                inbound_request_id: None,
             },
         )
         .await;
@@ -5465,8 +6099,11 @@ mod tests {
                 command_jobs: &command_jobs,
                 browser_runtime: &None,
                 worker_execution_profile: ChatExecutionProfile::default(),
+                worker_target_count: crate::workers::RECOMMENDED_WORKERS_PER_FAMILY,
                 worker_broker: test_worker_broker(),
                 managed_chat_broker: test_managed_chat_broker(),
+                companion_auth: None,
+                inbound_request_id: None,
             },
         )
         .await;
@@ -5493,8 +6130,11 @@ mod tests {
                 command_jobs: &command_jobs,
                 browser_runtime: &None,
                 worker_execution_profile: ChatExecutionProfile::default(),
+                worker_target_count: crate::workers::RECOMMENDED_WORKERS_PER_FAMILY,
                 worker_broker: test_worker_broker(),
                 managed_chat_broker: test_managed_chat_broker(),
+                companion_auth: None,
+                inbound_request_id: None,
             },
         )
         .await;

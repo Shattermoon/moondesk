@@ -4065,7 +4065,7 @@ async fn run_settings(
         let app = state.lock().await;
         themes.iter().position(|t| t.id == app.theme).unwrap_or(0)
     };
-    let total_rows = themes.len() + tool_modes.len() + browser_presentations.len() + 5;
+    let total_rows = themes.len() + tool_modes.len() + browser_presentations.len() + 6;
 
     loop {
         let (
@@ -4073,6 +4073,7 @@ async fn run_settings(
             current_tool_mode,
             current_browser_presentation,
             worker_execution_profile,
+            worker_target_count,
             usage_totals,
             set_moondesk_as_co_author,
             ngrok_authtoken_configured,
@@ -4087,6 +4088,7 @@ async fn run_settings(
                 app.tool_mode,
                 app.browser_presentation,
                 app.worker_execution_profile.clone(),
+                app.worker_target_count,
                 app.all_time_usage_totals(),
                 app.set_moondesk_as_co_author,
                 app.ngrok_authtoken().is_some(),
@@ -4107,6 +4109,7 @@ async fn run_settings(
                     current_tool_mode,
                     current_browser_presentation,
                     worker_execution_profile: &worker_execution_profile,
+                    worker_target_count,
                     companion_pairing_code: &companion_pairing_code,
                     companion_client_id: companion_client_id.as_deref(),
                     companion_local_url: &companion_local_url,
@@ -4215,6 +4218,16 @@ async fn run_settings(
                             );
                             app.mark_config_dirty();
                         } else if selected_row == settings_action_start + 2 {
+                            app.worker_target_count =
+                                if app.worker_target_count >= workers::MAX_WORKERS_PER_FAMILY {
+                                    1
+                                } else {
+                                    app.worker_target_count + 1
+                                };
+                            let count = app.worker_target_count;
+                            app.log("INFO", format!("Worker target count: {count}"));
+                            app.mark_config_dirty();
+                        } else if selected_row == settings_action_start + 3 {
                             app.set_moondesk_as_co_author = !app.set_moondesk_as_co_author;
                             let enabled = app.set_moondesk_as_co_author;
                             app.log(
@@ -4225,11 +4238,11 @@ async fn run_settings(
                                 ),
                             );
                             app.mark_config_dirty();
-                        } else if selected_row == settings_action_start + 3 {
+                        } else if selected_row == settings_action_start + 4 {
                             drop(app);
                             let _ =
                                 run_ngrok_auth_setup(terminal, state.clone(), None, true).await?;
-                        } else if selected_row == settings_action_start + 4 {
+                        } else if selected_row == settings_action_start + 5 {
                             let previous_domain = app.ngrok_domain.clone();
                             let current_domain = previous_domain.clone().unwrap_or_default();
                             drop(app);
@@ -4311,6 +4324,7 @@ struct SettingsView<'a> {
     current_tool_mode: ToolMode,
     current_browser_presentation: BrowserPresentation,
     worker_execution_profile: &'a ChatExecutionProfile,
+    worker_target_count: usize,
     companion_pairing_code: &'a str,
     companion_client_id: Option<&'a str>,
     companion_local_url: &'a str,
@@ -4329,6 +4343,7 @@ fn draw_settings(f: &mut Frame, view: SettingsView<'_>) {
         current_tool_mode,
         current_browser_presentation,
         worker_execution_profile,
+        worker_target_count,
         companion_pairing_code,
         companion_client_id,
         companion_local_url,
@@ -4496,8 +4511,10 @@ fn draw_settings(f: &mut Frame, view: SettingsView<'_>) {
 
     let worker_model_row = themes.len() + tool_modes.len() + browser_presentations.len();
     let worker_effort_row = worker_model_row + 1;
+    let worker_count_row = worker_effort_row + 1;
     let worker_model_selected = worker_model_row == selected_row;
     let worker_effort_selected = worker_effort_row == selected_row;
+    let worker_count_selected = worker_count_row == selected_row;
     let worker_model_style = if worker_model_selected {
         Style::default()
             .fg(palette.key_fg)
@@ -4506,6 +4523,13 @@ fn draw_settings(f: &mut Frame, view: SettingsView<'_>) {
         Style::default().fg(palette.primary_fg)
     };
     let worker_effort_style = if worker_effort_selected {
+        Style::default()
+            .fg(palette.key_fg)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(palette.primary_fg)
+    };
+    let worker_count_style = if worker_count_selected {
         Style::default()
             .fg(palette.key_fg)
             .add_modifier(Modifier::BOLD)
@@ -4543,6 +4567,24 @@ fn draw_settings(f: &mut Frame, view: SettingsView<'_>) {
         ),
         worker_effort_style,
     )));
+    if worker_count_selected {
+        selected_line_idx = lines.len();
+    }
+    lines.push(Line::from(Span::styled(
+        format!(
+            " {} [{}] Worker count: {} (recommended 1-{}, max {})",
+            if worker_count_selected { ">" } else { " " },
+            worker_count_row + 1,
+            worker_target_count,
+            workers::RECOMMENDED_WORKERS_PER_FAMILY,
+            workers::MAX_WORKERS_PER_FAMILY
+        ),
+        worker_count_style,
+    )));
+    lines.push(Line::from(Span::styled(
+        "     5-8 workers can hit ChatGPT/provider rate limits, especially with other active chats.",
+        Style::default().fg(palette.muted_fg),
+    )));
     lines.push(Line::from(Span::styled(
         format!(
             "     Companion: {} · {}",
@@ -4566,7 +4608,7 @@ fn draw_settings(f: &mut Frame, view: SettingsView<'_>) {
         Style::default().fg(palette.muted_fg),
     )));
 
-    let co_author_row = worker_effort_row + 1;
+    let co_author_row = worker_count_row + 1;
     let co_author_selected = co_author_row == selected_row;
     let co_author_marker = if co_author_selected { ">" } else { " " };
     let co_author_name_style = if co_author_selected {
@@ -10284,6 +10326,7 @@ mod tests {
                             current_tool_mode: tool_mode,
                             current_browser_presentation: super::BrowserPresentation::Headless,
                             worker_execution_profile: &super::ChatExecutionProfile::default(),
+                            worker_target_count: crate::workers::RECOMMENDED_WORKERS_PER_FAMILY,
                             companion_pairing_code: "test-pairing-code",
                             companion_client_id: None,
                             companion_local_url: "http://127.0.0.1:3200",
@@ -10319,6 +10362,7 @@ mod tests {
                         current_tool_mode: tool_mode,
                         current_browser_presentation: super::BrowserPresentation::Visible,
                         worker_execution_profile: &super::ChatExecutionProfile::default(),
+                        worker_target_count: crate::workers::RECOMMENDED_WORKERS_PER_FAMILY,
                         companion_pairing_code: "test-pairing-code",
                         companion_client_id: None,
                         companion_local_url: "http://127.0.0.1:3200",
@@ -10374,6 +10418,7 @@ mod tests {
                         current_tool_mode: tool_mode,
                         current_browser_presentation: super::BrowserPresentation::Headless,
                         worker_execution_profile: &profile,
+                        worker_target_count: crate::workers::RECOMMENDED_WORKERS_PER_FAMILY,
                         companion_pairing_code: "test-pairing-code",
                         companion_client_id: Some("extension-install-a"),
                         companion_local_url: "http://127.0.0.1:3200",
@@ -10401,6 +10446,8 @@ mod tests {
         assert!(rendered.contains("Workers (experimental)"));
         assert!(rendered.contains("Default model: GPT-5.6 Sol"));
         assert!(rendered.contains("Reasoning effort: High"));
+        assert!(rendered.contains("Worker count: 4 (recommended 1-4, max 8)"));
+        assert!(rendered.contains("5-8 workers can hit ChatGPT/provider rate limits"));
         assert!(rendered.contains("Companion: paired"));
         assert!(rendered.contains("http://127.0.0.1:3200"));
         assert!(rendered.contains("Manual repair code: test-pairing-code"));
@@ -10427,6 +10474,7 @@ mod tests {
                         current_tool_mode: tool_mode,
                         current_browser_presentation: super::BrowserPresentation::Headless,
                         worker_execution_profile: &super::ChatExecutionProfile::default(),
+                        worker_target_count: crate::workers::RECOMMENDED_WORKERS_PER_FAMILY,
                         companion_pairing_code: "test-pairing-code",
                         companion_client_id: None,
                         companion_local_url: "http://127.0.0.1:3200",
@@ -10505,6 +10553,7 @@ mod tests {
                         current_tool_mode: tool_mode,
                         current_browser_presentation: super::BrowserPresentation::Headless,
                         worker_execution_profile: &super::ChatExecutionProfile::default(),
+                        worker_target_count: crate::workers::RECOMMENDED_WORKERS_PER_FAMILY,
                         companion_pairing_code: "test-pairing-code",
                         companion_client_id: None,
                         companion_local_url: "http://127.0.0.1:3200",

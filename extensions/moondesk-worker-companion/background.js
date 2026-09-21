@@ -1,17 +1,28 @@
 const STORAGE_KEY = 'moondeskWorkerCompanionV1';
 const POLL_ALARM = 'moondesk-worker-companion-poll';
 const BRIDGE_PORTS = [47650, 47651, 47652, 47653, 47654];
+const REQUIRED_PROTOCOL_VERSION = 2;
 const HELLO_PATH = '/__moondesk/companion/v1/hello';
 const PAIR_PATH = '/__moondesk/companion/v1/pair';
 const REPAIR_PATH = '/__moondesk/companion/v1/repair';
 const STATUS_PATH = '/__moondesk/companion/v1/status';
+const CLIENTS_PATH = '/__moondesk/companion/v1/clients';
+const PRESENCE_PATH = '/__moondesk/companion/v1/presence';
+const CORRELATIONS_PATH = '/__moondesk/companion/v1/correlations';
+const SEND_STARTED_PATH = '/__moondesk/companion/v1/commands/send-started';
 const HELLO_TIMEOUT_MS = 1200;
 const FAST_POLL_MS = 1500;
 const MAX_RECONCILE_ATTEMPTS = 3;
+const MAX_PARALLEL_COMMANDS = 4;
+const MAX_PARALLEL_PROJECT_BOOTSTRAPS = 1;
 
 let pumpTimer = null;
 let pumpActive = false;
 let connecting = null;
+let stateWriteQueue = Promise.resolve();
+const sessionReconcileCommandIds = new Set();
+let availableProjectBootstrapSlots = MAX_PARALLEL_PROJECT_BOOTSTRAPS;
+const projectBootstrapWaiters = [];
 
 function freshState() {
   return {
@@ -21,13 +32,21 @@ function freshState() {
     bindings: {},
     launchRecords: {},
     threadRecords: {},
-    blockedCommand: null
+    blockedCommands: {}
   };
 }
 
 async function readState() {
   const stored = await chrome.storage.local.get(STORAGE_KEY);
-  const state = { ...freshState(), ...(stored[STORAGE_KEY] || {}) };
+  const persisted = stored[STORAGE_KEY] || {};
+  const state = { ...freshState(), ...persisted };
+  if (!state.blockedCommands || typeof state.blockedCommands !== 'object' || Array.isArray(state.blockedCommands)) {
+    state.blockedCommands = {};
+  }
+  if (persisted.blockedCommand?.commandId && !state.blockedCommands[persisted.blockedCommand.commandId]) {
+    state.blockedCommands[persisted.blockedCommand.commandId] = persisted.blockedCommand;
+  }
+  delete state.blockedCommand;
   if (!state.clientId) {
     state.clientId = crypto.randomUUID();
     await writeState(state);
@@ -36,7 +55,28 @@ async function readState() {
 }
 
 async function writeState(state) {
-  await chrome.storage.local.set({ [STORAGE_KEY]: state });
+  const snapshot = JSON.parse(JSON.stringify(state));
+  stateWriteQueue = stateWriteQueue
+    .catch(() => {})
+    .then(() => chrome.storage.local.set({ [STORAGE_KEY]: snapshot }));
+  await stateWriteQueue;
+}
+
+function blockCommand(state, blocked) {
+  if (!blocked?.commandId) return;
+  if (!state.blockedCommands || typeof state.blockedCommands !== 'object') {
+    state.blockedCommands = {};
+  }
+  state.blockedCommands[blocked.commandId] = blocked;
+}
+
+function clearBlockedCommand(state, commandId) {
+  if (!commandId) return;
+  delete state.blockedCommands[commandId];
+}
+
+function blockedCommandList(state) {
+  return Object.values(state.blockedCommands || {});
 }
 
 function normalizeBaseUrl(value) {
@@ -100,7 +140,7 @@ async function hello(baseUrl) {
     });
     if (!response.ok) return null;
     const body = await response.json().catch(() => null);
-    return body?.app === 'moondesk-worker-companion' && body?.protocolVersion === 1 ? body : null;
+    return body?.app === 'moondesk-worker-companion' && [1, 2].includes(body?.protocolVersion) ? body : null;
   } catch {
     return null;
   } finally {
@@ -125,13 +165,22 @@ async function discoverBridge(state) {
     ? [preferred, ...BRIDGE_PORTS.map((port) => `http://127.0.0.1:${port}`).filter((url) => url !== preferred)]
     : BRIDGE_PORTS.map((port) => `http://127.0.0.1:${port}`);
   const probes = await Promise.all(candidates.map(async (baseUrl) => ({ baseUrl, hello: await hello(baseUrl) })));
-  const match = probes.find((probe) => probe.hello);
+  const compatible = probes.filter((probe) => probe.hello?.protocolVersion === REQUIRED_PROTOCOL_VERSION);
+  const match = compatible.find((probe) => probe.baseUrl === preferred) || compatible[0];
   if (match) {
     if (state.baseUrl !== match.baseUrl) {
       state.baseUrl = match.baseUrl;
       await writeState(state);
     }
     return match.hello;
+  }
+  const older = probes.find((probe) => probe.hello);
+  if (older) {
+    throw requestError(
+      `MoonDesk Worker Companion requires bridge protocol ${REQUIRED_PROTOCOL_VERSION}; found protocol ${older.hello.protocolVersion}. Start the matching experimental MoonDesk build.`,
+      0,
+      'bridge_protocol_mismatch'
+    );
   }
   throw requestError('MoonDesk companion bridge was not found on this computer', 0, 'bridge_not_found');
 }
@@ -242,9 +291,174 @@ function canonicalConversationUrl(value) {
   }
 }
 
-function sourceUrlForCommand(binding, openMode, existingConversation) {
+function browserLabel() {
+  const ua = navigator.userAgent || '';
+  if (/Edg\//.test(ua)) return 'Edge';
+  if (/Chrome\//.test(ua)) return 'Chrome';
+  if (/Firefox\//.test(ua)) return 'Firefox';
+  return 'Chromium';
+}
+
+function chatContextFromUrl(value) {
+  try {
+    const url = new URL(value);
+    if (url.origin !== 'https://chatgpt.com') return null;
+    const conversation = /\/c\/([0-9a-f-]{16,64})(?:\/|$)/i.exec(url.pathname);
+    if (!conversation) return null;
+
+    let projectId = null;
+    let projectUrl = null;
+    const projectPath = /^\/g\/([^/]+)\/c\//i.exec(url.pathname);
+    if (projectPath) {
+      const candidate = projectPath[1].slice(0, 36).toLowerCase();
+      if (!/^g-p-[0-9a-f]{32}$/.test(candidate)) return null;
+      projectId = candidate;
+      projectUrl = url.origin + '/g/' + projectPath[1] + '/project';
+    }
+
+    url.hash = '';
+    return {
+      conversationId: conversation[1],
+      conversationUrl: url.toString(),
+      projectId,
+      projectUrl
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function collectPresence(state) {
+  const tabs = (await chrome.tabs.query({ url: 'https://chatgpt.com/*' })).slice(0, 32);
+  let focusedWindowId = null;
+  try {
+    const focused = await chrome.windows.getLastFocused();
+    focusedWindowId = focused?.focused ? (focused.id ?? null) : null;
+  } catch {}
+
+  const observed = (await Promise.all(tabs.map(async (tab) => {
+    const context = chatContextFromUrl(tab.url);
+    if (!context) return null;
+    let generating = false;
+    if (Number.isInteger(tab.id)) {
+      let response = null;
+      try {
+        response = await sendToTab(tab.id, { type: 'MOONDESK_CONTEXT' }, 600);
+      } catch {
+        if (tab.active) {
+          try { response = await ensureContent(tab.id); } catch {}
+        }
+      }
+      const reported = response?.ok ? response.context : null;
+      generating = Boolean(
+        reported?.conversationId === context.conversationId && reported?.generating === true
+      );
+    }
+    return {
+      ...context,
+      active: Boolean(tab.active),
+      windowFocused: focusedWindowId !== null && tab.windowId === focusedWindowId,
+      generating
+    };
+  }))).filter(Boolean);
+
+  const presence = await api(state, PRESENCE_PATH, {
+    method: 'POST',
+    body: { browserLabel: browserLabel(), tabs: observed }
+  });
+
+  const focusedTab = tabs.find(
+    (tab) => tab.id && tab.active && focusedWindowId !== null && tab.windowId === focusedWindowId
+  );
+  if (focusedTab?.id) {
+    try {
+      await ensureContent(focusedTab.id);
+      const response = await sendToTab(
+        focusedTab.id,
+        { type: 'MOONDESK_CORRELATION_EVIDENCE' },
+        2500
+      );
+      const evidence = response?.ok ? response.evidence : null;
+      const context = chatContextFromUrl(focusedTab.url);
+      if (
+        evidence?.conversationId &&
+        context?.conversationId === evidence.conversationId &&
+        Array.isArray(evidence.requestIds) &&
+        evidence.requestIds.length
+      ) {
+        await api(state, CORRELATIONS_PATH, {
+          method: 'POST',
+          body: {
+            conversationId: context.conversationId,
+            conversationUrl: context.conversationUrl,
+            projectId: context.projectId,
+            projectUrl: context.projectUrl,
+            requestIds: evidence.requestIds
+          }
+        });
+      }
+    } catch {}
+  }
+
+  return presence;
+}
+
+function placementForOffer(state, offer) {
+  const command = offer?.command;
+  const context = offer?.command?.anchorContext || offer?.anchorContext;
+  if (context?.conversationId && context?.conversationUrl) {
+    return {
+      projectId: context.projectId || null,
+      projectUrl: context.projectUrl || null,
+      anchorConversationUrl: context.conversationUrl
+    };
+  }
+
+  if (command?.launch?.openMode === 'existing_thread') {
+    const threadKey = command.launch.threadKey;
+    const thread = threadKey ? state.threadRecords?.[threadKey] : null;
+    if (thread?.conversationUrl && thread.workspaceId === command.launch.workspaceId) {
+      return {
+        projectId: thread.projectId || projectIdFromChatUrl(thread.conversationUrl),
+        projectUrl: null,
+        anchorConversationUrl: null
+      };
+    }
+
+    const prior = Object.values(state.launchRecords || {})
+      .filter((record) =>
+        record?.threadKey === threadKey &&
+        record?.workspaceId === command.launch.workspaceId &&
+        record?.phase === 'succeeded'
+      )
+      .sort((left, right) => (right.updatedAt || 0) - (left.updatedAt || 0))[0];
+    if (prior) {
+      const priorUrl = prior.conversationUrl || prior.sourceUrl || null;
+      return {
+        projectId: projectIdFromChatUrl(priorUrl),
+        projectUrl: null,
+        anchorConversationUrl: null
+      };
+    }
+  }
+
+  // Compatibility only for commands created before automatic Anchor routing existed.
+  const workspaceId = command?.launch?.workspaceId;
+  const legacy = workspaceId ? state.bindings?.[workspaceId] : null;
+  if (legacy?.projectId && legacy?.sourceUrl) {
+    return {
+      projectId: legacy.projectId,
+      projectUrl: legacy.projectUrl || null,
+      anchorConversationUrl: legacy.sourceUrl
+    };
+  }
+  return null;
+}
+
+function sourceUrlForCommand(placement, openMode, existingConversation) {
   if (openMode === 'existing_thread') return existingConversation;
-  return canonicalChatUrl(binding?.projectUrl) || binding?.sourceUrl || null;
+  if (placement?.projectId) return canonicalChatUrl(placement.projectUrl);
+  return 'https://chatgpt.com/';
 }
 
 function shouldAdoptConversation(offer, result) {
@@ -266,11 +480,11 @@ function projectIdFromChatUrl(value) {
   }
 }
 
-function threadRecordOwnedByBinding(thread, workspaceId, projectId) {
+function threadRecordOwnedByContext(thread, workspaceId, projectId) {
   return Boolean(
     thread &&
     thread.workspaceId === workspaceId &&
-    thread.projectId === projectId
+    (thread.projectId || null) === (projectId || null)
   );
 }
 
@@ -311,7 +525,7 @@ async function recoverTab(record) {
   return null;
 }
 
-async function recoverThreadRecord(state, threadKey, workspaceId, binding) {
+async function recoverThreadRecord(state, threadKey, workspaceId, placement) {
   const candidates = Object.values(state.launchRecords || {}).filter((record) =>
     record?.threadKey === threadKey &&
     record?.workspaceId === workspaceId &&
@@ -322,10 +536,10 @@ async function recoverThreadRecord(state, threadKey, workspaceId, binding) {
     const tab = await recoverTab(candidate);
     if (!tab) continue;
     const conversationUrl = canonicalConversationUrl(tab.url);
-    if (!conversationUrl || projectIdFromChatUrl(conversationUrl) !== binding.projectId) continue;
+    if (!conversationUrl || projectIdFromChatUrl(conversationUrl) !== (placement?.projectId || null)) continue;
     const next = {
       workspaceId,
-      projectId: binding.projectId,
+      projectId: placement?.projectId || null,
       conversationUrl,
       tabId: tab.id ?? null,
       updatedAt: Date.now()
@@ -340,33 +554,36 @@ async function recoverThreadRecord(state, threadKey, workspaceId, binding) {
   return recovered;
 }
 
-async function recordForCommand(state, command, binding) {
+async function recordForCommand(state, command, placement, reconcileRequired = false) {
   const threadKey = command.launch.threadKey || `command:${command.id}`;
   const openMode = command.launch.openMode || 'new_thread';
   let thread = state.threadRecords?.[threadKey] || null;
   if (
     openMode === 'existing_thread' &&
-    !threadRecordOwnedByBinding(thread, command.launch.workspaceId, binding.projectId)
+    !threadRecordOwnedByContext(thread, command.launch.workspaceId, placement?.projectId || null)
   ) {
     thread = await recoverThreadRecord(
       state,
       threadKey,
       command.launch.workspaceId,
-      binding
+      placement
     );
   }
   let record = state.launchRecords[command.id];
+  if (!record && reconcileRequired) {
+    throw new Error('Reconciliation has no durable browser launch record and cannot create a fresh worker thread');
+  }
   if (!record) {
-    const threadOwnedByBinding = threadRecordOwnedByBinding(
+    const threadOwnedByContext = threadRecordOwnedByContext(
       thread,
       command.launch.workspaceId,
-      binding.projectId
+      placement?.projectId || null
     );
-    const existingConversation = openMode === 'existing_thread' && threadOwnedByBinding
+    const existingConversation = openMode === 'existing_thread' && threadOwnedByContext
       ? canonicalChatUrl(thread.conversationUrl)
       : null;
     if (openMode === 'existing_thread' && !existingConversation) {
-      throw new Error('Existing worker thread has no confirmed ChatGPT conversation binding for this workspace and Project');
+      throw new Error('Existing worker thread has no confirmed ChatGPT conversation binding for this workspace and placement context');
     }
     record = {
       commandId: command.id,
@@ -375,7 +592,7 @@ async function recordForCommand(state, command, binding) {
       threadKey,
       openMode,
       launchToken: crypto.randomUUID(),
-      sourceUrl: sourceUrlForCommand(binding, openMode, existingConversation),
+      sourceUrl: sourceUrlForCommand(placement, openMode, existingConversation),
       tabId: null,
       conversationUrl: existingConversation,
       phase: 'creating',
@@ -386,6 +603,9 @@ async function recordForCommand(state, command, binding) {
   }
   let tab = await recoverTab(record);
   if (!tab) {
+    if (reconcileRequired && !record.conversationUrl) {
+      throw new Error('Reconciliation has no confirmed worker conversation URL and cannot create a fresh worker thread');
+    }
     const targetUrl = record.conversationUrl || record.sourceUrl;
     tab = await chrome.tabs.create({ url: sourceWithLaunchToken(targetUrl, record.launchToken), active: false });
     record.tabId = tab.id ?? null;
@@ -410,133 +630,398 @@ async function waitForContent(tabId, timeoutMs = 20000) {
   throw new Error('ChatGPT worker tab did not become ready');
 }
 
-async function ack(state, command, outcome, details = null) {
+async function markSendStarted(state, command) {
+  const leaseId = command.lease?.leaseId;
+  if (!leaseId) throw new Error('Managed chat command is missing lease');
+  const response = await api(state, SEND_STARTED_PATH, {
+    method: 'POST',
+    body: { commandId: command.id, leaseId }
+  });
+  return response.command || command;
+}
+
+async function ack(state, command, outcome, details = null, conversationUrl = null) {
   const leaseId = command.lease?.leaseId;
   if (!leaseId) throw new Error('Managed chat command is missing lease');
   const payload = { commandId: command.id, leaseId, outcome };
   if (details !== null && outcome !== 'needs_reconcile') payload.details = String(details).slice(0, 1000);
+  if (conversationUrl !== null && outcome === 'succeeded') payload.conversationUrl = conversationUrl;
   return api(state, '/__moondesk/companion/v1/commands/ack', { method: 'POST', body: payload });
 }
 
-async function processCommand(state, offer) {
-  const command = offer.command;
-  const workspaceId = command?.launch?.workspaceId;
-  const binding = state.bindings[workspaceId];
-  if (!binding?.projectId || !binding?.sourceUrl) {
-    await ack(state, command, 'failed', 'workspace_not_bound');
-    state.blockedCommand = {
+function acceptanceMatches(command, placement, baseline, evidence, conversationUrl, rememberedLaunch) {
+  if (!conversationUrl || !evidence) return false;
+  if (!rememberedLaunchMatchesRecord({
+    commandId: command.id,
+    openMode: command.launch.openMode || 'new_thread',
+    threadKey: command.launch.threadKey || null
+  }, rememberedLaunch)) return false;
+  const conversationProjectId = projectIdFromChatUrl(conversationUrl);
+  if ((conversationProjectId || null) !== (placement?.projectId || null)) return false;
+  if (
+    command.launch.openMode === 'existing_thread' &&
+    baseline?.conversationId &&
+    evidence.conversationId !== baseline.conversationId
+  ) return false;
+  const marker = evidence.markerPresent === true;
+  const generationStarted = evidence.generating === true && baseline?.generating !== true;
+  const newUserTurn = (
+    Number.isInteger(evidence.userTurnCount) &&
+    Number.isInteger(baseline?.userTurnCount) &&
+    evidence.userTurnCount > baseline.userTurnCount &&
+    evidence.composerEmpty === true
+  );
+  return marker || generationStarted || newUserTurn;
+}
+
+async function observeWorkerAcceptance(
+  state,
+  command,
+  record,
+  placement,
+  baseline,
+  timeoutMs = 45000
+) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    let tab = null;
+    if (Number.isInteger(record.tabId)) {
+      try { tab = await chrome.tabs.get(record.tabId); } catch {}
+    }
+    if (!tab) {
+      try { tab = await recoverTab(record); } catch {}
+    }
+    if (tab?.id && tab.url?.startsWith('https://chatgpt.com/')) {
+      const conversationUrl = canonicalConversationUrl(tab.url);
+      try {
+        await ensureContent(tab.id);
+        const response = await sendToTab(tab.id, {
+          type: 'MOONDESK_WORKER_EVIDENCE',
+          taskMarker: command.launch.taskMarker
+        }, 3000);
+        if (
+          response?.ok &&
+          acceptanceMatches(
+            command,
+            placement,
+            baseline,
+            response.evidence,
+            conversationUrl,
+            response.rememberedLaunch
+          )
+        ) {
+          record.tabId = tab.id;
+          record.conversationUrl = conversationUrl;
+          record.phase = 'succeeded';
+          await writeState(state);
+          return {
+            conversationUrl,
+            evidence: response.evidence
+          };
+        }
+      } catch {}
+    }
+    await new Promise((resolve) => setTimeout(resolve, 200));
+  }
+  return null;
+}
+
+async function reconcileOrBlock(state, command, record, workspaceId, reason) {
+  record.phase = 'uncertain';
+  record.reconcileAttempts = (record.reconcileAttempts || 0) + 1;
+  await writeState(state);
+  if (record.reconcileAttempts >= MAX_RECONCILE_ATTEMPTS) {
+    sessionReconcileCommandIds.delete(command.id);
+    const terminalReason = `reconciliation_exhausted:${reason}`;
+    await ack(state, command, 'paused', terminalReason);
+    blockCommand(state, {
       commandId: command.id,
       workspaceId,
-      reason: 'workspace_not_bound',
-      retryMode: offer.reconcileRequired ? 'none' : 'fresh'
-    };
+      reason,
+      retryMode: 'reconcile'
+    });
     await writeState(state);
+    return 'blocked';
+  }
+  sessionReconcileCommandIds.add(command.id);
+  await ack(state, command, 'needs_reconcile');
+  return 'needs_reconcile';
+}
+
+const TRANSIENT_PREPARE_FAILURES = new Set([
+  'project_entry_unconfirmed',
+  'project_composer_not_ready',
+  'worker_conversation_not_ready',
+  'normal_chat_composer_not_ready'
+]);
+const MAX_PREPARE_ATTEMPTS = 3;
+const PREPARE_RETRY_DELAY_MS = 1500;
+
+async function prepareWorkerWithRetry(tabId, payload) {
+  let response = null;
+  for (let attempt = 1; attempt <= MAX_PREPARE_ATTEMPTS; attempt += 1) {
+    response = await sendToTab(tabId, payload, 40000);
+    if (!response?.ok) return response;
+    const result = response.result || {};
+    if (
+      result.state !== 'failed' ||
+      !TRANSIENT_PREPARE_FAILURES.has(result.reason) ||
+      attempt === MAX_PREPARE_ATTEMPTS
+    ) {
+      return response;
+    }
+    await new Promise((resolve) => setTimeout(resolve, PREPARE_RETRY_DELAY_MS));
+  }
+  return response;
+}
+
+function shouldSerializeProjectBootstrap(offer, placement) {
+  return Boolean(
+    offer?.reconcileRequired !== true &&
+    placement?.projectId &&
+    (offer?.command?.launch?.openMode || 'new_thread') !== 'existing_thread'
+  );
+}
+
+async function acquireProjectBootstrapSlot() {
+  if (availableProjectBootstrapSlots > 0) {
+    availableProjectBootstrapSlots -= 1;
+  } else {
+    await new Promise((resolve) => projectBootstrapWaiters.push(resolve));
+  }
+
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    const next = projectBootstrapWaiters.shift();
+    if (next) {
+      next();
+      return;
+    }
+    availableProjectBootstrapSlots = Math.min(
+      MAX_PARALLEL_PROJECT_BOOTSTRAPS,
+      availableProjectBootstrapSlots + 1
+    );
+  };
+}
+
+
+async function processCommand(state, offer) {
+  let command = offer.command;
+  const workspaceId = command?.launch?.workspaceId;
+  const placement = placementForOffer(state, offer);
+  const failBeforeSend = async (reason) => {
+    await ack(state, command, 'failed', reason);
+    blockCommand(state, {
+      commandId: command.id,
+      workspaceId,
+      reason,
+      retryMode: 'fresh'
+    });
+    await writeState(state);
+  };
+  const pauseAfterSend = async (reason) => {
+    await ack(state, command, 'paused', reason);
+    sessionReconcileCommandIds.delete(command.id);
+    blockCommand(state, {
+      commandId: command.id,
+      workspaceId,
+      reason,
+      retryMode: 'reconcile'
+    });
+    await writeState(state);
+  };
+
+  if (!placement) {
+    if (offer.reconcileRequired) await pauseAfterSend('anchor_context_unconfirmed');
+    else await failBeforeSend('anchor_context_unconfirmed');
     return;
+  }
+  if (placement.projectId && !placement.projectUrl && command.launch.openMode !== 'existing_thread') {
+    if (offer.reconcileRequired) await pauseAfterSend('anchor_project_url_unconfirmed');
+    else await failBeforeSend('anchor_project_url_unconfirmed');
+    return;
+  }
+
+  let releaseProjectBootstrap = null;
+  if (shouldSerializeProjectBootstrap(offer, placement)) {
+    releaseProjectBootstrap = await acquireProjectBootstrapSlot();
   }
 
   let recordAndTab;
   try {
-    recordAndTab = await recordForCommand(state, command, binding);
+    recordAndTab = await recordForCommand(state, command, placement, offer.reconcileRequired === true);
   } catch (error) {
-    if (String(error?.message || error).includes('no confirmed ChatGPT conversation binding')) {
-      await ack(state, command, 'failed', 'worker_thread_binding_missing');
-      state.blockedCommand = {
-        commandId: command.id,
-        workspaceId,
-        reason: 'worker_thread_binding_missing',
-        retryMode: offer.reconcileRequired ? 'none' : 'fresh'
-      };
-      await writeState(state);
+    if (releaseProjectBootstrap) {
+      releaseProjectBootstrap();
+      releaseProjectBootstrap = null;
+    }
+    const message = String(error?.message || error);
+    if (offer.reconcileRequired) {
+      const reason = message.includes('no durable browser launch record')
+        ? 'reconciliation_launch_record_missing'
+        : message.includes('no confirmed worker conversation URL')
+          ? 'reconciliation_conversation_unconfirmed'
+          : message.includes('no confirmed ChatGPT conversation binding')
+            ? 'worker_thread_binding_missing'
+            : 'reconciliation_browser_context_unavailable';
+      await pauseAfterSend(reason);
+      return;
+    }
+    if (message.includes('no confirmed ChatGPT conversation binding')) {
+      await failBeforeSend('worker_thread_binding_missing');
       return;
     }
     throw error;
   }
+
   const { record, tab } = recordAndTab;
-  if (!tab.id) throw new Error('Worker tab has no tab id');
-  await waitForContent(tab.id);
-
-  const type = offer.reconcileRequired ? 'MOONDESK_RECONCILE_WORKER' : 'MOONDESK_PREPARE_WORKER';
-  const response = await sendToTab(tab.id, {
-    type,
-    commandId: command.id,
-    launchToken: record.launchToken,
-    binding,
-    launch: command.launch
-  }, 40000);
-  if (!response?.ok) {
-    await ack(state, command, 'needs_reconcile');
-    record.phase = 'uncertain';
-    record.reconcileAttempts = (record.reconcileAttempts || 0) + 1;
-    await writeState(state);
-    return;
+  if (!tab.id) {
+    if (releaseProjectBootstrap) releaseProjectBootstrap();
+    throw new Error('Worker tab has no tab id');
   }
 
-  const result = response.result || {};
-  const confirmedConversation = result.conversationUrl ? canonicalConversationUrl(result.conversationUrl) : null;
-  if (successfulResultNeedsConversationReconcile(result, confirmedConversation)) {
-    record.phase = 'uncertain';
-    record.reconcileAttempts = (record.reconcileAttempts || 0) + 1;
-    await writeState(state);
-    await ack(state, command, 'needs_reconcile');
-    if (record.reconcileAttempts >= MAX_RECONCILE_ATTEMPTS) {
-      state.blockedCommand = {
-        commandId: command.id,
-        workspaceId,
-        reason: 'worker_conversation_url_unconfirmed',
-        retryMode: 'reconcile'
-      };
+  if (offer.reconcileRequired) {
+    await waitForContent(tab.id);
+    const response = await sendToTab(tab.id, {
+      type: 'MOONDESK_RECONCILE_WORKER',
+      commandId: command.id,
+      launchToken: record.launchToken,
+      placement,
+      launch: command.launch
+    }, 10000);
+    if (!response?.ok) {
+      await reconcileOrBlock(state, command, record, workspaceId, 'reconciliation_tab_response_unconfirmed');
+      return;
+    }
+    const result = response.result || {};
+    const confirmedConversation = result.conversationUrl
+      ? canonicalConversationUrl(result.conversationUrl)
+      : canonicalConversationUrl(tab.url);
+    if (result.state === 'succeeded' && confirmedConversation) {
+      record.conversationUrl = confirmedConversation;
+      record.phase = 'succeeded';
+      if (record.threadKey) {
+        state.threadRecords[record.threadKey] = {
+          workspaceId,
+          projectId: placement.projectId || null,
+          conversationUrl: confirmedConversation,
+          tabId: tab.id,
+          updatedAt: Date.now()
+        };
+      }
       await writeState(state);
+      await ack(state, command, 'succeeded', result.reason || 'task marker confirmed', confirmedConversation);
+      sessionReconcileCommandIds.delete(command.id);
+      clearBlockedCommand(state, command.id);
+      await writeState(state);
+      return;
     }
+    if (result.state === 'failed') {
+      await pauseAfterSend(result.reason || 'reconciliation_failed');
+      return;
+    }
+    await reconcileOrBlock(
+      state,
+      command,
+      record,
+      workspaceId,
+      result.reason || 'reconciliation_unconfirmed'
+    );
     return;
   }
-  if (confirmedConversation && shouldAdoptConversation(offer, result)) {
-    record.conversationUrl = confirmedConversation;
-  }
-  if (result.state === 'succeeded') {
-    if (record.threadKey && confirmedConversation) {
-      state.threadRecords[record.threadKey] = {
-        workspaceId,
-        projectId: binding.projectId,
-        conversationUrl: confirmedConversation,
-        tabId: tab.id ?? null,
-        updatedAt: Date.now()
-      };
+
+  let prepared;
+  try {
+    await waitForContent(tab.id);
+    prepared = await prepareWorkerWithRetry(tab.id, {
+      type: 'MOONDESK_PREPARE_WORKER',
+      commandId: command.id,
+      launchToken: record.launchToken,
+      placement,
+      launch: command.launch
+    });
+  } finally {
+    if (releaseProjectBootstrap) {
+      releaseProjectBootstrap();
+      releaseProjectBootstrap = null;
     }
-    record.phase = 'succeeded';
-    await writeState(state);
-    await ack(state, command, 'succeeded', result.reason || 'task marker confirmed');
-    state.blockedCommand = null;
-    await writeState(state);
+  }
+  if (!prepared?.ok) {
+    await failBeforeSend('worker_prepare_response_unconfirmed');
     return;
   }
-  if (result.state === 'failed') {
-    const reason = result.reason || 'worker launch failed';
+  const prepareResult = prepared.result || {};
+  if (prepareResult.state === 'failed') {
     record.phase = 'failed';
     await writeState(state);
-    await ack(state, command, 'failed', reason);
-    state.blockedCommand = {
-      commandId: command.id,
-      workspaceId,
-      reason,
-      retryMode: offer.reconcileRequired ? 'none' : 'fresh'
-    };
+    await failBeforeSend(prepareResult.reason || 'worker_prepare_failed');
+    return;
+  }
+  if (prepareResult.state !== 'ready' && prepareResult.state !== 'already_sent') {
+    await failBeforeSend(prepareResult.reason || 'worker_prepare_state_invalid');
+    return;
+  }
+
+  record.baseline = prepareResult.evidence || null;
+  record.phase = 'prepared';
+  await writeState(state);
+  command = await markSendStarted(state, command);
+  record.phase = 'send_started';
+  await writeState(state);
+
+  if (prepareResult.state === 'already_sent') {
+    const existingConversation = canonicalConversationUrl(prepareResult.conversationUrl || tab.url);
+    if (!existingConversation) {
+      await reconcileOrBlock(state, command, record, workspaceId, 'preexisting_marker_conversation_unconfirmed');
+      return;
+    }
+    record.conversationUrl = existingConversation;
+    record.phase = 'succeeded';
+    await writeState(state);
+    await ack(state, command, 'succeeded', 'task marker already present', existingConversation);
+    sessionReconcileCommandIds.delete(command.id);
+    clearBlockedCommand(state, command.id);
     await writeState(state);
     return;
   }
 
-  record.phase = 'uncertain';
-  record.reconcileAttempts = (record.reconcileAttempts || 0) + 1;
-  await writeState(state);
-  await ack(state, command, 'needs_reconcile');
-  if (record.reconcileAttempts >= MAX_RECONCILE_ATTEMPTS) {
-    state.blockedCommand = {
-      commandId: command.id,
-      workspaceId,
-      reason: result.reason || 'reconciliation_unconfirmed',
-      retryMode: 'reconcile'
-    };
-    await writeState(state);
+  const committed = await sendToTab(tab.id, {
+    type: 'MOONDESK_COMMIT_WORKER_SEND',
+    commandId: command.id,
+    launchToken: record.launchToken,
+    launch: command.launch
+  }, 12000);
+  if (!committed?.ok || committed.result?.state !== 'committed') {
+    await pauseAfterSend(committed?.result?.reason || 'worker_send_commit_unconfirmed');
+    return;
   }
+
+  const baseline = committed.result.baseline || record.baseline || {};
+  record.baseline = baseline;
+  await writeState(state);
+  const accepted = await observeWorkerAcceptance(state, command, record, placement, baseline);
+  if (!accepted) {
+    await reconcileOrBlock(state, command, record, workspaceId, 'worker_send_acceptance_unconfirmed');
+    return;
+  }
+
+  if (record.threadKey) {
+    state.threadRecords[record.threadKey] = {
+      workspaceId,
+      projectId: placement.projectId || null,
+      conversationUrl: accepted.conversationUrl,
+      tabId: record.tabId,
+      updatedAt: Date.now()
+    };
+  }
+  record.phase = 'succeeded';
+  await writeState(state);
+  await ack(state, command, 'succeeded', 'worker send acceptance confirmed', accepted.conversationUrl);
+  sessionReconcileCommandIds.delete(command.id);
+  clearBlockedCommand(state, command.id);
+  await writeState(state);
 }
 
 function schedulePump(delayMs = FAST_POLL_MS) {
@@ -544,38 +1029,66 @@ function schedulePump(delayMs = FAST_POLL_MS) {
   pumpTimer = setTimeout(() => { void pump(); }, delayMs);
 }
 
+async function pauseInheritedReconciliation(state, offer) {
+  const command = offer?.command;
+  if (
+    !offer?.reconcileRequired ||
+    !command?.id ||
+    sessionReconcileCommandIds.has(command.id)
+  ) {
+    return false;
+  }
+  const previous = state.blockedCommands?.[command.id] || null;
+  const reason = previous?.reason || 'reconciliation_paused_after_companion_restart';
+  await ack(state, command, 'paused', `reconciliation_paused:${reason}`);
+  blockCommand(state, {
+    commandId: command.id,
+    workspaceId: command?.launch?.workspaceId || previous?.workspaceId || null,
+    reason,
+    retryMode: 'reconcile'
+  });
+  await writeState(state);
+  return true;
+}
+
+async function redeemCommandBatch(state, limit = MAX_PARALLEL_COMMANDS) {
+  const offers = [];
+  for (let index = 0; index < limit; index += 1) {
+    const offer = await api(state, '/__moondesk/companion/v1/commands/redeem', { method: 'POST' });
+    if (!offer?.command) break;
+    if (await pauseInheritedReconciliation(state, offer)) continue;
+    offers.push(offer);
+  }
+  return offers;
+}
+
+async function processCommandBatch(state, offers, processor = processCommand) {
+  return Promise.allSettled(offers.map((offer) => processor(state, offer)));
+}
+
 async function pump() {
   if (pumpActive) return;
   pumpActive = true;
+  let redeemed = 0;
   try {
     const state = await ensureConnected();
-    if (state.blockedCommand) {
-      const blocked = state.blockedCommand;
-      const binding = state.bindings[blocked.workspaceId];
-      if (
-        blocked.reason === 'workspace_not_bound' &&
-        blocked.retryMode === 'fresh' &&
-        binding?.projectId &&
-        binding?.sourceUrl
-      ) {
-        await api(state, '/__moondesk/companion/v1/commands/retry', {
-          method: 'POST',
-          body: { commandId: blocked.commandId }
-        });
-        state.blockedCommand = null;
-        await writeState(state);
-      } else {
-        return;
+    await collectPresence(state);
+    const offers = await redeemCommandBatch(state);
+    redeemed = offers.length;
+    if (offers.length) {
+      const outcomes = await processCommandBatch(state, offers);
+      for (const outcome of outcomes) {
+        if (outcome.status === 'rejected') {
+          console.warn('MoonDesk worker command failed:', String(outcome.reason?.message || outcome.reason));
+        }
       }
     }
-    const offer = await api(state, '/__moondesk/companion/v1/commands/redeem', { method: 'POST' });
-    if (offer?.command) await processCommand(state, offer);
   } catch (error) {
     // Keep the service worker quiet; popup/status surfaces the actionable connection state.
     console.warn('MoonDesk worker companion pump failed:', String(error?.message || error));
   } finally {
     pumpActive = false;
-    schedulePump();
+    schedulePump(redeemed ? 100 : FAST_POLL_MS);
   }
 }
 
@@ -589,7 +1102,7 @@ async function pair({ pairingToken }) {
   });
   state.clientId = response.clientId;
   state.credential = response.credential;
-  state.blockedCommand = null;
+  state.blockedCommands = {};
   await writeState(state);
   schedulePump(50);
   return { paired: true, connected: true, clientId: state.clientId, baseUrl: state.baseUrl };
@@ -599,15 +1112,18 @@ async function status() {
   try {
     const state = await ensureConnected();
     const remote = await api(state, STATUS_PATH);
+    const blockedCommands = blockedCommandList(state);
     return {
       ...remote,
       paired: true,
       connected: true,
       baseUrl: state.baseUrl,
-      blockedCommand: state.blockedCommand
+      blockedCommand: blockedCommands[0] || null,
+      blockedCommands
     };
   } catch (error) {
     const state = await readState();
+    const blockedCommands = blockedCommandList(state);
     return {
       paired: Boolean(state.credential),
       connected: false,
@@ -615,9 +1131,25 @@ async function status() {
       error: String(error?.message || error),
       errorCode: error?.code || null,
       repairRequired: error?.status === 409,
-      blockedCommand: state.blockedCommand
+      blockedCommand: blockedCommands[0] || null,
+      blockedCommands
     };
   }
+}
+
+async function clients() {
+  const state = await ensureConnected();
+  const response = await api(state, CLIENTS_PATH);
+  return response.clients || [];
+}
+
+async function revokeClient({ clientId }) {
+  if (!clientId) throw new Error('Paired browser client id is required');
+  const state = await ensureConnected();
+  return api(state, CLIENTS_PATH, {
+    method: 'POST',
+    body: { clientId }
+  });
 }
 
 async function workspaces() {
@@ -644,68 +1176,42 @@ async function setProfile({ profile: nextProfile }) {
   return response.profile || null;
 }
 
-async function bindProject({ workspaceId, context }) {
-  if (!workspaceId || !context?.projectId || !context?.sourceUrl || !context?.conversationId) {
-    throw new Error('Open an existing conversation inside the ChatGPT Project before binding it');
-  }
-  const source = new URL(context.sourceUrl);
-  if (source.origin !== 'https://chatgpt.com') throw new Error('Binding source must be ChatGPT');
-  const state = await ensureConnected();
-  state.bindings[workspaceId] = {
-    projectId: context.projectId,
-    sourceUrl: source.toString().split('#')[0],
-    projectUrl: context.projectUrl || null,
-    boundAt: Date.now()
-  };
-  const blocked = state.blockedCommand;
-  if (
-    blocked?.workspaceId === workspaceId &&
-    blocked.reason === 'workspace_not_bound' &&
-    blocked.retryMode === 'fresh'
-  ) {
-    await api(state, '/__moondesk/companion/v1/commands/retry', {
-      method: 'POST',
-      body: { commandId: blocked.commandId }
-    });
-    state.blockedCommand = null;
-  }
-  await writeState(state);
-  schedulePump(50);
-  return state.bindings[workspaceId];
-}
-
-async function currentBindings() {
-  return (await readState()).bindings;
-}
-
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (!message || typeof message.type !== 'string') return false;
   const task = (() => {
     switch (message.type) {
       case 'MOONDESK_PAIR': return pair(message);
       case 'MOONDESK_STATUS': return status();
-      case 'MOONDESK_WORKSPACES': return workspaces();
+      case 'MOONDESK_CLIENTS': return clients();
+      case 'MOONDESK_REVOKE_CLIENT': return revokeClient(message);
       case 'MOONDESK_PROFILE': return profile();
       case 'MOONDESK_SET_PROFILE': return setProfile(message);
-      case 'MOONDESK_BIND_PROJECT': return bindProject(message);
-      case 'MOONDESK_BINDINGS': return currentBindings();
       case 'MOONDESK_RETRY_BLOCKED': return (async () => {
         const state = await ensureConnected();
-        const blocked = state.blockedCommand;
-        if (!blocked) return { ok: true };
-        if (blocked.retryMode === 'none') {
-          throw new Error('This worker launch crossed a possible Send boundary and cannot be fresh-retried. Reconciliation or manual inspection is required.');
+        const blocked = blockedCommandList(state);
+        if (!blocked.length) return { ok: true, retried: 0, manual: 0 };
+        let retried = 0;
+        let manual = 0;
+        for (const entry of blocked) {
+          if (entry.retryMode === 'none') {
+            manual += 1;
+            continue;
+          }
+          if (entry.retryMode === 'fresh' || entry.retryMode === 'reconcile') {
+            await api(state, '/__moondesk/companion/v1/commands/retry', {
+              method: 'POST',
+              body: { commandId: entry.commandId }
+            });
+            if (entry.retryMode === 'reconcile') {
+              sessionReconcileCommandIds.add(entry.commandId);
+            }
+          }
+          clearBlockedCommand(state, entry.commandId);
+          retried += 1;
         }
-        if (blocked.retryMode === 'fresh') {
-          await api(state, '/__moondesk/companion/v1/commands/retry', {
-            method: 'POST',
-            body: { commandId: blocked.commandId }
-          });
-        }
-        state.blockedCommand = null;
         await writeState(state);
-        schedulePump(50);
-        return { ok: true };
+        if (retried) schedulePump(50);
+        return { ok: true, retried, manual };
       })();
       default: return null;
     }
@@ -727,6 +1233,17 @@ chrome.runtime.onStartup.addListener(() => {
 });
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === POLL_ALARM) void pump();
+});
+chrome.tabs.onActivated.addListener(() => {
+  schedulePump(25);
+});
+chrome.tabs.onUpdated.addListener((_tabId, changeInfo, tab) => {
+  if (changeInfo.url && tab.url?.startsWith('https://chatgpt.com/')) {
+    schedulePump(25);
+  }
+});
+chrome.windows.onFocusChanged.addListener(() => {
+  schedulePump(25);
 });
 
 void chrome.alarms.create(POLL_ALARM, { periodInMinutes: 0.5 });

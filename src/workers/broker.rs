@@ -2,8 +2,8 @@ use super::store;
 use super::types::{
     BrowserAttachmentState, ChatIdentity, MessageReceipt, OperationId, ReportReceipt, ReuseReceipt,
     SpawnReceipt, TaskId, TaskState, WorkerExecutionProfile, WorkerFamily, WorkerFamilyId,
-    WorkerId, WorkerMessage, WorkerMessageId, WorkerMessageState, WorkerRecord, WorkerReport,
-    WorkerReportId, WorkerResult, WorkerState, WorkerStoreData, WorkerTask,
+    WorkerId, WorkerLaunchState, WorkerMessage, WorkerMessageId, WorkerMessageState, WorkerRecord,
+    WorkerReport, WorkerReportId, WorkerResult, WorkerState, WorkerStoreData, WorkerTask,
 };
 use super::{
     MAX_PENDING_MESSAGES_PER_WORKER, MAX_WORKER_ASSIGNMENT_BYTES, MAX_WORKER_MESSAGE_BYTES,
@@ -218,6 +218,10 @@ impl WorkerBroker {
             state: WorkerState::Provisioning,
             attachment_state: BrowserAttachmentState::Absent,
             execution_profile: request.execution_profile,
+            launch_state: crate::workers::types::WorkerLaunchState::Queued,
+            launch_command_id: None,
+            launch_error: None,
+            conversation_url: None,
             chat_identity: None,
             claim_token: Some(claim_token.clone()),
             current_task_id: Some(task_id.clone()),
@@ -240,6 +244,370 @@ impl WorkerBroker {
 
         self.commit_candidate(&mut guard, candidate).await?;
         Ok(receipt)
+    }
+
+    pub async fn link_launch_command(
+        &self,
+        workspace_id: &WorkspaceId,
+        anchor_identity: &ChatIdentity,
+        worker_id: &WorkerId,
+        task_id: &TaskId,
+        command_id: &str,
+    ) -> Result<WorkerRecord, WorkerBrokerError> {
+        anchor_identity
+            .validate()
+            .map_err(WorkerBrokerError::Invalid)?;
+        if Uuid::parse_str(command_id).is_err() {
+            return Err(WorkerBrokerError::Invalid(
+                "worker launch command id is invalid".into(),
+            ));
+        }
+        let mut guard = self.data.lock().await;
+        let family_id = find_family_for_worker(&guard, workspace_id, worker_id)
+            .ok_or(WorkerBrokerError::NotFound)?;
+        let family = guard
+            .families
+            .get(&family_id)
+            .ok_or(WorkerBrokerError::NotFound)?;
+        if &family.anchor_identity != anchor_identity {
+            return Err(WorkerBrokerError::NotFound);
+        }
+        let worker = family
+            .workers
+            .get(worker_id)
+            .ok_or(WorkerBrokerError::NotFound)?;
+        if worker.current_task_id.as_ref() != Some(task_id) || !worker.tasks.contains_key(task_id) {
+            return Err(WorkerBrokerError::Conflict(
+                "worker launch task changed before command link was persisted".into(),
+            ));
+        }
+        if let Some(existing) = worker.launch_command_id.as_deref() {
+            if existing == command_id {
+                return Ok(worker.clone());
+            }
+            return Err(WorkerBrokerError::Conflict(
+                "worker task is already linked to a different launch command".into(),
+            ));
+        }
+
+        let mut candidate = guard.clone();
+        let worker = candidate
+            .families
+            .get_mut(&family_id)
+            .and_then(|family| family.workers.get_mut(worker_id))
+            .ok_or(WorkerBrokerError::NotFound)?;
+        worker.launch_command_id = Some(command_id.to_string());
+        worker.launch_state = WorkerLaunchState::Queued;
+        worker.launch_error = None;
+        worker.conversation_url = None;
+        let linked = worker.clone();
+        self.commit_candidate(&mut guard, candidate).await?;
+        Ok(linked)
+    }
+
+    pub async fn update_launch_by_command(
+        &self,
+        command_id: &str,
+        launch_state: WorkerLaunchState,
+        launch_error: Option<String>,
+        conversation_url: Option<String>,
+    ) -> Result<Option<WorkerRecord>, WorkerBrokerError> {
+        if Uuid::parse_str(command_id).is_err() {
+            return Err(WorkerBrokerError::Invalid(
+                "worker launch command id is invalid".into(),
+            ));
+        }
+        if launch_error
+            .as_deref()
+            .is_some_and(|value| value.len() > 1000)
+        {
+            return Err(WorkerBrokerError::Invalid(
+                "worker launch error is too long".into(),
+            ));
+        }
+        if conversation_url
+            .as_deref()
+            .is_some_and(|value| value.is_empty() || value.len() > 2048)
+        {
+            return Err(WorkerBrokerError::Invalid(
+                "worker conversation URL is invalid".into(),
+            ));
+        }
+        let mut guard = self.data.lock().await;
+        let mut location = None;
+        'families: for (family_id, family) in &guard.families {
+            for (worker_id, worker) in &family.workers {
+                if worker.launch_command_id.as_deref() == Some(command_id) {
+                    location = Some((family_id.clone(), worker_id.clone()));
+                    break 'families;
+                }
+            }
+        }
+        let Some((family_id, worker_id)) = location else {
+            return Ok(None);
+        };
+        let mut candidate = guard.clone();
+        let worker = candidate
+            .families
+            .get_mut(&family_id)
+            .and_then(|family| family.workers.get_mut(&worker_id))
+            .ok_or(WorkerBrokerError::NotFound)?;
+        if worker.launch_state == WorkerLaunchState::Claimed
+            && launch_state != WorkerLaunchState::Claimed
+        {
+            return Ok(Some(worker.clone()));
+        }
+        worker.launch_state = launch_state;
+        worker.launch_error = launch_error;
+        if conversation_url.is_some() {
+            worker.conversation_url = conversation_url;
+        }
+        worker.attachment_state = match launch_state {
+            WorkerLaunchState::Unknown | WorkerLaunchState::Queued => {
+                BrowserAttachmentState::Absent
+            }
+            WorkerLaunchState::Preparing
+            | WorkerLaunchState::SendStarted
+            | WorkerLaunchState::Reconciling
+            | WorkerLaunchState::WaitingClaim => BrowserAttachmentState::Opening,
+            WorkerLaunchState::Claimed => BrowserAttachmentState::Attached,
+            WorkerLaunchState::Paused | WorkerLaunchState::Failed => {
+                BrowserAttachmentState::Unknown
+            }
+        };
+        let updated = worker.clone();
+        self.commit_candidate(&mut guard, candidate).await?;
+        self.updates.notify_waiters();
+        Ok(Some(updated))
+    }
+
+    pub async fn rollback_linked_spawn(
+        &self,
+        workspace_id: &WorkspaceId,
+        anchor_identity: &ChatIdentity,
+        worker_id: &WorkerId,
+        task_id: &TaskId,
+        command_id: &str,
+    ) -> Result<(), WorkerBrokerError> {
+        anchor_identity
+            .validate()
+            .map_err(WorkerBrokerError::Invalid)?;
+        let mut guard = self.data.lock().await;
+        let family_id = find_family_for_worker(&guard, workspace_id, worker_id)
+            .ok_or(WorkerBrokerError::NotFound)?;
+        let family = guard
+            .families
+            .get(&family_id)
+            .ok_or(WorkerBrokerError::NotFound)?;
+        if &family.anchor_identity != anchor_identity {
+            return Err(WorkerBrokerError::NotFound);
+        }
+        let worker = family
+            .workers
+            .get(worker_id)
+            .ok_or(WorkerBrokerError::NotFound)?;
+        if worker.state != WorkerState::Provisioning
+            || worker.current_task_id.as_ref() != Some(task_id)
+            || worker.chat_identity.is_some()
+            || worker.launch_command_id.as_deref() != Some(command_id)
+            || worker
+                .tasks
+                .get(task_id)
+                .is_none_or(|task| task.state != TaskState::Pending)
+        {
+            return Err(WorkerBrokerError::Conflict(
+                "linked worker spawn cannot be rolled back after claim or task transition".into(),
+            ));
+        }
+
+        let mut candidate = guard.clone();
+        let family = candidate
+            .families
+            .get_mut(&family_id)
+            .ok_or(WorkerBrokerError::NotFound)?;
+        family.workers.remove(worker_id);
+        family
+            .spawn_requests
+            .retain(|_, receipt| receipt.worker_id != *worker_id || receipt.task_id != *task_id);
+        self.commit_candidate(&mut guard, candidate).await?;
+        self.updates.notify_waiters();
+        Ok(())
+    }
+
+    pub async fn rollback_linked_reuse(
+        &self,
+        workspace_id: &WorkspaceId,
+        anchor_identity: &ChatIdentity,
+        worker_id: &WorkerId,
+        task_id: &TaskId,
+        command_id: &str,
+    ) -> Result<(), WorkerBrokerError> {
+        anchor_identity
+            .validate()
+            .map_err(WorkerBrokerError::Invalid)?;
+        let mut guard = self.data.lock().await;
+        let family_id = find_family_for_worker(&guard, workspace_id, worker_id)
+            .ok_or(WorkerBrokerError::NotFound)?;
+        let family = guard
+            .families
+            .get(&family_id)
+            .ok_or(WorkerBrokerError::NotFound)?;
+        if &family.anchor_identity != anchor_identity {
+            return Err(WorkerBrokerError::NotFound);
+        }
+        let worker = family
+            .workers
+            .get(worker_id)
+            .ok_or(WorkerBrokerError::NotFound)?;
+        if worker.state != WorkerState::Waking
+            || worker.current_task_id.as_ref() != Some(task_id)
+            || worker.chat_identity.is_none()
+            || worker.launch_command_id.as_deref() != Some(command_id)
+            || worker
+                .tasks
+                .get(task_id)
+                .is_none_or(|task| task.state != TaskState::Pending)
+        {
+            return Err(WorkerBrokerError::Conflict(
+                "linked worker reuse cannot be rolled back after start or task transition".into(),
+            ));
+        }
+
+        let mut candidate = guard.clone();
+        let family = candidate
+            .families
+            .get_mut(&family_id)
+            .ok_or(WorkerBrokerError::NotFound)?;
+        let worker = family
+            .workers
+            .get_mut(worker_id)
+            .ok_or(WorkerBrokerError::NotFound)?;
+        worker.tasks.remove(task_id);
+        worker.current_task_id = None;
+        worker.state = WorkerState::Idle;
+        worker.launch_state = WorkerLaunchState::Claimed;
+        worker.launch_command_id = None;
+        worker.launch_error = None;
+        worker.attachment_state = BrowserAttachmentState::Attached;
+        family
+            .reuse_requests
+            .retain(|_, receipt| receipt.worker_id != *worker_id || receipt.task_id != *task_id);
+        self.commit_candidate(&mut guard, candidate).await?;
+        self.updates.notify_waiters();
+        Ok(())
+    }
+
+    pub async fn rollback_unlinked_spawn(
+        &self,
+        workspace_id: &WorkspaceId,
+        anchor_identity: &ChatIdentity,
+        worker_id: &WorkerId,
+        task_id: &TaskId,
+    ) -> Result<(), WorkerBrokerError> {
+        anchor_identity
+            .validate()
+            .map_err(WorkerBrokerError::Invalid)?;
+        let mut guard = self.data.lock().await;
+        let family_id = find_family_for_worker(&guard, workspace_id, worker_id)
+            .ok_or(WorkerBrokerError::NotFound)?;
+        let family = guard
+            .families
+            .get(&family_id)
+            .ok_or(WorkerBrokerError::NotFound)?;
+        if &family.anchor_identity != anchor_identity {
+            return Err(WorkerBrokerError::NotFound);
+        }
+        let worker = family
+            .workers
+            .get(worker_id)
+            .ok_or(WorkerBrokerError::NotFound)?;
+        if worker.state != WorkerState::Provisioning
+            || worker.current_task_id.as_ref() != Some(task_id)
+            || worker.chat_identity.is_some()
+            || worker.launch_command_id.is_some()
+            || worker
+                .tasks
+                .get(task_id)
+                .is_none_or(|task| task.state != TaskState::Pending)
+        {
+            return Err(WorkerBrokerError::Conflict(
+                "worker spawn cannot be rolled back after browser launch linkage or claim".into(),
+            ));
+        }
+
+        let mut candidate = guard.clone();
+        let family = candidate
+            .families
+            .get_mut(&family_id)
+            .ok_or(WorkerBrokerError::NotFound)?;
+        family.workers.remove(worker_id);
+        family
+            .spawn_requests
+            .retain(|_, receipt| receipt.worker_id != *worker_id || receipt.task_id != *task_id);
+        self.commit_candidate(&mut guard, candidate).await?;
+        self.updates.notify_waiters();
+        Ok(())
+    }
+
+    pub async fn rollback_unlinked_reuse(
+        &self,
+        workspace_id: &WorkspaceId,
+        anchor_identity: &ChatIdentity,
+        worker_id: &WorkerId,
+        task_id: &TaskId,
+    ) -> Result<(), WorkerBrokerError> {
+        anchor_identity
+            .validate()
+            .map_err(WorkerBrokerError::Invalid)?;
+        let mut guard = self.data.lock().await;
+        let family_id = find_family_for_worker(&guard, workspace_id, worker_id)
+            .ok_or(WorkerBrokerError::NotFound)?;
+        let family = guard
+            .families
+            .get(&family_id)
+            .ok_or(WorkerBrokerError::NotFound)?;
+        if &family.anchor_identity != anchor_identity {
+            return Err(WorkerBrokerError::NotFound);
+        }
+        let worker = family
+            .workers
+            .get(worker_id)
+            .ok_or(WorkerBrokerError::NotFound)?;
+        if worker.state != WorkerState::Waking
+            || worker.current_task_id.as_ref() != Some(task_id)
+            || worker.chat_identity.is_none()
+            || worker.launch_command_id.is_some()
+            || worker
+                .tasks
+                .get(task_id)
+                .is_none_or(|task| task.state != TaskState::Pending)
+        {
+            return Err(WorkerBrokerError::Conflict(
+                "worker reuse cannot be rolled back after browser launch linkage or start".into(),
+            ));
+        }
+
+        let mut candidate = guard.clone();
+        let family = candidate
+            .families
+            .get_mut(&family_id)
+            .ok_or(WorkerBrokerError::NotFound)?;
+        let worker = family
+            .workers
+            .get_mut(worker_id)
+            .ok_or(WorkerBrokerError::NotFound)?;
+        worker.tasks.remove(task_id);
+        worker.current_task_id = None;
+        worker.state = WorkerState::Idle;
+        worker.launch_state = WorkerLaunchState::Claimed;
+        worker.launch_error = None;
+        worker.attachment_state = BrowserAttachmentState::Attached;
+        family
+            .reuse_requests
+            .retain(|_, receipt| receipt.worker_id != *worker_id || receipt.task_id != *task_id);
+        self.commit_candidate(&mut guard, candidate).await?;
+        self.updates.notify_waiters();
+        Ok(())
     }
 
     pub async fn reuse_worker(
@@ -312,6 +680,9 @@ impl WorkerBroker {
             );
             worker.current_task_id = Some(task_id.clone());
             worker.state = WorkerState::Waking;
+            worker.launch_state = WorkerLaunchState::Queued;
+            worker.launch_command_id = None;
+            worker.launch_error = None;
             worker.attachment_state = BrowserAttachmentState::Opening;
             (worker.display_id.clone(), worker.execution_profile.clone())
         };
@@ -378,6 +749,8 @@ impl WorkerBroker {
             .ok_or(WorkerBrokerError::NotFound)?;
         task.state = TaskState::Running;
         worker.state = WorkerState::Running;
+        worker.launch_state = WorkerLaunchState::Claimed;
+        worker.launch_error = None;
         worker.attachment_state = BrowserAttachmentState::Attached;
         let started = worker.clone();
         self.commit_candidate(&mut guard, candidate).await?;
@@ -554,6 +927,8 @@ impl WorkerBroker {
         worker.chat_identity = Some(worker_identity);
         worker.claim_token = None;
         worker.state = WorkerState::Running;
+        worker.launch_state = WorkerLaunchState::Claimed;
+        worker.launch_error = None;
         worker.attachment_state = BrowserAttachmentState::Attached;
         let task = worker
             .tasks
@@ -1095,6 +1470,99 @@ mod tests {
             .await
             .expect_err("same operation id with changed input must fail");
         assert!(matches!(changed, WorkerBrokerError::Conflict(_)));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn unlinked_launch_rollbacks_leave_no_ghost_worker_or_wake_task() {
+        let root = temp_root("moondesk-worker-launch-rollback");
+        let path = root.join("worker-state-v1.json");
+        let broker = WorkerBroker::open(&path).expect("open worker broker");
+        let workspace = WorkspaceId::new();
+        let anchor_identity = anchor("anchor-rollback");
+        let worker_identity = anchor("worker-rollback");
+
+        let spawned = broker
+            .spawn_worker(spawn_request(
+                OperationId::new(),
+                workspace.clone(),
+                anchor_identity.clone(),
+                "launch that never enqueues",
+            ))
+            .await
+            .expect("spawn pending worker");
+        broker
+            .rollback_unlinked_spawn(
+                &workspace,
+                &anchor_identity,
+                &spawned.worker_id,
+                &spawned.task_id,
+            )
+            .await
+            .expect("rollback unlinked spawn");
+        let family = broker
+            .family_for_anchor(&workspace, &anchor_identity)
+            .await
+            .expect("read family")
+            .expect("family remains");
+        assert!(family.workers.is_empty());
+        assert!(family.spawn_requests.is_empty());
+
+        let live = broker
+            .spawn_worker(spawn_request(
+                OperationId::new(),
+                workspace.clone(),
+                anchor_identity.clone(),
+                "real worker",
+            ))
+            .await
+            .expect("spawn real worker");
+        broker
+            .claim_worker(
+                &workspace,
+                &live.worker_id,
+                &live.task_id,
+                &live.claim_token,
+                worker_identity.clone(),
+            )
+            .await
+            .expect("claim real worker");
+        broker
+            .finish_task(FinishTaskRequest {
+                workspace_id: workspace.clone(),
+                worker_identity: worker_identity.clone(),
+                worker_id: live.worker_id.clone(),
+                task_id: live.task_id.clone(),
+                result: finished_result(),
+            })
+            .await
+            .expect("finish real worker");
+
+        let wake = broker
+            .reuse_worker(ReuseWorkerRequest {
+                operation_id: OperationId::new(),
+                workspace_id: workspace.clone(),
+                anchor_identity: anchor_identity.clone(),
+                worker_id: live.worker_id.clone(),
+                assignment: "wake that never enqueues".into(),
+            })
+            .await
+            .expect("create pending reuse");
+        broker
+            .rollback_unlinked_reuse(&workspace, &anchor_identity, &live.worker_id, &wake.task_id)
+            .await
+            .expect("rollback unlinked reuse");
+        let family = broker
+            .family_for_anchor(&workspace, &anchor_identity)
+            .await
+            .expect("read family after reuse rollback")
+            .expect("family remains");
+        let worker = family.workers.get(&live.worker_id).expect("worker remains");
+        assert_eq!(worker.state, WorkerState::Idle);
+        assert!(worker.current_task_id.is_none());
+        assert!(!worker.tasks.contains_key(&wake.task_id));
+        assert!(family.reuse_requests.is_empty());
+
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -1899,7 +2367,7 @@ mod tests {
                 .values()
                 .filter(|worker| worker.state != WorkerState::Retired)
                 .count(),
-            MAX_WORKERS_PER_FAMILY
+            2
         );
         assert_eq!(
             family
@@ -1915,32 +2383,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn worker_family_limit_is_enforced_without_partial_third_worker() {
+    async fn worker_family_supports_eight_active_workers_and_rejects_ninth_without_partial_state() {
         let root = temp_root("moondesk-worker-limit");
         let path = root.join("worker-state-v1.json");
         let broker = WorkerBroker::open(&path).expect("open worker broker");
         let workspace = WorkspaceId::new();
         let identity = anchor("anchor-limit");
-        for assignment in ["first", "second"] {
-            broker
+        let mut display_ids = Vec::new();
+        for index in 1..=MAX_WORKERS_PER_FAMILY {
+            let receipt = broker
                 .spawn_worker(spawn_request(
                     OperationId::new(),
                     workspace.clone(),
                     identity.clone(),
-                    assignment,
+                    &format!("assignment-{index}"),
                 ))
                 .await
                 .expect("spawn allowed worker");
+            display_ids.push(receipt.display_id);
         }
+        assert_eq!(MAX_WORKERS_PER_FAMILY, 8);
+        assert_eq!(
+            display_ids,
+            (1..=MAX_WORKERS_PER_FAMILY)
+                .map(|index| format!("worker-{index}"))
+                .collect::<Vec<_>>()
+        );
         let error = broker
             .spawn_worker(spawn_request(
                 OperationId::new(),
                 workspace,
                 identity,
-                "third",
+                "ninth",
             ))
             .await
-            .expect_err("third worker must be rejected");
+            .expect_err("ninth worker must be rejected");
         assert!(matches!(error, WorkerBrokerError::Limit(_)));
         let family = broker
             .snapshot()
@@ -1950,6 +2427,14 @@ mod tests {
             .next()
             .expect("worker family");
         assert_eq!(family.workers.len(), MAX_WORKERS_PER_FAMILY);
+        assert_eq!(
+            family
+                .workers
+                .values()
+                .filter(|worker| worker.state != WorkerState::Retired)
+                .count(),
+            8
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 }

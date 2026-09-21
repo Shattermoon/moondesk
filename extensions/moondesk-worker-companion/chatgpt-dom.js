@@ -55,6 +55,14 @@
 
   const projectHome = () => Boolean(projectIdFromPath() && /\/project\/?$/i.test(location.pathname));
 
+  function projectHomeUrl() {
+    const projectId = projectIdFromPath();
+    if (!projectId) return null;
+    const match = /^\/g\/([^/]+)/i.exec(location.pathname);
+    if (!match) return null;
+    return location.origin + '/g/' + match[1] + '/project';
+  }
+
   function projectLink(projectId) {
     const links = [...document.querySelectorAll('header a[href], [role="banner"] a[href]')].filter(visible);
     const matched = links.filter((link) => {
@@ -206,6 +214,55 @@
       const timer = setTimeout(() => finish(null), 1500);
       window.addEventListener('message', receive);
       window.postMessage({ source: 'moondesk-picker-ask', nonce, v: 1 }, location.origin);
+    });
+  }
+
+  function readCorrelationEvidence() {
+    return new Promise((resolve) => {
+      const nonce = crypto.randomUUID();
+      let done = false;
+      const finish = (value) => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        window.removeEventListener('message', receive);
+        resolve(value);
+      };
+      const receive = (event) => {
+        const data = event.data;
+        if (
+          event.source !== window ||
+          event.origin !== location.origin ||
+          data?.source !== 'moondesk-correlation-reply' ||
+          data.nonce !== nonce ||
+          data.v !== 1
+        ) {
+          return;
+        }
+        const value = data.correlation;
+        const routeConversation = conversationIdFromPath();
+        if (
+          !value ||
+          !routeConversation ||
+          value.conversationId !== routeConversation ||
+          !Array.isArray(value.requestIds) ||
+          value.requestIds.length < 1 ||
+          value.requestIds.length > 32 ||
+          value.requestIds.some(
+            (requestId) => typeof requestId !== 'string' || !/^[a-z0-9_-]{1,100}$/i.test(requestId)
+          )
+        ) {
+          finish(null);
+          return;
+        }
+        finish({
+          conversationId: routeConversation,
+          requestIds: [...new Set(value.requestIds)]
+        });
+      };
+      const timer = setTimeout(() => finish(null), 1200);
+      window.addEventListener('message', receive);
+      window.postMessage({ source: 'moondesk-correlation-ask', nonce, v: 1 }, location.origin);
     });
   }
 
@@ -525,25 +582,52 @@
     }
   }
 
-  async function sendOnce(marker) {
+  function workerEvidence(marker) {
+    return {
+      conversationId: conversationIdFromPath(),
+      conversationUrl: location.href,
+      projectId: projectIdFromPath(),
+      markerPresent: taskMarkerPresent(marker),
+      generating: generating(),
+      userTurnCount: userMessages().length,
+      composerEmpty: composerText().length === 0
+    };
+  }
+
+  async function commitSendOnce(expectedPrompt, marker) {
     const box = composer();
     if (!box || generating()) return { state: 'failed', reason: 'composer_not_ready' };
+    if (compact(composerText(box)) !== compact(expectedPrompt)) {
+      return { state: 'failed', reason: 'prepared_prompt_changed' };
+    }
     const button = await waitFor(() => {
       const value = sendButton();
       return value && !value.disabled && value.getAttribute('aria-disabled') !== 'true' ? value : null;
     }, 8000);
     if (!button) return { state: 'failed', reason: 'send_button_unavailable' };
 
-    button.click();
-    const accepted = await waitFor(() => taskMarkerPresent(marker), 20000, 120);
-    if (accepted) {
-      return { state: 'succeeded', conversationUrl: location.href };
-    }
-    return {
-      state: 'needs_reconcile',
-      reason: 'send_acceptance_unconfirmed',
-      conversationUrl: location.href
+    const baseline = {
+      sourceUrl: location.href,
+      conversationId: conversationIdFromPath(),
+      projectId: projectIdFromPath(),
+      userTurnCount: userMessages().length,
+      markerPresent: taskMarkerPresent(marker),
+      composerHadPrompt: true
     };
+    setTimeout(() => {
+      try {
+        if (
+          visible(button) &&
+          !generating() &&
+          compact(composerText()) === compact(expectedPrompt) &&
+          !button.disabled &&
+          button.getAttribute('aria-disabled') !== 'true'
+        ) {
+          button.click();
+        }
+      } catch {}
+    }, 50);
+    return { state: 'committed', baseline };
   }
 
   function context() {
@@ -553,7 +637,8 @@
         projectId: null,
         sourceUrl: location.href,
         conversationId: conversationIdFromPath(),
-        projectUrl: null
+        projectUrl: null,
+        generating: generating()
       };
     }
     const link = projectLink(projectId);
@@ -561,12 +646,14 @@
       projectId,
       sourceUrl: location.href,
       conversationId: conversationIdFromPath(),
-      projectUrl: link?.href || (projectHome() ? location.href : null)
+      projectUrl: link?.href || projectHomeUrl(),
+      generating: generating()
     };
   }
 
   window.MOONDESK_CHATGPT_DOM = {
     context,
+    correlationEvidence: readCorrelationEvidence,
     projectIdFromPath,
     conversationIdFromPath,
     enterProject,
@@ -575,7 +662,8 @@
     selectModelSettings,
     selectedModelAndEffort,
     insertPrompt,
-    sendOnce,
+    workerEvidence,
+    commitSendOnce,
     composerReady: () => visible(composer()) && !generating()
   };
 })();

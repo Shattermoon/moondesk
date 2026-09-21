@@ -7,8 +7,11 @@ use super::types::{
     ChatIdentity, OperationId, TaskId, WorkerExecutionProfile, WorkerId, WorkerMessageId,
     WorkerResult, WorkerState,
 };
+use crate::companion::CompanionAnchorRoute;
 use crate::managed_chat::broker::{EnqueueManagedChatRequest, ManagedChatBroker};
-use crate::managed_chat::types::{ManagedChatLaunch, ManagedChatOpenMode, ManagedChatPurpose};
+use crate::managed_chat::types::{
+    ManagedChatAnchorContext, ManagedChatLaunch, ManagedChatOpenMode, ManagedChatPurpose,
+};
 use crate::workspaces::WorkspaceId;
 use serde_json::{Value, json};
 
@@ -71,6 +74,12 @@ fn broker_error(error: WorkerBrokerError) -> String {
     error.to_string()
 }
 
+pub struct WorkerLaunchContext<'a> {
+    pub managed_chat_broker: &'a ManagedChatBroker,
+    pub anchor_route: Option<&'a CompanionAnchorRoute>,
+    pub worker_target_count: usize,
+}
+
 pub async fn handle(
     arguments: &Value,
     workspace_id: &WorkspaceId,
@@ -78,8 +87,9 @@ pub async fn handle(
     caller_identity: &ChatIdentity,
     execution_profile: &WorkerExecutionProfile,
     broker: &WorkerBroker,
-    managed_chat_broker: &ManagedChatBroker,
+    launch_context: WorkerLaunchContext<'_>,
 ) -> Result<Value, String> {
+    let worker_target_count = launch_context.worker_target_count;
     let action = required_string(arguments, "action")?;
     match action {
         "spawn" => {
@@ -103,23 +113,122 @@ pub async fn handle(
                 &receipt,
                 &execution_profile,
             );
-            let launch = managed_chat_broker
-                .enqueue(EnqueueManagedChatRequest {
-                    dedupe_key: format!("worker:{}:task:{}", receipt.worker_id, receipt.task_id),
-                    launch: ManagedChatLaunch {
-                        workspace_id: workspace_id.clone(),
-                        purpose: ManagedChatPurpose::Worker,
-                        execution_profile: execution_profile.clone(),
-                        opening_message,
-                        task_marker: format!("moondesk-worker-task:{}", receipt.task_id),
-                        thread_key: Some(format!("worker:{}", receipt.worker_id)),
-                        open_mode: ManagedChatOpenMode::NewThread,
-                    },
+            let (target_client_id, anchor_context) = launch_context
+                .anchor_route
+                .map(|route| {
+                    (
+                        Some(route.client_id.clone()),
+                        Some(ManagedChatAnchorContext {
+                            conversation_id: route.tab.conversation_id.clone(),
+                            conversation_url: route.tab.conversation_url.clone(),
+                            project_id: route.tab.project_id.clone(),
+                            project_url: route.tab.project_url.clone(),
+                        }),
+                    )
                 })
+                .unwrap_or((None, None));
+            let dedupe_key = format!("worker:{}:task:{}", receipt.worker_id, receipt.task_id);
+            let launch = match launch_context
+                .managed_chat_broker
+                .enqueue_held_with_route(
+                    EnqueueManagedChatRequest {
+                        dedupe_key: dedupe_key.clone(),
+                        launch: ManagedChatLaunch {
+                            workspace_id: workspace_id.clone(),
+                            purpose: ManagedChatPurpose::Worker,
+                            execution_profile: execution_profile.clone(),
+                            opening_message,
+                            task_marker: format!("moondesk-worker-task:{}", receipt.task_id),
+                            thread_key: Some(format!("worker:{}", receipt.worker_id)),
+                            open_mode: ManagedChatOpenMode::NewThread,
+                            anchor_session_digest: Some(caller_identity.session_digest.clone()),
+                        },
+                    },
+                    target_client_id,
+                    anchor_context,
+                )
                 .await
-                .map_err(|error| {
-                    format!("worker was persisted but browser launch was not accepted: {error}")
-                })?;
+            {
+                Ok(launch) => launch,
+                Err(error) => {
+                    let rollback = broker
+                        .rollback_unlinked_spawn(
+                            workspace_id,
+                            caller_identity,
+                            &receipt.worker_id,
+                            &receipt.task_id,
+                        )
+                        .await;
+                    return Err(match rollback {
+                        Ok(()) => format!(
+                            "browser launch was not accepted; pending worker was rolled back: {error}"
+                        ),
+                        Err(rollback_error) => format!(
+                            "browser launch was not accepted ({error}); pending worker rollback also failed: {rollback_error}"
+                        ),
+                    });
+                }
+            };
+            if let Err(link_error) = broker
+                .link_launch_command(
+                    workspace_id,
+                    caller_identity,
+                    &receipt.worker_id,
+                    &receipt.task_id,
+                    &launch.id.to_string(),
+                )
+                .await
+            {
+                let cancel = launch_context
+                    .managed_chat_broker
+                    .cancel_pre_send_by_dedupe(&dedupe_key)
+                    .await;
+                let rollback = broker
+                    .rollback_unlinked_spawn(
+                        workspace_id,
+                        caller_identity,
+                        &receipt.worker_id,
+                        &receipt.task_id,
+                    )
+                    .await;
+                return Err(format!(
+                    "worker launch command could not be linked ({link_error}); command cleanup: {}; worker rollback: {}",
+                    cancel
+                        .map(|_| "ok".to_string())
+                        .unwrap_or_else(|error| error.to_string()),
+                    rollback
+                        .map(|_| "ok".to_string())
+                        .unwrap_or_else(|error| error.to_string())
+                ));
+            }
+            if let Err(activate_error) = launch_context
+                .managed_chat_broker
+                .activate_dispatch(&launch.id)
+                .await
+            {
+                let cancel = launch_context
+                    .managed_chat_broker
+                    .cancel_pre_send_by_dedupe(&dedupe_key)
+                    .await;
+                let rollback = broker
+                    .rollback_linked_spawn(
+                        workspace_id,
+                        caller_identity,
+                        &receipt.worker_id,
+                        &receipt.task_id,
+                        &launch.id.to_string(),
+                    )
+                    .await;
+                return Err(format!(
+                    "worker launch command could not be activated ({activate_error}); command cleanup: {}; linked worker rollback: {}",
+                    cancel
+                        .map(|_| "ok".to_string())
+                        .unwrap_or_else(|error| error.to_string()),
+                    rollback
+                        .map(|_| "ok".to_string())
+                        .unwrap_or_else(|error| error.to_string())
+                ));
+            }
 
             Ok(json!({
                 "action": "spawn",
@@ -130,7 +239,10 @@ pub async fn handle(
                 "claimToken": receipt.claim_token,
                 "executionProfile": execution_profile,
                 "launchCommandId": launch.id,
-                "state": "provisioning"
+                "state": "provisioning",
+                "targetWorkerCount": worker_target_count,
+                "recommendedWorkerCount": super::RECOMMENDED_WORKERS_PER_FAMILY,
+                "maxWorkerCount": super::MAX_WORKERS_PER_FAMILY
             }))
         }
         "reuse" => {
@@ -153,23 +265,108 @@ pub async fn handle(
                 &receipt.task_id,
                 &receipt.execution_profile,
             );
-            let launch = managed_chat_broker
-                .enqueue(EnqueueManagedChatRequest {
-                    dedupe_key: format!("worker:{}:task:{}", receipt.worker_id, receipt.task_id),
-                    launch: ManagedChatLaunch {
-                        workspace_id: workspace_id.clone(),
-                        purpose: ManagedChatPurpose::Worker,
-                        execution_profile: receipt.execution_profile.clone(),
-                        opening_message,
-                        task_marker: format!("moondesk-worker-task:{}", receipt.task_id),
-                        thread_key: Some(format!("worker:{}", receipt.worker_id)),
-                        open_mode: ManagedChatOpenMode::ExistingThread,
+            let dedupe_key = format!("worker:{}:task:{}", receipt.worker_id, receipt.task_id);
+            let launch = match launch_context
+                .managed_chat_broker
+                .enqueue_held_with_route(
+                    EnqueueManagedChatRequest {
+                        dedupe_key: dedupe_key.clone(),
+                        launch: ManagedChatLaunch {
+                            workspace_id: workspace_id.clone(),
+                            purpose: ManagedChatPurpose::Worker,
+                            execution_profile: receipt.execution_profile.clone(),
+                            opening_message,
+                            task_marker: format!("moondesk-worker-task:{}", receipt.task_id),
+                            thread_key: Some(format!("worker:{}", receipt.worker_id)),
+                            open_mode: ManagedChatOpenMode::ExistingThread,
+                            anchor_session_digest: Some(caller_identity.session_digest.clone()),
+                        },
                     },
-                })
+                    None,
+                    None,
+                )
                 .await
-                .map_err(|error| {
-                    format!("worker reuse was persisted but browser wake was not accepted: {error}")
-                })?;
+            {
+                Ok(launch) => launch,
+                Err(error) => {
+                    let rollback = broker
+                        .rollback_unlinked_reuse(
+                            workspace_id,
+                            caller_identity,
+                            &receipt.worker_id,
+                            &receipt.task_id,
+                        )
+                        .await;
+                    return Err(match rollback {
+                        Ok(()) => format!(
+                            "browser wake was not accepted; pending reuse was rolled back: {error}"
+                        ),
+                        Err(rollback_error) => format!(
+                            "browser wake was not accepted ({error}); pending reuse rollback also failed: {rollback_error}"
+                        ),
+                    });
+                }
+            };
+            if let Err(link_error) = broker
+                .link_launch_command(
+                    workspace_id,
+                    caller_identity,
+                    &receipt.worker_id,
+                    &receipt.task_id,
+                    &launch.id.to_string(),
+                )
+                .await
+            {
+                let cancel = launch_context
+                    .managed_chat_broker
+                    .cancel_pre_send_by_dedupe(&dedupe_key)
+                    .await;
+                let rollback = broker
+                    .rollback_unlinked_reuse(
+                        workspace_id,
+                        caller_identity,
+                        &receipt.worker_id,
+                        &receipt.task_id,
+                    )
+                    .await;
+                return Err(format!(
+                    "worker wake command could not be linked ({link_error}); command cleanup: {}; reuse rollback: {}",
+                    cancel
+                        .map(|_| "ok".to_string())
+                        .unwrap_or_else(|error| error.to_string()),
+                    rollback
+                        .map(|_| "ok".to_string())
+                        .unwrap_or_else(|error| error.to_string())
+                ));
+            }
+            if let Err(activate_error) = launch_context
+                .managed_chat_broker
+                .activate_dispatch(&launch.id)
+                .await
+            {
+                let cancel = launch_context
+                    .managed_chat_broker
+                    .cancel_pre_send_by_dedupe(&dedupe_key)
+                    .await;
+                let rollback = broker
+                    .rollback_linked_reuse(
+                        workspace_id,
+                        caller_identity,
+                        &receipt.worker_id,
+                        &receipt.task_id,
+                        &launch.id.to_string(),
+                    )
+                    .await;
+                return Err(format!(
+                    "worker wake command could not be activated ({activate_error}); command cleanup: {}; linked reuse rollback: {}",
+                    cancel
+                        .map(|_| "ok".to_string())
+                        .unwrap_or_else(|error| error.to_string()),
+                    rollback
+                        .map(|_| "ok".to_string())
+                        .unwrap_or_else(|error| error.to_string())
+                ));
+            }
             Ok(json!({
                 "action": "reuse",
                 "workerId": receipt.worker_id,
@@ -186,7 +383,14 @@ pub async fn handle(
                 .await
                 .map_err(broker_error)?;
             let Some(family) = family else {
-                return Ok(json!({ "action": "status", "family": null, "workers": [] }));
+                return Ok(json!({
+                    "action": "status",
+                    "family": null,
+                    "workers": [],
+                    "targetWorkerCount": worker_target_count,
+                    "recommendedWorkerCount": super::RECOMMENDED_WORKERS_PER_FAMILY,
+                    "maxWorkerCount": super::MAX_WORKERS_PER_FAMILY
+                }));
             };
             let workers: Vec<Value> = family
                 .workers
@@ -198,6 +402,10 @@ pub async fn handle(
                         "label": worker.label,
                         "state": worker.state,
                         "attachmentState": worker.attachment_state,
+                        "launchState": worker.launch_state,
+                        "launchCommandId": worker.launch_command_id,
+                        "launchError": worker.launch_error,
+                        "conversationUrl": worker.conversation_url,
                         "currentTaskId": worker.current_task_id,
                         "claimed": worker.chat_identity.is_some(),
                         "executionProfile": worker.execution_profile,
@@ -208,7 +416,10 @@ pub async fn handle(
             Ok(json!({
                 "action": "status",
                 "familyId": family.id,
-                "workers": workers
+                "workers": workers,
+                "targetWorkerCount": worker_target_count,
+                "recommendedWorkerCount": super::RECOMMENDED_WORKERS_PER_FAMILY,
+                "maxWorkerCount": super::MAX_WORKERS_PER_FAMILY
             }))
         }
         "retire" => {
@@ -231,8 +442,9 @@ pub async fn handle(
                         .clone()
                         .ok_or_else(|| "worker pending launch has no current task".to_string())?;
                     let dedupe_key = format!("worker:{}:task:{}", worker_id, task_id);
-                    managed_chat_broker
-                        .cancel_pre_send_by_dedupe(&dedupe_key)
+                    launch_context
+                        .managed_chat_broker
+                        .settle_for_worker_retire_by_dedupe(&dedupe_key)
                         .await
                         .map_err(|error| format!("worker cannot be retired safely: {error}"))?;
                     Some(task_id)

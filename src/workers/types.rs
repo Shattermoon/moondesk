@@ -81,9 +81,13 @@ pub struct ChatIdentity {
 }
 
 impl ChatIdentity {
+    pub fn session_digest_for(session: &str) -> String {
+        digest_identity("session", session)
+    }
+
     pub fn from_openai_meta(subject: Option<&str>, session: &str) -> Self {
         Self {
-            session_digest: digest_identity("session", session),
+            session_digest: Self::session_digest_for(session),
             subject_digest: subject.map(|value| digest_identity("subject", value)),
         }
     }
@@ -126,6 +130,21 @@ pub enum BrowserAttachmentState {
     Opening,
     Attached,
     Unknown,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerLaunchState {
+    #[default]
+    Unknown,
+    Queued,
+    Preparing,
+    SendStarted,
+    Reconciling,
+    WaitingClaim,
+    Paused,
+    Failed,
+    Claimed,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -195,6 +214,14 @@ pub struct WorkerRecord {
     pub state: WorkerState,
     pub attachment_state: BrowserAttachmentState,
     pub execution_profile: WorkerExecutionProfile,
+    #[serde(default)]
+    pub launch_state: WorkerLaunchState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_command_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chat_identity: Option<ChatIdentity>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

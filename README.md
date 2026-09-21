@@ -121,21 +121,21 @@ Select the connector and start working.
 ## Experimental ChatGPT workers
 
 > [!WARNING]
-> Workers are experimental and currently require the unpacked MoonDesk Worker Companion extension. The companion drives ChatGPT's web UI, so MoonDesk fails closed when it cannot positively confirm the requested model, reasoning effort, Project, or previous Send state.
+> Workers are experimental and currently require the unpacked MoonDesk Worker Companion extension. The companion drives ChatGPT's web UI, so MoonDesk fails closed when it cannot positively confirm the requested model, reasoning effort, exact placement, or previous Send state.
 
-Workers let one ChatGPT conversation act as the **Anchor** and delegate independent tasks to at most **two durable worker conversations** in the same MoonDesk workspace. Worker identity is bound to the route-resolved workspace plus ChatGPT's exact session metadata; a different conversation in the same workspace does not inherit Anchor or worker authority.
+Workers let one ChatGPT conversation act as the **Anchor** and delegate independent tasks to durable worker conversations in the same MoonDesk workspace. The configurable target is **1-8 workers**, defaults to **4**, and has a hard maximum of **8 active workers per Anchor family**. **1-4 workers is the recommended operating range.** Using **5-8 workers** is supported but can trigger ChatGPT/provider rate limits, especially when the account already has other conversations generating at the same time, so higher counts are best treated as an advanced/high-load mode. MoonDesk launches up to four fresh worker conversations concurrently so the recommended group does not serialize behind one slow launch. Worker identity is bound to the route-resolved workspace plus ChatGPT's exact session metadata; a different conversation in the same workspace does not inherit Anchor or worker authority. ChatGPT Project names, connector names, MoonDesk workspace names, and folder names are display-only and are never used as routing or authorization keys.
 
 ### Install the companion
 
-1. Open `chrome://extensions`, enable **Developer mode**, and choose **Load unpacked**.
+1. Open `chrome://extensions` (or `edge://extensions`), enable **Developer mode**, and choose **Load unpacked**.
 2. Select `extensions/moondesk-worker-companion`.
-3. Start MoonDesk. The extension discovers MoonDesk's dedicated loopback-only companion bridge and pairs automatically; there is no per-chat token step.
-4. From a conversation inside the ChatGPT Project that owns this MoonDesk connector, choose the MoonDesk workspace and click **Bind this Project** once.
+3. Start MoonDesk. The extension discovers MoonDesk's dedicated loopback-only companion bridge and pairs automatically; there is no per-chat token step. Multiple browser installations may remain paired independently.
+4. Open the ChatGPT conversation you want to use as the Anchor. No Project/workspace binding step is required.
 5. Click **Discover available ChatGPT models**, choose a confirmed model and reasoning effort, and save the worker profile.
 
-The companion credential and Project/workspace binding survive Chrome and MoonDesk restarts. New conversations inside the already-bound ChatGPT Project do not need to pair or bind again. MoonDesk keeps a manual repair code in Settings only for rare recovery cases such as replacing the extension installation while an older installation is still paired.
+Worker placement is automatic. A Project Anchor routes a fresh worker into the exact same `g-p-...` Project ID; a normal Anchor creates a normal ChatGPT worker conversation. Fresh workers are routed to the paired browser that positively observes the exact Anchor. After the worker conversation is confirmed, reuse remains attached to that durable thread/browser affinity.
 
-The last confirmed model catalog is stored in extension-local storage, so reopening the popup does not require rediscovery. MoonDesk still re-verifies the actual model and effort in ChatGPT before sending every worker assignment.
+The last confirmed model catalog is stored in extension-local storage, so reopening the popup does not require rediscovery. MoonDesk still re-verifies the actual model and effort in ChatGPT before sending every worker assignment. If MoonDesk has been upgraded but an existing ChatGPT conversation does not expose the `workers` tool, refresh/reconnect the Custom Connector and start a fresh conversation because ChatGPT may retain an older connector schema.
 
 ### Worker lifecycle
 

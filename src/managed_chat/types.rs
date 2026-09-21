@@ -139,6 +139,8 @@ pub struct ManagedChatLaunch {
     pub thread_key: Option<String>,
     #[serde(default)]
     pub open_mode: ManagedChatOpenMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor_session_digest: Option<String>,
 }
 
 impl ManagedChatLaunch {
@@ -163,6 +165,51 @@ impl ManagedChatLaunch {
         if self.open_mode == ManagedChatOpenMode::ExistingThread && self.thread_key.is_none() {
             return Err("existing managed chat launch requires a thread key".into());
         }
+        if self.anchor_session_digest.as_deref().is_some_and(|digest| {
+            digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+        }) {
+            return Err("managed chat anchor session digest is invalid".into());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ManagedChatAnchorContext {
+    pub conversation_id: String,
+    pub conversation_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_url: Option<String>,
+}
+
+impl ManagedChatAnchorContext {
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        if self.conversation_id.trim().is_empty() || self.conversation_id.len() > 128 {
+            return Err("managed chat Anchor conversation id is invalid".into());
+        }
+        if self.conversation_url.trim().is_empty() || self.conversation_url.len() > 2048 {
+            return Err("managed chat Anchor conversation URL is invalid".into());
+        }
+        if self
+            .project_id
+            .as_deref()
+            .is_some_and(|value| value.trim().is_empty() || value.len() > 128)
+        {
+            return Err("managed chat Anchor Project id is invalid".into());
+        }
+        if self
+            .project_url
+            .as_deref()
+            .is_some_and(|value| value.trim().is_empty() || value.len() > 2048)
+        {
+            return Err("managed chat Anchor Project URL is invalid".into());
+        }
+        if self.project_id.is_some() != self.project_url.is_some() {
+            return Err("managed chat Anchor Project metadata is incomplete".into());
+        }
         Ok(())
     }
 }
@@ -172,7 +219,9 @@ impl ManagedChatLaunch {
 pub enum ManagedChatCommandState {
     Queued,
     Leased,
+    SendStarted,
     NeedsReconcile,
+    Paused,
     Succeeded,
     Failed,
 }
@@ -191,6 +240,12 @@ pub struct ManagedChatTerminalResult {
     pub succeeded: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub details: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation_url: Option<String>,
+}
+
+fn default_dispatch_ready() -> bool {
+    true
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -202,12 +257,18 @@ pub struct ManagedChatCommand {
     pub request_fingerprint: String,
     pub launch: ManagedChatLaunch,
     pub state: ManagedChatCommandState,
+    #[serde(default = "default_dispatch_ready")]
+    pub dispatch_ready: bool,
     #[serde(default)]
     pub reconcile_history: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lease: Option<ManagedChatLease>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal: Option<ManagedChatTerminalResult>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_client_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor_context: Option<ManagedChatAnchorContext>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -281,12 +342,30 @@ impl ManagedChatStoreData {
                 }
             }
             if command
+                .target_client_id
+                .as_deref()
+                .is_some_and(|client_id| client_id.trim().is_empty() || client_id.len() > 128)
+            {
+                return Err("managed chat target client id is invalid".into());
+            }
+            if let Some(anchor_context) = command.anchor_context.as_ref() {
+                anchor_context.validate()?;
+            }
+            if command
                 .terminal
                 .as_ref()
                 .and_then(|terminal| terminal.details.as_deref())
                 .is_some_and(|details| details.len() > super::MAX_MANAGED_CHAT_DETAIL_BYTES)
             {
                 return Err("managed chat terminal details exceed configured size limit".into());
+            }
+            if command
+                .terminal
+                .as_ref()
+                .and_then(|terminal| terminal.conversation_url.as_deref())
+                .is_some_and(|url| url.is_empty() || url.len() > 2048)
+            {
+                return Err("managed chat terminal conversation URL is invalid".into());
             }
             match command.state {
                 ManagedChatCommandState::Queued => {
@@ -303,11 +382,34 @@ impl ManagedChatStoreData {
                         );
                     }
                 }
-                ManagedChatCommandState::NeedsReconcile => {
-                    if command.lease.is_some() || command.terminal.is_some() {
+                ManagedChatCommandState::SendStarted => {
+                    if command.lease.is_none()
+                        || command.terminal.is_some()
+                        || !command.reconcile_history
+                    {
                         return Err(
-                            "reconcile managed chat command has invalid lease/terminal state"
+                            "send-started managed chat command has invalid lease/history state"
                                 .into(),
+                        );
+                    }
+                }
+                ManagedChatCommandState::NeedsReconcile => {
+                    if command.lease.is_some()
+                        || command.terminal.is_some()
+                        || !command.reconcile_history
+                    {
+                        return Err(
+                            "reconcile managed chat command has invalid lease/history state".into(),
+                        );
+                    }
+                }
+                ManagedChatCommandState::Paused => {
+                    if command.lease.is_some()
+                        || command.terminal.is_none()
+                        || !command.reconcile_history
+                    {
+                        return Err(
+                            "paused managed chat command has invalid lease/history state".into(),
                         );
                     }
                 }

@@ -29,6 +29,7 @@ task_id: {task_id}
 claim_token: {claim_token}
 expected_model: {model_label}
 expected_reasoning_effort: {reasoning_effort:?}
+moondesk_task_marker: moondesk-worker-task:{task_id}
 "#,
         assignment = assignment,
         display_id = receipt.display_id,
@@ -71,6 +72,7 @@ worker_id: {worker_id}
 task_id: {task_id}
 expected_model: {model_label}
 expected_reasoning_effort: {reasoning_effort:?}
+moondesk_task_marker: moondesk-worker-task:{task_id}
 "#,
         assignment = assignment,
         display_id = display_id,

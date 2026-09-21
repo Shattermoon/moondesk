@@ -7,7 +7,8 @@
     "storage",
     "tabs",
     "scripting",
-    "alarms"
+    "alarms",
+    "windows"
   ],
   "host_permissions": [
     "https://chatgpt.com/*",
@@ -23,14 +24,23 @@
   },
   "content_scripts": [
     {
-      "matches": ["https://chatgpt.com/*"],
-      "js": ["model-state-main.js"],
+      "matches": [
+        "https://chatgpt.com/*"
+      ],
+      "js": [
+        "model-state-main.js"
+      ],
       "run_at": "document_start",
       "world": "MAIN"
     },
     {
-      "matches": ["https://chatgpt.com/*"],
-      "js": ["chatgpt-dom.js", "content.js"],
+      "matches": [
+        "https://chatgpt.com/*"
+      ],
+      "js": [
+        "chatgpt-dom.js",
+        "content.js"
+      ],
       "run_at": "document_idle"
     }
   ]

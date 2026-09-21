@@ -1,7 +1,6 @@
 const $ = (id) => document.getElementById(id);
 const MODEL_CATALOG_STORAGE_KEY = 'moondeskWorkerModelCatalogV1';
 let currentContext = null;
-let workspaceList = [];
 let modelCatalog = [];
 let currentProfile = null;
 
@@ -96,6 +95,32 @@ function profileText(profile) {
   return `Current worker profile: ${profile.modelLabel} / ${CONFIG_EFFORT_LABEL[profile.reasoningEffort] || profile.reasoningEffort}`;
 }
 
+function renderBrowserClients(clients) {
+  const list = $('browserList');
+  list.textContent = '';
+  const stale = (clients || []).filter((client) => !client.current);
+  $('browserManager').hidden = stale.length === 0;
+  for (const client of clients || []) {
+    const row = document.createElement('div');
+    row.className = 'browser-row';
+    const text = document.createElement('div');
+    text.className = 'browser-copy';
+    const label = client.browserLabel || 'Browser';
+    const presence = client.online ? 'online' : 'offline';
+    text.textContent = `${label} · ${presence} · ${client.clientId}${client.current ? ' · current' : ''}`;
+    row.append(text);
+    if (!client.current) {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'browser-revoke';
+      button.dataset.clientId = client.clientId;
+      button.textContent = 'Revoke';
+      row.append(button);
+    }
+    list.append(row);
+  }
+}
+
 function supportedEfforts(model) {
   const unique = new Map();
   for (const choice of model?.choices || []) {
@@ -160,7 +185,7 @@ async function render() {
   showError('');
   const status = await bg({ type: 'MOONDESK_STATUS' });
   const connected = status.connected === true;
-  $('binding').hidden = !connected;
+  $('routing').hidden = !connected;
   $('profile').hidden = !connected;
   $('manualRepair').hidden = !status.repairRequired;
   $('manualRepair').open = Boolean(status.repairRequired);
@@ -176,47 +201,44 @@ async function render() {
     : 'Searching for local MoonDesk…';
   if (!connected && status.error) showError(status.error);
 
-  $('blocked').hidden = !status.blockedCommand;
-  if (status.blockedCommand) {
-    const retryMode = status.blockedCommand.retryMode || 'reconcile';
-    $('blockedText').textContent = `Worker launch ${status.blockedCommand.commandId} is paused: ${status.blockedCommand.reason}`;
-    $('retry').disabled = retryMode === 'none';
-    $('retry').textContent = retryMode === 'fresh'
-      ? 'Retry launch'
-      : retryMode === 'none'
-        ? 'Manual inspection required'
-        : 'Retry reconciliation';
+  const blockedCommands = Array.isArray(status.blockedCommands)
+    ? status.blockedCommands
+    : status.blockedCommand
+      ? [status.blockedCommand]
+      : [];
+  const retryableBlocked = blockedCommands.filter((entry) => entry.retryMode !== 'none');
+  const manualBlocked = blockedCommands.length - retryableBlocked.length;
+  $('blocked').hidden = blockedCommands.length === 0;
+  if (blockedCommands.length) {
+    const first = blockedCommands[0];
+    $('blockedText').textContent = blockedCommands.length === 1
+      ? `Worker launch ${first.commandId} is paused: ${first.reason}`
+      : `${blockedCommands.length} worker launches need attention (${retryableBlocked.length} retryable, ${manualBlocked} manual inspection).`;
+    $('retry').disabled = retryableBlocked.length === 0;
+    $('retry').textContent = retryableBlocked.length > 1
+      ? `Retry ${retryableBlocked.length} safe launches`
+      : retryableBlocked.length === 1
+        ? 'Retry safe launch'
+        : 'Manual inspection required';
   } else {
     $('retry').disabled = false;
     $('retry').textContent = 'Retry reconciliation';
   }
 
   if (!connected) return;
-  workspaceList = await bg({ type: 'MOONDESK_WORKSPACES' });
   currentProfile = await bg({ type: 'MOONDESK_PROFILE' });
+  const pairedClients = await bg({ type: 'MOONDESK_CLIENTS' });
+  renderBrowserClients(pairedClients);
   modelCatalog = await loadCachedModelCatalog();
   $('currentProfile').textContent = profileText(currentProfile);
-
-  const select = $('workspace');
-  select.textContent = '';
-  for (const workspace of workspaceList) {
-    const option = document.createElement('option');
-    option.value = workspace.workspaceId;
-    option.textContent = `${workspace.name} — ${workspace.root}`;
-    select.append(option);
-  }
+  $('browserStatus').textContent = `${status.pairedClientCount || 1} paired browser installation${(status.pairedClientCount || 1) === 1 ? '' : 's'} · this client ${status.clientId || 'connected'}`;
 
   currentContext = await currentChatContext();
-  $('projectContext').textContent = currentContext?.projectId && currentContext?.conversationId
-    ? `Project ${currentContext.projectId} · conversation ${currentContext.conversationId}`
-    : 'Open an existing conversation inside the ChatGPT Project you want to bind.';
-  $('bind').disabled = !(currentContext?.projectId && currentContext?.conversationId && workspaceList.length);
-
-  const bindings = await bg({ type: 'MOONDESK_BINDINGS' });
-  const summaries = workspaceList
-    .filter((workspace) => bindings[workspace.workspaceId])
-    .map((workspace) => `${workspace.name} → ${bindings[workspace.workspaceId].projectId}`);
-  $('bindings').textContent = summaries.length ? `Bindings: ${summaries.join(' · ')}` : 'No Project bindings yet.';
+  $('chatContext').textContent = currentContext?.conversationId
+    ? currentContext.projectId
+      ? `Current chat: Project ${currentContext.projectId} · conversation ${currentContext.conversationId}`
+      : `Current chat: normal conversation ${currentContext.conversationId}`
+    : 'Open an existing ChatGPT conversation to make it an Anchor for worker routing.';
 
   if (modelCatalog.length) renderCatalog();
 }
@@ -235,18 +257,21 @@ $('pair').addEventListener('click', async () => {
   }
 });
 
-$('bind').addEventListener('click', async () => {
+$('browserList').addEventListener('click', async (event) => {
+  const button = event.target.closest('button[data-client-id]');
+  if (!button) return;
+  const clientId = button.dataset.clientId;
+  if (!clientId) return;
+  if (!confirm(`Revoke paired browser ${clientId}? Any ambiguous launch pinned to it will be paused, not resent.`)) return;
   showError('');
+  button.disabled = true;
   try {
-    if (!currentContext) throw new Error('ChatGPT Project context is unavailable');
-    await bg({
-      type: 'MOONDESK_BIND_PROJECT',
-      workspaceId: $('workspace').value,
-      context: currentContext
-    });
+    const result = await bg({ type: 'MOONDESK_REVOKE_CLIENT', clientId });
+    $('browserStatus').textContent = `Stale browser revoked · ${result.retargetedCommands || 0} safe command(s) retargeted · ${result.pausedCommands || 0} ambiguous command(s) paused`;
     await render();
   } catch (error) {
     showError(error);
+    button.disabled = false;
   }
 });
 

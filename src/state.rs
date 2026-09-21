@@ -163,6 +163,10 @@ pub enum AgentsPathMode {
     Disabled,
 }
 
+fn default_worker_target_count() -> usize {
+    workers::RECOMMENDED_WORKERS_PER_FAMILY
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppConfig {
@@ -185,6 +189,8 @@ pub struct AppConfig {
     pub browser_presentation: BrowserPresentation,
     #[serde(default)]
     pub worker_execution_profile: ChatExecutionProfile,
+    #[serde(default = "default_worker_target_count")]
+    pub worker_target_count: usize,
     #[serde(default)]
     pub usage_by_model: BTreeMap<String, UsageTotals>,
 }
@@ -204,6 +210,7 @@ impl Default for AppConfig {
             tool_mode: ToolMode::MultiTools,
             browser_presentation: BrowserPresentation::Headless,
             worker_execution_profile: ChatExecutionProfile::default(),
+            worker_target_count: default_worker_target_count(),
             usage_by_model: BTreeMap::new(),
         }
     }
@@ -233,6 +240,12 @@ impl AppConfig {
         self.worker_execution_profile
             .validate()
             .map_err(std::io::Error::other)?;
+        if !(1..=workers::MAX_WORKERS_PER_FAMILY).contains(&self.worker_target_count) {
+            return Err(std::io::Error::other(format!(
+                "worker target count must be between 1 and {}",
+                workers::MAX_WORKERS_PER_FAMILY
+            )));
+        }
         match self.config_version {
             0 => {
                 if !self.workspaces.is_empty() {
@@ -995,6 +1008,7 @@ pub struct AppState {
     pub session_usage_totals: UsageTotals,
     pub command_jobs: CommandJobManager,
     pub worker_execution_profile: ChatExecutionProfile,
+    pub worker_target_count: usize,
     pub worker_broker: Arc<WorkerBroker>,
     pub managed_chat_broker: Arc<ManagedChatBroker>,
     pub companion_auth: Arc<CompanionAuth>,
@@ -1621,6 +1635,7 @@ impl AppState {
             session_usage_totals: UsageTotals::default(),
             command_jobs: CommandJobManager::new(),
             worker_execution_profile: config.worker_execution_profile,
+            worker_target_count: config.worker_target_count,
             worker_broker,
             managed_chat_broker,
             companion_auth,
@@ -1835,6 +1850,7 @@ impl AppState {
             tool_mode: self.tool_mode,
             browser_presentation: self.browser_presentation,
             worker_execution_profile: self.worker_execution_profile.clone(),
+            worker_target_count: self.worker_target_count,
             usage_by_model: self.usage_by_model.clone(),
         }
         .normalized()
@@ -4564,6 +4580,7 @@ toolMode = "multiTools"
                         task_marker: marker.into(),
                         thread_key: Some(format!("worker:{marker}")),
                         open_mode: crate::managed_chat::types::ManagedChatOpenMode::NewThread,
+                        anchor_session_digest: None,
                     },
                 })
                 .await

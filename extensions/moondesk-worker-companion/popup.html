@@ -22,13 +22,14 @@
       </section>
     </details>
 
-    <section id="binding" hidden>
-      <div id="projectContext" class="muted">Open a ChatGPT Project conversation.</div>
-      <label>MoonDesk workspace
-        <select id="workspace"></select>
-      </label>
-      <button id="bind">Bind this Project</button>
-      <div id="bindings" class="muted"></div>
+    <section id="routing" hidden>
+      <div id="browserStatus" class="muted"></div>
+      <details id="browserManager" hidden>
+        <summary>Manage paired browsers</summary>
+        <div id="browserList"></div>
+      </details>
+      <div id="chatContext" class="muted">Open a ChatGPT conversation to expose it to MoonDesk Workers.</div>
+      <div class="muted">Worker destination is automatic: Project chats stay in the exact same Project ID; normal chats create normal worker conversations.</div>
     </section>
 
     <section id="profile" hidden>

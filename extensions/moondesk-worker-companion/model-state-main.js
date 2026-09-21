@@ -4,7 +4,11 @@
 
   const ASK = 'moondesk-picker-ask';
   const REPLY = 'moondesk-picker-reply';
+  const CORRELATION_ASK = 'moondesk-correlation-ask';
+  const CORRELATION_REPLY = 'moondesk-correlation-reply';
   const MAX_CLIMB = 80;
+  const MAX_CORRELATION_TURNS = 16;
+  const MAX_CORRELATION_IDS = 32;
 
   function fiberOf(node) {
     if (!node) return null;
@@ -21,6 +25,110 @@
       !node.closest('[hidden],[aria-hidden="true"],[inert]') &&
       node.getClientRects().length > 0
     );
+  }
+
+  function conversationIdFromPath() {
+    const match = /\/c\/([0-9a-f-]{16,64})(?:\/|$)/i.exec(location.pathname);
+    return match?.[1]?.toLowerCase() || null;
+  }
+
+  function boundedString(value, max = 128) {
+    return typeof value === 'string' && value.length > 0 && value.length <= max ? value : null;
+  }
+
+  function normalizedRequestId(value) {
+    const raw = boundedString(value, 160);
+    if (!raw) return null;
+    const id = raw.split('/')[0].trim();
+    return /^[a-z0-9_-]{1,100}$/i.test(id) ? id : null;
+  }
+
+  function turnMessagesOf(fiber) {
+    for (let at = fiber, up = 0; at && up < MAX_CLIMB; up += 1, at = at.return) {
+      const props = at.memoizedProps;
+      if (!props || typeof props !== 'object') continue;
+      const turn = props.turn;
+      if (turn && typeof turn === 'object' && Array.isArray(turn.messages)) return turn.messages;
+      if (Array.isArray(props.allMessages)) return props.allMessages;
+    }
+    return null;
+  }
+
+  function conversationEvidenceOf(fiber) {
+    let found = null;
+    const conversations = new Map();
+    for (let at = fiber, up = 0; at && up < MAX_CLIMB; up += 1, at = at.return) {
+      const props = at.memoizedProps;
+      if (!props || typeof props !== 'object') continue;
+      const turn = props.turn && typeof props.turn === 'object' ? props.turn : null;
+      const conversation =
+        props.conversation && typeof props.conversation === 'object' ? props.conversation : null;
+      if (conversation && !conversations.has(conversation)) {
+        let serverId = null;
+        try {
+          const value =
+            typeof conversation.serverId$ === 'function' ? conversation.serverId$() : null;
+          if (typeof value === 'string' && /^[0-9a-f-]{16,64}$/i.test(value)) {
+            serverId = value.toLowerCase();
+          }
+        } catch {}
+        conversations.set(conversation, serverId);
+      }
+
+      const values = [
+        props.clientThreadId,
+        props.conversationId,
+        conversation?.id,
+        conversations.get(conversation),
+        turn?.clientThreadId,
+        turn?.conversationId
+      ];
+      for (const value of values) {
+        if (typeof value !== 'string' || value.startsWith('WEB:')) continue;
+        if (!/^[0-9a-f-]{16,64}$/i.test(value)) continue;
+        const normalized = value.toLowerCase();
+        if (found && found !== normalized) return { conversationId: null, conflict: true };
+        found = normalized;
+      }
+    }
+    return { conversationId: found, conflict: false };
+  }
+
+  function correlationSnapshot() {
+    const routeConversation = conversationIdFromPath();
+    if (!routeConversation) return null;
+
+    let sections;
+    try {
+      sections = [...document.querySelectorAll('section[data-testid^="conversation-turn"]')];
+    } catch {
+      return null;
+    }
+
+    const requestIds = [];
+    const seen = new Set();
+    const first = Math.max(0, sections.length - MAX_CORRELATION_TURNS);
+    for (let index = first; index < sections.length && requestIds.length < MAX_CORRELATION_IDS; index += 1) {
+      const fiber = fiberOf(sections[index]);
+      if (!fiber) continue;
+      const evidence = conversationEvidenceOf(fiber);
+      if (evidence.conflict || evidence.conversationId !== routeConversation) continue;
+      const messages = turnMessagesOf(fiber);
+      if (!Array.isArray(messages)) continue;
+      for (const message of messages) {
+        const metadata =
+          message && typeof message === 'object' && message.metadata && typeof message.metadata === 'object'
+            ? message.metadata
+            : null;
+        const requestId = normalizedRequestId(metadata?.request_id);
+        if (!requestId || seen.has(requestId)) continue;
+        seen.add(requestId);
+        requestIds.push(requestId);
+        if (requestIds.length >= MAX_CORRELATION_IDS) break;
+      }
+    }
+
+    return requestIds.length ? { conversationId: routeConversation, requestIds } : null;
   }
 
   function modelPickerTrigger() {
@@ -201,15 +309,32 @@
   window.addEventListener('message', (event) => {
     if (event.source !== window || event.origin !== location.origin) return;
     const data = event.data;
-    if (!data || data.source !== ASK || data.v !== 1) return;
+    if (!data || data.v !== 1) return;
     const nonce = typeof data.nonce === 'string' ? data.nonce.slice(0, 64) : '';
     if (!nonce) return;
-    let picker = null;
-    try {
-      picker = pickerSnapshot();
-    } catch {
-      picker = null;
+
+    if (data.source === ASK) {
+      let picker = null;
+      try {
+        picker = pickerSnapshot();
+      } catch {
+        picker = null;
+      }
+      window.postMessage({ source: REPLY, nonce, v: 1, picker }, location.origin);
+      return;
     }
-    window.postMessage({ source: REPLY, nonce, v: 1, picker }, location.origin);
+
+    if (data.source === CORRELATION_ASK) {
+      let correlation = null;
+      try {
+        correlation = correlationSnapshot();
+      } catch {
+        correlation = null;
+      }
+      window.postMessage(
+        { source: CORRELATION_REPLY, nonce, v: 1, correlation },
+        location.origin
+      );
+    }
   });
 })();

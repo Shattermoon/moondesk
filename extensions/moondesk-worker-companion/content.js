@@ -33,8 +33,8 @@
   }
 
   async function prepareWorker(message) {
-    const { commandId, launchToken, binding, launch } = message;
-    if (!commandId || !launchToken || !binding?.projectId || !launch?.taskMarker || !launch?.openingMessage || !launch?.executionProfile) {
+    const { commandId, launchToken, placement, launch } = message;
+    if (!commandId || !launchToken || !placement || !launch?.taskMarker || !launch?.openingMessage || !launch?.executionProfile) {
       return { state: 'failed', reason: 'invalid_launch_payload' };
     }
     rememberLaunch({
@@ -45,49 +45,80 @@
       threadKey: launch.threadKey || null
     });
 
-    if (DOM.projectIdFromPath() !== binding.projectId) {
-      return { state: 'failed', reason: 'wrong_chatgpt_project' };
-    }
+    const expectedProjectId = placement.projectId || null;
     const existingThread = launch.openMode === 'existing_thread';
     if (existingThread) {
       if (!DOM.conversationIdFromPath()) {
         return { state: 'failed', reason: 'existing_worker_conversation_unconfirmed' };
       }
+      if ((DOM.projectIdFromPath() || null) !== expectedProjectId) {
+        return { state: 'failed', reason: 'worker_placement_mismatch' };
+      }
       if (!DOM.composerReady()) {
         return { state: 'failed', reason: 'worker_conversation_not_ready' };
       }
-    } else {
-      if (!(await DOM.enterProject(binding.projectId))) {
+    } else if (expectedProjectId) {
+      if (DOM.projectIdFromPath() !== expectedProjectId) {
+        return { state: 'failed', reason: 'wrong_chatgpt_project' };
+      }
+      if (!(await DOM.enterProject(expectedProjectId))) {
         return { state: 'failed', reason: 'project_entry_unconfirmed' };
       }
       if (!DOM.composerReady()) {
         return { state: 'failed', reason: 'project_composer_not_ready' };
+      }
+    } else {
+      if (DOM.projectIdFromPath() !== null || DOM.conversationIdFromPath() !== null) {
+        return { state: 'failed', reason: 'normal_chat_entry_unconfirmed' };
+      }
+      if (!DOM.composerReady()) {
+        return { state: 'failed', reason: 'normal_chat_composer_not_ready' };
       }
     }
 
     if (!(await DOM.selectModelSettings(launch.executionProfile))) {
       return { state: 'failed', reason: 'model_or_effort_unconfirmed' };
     }
+    const selection = await DOM.selectedModelAndEffort(launch.executionProfile);
+    if (!selection) {
+      return { state: 'failed', reason: 'model_or_effort_readback_unconfirmed' };
+    }
     if (DOM.taskMarkerPresent(launch.taskMarker)) {
+      const evidence = DOM.workerEvidence(launch.taskMarker);
       return {
-        state: 'succeeded',
+        state: 'already_sent',
         reason: 'task_marker_already_present',
         conversationUrl: location.href,
-        selection: await DOM.selectedModelAndEffort(launch.executionProfile)
+        selection,
+        evidence
       };
     }
     if (!DOM.insertPrompt(launch.openingMessage)) {
       return { state: 'failed', reason: 'prompt_insert_unconfirmed' };
     }
-    const sent = await DOM.sendOnce(launch.taskMarker);
-    if (sent.state === 'succeeded') {
-      const selection = await DOM.selectedModelAndEffort(launch.executionProfile);
-      if (!selection) {
-        return { state: 'needs_reconcile', reason: 'post_send_model_readback_unconfirmed', conversationUrl: sent.conversationUrl };
-      }
-      return { ...sent, selection };
+    return {
+      state: 'ready',
+      reason: 'worker_prompt_prepared',
+      selection,
+      evidence: DOM.workerEvidence(launch.taskMarker)
+    };
+  }
+
+  async function commitWorkerSend(message) {
+    const { commandId, launchToken, launch } = message;
+    if (!commandId || !launchToken || !launch?.taskMarker || !launch?.openingMessage) {
+      return { state: 'failed', reason: 'invalid_commit_payload' };
     }
-    return sent;
+    const remembered = rememberedLaunch();
+    if (
+      !remembered ||
+      remembered.commandId !== commandId ||
+      remembered.launchToken !== launchToken ||
+      remembered.taskMarker !== launch.taskMarker
+    ) {
+      return { state: 'failed', reason: 'prepared_launch_identity_mismatch' };
+    }
+    return DOM.commitSendOnce(launch.openingMessage, launch.taskMarker);
   }
 
   async function reconcileWorker(message) {
@@ -113,6 +144,12 @@
       sendResponse({ ok: true, context: DOM.context(), rememberedLaunch: rememberedLaunch() });
       return false;
     }
+    if (message.type === 'MOONDESK_CORRELATION_EVIDENCE') {
+      void DOM.correlationEvidence()
+        .then((evidence) => sendResponse({ ok: Boolean(evidence), evidence, context: DOM.context() }))
+        .catch((error) => sendResponse({ ok: false, error: String(error?.message || error) }));
+      return true;
+    }
     if (message.type === 'MOONDESK_MODEL_CATALOG') {
       void DOM.inspectModelSettings()
         .then((catalog) => sendResponse({ ok: Boolean(catalog), catalog }))
@@ -124,6 +161,21 @@
         .then((result) => sendResponse({ ok: true, result }))
         .catch((error) => sendResponse({ ok: false, error: String(error?.message || error) }));
       return true;
+    }
+    if (message.type === 'MOONDESK_COMMIT_WORKER_SEND') {
+      void commitWorkerSend(message)
+        .then((result) => sendResponse({ ok: true, result }))
+        .catch((error) => sendResponse({ ok: false, error: String(error?.message || error) }));
+      return true;
+    }
+    if (message.type === 'MOONDESK_WORKER_EVIDENCE') {
+      const marker = message?.taskMarker;
+      if (!marker) {
+        sendResponse({ ok: false, error: 'task marker is required' });
+      } else {
+        sendResponse({ ok: true, evidence: DOM.workerEvidence(marker), rememberedLaunch: rememberedLaunch() });
+      }
+      return false;
     }
     if (message.type === 'MOONDESK_RECONCILE_WORKER') {
       void reconcileWorker(message)

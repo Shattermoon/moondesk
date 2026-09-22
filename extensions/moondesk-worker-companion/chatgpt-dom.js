@@ -99,6 +99,11 @@
     return [...document.querySelectorAll(selectors)].filter(visible);
   }
 
+  function assistantMessages() {
+    const selectors = '[data-message-author-role="assistant"],[data-testid^="conversation-turn-"] [data-message-author-role="assistant"]';
+    return [...document.querySelectorAll(selectors)].filter(visible);
+  }
+
   const taskMarkerPresent = (marker) => userMessages().some(
     (node) => (node.innerText || node.textContent || '').includes(marker)
   );
@@ -590,6 +595,7 @@
       markerPresent: taskMarkerPresent(marker),
       generating: generating(),
       userTurnCount: userMessages().length,
+      assistantTurnCount: assistantMessages().length,
       composerEmpty: composerText().length === 0
     };
   }
@@ -611,6 +617,7 @@
       conversationId: conversationIdFromPath(),
       projectId: projectIdFromPath(),
       userTurnCount: userMessages().length,
+      assistantTurnCount: assistantMessages().length,
       markerPresent: taskMarkerPresent(marker),
       composerHadPrompt: true
     };

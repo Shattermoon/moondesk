@@ -665,13 +665,12 @@ function acceptanceMatches(command, placement, baseline, evidence, conversationU
   ) return false;
   const marker = evidence.markerPresent === true;
   const generationStarted = evidence.generating === true && baseline?.generating !== true;
-  const newUserTurn = (
-    Number.isInteger(evidence.userTurnCount) &&
-    Number.isInteger(baseline?.userTurnCount) &&
-    evidence.userTurnCount > baseline.userTurnCount &&
-    evidence.composerEmpty === true
+  const newAssistantTurn = (
+    Number.isInteger(evidence.assistantTurnCount) &&
+    Number.isInteger(baseline?.assistantTurnCount) &&
+    evidence.assistantTurnCount > baseline.assistantTurnCount
   );
-  return marker || generationStarted || newUserTurn;
+  return marker && (generationStarted || newAssistantTurn);
 }
 
 async function observeWorkerAcceptance(
@@ -899,24 +898,34 @@ async function processCommand(state, offer) {
     const confirmedConversation = result.conversationUrl
       ? canonicalConversationUrl(result.conversationUrl)
       : canonicalConversationUrl(tab.url);
-    if (result.state === 'succeeded' && confirmedConversation) {
-      record.conversationUrl = confirmedConversation;
-      record.phase = 'succeeded';
-      if (record.threadKey) {
-        state.threadRecords[record.threadKey] = {
-          workspaceId,
-          projectId: placement.projectId || null,
-          conversationUrl: confirmedConversation,
-          tabId: tab.id,
-          updatedAt: Date.now()
-        };
+    if ((result.state === 'succeeded' || result.state === 'observed') && confirmedConversation) {
+      const accepted = acceptanceMatches(
+        command,
+        placement,
+        record.baseline || {},
+        result.evidence || null,
+        confirmedConversation,
+        response.rememberedLaunch
+      );
+      if (accepted) {
+        record.conversationUrl = confirmedConversation;
+        record.phase = 'succeeded';
+        if (record.threadKey) {
+          state.threadRecords[record.threadKey] = {
+            workspaceId,
+            projectId: placement.projectId || null,
+            conversationUrl: confirmedConversation,
+            tabId: tab.id,
+            updatedAt: Date.now()
+          };
+        }
+        await writeState(state);
+        await ack(state, command, 'succeeded', 'worker execution acceptance confirmed', confirmedConversation);
+        sessionReconcileCommandIds.delete(command.id);
+        clearBlockedCommand(state, command.id);
+        await writeState(state);
+        return;
       }
-      await writeState(state);
-      await ack(state, command, 'succeeded', result.reason || 'task marker confirmed', confirmedConversation);
-      sessionReconcileCommandIds.delete(command.id);
-      clearBlockedCommand(state, command.id);
-      await writeState(state);
-      return;
     }
     if (result.state === 'failed') {
       await pauseAfterSend(result.reason || 'reconciliation_failed');
@@ -964,7 +973,9 @@ async function processCommand(state, offer) {
     return;
   }
 
-  record.baseline = prepareResult.evidence || null;
+  if (prepareResult.state === 'ready') {
+    record.baseline = prepareResult.evidence || null;
+  }
   record.phase = 'prepared';
   await writeState(state);
   command = await markSendStarted(state, command);
@@ -977,10 +988,22 @@ async function processCommand(state, offer) {
       await reconcileOrBlock(state, command, record, workspaceId, 'preexisting_marker_conversation_unconfirmed');
       return;
     }
+    const accepted = acceptanceMatches(
+      command,
+      placement,
+      record.baseline || {},
+      prepareResult.evidence || null,
+      existingConversation,
+      prepared.rememberedLaunch
+    );
+    if (!accepted) {
+      await reconcileOrBlock(state, command, record, workspaceId, 'preexisting_marker_execution_unconfirmed');
+      return;
+    }
     record.conversationUrl = existingConversation;
     record.phase = 'succeeded';
     await writeState(state);
-    await ack(state, command, 'succeeded', 'task marker already present', existingConversation);
+    await ack(state, command, 'succeeded', 'worker execution acceptance confirmed', existingConversation);
     sessionReconcileCommandIds.delete(command.id);
     clearBlockedCommand(state, command.id);
     await writeState(state);

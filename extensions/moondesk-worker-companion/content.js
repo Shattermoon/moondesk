@@ -126,10 +126,11 @@
     if (!launch?.taskMarker) return { state: 'failed', reason: 'invalid_reconcile_payload' };
     if (DOM.taskMarkerPresent(launch.taskMarker)) {
       return {
-        state: 'succeeded',
-        reason: 'task_marker_confirmed',
+        state: 'observed',
+        reason: 'task_marker_present_execution_unconfirmed',
         conversationUrl: location.href,
-        selection: await DOM.selectedModelAndEffort(launch.executionProfile)
+        selection: await DOM.selectedModelAndEffort(launch.executionProfile),
+        evidence: DOM.workerEvidence(launch.taskMarker)
       };
     }
     // Never click Send from reconciliation. If the first click may have crossed the
@@ -158,7 +159,7 @@
     }
     if (message.type === 'MOONDESK_PREPARE_WORKER') {
       void prepareWorker(message)
-        .then((result) => sendResponse({ ok: true, result }))
+        .then((result) => sendResponse({ ok: true, result, rememberedLaunch: rememberedLaunch() }))
         .catch((error) => sendResponse({ ok: false, error: String(error?.message || error) }));
       return true;
     }
@@ -179,7 +180,7 @@
     }
     if (message.type === 'MOONDESK_RECONCILE_WORKER') {
       void reconcileWorker(message)
-        .then((result) => sendResponse({ ok: true, result }))
+        .then((result) => sendResponse({ ok: true, result, rememberedLaunch: rememberedLaunch() }))
         .catch((error) => sendResponse({ ok: false, error: String(error?.message || error) }));
       return true;
     }

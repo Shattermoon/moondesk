@@ -663,6 +663,70 @@ test('existing-thread reuse accepts a confirmed thread owned by the same workspa
   assert.equal(createdTabs.length, 0);
 });
 
+test('worker acceptance requires assistant activity after the task marker is posted', () => {
+  const { evaluate } = loadBackground();
+  const acceptanceMatches = evaluate('acceptanceMatches');
+  const projectId = 'g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+  const conversationUrl = `https://chatgpt.com/g/${projectId}-moondesk/c/bbbbbbbb-cccc-4ddd-8eee-ffffffffffff`;
+  const command = {
+    id: 'acceptance-command',
+    launch: {
+      openMode: 'new_thread',
+      threadKey: 'worker:acceptance'
+    }
+  };
+  const placement = { projectId };
+  const baseline = {
+    generating: false,
+    userTurnCount: 0,
+    assistantTurnCount: 0
+  };
+  const rememberedLaunch = {
+    commandId: command.id,
+    threadKey: command.launch.threadKey
+  };
+
+  const postedOnly = {
+    conversationId: 'bbbbbbbb-cccc-4ddd-8eee-ffffffffffff',
+    markerPresent: true,
+    generating: false,
+    userTurnCount: 1,
+    assistantTurnCount: 0,
+    composerEmpty: true
+  };
+  assert.equal(
+    acceptanceMatches(command, placement, baseline, postedOnly, conversationUrl, rememberedLaunch),
+    false,
+    'a posted user turn alone must not count as a launched worker'
+  );
+
+  assert.equal(
+    acceptanceMatches(
+      command,
+      placement,
+      baseline,
+      { ...postedOnly, generating: true },
+      conversationUrl,
+      rememberedLaunch
+    ),
+    true,
+    'active assistant generation confirms execution started'
+  );
+
+  assert.equal(
+    acceptanceMatches(
+      command,
+      placement,
+      baseline,
+      { ...postedOnly, assistantTurnCount: 1 },
+      conversationUrl,
+      rememberedLaunch
+    ),
+    true,
+    'a completed new assistant turn confirms execution even if generation already ended'
+  );
+});
+
 test('worker launch transaction survives ChatGPT navigation and ACKs the confirmed conversation', async () => {
   const projectId = 'g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
   const commandId = '11111111-2222-4333-8444-555555555555';
@@ -836,6 +900,122 @@ test('worker launch transaction survives ChatGPT navigation and ACKs the confirm
     state.threadRecords['worker:transaction-test'].conversationUrl,
     conversationUrl
   );
+});
+
+test('reconciliation keeps a marker-only worker uncertain until assistant activity is observed', async () => {
+  const projectId = 'g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+  const commandId = '21111111-2222-4333-8444-555555555555';
+  const leaseId = '26666666-7777-4888-8999-aaaaaaaaaaaa';
+  const conversationUrl = `https://chatgpt.com/g/${projectId}-moondesk/c/cbbbbbbb-cccc-4ddd-8eee-ffffffffffff`;
+  const threadKey = 'worker:reconcile-marker-only';
+  const rememberedLaunch = { commandId, threadKey };
+  const ackPayloads = [];
+  const command = {
+    id: commandId,
+    state: 'send_started',
+    lease: { leaseId, clientId: 'browser-current' },
+    anchorContext: {
+      conversationId: 'anchor-conversation',
+      conversationUrl: `https://chatgpt.com/g/${projectId}-moondesk/c/anchor-conversation`,
+      projectId,
+      projectUrl: `https://chatgpt.com/g/${projectId}-moondesk/project`
+    },
+    launch: {
+      workspaceId: 'workspace-a',
+      purpose: 'worker',
+      taskMarker: 'moondesk-worker-task:reconcile-marker-only',
+      threadKey,
+      openMode: 'new_thread',
+      openingMessage: 'marker-only reconciliation test'
+    }
+  };
+  const fetchImpl = async (url, options = {}) => {
+    const parsed = new URL(url);
+    const body = options.body ? JSON.parse(options.body) : {};
+    if (parsed.pathname === '/__moondesk/companion/v1/commands/ack') {
+      ackPayloads.push(body);
+      return {
+        ok: true,
+        status: 200,
+        async text() { return JSON.stringify({ command: { ...command, state: body.outcome } }); }
+      };
+    }
+    throw new Error(`unexpected request: ${parsed.pathname}`);
+  };
+  const sendMessageImpl = async (_tabId, message) => {
+    if (message.type === 'MOONDESK_CONTEXT') {
+      return {
+        ok: true,
+        context: {
+          projectId,
+          projectUrl: command.anchorContext.projectUrl,
+          conversationId: 'cbbbbbbb-cccc-4ddd-8eee-ffffffffffff',
+          sourceUrl: conversationUrl,
+          generating: false
+        },
+        rememberedLaunch
+      };
+    }
+    if (message.type === 'MOONDESK_RECONCILE_WORKER') {
+      return {
+        ok: true,
+        rememberedLaunch,
+        result: {
+          state: 'observed',
+          reason: 'task_marker_present_execution_unconfirmed',
+          conversationUrl,
+          evidence: {
+            conversationId: 'cbbbbbbb-cccc-4ddd-8eee-ffffffffffff',
+            projectId,
+            markerPresent: true,
+            generating: false,
+            userTurnCount: 1,
+            assistantTurnCount: 0,
+            composerEmpty: true
+          }
+        }
+      };
+    }
+    throw new Error(`unexpected tab message: ${message.type}`);
+  };
+  const { evaluate } = loadBackground({
+    existingTabs: { 77: { id: 77, url: conversationUrl } },
+    fetchImpl,
+    sendMessageImpl
+  });
+  const processCommand = evaluate('processCommand');
+  const state = {
+    baseUrl: 'http://127.0.0.1:47650',
+    credential: 'a'.repeat(64),
+    launchRecords: {
+      [commandId]: {
+        commandId,
+        launchToken: 'launch-token',
+        threadKey,
+        openMode: 'new_thread',
+        sourceUrl: conversationUrl,
+        conversationUrl,
+        tabId: 77,
+        phase: 'send_started',
+        reconcileAttempts: 0,
+        baseline: {
+          generating: false,
+          userTurnCount: 0,
+          assistantTurnCount: 0
+        }
+      }
+    },
+    threadRecords: {},
+    blockedCommands: {},
+    bindings: {}
+  };
+
+  await processCommand(state, { command, reconcileRequired: true });
+
+  assert.equal(ackPayloads.length, 1);
+  assert.equal(ackPayloads[0].outcome, 'needs_reconcile');
+  assert.equal(state.launchRecords[commandId].phase, 'uncertain');
+  assert.equal(state.threadRecords[threadKey], undefined);
 });
 
 test('transient Project readiness retries preparation on the same tab before Send', async () => {

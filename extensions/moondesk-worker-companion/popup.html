@@ -1,0 +1,57 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>MoonDesk Worker Companion</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <main>
+    <h1>MoonDesk Workers</h1>
+    <p id="status" class="status">Checking…</p>
+    <div id="bridgeStatus" class="muted">Searching for local MoonDesk…</div>
+
+    <details id="manualRepair">
+      <summary>Manual repair</summary>
+      <section id="pairing">
+        <label>Manual repair code
+          <input id="pairingToken" type="password" autocomplete="off" spellcheck="false" />
+        </label>
+        <button id="pair">Repair companion pairing</button>
+      </section>
+    </details>
+
+    <section id="routing" hidden>
+      <div id="browserStatus" class="muted"></div>
+      <details id="browserManager" hidden>
+        <summary>Manage paired browsers</summary>
+        <div id="browserList"></div>
+      </details>
+      <div id="chatContext" class="muted">Open a ChatGPT conversation to expose it to MoonDesk Workers.</div>
+      <div class="muted">Worker destination is automatic: Project chats stay in the exact same Project ID; normal chats create normal worker conversations.</div>
+    </section>
+
+    <section id="profile" hidden>
+      <div id="currentProfile" class="muted">Worker profile unavailable.</div>
+      <button id="discoverModels">Discover available ChatGPT models</button>
+      <div id="catalogStatus" class="muted"></div>
+      <label id="modelLabel" hidden>Worker model
+        <select id="model"></select>
+      </label>
+      <label id="effortLabel" hidden>Reasoning effort
+        <select id="effort"></select>
+      </label>
+      <button id="saveProfile" hidden>Save worker profile</button>
+    </section>
+
+    <section id="blocked" hidden>
+      <p id="blockedText"></p>
+      <button id="retry">Retry reconciliation</button>
+    </section>
+
+    <p id="error" class="error"></p>
+  </main>
+  <script src="popup.js"></script>
+</body>
+</html>

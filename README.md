@@ -118,6 +118,33 @@ MoonDesk is a coding tool and a custom connector. Always use MoonDesk if the use
 
 Select the connector and start working.
 
+## Experimental ChatGPT workers
+
+> [!WARNING]
+> Workers are experimental and currently require the unpacked MoonDesk Worker Companion extension. The companion drives ChatGPT's web UI, so MoonDesk fails closed when it cannot positively confirm the requested model, reasoning effort, exact placement, or previous Send state.
+
+Workers let one ChatGPT conversation act as the **Anchor** and delegate independent tasks to durable worker conversations in the same MoonDesk workspace. The configurable target is **1-8 workers**, defaults to **4**, and has a hard maximum of **8 active workers per Anchor family**. **1-4 workers is the recommended operating range.** Using **5-8 workers** is supported but can trigger ChatGPT/provider rate limits, especially when the account already has other conversations generating at the same time, so higher counts are best treated as an advanced/high-load mode. MoonDesk launches up to four fresh worker conversations concurrently so the recommended group does not serialize behind one slow launch. Worker identity is bound to the route-resolved workspace plus ChatGPT's exact session metadata; a different conversation in the same workspace does not inherit Anchor or worker authority. ChatGPT Project names, connector names, MoonDesk workspace names, and folder names are display-only and are never used as routing or authorization keys.
+
+### Install the companion
+
+1. Open `chrome://extensions` (or `edge://extensions`), enable **Developer mode**, and choose **Load unpacked**.
+2. Select `extensions/moondesk-worker-companion`.
+3. Start MoonDesk. The extension discovers MoonDesk's dedicated loopback-only companion bridge and pairs automatically; there is no per-chat token step. Multiple browser installations may remain paired independently.
+4. Open the ChatGPT conversation you want to use as the Anchor. No Project/workspace binding step is required.
+5. Click **Discover available ChatGPT models**, choose a confirmed model and reasoning effort, and save the worker profile.
+
+Worker placement is automatic. A Project Anchor routes a fresh worker into the exact same `g-p-...` Project ID; a normal Anchor creates a normal ChatGPT worker conversation. Fresh workers are routed to the paired browser that positively observes the exact Anchor. After the worker conversation is confirmed, reuse remains attached to that durable thread/browser affinity.
+
+The last confirmed model catalog is stored in extension-local storage, so reopening the popup does not require rediscovery. MoonDesk still re-verifies the actual model and effort in ChatGPT before sending every worker assignment. If MoonDesk has been upgraded but an existing ChatGPT conversation does not expose the `workers` tool, refresh/reconnect the Custom Connector and start a fresh conversation because ChatGPT may retain an older connector schema.
+
+### Worker lifecycle
+
+The MCP `workers` tool supports Anchor operations such as spawn, status, send, collect, reuse, and retire, plus worker-side claim, inbox, report, start, and finish operations. A newly opened worker must claim its one-time capability before MoonDesk binds that ChatGPT session to the durable worker record.
+
+Workers survive MoonDesk/browser tab restarts as durable records. Completing a task leaves the worker idle so a later task can reopen the same confirmed ChatGPT conversation. Retiring an idle worker frees its display slot; MoonDesk refuses retirement once a browser launch may have crossed the Send boundary.
+
+Browser commands use durable leases and acknowledgements. If MoonDesk cannot tell whether ChatGPT accepted a Send, the command moves to reconciliation and **never blindly sends the assignment again**. Proven pre-Send failures can be retried; ambiguous post-Send failures require reconciliation or manual inspection.
+
 ## Browser control
 
 MoonDesk owns one lazy managed Chromium process instead of attaching to your personal browser profile or launching a separate browser for every project. On first browser use it provisions a pinned Chrome for Testing build for the current platform, verifies the exact archive size and SHA-256, records a verified inventory of the installed browser files including Unix permission bits where applicable, installs it atomically into MoonDesk's browser cache, and controls it directly from Rust over the Chrome DevTools Protocol (CDP)—no Playwright, `chrome-devtools-mcp`, or separate browser-control service is required. Later starts revalidate that inventory so a missing or damaged support file triggers reprovisioning instead of a persistent broken-browser loop. Inside that shared Chromium, each registered workspace gets its own isolated BrowserContext for cookies and site storage, while each ChatGPT conversation gets its own MoonDesk-routed logical tab set. Different workspaces therefore do not share cookies, localStorage, IndexedDB, or service-worker state, and separate conversations cannot accidentally act on each other's selected tabs.
@@ -171,6 +198,8 @@ Use read-only mode when mutation is unnecessary, and use a VM or container for u
 <summary><strong>Tools</strong></summary>
 
 **Guidance / handoffs:** `moondesk_instruction`, `create_handoff`, `resume_handoff`, `complete_handoff`
+
+**Experimental workers:** `workers`
 
 **Files:** `read`, `view_image`, `view_images`, `search`, `write`, `edit`, `delete`
 

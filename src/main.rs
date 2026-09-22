@@ -5,7 +5,9 @@ mod browser_runtime;
 mod clippymoon_gen;
 mod command;
 mod command_jobs;
+mod companion;
 mod handoff;
+mod managed_chat;
 
 mod macos_terminal;
 mod mascot;
@@ -18,10 +20,12 @@ mod terminal_compat;
 mod theme;
 mod update;
 mod vision;
+mod workers;
 mod workspace_tools;
 mod workspaces;
 
 use browser_runtime::{BrowserPresentationChange, BrowserRuntime, DEFAULT_BROWSER_COMMAND_TIMEOUT};
+use command_jobs::CommandJobManager;
 use crossterm::{
     ExecutableCommand,
     event::{
@@ -30,6 +34,7 @@ use crossterm::{
     },
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
+use managed_chat::types::ChatExecutionProfile;
 use mascot::{TUI_MASCOT_BLOCK_HEIGHT, TUI_MASCOT_BLOCK_WIDTH, render_tui_lines};
 use ratatui::{
     prelude::*,
@@ -2237,12 +2242,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Cleanup after the TUI is gone so quit never appears frozen on screen.
     // Stop accepting new MCP work first, then terminate owned command trees and
     // shared host services before finally clearing local runtime status.
-    let (server_handle, command_jobs) = {
+    let (server_handle, companion_server_handle, command_jobs) = {
         let mut app = state.lock().await;
         app.server_running = false;
-        (app.server_handle.take(), app.command_jobs.clone())
+        app.companion_bridge_port = None;
+        (
+            app.server_handle.take(),
+            app.companion_server_handle.take(),
+            app.command_jobs.clone(),
+        )
     };
     if let Some(handle) = server_handle {
+        handle.abort();
+        let _ = handle.await;
+    }
+    if let Some(handle) = companion_server_handle {
         handle.abort();
         let _ = handle.await;
     }
@@ -4140,29 +4154,42 @@ async fn run_settings(
         let app = state.lock().await;
         themes.iter().position(|t| t.id == app.theme).unwrap_or(0)
     };
-    let total_rows = themes.len() + tool_modes.len() + browser_presentations.len() + 3;
+    let total_rows = themes.len() + tool_modes.len() + browser_presentations.len() + 6;
 
     loop {
         let (
             current_theme,
             current_tool_mode,
             current_browser_presentation,
+            worker_execution_profile,
+            worker_target_count,
             usage_totals,
             set_moondesk_as_co_author,
             ngrok_authtoken_configured,
             ngrok_domain,
+            companion_auth,
+            companion_pairing_code,
+            companion_local_url,
         ) = {
             let app = state.lock().await;
             (
                 app.current_theme(),
                 app.tool_mode,
                 app.browser_presentation,
+                app.worker_execution_profile.clone(),
+                app.worker_target_count,
                 app.all_time_usage_totals(),
                 app.set_moondesk_as_co_author,
                 app.ngrok_authtoken().is_some(),
                 app.ngrok_domain.clone(),
+                app.companion_auth.clone(),
+                app.companion_auth.pairing_token(),
+                app.companion_bridge_port
+                    .map(|port| format!("http://127.0.0.1:{port}"))
+                    .unwrap_or_else(|| "unavailable".into()),
             )
         };
+        let companion_client_id = companion_auth.paired_client_id().await;
         terminal.draw(|f| {
             draw_settings(
                 f,
@@ -4170,6 +4197,11 @@ async fn run_settings(
                     current_theme,
                     current_tool_mode,
                     current_browser_presentation,
+                    worker_execution_profile: &worker_execution_profile,
+                    worker_target_count,
+                    companion_pairing_code: &companion_pairing_code,
+                    companion_client_id: companion_client_id.as_deref(),
+                    companion_local_url: &companion_local_url,
                     set_moondesk_as_co_author,
                     ngrok_authtoken_configured,
                     ngrok_domain: ngrok_domain.as_deref(),
@@ -4241,6 +4273,50 @@ async fn run_settings(
                                 app.mark_config_dirty();
                             }
                         } else if selected_row == settings_action_start {
+                            let current_model = app.worker_execution_profile.model_label.clone();
+                            drop(app);
+                            if let Some(model) = run_prompt(
+                                terminal,
+                                current_theme.palette,
+                                "Worker ChatGPT model (must exactly match an available model):",
+                                &current_model,
+                            )
+                            .await?
+                            {
+                                let model = model.trim();
+                                if model.is_empty() || model.len() > 128 {
+                                    state.lock().await.log(
+                                        "WARN",
+                                        "Worker model must contain 1..=128 characters".into(),
+                                    );
+                                    continue;
+                                }
+                                let mut app = state.lock().await;
+                                app.worker_execution_profile.model_key = model.to_string();
+                                app.worker_execution_profile.model_label = model.to_string();
+                                app.log("INFO", format!("Worker model: {model}"));
+                                app.mark_config_dirty();
+                            }
+                        } else if selected_row == settings_action_start + 1 {
+                            app.worker_execution_profile.reasoning_effort =
+                                app.worker_execution_profile.reasoning_effort.next();
+                            let effort = app.worker_execution_profile.reasoning_effort;
+                            app.log(
+                                "INFO",
+                                format!("Worker reasoning effort: {}", effort.label()),
+                            );
+                            app.mark_config_dirty();
+                        } else if selected_row == settings_action_start + 2 {
+                            app.worker_target_count =
+                                if app.worker_target_count >= workers::MAX_WORKERS_PER_FAMILY {
+                                    1
+                                } else {
+                                    app.worker_target_count + 1
+                                };
+                            let count = app.worker_target_count;
+                            app.log("INFO", format!("Worker target count: {count}"));
+                            app.mark_config_dirty();
+                        } else if selected_row == settings_action_start + 3 {
                             app.set_moondesk_as_co_author = !app.set_moondesk_as_co_author;
                             let enabled = app.set_moondesk_as_co_author;
                             app.log(
@@ -4251,11 +4327,11 @@ async fn run_settings(
                                 ),
                             );
                             app.mark_config_dirty();
-                        } else if selected_row == settings_action_start + 1 {
+                        } else if selected_row == settings_action_start + 4 {
                             drop(app);
                             let _ =
                                 run_ngrok_auth_setup(terminal, state.clone(), None, true).await?;
-                        } else if selected_row == settings_action_start + 2 {
+                        } else if selected_row == settings_action_start + 5 {
                             let previous_domain = app.ngrok_domain.clone();
                             let current_domain = previous_domain.clone().unwrap_or_default();
                             drop(app);
@@ -4336,6 +4412,11 @@ struct SettingsView<'a> {
     current_theme: &'a theme::ThemeDef,
     current_tool_mode: ToolMode,
     current_browser_presentation: BrowserPresentation,
+    worker_execution_profile: &'a ChatExecutionProfile,
+    worker_target_count: usize,
+    companion_pairing_code: &'a str,
+    companion_client_id: Option<&'a str>,
+    companion_local_url: &'a str,
     set_moondesk_as_co_author: bool,
     ngrok_authtoken_configured: bool,
     ngrok_domain: Option<&'a str>,
@@ -4350,6 +4431,11 @@ fn draw_settings(f: &mut Frame, view: SettingsView<'_>) {
         current_theme,
         current_tool_mode,
         current_browser_presentation,
+        worker_execution_profile,
+        worker_target_count,
+        companion_pairing_code,
+        companion_client_id,
+        companion_local_url,
         set_moondesk_as_co_author,
         ngrok_authtoken_configured,
         ngrok_domain,
@@ -4512,7 +4598,106 @@ fn draw_settings(f: &mut Frame, view: SettingsView<'_>) {
         )]));
     }
 
-    let co_author_row = themes.len() + tool_modes.len() + browser_presentations.len();
+    let worker_model_row = themes.len() + tool_modes.len() + browser_presentations.len();
+    let worker_effort_row = worker_model_row + 1;
+    let worker_count_row = worker_effort_row + 1;
+    let worker_model_selected = worker_model_row == selected_row;
+    let worker_effort_selected = worker_effort_row == selected_row;
+    let worker_count_selected = worker_count_row == selected_row;
+    let worker_model_style = if worker_model_selected {
+        Style::default()
+            .fg(palette.key_fg)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(palette.primary_fg)
+    };
+    let worker_effort_style = if worker_effort_selected {
+        Style::default()
+            .fg(palette.key_fg)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(palette.primary_fg)
+    };
+    let worker_count_style = if worker_count_selected {
+        Style::default()
+            .fg(palette.key_fg)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(palette.primary_fg)
+    };
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  Workers (experimental)",
+        Style::default()
+            .fg(palette.title_fg)
+            .add_modifier(Modifier::BOLD),
+    )));
+    if worker_model_selected {
+        selected_line_idx = lines.len();
+    }
+    lines.push(Line::from(Span::styled(
+        format!(
+            " {} [{}] Default model: {}",
+            if worker_model_selected { ">" } else { " " },
+            worker_model_row + 1,
+            worker_execution_profile.model_label
+        ),
+        worker_model_style,
+    )));
+    if worker_effort_selected {
+        selected_line_idx = lines.len();
+    }
+    lines.push(Line::from(Span::styled(
+        format!(
+            " {} [{}] Reasoning effort: {}",
+            if worker_effort_selected { ">" } else { " " },
+            worker_effort_row + 1,
+            worker_execution_profile.reasoning_effort.label()
+        ),
+        worker_effort_style,
+    )));
+    if worker_count_selected {
+        selected_line_idx = lines.len();
+    }
+    lines.push(Line::from(Span::styled(
+        format!(
+            " {} [{}] Worker count: {} (recommended 1-{}, max {})",
+            if worker_count_selected { ">" } else { " " },
+            worker_count_row + 1,
+            worker_target_count,
+            workers::RECOMMENDED_WORKERS_PER_FAMILY,
+            workers::MAX_WORKERS_PER_FAMILY
+        ),
+        worker_count_style,
+    )));
+    lines.push(Line::from(Span::styled(
+        "     5-8 workers can hit ChatGPT/provider rate limits, especially with other active chats.",
+        Style::default().fg(palette.muted_fg),
+    )));
+    lines.push(Line::from(Span::styled(
+        format!(
+            "     Companion: {} · {}",
+            companion_client_id
+                .map(|_| "paired")
+                .unwrap_or("not paired"),
+            companion_local_url
+        ),
+        Style::default().fg(if companion_client_id.is_some() {
+            palette.success_fg
+        } else {
+            palette.muted_fg
+        }),
+    )));
+    lines.push(Line::from(Span::styled(
+        format!("     Manual repair code: {companion_pairing_code}"),
+        Style::default().fg(palette.muted_fg),
+    )));
+    lines.push(Line::from(Span::styled(
+        "     The companion verifies model + effort before it sends a worker assignment.",
+        Style::default().fg(palette.muted_fg),
+    )));
+
+    let co_author_row = worker_count_row + 1;
     let co_author_selected = co_author_row == selected_row;
     let co_author_marker = if co_author_selected { ">" } else { " " };
     let co_author_name_style = if co_author_selected {
@@ -4847,9 +5032,10 @@ async fn wait_for_local_server_ready(port: u16) -> bool {
 }
 
 async fn handle_mcp_server_exit(state: SharedState, result: Result<(), std::io::Error>) {
-    {
+    let companion_handle = {
         let mut app = state.lock().await;
         app.server_running = false;
+        app.companion_bridge_port = None;
         match result {
             Ok(()) => app.log("WARN", "MCP server exited".into()),
             Err(error) => app.log("ERROR", format!("MCP server failed: {error}")),
@@ -4860,8 +5046,64 @@ async fn handle_mcp_server_exit(state: SharedState, result: Result<(), std::io::
                 "Stopping ngrok because the local MCP server is unavailable".into(),
             );
         }
+        app.companion_server_handle.take()
+    };
+    if let Some(handle) = companion_handle {
+        handle.abort();
+        let _ = handle.await;
     }
     ngrok::stop(state).await;
+}
+
+async fn start_companion_bridge(
+    state: SharedState,
+    browser_runtime: Option<Arc<BrowserRuntime>>,
+    command_jobs: CommandJobManager,
+    ui_events: UiEventSender,
+    host_control_token: Arc<str>,
+) -> Result<u16, String> {
+    let mut last_error = None;
+    for port in server::COMPANION_BRIDGE_PORTS {
+        match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
+            Ok(listener) => {
+                let router = server::companion_bridge_router(
+                    state.clone(),
+                    browser_runtime,
+                    command_jobs,
+                    ui_events,
+                    host_control_token,
+                );
+                let bridge_state = state.clone();
+                let handle = tokio::spawn(async move {
+                    let result = axum::serve(listener, router).await;
+                    let mut app = bridge_state.lock().await;
+                    app.companion_bridge_port = None;
+                    match result {
+                        Ok(()) => app.log("WARN", "Worker companion bridge exited".into()),
+                        Err(error) => {
+                            app.log("ERROR", format!("Worker companion bridge failed: {error}"))
+                        }
+                    }
+                });
+                let mut app = state.lock().await;
+                app.companion_bridge_port = Some(port);
+                app.companion_server_handle = Some(handle);
+                app.log(
+                    "INFO",
+                    format!("Worker companion bridge started on 127.0.0.1:{port}"),
+                );
+                return Ok(port);
+            }
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(format!(
+        "could not bind any worker companion bridge port ({:?}): {}",
+        server::COMPANION_BRIDGE_PORTS,
+        last_error
+            .map(|error| error.to_string())
+            .unwrap_or_else(|| "no port candidates".into())
+    ))
 }
 
 async fn start_services(
@@ -4911,9 +5153,9 @@ async fn start_services(
     let router = server::router(
         state.clone(),
         browser_runtime.clone(),
-        command_jobs,
-        ui_events,
-        host_control_token,
+        command_jobs.clone(),
+        ui_events.clone(),
+        host_control_token.clone(),
     );
     let server_state = state.clone();
     let handle = tokio::spawn(async move {
@@ -4947,6 +5189,21 @@ async fn start_services(
         "INFO",
         format!("Local MCP health check passed on 127.0.0.1:{port}"),
     );
+
+    if let Err(error) = start_companion_bridge(
+        state.clone(),
+        browser_runtime.clone(),
+        command_jobs,
+        ui_events,
+        host_control_token,
+    )
+    .await
+    {
+        state.lock().await.log(
+            "WARN",
+            format!("Worker companion bridge unavailable: {error}"),
+        );
+    }
 
     // Start ngrok only after the local HTTP server has answered its health probe.
     let ngrok_start_error = match ngrok::start(state.clone()).await {
@@ -8380,6 +8637,9 @@ mod tests {
         let tunnel_task = tokio::spawn(async {
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
         });
+        let companion_task = tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        });
         {
             let mut app = state.lock().await;
             app.server_running = true;
@@ -8387,6 +8647,8 @@ mod tests {
             app.ngrok_url = Some("https://test.ngrok.app".into());
             app.remote_connected = true;
             app.ngrok_task = Some(tunnel_task);
+            app.companion_bridge_port = Some(crate::server::COMPANION_BRIDGE_PORTS[0]);
+            app.companion_server_handle = Some(companion_task);
         }
 
         handle_mcp_server_exit(state.clone(), Ok(())).await;
@@ -8398,6 +8660,8 @@ mod tests {
             assert!(app.ngrok_url.is_none());
             assert!(!app.remote_connected);
             assert!(app.ngrok_task.is_none());
+            assert!(app.companion_bridge_port.is_none());
+            assert!(app.companion_server_handle.is_none());
             assert!(app.logs.iter().any(|entry| {
                 entry
                     .message
@@ -10233,6 +10497,11 @@ mod tests {
                             current_theme: theme,
                             current_tool_mode: tool_mode,
                             current_browser_presentation: super::BrowserPresentation::Headless,
+                            worker_execution_profile: &super::ChatExecutionProfile::default(),
+                            worker_target_count: crate::workers::RECOMMENDED_WORKERS_PER_FAMILY,
+                            companion_pairing_code: "test-pairing-code",
+                            companion_client_id: None,
+                            companion_local_url: "http://127.0.0.1:3200",
                             set_moondesk_as_co_author: false,
                             ngrok_authtoken_configured: false,
                             ngrok_domain: None,
@@ -10264,6 +10533,11 @@ mod tests {
                         current_theme: theme,
                         current_tool_mode: tool_mode,
                         current_browser_presentation: super::BrowserPresentation::Visible,
+                        worker_execution_profile: &super::ChatExecutionProfile::default(),
+                        worker_target_count: crate::workers::RECOMMENDED_WORKERS_PER_FAMILY,
+                        companion_pairing_code: "test-pairing-code",
+                        companion_client_id: None,
+                        companion_local_url: "http://127.0.0.1:3200",
                         set_moondesk_as_co_author: false,
                         ngrok_authtoken_configured: false,
                         ngrok_domain: None,
@@ -10292,6 +10566,66 @@ mod tests {
     }
 
     #[test]
+    fn settings_renders_worker_profile_and_companion_status() {
+        let usage = super::UsageTotals::default();
+        let theme = super::theme::resolve(super::theme::DEFAULT_THEME_ID);
+        let tool_mode = super::ToolMode::all()[0];
+        let worker_row = super::theme::all().len()
+            + super::ToolMode::all().len()
+            + super::BrowserPresentation::all().len();
+        let profile = super::ChatExecutionProfile {
+            model_key: "gpt-5-6-thinking".into(),
+            model_label: "GPT-5.6 Sol".into(),
+            reasoning_effort: super::managed_chat::types::ReasoningEffort::High,
+        };
+        let backend = TestBackend::new(110, 36);
+        let mut terminal = Terminal::new(backend).expect("create worker settings terminal");
+
+        terminal
+            .draw(|frame| {
+                super::draw_settings(
+                    frame,
+                    super::SettingsView {
+                        current_theme: theme,
+                        current_tool_mode: tool_mode,
+                        current_browser_presentation: super::BrowserPresentation::Headless,
+                        worker_execution_profile: &profile,
+                        worker_target_count: crate::workers::RECOMMENDED_WORKERS_PER_FAMILY,
+                        companion_pairing_code: "test-pairing-code",
+                        companion_client_id: Some("extension-install-a"),
+                        companion_local_url: "http://127.0.0.1:3200",
+                        set_moondesk_as_co_author: false,
+                        ngrok_authtoken_configured: false,
+                        ngrok_domain: None,
+                        config_path: r"C:\Users\tester\.moondesk\config.toml",
+                        usage_totals: &usage,
+                        selected_row: worker_row,
+                        confirm_reset_token_billing: false,
+                    },
+                )
+            })
+            .expect("render worker settings");
+
+        let buffer = terminal.backend().buffer();
+        let mut rendered = String::new();
+        for row in 0..buffer.area.height {
+            for column in 0..buffer.area.width {
+                rendered.push_str(buffer[(column, row)].symbol());
+            }
+            rendered.push('\n');
+        }
+
+        assert!(rendered.contains("Workers (experimental)"));
+        assert!(rendered.contains("Default model: GPT-5.6 Sol"));
+        assert!(rendered.contains("Reasoning effort: High"));
+        assert!(rendered.contains("Worker count: 4 (recommended 1-4, max 8)"));
+        assert!(rendered.contains("5-8 workers can hit ChatGPT/provider rate limits"));
+        assert!(rendered.contains("Companion: paired"));
+        assert!(rendered.contains("http://127.0.0.1:3200"));
+        assert!(rendered.contains("Manual repair code: test-pairing-code"));
+    }
+
+    #[test]
     fn settings_exposes_masked_ngrok_authtoken_action() {
         let usage = super::UsageTotals::default();
         let theme = super::theme::resolve(super::theme::DEFAULT_THEME_ID);
@@ -10299,7 +10633,7 @@ mod tests {
         let auth_token_row = super::theme::all().len()
             + super::ToolMode::all().len()
             + super::BrowserPresentation::all().len()
-            + 1;
+            + 3;
         let backend = TestBackend::new(100, 32);
         let mut terminal = Terminal::new(backend).expect("create ngrok auth settings terminal");
 
@@ -10311,6 +10645,11 @@ mod tests {
                         current_theme: theme,
                         current_tool_mode: tool_mode,
                         current_browser_presentation: super::BrowserPresentation::Headless,
+                        worker_execution_profile: &super::ChatExecutionProfile::default(),
+                        worker_target_count: crate::workers::RECOMMENDED_WORKERS_PER_FAMILY,
+                        companion_pairing_code: "test-pairing-code",
+                        companion_client_id: None,
+                        companion_local_url: "http://127.0.0.1:3200",
                         set_moondesk_as_co_author: false,
                         ngrok_authtoken_configured: true,
                         ngrok_domain: Some("example.ngrok-free.app"),
@@ -10385,6 +10724,11 @@ mod tests {
                         current_theme: theme,
                         current_tool_mode: tool_mode,
                         current_browser_presentation: super::BrowserPresentation::Headless,
+                        worker_execution_profile: &super::ChatExecutionProfile::default(),
+                        worker_target_count: crate::workers::RECOMMENDED_WORKERS_PER_FAMILY,
+                        companion_pairing_code: "test-pairing-code",
+                        companion_client_id: None,
+                        companion_local_url: "http://127.0.0.1:3200",
                         set_moondesk_as_co_author: false,
                         ngrok_authtoken_configured: false,
                         ngrok_domain: None,

@@ -12,8 +12,11 @@ use tokio::sync::{
 use uuid::Uuid;
 
 use crate::command_jobs::CommandJobManager;
+use crate::companion::CompanionAuth;
+use crate::managed_chat::{self, broker::ManagedChatBroker, types::ChatExecutionProfile};
 use crate::mascot::{self, MascotPack};
 use crate::theme;
+use crate::workers::{self, broker::WorkerBroker};
 use crate::workspaces::{self, WorkspaceConfig, WorkspaceId, WorkspaceRuntime};
 
 /// Log entry displayed in the TUI.
@@ -160,6 +163,10 @@ pub enum AgentsPathMode {
     Disabled,
 }
 
+fn default_worker_target_count() -> usize {
+    workers::RECOMMENDED_WORKERS_PER_FAMILY
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppConfig {
@@ -181,6 +188,10 @@ pub struct AppConfig {
     #[serde(default)]
     pub browser_presentation: BrowserPresentation,
     #[serde(default)]
+    pub worker_execution_profile: ChatExecutionProfile,
+    #[serde(default = "default_worker_target_count")]
+    pub worker_target_count: usize,
+    #[serde(default)]
     pub usage_by_model: BTreeMap<String, UsageTotals>,
 }
 
@@ -198,6 +209,8 @@ impl Default for AppConfig {
             mode: Mode::Both,
             tool_mode: ToolMode::MultiTools,
             browser_presentation: BrowserPresentation::Headless,
+            worker_execution_profile: ChatExecutionProfile::default(),
+            worker_target_count: default_worker_target_count(),
             usage_by_model: BTreeMap::new(),
         }
     }
@@ -224,6 +237,15 @@ impl AppConfig {
     }
 
     fn validate_versioned(&self) -> std::io::Result<()> {
+        self.worker_execution_profile
+            .validate()
+            .map_err(std::io::Error::other)?;
+        if !(1..=workers::MAX_WORKERS_PER_FAMILY).contains(&self.worker_target_count) {
+            return Err(std::io::Error::other(format!(
+                "worker target count must be between 1 and {}",
+                workers::MAX_WORKERS_PER_FAMILY
+            )));
+        }
         match self.config_version {
             0 => {
                 if !self.workspaces.is_empty() {
@@ -985,8 +1007,15 @@ pub struct AppState {
     pub usage_by_model: BTreeMap<String, UsageTotals>,
     pub session_usage_totals: UsageTotals,
     pub command_jobs: CommandJobManager,
+    pub worker_execution_profile: ChatExecutionProfile,
+    pub worker_target_count: usize,
+    pub worker_broker: Arc<WorkerBroker>,
+    pub managed_chat_broker: Arc<ManagedChatBroker>,
+    pub companion_auth: Arc<CompanionAuth>,
+    pub companion_bridge_port: Option<u16>,
     config_path: PathBuf,
     pub server_handle: Option<tokio::task::JoinHandle<()>>,
+    pub companion_server_handle: Option<tokio::task::JoinHandle<()>>,
     pub ngrok_task: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -1565,6 +1594,14 @@ impl AppState {
             .iter()
             .map(|workspace| (workspace.id.clone(), Arc::new(WorkspaceRuntime::default())))
             .collect::<HashMap<_, _>>();
+        let worker_store_path = workers::store_path_for_config(&config_path)?;
+        let worker_broker =
+            Arc::new(WorkerBroker::open(worker_store_path).map_err(std::io::Error::other)?);
+        let managed_chat_store_path = managed_chat::store_path_for_config(&config_path)?;
+        let managed_chat_broker = Arc::new(
+            ManagedChatBroker::open(managed_chat_store_path).map_err(std::io::Error::other)?,
+        );
+        let companion_auth = Arc::new(CompanionAuth::open_for_config(&config_path)?);
 
         let mut app = Self {
             theme: config.theme,
@@ -1601,8 +1638,15 @@ impl AppState {
             usage_by_model: config.usage_by_model,
             session_usage_totals: UsageTotals::default(),
             command_jobs: CommandJobManager::new(),
+            worker_execution_profile: config.worker_execution_profile,
+            worker_target_count: config.worker_target_count,
+            worker_broker,
+            managed_chat_broker,
+            companion_auth,
+            companion_bridge_port: None,
             config_path,
             server_handle: None,
+            companion_server_handle: None,
             ngrok_task: None,
         };
         app.log("INFO", format!("ClippyMoon seed: {mascot_seed:016x}"));
@@ -1815,6 +1859,8 @@ impl AppState {
             mode: self.mode,
             tool_mode: self.tool_mode,
             browser_presentation: self.browser_presentation,
+            worker_execution_profile: self.worker_execution_profile.clone(),
+            worker_target_count: self.worker_target_count,
             usage_by_model: self.usage_by_model.clone(),
         }
         .normalized()
@@ -2319,7 +2365,7 @@ pub async fn remove_workspace(
 ) -> Result<(), String> {
     let mutation_lock = { state.lock().await.workspace_mutation_lock.clone() };
     let _mutation_guard = mutation_lock.lock().await;
-    let (runtime, command_jobs, proposed) = {
+    let (runtime, command_jobs, worker_broker, managed_chat_broker, proposed) = {
         let app = state.lock().await;
         if app.workspaces.len() <= 1 {
             return Err("cannot remove the final workspace".to_string());
@@ -2342,7 +2388,13 @@ pub async fn remove_workspace(
             .filter(|workspace| &workspace.id != workspace_id)
             .cloned()
             .collect::<Vec<_>>();
-        (runtime, app.command_jobs.clone(), proposed)
+        (
+            runtime,
+            app.command_jobs.clone(),
+            app.worker_broker.clone(),
+            app.managed_chat_broker.clone(),
+            proposed,
+        )
     };
     let proposed = validate_workspace_registry_off_thread(proposed).await?;
     let (config, path) = {
@@ -2384,6 +2436,11 @@ pub async fn remove_workspace(
     // creating an orphaned background job.
     let cleanup_error = command_jobs
         .finalize_workspace_removal(workspace_id)
+        .await
+        .err();
+    let worker_cleanup_error = worker_broker.purge_workspace(workspace_id).await.err();
+    let managed_chat_cleanup_error = managed_chat_broker
+        .purge_workspace(workspace_id)
         .await
         .err();
 
@@ -2429,6 +2486,51 @@ pub async fn remove_workspace(
                 "WARN",
                 format!(
                     "Workspace was removed, but command cleanup is still incomplete after {WORKSPACE_CLEANUP_RETRY_ATTEMPTS} retries: {last_error}"
+                ),
+            );
+        });
+    }
+
+    if worker_cleanup_error.is_some() || managed_chat_cleanup_error.is_some() {
+        let retry_state = state.clone();
+        let retry_worker_broker = worker_broker.clone();
+        let retry_managed_chat_broker = managed_chat_broker.clone();
+        let retry_workspace_id = workspace_id.clone();
+        tokio::spawn(async move {
+            let mut worker_error = worker_cleanup_error.map(|error| error.to_string());
+            let mut managed_chat_error = managed_chat_cleanup_error.map(|error| error.to_string());
+            for attempt in 1..=WORKSPACE_CLEANUP_RETRY_ATTEMPTS {
+                tokio::time::sleep(WORKSPACE_CLEANUP_RETRY_DELAY).await;
+                if worker_error.is_some() {
+                    worker_error = retry_worker_broker
+                        .purge_workspace(&retry_workspace_id)
+                        .await
+                        .err()
+                        .map(|error| error.to_string());
+                }
+                if managed_chat_error.is_some() {
+                    managed_chat_error = retry_managed_chat_broker
+                        .purge_workspace(&retry_workspace_id)
+                        .await
+                        .err()
+                        .map(|error| error.to_string());
+                }
+                if worker_error.is_none() && managed_chat_error.is_none() {
+                    retry_state.lock().await.log(
+                        "INFO",
+                        format!(
+                            "Finished deferred worker-state cleanup for removed workspace after {attempt} retry attempt(s)"
+                        ),
+                    );
+                    return;
+                }
+            }
+            let worker_detail = worker_error.as_deref().unwrap_or("clean");
+            let managed_detail = managed_chat_error.as_deref().unwrap_or("clean");
+            retry_state.lock().await.log(
+                "WARN",
+                format!(
+                    "Workspace was removed, but worker-state cleanup is still incomplete after {WORKSPACE_CLEANUP_RETRY_ATTEMPTS} retries (workers: {worker_detail}; managed chats: {managed_detail})"
                 ),
             );
         });
@@ -4430,6 +4532,71 @@ toolMode = "multiTools"
             .await
             .expect("add workspace");
 
+        let (primary_id, worker_broker, managed_chat_broker) = {
+            let app = state.lock().await;
+            (
+                app.workspaces[0].id.clone(),
+                app.worker_broker.clone(),
+                app.managed_chat_broker.clone(),
+            )
+        };
+        let primary_anchor = crate::workers::types::ChatIdentity::from_openai_meta(
+            Some("remove-test"),
+            "primary-anchor",
+        );
+        let secondary_anchor = crate::workers::types::ChatIdentity::from_openai_meta(
+            Some("remove-test"),
+            "secondary-anchor",
+        );
+        worker_broker
+            .spawn_worker(crate::workers::broker::SpawnWorkerRequest {
+                operation_id: crate::workers::types::OperationId::new(),
+                workspace_id: primary_id.clone(),
+                anchor_identity: primary_anchor.clone(),
+                label: "primary worker".into(),
+                assignment: "survive workspace removal".into(),
+                execution_profile: crate::managed_chat::types::ChatExecutionProfile::default(),
+            })
+            .await
+            .expect("seed primary worker family");
+        worker_broker
+            .spawn_worker(crate::workers::broker::SpawnWorkerRequest {
+                operation_id: crate::workers::types::OperationId::new(),
+                workspace_id: added.id.clone(),
+                anchor_identity: secondary_anchor.clone(),
+                label: "secondary worker".into(),
+                assignment: "purge with workspace".into(),
+                execution_profile: crate::managed_chat::types::ChatExecutionProfile::default(),
+            })
+            .await
+            .expect("seed secondary worker family");
+        for (workspace_id, dedupe_key, marker) in [
+            (primary_id.clone(), "remove-test-primary", "primary-marker"),
+            (
+                added.id.clone(),
+                "remove-test-secondary",
+                "secondary-marker",
+            ),
+        ] {
+            managed_chat_broker
+                .enqueue(crate::managed_chat::broker::EnqueueManagedChatRequest {
+                    dedupe_key: dedupe_key.into(),
+                    launch: crate::managed_chat::types::ManagedChatLaunch {
+                        workspace_id,
+                        purpose: crate::managed_chat::types::ManagedChatPurpose::Worker,
+                        execution_profile:
+                            crate::managed_chat::types::ChatExecutionProfile::default(),
+                        opening_message: format!("workspace removal probe {marker}"),
+                        task_marker: marker.into(),
+                        thread_key: Some(format!("worker:{marker}")),
+                        open_mode: crate::managed_chat::types::ManagedChatOpenMode::NewThread,
+                        anchor_session_digest: None,
+                    },
+                })
+                .await
+                .expect("seed managed-chat command");
+        }
+
         {
             let mut app = state.lock().await;
             let primary_id = app.workspaces[0].id.clone();
@@ -4563,6 +4730,36 @@ toolMode = "multiTools"
             assert!(!app.remote_connected);
             assert_eq!(app.last_remote_activity_ms, None);
         }
+        let worker_snapshot = worker_broker.snapshot().await;
+        assert!(
+            worker_snapshot
+                .families
+                .values()
+                .any(|family| family.workspace_id == primary_id),
+            "primary workspace worker family must survive secondary removal"
+        );
+        assert!(
+            worker_snapshot
+                .families
+                .values()
+                .all(|family| family.workspace_id != added.id),
+            "removed workspace worker families must be purged"
+        );
+        let managed_snapshot = managed_chat_broker.snapshot().await;
+        assert!(
+            managed_snapshot
+                .commands
+                .values()
+                .any(|command| command.launch.workspace_id == primary_id),
+            "primary workspace managed-chat commands must survive secondary removal"
+        );
+        assert!(
+            managed_snapshot
+                .commands
+                .values()
+                .all(|command| command.launch.workspace_id != added.id),
+            "removed workspace managed-chat commands must be purged"
+        );
         assert!(
             manager
                 .poll_for_workspace(&added.id, &started.snapshot.job_id, 0, 0)

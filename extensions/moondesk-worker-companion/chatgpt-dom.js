@@ -80,10 +80,14 @@
     return matched.length === 1 ? matched[0] : null;
   }
 
+  async function waitForComposerReady(timeoutMs = 15000) {
+    return Boolean(await waitFor(() => visible(composer()) && !generating(), timeoutMs));
+  }
+
   async function enterProject(projectId) {
     if (projectIdFromPath() !== projectId) return false;
     if (projectHome()) {
-      return Boolean(await waitFor(() => visible(composer()) && !generating(), 15000));
+      return waitForComposerReady(15000);
     }
     const link = await waitFor(() => projectLink(projectId), 10000);
     if (!link) return false;
@@ -671,6 +675,7 @@
     insertPrompt,
     workerEvidence,
     commitSendOnce,
+    waitForComposerReady,
     composerReady: () => visible(composer()) && !generating()
   };
 })();

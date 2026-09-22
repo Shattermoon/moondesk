@@ -54,7 +54,7 @@
       if ((DOM.projectIdFromPath() || null) !== expectedProjectId) {
         return { state: 'failed', reason: 'worker_placement_mismatch' };
       }
-      if (!DOM.composerReady()) {
+      if (!(await DOM.waitForComposerReady(15000))) {
         return { state: 'failed', reason: 'worker_conversation_not_ready' };
       }
     } else if (expectedProjectId) {

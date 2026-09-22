@@ -9,8 +9,10 @@ const backgroundPath = path.join(__dirname, 'background.js');
 const serverPath = path.join(__dirname, '..', '..', 'src', 'server.rs');
 const manifestPath = path.join(__dirname, 'manifest.json');
 const modelStateMainPath = path.join(__dirname, 'model-state-main.js');
+const contentPath = path.join(__dirname, 'content.js');
 const source = fs.readFileSync(backgroundPath, 'utf8');
 const modelStateMainSource = fs.readFileSync(modelStateMainPath, 'utf8');
+const contentSource = fs.readFileSync(contentPath, 'utf8');
 const serverSource = fs.readFileSync(serverPath, 'utf8');
 const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
 
@@ -661,6 +663,98 @@ test('existing-thread reuse accepts a confirmed thread owned by the same workspa
   assert.equal(record.sourceUrl, conversationUrl);
   assert.equal(tab.id, 77);
   assert.equal(createdTabs.length, 0);
+});
+
+test('existing-thread preparation waits for the recovered conversation composer before continuing', async () => {
+  let messageHandler = null;
+  let waitCalls = 0;
+  let selectCalls = 0;
+  const storage = new Map();
+  const DOM = {
+    conversationIdFromPath() { return 'worker-conversation'; },
+    projectIdFromPath() { return 'g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'; },
+    async waitForComposerReady(timeoutMs) {
+      waitCalls += 1;
+      assert.equal(timeoutMs, 15000);
+      return true;
+    },
+    composerReady() {
+      throw new Error('reuse must use the bounded readiness wait instead of a one-shot check');
+    },
+    async selectModelSettings() {
+      selectCalls += 1;
+      return true;
+    },
+    async selectedModelAndEffort() {
+      return { modelId: 'gpt-5.6-sol', reasoningEffort: 'high' };
+    },
+    taskMarkerPresent() { return false; },
+    insertPrompt() { return true; },
+    workerEvidence() {
+      return {
+        conversationId: 'worker-conversation',
+        projectId: 'g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+        markerPresent: false,
+        generating: false,
+        userTurnCount: 1,
+        assistantTurnCount: 1,
+        composerEmpty: false
+      };
+    }
+  };
+  const pageWindow = { MOONDESK_CHATGPT_DOM: DOM };
+  const context = vm.createContext({
+    window: pageWindow,
+    sessionStorage: {
+      setItem(key, value) { storage.set(key, value); },
+      getItem(key) { return storage.get(key) || null; }
+    },
+    location: {
+      hash: '',
+      pathname: '/g/g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-moondesk/c/worker-conversation',
+      search: '',
+      href: 'https://chatgpt.com/g/g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-moondesk/c/worker-conversation'
+    },
+    history: { state: null, replaceState() {} },
+    chrome: {
+      runtime: {
+        onMessage: {
+          addListener(handler) { messageHandler = handler; }
+        }
+      }
+    },
+    console
+  });
+
+  vm.runInContext(contentSource, context, { filename: contentPath });
+  assert.equal(typeof messageHandler, 'function');
+
+  const response = await new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error('prepare response timed out')), 1000);
+    const returned = messageHandler({
+      type: 'MOONDESK_PREPARE_WORKER',
+      commandId: 'reuse-command',
+      launchToken: 'reuse-token',
+      placement: { projectId: 'g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' },
+      launch: {
+        workspaceId: 'workspace-a',
+        taskMarker: 'moondesk-worker-task:reuse-ready',
+        openingMessage: 'reuse-ready',
+        threadKey: 'worker:reuse-ready',
+        openMode: 'existing_thread',
+        executionProfile: { modelId: 'gpt-5.6-sol', reasoningEffort: 'high' }
+      }
+    }, null, (value) => {
+      clearTimeout(timeout);
+      resolve(value);
+    });
+    assert.equal(returned, true);
+  });
+
+  assert.equal(response.ok, true);
+  assert.equal(response.result.state, 'ready');
+  assert.equal(waitCalls, 1);
+  assert.equal(selectCalls, 1);
 });
 
 test('worker acceptance requires assistant activity after the task marker is posted', () => {

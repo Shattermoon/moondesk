@@ -19,6 +19,7 @@ const MAX_PARALLEL_PROJECT_BOOTSTRAPS = 1;
 let pumpTimer = null;
 let pumpActive = false;
 let connecting = null;
+let modelCatalogFlight = null;
 let stateWriteQueue = Promise.resolve();
 const sessionReconcileCommandIds = new Set();
 let availableProjectBootstrapSlots = MAX_PARALLEL_PROJECT_BOOTSTRAPS;
@@ -457,7 +458,10 @@ function placementForOffer(state, offer) {
 
 function sourceUrlForCommand(placement, openMode, existingConversation) {
   if (openMode === 'existing_thread') return existingConversation;
-  if (placement?.projectId) return canonicalChatUrl(placement.projectUrl);
+  // Current ChatGPT Project homes are not a reliable cold-entry surface. Start from the exact
+  // Anchor conversation and let the content script follow that page's one native Project link;
+  // this preserves exact Project identity without guessing a display name or direct route.
+  if (placement?.projectId) return canonicalChatUrl(placement.anchorConversationUrl);
   return 'https://chatgpt.com/';
 }
 
@@ -751,7 +755,8 @@ const TRANSIENT_PREPARE_FAILURES = new Set([
   'project_entry_unconfirmed',
   'project_composer_not_ready',
   'worker_conversation_not_ready',
-  'normal_chat_composer_not_ready'
+  'normal_chat_composer_not_ready',
+  'composer_after_model_not_ready'
 ]);
 const MAX_PREPARE_ATTEMPTS = 3;
 const PREPARE_RETRY_DELAY_MS = 1500;
@@ -1199,6 +1204,63 @@ async function setProfile({ profile: nextProfile }) {
   return response.profile || null;
 }
 
+function modelCatalogHelperUrl(nonce) {
+  return `https://chatgpt.com/?moondesk-model-catalog=${encodeURIComponent(nonce)}`;
+}
+
+function modelCatalogHelperOwned(tab, nonce) {
+  try {
+    const url = new URL(tab?.pendingUrl || tab?.url || '');
+    return url.origin === 'https://chatgpt.com' &&
+      url.pathname === '/' &&
+      url.searchParams.get('moondesk-model-catalog') === nonce;
+  } catch {
+    return false;
+  }
+}
+
+async function closeModelCatalogHelper(tabId, nonce) {
+  if (!Number.isInteger(tabId)) return;
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    if (modelCatalogHelperOwned(tab, nonce)) await chrome.tabs.remove(tabId);
+  } catch {}
+}
+
+async function discoverModelCatalog() {
+  if (modelCatalogFlight) return modelCatalogFlight;
+  modelCatalogFlight = (async () => {
+    const nonce = crypto.randomUUID();
+    const expiresAt = Date.now() + 60000;
+    let tab = null;
+    try {
+      tab = await chrome.tabs.create({ url: modelCatalogHelperUrl(nonce), active: false });
+      if (!Number.isInteger(tab?.id)) throw new Error('Could not create ChatGPT model-discovery helper');
+      try { await chrome.tabs.update(tab.id, { autoDiscardable: false }); } catch {}
+      await waitForContent(tab.id, Math.min(20000, Math.max(1, expiresAt - Date.now())));
+      const remaining = expiresAt - Date.now();
+      if (remaining <= 0) throw new Error('ChatGPT model discovery timed out before inspection');
+      const response = await sendToTab(tab.id, {
+        type: 'MOONDESK_MODEL_CATALOG',
+        nonce,
+        expiresAt
+      }, remaining);
+      if (!response?.ok || !Array.isArray(response.catalog) || !response.catalog.length) {
+        const reason = response?.error || 'catalog_unconfirmed';
+        throw new Error(`Could not confirm ChatGPT model catalog (${reason})`);
+      }
+      return response.catalog;
+    } finally {
+      if (tab?.id) await closeModelCatalogHelper(tab.id, nonce);
+    }
+  })();
+  try {
+    return await modelCatalogFlight;
+  } finally {
+    modelCatalogFlight = null;
+  }
+}
+
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (!message || typeof message.type !== 'string') return false;
   const task = (() => {
@@ -1209,6 +1271,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       case 'MOONDESK_REVOKE_CLIENT': return revokeClient(message);
       case 'MOONDESK_PROFILE': return profile();
       case 'MOONDESK_SET_PROFILE': return setProfile(message);
+      case 'MOONDESK_DISCOVER_MODELS': return discoverModelCatalog();
       case 'MOONDESK_RETRY_BLOCKED': return (async () => {
         const state = await ensureConnected();
         const blocked = blockedCommandList(state);

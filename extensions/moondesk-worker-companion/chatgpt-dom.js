@@ -22,24 +22,125 @@
     return match?.[1] || null;
   };
 
-  const composer = () => document.querySelector(
-    '#prompt-textarea,[data-testid="prompt-textarea"][contenteditable="true"],textarea[data-testid="prompt-textarea"]'
-  );
+  const LEGACY_TURN = 'section[data-testid^="conversation-turn"]';
+  const SHELL_TURN = '[data-app-shell-main-surface] [data-thread-find-target="conversation"] [data-turn-key]';
+  const SEARCH_TURN = '[data-chatgpt-search-unit-key]';
+  const TURN = `${LEGACY_TURN}, ${SHELL_TURN}, ${SEARCH_TURN}`;
+  const PICKER = '[data-testid="composer-intelligence-picker-content"], [data-model-picker-view]';
+
+  function onKeptPage(node) {
+    for (let page = node?.closest?.('[data-app-shell-page-surface]'); page;
+      page = page.parentElement?.closest?.('[data-app-shell-page-surface]')) {
+      if (getComputedStyle(page).display === 'none') return true;
+    }
+    return false;
+  }
+
+  function composerCssVisible(node) {
+    try {
+      if (!node || onKeptPage(node)) return false;
+      for (let parent = node; parent; parent = parent.parentElement) {
+        const style = getComputedStyle(parent);
+        if (style.display === 'none' || style.visibility === 'hidden' || style.visibility === 'collapse') return false;
+      }
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  function composer() {
+    const classic = [...document.querySelectorAll('#prompt-textarea')].filter(composerCssVisible);
+    if (classic.length) return classic.length === 1 ? classic[0] : null;
+    const candidates = [...document.querySelectorAll(
+      'form[data-chatgpt-composer] [contenteditable="true"][role="textbox"], ' +
+      'form [data-composer-markdown][contenteditable="true"][role="textbox"]'
+    )].filter((node) =>
+      !node.closest(`${TURN},.markdown,[hidden],[aria-hidden="true"],[inert]`) && composerCssVisible(node)
+    );
+    return candidates.length === 1 ? candidates[0] : null;
+  }
+
   const composerForm = () => composer()?.closest('form') || null;
-
-  const sendButton = () => {
-    const root = composerForm() || document;
-    const candidates = [
-      root.querySelector('button[data-testid="send-button"]'),
-      root.querySelector('button[data-testid="composer-submit-button"]'),
-      root.querySelector('button[aria-label*="Send" i]')
-    ].filter(visible);
-    return candidates[0] || null;
+  const composerWritable = () => {
+    const box = composer();
+    return Boolean(
+      box?.isConnected &&
+      box.getAttribute('aria-disabled') !== 'true' &&
+      box.getAttribute('contenteditable') !== 'false'
+    );
   };
-
-  const generating = () => Boolean(
-    [...document.querySelectorAll('button[data-testid="stop-button"],button[aria-label*="Stop" i]')].find(visible)
+  const composerSubmitReady = () => Boolean(
+    composerWritable() && !generating() && !composerText().trim()
   );
+
+  function renderedComposerNode(node) {
+    if (!node?.isConnected || node.closest(`${TURN},[data-message-author-role],[hidden],[aria-hidden="true"],[inert]`)) {
+      return false;
+    }
+    for (let parent = node; parent; parent = parent.parentElement) {
+      const style = getComputedStyle(parent);
+      if (style.display === 'none' || style.visibility === 'hidden' || style.visibility === 'collapse') return false;
+    }
+    return true;
+  }
+
+  function nativeComposerControls(selector) {
+    const form = composerForm();
+    return [...(form || document).querySelectorAll(selector)].filter((button) =>
+      renderedComposerNode(button) && (!form || button.closest('form') === form)
+    );
+  }
+
+  const STOP_SQUARE = /^\s*M4\.5 5\.75/;
+  function primarySlotControls() {
+    const form = composerForm();
+    if (!form) return [];
+    return [...form.querySelectorAll('button[class*="size-token-button-composer"][class*="bg-composer-primary"]')]
+      .filter((button) => renderedComposerNode(button) && button.closest('form') === form);
+  }
+
+  function isStopSquare(button) {
+    if (!button || button.hasAttribute('data-state')) return false;
+    const paths = button.querySelectorAll('svg path');
+    return paths.length === 1 && STOP_SQUARE.test(paths[0].getAttribute('d') || '');
+  }
+
+  function stopControls() {
+    const labelled = nativeComposerControls(
+      'button[data-testid="stop-button"],button[data-testid="composer-stop-button"],' +
+      'button[aria-label="Stop streaming"],button[aria-label="Stop generating"],button[aria-label="Stop answering"]'
+    );
+    return labelled.length ? labelled : primarySlotControls().filter(isStopSquare);
+  }
+
+  function generating() {
+    if (stopControls().length) return true;
+    return false;
+  }
+
+  function localeFreeSendControls() {
+    const box = composer();
+    const form = box?.closest('form');
+    if (!form) return [];
+    const drafted = (typeof box.innerText === 'string' ? box.innerText : box.textContent || '').trim();
+    if (!drafted || generating()) return [];
+    return primarySlotControls().filter((button) => {
+      if (button.hasAttribute('data-state')) return false;
+      const paths = button.querySelectorAll('svg path');
+      if (paths.length === 1 && STOP_SQUARE.test(paths[0].getAttribute('d') || '')) return false;
+      return paths.length >= 1 && paths.length <= 2;
+    });
+  }
+
+  function sendButton() {
+    const labelled = nativeComposerControls(
+      'button[data-testid="send-button"],button[data-testid="composer-submit-button"],' +
+      'form button[aria-label^="Send" i],form[data-chatgpt-composer] button[type="submit"]'
+    );
+    const buttons = labelled.length ? labelled : localeFreeSendControls();
+    return buttons.length === 1 ? buttons[0] : null;
+  }
 
   async function waitFor(read, timeoutMs = 12000, intervalMs = 80) {
     const deadline = Date.now() + timeoutMs;
@@ -53,7 +154,9 @@
     return null;
   }
 
-  const projectHome = () => Boolean(projectIdFromPath() && /\/project\/?$/i.test(location.pathname));
+  const projectHomeId = (pathname = location.pathname) =>
+    /^\/g\/(g-p-[0-9a-f]{32})(?:-[^/]+)?\/project\/?$/i.exec(pathname)?.[1]?.toLowerCase() || null;
+  const projectHome = () => Boolean(projectHomeId());
 
   function projectHomeUrl() {
     const projectId = projectIdFromPath();
@@ -64,15 +167,11 @@
   }
 
   function projectLink(projectId) {
-    const links = [...document.querySelectorAll('header a[href], [role="banner"] a[href]')].filter(visible);
-    const matched = links.filter((link) => {
+    const matched = [...document.querySelectorAll('a[href]')].filter((link) => {
       try {
+        if (link.closest(TURN) || !composerCssVisible(link)) return false;
         const url = new URL(link.href, location.href);
-        return (
-          url.origin === location.origin &&
-          projectIdFromPath(url.pathname) === projectId &&
-          /\/project\/?$/i.test(url.pathname)
-        );
+        return url.origin === location.origin && projectHomeId(url.pathname) === projectId;
       } catch {
         return false;
       }
@@ -80,33 +179,107 @@
     return matched.length === 1 ? matched[0] : null;
   }
 
-  async function waitForComposerReady(timeoutMs = 15000) {
-    return Boolean(await waitFor(() => visible(composer()) && !generating(), timeoutMs));
+  function waitForComposerReady(timeoutMs = 15000, stillCurrent = () => true) {
+    if (!stillCurrent()) return Promise.resolve(false);
+    if (composerWritable() && !generating()) return Promise.resolve(true);
+    return new Promise((resolve) => {
+      let done = false;
+      const finish = (value) => {
+        if (done) return;
+        done = true;
+        observer.disconnect();
+        clearTimeout(timer);
+        resolve(value);
+      };
+      const check = () => {
+        if (!stillCurrent()) return finish(false);
+        if (composerWritable() && !generating()) finish(true);
+      };
+      const observer = new MutationObserver(check);
+      observer.observe(document.documentElement, {
+        childList: true,
+        subtree: true,
+        attributes: true,
+        attributeFilter: [
+          'class', 'style', 'hidden', 'aria-hidden', 'inert', 'contenteditable', 'aria-disabled',
+          'data-chatgpt-composer', 'data-composer-markdown'
+        ]
+      });
+      const timer = setTimeout(() => finish(false), timeoutMs);
+      check();
+    });
   }
 
-  async function enterProject(projectId) {
-    if (projectIdFromPath() !== projectId) return false;
-    if (projectHome()) {
-      return waitForComposerReady(15000);
+  function currentTurnNodes() {
+    return [...document.querySelectorAll(TURN)].filter((node) =>
+      !onKeptPage(node) && !node.closest('.markdown,[contenteditable]')
+    );
+  }
+
+  async function enterProject(projectId, stillCurrent = () => true) {
+    const sourceConversation = conversationIdFromPath();
+    if (!/^g-p-[0-9a-f]{32}$/.test(projectId || '') || projectIdFromPath() !== projectId) return false;
+    if (projectHomeId() === projectId) {
+      return Boolean(await waitForComposerReady(15000, stillCurrent)) && !conversationIdFromPath();
     }
-    const link = await waitFor(() => projectLink(projectId), 10000);
-    if (!link) return false;
-    link.click();
-    return Boolean(await waitFor(
-      () => projectIdFromPath() === projectId && projectHome() && visible(composer()) && !generating(),
-      15000
-    ));
+    if (!sourceConversation) return false;
+
+    return new Promise((resolve) => {
+      let clicked = false;
+      let done = false;
+      let timer = null;
+      const finish = (value) => {
+        if (done) return;
+        done = true;
+        observer.disconnect();
+        clearTimeout(timer);
+        resolve(value);
+      };
+      const check = () => {
+        if (done) return;
+        if (!stillCurrent()) return finish(false);
+        if (
+          clicked &&
+          projectHomeId() === projectId &&
+          !conversationIdFromPath() &&
+          composerSubmitReady() &&
+          currentTurnNodes().length === 0
+        ) return finish(true);
+        if (conversationIdFromPath() !== sourceConversation) {
+          if (projectHomeId() !== projectId) finish(false);
+          return;
+        }
+        if (clicked || !composerSubmitReady()) return;
+        const link = projectLink(projectId);
+        if (!link) return;
+        clicked = true;
+        clearTimeout(timer);
+        timer = setTimeout(() => finish(false), 12000);
+        link.click();
+        check();
+      };
+      const observer = new MutationObserver(check);
+      observer.observe(document.documentElement, { childList: true, subtree: true, attributes: true });
+      timer = setTimeout(() => finish(false), 60000);
+      check();
+    });
   }
 
-  function userMessages() {
-    const selectors = '[data-message-author-role="user"],[data-testid^="conversation-turn-"] [data-message-author-role="user"]';
-    return [...document.querySelectorAll(selectors)].filter(visible);
+  function messageNodes(role) {
+    const selectors = [
+      `[data-message-author-role="${role}"]`,
+      `[data-content-search-unit-key$=":${role}"]`,
+      `[data-chatgpt-search-unit-key$=":${role}"]`,
+      role === 'assistant' ? '[data-chatgpt-agent-turn-start]' : null
+    ].filter(Boolean).join(',');
+    const found = [...document.querySelectorAll(selectors)].filter((node) =>
+      !onKeptPage(node) && composerCssVisible(node)
+    );
+    return [...new Set(found)];
   }
 
-  function assistantMessages() {
-    const selectors = '[data-message-author-role="assistant"],[data-testid^="conversation-turn-"] [data-message-author-role="assistant"]';
-    return [...document.querySelectorAll(selectors)].filter(visible);
-  }
+  const userMessages = () => messageNodes('user');
+  const assistantMessages = () => messageNodes('assistant');
 
   const taskMarkerPresent = (marker) => userMessages().some(
     (node) => (node.innerText || node.textContent || '').includes(marker)
@@ -115,26 +288,59 @@
   function modelPickerTrigger() {
     const root = composerForm();
     if (!root) return null;
-    const candidates = [...root.querySelectorAll('button[aria-haspopup="menu"]')].filter(
+    const reported = '[data-codex-intelligence-trigger],[data-composer-navigation-target="reasoning"]';
+    const candidates = [...new Set([
+      ...root.querySelectorAll('button[aria-haspopup="menu"]'),
+      ...document.querySelectorAll(reported)
+    ])].filter(
       (node) =>
+        node.matches?.('button,[role="button"]') &&
         visible(node) &&
+        !node.closest(`${TURN},[data-message-author-role],.markdown,[contenteditable]`) &&
         node.id !== 'composer-plus-btn' &&
         node.getAttribute('data-testid') !== 'composer-plus-btn'
     );
-    return candidates.length === 1 ? candidates[0] : null;
+    const owned = candidates.filter((node) =>
+      node.getAttribute('data-moondesk-picker-route') === location.pathname
+    );
+    if (owned.length === 1) return owned[0];
+    // Legacy provider pickers without the new reported anchors may still be uniquely identifiable.
+    return candidates.length === 1 && !candidates[0].matches(reported) ? candidates[0] : null;
   }
 
-  const pickerRoot = () => document.querySelector('[data-testid="composer-intelligence-picker-content"]');
+  const pickerRoot = () => document.querySelector(PICKER);
 
-  function providerEffort(reasoningEffort) {
+  function providerEfforts(reasoningEffort) {
     return ({
-      instant: 'none',
-      low: 'low',
-      medium: 'medium',
-      high: 'high',
-      extra_high: 'xhigh'
-    })[reasoningEffort] || null;
+      instant: ['none'],
+      minimal: ['minimal'],
+      low: ['low'],
+      medium: ['medium'],
+      high: ['high'],
+      // Legacy saved Extra High profiles remain valid across the provider's xhigh -> max migration.
+      extra_high: ['xhigh', 'max'],
+      max: ['max'],
+      ultra: ['ultra'],
+      pro: ['pro']
+    })[reasoningEffort] || [];
   }
+
+  function resolveWantedEffort(desiredEfforts, offeredEfforts) {
+    const offered = [...new Set(offeredEfforts.filter((effort) => PROVIDER_EFFORTS.has(effort)))];
+    const exact = desiredEfforts.find((effort) => offered.includes(effort));
+    if (exact) return exact;
+    const ladder = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
+    const target = ladder.indexOf(desiredEfforts[0]);
+    const candidates = offered.filter((effort) => ladder.includes(effort));
+    if (target < 0 || !candidates.length) return null;
+    candidates.sort((left, right) => {
+      const leftDistance = Math.abs(ladder.indexOf(left) - target);
+      const rightDistance = Math.abs(ladder.indexOf(right) - target);
+      return leftDistance - rightDistance || ladder.indexOf(right) - ladder.indexOf(left);
+    });
+    return candidates[0];
+  }
+
 
   function validPickerState(state) {
     const groupId = (value) =>
@@ -275,7 +481,7 @@
     });
   }
 
-  async function prepareChatModelSurface() {
+  async function prepareChatModelSurface(stillCurrent = () => true) {
     const radios = () => [...document.querySelectorAll('[role="radio"][data-tpp-toggle-value]')].filter(visible);
     const state = () => {
       const nodes = radios();
@@ -284,8 +490,9 @@
       return chat.length === 1 && work.length === 1 ? { chat: chat[0], work: work[0] } : null;
     };
 
+    if (!stillCurrent()) return false;
     const before = state();
-    if (!before) return radios().length === 0;
+    if (!before) return radios().length === 0 && stillCurrent();
     if (before.chat.getAttribute('aria-checked') === 'true') return true;
     if (
       before.work.getAttribute('aria-checked') !== 'true' ||
@@ -294,20 +501,106 @@
     ) {
       return false;
     }
-    before.chat.click();
-    return Boolean(await waitFor(() => {
-      const next = state();
-      return next?.chat.getAttribute('aria-checked') === 'true' &&
-        next.work.getAttribute('aria-checked') === 'false';
-    }, 5000));
+    return new Promise((resolve) => {
+      let done = false;
+      const finish = (value) => {
+        if (done) return;
+        done = true;
+        observer.disconnect();
+        clearTimeout(timer);
+        resolve(value);
+      };
+      const check = () => {
+        if (!stillCurrent()) return finish(false);
+        const next = state();
+        if (
+          next?.chat.getAttribute('aria-checked') === 'true' &&
+          next.work.getAttribute('aria-checked') === 'false'
+        ) finish(true);
+      };
+      const observer = new MutationObserver(check);
+      observer.observe(document.documentElement, { subtree: true, childList: true, attributes: true });
+      const timer = setTimeout(() => finish(false), 5000);
+      before.chat.click();
+      check();
+    });
   }
 
-  function modelPickerAccess() {
-    const state = async (predicate = null, timeoutMs = 3500) => waitFor(async () => {
+  function pickerVersionNamed(row, expected) {
+    const text = (node) => compact(node?.textContent);
+    const name = compact(expected);
+    for (let node = row, depth = 0; node && depth < 8; depth += 1) {
+      if (text(node) === name) return true;
+      node = [...(node.childNodes || [])].find((child) =>
+        text(child) &&
+        (child.nodeType === Node.TEXT_NODE ||
+          (child.nodeType === Node.ELEMENT_NODE && !child.matches?.('svg,[hidden],[aria-hidden="true"],[inert]')))
+      );
+    }
+    return false;
+  }
+
+  function modelPickerAccess(stillCurrent = () => true) {
+    let motion = null;
+    const shown = (node) => visible(node);
+    const openPicker = () => {
+      const panel = pickerRoot();
+      return panel && panel.closest('[role="menu"],[role="dialog"]')?.getAttribute('data-state') !== 'closed'
+        ? panel
+        : null;
+    };
+    const wait = (read, timeoutMs = 3500) => new Promise((resolve) => {
+      let reading = false;
+      let dirty = false;
+      let done = false;
+      const finish = (value) => {
+        if (done) return;
+        done = true;
+        observer.disconnect();
+        clearTimeout(timer);
+        resolve(value);
+      };
+      const check = async () => {
+        if (done) return;
+        if (!stillCurrent()) return finish(null);
+        if (reading) {
+          dirty = true;
+          return;
+        }
+        reading = true;
+        try {
+          let value = read();
+          if (value?.then) value = await value;
+          if (stillCurrent() && value) finish(value);
+        } catch {
+          finish(null);
+        } finally {
+          reading = false;
+          if (dirty && !done) {
+            dirty = false;
+            void check();
+          }
+        }
+      };
+      const observer = new MutationObserver(check);
+      observer.observe(document.documentElement, {
+        subtree: true,
+        childList: true,
+        attributes: true,
+        characterData: true
+      });
+      const timer = setTimeout(() => finish(null), timeoutMs);
+      void check();
+    });
+    const state = (predicate = null, timeoutMs = 3500) => wait(async () => {
       const value = await readPickerState();
       if (!value || value.selected) return null;
       return !predicate || predicate(value) ? value : null;
-    }, timeoutMs, 90);
+    }, timeoutMs);
+    const readyTrigger = () => wait(async () => {
+      await readPickerState();
+      return modelPickerTrigger();
+    }, 15000);
 
     const key = (node, value) => {
       if (!node) return false;
@@ -324,16 +617,40 @@
     return {
       state,
       async open() {
-        const trigger = await waitFor(modelPickerTrigger, 15000);
-        if (!trigger || !(await prepareChatModelSurface())) return null;
-        if (!pickerRoot()) {
-          key(trigger, 'Enter');
-          if (!(await waitFor(pickerRoot, 3500))) return null;
+        if (!stillCurrent()) return null;
+        motion = document.createElement('style');
+        motion.textContent =
+          '[role="menu"]:has(> [data-testid="composer-intelligence-picker-content"]),' +
+          '[role="dialog"]:has([data-testid="composer-intelligence-picker-content"]),' +
+          '[role="menu"]:has([data-model-picker-view]),[role="menu"][data-model-picker-view]{animation:none!important}';
+        document.head.append(motion);
+        const trigger = await readyTrigger();
+        if (!trigger || !(await prepareChatModelSurface(stillCurrent))) return null;
+        if (!openPicker()) {
+          const current = await readyTrigger();
+          if (!key(current, 'Enter') || !(await wait(openPicker))) return null;
         }
         return state();
       },
-      close() {
-        key(modelPickerTrigger(), 'Escape');
+      async close() {
+        try {
+          if (!stillCurrent()) return false;
+          const panel = pickerRoot();
+          if (!panel) return true;
+          const dialog = panel.closest('[role="dialog"]');
+          const active = document.activeElement;
+          if (!shown(panel) && !shown(dialog)) return true;
+          const target = panel.contains(active) || dialog?.contains(active) ? active : panel;
+          if (!key(target, 'Escape')) return false;
+          const closed = Boolean(await wait(() =>
+            !shown(pickerRoot()) && (!dialog?.isConnected || !shown(dialog))
+          ));
+          if (closed && stillCurrent()) await readPickerState();
+          return closed && stillCurrent();
+        } finally {
+          motion?.remove();
+          motion = null;
+        }
       },
       async version(versionId) {
         const before = await state();
@@ -344,19 +661,16 @@
         if (!versionLabel) return null;
 
         if (!versionRows().length) {
-          const toggles = [...pickerRoot().querySelectorAll('[role="menuitem"][aria-expanded]')].filter(visible);
+          const toggles = [...pickerRoot().querySelectorAll(
+            '[role="menuitem"][aria-expanded], [role="menuitem"][data-model-picker-view-toggle]'
+          )].filter(visible);
           if (toggles.length !== 1) return null;
           toggles[0].click();
         }
-        const option = await waitFor(() => {
-          const rows = versionRows().filter((node) => {
-            if (node.getAttribute('aria-disabled') === 'true') return false;
-            const exactLabel = compact(node.textContent) === versionLabel ||
-              [...node.querySelectorAll('*')].some(
-                (child) => child.children.length === 0 && compact(child.textContent) === versionLabel
-              );
-            return exactLabel;
-          });
+        const option = await wait(() => {
+          const rows = versionRows().filter((node) =>
+            node.getAttribute('aria-disabled') !== 'true' && pickerVersionNamed(node, versionLabel)
+          );
           return rows.length === 1 ? rows[0] : null;
         }, 3500);
         if (!key(option, 'Enter')) return null;
@@ -387,52 +701,70 @@
     };
   }
 
-  function modelMatches(choice, profile) {
+  function modelRank(choice, profile) {
     const requested = [profile?.modelKey, profile?.modelLabel].filter(
       (value) => typeof value === 'string' && value.trim()
     );
+    if (requested.some((model) => choice.familyId === model || choice.id === model)) return 2;
     return requested.some((model) =>
-      choice.familyId === model ||
-      choice.id === model ||
       normalizeModel(choice.familyLabel) === normalizeModel(model) ||
       normalizeModel(choice.label) === normalizeModel(model)
+    ) ? 1 : 0;
+  }
+
+  function modelMatches(choice, profile) {
+    return modelRank(choice, profile) > 0;
+  }
+
+  function choiceMatchesResolvedProfile(state, choice, profile) {
+    if (!choice?.available || !modelMatches(choice, profile)) return false;
+    const desired = providerEfforts(profile?.reasoningEffort);
+    if (!desired.length) return false;
+    const modelChoices = state.choices.filter((entry) => entry.available && modelRank(entry, profile) > 0);
+    const bestRank = Math.max(0, ...modelChoices.map((entry) => modelRank(entry, profile)));
+    const offered = modelChoices.filter((entry) => modelRank(entry, profile) === bestRank);
+    if (!offered.length || new Set(offered.map((entry) => entry.familyId)).size !== 1) return false;
+    const wanted = resolveWantedEffort(desired, offered.map((entry) => entry.effort));
+    return Boolean(
+      wanted &&
+      modelRank(choice, profile) === bestRank &&
+      choice.familyId === offered[0].familyId &&
+      choice.effort === wanted
     );
   }
 
-  function choiceMatchesProfile(choice, profile) {
-    const effort = providerEffort(profile?.reasoningEffort);
-    return Boolean(choice?.available && effort && choice.effort === effort && modelMatches(choice, profile));
-  }
-
   async function selectedModelAndEffort(profile) {
-    let snapshot = await readPickerState();
-    if (!snapshot) {
-      const ui = modelPickerAccess();
-      snapshot = await ui.open();
-      if (!snapshot) {
-        ui.close();
-        return null;
-      }
-      const choice = snapshot.choices.find((entry) => entry.bucket === snapshot.currentBucket);
-      ui.close();
-      return choiceMatchesProfile(choice, profile)
+    const fromFullState = (state) => {
+      const choice = state?.choices?.find((entry) => entry.bucket === state.currentBucket);
+      return choiceMatchesResolvedProfile(state, choice, profile)
         ? { model: choice.id, reasoningEffort: choice.effort }
         : null;
-    }
+    };
 
-    if (snapshot.selected) {
-      const expectedEffort = providerEffort(profile?.reasoningEffort);
+    const snapshot = await readPickerState();
+    if (snapshot && !snapshot.selected) return fromFullState(snapshot);
+
+    if (snapshot?.selected) {
+      const expectedEfforts = providerEfforts(profile?.reasoningEffort);
       const requested = [profile?.modelKey, profile?.modelLabel].filter(Boolean);
       const modelConfirmed = requested.some((value) => snapshot.selected.id === value);
-      return modelConfirmed && snapshot.selected.effort === expectedEffort
-        ? { model: snapshot.selected.id, reasoningEffort: snapshot.selected.effort }
-        : null;
+      if (modelConfirmed && expectedEfforts.includes(snapshot.selected.effort)) {
+        return { model: snapshot.selected.id, reasoningEffort: snapshot.selected.effort };
+      }
+      // A closed picker exposes only the execution id. Older saved profiles can legitimately name
+      // the same provider family by a previous slug/display identity, so reopen the native picker
+      // and require full account-evaluated family proof before rejecting the readback.
     }
 
-    const choice = snapshot.choices.find((entry) => entry.bucket === snapshot.currentBucket);
-    return choiceMatchesProfile(choice, profile)
-      ? { model: choice.id, reasoningEffort: choice.effort }
-      : null;
+    const ui = modelPickerAccess();
+    const full = await ui.open();
+    if (!full) {
+      await ui.close();
+      return null;
+    }
+    const confirmed = fromFullState(full);
+    const closed = await ui.close();
+    return closed ? confirmed : null;
   }
 
   async function restoreModelPicker(ui, original) {
@@ -448,116 +780,148 @@
     );
   }
 
-  async function inspectModelSettings() {
-    const ui = modelPickerAccess();
-    let original = await ui.open();
+  function collectModelChoices(result, state) {
+    for (const choice of state.choices.filter((entry) => entry.available)) {
+      const existing = result.get(choice.familyId) || {
+        id: choice.familyId,
+        label: choice.familyLabel,
+        efforts: [],
+        aliases: [],
+        choices: []
+      };
+      if (!existing.efforts.includes(choice.effort)) existing.efforts.push(choice.effort);
+      if (!existing.aliases.includes(choice.id)) existing.aliases.push(choice.id);
+      if (!existing.choices.some((entry) => entry.id === choice.id && entry.effort === choice.effort)) {
+        existing.choices.push({ id: choice.id, effort: choice.effort });
+      }
+      result.set(choice.familyId, existing);
+    }
+  }
+
+  async function inspectModelSettings(stillCurrent = () => true, failure = () => {}) {
+    const ui = modelPickerAccess(stillCurrent);
+    const original = await ui.open();
     if (!original) {
-      ui.close();
-      await sleep(200);
-      original = await ui.open();
-      if (!original) {
-        ui.close();
-        return null;
-      }
+      await ui.close();
+      failure('picker_unavailable');
+      return null;
     }
 
-    for (let attempt = 0; attempt < 2; attempt += 1) {
-      const result = new Map();
-      let discoveryOk = true;
-      let restored = false;
-      try {
-        for (const version of original.versions) {
-          const state = await ui.version(version.id);
-          if (!state) {
-            discoveryOk = false;
-            break;
-          }
-          for (const choice of state.choices.filter((entry) => entry.available)) {
-            const existing = result.get(choice.familyId) || {
-              id: choice.familyId,
-              label: choice.familyLabel,
-              efforts: [],
-              aliases: [],
-              choices: []
-            };
-            if (!existing.efforts.includes(choice.effort)) existing.efforts.push(choice.effort);
-            if (!existing.aliases.includes(choice.id)) existing.aliases.push(choice.id);
-            if (!existing.choices.some((entry) => entry.id === choice.id && entry.effort === choice.effort)) {
-              existing.choices.push({ id: choice.id, effort: choice.effort });
-            }
-            result.set(choice.familyId, existing);
-          }
-        }
-      } finally {
-        restored = await restoreModelPicker(ui, original);
-        ui.close();
+    const result = new Map();
+    let restored = false;
+    let closed = false;
+    try {
+      // Read each account-evaluated version once. The provider-owned choices already include
+      // availability/denial state, so walking every effort as a separate mutation only makes
+      // discovery slower and more fragile on the current shell.
+      for (const version of original.versions) {
+        if (!stillCurrent()) throw new Error('catalog_deadline');
+        const state = await ui.version(version.id);
+        if (!state) throw new Error('model_unconfirmed');
+        collectModelChoices(result, state);
       }
-
-      if (discoveryOk && restored && result.size) return [...result.values()];
-      if (!restored || attempt === 1) return null;
-
-      // A discovery pass can race ChatGPT's picker hydration immediately after the
-      // popup opens. Retry once only after the exact original selection was restored.
-      await sleep(200);
-      const reopened = await ui.open();
-      if (!reopened) {
-        ui.close();
-        return null;
-      }
-      const previous = original.choices.find((choice) => choice.bucket === original.currentBucket);
-      const selected = reopened.choices.find((choice) => choice.bucket === reopened.currentBucket);
-      if (
-        reopened.version !== original.version ||
-        reopened.currentBucket !== original.currentBucket ||
-        !previous ||
-        selected?.id !== previous.id ||
-        selected?.effort !== previous.effort
-      ) {
-        await restoreModelPicker(ui, original);
-        ui.close();
-        return null;
-      }
+    } catch (error) {
+      failure(error?.message === 'catalog_deadline' ? 'catalog_deadline' : 'model_unconfirmed');
+      result.clear();
+    } finally {
+      if (stillCurrent()) restored = await restoreModelPicker(ui, original);
+      closed = await ui.close();
     }
-    return null;
+
+    if (!restored) failure('restore_failed');
+    if (!closed) failure('picker_close_failed');
+    return restored && closed && stillCurrent() && result.size ? [...result.values()] : null;
   }
 
   async function selectModelSettings(profile) {
-    const desiredEffort = providerEffort(profile?.reasoningEffort);
-    if (!desiredEffort) return false;
+    const desiredEfforts = providerEfforts(profile?.reasoningEffort);
+    if (!desiredEfforts.length) return false;
     const ui = modelPickerAccess();
     const original = await ui.open();
     if (!original) {
-      ui.close();
+      await ui.close();
       return false;
     }
 
     let selected = false;
     try {
+      const current = original.choices.find((choice) => choice.bucket === original.currentBucket);
+      if (
+        current?.available &&
+        modelRank(current, profile) > 0 &&
+        desiredEfforts.includes(current.effort)
+      ) {
+        selected = true;
+        return true;
+      }
+
       const currentVersion = original.versions.find((version) => version.id === original.version);
       const versions = [currentVersion, ...original.versions.filter((version) => version.id !== original.version)].filter(Boolean);
+      const offered = [];
       for (const version of versions) {
         const state = await ui.version(version.id);
         if (!state) return false;
-        const choices = state.choices.filter((choice) => choiceMatchesProfile(choice, profile));
-        if (!choices.length) continue;
-        const choice = choices.find((entry) => entry.bucket === state.currentBucket) || choices[0];
-        const after = await ui.bucket(choice.bucket);
-        const confirmed = after?.choices.find((entry) => entry.bucket === after.currentBucket);
-        selected = Boolean(
-          confirmed?.available === true &&
-          confirmed.id === choice.id &&
-          confirmed.effort === desiredEffort &&
-          modelMatches(confirmed, profile)
-        );
-        return selected;
+        for (const choice of state.choices) {
+          const rank = choice.available ? modelRank(choice, profile) : 0;
+          if (rank) offered.push({ version: version.id, choice, rank });
+        }
       }
-      return false;
+      if (!offered.length) return false;
+
+      let wantedEffort = desiredEfforts.find((effort) =>
+        offered.some((entry) => entry.choice.effort === effort)
+      ) || null;
+      if (!wantedEffort) {
+        const ladder = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
+        const target = ladder.indexOf(desiredEfforts[0]);
+        const efforts = [...new Set(offered.map((entry) => entry.choice.effort))]
+          .filter((effort) => ladder.includes(effort));
+        if (target >= 0 && efforts.length) {
+          efforts.sort((left, right) => {
+            const leftDistance = Math.abs(ladder.indexOf(left) - target);
+            const rightDistance = Math.abs(ladder.indexOf(right) - target);
+            return leftDistance - rightDistance || ladder.indexOf(right) - ladder.indexOf(left);
+          });
+          wantedEffort = efforts[0];
+        }
+      }
+      if (!wantedEffort) return false;
+
+      const candidates = offered.filter((entry) => entry.choice.effort === wantedEffort);
+      const rank = Math.max(0, ...candidates.map((candidate) => candidate.rank));
+      const matches = candidates.filter((candidate) => candidate.rank === rank);
+      if (
+        !matches.length ||
+        new Set(matches.map((candidate) => candidate.choice.familyId)).size !== 1 ||
+        new Set(matches.map((candidate) => `${candidate.choice.id}\u0000${candidate.choice.effort}`)).size !== 1
+      ) return false;
+
+      const wanted = matches.find((candidate) =>
+        candidate.version === original.version && candidate.choice.bucket === original.currentBucket
+      ) || matches[0];
+      const state = await ui.version(wanted.version);
+      const choice = wanted.choice;
+      if (!state?.choices.some((next) =>
+        next.bucket === choice.bucket &&
+        next.available &&
+        next.id === choice.id &&
+        next.effort === choice.effort
+      )) return false;
+      const after = await ui.bucket(choice.bucket);
+      const confirmed = after?.choices.find((entry) => entry.bucket === after.currentBucket);
+      selected = Boolean(
+        confirmed?.available === true &&
+        confirmed.id === choice.id &&
+        confirmed.effort === choice.effort &&
+        modelRank(confirmed, profile) > 0
+      );
+      return selected;
     } finally {
       if (!selected) {
         const restoredVersion = await ui.version(original.version);
         if (restoredVersion) await ui.bucket(original.currentBucket);
       }
-      ui.close();
+      await ui.close();
     }
   }
 
@@ -605,8 +969,8 @@
   }
 
   async function commitSendOnce(expectedPrompt, marker) {
-    const box = composer();
-    if (!box || generating()) return { state: 'failed', reason: 'composer_not_ready' };
+    let box = composer();
+    if (!box || !composerWritable() || generating()) return { state: 'failed', reason: 'composer_not_ready' };
     if (compact(composerText(box)) !== compact(expectedPrompt)) {
       return { state: 'failed', reason: 'prepared_prompt_changed' };
     }
@@ -625,19 +989,26 @@
       markerPresent: taskMarkerPresent(marker),
       composerHadPrompt: true
     };
-    setTimeout(() => {
-      try {
-        if (
-          visible(button) &&
-          !generating() &&
-          compact(composerText()) === compact(expectedPrompt) &&
-          !button.disabled &&
-          button.getAttribute('aria-disabled') !== 'true'
-        ) {
-          button.click();
-        }
-      } catch {}
-    }, 50);
+
+    // Let synchronous React input work settle, then re-prove both the exact draft and native
+    // control at the irreversible boundary. Returning "committed" before a delayed timer click
+    // made the background believe Send happened even when a hidden tab throttled that timer.
+    await Promise.resolve();
+    box = composer();
+    const currentButton = sendButton();
+    if (
+      !box ||
+      !composerWritable() ||
+      generating() ||
+      compact(composerText(box)) !== compact(expectedPrompt) ||
+      !currentButton ||
+      currentButton !== button ||
+      currentButton.disabled ||
+      currentButton.getAttribute('aria-disabled') === 'true'
+    ) {
+      return { state: 'failed', reason: 'prepared_prompt_changed_before_send' };
+    }
+    currentButton.click();
     return { state: 'committed', baseline };
   }
 
@@ -676,6 +1047,6 @@
     workerEvidence,
     commitSendOnce,
     waitForComposerReady,
-    composerReady: () => visible(composer()) && !generating()
+    composerReady: () => composerWritable() && !generating()
   };
 })();

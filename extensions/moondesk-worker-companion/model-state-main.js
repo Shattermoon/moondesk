@@ -100,7 +100,11 @@
 
     let sections;
     try {
-      sections = [...document.querySelectorAll('section[data-testid^="conversation-turn"]')];
+      sections = [...new Set(document.querySelectorAll(
+        'section[data-testid^="conversation-turn"], ' +
+        '[data-app-shell-main-surface] [data-thread-find-target="conversation"] [data-turn-key], ' +
+        '[data-chatgpt-search-unit-key]'
+      ))];
     } catch {
       return null;
     }
@@ -131,15 +135,27 @@
     return requestIds.length ? { conversationId: routeConversation, requestIds } : null;
   }
 
-  function modelPickerTrigger() {
-    const form = document.querySelector('#prompt-textarea')?.closest('form');
-    const triggers = [...(form?.querySelectorAll('button[aria-haspopup="menu"]') || [])].filter(
+  const PICKER_TRIGGER = '[data-codex-intelligence-trigger],[data-composer-navigation-target="reasoning"]';
+
+  function modelPickerTriggers() {
+    const composer = document.querySelector(
+      '#prompt-textarea, form[data-chatgpt-composer] [contenteditable="true"][role="textbox"], ' +
+      'form [data-composer-markdown][contenteditable="true"][role="textbox"]'
+    );
+    const form = composer?.closest?.('form');
+    return [...new Set([
+      ...(form?.querySelectorAll?.('button[aria-haspopup="menu"]') || []),
+      ...document.querySelectorAll(PICKER_TRIGGER)
+    ])].filter(
       (node) =>
+        node?.matches?.('button,[role="button"]') &&
         visible(node) &&
+        !node.closest?.(
+          '[data-testid^="conversation-turn"],[data-message-author-role],.markdown,[contenteditable],[hidden],[aria-hidden="true"],[inert]'
+        ) &&
         node.id !== 'composer-plus-btn' &&
         node.getAttribute('data-testid') !== 'composer-plus-btn'
     );
-    return triggers.length === 1 ? triggers[0] : null;
   }
 
   function strictId(value) {
@@ -259,8 +275,14 @@
     return null;
   }
 
+  function shellProExecutionModel(value) {
+    const normalized = typeof value === 'string' ? value.trim().toLowerCase() : '';
+    return /^(?:pro|(?:gpt-?)?\d+(?:[.-]\d+)?-pro)$/.test(normalized);
+  }
+
   function closedPickerSelection(node) {
-    const effort = ({
+    const machine = node?.getAttribute?.('data-selected-reasoning-effort');
+    const captionEffort = ({
       instant: 'none',
       minimal: 'minimal',
       low: 'low',
@@ -271,38 +293,156 @@
       ultra: 'ultra',
       pro: 'pro'
     })[String(node?.textContent || '').trim().toLowerCase()];
-    if (!effort) return null;
-
     let model = null;
+    let lane = null;
     for (let fiber = fiberOf(node), up = 0; fiber && up < MAX_CLIMB; up += 1, fiber = fiber.return) {
+      const selected = fiber.memoizedProps?.selectedPowerSelection ?? fiber.memoizedProps?.selectedLabelCandidate;
+      if (lane === null && selected) {
+        lane = {
+          model: selected.model,
+          effort: ({
+            instant: 'none', minimal: 'minimal', low: 'low', medium: 'medium', high: 'high',
+            'extra high': 'xhigh', max: 'max', ultra: 'ultra', pro: 'pro'
+          })[String(selected.labels?.effort ?? selected.sliderLabel ?? '').trim().toLowerCase()] || null
+        };
+      }
       const current = fiber.memoizedProps?.currentModelId;
       if (current === undefined) continue;
       if (
         typeof current !== 'string' ||
         !/^[a-zA-Z0-9._-]{1,80}$/.test(current) ||
         (model && model !== current)
-      ) {
-        return null;
-      }
+      ) return null;
       model = current;
     }
-    return model ? { id: model, effort } : null;
+    const effort = shellProExecutionModel(model)
+      ? 'pro'
+      : (lane && lane.model === model && lane.effort) ||
+        (machine !== null
+          ? (['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra', 'pro'].includes(machine) ? machine : null)
+          : captionEffort);
+    return model && effort ? { id: model, effort } : null;
+  }
+
+  function readShellPickerSnapshot(node) {
+    for (let fiber = node && fiberOf(node), up = 0; fiber && up < MAX_CLIMB; up += 1, fiber = fiber.return) {
+      const props = fiber.memoizedProps;
+      if (!Array.isArray(props?.powerSelections)) continue;
+      const selected = props.selectedPowerSelection ?? props.selectedLabelCandidate;
+      const options = props.modelListConfig?.options;
+      if (!selected || !Array.isArray(options) || options.length > 20 || props.powerSelections.length > 12) {
+        return null;
+      }
+      const effort = (value) => ({
+        none: 'none', instant: 'none', minimal: 'minimal', min: 'low', low: 'low', standard: 'medium',
+        medium: 'medium', extended: 'high', high: 'high', xhigh: 'xhigh', 'extra high': 'xhigh',
+        max: 'max', ultra: 'ultra', pro: 'pro'
+      })[value] || null;
+      const laneEffort = (choice) => shellProExecutionModel(choice?.model)
+        ? 'pro'
+        : effort(String(choice?.labels?.effort ?? choice?.sliderLabel ?? '').trim().toLowerCase()) ||
+          effort(choice?.reasoningEffort);
+      const current = options.filter((option) => option?.selected === true);
+      if (current.length !== 1) return null;
+      const version = groupId(current[0].id);
+      const versions = options
+        .filter((option) => option && option.disabled !== true)
+        .map((option) => ({ id: groupId(option.id), label: label(option.label) }));
+      const choices = props.powerSelections.map((choice) => ({
+        bucket: choice?.powerSettingIndex,
+        id: strictId(choice?.model),
+        label: label(choice?.modelLabel),
+        familyId: strictId(choice?.model),
+        familyLabel: label(choice?.modelLabel),
+        effort: laneEffort(choice),
+        available:
+          props.modelSelectionDisabled !== true &&
+          choice?.disabled !== true &&
+          (!choice?.availability || choice.availability.status === 'available') &&
+          !props.modelSwitcherDenialsBySlug?.[choice?.model]
+      }));
+      if (
+        !version ||
+        !versions.length ||
+        versions.some((entry) => !entry.id || !entry.label) ||
+        !choices.length ||
+        choices.some((choice) =>
+          !Number.isInteger(choice.bucket) || !choice.id || !choice.label || !choice.familyId || !choice.familyLabel || !choice.effort
+        ) ||
+        new Set(versions.map((entry) => entry.id)).size !== versions.length ||
+        new Set(choices.map((choice) => choice.bucket)).size !== choices.length ||
+        !versions.some((entry) => entry.id === version)
+      ) return null;
+      const selectedId = strictId(selected.model);
+      const selectedEffort = laneEffort(selected);
+      const matches = choices.filter((choice) => choice.id === selectedId && choice.effort === selectedEffort);
+      if (
+        matches.length !== 1 ||
+        (selected.powerSettingIndex !== undefined && selected.powerSettingIndex !== matches[0].bucket)
+      ) return null;
+      return { version, currentBucket: matches[0].bucket, versions, choices };
+    }
+    return null;
   }
 
   function pickerSnapshot() {
-    const trigger = modelPickerTrigger();
-    const node =
-      document.querySelector('[data-testid="composer-intelligence-picker-content"]') || trigger;
-    let state = null;
-    try {
-      state = readPickerSnapshot(node);
-    } catch {
-      state = null;
+    const triggers = modelPickerTriggers();
+    const candidates = [];
+    for (const trigger of triggers) {
+      try {
+        const picker = readPickerSnapshot(trigger) || readShellPickerSnapshot(trigger);
+        if (picker) candidates.push({ trigger, picker });
+      } catch {
+        // An unrelated native menu is not picker evidence.
+      }
     }
-    if (state) return state;
+    const explicit = candidates.filter(({ trigger }) => trigger.matches?.(PICKER_TRIGGER));
+    const identified = explicit.length === 1
+      ? explicit[0]
+      : candidates.length === 1
+        ? candidates[0]
+        : null;
+    const native = triggers.filter((trigger) => trigger.matches?.(PICKER_TRIGGER));
+    const fallback = native.length === 1
+      ? native[0]
+      : triggers.length === 1
+        ? triggers[0]
+        : null;
+    const panel = document.querySelector(
+      '[data-testid="composer-intelligence-picker-content"], [data-model-picker-view]'
+    );
+    const node = panel || identified?.trigger || fallback;
 
-    // Closed-picker state is enough only for exact current-selection readback, not catalog discovery.
-    const selected = trigger && node === trigger ? closedPickerSelection(trigger) : null;
+    let state = identified?.picker || null;
+    if (!state && panel) {
+      try {
+        state = readPickerSnapshot(panel) || readShellPickerSnapshot(panel);
+      } catch {
+        state = null;
+      }
+    }
+    const selected = state
+      ? state.choices.find((choice) => choice.bucket === state.currentBucket && choice.available) || null
+      : (fallback && node === fallback ? closedPickerSelection(fallback) : null);
+    const provenTrigger = identified?.trigger || (selected && fallback ? fallback : null);
+
+    // Stamp provider-proven ownership onto one exact native trigger. Open shell portals often own
+    // no picker Fiber themselves, so the trigger remains the authority even while a menu is open.
+    for (const trigger of triggers) {
+      if (trigger === provenTrigger) trigger.setAttribute?.('data-moondesk-picker-route', location.pathname);
+      else trigger.removeAttribute?.('data-moondesk-picker-route');
+    }
+    for (const [attribute, value] of [
+      ['data-moondesk-selected-model', selected?.id],
+      ['data-moondesk-selected-effort', selected?.effort],
+      ['data-moondesk-selected-route', selected && location.pathname]
+    ]) {
+      if (!node) continue;
+      if (!value) node.removeAttribute?.(attribute);
+      else node.setAttribute?.(attribute, value);
+    }
+
+    if (state) return state;
     return selected ? { selected } : null;
   }
 

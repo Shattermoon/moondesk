@@ -24,9 +24,9 @@ It does **not** match ChatGPT Projects, MoonDesk workspaces, connectors, or loca
 3. Select `extensions/moondesk-worker-companion`.
 4. Open the extension popup. The extension should automatically discover and pair with the local MoonDesk companion bridge. Manual repair is only a fallback when this installation's stored credential can no longer be accepted.
 5. Open the ChatGPT conversation you want to use as the Anchor. No Project/workspace binding step is required.
-6. Click **Discover available ChatGPT models**, choose a confirmed model and reasoning effort, and save the worker profile.
+6. Click **Discover available ChatGPT models**, choose a confirmed model and reasoning effort, and save the worker profile. Discovery reads ChatGPT's provider-owned picker state and supports the current effort lanes (`Instant`, `Minimal`, `Low`, `Medium`, `High`, `Extra High`, `Max`, `Ultra`, and `Pro`) when the account offers them. Existing `Extra High` profiles remain compatible with the provider's `xhigh`/`max` migration.
 
-Placement is automatic. If the Anchor is inside a ChatGPT Project, a fresh worker starts in that exact `g-p-...` Project ID. If the Anchor is an ordinary ChatGPT conversation, a fresh worker starts as an ordinary ChatGPT conversation. Later tasks for the same durable worker reuse its exact confirmed worker conversation.
+Placement is automatic. If the Anchor is inside a ChatGPT Project, MoonDesk opens that exact Anchor conversation first and follows its native Project link, then proves the resulting `g-p-...` Project home before inserting anything; it does not rely on a cold direct Project-home load. If the Anchor is an ordinary ChatGPT conversation, a fresh worker starts as an ordinary ChatGPT conversation. Later tasks for the same durable worker reuse its exact confirmed worker conversation.
 
 Multiple Chromium browser installations can remain paired at once. Fresh workers are routed to the browser that positively observes the exact Anchor conversation; once a worker thread exists, reuse stays pinned to the browser that owns that exact worker thread unless a safe recovery path is established.
 

@@ -55,30 +55,42 @@ uuid_id!(ManagedChatLeaseId);
 #[serde(rename_all = "snake_case")]
 pub enum ReasoningEffort {
     Instant,
+    Minimal,
     Low,
     Medium,
     High,
     ExtraHigh,
+    Max,
+    Ultra,
+    Pro,
 }
 
 impl ReasoningEffort {
     pub const fn label(self) -> &'static str {
         match self {
             Self::Instant => "Instant",
+            Self::Minimal => "Minimal",
             Self::Low => "Low",
             Self::Medium => "Medium",
             Self::High => "High",
             Self::ExtraHigh => "Extra High",
+            Self::Max => "Max",
+            Self::Ultra => "Ultra",
+            Self::Pro => "Pro",
         }
     }
 
     pub const fn next(self) -> Self {
         match self {
-            Self::Instant => Self::Low,
+            Self::Instant => Self::Minimal,
+            Self::Minimal => Self::Low,
             Self::Low => Self::Medium,
             Self::Medium => Self::High,
             Self::High => Self::ExtraHigh,
-            Self::ExtraHigh => Self::Instant,
+            Self::ExtraHigh => Self::Max,
+            Self::Max => Self::Ultra,
+            Self::Ultra => Self::Pro,
+            Self::Pro => Self::Instant,
         }
     }
 }
@@ -431,5 +443,34 @@ impl ManagedChatStoreData {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ReasoningEffort;
+
+    #[test]
+    fn reasoning_effort_serde_keeps_legacy_and_current_provider_values_stable() {
+        assert_eq!(
+            serde_json::from_str::<ReasoningEffort>("\"extra_high\"").expect("legacy extra high"),
+            ReasoningEffort::ExtraHigh
+        );
+        assert_eq!(
+            serde_json::from_str::<ReasoningEffort>("\"max\"").expect("current max"),
+            ReasoningEffort::Max
+        );
+        assert_eq!(
+            serde_json::from_str::<ReasoningEffort>("\"pro\"").expect("current pro"),
+            ReasoningEffort::Pro
+        );
+        assert_eq!(
+            serde_json::to_string(&ReasoningEffort::Minimal).expect("minimal serialization"),
+            "\"minimal\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ReasoningEffort::Ultra).expect("ultra serialization"),
+            "\"ultra\""
+        );
     }
 }

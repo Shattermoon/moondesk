@@ -79,6 +79,18 @@
     if (!(await DOM.selectModelSettings(launch.executionProfile))) {
       return { state: 'failed', reason: 'model_or_effort_unconfirmed' };
     }
+    // Chat/Work/model transitions can replace or temporarily disable the composer after the
+    // picker has already confirmed the selection. Reacquire a writable host before any marker
+    // inspection or prompt insertion instead of trusting the pre-picker editor instance.
+    if (!(await DOM.waitForComposerReady(15000))) {
+      return { state: 'failed', reason: 'composer_after_model_not_ready' };
+    }
+    if (existingThread && !DOM.conversationIdFromPath()) {
+      return { state: 'failed', reason: 'worker_conversation_changed_after_model' };
+    }
+    if (!existingThread && expectedProjectId && DOM.projectIdFromPath() !== expectedProjectId) {
+      return { state: 'failed', reason: 'worker_project_changed_after_model' };
+    }
     const selection = await DOM.selectedModelAndEffort(launch.executionProfile);
     if (!selection) {
       return { state: 'failed', reason: 'model_or_effort_readback_unconfirmed' };
@@ -139,6 +151,34 @@
     return { state: 'needs_reconcile', reason: 'task_marker_still_unconfirmed', conversationUrl: location.href };
   }
 
+  async function inspectModelCatalogRequest(message) {
+    const nonce = typeof message?.nonce === 'string' ? message.nonce : '';
+    const expiresAt = Number(message?.expiresAt);
+    let helperNonce = '';
+    try {
+      helperNonce = new URL(location.href).searchParams.get('moondesk-model-catalog') || '';
+    } catch {}
+    if (!/^[a-f0-9-]{36}$/i.test(nonce) || helperNonce !== nonce || !Number.isFinite(expiresAt)) {
+      return { ok: false, error: 'catalog_helper_identity_unconfirmed' };
+    }
+    const stillCurrent = () =>
+      Date.now() < expiresAt &&
+      location.origin === 'https://chatgpt.com' &&
+      location.pathname === '/' &&
+      !DOM.conversationIdFromPath();
+    if (!stillCurrent()) return { ok: false, error: 'catalog_helper_changed' };
+    const readyMs = Math.max(0, Math.min(15000, expiresAt - Date.now()));
+    if (!readyMs || !(await DOM.waitForComposerReady(readyMs, stillCurrent))) {
+      return { ok: false, error: 'catalog_composer_not_ready' };
+    }
+    let failure = null;
+    const catalog = await DOM.inspectModelSettings(stillCurrent, (reason) => { failure ??= reason; });
+    if (!catalog || !stillCurrent()) {
+      return { ok: false, error: failure || (Date.now() >= expiresAt ? 'catalog_deadline' : 'catalog_unconfirmed') };
+    }
+    return { ok: true, catalog };
+  }
+
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     if (!message || typeof message.type !== 'string') return false;
     if (message.type === 'MOONDESK_CONTEXT') {
@@ -152,8 +192,8 @@
       return true;
     }
     if (message.type === 'MOONDESK_MODEL_CATALOG') {
-      void DOM.inspectModelSettings()
-        .then((catalog) => sendResponse({ ok: Boolean(catalog), catalog }))
+      void inspectModelCatalogRequest(message)
+        .then(sendResponse)
         .catch((error) => sendResponse({ ok: false, error: String(error?.message || error) }));
       return true;
     }

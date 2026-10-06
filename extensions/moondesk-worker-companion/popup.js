@@ -6,17 +6,25 @@ let currentProfile = null;
 
 const PROVIDER_TO_CONFIG_EFFORT = {
   none: 'instant',
+  minimal: 'minimal',
   low: 'low',
   medium: 'medium',
   high: 'high',
-  xhigh: 'extra_high'
+  xhigh: 'extra_high',
+  max: 'max',
+  ultra: 'ultra',
+  pro: 'pro'
 };
 const CONFIG_EFFORT_LABEL = {
   instant: 'Instant',
+  minimal: 'Minimal',
   low: 'Low',
   medium: 'Medium',
   high: 'High',
-  extra_high: 'Extra High'
+  extra_high: 'Extra High',
+  max: 'Max',
+  ultra: 'Ultra',
+  pro: 'Pro'
 };
 
 async function bg(message) {
@@ -57,14 +65,11 @@ async function currentChatContext() {
 }
 
 async function currentModelCatalog() {
-  const tab = await activeChatTab();
-  if (!tab) throw new Error('Open ChatGPT before discovering models');
-  await ensureChatScripts(tab.id);
-  const response = await chrome.tabs.sendMessage(tab.id, { type: 'MOONDESK_MODEL_CATALOG' });
-  if (!response?.ok || !Array.isArray(response.catalog)) {
-    throw new Error(response?.error || 'Could not confirm ChatGPT model catalog');
+  const catalog = await bg({ type: 'MOONDESK_DISCOVER_MODELS' });
+  if (!Array.isArray(catalog) || !catalog.length) {
+    throw new Error('Could not confirm ChatGPT model catalog');
   }
-  return response.catalog;
+  return catalog;
 }
 
 async function loadCachedModelCatalog() {
@@ -151,7 +156,12 @@ function renderEfforts() {
     select.append(option);
   }
   if (profileBelongsToModel(currentProfile, selectedModel)) {
-    const matching = [...select.options].find((option) => option.value === currentProfile.reasoningEffort);
+    let matching = [...select.options].find((option) => option.value === currentProfile.reasoningEffort);
+    // Legacy saved Extra High profiles remain usable when the current picker exposes the same
+    // lane as Max. Prefer the exact legacy xhigh option whenever the provider still offers it.
+    if (!matching && currentProfile.reasoningEffort === 'extra_high') {
+      matching = [...select.options].find((option) => option.value === 'max');
+    }
     if (matching) select.value = matching.value;
   }
   $('effortLabel').hidden = efforts.length === 0;

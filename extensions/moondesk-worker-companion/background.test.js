@@ -9,15 +9,18 @@ const backgroundPath = path.join(__dirname, 'background.js');
 const serverPath = path.join(__dirname, '..', '..', 'src', 'server.rs');
 const manifestPath = path.join(__dirname, 'manifest.json');
 const modelStateMainPath = path.join(__dirname, 'model-state-main.js');
+const chatgptDomPath = path.join(__dirname, 'chatgpt-dom.js');
 const contentPath = path.join(__dirname, 'content.js');
 const source = fs.readFileSync(backgroundPath, 'utf8');
 const modelStateMainSource = fs.readFileSync(modelStateMainPath, 'utf8');
+const chatgptDomSource = fs.readFileSync(chatgptDomPath, 'utf8');
 const contentSource = fs.readFileSync(contentPath, 'utf8');
 const serverSource = fs.readFileSync(serverPath, 'utf8');
 const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
 
 function loadBackground({ existingTabs = {}, contentByTab = {}, sendMessageImpl = null, fetchImpl = async () => { throw new Error('network not used'); }, setTimeoutImpl = null } = {}) {
   const createdTabs = [];
+  const removedTabs = [];
   let stored = {};
 
   const chrome = {
@@ -36,10 +39,20 @@ function loadBackground({ existingTabs = {}, contentByTab = {}, sendMessageImpl 
         return Object.values(existingTabs);
       },
       async create(options) {
-        const tab = { id: 101 + createdTabs.length, url: options.url };
+        const tab = { id: 101 + createdTabs.length, url: options.url, active: options.active !== false };
         createdTabs.push(tab);
         existingTabs[tab.id] = tab;
         return tab;
+      },
+      async update(id, changes) {
+        if (!existingTabs[id]) throw new Error('missing tab');
+        existingTabs[id] = { ...existingTabs[id], ...changes };
+        return existingTabs[id];
+      },
+      async remove(id) {
+        if (!existingTabs[id]) throw new Error('missing tab');
+        removedTabs.push(id);
+        delete existingTabs[id];
       },
       async sendMessage(id, message) {
         if (sendMessageImpl) return sendMessageImpl(id, message, { existingTabs, createdTabs });
@@ -83,6 +96,7 @@ function loadBackground({ existingTabs = {}, contentByTab = {}, sendMessageImpl 
 
   return {
     createdTabs,
+    removedTabs,
     evaluate(expression) {
       return vm.runInContext(expression, context);
     }
@@ -201,7 +215,7 @@ test('MAIN-world correlation reader joins metadata.request_id only to the exact 
     window: pageWindow,
     document: {
       querySelectorAll(selector) {
-        return selector === 'section[data-testid^="conversation-turn"]'
+        return selector.includes('section[data-testid^="conversation-turn"]')
           ? [staleSection, exactSection]
           : [];
       },
@@ -229,6 +243,318 @@ test('MAIN-world correlation reader joins metadata.request_id only to the exact 
     ['wfr_exact_request', 'wfr_second_request']
   );
   assert.ok(!reply.correlation.requestIds.includes('wfr_stale_request'));
+});
+
+test('MAIN-world correlation reader scans the current shell turn shape', () => {
+  const conversationId = '8ccd9eb1-4b10-83ee-97bd-d98b338864de';
+  const shellTurn = {};
+  shellTurn.__reactFiber$shell = {
+    memoizedProps: {
+      clientThreadId: conversationId,
+      turn: {
+        conversationId,
+        messages: [{ id: 'shell-message', metadata: { request_id: 'wfr_shell_request/attempt-2' } }]
+      }
+    },
+    return: null
+  };
+
+  let messageHandler = null;
+  const posted = [];
+  const pageWindow = {
+    addEventListener(type, handler) {
+      if (type === 'message') messageHandler = handler;
+    },
+    postMessage(message) { posted.push(message); }
+  };
+  const context = vm.createContext({
+    window: pageWindow,
+    document: {
+      querySelectorAll(selector) {
+        return selector.includes('[data-turn-key]') ? [shellTurn] : [];
+      },
+      querySelector() { return null; }
+    },
+    location: {
+      origin: 'https://chatgpt.com',
+      pathname: '/c/' + conversationId
+    }
+  });
+
+  vm.runInContext(modelStateMainSource, context, { filename: modelStateMainPath });
+  messageHandler({
+    source: pageWindow,
+    origin: 'https://chatgpt.com',
+    data: { source: 'moondesk-correlation-ask', nonce: 'shell-correlation', v: 1 }
+  });
+
+  const reply = posted.find((message) => message.source === 'moondesk-correlation-reply');
+  assert.ok(reply?.correlation, 'current shell turn must produce correlation evidence');
+  assert.equal(reply.correlation.conversationId, conversationId);
+  assert.deepEqual(Array.from(reply.correlation.requestIds), ['wfr_shell_request']);
+});
+
+test('MAIN-world model reader understands the current shell power-selection picker', () => {
+  const trigger = {
+    id: '',
+    isConnected: true,
+    __reactFiber$test: {
+      memoizedProps: {
+        selectedPowerSelection: {
+          model: 'gpt-5.6-sol',
+          modelLabel: 'GPT-5.6 Sol',
+          powerSettingIndex: 2,
+          labels: { effort: 'Max' },
+          reasoningEffort: 'max'
+        },
+        powerSelections: [
+          {
+            model: 'gpt-5.6-sol',
+            modelLabel: 'GPT-5.6 Sol',
+            powerSettingIndex: 0,
+            labels: { effort: 'Medium' },
+            reasoningEffort: 'medium',
+            availability: { status: 'available' }
+          },
+          {
+            model: 'gpt-5.6-sol',
+            modelLabel: 'GPT-5.6 Sol',
+            powerSettingIndex: 1,
+            labels: { effort: 'High' },
+            reasoningEffort: 'high',
+            availability: { status: 'available' }
+          },
+          {
+            model: 'gpt-5.6-sol',
+            modelLabel: 'GPT-5.6 Sol',
+            powerSettingIndex: 2,
+            labels: { effort: 'Max' },
+            reasoningEffort: 'max',
+            availability: { status: 'available' }
+          }
+        ],
+        modelListConfig: {
+          options: [{ id: 'gpt-5.6', label: 'GPT-5.6', selected: true }]
+        },
+        modelSelectionDisabled: false,
+        modelSwitcherDenialsBySlug: {}
+      },
+      return: null
+    },
+    matches(selector) {
+      return selector.includes('data-codex-intelligence-trigger') || selector.includes('button');
+    },
+    closest() { return null; },
+    getClientRects() { return [{ width: 1, height: 1 }]; },
+    attributes: Object.create(null),
+    getAttribute(name) {
+      if (name === 'data-codex-intelligence-trigger') return '';
+      return this.attributes[name] ?? null;
+    },
+    setAttribute(name, value) { this.attributes[name] = String(value); },
+    removeAttribute(name) { delete this.attributes[name]; },
+    textContent: 'Max'
+  };
+  const panel = {
+    attributes: Object.create(null),
+    getAttribute(name) { return this.attributes[name] ?? null; },
+    setAttribute(name, value) { this.attributes[name] = String(value); },
+    removeAttribute(name) { delete this.attributes[name]; }
+  };
+
+  let messageHandler = null;
+  const posted = [];
+  const pageWindow = {
+    addEventListener(type, handler) {
+      if (type === 'message') messageHandler = handler;
+    },
+    postMessage(message) { posted.push(message); }
+  };
+  const context = vm.createContext({
+    window: pageWindow,
+    document: {
+      querySelector(selector) {
+        if (selector.includes('data-model-picker-view')) return panel;
+        if (selector.includes('data-codex-intelligence-trigger')) return trigger;
+        return null;
+      },
+      querySelectorAll(selector) {
+        if (selector.includes('data-codex-intelligence-trigger')) return [trigger];
+        return [];
+      }
+    },
+    location: {
+      origin: 'https://chatgpt.com',
+      pathname: '/'
+    }
+  });
+
+  vm.runInContext(modelStateMainSource, context, { filename: modelStateMainPath });
+  messageHandler({
+    source: pageWindow,
+    origin: 'https://chatgpt.com',
+    data: { source: 'moondesk-picker-ask', nonce: 'shell-picker', v: 1 }
+  });
+
+  const reply = posted.find((message) => message.source === 'moondesk-picker-reply');
+  assert.ok(reply?.picker, `new shell picker state must be readable: ${JSON.stringify(posted)}`);
+  assert.equal(reply.picker.currentBucket, 2);
+  assert.equal(reply.picker.choices.length, 3);
+  assert.equal(reply.picker.choices[2].id, 'gpt-5.6-sol');
+  assert.equal(reply.picker.choices[2].effort, 'max');
+  assert.equal(trigger.attributes['data-moondesk-picker-route'], '/');
+  assert.equal(panel.attributes['data-moondesk-selected-model'], 'gpt-5.6-sol');
+  assert.equal(panel.attributes['data-moondesk-selected-effort'], 'max');
+});
+
+test('MAIN-world model reader uses the reported current-shell trigger as closed-picker selection proof', () => {
+  const trigger = {
+    id: '',
+    isConnected: true,
+    __reactFiber$closed: {
+      memoizedProps: { currentModelId: 'gpt-5.6-sol' },
+      return: null
+    },
+    attributes: { 'data-selected-reasoning-effort': 'max' },
+    matches(selector) {
+      return selector.includes('data-codex-intelligence-trigger') || selector.includes('button');
+    },
+    closest() { return null; },
+    getClientRects() { return [{ width: 1, height: 1 }]; },
+    getAttribute(name) { return this.attributes[name] ?? null; },
+    setAttribute(name, value) { this.attributes[name] = String(value); },
+    removeAttribute(name) { delete this.attributes[name]; },
+    textContent: 'Max'
+  };
+  let messageHandler = null;
+  const posted = [];
+  const pageWindow = {
+    addEventListener(type, handler) {
+      if (type === 'message') messageHandler = handler;
+    },
+    postMessage(message) { posted.push(message); }
+  };
+  const context = vm.createContext({
+    window: pageWindow,
+    document: {
+      querySelector() { return null; },
+      querySelectorAll(selector) {
+        return selector.includes('data-codex-intelligence-trigger') ? [trigger] : [];
+      }
+    },
+    location: { origin: 'https://chatgpt.com', pathname: '/' }
+  });
+
+  vm.runInContext(modelStateMainSource, context, { filename: modelStateMainPath });
+  messageHandler({
+    source: pageWindow,
+    origin: 'https://chatgpt.com',
+    data: { source: 'moondesk-picker-ask', nonce: 'closed-picker', v: 1 }
+  });
+
+  const reply = posted.find((message) => message.source === 'moondesk-picker-reply');
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(reply?.picker)),
+    { selected: { id: 'gpt-5.6-sol', effort: 'max' } }
+  );
+  assert.equal(trigger.attributes['data-moondesk-picker-route'], '/');
+  assert.equal(trigger.attributes['data-moondesk-selected-model'], 'gpt-5.6-sol');
+  assert.equal(trigger.attributes['data-moondesk-selected-effort'], 'max');
+});
+
+test('isolated model readback accepts a legacy Extra High profile when the current shell offers Max', async () => {
+  const picker = {
+    version: 'gpt-5.6',
+    currentBucket: 2,
+    versions: [{ id: 'gpt-5.6', label: 'GPT-5.6' }],
+    choices: [{
+      bucket: 2,
+      id: 'gpt-5.6-sol',
+      label: 'GPT-5.6 Sol',
+      familyId: 'gpt-5.6-sol',
+      familyLabel: 'GPT-5.6 Sol',
+      effort: 'max',
+      available: true
+    }]
+  };
+  const listeners = new Set();
+  const pageWindow = {
+    addEventListener(type, handler) {
+      if (type === 'message') listeners.add(handler);
+    },
+    removeEventListener(type, handler) {
+      if (type === 'message') listeners.delete(handler);
+    },
+    postMessage(message) {
+      if (message?.source !== 'moondesk-picker-ask') return;
+      for (const handler of [...listeners]) {
+        handler({
+          source: pageWindow,
+          origin: 'https://chatgpt.com',
+          data: { source: 'moondesk-picker-reply', nonce: message.nonce, v: 1, picker }
+        });
+      }
+    }
+  };
+  const context = vm.createContext({
+    window: pageWindow,
+    document: { querySelector() { return null; }, querySelectorAll() { return []; } },
+    location: { origin: 'https://chatgpt.com', pathname: '/' },
+    crypto: webcrypto,
+    URL,
+    setTimeout,
+    clearTimeout
+  });
+
+  vm.runInContext(chatgptDomSource, context, { filename: chatgptDomPath });
+  const selection = await pageWindow.MOONDESK_CHATGPT_DOM.selectedModelAndEffort({
+    modelKey: 'gpt-5.6-sol',
+    modelLabel: 'GPT-5.6 Sol',
+    reasoningEffort: 'extra_high'
+  });
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(selection)),
+    { model: 'gpt-5.6-sol', reasoningEffort: 'max' }
+  );
+});
+
+test('model discovery runs in one owned clean helper tab and closes it after a confirmed catalog', async () => {
+  const existingTabs = {
+    7: { id: 7, url: 'https://chatgpt.com/g/g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-moondesk/c/anchor', active: true }
+  };
+  const seen = [];
+  const catalog = [{
+    id: 'gpt-5.6-sol',
+    label: 'GPT-5.6 Sol',
+    efforts: ['high'],
+    aliases: ['gpt-5.6-sol'],
+    choices: [{ id: 'gpt-5.6-sol', effort: 'high' }]
+  }];
+  const { createdTabs, removedTabs, evaluate } = loadBackground({
+    existingTabs,
+    sendMessageImpl: async (id, message, { existingTabs: tabs }) => {
+      seen.push({ id, message });
+      if (message.type === 'MOONDESK_CONTEXT') return { ok: true, context: {} };
+      if (message.type === 'MOONDESK_MODEL_CATALOG') {
+        const helper = new URL(tabs[id].url);
+        assert.equal(helper.origin, 'https://chatgpt.com');
+        assert.equal(helper.pathname, '/');
+        assert.equal(helper.searchParams.get('moondesk-model-catalog'), message.nonce);
+        assert.ok(Number.isFinite(message.expiresAt) && message.expiresAt > Date.now());
+        return { ok: true, catalog };
+      }
+      throw new Error('unexpected message');
+    }
+  });
+
+  const result = await evaluate('discoverModelCatalog()');
+  assert.deepEqual(JSON.parse(JSON.stringify(result)), catalog);
+  assert.equal(createdTabs.length, 1);
+  assert.equal(createdTabs[0].active, false, 'discovery must not steal focus from the Anchor');
+  assert.match(createdTabs[0].url, /^https:\/\/chatgpt\.com\/\?moondesk-model-catalog=/);
+  assert.deepEqual(removedTabs, [createdTabs[0].id]);
+  assert.equal(existingTabs[7].url.includes('/c/anchor'), true, 'active Anchor tab must remain untouched');
+  assert.equal(seen.filter((entry) => entry.message.type === 'MOONDESK_MODEL_CATALOG').length, 1);
 });
 
 test('ChatGPT URL routing extracts exact conversation and Project IDs without using visible names', () => {
@@ -318,7 +644,7 @@ test('existing worker placement survives without Anchor presence by using its du
   assert.equal(placement.projectUrl, null);
 });
 
-test('new worker threads in a Project start from the exact Anchor Project home', () => {
+test('new worker threads in a Project start from the exact Anchor conversation before native Project entry', () => {
   const { evaluate } = loadBackground();
   const sourceUrlForCommand = evaluate('sourceUrlForCommand');
   const placement = {
@@ -326,7 +652,7 @@ test('new worker threads in a Project start from the exact Anchor Project home',
     projectUrl: 'https://chatgpt.com/g/g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-any-human-name/project',
     anchorConversationUrl: 'https://chatgpt.com/g/g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-any-human-name/c/anchor'
   };
-  assert.equal(sourceUrlForCommand(placement, 'new_thread', null), placement.projectUrl);
+  assert.equal(sourceUrlForCommand(placement, 'new_thread', null), placement.anchorConversationUrl);
 });
 
 test('new worker threads from normal Anchors start from normal ChatGPT home', () => {
@@ -385,7 +711,7 @@ test('uncertain reconciliation never adopts the inspected source conversation as
   );
 });
 
-test('record creation wires Project launches to exact Project ID and normal launches to normal home', async () => {
+test('record creation opens Project launches on the exact Anchor conversation and normal launches on normal home', async () => {
   const { createdTabs, evaluate } = loadBackground();
   const recordForCommand = evaluate('recordForCommand');
   const command = {
@@ -405,8 +731,8 @@ test('record creation wires Project launches to exact Project ID and normal laun
   };
   const state = { launchRecords: {}, threadRecords: {} };
   const { record } = await recordForCommand(state, command, projectPlacement);
-  assert.equal(record.sourceUrl, projectPlacement.projectUrl);
-  assert.match(createdTabs[0].url, /\/project#moondesk-launch=/);
+  assert.equal(record.sourceUrl, projectPlacement.anchorConversationUrl);
+  assert.match(createdTabs[0].url, /\/c\/anchor#moondesk-launch=/);
 
   const normalState = { launchRecords: {}, threadRecords: {} };
   const normalCommand = {
@@ -753,8 +1079,63 @@ test('existing-thread preparation waits for the recovered conversation composer 
 
   assert.equal(response.ok, true);
   assert.equal(response.result.state, 'ready');
-  assert.equal(waitCalls, 1);
+  assert.equal(waitCalls, 2, 'reuse waits once before model selection and reacquires the composer after it');
   assert.equal(selectCalls, 1);
+});
+
+test('model-catalog content request is helper-owned and returns a bounded readiness failure', async () => {
+  let messageHandler = null;
+  let inspectCalls = 0;
+  const nonce = '11111111-2222-4333-8444-555555555555';
+  const DOM = {
+    conversationIdFromPath() { return null; },
+    async waitForComposerReady(timeoutMs, stillCurrent) {
+      assert.ok(timeoutMs > 0 && timeoutMs <= 15000);
+      assert.equal(stillCurrent(), true);
+      return false;
+    },
+    async inspectModelSettings() {
+      inspectCalls += 1;
+      return [];
+    }
+  };
+  const pageWindow = { MOONDESK_CHATGPT_DOM: DOM };
+  const context = vm.createContext({
+    window: pageWindow,
+    sessionStorage: { setItem() {}, getItem() { return null; } },
+    location: {
+      origin: 'https://chatgpt.com',
+      hash: '',
+      pathname: '/',
+      search: `?moondesk-model-catalog=${nonce}`,
+      href: `https://chatgpt.com/?moondesk-model-catalog=${nonce}`
+    },
+    history: { state: null, replaceState() {} },
+    URL,
+    chrome: {
+      runtime: {
+        onMessage: {
+          addListener(handler) { messageHandler = handler; }
+        }
+      }
+    },
+    console
+  });
+  vm.runInContext(contentSource, context, { filename: contentPath });
+
+  const response = await new Promise((resolve) => {
+    const returned = messageHandler({
+      type: 'MOONDESK_MODEL_CATALOG',
+      nonce,
+      expiresAt: Date.now() + 5000
+    }, null, resolve);
+    assert.equal(returned, true);
+  });
+  assert.deepEqual(JSON.parse(JSON.stringify(response)), {
+    ok: false,
+    error: 'catalog_composer_not_ready'
+  });
+  assert.equal(inspectCalls, 0, 'picker inspection must not run before the clean helper composer is ready');
 });
 
 test('worker acceptance requires assistant activity after the task marker is posted', () => {

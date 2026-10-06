@@ -4,6 +4,9 @@ let currentContext = null;
 let modelCatalog = [];
 let currentProfile = null;
 
+const DEFAULT_WORKER_MODEL_ALIAS = 'gpt-5.6-sol';
+const DEFAULT_WORKER_EFFORT = 'high';
+
 const PROVIDER_TO_CONFIG_EFFORT = {
   none: 'instant',
   minimal: 'minimal',
@@ -144,6 +147,15 @@ function profileBelongsToModel(profile, model) {
   );
 }
 
+function isPreferredDefaultModel(model) {
+  return Boolean(
+    model &&
+    (model.id === DEFAULT_WORKER_MODEL_ALIAS ||
+      (model.choices || []).some((choice) => choice.id === DEFAULT_WORKER_MODEL_ALIAS)) &&
+    supportedEfforts(model).some((effort) => effort.config === DEFAULT_WORKER_EFFORT)
+  );
+}
+
 function renderEfforts() {
   const selectedModel = modelCatalog.find((entry) => entry.id === $('model').value);
   const efforts = supportedEfforts(selectedModel);
@@ -163,6 +175,9 @@ function renderEfforts() {
       matching = [...select.options].find((option) => option.value === 'max');
     }
     if (matching) select.value = matching.value;
+  } else if (isPreferredDefaultModel(selectedModel)) {
+    const preferred = [...select.options].find((option) => option.value === DEFAULT_WORKER_EFFORT);
+    if (preferred) select.value = preferred.value;
   }
   $('effortLabel').hidden = efforts.length === 0;
   $('saveProfile').hidden = efforts.length === 0;
@@ -186,7 +201,9 @@ function renderCatalog() {
     return;
   }
   const configured = usable.find((model) => profileBelongsToModel(currentProfile, model));
-  if (configured) select.value = configured.id;
+  const preferredDefault = usable.find(isPreferredDefaultModel);
+  const selected = configured || preferredDefault || usable[0];
+  if (selected) select.value = selected.id;
   $('catalogStatus').textContent = `${usable.length} available model famil${usable.length === 1 ? 'y' : 'ies'} confirmed from this ChatGPT account.`;
   renderEfforts();
 }

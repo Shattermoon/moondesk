@@ -11,10 +11,12 @@ const manifestPath = path.join(__dirname, 'manifest.json');
 const modelStateMainPath = path.join(__dirname, 'model-state-main.js');
 const chatgptDomPath = path.join(__dirname, 'chatgpt-dom.js');
 const contentPath = path.join(__dirname, 'content.js');
+const popupPath = path.join(__dirname, 'popup.js');
 const source = fs.readFileSync(backgroundPath, 'utf8');
 const modelStateMainSource = fs.readFileSync(modelStateMainPath, 'utf8');
 const chatgptDomSource = fs.readFileSync(chatgptDomPath, 'utf8');
 const contentSource = fs.readFileSync(contentPath, 'utf8');
+const popupSource = fs.readFileSync(popupPath, 'utf8');
 const serverSource = fs.readFileSync(serverPath, 'utf8');
 const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
 
@@ -573,6 +575,63 @@ test('model catalog merges duplicate execution slugs into one visible family wit
     { id: 'gpt-5.5', effort: 'medium' },
     { id: 'gpt-5.5', effort: 'high' }
   ]);
+});
+
+test('popup defaults discovered workers to GPT-5.6 Sol High instead of catalog order', () => {
+  const makeSelect = () => {
+    const select = {
+      options: [],
+      value: '',
+      append(option) {
+        this.options.push(option);
+        if (this.options.length === 1) this.value = option.value;
+      }
+    };
+    Object.defineProperty(select, 'textContent', {
+      get() { return ''; },
+      set() { select.options = []; select.value = ''; }
+    });
+    return select;
+  };
+  const elements = {
+    model: makeSelect(),
+    effort: makeSelect(),
+    modelLabel: { hidden: true },
+    effortLabel: { hidden: true },
+    saveProfile: { hidden: true },
+    catalogStatus: { textContent: '' }
+  };
+  const document = {
+    getElementById(id) { return elements[id]; },
+    createElement() { return { value: '', textContent: '' }; }
+  };
+  const prefix = popupSource.slice(0, popupSource.indexOf('async function render()'));
+  const context = vm.createContext({ document, console });
+  vm.runInContext(prefix, context, { filename: popupPath });
+  const catalog = [
+    {
+      id: '5.5', label: '5.5', choices: [
+        { id: 'gpt-5.5-instant', effort: 'none' },
+        { id: 'gpt-5.5', effort: 'medium' },
+        { id: 'gpt-5.5', effort: 'high' }
+      ]
+    },
+    {
+      id: '5.6', label: '5.6', choices: [
+        { id: 'gpt-5.6-instant', effort: 'none' },
+        { id: 'gpt-5.6-sol', effort: 'medium' },
+        { id: 'gpt-5.6-sol', effort: 'high' }
+      ]
+    }
+  ];
+
+  vm.runInContext(`modelCatalog = ${JSON.stringify(catalog)}; currentProfile = null; renderCatalog();`, context);
+  assert.equal(elements.model.value, '5.6');
+  assert.equal(elements.effort.value, 'high');
+
+  vm.runInContext(`currentProfile = { modelKey: 'gpt-5.5', modelLabel: '5.5', reasoningEffort: 'medium' }; renderCatalog();`, context);
+  assert.equal(elements.model.value, '5.5', 'an explicitly saved profile remains authoritative');
+  assert.equal(elements.effort.value, 'medium');
 });
 
 test('model discovery runs in one owned clean helper tab and closes it after a confirmed catalog', async () => {

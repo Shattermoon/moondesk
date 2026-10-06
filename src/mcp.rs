@@ -1104,8 +1104,18 @@ async fn handle_tools_call_for_workspace(
         let anchor_route = if arguments.get("action").and_then(Value::as_str) == Some("spawn") {
             match companion_auth.as_ref() {
                 Some(auth) => {
+                    let routing_started_ms = crate::companion::unix_time_ms();
                     let route = if let Some(request_id) = inbound_request_id.as_deref() {
-                        auth.correlation_for(request_id).await
+                        match auth
+                            .wait_for_correlation(
+                                request_id,
+                                std::time::Duration::from_millis(3_200),
+                            )
+                            .await
+                        {
+                            Ok(route) => route,
+                            Err(error) => return tool_error_response_text_only(req, error),
+                        }
                     } else {
                         None
                     };
@@ -1123,7 +1133,6 @@ async fn handle_tools_call_for_workspace(
                     {
                         Some(route)
                     } else {
-                        let routing_started_ms = crate::companion::unix_time_ms();
                         match auth
                             .wait_for_generating_anchor_after(
                                 routing_started_ms,
@@ -4226,22 +4235,6 @@ mod tests {
 
         let request_id = "wfr_exact_worker_spawn";
         let wrong_correlation_conversation = "6aad7eb1-4b10-83ee-97bd-d98b338864de";
-        companion_auth
-            .observe_correlations(
-                "chrome-install",
-                crate::companion::CompanionCorrelationUpdate {
-                    conversation_id: wrong_correlation_conversation.into(),
-                    conversation_url: format!(
-                        "https://chatgpt.com/c/{wrong_correlation_conversation}"
-                    ),
-                    project_id: None,
-                    project_url: None,
-                    request_ids: vec![request_id.into()],
-                },
-                100,
-            )
-            .await
-            .expect("publish stale browser correlation");
 
         companion_auth
             .update_presence(
@@ -4286,6 +4279,27 @@ mod tests {
             .await
             .expect("edge generating presence");
 
+        let delayed_auth = companion_auth.clone();
+        let delayed_request_id = request_id.to_string();
+        let delayed_conversation = wrong_correlation_conversation.to_string();
+        let correlation_task = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+            delayed_auth
+                .observe_correlations(
+                    "chrome-install",
+                    crate::companion::CompanionCorrelationUpdate {
+                        conversation_id: delayed_conversation.clone(),
+                        conversation_url: format!("https://chatgpt.com/c/{delayed_conversation}"),
+                        project_id: None,
+                        project_url: None,
+                        request_ids: vec![delayed_request_id],
+                    },
+                    crate::companion::unix_time_ms(),
+                )
+                .await
+                .expect("publish delayed exact correlation");
+        });
+
         let opaque_openai_session = "opaque-openai-session-not-browser-url";
         let request = tool_call_request_with_session(
             "workers",
@@ -4320,6 +4334,7 @@ mod tests {
             },
         )
         .await;
+        correlation_task.await.expect("delayed correlation task");
         assert_ne!(
             response
                 .result

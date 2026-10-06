@@ -779,7 +779,6 @@ impl CompanionAuth {
             .map(|(route, _)| route.clone())
     }
 
-    #[cfg(test)]
     pub async fn wait_for_correlation(
         &self,
         request_id: &str,

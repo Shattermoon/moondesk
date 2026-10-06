@@ -1227,6 +1227,54 @@ async function closeModelCatalogHelper(tabId, nonce) {
   } catch {}
 }
 
+function modelCatalogFamilyKey(label) {
+  const normalized = String(label || '')
+    .trim()
+    .toLowerCase()
+    .replace(/^gpt[\s_-]*/i, '')
+    .replace(/[^a-z0-9.]+/g, '');
+  return normalized || null;
+}
+
+function normalizeModelCatalog(catalog) {
+  const families = new Map();
+  for (const model of Array.isArray(catalog) ? catalog : []) {
+    const key = modelCatalogFamilyKey(model?.label);
+    if (!key) continue;
+    const choices = Array.isArray(model?.choices) ? model.choices : [];
+    const aliases = Array.isArray(model?.aliases) ? model.aliases : [];
+    let family = families.get(key);
+    if (!family) {
+      family = {
+        id: typeof model?.id === 'string' && model.id ? model.id : key,
+        label: String(model?.label || '').trim(),
+        efforts: [],
+        aliases: [],
+        choices: []
+      };
+      families.set(key, family);
+    }
+    for (const alias of aliases) {
+      if (typeof alias === 'string' && alias && !family.aliases.includes(alias)) family.aliases.push(alias);
+    }
+    if (typeof model?.id === 'string' && model.id && !family.aliases.includes(model.id)) {
+      family.aliases.push(model.id);
+    }
+    for (const choice of choices) {
+      if (!choice || typeof choice.id !== 'string' || !choice.id || typeof choice.effort !== 'string' || !choice.effort) continue;
+      if (!family.aliases.includes(choice.id)) family.aliases.push(choice.id);
+      if (!family.efforts.includes(choice.effort)) family.efforts.push(choice.effort);
+      if (!family.choices.some((entry) => entry.id === choice.id && entry.effort === choice.effort)) {
+        family.choices.push({ id: choice.id, effort: choice.effort });
+      }
+    }
+    for (const effort of Array.isArray(model?.efforts) ? model.efforts : []) {
+      if (typeof effort === 'string' && effort && !family.efforts.includes(effort)) family.efforts.push(effort);
+    }
+  }
+  return [...families.values()].filter((family) => family.choices.length > 0);
+}
+
 async function discoverModelCatalog() {
   if (modelCatalogFlight) return modelCatalogFlight;
   modelCatalogFlight = (async () => {
@@ -1249,7 +1297,9 @@ async function discoverModelCatalog() {
         const reason = response?.error || 'catalog_unconfirmed';
         throw new Error(`Could not confirm ChatGPT model catalog (${reason})`);
       }
-      return response.catalog;
+      const catalog = normalizeModelCatalog(response.catalog);
+      if (!catalog.length) throw new Error('Could not confirm ChatGPT model catalog (catalog_empty_after_normalization)');
+      return catalog;
     } finally {
       if (tab?.id) await closeModelCatalogHelper(tab.id, nonce);
     }

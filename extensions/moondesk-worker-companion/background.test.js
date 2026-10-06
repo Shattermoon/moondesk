@@ -518,6 +518,63 @@ test('isolated model readback accepts a legacy Extra High profile when the curre
   );
 });
 
+test('model catalog merges duplicate execution slugs into one visible family with all efforts', () => {
+  const { evaluate } = loadBackground();
+  const normalize = evaluate('normalizeModelCatalog');
+  const raw = [
+    {
+      id: 'gpt-5.6-instant',
+      label: '5.6',
+      efforts: ['none'],
+      aliases: ['gpt-5.6-instant'],
+      choices: [{ id: 'gpt-5.6-instant', effort: 'none' }]
+    },
+    {
+      id: 'gpt-5.6-sol',
+      label: '5.6',
+      efforts: ['medium', 'high'],
+      aliases: ['gpt-5.6-sol'],
+      choices: [
+        { id: 'gpt-5.6-sol', effort: 'medium' },
+        { id: 'gpt-5.6-sol', effort: 'high' }
+      ]
+    },
+    {
+      id: 'gpt-5.5-instant',
+      label: 'GPT-5.5',
+      efforts: ['none'],
+      aliases: ['gpt-5.5-instant'],
+      choices: [{ id: 'gpt-5.5-instant', effort: 'none' }]
+    },
+    {
+      id: 'gpt-5.5',
+      label: '5.5',
+      efforts: ['medium', 'high'],
+      aliases: ['gpt-5.5'],
+      choices: [
+        { id: 'gpt-5.5', effort: 'medium' },
+        { id: 'gpt-5.5', effort: 'high' }
+      ]
+    }
+  ];
+
+  const catalog = JSON.parse(JSON.stringify(normalize(raw)));
+  assert.equal(catalog.length, 2);
+  assert.deepEqual(catalog.map((entry) => entry.label), ['5.6', 'GPT-5.5']);
+  assert.deepEqual(catalog[0].efforts, ['none', 'medium', 'high']);
+  assert.deepEqual(catalog[0].choices, [
+    { id: 'gpt-5.6-instant', effort: 'none' },
+    { id: 'gpt-5.6-sol', effort: 'medium' },
+    { id: 'gpt-5.6-sol', effort: 'high' }
+  ]);
+  assert.deepEqual(catalog[1].efforts, ['none', 'medium', 'high']);
+  assert.deepEqual(catalog[1].choices, [
+    { id: 'gpt-5.5-instant', effort: 'none' },
+    { id: 'gpt-5.5', effort: 'medium' },
+    { id: 'gpt-5.5', effort: 'high' }
+  ]);
+});
+
 test('model discovery runs in one owned clean helper tab and closes it after a confirmed catalog', async () => {
   const existingTabs = {
     7: { id: 7, url: 'https://chatgpt.com/g/g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-moondesk/c/anchor', active: true }

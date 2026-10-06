@@ -1781,7 +1781,7 @@ test('companion starts a four-worker launch batch concurrently and isolates fail
   );
 });
 
-test('four fresh Project launches do not overlap the fragile bootstrap stage', async () => {
+test('a hung Project worker does not block three sibling launches from reaching Send', async () => {
   const projectId = 'g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
   const commands = Array.from({ length: 4 }, (_, index) => {
     const suffix = String(index + 1).padStart(12, '0');
@@ -1813,15 +1813,16 @@ test('four fresh Project launches do not overlap the fragile bootstrap stage', a
   const commandById = new Map(commands.map((command) => [command.id, command]));
   const indexById = new Map(commands.map((command, index) => [command.id, index]));
   const rememberedByTab = new Map();
-  const poisonedTabs = new Set();
   const ackPayloads = [];
-  let activeProjectBootstraps = 0;
-  let maxActiveProjectBootstraps = 0;
+  const sendStartedCommandIds = [];
+  let releaseHungWorker;
+  const hungWorkerGate = new Promise((resolve) => { releaseHungWorker = resolve; });
 
   const fetchImpl = async (url, options = {}) => {
     const parsed = new URL(url);
     const body = options.body ? JSON.parse(options.body) : {};
     if (parsed.pathname === '/__moondesk/companion/v1/commands/send-started') {
+      sendStartedCommandIds.push(body.commandId);
       const command = commandById.get(body.commandId);
       return {
         ok: true,
@@ -1872,18 +1873,14 @@ test('four fresh Project launches do not overlap the fragile bootstrap stage', a
         workspaceId: message.launch.workspaceId,
         threadKey: message.launch.threadKey
       });
-      activeProjectBootstraps += 1;
-      maxActiveProjectBootstraps = Math.max(maxActiveProjectBootstraps, activeProjectBootstraps);
-      if (activeProjectBootstraps > 1) poisonedTabs.add(tabId);
-      await new Promise((resolve) => setImmediate(resolve));
-      activeProjectBootstraps -= 1;
-
-      if (poisonedTabs.has(tabId)) {
+      if (message.commandId === commands[0].id) {
+        await hungWorkerGate;
         return {
           ok: true,
           result: { state: 'failed', reason: 'project_entry_unconfirmed' }
         };
       }
+      await new Promise((resolve) => setImmediate(resolve));
       return {
         ok: true,
         result: {
@@ -1958,45 +1955,30 @@ test('four fresh Project launches do not overlap the fragile bootstrap stage', a
     bindings: {}
   };
 
-  const outcomes = await processCommandBatch(
+  const batch = processCommandBatch(
     state,
     commands.map((command) => ({ command, reconcileRequired: false }))
   );
 
+  for (let attempt = 0; attempt < 20 && sendStartedCommandIds.length < 3; attempt += 1) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert.deepEqual(
+    Array.from(sendStartedCommandIds).sort(),
+    commands.slice(1).map((command) => command.id).sort(),
+    'workers B/C/D must cross the durable Send boundary while worker A is still hung in preparation'
+  );
+  assert.equal(state.launchRecords[commands[0].id].phase, 'created');
+
+  releaseHungWorker();
+  const outcomes = await batch;
   assert.deepEqual(
     Array.from(outcomes, (outcome) => outcome.status),
     ['fulfilled', 'fulfilled', 'fulfilled', 'fulfilled']
   );
-  assert.equal(
-    maxActiveProjectBootstraps,
-    1,
-    'fresh Project initialization must be serialized even while worker commands remain concurrently active'
-  );
-  assert.equal(ackPayloads.filter((payload) => payload.outcome === 'succeeded').length, 4);
-  assert.equal(ackPayloads.filter((payload) => payload.outcome === 'failed').length, 0);
-});
-
-test('Project bootstrap slot hands off to the next launch and becomes reusable after release', async () => {
-  const { evaluate } = loadBackground();
-  const acquireProjectBootstrapSlot = evaluate('acquireProjectBootstrapSlot');
-
-  const releaseFirst = await acquireProjectBootstrapSlot();
-  let secondEntered = false;
-  const second = acquireProjectBootstrapSlot().then((release) => {
-    secondEntered = true;
-    return release;
-  });
-
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(secondEntered, false, 'a second fresh Project bootstrap must wait for the active slot');
-
-  releaseFirst();
-  const releaseSecond = await second;
-  assert.equal(secondEntered, true, 'releasing a bootstrap must hand the slot to the next waiter');
-
-  releaseSecond();
-  const releaseThird = await acquireProjectBootstrapSlot();
-  releaseThird();
+  assert.equal(ackPayloads.filter((payload) => payload.outcome === 'succeeded').length, 3);
+  assert.equal(ackPayloads.filter((payload) => payload.outcome === 'failed').length, 1);
+  assert.equal(state.launchRecords[commands[0].id].phase, 'failed');
 });
 
 test('blocked worker registry preserves independent concurrent launch failures', () => {

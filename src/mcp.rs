@@ -4354,7 +4354,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn workers_mcp_spawn_uses_generating_anchor_even_when_focus_is_elsewhere() {
+    async fn workers_mcp_spawn_ignores_unrelated_older_generating_companion() {
         let root = TestTempDir::new("moondesk-workers-mcp-focused-fallback");
         let workspace_root = root.path().join("workspace");
         std::fs::create_dir_all(&workspace_root).expect("create workspace");
@@ -4400,14 +4400,14 @@ mod tests {
                         project_id: None,
                         project_url: None,
                         active: true,
-                        window_focused: true,
-                        generating: false,
+                        window_focused: false,
+                        generating: true,
                     }],
                 },
-                crate::companion::unix_time_ms().saturating_add(10_000),
+                crate::companion::unix_time_ms(),
             )
             .await
-            .expect("chrome presence");
+            .expect("chrome generating presence");
 
         let edge_conversation = "7bbd8fc2-5c21-94ff-a8ce-e09c449975ef";
         companion_auth
@@ -4421,14 +4421,33 @@ mod tests {
                         project_id: None,
                         project_url: None,
                         active: true,
-                        window_focused: false,
+                        window_focused: true,
+                        generating: true,
+                    }],
+                },
+                crate::companion::unix_time_ms().saturating_sub(5_000),
+            )
+            .await
+            .expect("unrelated edge generating presence");
+        companion_auth
+            .update_presence(
+                "edge-install",
+                crate::companion::CompanionPresenceUpdate {
+                    browser_label: Some("Edge".into()),
+                    tabs: vec![crate::companion::CompanionTabPresence {
+                        conversation_id: edge_conversation.into(),
+                        conversation_url: format!("https://chatgpt.com/c/{edge_conversation}"),
+                        project_id: None,
+                        project_url: None,
+                        active: true,
+                        window_focused: true,
                         generating: true,
                     }],
                 },
                 crate::companion::unix_time_ms().saturating_add(10_000),
             )
             .await
-            .expect("edge presence");
+            .expect("unrelated edge refreshed generating presence");
 
         let request = tool_call_request_with_session(
             "workers",
@@ -4478,13 +4497,13 @@ mod tests {
             .values()
             .next()
             .expect("managed worker launch");
-        assert_eq!(command.target_client_id.as_deref(), Some("edge-install"));
+        assert_eq!(command.target_client_id.as_deref(), Some("chrome-install"));
         assert_eq!(
             command
                 .anchor_context
                 .as_ref()
                 .map(|context| context.conversation_id.as_str()),
-            Some(edge_conversation)
+            Some(chrome_conversation)
         );
     }
 

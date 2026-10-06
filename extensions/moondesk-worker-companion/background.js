@@ -14,7 +14,6 @@ const HELLO_TIMEOUT_MS = 1200;
 const FAST_POLL_MS = 1500;
 const MAX_RECONCILE_ATTEMPTS = 3;
 const MAX_PARALLEL_COMMANDS = 4;
-const MAX_PARALLEL_PROJECT_BOOTSTRAPS = 1;
 
 let pumpTimer = null;
 let pumpActive = false;
@@ -22,8 +21,6 @@ let connecting = null;
 let modelCatalogFlight = null;
 let stateWriteQueue = Promise.resolve();
 const sessionReconcileCommandIds = new Set();
-let availableProjectBootstrapSlots = MAX_PARALLEL_PROJECT_BOOTSTRAPS;
-const projectBootstrapWaiters = [];
 
 function freshState() {
   return {
@@ -761,10 +758,12 @@ const TRANSIENT_PREPARE_FAILURES = new Set([
 const MAX_PREPARE_ATTEMPTS = 3;
 const PREPARE_RETRY_DELAY_MS = 1500;
 
-async function prepareWorkerWithRetry(tabId, payload) {
+async function prepareWorkerWithRetry(tabId, payload, deadlineMs = Date.now() + 60000) {
   let response = null;
   for (let attempt = 1; attempt <= MAX_PREPARE_ATTEMPTS; attempt += 1) {
-    response = await sendToTab(tabId, payload, 40000);
+    const remainingMs = deadlineMs - Date.now();
+    if (remainingMs <= 0) throw new Error('worker_prepare_timeout');
+    response = await sendToTab(tabId, payload, Math.min(40000, remainingMs));
     if (!response?.ok) return response;
     const result = response.result || {};
     if (
@@ -774,42 +773,12 @@ async function prepareWorkerWithRetry(tabId, payload) {
     ) {
       return response;
     }
-    await new Promise((resolve) => setTimeout(resolve, PREPARE_RETRY_DELAY_MS));
+    const retryDelayMs = Math.min(PREPARE_RETRY_DELAY_MS, Math.max(0, deadlineMs - Date.now()));
+    if (retryDelayMs === 0) throw new Error('worker_prepare_timeout');
+    await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
   }
   return response;
 }
-
-function shouldSerializeProjectBootstrap(offer, placement) {
-  return Boolean(
-    offer?.reconcileRequired !== true &&
-    placement?.projectId &&
-    (offer?.command?.launch?.openMode || 'new_thread') !== 'existing_thread'
-  );
-}
-
-async function acquireProjectBootstrapSlot() {
-  if (availableProjectBootstrapSlots > 0) {
-    availableProjectBootstrapSlots -= 1;
-  } else {
-    await new Promise((resolve) => projectBootstrapWaiters.push(resolve));
-  }
-
-  let released = false;
-  return () => {
-    if (released) return;
-    released = true;
-    const next = projectBootstrapWaiters.shift();
-    if (next) {
-      next();
-      return;
-    }
-    availableProjectBootstrapSlots = Math.min(
-      MAX_PARALLEL_PROJECT_BOOTSTRAPS,
-      availableProjectBootstrapSlots + 1
-    );
-  };
-}
-
 
 async function processCommand(state, offer) {
   let command = offer.command;
@@ -848,19 +817,10 @@ async function processCommand(state, offer) {
     return;
   }
 
-  let releaseProjectBootstrap = null;
-  if (shouldSerializeProjectBootstrap(offer, placement)) {
-    releaseProjectBootstrap = await acquireProjectBootstrapSlot();
-  }
-
   let recordAndTab;
   try {
     recordAndTab = await recordForCommand(state, command, placement, offer.reconcileRequired === true);
   } catch (error) {
-    if (releaseProjectBootstrap) {
-      releaseProjectBootstrap();
-      releaseProjectBootstrap = null;
-    }
     const message = String(error?.message || error);
     if (offer.reconcileRequired) {
       const reason = message.includes('no durable browser launch record')
@@ -882,7 +842,6 @@ async function processCommand(state, offer) {
 
   const { record, tab } = recordAndTab;
   if (!tab.id) {
-    if (releaseProjectBootstrap) releaseProjectBootstrap();
     throw new Error('Worker tab has no tab id');
   }
 
@@ -948,19 +907,21 @@ async function processCommand(state, offer) {
 
   let prepared;
   try {
-    await waitForContent(tab.id);
+    const prepareDeadlineMs = Date.now() + 60000;
+    await waitForContent(tab.id, Math.max(1, prepareDeadlineMs - Date.now()));
     prepared = await prepareWorkerWithRetry(tab.id, {
       type: 'MOONDESK_PREPARE_WORKER',
       commandId: command.id,
       launchToken: record.launchToken,
       placement,
       launch: command.launch
-    });
-  } finally {
-    if (releaseProjectBootstrap) {
-      releaseProjectBootstrap();
-      releaseProjectBootstrap = null;
-    }
+    }, prepareDeadlineMs);
+  } catch (error) {
+    record.phase = 'failed';
+    await writeState(state);
+    const message = String(error?.message || error);
+    await failBeforeSend(message === 'worker_prepare_timeout' ? message : 'worker_prepare_exception');
+    return;
   }
   if (!prepared?.ok) {
     await failBeforeSend('worker_prepare_response_unconfirmed');

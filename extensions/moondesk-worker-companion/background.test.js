@@ -266,6 +266,201 @@ test('provider correlation captures exact request identity from live conversatio
   assert.deepEqual(Array.from(replay.correlations[0].requestIds), ['wfr_live_request']);
 });
 
+test('provider correlation reattaches after ChatGPT replaces fetch during page startup', async () => {
+  const conversationId = '6bc52738-64a0-83ee-bff8-59ffcc9f8c92';
+  const posted = [];
+  let domReady = null;
+  let providerCalls = 0;
+  const pageWindow = {
+    fetch: async () => eventStreamResponse(''),
+    addEventListener(type, handler) {
+      if (type === 'DOMContentLoaded') domReady = handler;
+    },
+    postMessage(message) { posted.push(message); }
+  };
+  const context = vm.createContext({
+    window: pageWindow,
+    document: { readyState: 'loading' },
+    location: {
+      origin: 'https://chatgpt.com',
+      href: `https://chatgpt.com/c/${conversationId}`,
+      pathname: `/c/${conversationId}`
+    },
+    URL,
+    TextDecoder,
+    Uint8Array,
+    Date,
+    console
+  });
+
+  vm.runInContext(providerCorrelationMainSource, context, { filename: providerCorrelationMainPath });
+  const providerFetch = async () => {
+    providerCalls += 1;
+    return eventStreamResponse(
+      `data: {"conversation_id":"${conversationId}","input_message":{"metadata":{"request_id":"wfr_after_provider_wrap"}}}\n\n`
+    );
+  };
+  pageWindow.fetch = providerFetch;
+  assert.equal(typeof domReady, 'function', 'observer must schedule a page-ready refresh');
+  domReady();
+  assert.notEqual(pageWindow.fetch, providerFetch, 'MoonDesk must wrap the provider-owned fetch after startup');
+
+  await pageWindow.fetch('https://chatgpt.com/backend-api/f/conversation');
+  await flushMicrotasks();
+
+  assert.equal(providerCalls, 1, 'reattachment must preserve the provider fetch without recursion');
+  const observed = posted.find((message) =>
+    message.source === 'moondesk-provider-correlation-observed' &&
+    message.correlation.requestIds.includes('wfr_after_provider_wrap')
+  );
+  assert.ok(observed, 'request identity must survive ChatGPT replacing fetch after document_start');
+  assert.equal(observed.correlation.conversationId, conversationId);
+});
+
+test('provider correlation reinjection refreshes a displaced fetch hook on an already-open tab', async () => {
+  const conversationId = '6cc52738-64a0-83ee-bff8-59ffcc9f8c93';
+  const posted = [];
+  let providerCalls = 0;
+  const pageWindow = {
+    fetch: async () => eventStreamResponse(''),
+    addEventListener() {},
+    postMessage(message) { posted.push(message); }
+  };
+  const context = vm.createContext({
+    window: pageWindow,
+    location: {
+      origin: 'https://chatgpt.com',
+      href: `https://chatgpt.com/c/${conversationId}`,
+      pathname: `/c/${conversationId}`
+    },
+    URL,
+    TextDecoder,
+    Uint8Array,
+    Date,
+    console
+  });
+
+  vm.runInContext(providerCorrelationMainSource, context, { filename: providerCorrelationMainPath });
+  const providerFetch = async () => {
+    providerCalls += 1;
+    return eventStreamResponse(
+      `data: {"conversation_id":"${conversationId}","metadata":{"request_id":"wfr_reinjected_refresh"}}\n\n`
+    );
+  };
+  pageWindow.fetch = providerFetch;
+  vm.runInContext(providerCorrelationMainSource, context, { filename: providerCorrelationMainPath });
+  assert.notEqual(pageWindow.fetch, providerFetch, 'MAIN-world reinjection must repair the displaced observer');
+
+  await pageWindow.fetch('https://chatgpt.com/backend-api/f/conversation');
+  await flushMicrotasks();
+
+  assert.equal(providerCalls, 1);
+  assert.ok(posted.some((message) =>
+    message.source === 'moondesk-provider-correlation-observed' &&
+    message.correlation.requestIds.includes('wfr_reinjected_refresh')
+  ));
+});
+
+test('provider correlation reattaches after ChatGPT replaces WebSocket during page startup', async () => {
+  const conversationId = '6ec52738-64a0-83ee-bff8-59ffcc9f8c95';
+  const posted = [];
+  let domReady = null;
+  class InitialWebSocket {
+    addEventListener() {}
+  }
+  class ProviderWebSocket {
+    static last = null;
+    constructor() {
+      this.listeners = new Map();
+      ProviderWebSocket.last = this;
+    }
+    addEventListener(type, handler) {
+      const handlers = this.listeners.get(type) || [];
+      handlers.push(handler);
+      this.listeners.set(type, handlers);
+    }
+    emit(type, data) {
+      for (const handler of this.listeners.get(type) || []) handler({ data });
+    }
+  }
+  const pageWindow = {
+    fetch: async () => eventStreamResponse(''),
+    WebSocket: InitialWebSocket,
+    addEventListener(type, handler) {
+      if (type === 'DOMContentLoaded') domReady = handler;
+    },
+    postMessage(message) { posted.push(message); }
+  };
+  const context = vm.createContext({
+    window: pageWindow,
+    document: { readyState: 'loading' },
+    location: {
+      origin: 'https://chatgpt.com',
+      href: `https://chatgpt.com/c/${conversationId}`,
+      pathname: `/c/${conversationId}`
+    },
+    URL,
+    TextDecoder,
+    Uint8Array,
+    Date,
+    console
+  });
+
+  vm.runInContext(providerCorrelationMainSource, context, { filename: providerCorrelationMainPath });
+  pageWindow.WebSocket = ProviderWebSocket;
+  domReady();
+  assert.notEqual(pageWindow.WebSocket, ProviderWebSocket, 'MoonDesk must wrap the provider-owned WebSocket after startup');
+
+  const socket = new pageWindow.WebSocket('wss://chatgpt.com/ws');
+  socket.emit('message', JSON.stringify({
+    conversation_id: conversationId,
+    input_message: { metadata: { request_id: 'wfr_after_websocket_wrap' } }
+  }));
+  await flushMicrotasks();
+
+  assert.ok(posted.some((message) =>
+    message.source === 'moondesk-provider-correlation-observed' &&
+    message.correlation.requestIds.includes('wfr_after_websocket_wrap')
+  ));
+});
+
+test('provider correlation keeps reading a bounded long response beyond the old 256 KiB cutoff', async () => {
+  const conversationId = '6dc52738-64a0-83ee-bff8-59ffcc9f8c94';
+  const posted = [];
+  const padding = 'x'.repeat(300 * 1024);
+  const response = eventStreamResponse(
+    `data: {"conversation_id":"${conversationId}","padding":"${padding}"}\n\n` +
+    `data: {"input_message":{"metadata":{"request_id":"wfr_late_stream_identity"}}}\n\n`
+  );
+  const pageWindow = {
+    fetch: async () => response,
+    addEventListener() {},
+    postMessage(message) { posted.push(message); }
+  };
+  const context = vm.createContext({
+    window: pageWindow,
+    location: {
+      origin: 'https://chatgpt.com',
+      href: `https://chatgpt.com/c/${conversationId}`,
+      pathname: `/c/${conversationId}`
+    },
+    URL,
+    TextDecoder,
+    Uint8Array,
+    Date,
+    console
+  });
+
+  vm.runInContext(providerCorrelationMainSource, context, { filename: providerCorrelationMainPath });
+  await pageWindow.fetch('https://chatgpt.com/backend-api/f/conversation');
+  await flushMicrotasks();
+
+  assert.ok(posted.some((message) =>
+    message.source === 'moondesk-provider-correlation-observed' &&
+    message.correlation.requestIds.includes('wfr_late_stream_identity')
+  ), 'late request identity must not be discarded solely because the response exceeded 256 KiB');
+});
+
 test('provider correlation follows current ChatGPT stream handoff into encoded WebSocket SSE', async () => {
   const conversationId = '7ac52738-64a0-83ee-bff8-59ffcc9f8c92';
   const topicId = 'conversation-turn-turn_12345';

@@ -1,11 +1,19 @@
 (() => {
-  if (window.__MOONDESK_PROVIDER_CORRELATION_MAIN__) return;
-  window.__MOONDESK_PROVIDER_CORRELATION_MAIN__ = true;
+  const OBSERVER_VERSION = 2;
+  const prior = window.__MOONDESK_PROVIDER_CORRELATION_MAIN__;
+  if (
+    prior?.version === OBSERVER_VERSION &&
+    typeof prior.refresh === 'function' &&
+    prior.refresh() === true
+  ) return;
 
+  let active = true;
   const OBSERVED = 'moondesk-provider-correlation-observed';
   const ASK = 'moondesk-provider-correlation-ask';
   const REPLY = 'moondesk-provider-correlation-reply';
-  const MAX_STREAM_BYTES = 256 * 1024;
+  const MAX_EVENT_BYTES = 512 * 1024;
+  const MAX_RESPONSE_BYTES = 4 * 1024 * 1024;
+  const MAX_WEBSOCKET_BYTES = 2 * 1024 * 1024;
   const MAX_BUFFERED_PROOFS = 32;
   const MAX_REQUEST_IDS = 16;
   const MAX_SCAN_NODES = 1024;
@@ -19,6 +27,11 @@
   const proofKeys = new Map();
   const topicRoutes = new Map();
   const messageRoutes = new Map();
+  const inspectedResponses = new WeakSet();
+  const observedSockets = new WeakSet();
+  const originReaders = new Set();
+  let observedFetch = null;
+  let observedWebSocket = null;
 
   function normalizedRequestId(value) {
     if (typeof value !== 'string' || value.length > 160) return null;
@@ -170,7 +183,7 @@
         ) {
           const messageId = normalizedMessageId(child);
           if (messageId) messageIds.add(messageId);
-        } else if (key === 'encoded_item' && typeof child === 'string' && child.length <= MAX_STREAM_BYTES) {
+        } else if (key === 'encoded_item' && typeof child === 'string' && child.length <= MAX_EVENT_BYTES) {
           encodedItems.push(child);
           continue;
         }
@@ -227,7 +240,7 @@
   }
 
   function consumeSseText(text, inheritedConversationId = null) {
-    if (typeof text !== 'string' || !text || text.length > MAX_STREAM_BYTES) return inheritedConversationId;
+    if (typeof text !== 'string' || !text || text.length > MAX_EVENT_BYTES) return inheritedConversationId;
     let conversationId = inheritedConversationId;
     const events = text.split(/\r?\n\r?\n/);
     for (const event of events) {
@@ -237,7 +250,7 @@
   }
 
   function consumeProviderText(text, inheritedConversationId = null) {
-    if (typeof text !== 'string' || !text || text.length > MAX_STREAM_BYTES) return inheritedConversationId;
+    if (typeof text !== 'string' || !text || text.length > MAX_EVENT_BYTES) return inheritedConversationId;
     const trimmed = text.trim();
     if (!trimmed) return inheritedConversationId;
     if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
@@ -250,11 +263,15 @@
   }
 
   async function inspectEventStream(response, requestIdentity = null) {
+    if (!active || !response || typeof response !== 'object' || inspectedResponses.has(response)) return;
+    inspectedResponses.add(response);
     let clone;
     try { clone = response.clone(); } catch { return; }
     const body = clone?.body;
     if (!body || typeof body.getReader !== 'function' || typeof TextDecoder !== 'function') return;
+    if (originReaders.size >= 2) return;
     const reader = body.getReader();
+    originReaders.add(reader);
     const decoder = new TextDecoder();
     let bytes = 0;
     let buffer = '';
@@ -268,12 +285,12 @@
     };
     bindRequestMessages();
     try {
-      while (bytes < MAX_STREAM_BYTES) {
+      while (bytes < MAX_RESPONSE_BYTES) {
         const { done, value } = await reader.read();
         if (done) break;
         if (!(value instanceof Uint8Array)) break;
         bytes += value.byteLength;
-        if (bytes > MAX_STREAM_BYTES) break;
+        if (bytes > MAX_RESPONSE_BYTES) break;
         buffer += decoder.decode(value, { stream: true });
         let boundary;
         while ((boundary = buffer.search(/\r?\n\r?\n/)) >= 0) {
@@ -284,7 +301,7 @@
           conversationId = consumeSseEvent(event, conversationId) || conversationId;
           bindRequestMessages();
         }
-        if (buffer.length > MAX_STREAM_BYTES) break;
+        if (buffer.length > MAX_EVENT_BYTES) break;
       }
       buffer += decoder.decode();
       if (buffer.trim()) {
@@ -294,6 +311,7 @@
     } catch {
       // Provider transport inspection must never affect the ChatGPT request.
     } finally {
+      originReaders.delete(reader);
       try { await reader.cancel(); } catch {}
     }
   }
@@ -310,27 +328,27 @@
   }
 
   function installFetchObserver() {
-    const nativeFetch = window.fetch;
-    if (typeof nativeFetch !== 'function' || nativeFetch.__moondeskProviderObserved) return;
-    function observedFetch(input, init) {
+    if (!active || typeof window.fetch !== 'function' || window.fetch === observedFetch) return;
+    const downstreamFetch = window.fetch;
+    const nextObservedFetch = function (input, init) {
       let url = null;
       try { url = typeof input === 'string' || input instanceof URL ? String(input) : input?.url || null; } catch {}
       const requestIdentity = url ? requestIdentityFor(url, init) : null;
-      const result = nativeFetch.apply(this, arguments);
+      const result = downstreamFetch.apply(this, arguments);
       if (url && result && typeof result.then === 'function') {
         result.then((response) => {
           if (eligibleFetchResponse(url, response)) void inspectEventStream(response, requestIdentity);
         }).catch(() => {});
       }
       return result;
-    }
-    try { Object.setPrototypeOf(observedFetch, nativeFetch); } catch {}
-    try { observedFetch.__moondeskProviderObserved = true; } catch {}
+    };
+    try { Object.setPrototypeOf(nextObservedFetch, downstreamFetch); } catch {}
+    observedFetch = nextObservedFetch;
     window.fetch = observedFetch;
   }
 
   function inspectWebSocketData(data) {
-    if (typeof data !== 'string' || !data || data.length > MAX_STREAM_BYTES) return;
+    if (typeof data !== 'string' || !data || data.length > MAX_WEBSOCKET_BYTES) return;
     const parsed = parseJson(data);
     if (parsed !== null) {
       analyzeValue(parsed, null);
@@ -340,21 +358,24 @@
   }
 
   function installWebSocketObserver() {
-    const NativeWebSocket = window.WebSocket;
-    if (typeof NativeWebSocket !== 'function' || NativeWebSocket.__moondeskProviderObserved) return;
+    if (!active || typeof window.WebSocket !== 'function' || window.WebSocket === observedWebSocket) return;
+    const DownstreamWebSocket = window.WebSocket;
     function ObservedWebSocket(url, protocols) {
       const socket = protocols === undefined
-        ? new NativeWebSocket(url)
-        : new NativeWebSocket(url, protocols);
+        ? new DownstreamWebSocket(url)
+        : new DownstreamWebSocket(url, protocols);
       try {
-        socket.addEventListener('message', (event) => inspectWebSocketData(event?.data));
+        if (!observedSockets.has(socket)) {
+          observedSockets.add(socket);
+          socket.addEventListener('message', (event) => inspectWebSocketData(event?.data));
+        }
       } catch {}
       return socket;
     }
-    try { Object.setPrototypeOf(ObservedWebSocket, NativeWebSocket); } catch {}
-    ObservedWebSocket.prototype = NativeWebSocket.prototype;
-    try { ObservedWebSocket.__moondeskProviderObserved = true; } catch {}
-    window.WebSocket = ObservedWebSocket;
+    try { Object.setPrototypeOf(ObservedWebSocket, DownstreamWebSocket); } catch {}
+    ObservedWebSocket.prototype = DownstreamWebSocket.prototype;
+    observedWebSocket = ObservedWebSocket;
+    window.WebSocket = observedWebSocket;
   }
 
   window.addEventListener('message', (event) => {
@@ -373,6 +394,24 @@
     }, location.origin);
   });
 
-  installFetchObserver();
-  installWebSocketObserver();
+  function refreshObservers() {
+    if (!active) return false;
+    installFetchObserver();
+    installWebSocketObserver();
+    return true;
+  }
+
+  refreshObservers();
+  if (typeof document !== 'undefined' && document.readyState === 'loading') {
+    window.addEventListener('DOMContentLoaded', refreshObservers, { once: true });
+  }
+  window.__MOONDESK_PROVIDER_CORRELATION_MAIN__ = {
+    version: OBSERVER_VERSION,
+    refresh: refreshObservers,
+    dispose() {
+      active = false;
+      for (const reader of originReaders) void reader.cancel().catch(() => {});
+      originReaders.clear();
+    }
+  };
 })();

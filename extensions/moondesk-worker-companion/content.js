@@ -140,6 +140,30 @@
     }
   }
 
+  function exactPendingProviderConversationId() {
+    const now = Date.now();
+    for (const [conversationId, pending] of pendingProviderCorrelations) {
+      if (now >= pending.expiresAt) pendingProviderCorrelations.delete(conversationId);
+    }
+    const ids = [...pendingProviderCorrelations.keys()];
+    return ids.length === 1 ? ids[0] : null;
+  }
+
+  function workerEvidence(marker) {
+    const evidence = DOM.workerEvidence(marker);
+    if (evidence?.conversationId || evidence?.markerPresent !== true) return evidence;
+    const remembered = rememberedLaunch();
+    if (remembered?.openMode !== 'new_thread') return evidence;
+    const providerConversationId = exactPendingProviderConversationId();
+    if (!providerConversationId) return evidence;
+    rememberLaunch({ ...remembered, targetConversationId: providerConversationId });
+    return {
+      ...evidence,
+      conversationId: providerConversationId,
+      conversationUrl: `https://chatgpt.com/c/${providerConversationId}`
+    };
+  }
+
   async function prepareWorker(message) {
     const { commandId, launchToken, placement, launch } = message;
     if (!commandId || !launchToken || !placement || !launch?.taskMarker || !launch?.openingMessage || !launch?.executionProfile) {
@@ -275,12 +299,13 @@
     const { launch } = message;
     if (!launch?.taskMarker) return { state: 'failed', reason: 'invalid_reconcile_payload' };
     if (DOM.taskMarkerPresent(launch.taskMarker)) {
+      const evidence = workerEvidence(launch.taskMarker);
       return {
         state: 'observed',
         reason: 'task_marker_present_execution_unconfirmed',
-        conversationUrl: location.href,
+        conversationUrl: evidence?.conversationUrl || location.href,
         selection: await DOM.selectedModelAndEffort(launch.executionProfile),
-        evidence: DOM.workerEvidence(launch.taskMarker)
+        evidence
       };
     }
     // Never click Send from reconciliation. If the first click may have crossed the
@@ -352,7 +377,7 @@
       if (!marker) {
         sendResponse({ ok: false, error: 'task marker is required' });
       } else {
-        sendResponse({ ok: true, evidence: DOM.workerEvidence(marker), rememberedLaunch: rememberedLaunch() });
+        sendResponse({ ok: true, evidence: workerEvidence(marker), rememberedLaunch: rememberedLaunch() });
       }
       return false;
     }

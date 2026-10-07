@@ -733,6 +733,96 @@ test('isolated content holds a new-chat provider proof until the URL converges t
   }]);
 });
 
+test('worker evidence promotes one exact provider conversation while ChatGPT still shows a local placeholder route', async () => {
+  const conversationId = '8cc52738-64a0-83ee-bff8-59ffcc9f8c96';
+  const marker = 'moondesk-worker-task:provider-finalize';
+  let windowMessageHandler = null;
+  let runtimeMessageHandler = null;
+  const storage = new Map([[
+    'moondesk-worker-launch-v1',
+    JSON.stringify({
+      commandId: 'provider-finalize-command',
+      launchToken: 'provider-finalize-token',
+      taskMarker: marker,
+      workspaceId: 'workspace-a',
+      threadKey: 'worker:provider-finalize',
+      openMode: 'new_thread',
+      targetConversationId: null,
+      projectId: null
+    })
+  ]]);
+  const localUrl = 'https://chatgpt.com/c/local-chatgpt%3A422be40f-2871-4c05-9110-62ac6e7854cd';
+  const pageWindow = {
+    MOONDESK_CHATGPT_DOM: {
+      conversationIdFromPath() { return null; },
+      workerEvidence() {
+        return {
+          conversationId: null,
+          conversationUrl: localUrl,
+          projectId: null,
+          markerPresent: true,
+          generating: true,
+          userTurnCount: 1,
+          assistantTurnCount: 0,
+          composerEmpty: true
+        };
+      }
+    },
+    addEventListener(type, handler) {
+      if (type === 'message') windowMessageHandler = handler;
+    },
+    postMessage() {}
+  };
+  const context = vm.createContext({
+    window: pageWindow,
+    sessionStorage: {
+      setItem(key, value) { storage.set(key, value); },
+      getItem(key) { return storage.get(key) || null; }
+    },
+    location: {
+      origin: 'https://chatgpt.com',
+      pathname: '/c/local-chatgpt%3A422be40f-2871-4c05-9110-62ac6e7854cd',
+      search: '',
+      hash: '',
+      href: localUrl
+    },
+    history: { state: null, replaceState() {} },
+    chrome: {
+      runtime: {
+        async sendMessage() { throw new Error('provider proof must stay tab-local until a durable route exists'); },
+        onMessage: { addListener(handler) { runtimeMessageHandler = handler; } }
+      }
+    },
+    crypto: webcrypto,
+    Date,
+    setTimeout,
+    clearTimeout,
+    setInterval() { return 1; },
+    clearInterval() {},
+    console
+  });
+
+  vm.runInContext(contentSource, context, { filename: contentPath });
+  windowMessageHandler({
+    source: pageWindow,
+    origin: 'https://chatgpt.com',
+    data: {
+      source: 'moondesk-provider-correlation-observed',
+      v: 1,
+      correlation: { conversationId, requestIds: ['wfr_worker_finalize'] }
+    }
+  });
+  const response = await new Promise((resolve) => {
+    const keepAlive = runtimeMessageHandler({ type: 'MOONDESK_WORKER_EVIDENCE', taskMarker: marker }, null, resolve);
+    assert.equal(keepAlive, false);
+  });
+
+  assert.equal(response.ok, true);
+  assert.equal(response.evidence.conversationId, conversationId);
+  assert.equal(response.evidence.conversationUrl, `https://chatgpt.com/c/${conversationId}`);
+  assert.equal(JSON.parse(storage.get('moondesk-worker-launch-v1')).targetConversationId, conversationId);
+});
+
 test('background accepts provider correlation only from the exact sending ChatGPT tab', async () => {
   const conversationId = '9ac52738-64a0-83ee-bff8-59ffcc9f8c94';
   const requests = [];
@@ -1738,6 +1828,26 @@ test('existing worker threads always reuse the confirmed worker conversation', (
   assert.equal(sourceUrlForCommand(placement, 'existing_thread', confirmed), confirmed);
 });
 
+test('temporary local-chatgpt routes are never accepted as durable worker conversation URLs', () => {
+  const { evaluate } = loadBackground();
+  const canonicalConversationUrl = evaluate('canonicalConversationUrl');
+  const conversationUrlFromEvidence = evaluate('conversationUrlFromEvidence');
+  const conversationId = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeee4';
+
+  assert.equal(
+    canonicalConversationUrl('https://chatgpt.com/c/local-chatgpt%3A422be40f-2871-4c05-9110-62ac6e7854cd'),
+    null
+  );
+  assert.equal(
+    canonicalConversationUrl(`https://chatgpt.com/c/${conversationId}`),
+    `https://chatgpt.com/c/${conversationId}`
+  );
+  assert.equal(
+    conversationUrlFromEvidence({ conversationId }),
+    `https://chatgpt.com/c/${conversationId}`
+  );
+});
+
 test('successful send without a confirmed conversation URL must reconcile before terminal success', () => {
   const { evaluate } = loadBackground();
   const needsReconcile = evaluate('successfulResultNeedsConversationReconcile');
@@ -1920,7 +2030,7 @@ test('new-thread recovery never matches an older launch only by durable thread k
 });
 
 test('existing-thread reuse is owned by workspace and exact thread, not the Anchor Project', async () => {
-  const legacyWorkerUrl = 'https://chatgpt.com/g/g-p-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-legacy/c/worker-thread';
+  const legacyWorkerUrl = 'https://chatgpt.com/g/g-p-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-legacy/c/aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeee1';
   const { createdTabs, evaluate } = loadBackground({
     existingTabs: { 77: { id: 77, url: legacyWorkerUrl } }
   });
@@ -1971,8 +2081,58 @@ test('existing-thread reuse is owned by workspace and exact thread, not the Anch
   assert.equal(createdTabs.length, 0);
 });
 
+test('existing-thread reuse never adopts a remembered local-chatgpt placeholder instead of its durable conversation', async () => {
+  const durableUrl = 'https://chatgpt.com/c/aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeee5';
+  const localUrl = 'https://chatgpt.com/c/local-chatgpt%3A422be40f-2871-4c05-9110-62ac6e7854cd';
+  const { createdTabs, evaluate } = loadBackground({
+    existingTabs: { 77: { id: 77, url: localUrl } },
+    contentByTab: {
+      77: {
+        ok: true,
+        rememberedLaunch: { commandId: 'old-command', threadKey: 'worker:durable-reuse' }
+      }
+    }
+  });
+  const recordForCommand = evaluate('recordForCommand');
+  const command = {
+    id: 'command-durable-reuse',
+    launch: {
+      workspaceId: 'workspace-current',
+      taskMarker: 'marker-durable-reuse',
+      threadKey: 'worker:durable-reuse',
+      openMode: 'existing_thread',
+      executionProfile: {
+        modelKey: 'gpt-5.6-sol',
+        modelLabel: 'GPT-5.6 Sol',
+        reasoningEffort: 'high'
+      }
+    }
+  };
+  const state = {
+    launchRecords: {},
+    threadRecords: {
+      'worker:durable-reuse': {
+        workspaceId: 'workspace-current',
+        projectId: null,
+        conversationUrl: durableUrl,
+        tabId: 77
+      }
+    }
+  };
+
+  const { record, tab } = await recordForCommand(state, command, {
+    projectId: 'g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+    projectUrl: 'https://chatgpt.com/g/g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-moondesk/project',
+    anchorConversationUrl: 'https://chatgpt.com/g/g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-moondesk/c/aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeee6'
+  });
+  assert.equal(record.conversationUrl, durableUrl);
+  assert.notEqual(tab.id, 77, 'the placeholder tab must not be reused by remembered thread key alone');
+  assert.equal(createdTabs.length, 1);
+  assert.equal(new URL(createdTabs[0].url).pathname, '/c/aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeee5');
+});
+
 test('existing-thread reuse self-heals a missing thread record from a succeeded launch tab', async () => {
-  const workerUrl = 'https://chatgpt.com/g/g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-moondesk/c/recovered-worker';
+  const workerUrl = 'https://chatgpt.com/g/g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-moondesk/c/aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeee2';
   const { createdTabs, evaluate } = loadBackground({
     existingTabs: {
       77: { id: 77, url: workerUrl }
@@ -2031,7 +2191,7 @@ test('existing-thread reuse self-heals a missing thread record from a succeeded 
 });
 
 test('existing-thread reuse accepts the exact confirmed thread owned by the same workspace', async () => {
-  const conversationUrl = 'https://chatgpt.com/g/g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-moondesk/c/worker-thread';
+  const conversationUrl = 'https://chatgpt.com/g/g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-moondesk/c/aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeee3';
   const { createdTabs, evaluate } = loadBackground({
     existingTabs: {
       77: { id: 77, url: conversationUrl }

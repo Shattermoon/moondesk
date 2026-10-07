@@ -295,10 +295,19 @@ function canonicalConversationUrl(value) {
   if (!canonical) return null;
   try {
     const url = new URL(canonical);
-    return /\/c\/[^/?#]+(?:\/|$)/.test(url.pathname) ? canonical : null;
+    return /\/c\/[0-9a-f-]{16,64}(?:\/|$)/i.test(url.pathname) ? canonical : null;
   } catch {
     return null;
   }
+}
+
+function conversationUrlFromEvidence(evidence) {
+  const conversationId = typeof evidence?.conversationId === 'string'
+    ? evidence.conversationId.trim().toLowerCase()
+    : '';
+  return /^[0-9a-f-]{16,64}$/i.test(conversationId)
+    ? `https://chatgpt.com/c/${conversationId}`
+    : null;
 }
 
 function browserLabel() {
@@ -550,6 +559,10 @@ async function tabMatchesRecord(tab, record) {
   if (tab.url.includes(`moondesk-launch=${encodeURIComponent(record.launchToken)}`)) return true;
   const tabUrl = canonicalChatUrl(tab.url);
   if (record.conversationUrl && tabUrl === canonicalChatUrl(record.conversationUrl)) return true;
+  // Once reuse has a confirmed durable conversation URL, never adopt a different tab merely
+  // because it remembers the same thread key. ChatGPT can leave hidden tabs on a shared
+  // local-chatgpt placeholder route; reuse must reopen/target the durable /c/<id> instead.
+  if (record.openMode === 'existing_thread' && record.conversationUrl) return false;
   try {
     const response = await ensureContent(tab.id);
     return rememberedLaunchMatchesRecord(record, response?.rememberedLaunch);
@@ -582,7 +595,7 @@ async function recoverThreadRecord(state, threadKey, workspaceId) {
   for (const candidate of candidates) {
     const tab = await recoverTab(candidate);
     if (!tab) continue;
-    const conversationUrl = canonicalConversationUrl(tab.url);
+    const conversationUrl = canonicalConversationUrl(candidate.conversationUrl) || canonicalConversationUrl(tab.url);
     if (!conversationUrl) continue;
     const next = {
       workspaceId,
@@ -618,7 +631,7 @@ async function recordForCommand(state, command, placement, reconcileRequired = f
   if (!record) {
     const threadOwnedByWorkspace = threadRecordOwnedByWorkspace(thread, command.launch.workspaceId);
     const existingConversation = openMode === 'existing_thread' && threadOwnedByWorkspace
-      ? canonicalChatUrl(thread.conversationUrl)
+      ? canonicalConversationUrl(thread.conversationUrl)
       : null;
     if (openMode === 'existing_thread' && !existingConversation) {
       throw new Error('Existing worker thread has no confirmed ChatGPT conversation binding for this workspace and thread identity');
@@ -701,6 +714,12 @@ function acceptanceMatches(command, placement, baseline, evidence, conversationU
     openMode: command.launch.openMode || 'new_thread',
     threadKey: command.launch.threadKey || null
   }, rememberedLaunch)) return false;
+  const conversationContext = chatContextFromUrl(conversationUrl);
+  if (!conversationContext?.conversationId) return false;
+  if (
+    typeof evidence.conversationId !== 'string' ||
+    evidence.conversationId.toLowerCase() !== conversationContext.conversationId.toLowerCase()
+  ) return false;
   const conversationProjectId = projectIdFromChatUrl(conversationUrl);
   if (command.launch.openMode !== 'existing_thread' && conversationProjectId !== null) return false;
   if (
@@ -738,13 +757,13 @@ async function observeWorkerAcceptance(
       try { tab = await recoverTab(record); } catch {}
     }
     if (tab?.id && tab.url?.startsWith('https://chatgpt.com/')) {
-      const conversationUrl = canonicalConversationUrl(tab.url);
       try {
         await ensureContent(tab.id);
         const response = await sendToTab(tab.id, {
           type: 'MOONDESK_WORKER_EVIDENCE',
           taskMarker: command.launch.taskMarker
         }, 3000);
+        const conversationUrl = canonicalConversationUrl(tab.url) || conversationUrlFromEvidence(response?.evidence);
         if (
           response?.ok &&
           acceptanceMatches(

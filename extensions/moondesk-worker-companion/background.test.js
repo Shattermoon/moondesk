@@ -1671,7 +1671,12 @@ test('record creation opens Project launches on the exact Anchor conversation an
       workspaceId: 'workspace-1',
       taskMarker: 'marker-1',
       threadKey: 'worker:test-thread',
-      openMode: 'new_thread'
+      openMode: 'new_thread',
+      executionProfile: {
+        modelKey: 'gpt-5.6-sol',
+        modelLabel: 'GPT-5.6 Sol',
+        reasoningEffort: 'high'
+      }
     }
   };
 
@@ -1683,7 +1688,12 @@ test('record creation opens Project launches on the exact Anchor conversation an
   const state = { launchRecords: {}, threadRecords: {} };
   const { record } = await recordForCommand(state, command, projectPlacement);
   assert.equal(record.sourceUrl, projectPlacement.anchorConversationUrl);
-  assert.match(createdTabs[0].url, /\/c\/anchor#moondesk-launch=/);
+  const projectUrl = new URL(createdTabs[0].url);
+  assert.equal(projectUrl.pathname.endsWith('/c/anchor'), true);
+  assert.equal(projectUrl.searchParams.get('moondesk-launch'), record.launchToken);
+  assert.equal(projectUrl.searchParams.get('model'), 'gpt-5.6-sol');
+  assert.equal(projectUrl.searchParams.get('reasoning_effort'), 'high');
+  assert.equal(projectUrl.hash, `#moondesk-launch=${encodeURIComponent(record.launchToken)}`);
 
   const normalState = { launchRecords: {}, threadRecords: {} };
   const normalCommand = {
@@ -1698,7 +1708,12 @@ test('record creation opens Project launches on the exact Anchor conversation an
   };
   const normal = await recordForCommand(normalState, normalCommand, normalPlacement);
   assert.equal(normal.record.sourceUrl, 'https://chatgpt.com/');
-  assert.match(createdTabs[1].url, /^https:\/\/chatgpt\.com\/#moondesk-launch=/);
+  const normalUrl = new URL(createdTabs[1].url);
+  assert.equal(normalUrl.origin + normalUrl.pathname, 'https://chatgpt.com/');
+  assert.equal(normalUrl.searchParams.get('model'), 'gpt-5.6-sol');
+  assert.equal(normalUrl.searchParams.get('reasoning_effort'), 'high');
+  assert.equal(normalUrl.searchParams.get('moondesk-launch'), normal.record.launchToken);
+  assert.equal(normalUrl.hash, `#moondesk-launch=${encodeURIComponent(normal.record.launchToken)}`);
 });
 
 test('reconciliation without a durable launch record never creates a fresh worker tab', async () => {
@@ -1958,12 +1973,17 @@ test('existing-thread preparation waits for the recovered conversation composer 
     composerReady() {
       throw new Error('reuse must use the bounded readiness wait instead of a one-shot check');
     },
-    async selectModelSettings() {
+    async selectModelSettings(_profile, _failure, stillCurrent) {
       selectCalls += 1;
+      assert.equal(typeof stillCurrent, 'function');
+      assert.equal(stillCurrent(), true);
       return true;
     },
+    visibleModelSelection() {
+      return { model: 'gpt-5.6-sol', reasoningEffort: 'high' };
+    },
     async selectedModelAndEffort() {
-      return { modelId: 'gpt-5.6-sol', reasoningEffort: 'high' };
+      throw new Error('worker preparation must not reopen the picker after successful selection');
     },
     taskMarkerPresent() { return false; },
     insertPrompt() { return true; },
@@ -2032,6 +2052,232 @@ test('existing-thread preparation waits for the recovered conversation composer 
   assert.equal(response.result.state, 'ready');
   assert.equal(waitCalls, 2, 'reuse waits once before model selection and reacquires the composer after it');
   assert.equal(selectCalls, 1);
+});
+
+test('Project worker preparation keeps launch authority across the exact source-to-Project transition', async () => {
+  let messageHandler = null;
+  let conversationId = 'anchor-conversation';
+  const projectId = 'g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+  const storage = new Map();
+  const DOM = {
+    conversationIdFromPath() { return conversationId; },
+    projectIdFromPath() { return projectId; },
+    async enterProject(expectedProjectId, stillCurrent) {
+      assert.equal(expectedProjectId, projectId);
+      assert.equal(stillCurrent(), true);
+      conversationId = null;
+      assert.equal(stillCurrent(), true, 'launch lifetime stays valid after the native Project transition');
+      return true;
+    },
+    composerReady() { return true; },
+    async waitForComposerReady(_timeoutMs, stillCurrent) {
+      assert.equal(stillCurrent(), true);
+      return true;
+    },
+    async selectModelSettings(_profile, _failure, stillCurrent) {
+      assert.equal(stillCurrent(), true, 'model selection is fenced to the Project-home target');
+      return true;
+    },
+    visibleModelSelection() { return { model: 'gpt-5.6-sol', reasoningEffort: 'high' }; },
+    taskMarkerPresent() { return false; },
+    insertPrompt() { return true; },
+    workerEvidence() {
+      return {
+        conversationId,
+        projectId,
+        markerPresent: false,
+        generating: false,
+        userTurnCount: 0,
+        assistantTurnCount: 0,
+        composerEmpty: false
+      };
+    }
+  };
+  const context = vm.createContext({
+    window: { MOONDESK_CHATGPT_DOM: DOM },
+    sessionStorage: {
+      setItem(key, value) { storage.set(key, value); },
+      getItem(key) { return storage.get(key) || null; }
+    },
+    location: {
+      origin: 'https://chatgpt.com',
+      hash: '#moondesk-launch=project-token',
+      pathname: `/g/${projectId}-moondesk/c/anchor-conversation`,
+      search: '',
+      href: `https://chatgpt.com/g/${projectId}-moondesk/c/anchor-conversation#moondesk-launch=project-token`
+    },
+    history: { state: null, replaceState() {} },
+    chrome: { runtime: { onMessage: { addListener(handler) { messageHandler = handler; } } } },
+    crypto: webcrypto,
+    setTimeout,
+    clearTimeout,
+    setInterval,
+    clearInterval,
+    console
+  });
+  vm.runInContext(contentSource, context, { filename: contentPath });
+
+  const response = await new Promise((resolve) => {
+    const returned = messageHandler({
+      type: 'MOONDESK_PREPARE_WORKER',
+      commandId: 'project-transition-command',
+      launchToken: 'project-token',
+      placement: { projectId },
+      launch: {
+        workspaceId: 'workspace-a',
+        taskMarker: 'moondesk-worker-task:project-transition',
+        openingMessage: 'project-transition',
+        threadKey: 'worker:project-transition',
+        openMode: 'new_thread',
+        executionProfile: { modelKey: 'gpt-5.6-sol', modelLabel: 'GPT-5.6 Sol', reasoningEffort: 'high' }
+      }
+    }, null, resolve);
+    assert.equal(returned, true);
+  });
+  assert.equal(response.ok, true);
+  assert.equal(response.result.state, 'ready');
+});
+
+test('worker preparation aborts when the target route changes during model selection', async () => {
+  let messageHandler = null;
+  let conversationId = null;
+  const storage = new Map();
+  const DOM = {
+    conversationIdFromPath() { return conversationId; },
+    projectIdFromPath() { return null; },
+    composerReady() { return true; },
+    async waitForComposerReady() { return true; },
+    async selectModelSettings(_profile, failure, stillCurrent) {
+      assert.equal(stillCurrent(), true);
+      conversationId = 'foreign-conversation';
+      assert.equal(stillCurrent(), false);
+      failure('launch_target_changed');
+      return false;
+    },
+    taskMarkerPresent() { return false; },
+    insertPrompt() { throw new Error('route-changed launch must not insert a prompt'); },
+    workerEvidence() { throw new Error('route-changed launch must not collect send evidence'); }
+  };
+  const context = vm.createContext({
+    window: { MOONDESK_CHATGPT_DOM: DOM },
+    sessionStorage: {
+      setItem(key, value) { storage.set(key, value); },
+      getItem(key) { return storage.get(key) || null; }
+    },
+    location: {
+      origin: 'https://chatgpt.com', hash: '', pathname: '/', search: '', href: 'https://chatgpt.com/'
+    },
+    history: { state: null, replaceState() {} },
+    chrome: { runtime: { onMessage: { addListener(handler) { messageHandler = handler; } } } },
+    crypto: webcrypto,
+    setTimeout,
+    clearTimeout,
+    setInterval,
+    clearInterval,
+    console
+  });
+  vm.runInContext(contentSource, context, { filename: contentPath });
+
+  const response = await new Promise((resolve) => {
+    const returned = messageHandler({
+      type: 'MOONDESK_PREPARE_WORKER',
+      commandId: 'route-change-command',
+      launchToken: 'route-change-token',
+      placement: { projectId: null },
+      launch: {
+        workspaceId: 'workspace-a',
+        taskMarker: 'moondesk-worker-task:route-change',
+        openingMessage: 'route-change',
+        threadKey: 'worker:route-change',
+        openMode: 'new_thread',
+        executionProfile: { modelKey: 'gpt-5.6-sol', modelLabel: 'GPT-5.6 Sol', reasoningEffort: 'high' }
+      }
+    }, null, resolve);
+    assert.equal(returned, true);
+  });
+  assert.equal(response.ok, true);
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(response.result)),
+    { state: 'failed', reason: 'model_or_effort_unconfirmed:launch_target_changed' }
+  );
+});
+
+test('worker commit refuses a route change that occurs after preparation but before Send', async () => {
+  let messageHandler = null;
+  let conversationId = null;
+  let commitCalls = 0;
+  const storage = new Map();
+  const DOM = {
+    conversationIdFromPath() { return conversationId; },
+    projectIdFromPath() { return null; },
+    composerReady() { return true; },
+    async waitForComposerReady(_timeoutMs, stillCurrent) { return stillCurrent(); },
+    async selectModelSettings(_profile, _failure, stillCurrent) { return stillCurrent(); },
+    visibleModelSelection() { return { model: 'gpt-5.6-sol', reasoningEffort: 'high' }; },
+    taskMarkerPresent() { return false; },
+    insertPrompt() { return true; },
+    workerEvidence() {
+      return {
+        conversationId,
+        projectId: null,
+        markerPresent: false,
+        generating: false,
+        userTurnCount: 0,
+        assistantTurnCount: 0,
+        composerEmpty: false
+      };
+    },
+    async commitSendOnce() {
+      commitCalls += 1;
+      return { state: 'committed' };
+    }
+  };
+  const context = vm.createContext({
+    window: { MOONDESK_CHATGPT_DOM: DOM },
+    sessionStorage: {
+      setItem(key, value) { storage.set(key, value); },
+      getItem(key) { return storage.get(key) || null; }
+    },
+    location: { origin: 'https://chatgpt.com', hash: '', pathname: '/', search: '', href: 'https://chatgpt.com/' },
+    history: { state: null, replaceState() {} },
+    chrome: { runtime: { onMessage: { addListener(handler) { messageHandler = handler; } } } },
+    crypto: webcrypto,
+    setTimeout,
+    clearTimeout,
+    setInterval,
+    clearInterval,
+    console
+  });
+  vm.runInContext(contentSource, context, { filename: contentPath });
+  const launch = {
+    workspaceId: 'workspace-a',
+    taskMarker: 'moondesk-worker-task:commit-route-change',
+    openingMessage: 'commit-route-change',
+    threadKey: 'worker:commit-route-change',
+    openMode: 'new_thread',
+    executionProfile: { modelKey: 'gpt-5.6-sol', modelLabel: 'GPT-5.6 Sol', reasoningEffort: 'high' }
+  };
+  const prepare = await new Promise((resolve) => {
+    const returned = messageHandler({
+      type: 'MOONDESK_PREPARE_WORKER', commandId: 'commit-route-command', launchToken: 'commit-route-token',
+      placement: { projectId: null }, launch
+    }, null, resolve);
+    assert.equal(returned, true);
+  });
+  assert.equal(prepare.result.state, 'ready');
+
+  conversationId = 'foreign-conversation';
+  const commit = await new Promise((resolve) => {
+    const returned = messageHandler({
+      type: 'MOONDESK_COMMIT_WORKER_SEND', commandId: 'commit-route-command', launchToken: 'commit-route-token',
+      placement: { projectId: null }, launch
+    }, null, resolve);
+    assert.equal(returned, true);
+  });
+  assert.deepEqual(JSON.parse(JSON.stringify(commit.result)), {
+    state: 'failed', reason: 'prepared_launch_target_changed'
+  });
+  assert.equal(commitCalls, 0, 'the native Send path must not run after the prepared target changes');
 });
 
 test('worker preparation reports the exact model-picker stage that failed', async () => {
@@ -2149,7 +2395,7 @@ test('model-catalog content request is helper-owned and returns a bounded readin
   assert.equal(inspectCalls, 0, 'picker inspection must not run before the clean helper composer is ready');
 });
 
-test('worker acceptance requires assistant activity after the task marker is posted', () => {
+test('worker acceptance binds on the exact new marker user turn without waiting for assistant activity', () => {
   const { evaluate } = loadBackground();
   const acceptanceMatches = evaluate('acceptanceMatches');
   const projectId = 'g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
@@ -2163,6 +2409,7 @@ test('worker acceptance requires assistant activity after the task marker is pos
   };
   const placement = { projectId };
   const baseline = {
+    markerPresent: false,
     generating: false,
     userTurnCount: 0,
     assistantTurnCount: 0
@@ -2172,7 +2419,7 @@ test('worker acceptance requires assistant activity after the task marker is pos
     threadKey: command.launch.threadKey
   };
 
-  const postedOnly = {
+  const posted = {
     conversationId: 'bbbbbbbb-cccc-4ddd-8eee-ffffffffffff',
     markerPresent: true,
     generating: false,
@@ -2181,35 +2428,35 @@ test('worker acceptance requires assistant activity after the task marker is pos
     composerEmpty: true
   };
   assert.equal(
-    acceptanceMatches(command, placement, baseline, postedOnly, conversationUrl, rememberedLaunch),
+    acceptanceMatches(command, placement, baseline, posted, conversationUrl, rememberedLaunch),
+    true,
+    'the newly committed exact marker user row is sufficient Send acceptance proof'
+  );
+
+  assert.equal(
+    acceptanceMatches(
+      command,
+      placement,
+      { ...baseline, userTurnCount: 1 },
+      posted,
+      conversationUrl,
+      rememberedLaunch
+    ),
     false,
-    'a posted user turn alone must not count as a launched worker'
+    'a marker without a newly added user turn is not fresh Send acceptance'
   );
 
   assert.equal(
     acceptanceMatches(
       command,
       placement,
-      baseline,
-      { ...postedOnly, generating: true },
+      { ...baseline, markerPresent: true },
+      posted,
       conversationUrl,
       rememberedLaunch
     ),
-    true,
-    'active assistant generation confirms execution started'
-  );
-
-  assert.equal(
-    acceptanceMatches(
-      command,
-      placement,
-      baseline,
-      { ...postedOnly, assistantTurnCount: 1 },
-      conversationUrl,
-      rememberedLaunch
-    ),
-    true,
-    'a completed new assistant turn confirms execution even if generation already ended'
+    false,
+    'a marker already present in the pre-Send baseline cannot be reused as a new receipt'
   );
 });
 
@@ -2388,7 +2635,7 @@ test('worker launch transaction survives ChatGPT navigation and ACKs the confirm
   );
 });
 
-test('reconciliation keeps a marker-only worker uncertain until assistant activity is observed', async () => {
+test('reconciliation commits a newly observed marker user turn without waiting for assistant activity', async () => {
   const projectId = 'g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
   const commandId = '21111111-2222-4333-8444-555555555555';
   const leaseId = '26666666-7777-4888-8999-aaaaaaaaaaaa';
@@ -2499,9 +2746,10 @@ test('reconciliation keeps a marker-only worker uncertain until assistant activi
   await processCommand(state, { command, reconcileRequired: true });
 
   assert.equal(ackPayloads.length, 1);
-  assert.equal(ackPayloads[0].outcome, 'needs_reconcile');
-  assert.equal(state.launchRecords[commandId].phase, 'uncertain');
-  assert.equal(state.threadRecords[threadKey], undefined);
+  assert.equal(ackPayloads[0].outcome, 'succeeded');
+  assert.equal(ackPayloads[0].conversationUrl, conversationUrl);
+  assert.equal(state.launchRecords[commandId].phase, 'succeeded');
+  assert.equal(state.threadRecords[threadKey].conversationUrl, conversationUrl);
 });
 
 test('transient Project readiness retries preparation on the same tab before Send', async () => {

@@ -733,6 +733,24 @@
     );
   }
 
+  function visibleModelSelection(profile = null) {
+    const node = pickerRoot() || modelPickerTrigger();
+    if (node?.getAttribute('data-moondesk-selected-route') !== location.pathname) return null;
+    const model = node.getAttribute('data-moondesk-selected-model');
+    const reasoningEffort = node.getAttribute('data-moondesk-selected-effort');
+    if (
+      typeof model !== 'string' ||
+      !/^[a-zA-Z0-9._-]{1,80}$/.test(model) ||
+      !PROVIDER_EFFORTS.has(reasoningEffort)
+    ) return null;
+    if (profile) {
+      const desired = providerEfforts(profile.reasoningEffort);
+      const requested = [profile.modelKey, profile.modelLabel].filter(Boolean);
+      if (!desired.includes(reasoningEffort) || !requested.some((value) => value === model)) return null;
+    }
+    return { model, reasoningEffort };
+  }
+
   async function selectedModelAndEffort(profile) {
     const fromFullState = (state) => {
       const choice = state?.choices?.find((entry) => entry.bucket === state.currentBucket);
@@ -833,7 +851,7 @@
     return restored && closed && stillCurrent() && result.size ? [...result.values()] : null;
   }
 
-  async function selectModelSettings(profile, failure = () => {}) {
+  async function selectModelSettings(profile, failure = () => {}, stillCurrent = () => true) {
     let failureCode = null;
     const fail = (code) => {
       if (!failureCode) failureCode = code;
@@ -849,7 +867,11 @@
       fail('effort_invalid');
       return publishFailure();
     }
-    const ui = modelPickerAccess();
+    if (!stillCurrent()) {
+      fail('launch_target_changed');
+      return publishFailure();
+    }
+    const ui = modelPickerAccess(stillCurrent);
     const original = await ui.open();
     if (!original) {
       await ui.close();
@@ -1011,16 +1033,20 @@
     };
   }
 
-  async function commitSendOnce(expectedPrompt, marker) {
+  async function commitSendOnce(expectedPrompt, marker, stillCurrent = () => true) {
+    if (!stillCurrent()) return { state: 'failed', reason: 'prepared_launch_target_changed' };
     let box = composer();
     if (!box || !composerWritable() || generating()) return { state: 'failed', reason: 'composer_not_ready' };
     if (compact(composerText(box)) !== compact(expectedPrompt)) {
       return { state: 'failed', reason: 'prepared_prompt_changed' };
     }
+    const routeChanged = {};
     const button = await waitFor(() => {
+      if (!stillCurrent()) return routeChanged;
       const value = sendButton();
       return value && !value.disabled && value.getAttribute('aria-disabled') !== 'true' ? value : null;
     }, 8000);
+    if (button === routeChanged) return { state: 'failed', reason: 'prepared_launch_target_changed' };
     if (!button) return { state: 'failed', reason: 'send_button_unavailable' };
 
     const baseline = {
@@ -1039,6 +1065,7 @@
     await Promise.resolve();
     box = composer();
     const currentButton = sendButton();
+    if (!stillCurrent()) return { state: 'failed', reason: 'prepared_launch_target_changed' };
     if (
       !box ||
       !composerWritable() ||
@@ -1085,6 +1112,7 @@
     taskMarkerPresent,
     inspectModelSettings,
     selectModelSettings,
+    visibleModelSelection,
     selectedModelAndEffort,
     insertPrompt,
     workerEvidence,

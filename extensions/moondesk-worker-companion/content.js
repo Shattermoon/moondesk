@@ -118,7 +118,10 @@
         launchToken: record.launchToken,
         taskMarker: record.taskMarker,
         workspaceId: record.workspaceId,
-        threadKey: record.threadKey || null
+        threadKey: record.threadKey || null,
+        openMode: record.openMode || null,
+        targetConversationId: record.targetConversationId || null,
+        projectId: record.projectId || null
       }));
     } catch {}
     if (location.hash.startsWith('#moondesk-launch=')) {
@@ -152,28 +155,62 @@
 
     const expectedProjectId = placement.projectId || null;
     const existingThread = launch.openMode === 'existing_thread';
+    const launchAlive = () => {
+      const current = rememberedLaunch();
+      return Boolean(
+        current &&
+        current.commandId === commandId &&
+        current.launchToken === launchToken &&
+        current.taskMarker === launch.taskMarker
+      );
+    };
+    let stillOnTarget = () => launchAlive();
     if (existingThread) {
-      if (!DOM.conversationIdFromPath()) {
+      const workerConversation = DOM.conversationIdFromPath();
+      if (!workerConversation) {
         return { state: 'failed', reason: 'existing_worker_conversation_unconfirmed' };
       }
-      if ((DOM.projectIdFromPath() || null) !== expectedProjectId) {
+      stillOnTarget = () =>
+        launchAlive() &&
+        DOM.conversationIdFromPath() === workerConversation &&
+        (DOM.projectIdFromPath() || null) === expectedProjectId;
+      if (!stillOnTarget()) {
         return { state: 'failed', reason: 'worker_placement_mismatch' };
       }
-      if (!(await DOM.waitForComposerReady(15000))) {
-        return { state: 'failed', reason: 'worker_conversation_not_ready' };
+      if (!(await DOM.waitForComposerReady(15000, stillOnTarget))) {
+        return { state: 'failed', reason: stillOnTarget() ? 'worker_conversation_not_ready' : 'worker_launch_target_changed' };
       }
     } else if (expectedProjectId) {
-      if (DOM.projectIdFromPath() !== expectedProjectId) {
+      const sourceConversation = DOM.conversationIdFromPath();
+      if (DOM.projectIdFromPath() !== expectedProjectId || !sourceConversation) {
         return { state: 'failed', reason: 'wrong_chatgpt_project' };
       }
-      if (!(await DOM.enterProject(expectedProjectId))) {
-        return { state: 'failed', reason: 'project_entry_unconfirmed' };
+      const stillOnSource = () =>
+        launchAlive() &&
+        DOM.projectIdFromPath() === expectedProjectId &&
+        DOM.conversationIdFromPath() === sourceConversation;
+      if (!stillOnSource()) {
+        return { state: 'failed', reason: 'worker_launch_target_changed' };
       }
-      if (!DOM.composerReady()) {
-        return { state: 'failed', reason: 'project_composer_not_ready' };
+      // enterProject owns the exact source-conversation -> Project-home transition proof. Its
+      // cancellation fence must cover the launch lifetime, not require the source route to remain
+      // unchanged after the one native Project click.
+      if (!(await DOM.enterProject(expectedProjectId, launchAlive))) {
+        return { state: 'failed', reason: launchAlive() ? 'project_entry_unconfirmed' : 'worker_launch_target_changed' };
+      }
+      stillOnTarget = () =>
+        launchAlive() &&
+        DOM.projectIdFromPath() === expectedProjectId &&
+        DOM.conversationIdFromPath() === null;
+      if (!stillOnTarget() || !DOM.composerReady()) {
+        return { state: 'failed', reason: stillOnTarget() ? 'project_composer_not_ready' : 'worker_launch_target_changed' };
       }
     } else {
-      if (DOM.projectIdFromPath() !== null || DOM.conversationIdFromPath() !== null) {
+      stillOnTarget = () =>
+        launchAlive() &&
+        DOM.projectIdFromPath() === null &&
+        DOM.conversationIdFromPath() === null;
+      if (!stillOnTarget()) {
         return { state: 'failed', reason: 'normal_chat_entry_unconfirmed' };
       }
       if (!DOM.composerReady()) {
@@ -181,29 +218,40 @@
       }
     }
 
+    if (!stillOnTarget()) {
+      return { state: 'failed', reason: 'worker_launch_target_changed' };
+    }
+    rememberLaunch({
+      commandId,
+      launchToken,
+      taskMarker: launch.taskMarker,
+      workspaceId: launch.workspaceId,
+      threadKey: launch.threadKey || null,
+      openMode: launch.openMode || 'new_thread',
+      targetConversationId: DOM.conversationIdFromPath() || null,
+      projectId: expectedProjectId
+    });
+
     let modelFailure = 'selection_unconfirmed';
     const modelSelected = await DOM.selectModelSettings(launch.executionProfile, (code) => {
       if (typeof code === 'string' && /^[a-z_]{1,64}$/.test(code)) modelFailure = code;
-    });
+    }, stillOnTarget);
     if (!modelSelected) {
       return { state: 'failed', reason: `model_or_effort_unconfirmed:${modelFailure}` };
     }
     // Chat/Work/model transitions can replace or temporarily disable the composer after the
-    // picker has already confirmed the selection. Reacquire a writable host before any marker
-    // inspection or prompt insertion instead of trusting the pre-picker editor instance.
-    if (!(await DOM.waitForComposerReady(15000))) {
-      return { state: 'failed', reason: 'composer_after_model_not_ready' };
+    // picker has already confirmed the selection. Reacquire a writable host under the same exact
+    // launch/route fence instead of trusting the pre-picker editor instance.
+    if (!(await DOM.waitForComposerReady(15000, stillOnTarget))) {
+      return { state: 'failed', reason: stillOnTarget() ? 'composer_after_model_not_ready' : 'worker_launch_target_changed' };
     }
-    if (existingThread && !DOM.conversationIdFromPath()) {
-      return { state: 'failed', reason: 'worker_conversation_changed_after_model' };
+    if (!stillOnTarget()) {
+      return { state: 'failed', reason: 'worker_launch_target_changed' };
     }
-    if (!existingThread && expectedProjectId && DOM.projectIdFromPath() !== expectedProjectId) {
-      return { state: 'failed', reason: 'worker_project_changed_after_model' };
-    }
-    const selection = await DOM.selectedModelAndEffort(launch.executionProfile);
-    if (!selection) {
-      return { state: 'failed', reason: 'model_or_effort_readback_unconfirmed' };
-    }
+    // selectModelSettings already requires an account-evaluated exact choice and confirmed picker
+    // closure. Do not make Send depend on a second independent picker traversal. When the closed
+    // native trigger exposes the route-stamped selection, retain it as diagnostic evidence only.
+    const selection = DOM.visibleModelSelection?.(launch.executionProfile) || null;
     if (DOM.taskMarkerPresent(launch.taskMarker)) {
       const evidence = DOM.workerEvidence(launch.taskMarker);
       return {
@@ -239,7 +287,13 @@
     ) {
       return { state: 'failed', reason: 'prepared_launch_identity_mismatch' };
     }
-    return DOM.commitSendOnce(launch.openingMessage, launch.taskMarker);
+    const stillOnPreparedTarget = () =>
+      DOM.conversationIdFromPath() === (remembered.targetConversationId || null) &&
+      (DOM.projectIdFromPath() || null) === (remembered.projectId || null);
+    if (!stillOnPreparedTarget()) {
+      return { state: 'failed', reason: 'prepared_launch_target_changed' };
+    }
+    return DOM.commitSendOnce(launch.openingMessage, launch.taskMarker, stillOnPreparedTarget);
   }
 
   async function reconcileWorker(message) {

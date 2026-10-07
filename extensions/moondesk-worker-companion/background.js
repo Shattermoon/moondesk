@@ -14,6 +14,7 @@ const HELLO_TIMEOUT_MS = 1200;
 const FAST_POLL_MS = 1500;
 const MAX_RECONCILE_ATTEMPTS = 3;
 const MAX_PARALLEL_COMMANDS = 4;
+const CHATGPT_MODEL_EFFORTS = new Set(['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra', 'pro']);
 
 let pumpTimer = null;
 let pumpActive = false;
@@ -261,8 +262,20 @@ function launchHash(token) {
   return `#moondesk-launch=${encodeURIComponent(token)}`;
 }
 
-function sourceWithLaunchToken(sourceUrl, token) {
+function sourceWithLaunchToken(sourceUrl, token, executionProfile = null) {
   const url = new URL(sourceUrl);
+  const model = typeof executionProfile?.modelKey === 'string' && /^[a-zA-Z0-9._-]{1,80}$/.test(executionProfile.modelKey)
+    ? executionProfile.modelKey
+    : null;
+  const effort = typeof executionProfile?.reasoningEffort === 'string' && CHATGPT_MODEL_EFFORTS.has(executionProfile.reasoningEffort)
+    ? executionProfile.reasoningEffort
+    : null;
+  // Match the proven ChatGPT bootstrap shape: keep the launch marker in both query and fragment
+  // because the shell has rewritten either one during startup across builds, and seed the exact
+  // provider model/effort before the content bootstrap ever touches the picker.
+  url.searchParams.set('moondesk-launch', token);
+  if (model) url.searchParams.set('model', model);
+  if (effort) url.searchParams.set('reasoning_effort', effort);
   url.hash = launchHash(token);
   return url.toString();
 }
@@ -648,7 +661,10 @@ async function recordForCommand(state, command, placement, reconcileRequired = f
       throw new Error('Reconciliation has no confirmed worker conversation URL and cannot create a fresh worker thread');
     }
     const targetUrl = record.conversationUrl || record.sourceUrl;
-    tab = await chrome.tabs.create({ url: sourceWithLaunchToken(targetUrl, record.launchToken), active: false });
+    tab = await chrome.tabs.create({
+      url: sourceWithLaunchToken(targetUrl, record.launchToken, command.launch.executionProfile),
+      active: false
+    });
     record.tabId = tab.id ?? null;
     record.phase = 'created';
     await writeState(state);
@@ -704,14 +720,16 @@ function acceptanceMatches(command, placement, baseline, evidence, conversationU
     baseline?.conversationId &&
     evidence.conversationId !== baseline.conversationId
   ) return false;
-  const marker = evidence.markerPresent === true;
-  const generationStarted = evidence.generating === true && baseline?.generating !== true;
-  const newAssistantTurn = (
-    Number.isInteger(evidence.assistantTurnCount) &&
-    Number.isInteger(baseline?.assistantTurnCount) &&
-    evidence.assistantTurnCount > baseline.assistantTurnCount
+  const marker = evidence.markerPresent === true && baseline?.markerPresent !== true;
+  const newUserTurn = (
+    Number.isInteger(evidence.userTurnCount) &&
+    Number.isInteger(baseline?.userTurnCount) &&
+    evidence.userTurnCount > baseline.userTurnCount
   );
-  return marker && (generationStarted || newAssistantTurn);
+  // The exact unique marker appearing in a new native user turn is the browser/provider Send
+  // receipt. Do not make conversation binding wait for assistant generation to begin; hidden tabs
+  // and deliberate models can remain quiet after ChatGPT has already accepted the user message.
+  return marker && newUserTurn;
 }
 
 async function observeWorkerAcceptance(
@@ -1020,6 +1038,7 @@ async function processCommand(state, offer) {
     type: 'MOONDESK_COMMIT_WORKER_SEND',
     commandId: command.id,
     launchToken: record.launchToken,
+    placement,
     launch: command.launch
   }, 12000);
   if (!committed?.ok || committed.result?.state !== 'committed') {

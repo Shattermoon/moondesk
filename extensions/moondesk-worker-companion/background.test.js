@@ -2138,6 +2138,82 @@ test('Project worker preparation keeps launch authority across the exact source-
   assert.equal(response.result.state, 'ready');
 });
 
+test('Project worker preparation resumes from the exact Project home after a document transition', async () => {
+  let messageHandler = null;
+  let enterProjectCalls = 0;
+  const projectId = 'g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+  const storage = new Map();
+  const DOM = {
+    conversationIdFromPath() { return null; },
+    projectIdFromPath() { return projectId; },
+    projectHomeId() { return projectId; },
+    async enterProject() {
+      enterProjectCalls += 1;
+      throw new Error('a resumed Project-home bootstrap must not click Project entry again');
+    },
+    composerReady() { return true; },
+    async waitForComposerReady(_timeoutMs, stillCurrent) { return stillCurrent(); },
+    async selectModelSettings(_profile, _failure, stillCurrent) { return stillCurrent(); },
+    visibleModelSelection() { return { model: 'gpt-5.6-sol', reasoningEffort: 'high' }; },
+    taskMarkerPresent() { return false; },
+    insertPrompt() { return true; },
+    workerEvidence() {
+      return {
+        conversationId: null,
+        projectId,
+        markerPresent: false,
+        generating: false,
+        userTurnCount: 0,
+        assistantTurnCount: 0,
+        composerEmpty: false
+      };
+    }
+  };
+  const context = vm.createContext({
+    window: { MOONDESK_CHATGPT_DOM: DOM },
+    sessionStorage: {
+      setItem(key, value) { storage.set(key, value); },
+      getItem(key) { return storage.get(key) || null; }
+    },
+    location: {
+      origin: 'https://chatgpt.com',
+      hash: '#moondesk-launch=project-resume-token',
+      pathname: `/g/${projectId}-moondesk/project`,
+      search: '?moondesk-launch=project-resume-token',
+      href: `https://chatgpt.com/g/${projectId}-moondesk/project?moondesk-launch=project-resume-token#moondesk-launch=project-resume-token`
+    },
+    history: { state: null, replaceState() {} },
+    chrome: { runtime: { onMessage: { addListener(handler) { messageHandler = handler; } } } },
+    crypto: webcrypto,
+    setTimeout,
+    clearTimeout,
+    setInterval,
+    clearInterval,
+    console
+  });
+  vm.runInContext(contentSource, context, { filename: contentPath });
+
+  const response = await new Promise((resolve) => {
+    const returned = messageHandler({
+      type: 'MOONDESK_PREPARE_WORKER',
+      commandId: 'project-resume-command',
+      launchToken: 'project-resume-token',
+      placement: { projectId },
+      launch: {
+        workspaceId: 'workspace-a',
+        taskMarker: 'moondesk-worker-task:project-resume',
+        openingMessage: 'project-resume',
+        threadKey: 'worker:project-resume',
+        openMode: 'new_thread',
+        executionProfile: { modelKey: 'gpt-5.6-sol', modelLabel: 'GPT-5.6 Sol', reasoningEffort: 'high' }
+      }
+    }, null, resolve);
+    assert.equal(returned, true);
+  });
+  assert.equal(response.ok, true);
+  assert.equal(response.result.state, 'ready');
+  assert.equal(enterProjectCalls, 0);
+});
 test('worker preparation aborts when the target route changes during model selection', async () => {
   let messageHandler = null;
   let conversationId = null;
@@ -2787,6 +2863,72 @@ test('transient Project readiness retries preparation on the same tab before Sen
   assert.deepEqual(tabIds, [42, 42]);
 });
 
+test('worker preparation uses the full remaining deadline instead of the old 40 second transport cap', async () => {
+  const timeoutDelays = [];
+  const { evaluate } = loadBackground({
+    sendMessageImpl: async (_tabId, message) => {
+      assert.equal(message.type, 'MOONDESK_PREPARE_WORKER');
+      return {
+        ok: true,
+        result: {
+          state: 'ready',
+          reason: 'worker_prompt_prepared',
+          evidence: { conversationId: null, userTurnCount: 0, composerEmpty: false }
+        }
+      };
+    },
+    setTimeoutImpl(_fn, delay) {
+      timeoutDelays.push(delay);
+      return 1;
+    }
+  });
+  const prepareWorkerWithRetry = evaluate('prepareWorkerWithRetry');
+  const response = await prepareWorkerWithRetry(
+    42,
+    { type: 'MOONDESK_PREPARE_WORKER' },
+    Date.now() + 60000
+  );
+  assert.equal(response.result.state, 'ready');
+  assert.ok(
+    timeoutDelays.some((delay) => delay > 40000),
+    `expected the send-message timeout to inherit the overall deadline, got ${timeoutDelays.join(', ')}`
+  );
+});
+
+test('worker preparation reacquires content and retries after a Project navigation closes the message port', async () => {
+  let prepareCalls = 0;
+  let contextCalls = 0;
+  const { evaluate } = loadBackground({
+    sendMessageImpl: async (_tabId, message) => {
+      if (message.type === 'MOONDESK_CONTEXT') {
+        contextCalls += 1;
+        return { ok: true, context: { projectId: 'g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' } };
+      }
+      assert.equal(message.type, 'MOONDESK_PREPARE_WORKER');
+      prepareCalls += 1;
+      if (prepareCalls === 1) {
+        throw new Error('The message port closed before a response was received.');
+      }
+      return {
+        ok: true,
+        result: {
+          state: 'ready',
+          reason: 'worker_prompt_prepared',
+          evidence: { conversationId: null, userTurnCount: 0, composerEmpty: false }
+        }
+      };
+    },
+    setTimeoutImpl(fn, delay) {
+      if (delay === 1500) queueMicrotask(fn);
+      return 1;
+    }
+  });
+  const prepareWorkerWithRetry = evaluate('prepareWorkerWithRetry');
+  const response = await prepareWorkerWithRetry(42, { type: 'MOONDESK_PREPARE_WORKER' });
+  assert.equal(response.result.state, 'ready');
+  assert.equal(prepareCalls, 2);
+  assert.ok(contextCalls >= 1, 'the retry must reacquire the post-navigation content script first');
+});
 test('non-transient preparation failure is not retried', async () => {
   let prepareCalls = 0;
   const { evaluate } = loadBackground({

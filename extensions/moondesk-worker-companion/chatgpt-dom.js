@@ -1107,6 +1107,7 @@
     context,
     correlationEvidence: readCorrelationEvidence,
     projectIdFromPath,
+    projectHomeId,
     conversationIdFromPath,
     enterProject,
     taskMarkerPresent,

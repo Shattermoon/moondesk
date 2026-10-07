@@ -182,28 +182,46 @@
       }
     } else if (expectedProjectId) {
       const sourceConversation = DOM.conversationIdFromPath();
-      if (DOM.projectIdFromPath() !== expectedProjectId || !sourceConversation) {
-        return { state: 'failed', reason: 'wrong_chatgpt_project' };
-      }
-      const stillOnSource = () =>
-        launchAlive() &&
+      const alreadyOnProjectHome =
         DOM.projectIdFromPath() === expectedProjectId &&
-        DOM.conversationIdFromPath() === sourceConversation;
-      if (!stillOnSource()) {
-        return { state: 'failed', reason: 'worker_launch_target_changed' };
-      }
-      // enterProject owns the exact source-conversation -> Project-home transition proof. Its
-      // cancellation fence must cover the launch lifetime, not require the source route to remain
-      // unchanged after the one native Project click.
-      if (!(await DOM.enterProject(expectedProjectId, launchAlive))) {
-        return { state: 'failed', reason: launchAlive() ? 'project_entry_unconfirmed' : 'worker_launch_target_changed' };
-      }
-      stillOnTarget = () =>
-        launchAlive() &&
-        DOM.projectIdFromPath() === expectedProjectId &&
-        DOM.conversationIdFromPath() === null;
-      if (!stillOnTarget() || !DOM.composerReady()) {
-        return { state: 'failed', reason: stillOnTarget() ? 'project_composer_not_ready' : 'worker_launch_target_changed' };
+        DOM.projectHomeId?.() === expectedProjectId &&
+        sourceConversation === null;
+      if (alreadyOnProjectHome) {
+        // A native Project transition may replace the source document and close the original
+        // extension message port. The background can safely resend PREPARE before Send; resume
+        // only on the exact Project home proved by the same durable launch identity.
+        stillOnTarget = () =>
+          launchAlive() &&
+          DOM.projectIdFromPath() === expectedProjectId &&
+          DOM.projectHomeId?.() === expectedProjectId &&
+          DOM.conversationIdFromPath() === null;
+        if (!(await DOM.waitForComposerReady(15000, stillOnTarget))) {
+          return { state: 'failed', reason: stillOnTarget() ? 'project_composer_not_ready' : 'worker_launch_target_changed' };
+        }
+      } else {
+        if (DOM.projectIdFromPath() !== expectedProjectId || !sourceConversation) {
+          return { state: 'failed', reason: 'wrong_chatgpt_project' };
+        }
+        const stillOnSource = () =>
+          launchAlive() &&
+          DOM.projectIdFromPath() === expectedProjectId &&
+          DOM.conversationIdFromPath() === sourceConversation;
+        if (!stillOnSource()) {
+          return { state: 'failed', reason: 'worker_launch_target_changed' };
+        }
+        // enterProject owns the exact source-conversation -> Project-home transition proof. Its
+        // cancellation fence must cover the launch lifetime, not require the source route to remain
+        // unchanged after the one native Project click.
+        if (!(await DOM.enterProject(expectedProjectId, launchAlive))) {
+          return { state: 'failed', reason: launchAlive() ? 'project_entry_unconfirmed' : 'worker_launch_target_changed' };
+        }
+        stillOnTarget = () =>
+          launchAlive() &&
+          DOM.projectIdFromPath() === expectedProjectId &&
+          DOM.conversationIdFromPath() === null;
+        if (!stillOnTarget() || !DOM.composerReady()) {
+          return { state: 'failed', reason: stillOnTarget() ? 'project_composer_not_ready' : 'worker_launch_target_changed' };
+        }
       }
     } else {
       stillOnTarget = () =>

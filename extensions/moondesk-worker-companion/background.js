@@ -818,23 +818,44 @@ const PREPARE_RETRY_DELAY_MS = 1500;
 
 async function prepareWorkerWithRetry(tabId, payload, deadlineMs = Date.now() + 60000) {
   let response = null;
+  let lastTransportError = null;
   for (let attempt = 1; attempt <= MAX_PREPARE_ATTEMPTS; attempt += 1) {
     const remainingMs = deadlineMs - Date.now();
     if (remainingMs <= 0) throw new Error('worker_prepare_timeout');
-    response = await sendToTab(tabId, payload, Math.min(40000, remainingMs));
-    if (!response?.ok) return response;
-    const result = response.result || {};
-    if (
-      result.state !== 'failed' ||
-      !TRANSIENT_PREPARE_FAILURES.has(result.reason) ||
-      attempt === MAX_PREPARE_ATTEMPTS
-    ) {
-      return response;
+    try {
+      // One overall preparation deadline owns the whole bootstrap. Project source hydration is
+      // allowed to consume most of that window, so never nest the old 40 s transport cutoff
+      // inside the 60 s Project readiness budget.
+      response = await sendToTab(tabId, payload, remainingMs);
+      lastTransportError = null;
+    } catch (error) {
+      lastTransportError = error;
+      if (attempt === MAX_PREPARE_ATTEMPTS) throw error;
+      const afterFailureMs = deadlineMs - Date.now();
+      if (afterFailureMs <= 0) throw new Error('worker_prepare_timeout');
+      // A native Project transition can replace the document/message port. Preparation has not
+      // crossed Send, so it is safe to reacquire the content script and re-run the idempotent
+      // prepare step on the same tab under the same durable launch identity.
+      try {
+        await waitForContent(tabId, Math.min(10000, afterFailureMs));
+      } catch {}
+    }
+    if (!lastTransportError) {
+      if (!response?.ok) return response;
+      const result = response.result || {};
+      if (
+        result.state !== 'failed' ||
+        !TRANSIENT_PREPARE_FAILURES.has(result.reason) ||
+        attempt === MAX_PREPARE_ATTEMPTS
+      ) {
+        return response;
+      }
     }
     const retryDelayMs = Math.min(PREPARE_RETRY_DELAY_MS, Math.max(0, deadlineMs - Date.now()));
     if (retryDelayMs === 0) throw new Error('worker_prepare_timeout');
     await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
   }
+  if (lastTransportError) throw lastTransportError;
   return response;
 }
 
@@ -978,7 +999,8 @@ async function processCommand(state, offer) {
     record.phase = 'failed';
     await writeState(state);
     const message = String(error?.message || error);
-    await failBeforeSend(message === 'worker_prepare_timeout' ? message : 'worker_prepare_exception');
+    const timedOut = message === 'worker_prepare_timeout' || /timed out/i.test(message);
+    await failBeforeSend(timedOut ? 'worker_prepare_timeout' : 'worker_prepare_exception');
     return;
   }
   if (!prepared?.ok) {

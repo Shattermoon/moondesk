@@ -28,6 +28,7 @@
         "https://chatgpt.com/*"
       ],
       "js": [
+        "provider-correlation-main.js",
         "model-state-main.js"
       ],
       "run_at": "document_start",

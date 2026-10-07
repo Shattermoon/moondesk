@@ -1104,63 +1104,50 @@ async fn handle_tools_call_for_workspace(
         let anchor_route = if arguments.get("action").and_then(Value::as_str) == Some("spawn") {
             match companion_auth.as_ref() {
                 Some(auth) => {
-                    let routing_started_ms = crate::companion::unix_time_ms();
-                    let route = if let Some(request_id) = inbound_request_id.as_deref() {
-                        match auth
+                    let request_id = inbound_request_id.as_deref();
+                    let mut route = match request_id {
+                        Some(request_id) => auth.correlation_for(request_id).await,
+                        None => None,
+                    };
+
+                    if route.is_none() {
+                        route = auth
+                            .anchor_affinity_for(&caller_identity.session_digest)
+                            .await;
+                    }
+
+                    if route.is_none() {
+                        let Some(request_id) = request_id else {
+                            return tool_error_response_text_only(
+                                req,
+                                "workers spawn could not identify the originating ChatGPT Anchor because the MCP request did not include a usable OpenAI x-request-id and no remembered Anchor affinity was available".into(),
+                            );
+                        };
+                        route = match auth
                             .wait_for_correlation(
                                 request_id,
-                                std::time::Duration::from_millis(3_200),
+                                std::time::Duration::from_millis(5_000),
                             )
                             .await
                         {
                             Ok(route) => route,
                             Err(error) => return tool_error_response_text_only(req, error),
-                        }
-                    } else {
-                        None
+                        };
+                    }
+
+                    let Some(route) = route else {
+                        return tool_error_response_text_only(
+                            req,
+                            "workers spawn could not identify the originating ChatGPT Anchor; no exact provider-stream request correlation or remembered Anchor affinity was available".into(),
+                        );
                     };
-                    if let Some(route) = route {
-                        if let Err(error) = auth
-                            .remember_anchor_affinity(&caller_identity.session_digest, &route)
-                            .await
-                        {
-                            return tool_error_response_text_only(req, error);
-                        }
-                        Some(route)
-                    } else if let Some(route) = auth
-                        .anchor_affinity_for(&caller_identity.session_digest)
+                    if let Err(error) = auth
+                        .remember_anchor_affinity(&caller_identity.session_digest, &route)
                         .await
                     {
-                        Some(route)
-                    } else {
-                        match auth
-                            .wait_for_generating_anchor_after(
-                                routing_started_ms,
-                                std::time::Duration::from_millis(3_200),
-                            )
-                            .await
-                        {
-                            Ok(Some(route)) => {
-                                if let Err(error) = auth
-                                    .remember_anchor_affinity(
-                                        &caller_identity.session_digest,
-                                        &route,
-                                    )
-                                    .await
-                                {
-                                    return tool_error_response_text_only(req, error);
-                                }
-                                Some(route)
-                            }
-                            Ok(None) => {
-                                return tool_error_response_text_only(
-                                    req,
-                                    "workers spawn could not identify the originating ChatGPT Anchor after waiting for fresh companion presence; no exact request correlation, remembered Anchor affinity, or unique actively-generating paired conversation was available".into(),
-                                );
-                            }
-                            Err(error) => return tool_error_response_text_only(req, error),
-                        }
+                        return tool_error_response_text_only(req, error);
                     }
+                    Some(route)
                 }
                 None => None,
             }
@@ -4199,8 +4186,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn workers_mcp_spawn_prefers_exact_request_correlation() {
-        let root = TestTempDir::new("moondesk-workers-mcp-generating-route");
+    async fn workers_mcp_spawn_waits_for_exact_provider_correlation() {
+        let root = TestTempDir::new("moondesk-workers-mcp-provider-correlation");
         let workspace_root = root.path().join("workspace");
         std::fs::create_dir_all(&workspace_root).expect("create workspace");
         let workspace_id = WorkspaceId::new();
@@ -4369,8 +4356,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn workers_mcp_spawn_ignores_unrelated_older_generating_companion() {
-        let root = TestTempDir::new("moondesk-workers-mcp-focused-fallback");
+    async fn workers_mcp_spawn_fails_closed_without_exact_provider_correlation() {
+        let root = TestTempDir::new("moondesk-workers-mcp-no-provider-correlation");
         let workspace_root = root.path().join("workspace");
         std::fs::create_dir_all(&workspace_root).expect("create workspace");
         let workspace_id = WorkspaceId::new();
@@ -4490,14 +4477,14 @@ mod tests {
                 browser_runtime: &browser_runtime,
                 worker_execution_profile: ChatExecutionProfile::default(),
                 worker_target_count: crate::workers::RECOMMENDED_WORKERS_PER_FAMILY,
-                worker_broker: broker,
+                worker_broker: broker.clone(),
                 managed_chat_broker: managed_chat_broker.clone(),
                 companion_auth: Some(companion_auth),
                 inbound_request_id: Some("request_without_page_correlation".into()),
             },
         )
         .await;
-        assert_ne!(
+        assert_eq!(
             response
                 .result
                 .as_ref()
@@ -4505,21 +4492,9 @@ mod tests {
                 .and_then(Value::as_bool),
             Some(true)
         );
-
-        let snapshot = managed_chat_broker.snapshot().await;
-        let command = snapshot
-            .commands
-            .values()
-            .next()
-            .expect("managed worker launch");
-        assert_eq!(command.target_client_id.as_deref(), Some("chrome-install"));
-        assert_eq!(
-            command
-                .anchor_context
-                .as_ref()
-                .map(|context| context.conversation_id.as_str()),
-            Some(chrome_conversation)
-        );
+        assert!(result_text(&response).contains("no exact provider-stream request correlation"));
+        assert!(managed_chat_broker.snapshot().await.commands.is_empty());
+        assert!(broker.snapshot().await.families.is_empty());
     }
 
     #[tokio::test]

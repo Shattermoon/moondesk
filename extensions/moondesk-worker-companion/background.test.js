@@ -4,15 +4,18 @@ const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
 const { webcrypto } = require('node:crypto');
+const { ReadableStream } = require('node:stream/web');
 
 const backgroundPath = path.join(__dirname, 'background.js');
 const serverPath = path.join(__dirname, '..', '..', 'src', 'server.rs');
 const manifestPath = path.join(__dirname, 'manifest.json');
+const providerCorrelationMainPath = path.join(__dirname, 'provider-correlation-main.js');
 const modelStateMainPath = path.join(__dirname, 'model-state-main.js');
 const chatgptDomPath = path.join(__dirname, 'chatgpt-dom.js');
 const contentPath = path.join(__dirname, 'content.js');
 const popupPath = path.join(__dirname, 'popup.js');
 const source = fs.readFileSync(backgroundPath, 'utf8');
+const providerCorrelationMainSource = fs.readFileSync(providerCorrelationMainPath, 'utf8');
 const modelStateMainSource = fs.readFileSync(modelStateMainPath, 'utf8');
 const chatgptDomSource = fs.readFileSync(chatgptDomPath, 'utf8');
 const contentSource = fs.readFileSync(contentPath, 'utf8');
@@ -24,6 +27,7 @@ function loadBackground({ existingTabs = {}, contentByTab = {}, sendMessageImpl 
   const createdTabs = [];
   const removedTabs = [];
   let stored = {};
+  let runtimeMessageHandler = null;
 
   const chrome = {
     storage: {
@@ -76,7 +80,7 @@ function loadBackground({ existingTabs = {}, contentByTab = {}, sendMessageImpl 
       onAlarm: { addListener() {} }
     },
     runtime: {
-      onMessage: { addListener() {} },
+      onMessage: { addListener(handler) { runtimeMessageHandler = handler; } },
       onInstalled: { addListener() {} },
       onStartup: { addListener() {} }
     }
@@ -101,8 +105,45 @@ function loadBackground({ existingTabs = {}, contentByTab = {}, sendMessageImpl 
     removedTabs,
     evaluate(expression) {
       return vm.runInContext(expression, context);
+    },
+    dispatchRuntimeMessage(message, sender = {}) {
+      if (!runtimeMessageHandler) throw new Error('runtime message handler was not registered');
+      return new Promise((resolve) => {
+        const keepAlive = runtimeMessageHandler(message, sender, resolve);
+        if (!keepAlive) resolve(undefined);
+      });
     }
   };
+}
+
+function bodyStreamResponse(text, contentType) {
+  const bytes = new TextEncoder().encode(text);
+  return {
+    headers: { get(name) { return String(name).toLowerCase() === 'content-type' ? contentType : null; } },
+    clone() {
+      return {
+        body: new ReadableStream({
+          start(controller) {
+            controller.enqueue(bytes);
+            controller.close();
+          }
+        })
+      };
+    }
+  };
+}
+
+function eventStreamResponse(text) {
+  return bodyStreamResponse(text, 'text/event-stream');
+}
+
+function jsonStreamResponse(value) {
+  return bodyStreamResponse(JSON.stringify(value), 'application/json');
+}
+
+async function flushMicrotasks() {
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
 }
 
 test('companion HTTP paths used by the extension match server route constants', () => {
@@ -161,7 +202,13 @@ test('model-state bridge is injected in ChatGPT MAIN world before isolated conte
   );
   assert.ok(main, 'model-state-main.js must be declared as a MAIN-world content script');
   assert.deepEqual(main.matches, ['https://chatgpt.com/*']);
+  assert.deepEqual(main.js, ['provider-correlation-main.js', 'model-state-main.js']);
   assert.equal(main.run_at, 'document_start');
+  assert.match(
+    source,
+    /files: \['provider-correlation-main\.js', 'model-state-main\.js'\]/,
+    'already-open ChatGPT tabs must receive the provider observer through dynamic MAIN-world injection too'
+  );
 
   const isolated = manifest.content_scripts.find((entry) =>
     entry.js?.includes('chatgpt-dom.js') && entry.js?.includes('content.js')
@@ -169,6 +216,345 @@ test('model-state bridge is injected in ChatGPT MAIN world before isolated conte
   assert.ok(isolated, 'isolated companion content scripts must remain declared');
   assert.equal(isolated.world, undefined);
   assert.equal(isolated.run_at, 'document_idle');
+});
+
+test('provider correlation captures exact request identity from live conversation SSE before Fiber metadata exists', async () => {
+  const conversationId = '6ac52738-64a0-83ee-bff8-59ffcc9f8c91';
+  const posted = [];
+  let messageHandler = null;
+  const response = eventStreamResponse(
+    `event: message\ndata: {"conversation_id":"${conversationId}","message":{"metadata":{"request_id":"wfr_live_request/attempt-7"}}}\n\n`
+  );
+  const pageWindow = {
+    fetch: async () => response,
+    addEventListener(type, handler) {
+      if (type === 'message') messageHandler = handler;
+    },
+    postMessage(message) { posted.push(message); }
+  };
+  const context = vm.createContext({
+    window: pageWindow,
+    location: {
+      origin: 'https://chatgpt.com',
+      href: `https://chatgpt.com/c/${conversationId}`,
+      pathname: `/c/${conversationId}`
+    },
+    URL,
+    TextDecoder,
+    Uint8Array,
+    Date,
+    console
+  });
+
+  vm.runInContext(providerCorrelationMainSource, context, { filename: providerCorrelationMainPath });
+  await pageWindow.fetch('https://chatgpt.com/backend-api/f/conversation');
+  await flushMicrotasks();
+
+  const observed = posted.find((message) => message.source === 'moondesk-provider-correlation-observed');
+  assert.ok(observed, 'live SSE must emit correlation without waiting for rendered React metadata');
+  assert.equal(observed.correlation.conversationId, conversationId);
+  assert.deepEqual(Array.from(observed.correlation.requestIds), ['wfr_live_request']);
+
+  messageHandler({
+    source: pageWindow,
+    origin: 'https://chatgpt.com',
+    data: { source: 'moondesk-provider-correlation-ask', nonce: 'late-content-script', v: 1 }
+  });
+  const replay = posted.find((message) => message.source === 'moondesk-provider-correlation-reply');
+  assert.ok(replay, 'provider proof must remain briefly replayable if isolated content loads later');
+  assert.equal(replay.correlations[0].conversationId, conversationId);
+  assert.deepEqual(Array.from(replay.correlations[0].requestIds), ['wfr_live_request']);
+});
+
+test('provider correlation follows current ChatGPT stream handoff into encoded WebSocket SSE', async () => {
+  const conversationId = '7ac52738-64a0-83ee-bff8-59ffcc9f8c92';
+  const topicId = 'conversation-turn-turn_12345';
+  const parentMessageId = 'parent_message_12345';
+  const userMessageId = 'user_message_12345';
+  const posted = [];
+  const response = jsonStreamResponse({
+    type: 'stream_handoff',
+    conversation_id: conversationId,
+    options: [
+      { type: 'resume_sse_endpoint', topic_id: topicId },
+      { type: 'subscribe_ws_topic', topic_id: topicId }
+    ]
+  });
+  class FakeWebSocket {
+    static last = null;
+    constructor() {
+      this.listeners = new Map();
+      FakeWebSocket.last = this;
+    }
+    addEventListener(type, handler) {
+      const handlers = this.listeners.get(type) || [];
+      handlers.push(handler);
+      this.listeners.set(type, handlers);
+    }
+    emit(type, data) {
+      for (const handler of this.listeners.get(type) || []) handler({ data });
+    }
+  }
+  const pageWindow = {
+    fetch: async () => response,
+    WebSocket: FakeWebSocket,
+    addEventListener() {},
+    postMessage(message) { posted.push(message); }
+  };
+  const context = vm.createContext({
+    window: pageWindow,
+    location: {
+      origin: 'https://chatgpt.com',
+      href: `https://chatgpt.com/c/${conversationId}`,
+      pathname: `/c/${conversationId}`
+    },
+    URL,
+    TextDecoder,
+    Uint8Array,
+    Date,
+    console
+  });
+
+  vm.runInContext(providerCorrelationMainSource, context, { filename: providerCorrelationMainPath });
+  await pageWindow.fetch('https://chatgpt.com/backend-api/f/conversation', {
+    method: 'POST',
+    body: JSON.stringify({
+      conversation_id: conversationId,
+      parent_message_id: parentMessageId,
+      messages: [{ id: userMessageId, author: { role: 'user' }, content: { parts: ['not retained'] } }]
+    })
+  });
+  await flushMicrotasks();
+
+  const socket = new pageWindow.WebSocket('wss://chatgpt.com/ws');
+  const encodedItem = 'data: {"message":{"metadata":{"request_id":"wfr_ws_request/attempt-3"}}}\n\n';
+  socket.emit('message', JSON.stringify([{
+    parent_message_id: parentMessageId,
+    payload: { payload: { encoded_item: encodedItem } }
+  }]));
+  await flushMicrotasks();
+
+  const observed = posted.find((message) =>
+    message.source === 'moondesk-provider-correlation-observed' &&
+    message.correlation.requestIds.includes('wfr_ws_request')
+  );
+  assert.ok(observed, 'WebSocket handoff must retain exact conversation ownership');
+  assert.equal(observed.correlation.conversationId, conversationId);
+});
+
+test('provider correlation fails closed when one stream event claims conflicting conversation ids', async () => {
+  const firstConversation = '7bc52738-64a0-83ee-bff8-59ffcc9f8c96';
+  const secondConversation = '7cc52738-64a0-83ee-bff8-59ffcc9f8c97';
+  const posted = [];
+  const response = eventStreamResponse(
+    `data: {"conversation_id":"${firstConversation}","message":{"conversation_id":"${secondConversation}","metadata":{"request_id":"wfr_conflicted"}}}\n\n`
+  );
+  const pageWindow = {
+    fetch: async () => response,
+    addEventListener() {},
+    postMessage(message) { posted.push(message); }
+  };
+  const context = vm.createContext({
+    window: pageWindow,
+    location: {
+      origin: 'https://chatgpt.com',
+      href: `https://chatgpt.com/c/${firstConversation}`,
+      pathname: `/c/${firstConversation}`
+    },
+    URL,
+    TextDecoder,
+    Uint8Array,
+    Date,
+    console
+  });
+
+  vm.runInContext(providerCorrelationMainSource, context, { filename: providerCorrelationMainPath });
+  await pageWindow.fetch('https://chatgpt.com/backend-api/f/conversation');
+  await flushMicrotasks();
+  assert.equal(
+    posted.filter((message) => message.source === 'moondesk-provider-correlation-observed').length,
+    0,
+    'ambiguous provider evidence must never be promoted into Anchor authority'
+  );
+});
+
+test('isolated content forwards provider correlation immediately for the exact current conversation', async () => {
+  const conversationId = '8ac52738-64a0-83ee-bff8-59ffcc9f8c93';
+  let windowMessageHandler = null;
+  const runtimeMessages = [];
+  const pageWindow = {
+    MOONDESK_CHATGPT_DOM: {
+      conversationIdFromPath() { return conversationId; }
+    },
+    addEventListener(type, handler) {
+      if (type === 'message') windowMessageHandler = handler;
+    },
+    postMessage() {}
+  };
+  const context = vm.createContext({
+    window: pageWindow,
+    location: {
+      origin: 'https://chatgpt.com',
+      pathname: `/c/${conversationId}`,
+      search: '',
+      hash: ''
+    },
+    chrome: {
+      runtime: {
+        async sendMessage(message) {
+          runtimeMessages.push(message);
+          return { ok: true };
+        },
+        onMessage: { addListener() {} }
+      }
+    },
+    crypto: webcrypto,
+    Date,
+    setTimeout,
+    clearTimeout,
+    setInterval,
+    clearInterval,
+    console
+  });
+
+  vm.runInContext(contentSource, context, { filename: contentPath });
+  assert.equal(typeof windowMessageHandler, 'function');
+  windowMessageHandler({
+    source: pageWindow,
+    origin: 'https://chatgpt.com',
+    data: {
+      source: 'moondesk-provider-correlation-observed',
+      v: 1,
+      correlation: { conversationId, requestIds: ['wfr_provider_exact'] }
+    }
+  });
+  await flushMicrotasks();
+
+  assert.deepEqual(JSON.parse(JSON.stringify(runtimeMessages)), [{
+    type: 'MOONDESK_PROVIDER_CORRELATION',
+    correlation: { conversationId, requestIds: ['wfr_provider_exact'] }
+  }]);
+});
+
+test('isolated content holds a new-chat provider proof until the URL converges to the exact conversation', async () => {
+  const conversationId = '8bc52738-64a0-83ee-bff8-59ffcc9f8c95';
+  let currentConversation = null;
+  let windowMessageHandler = null;
+  const runtimeMessages = [];
+  const pageWindow = {
+    MOONDESK_CHATGPT_DOM: {
+      conversationIdFromPath() { return currentConversation; }
+    },
+    addEventListener(type, handler) {
+      if (type === 'message') windowMessageHandler = handler;
+    },
+    postMessage() {}
+  };
+  const context = vm.createContext({
+    window: pageWindow,
+    location: { origin: 'https://chatgpt.com', pathname: '/', search: '', hash: '' },
+    chrome: {
+      runtime: {
+        async sendMessage(message) {
+          runtimeMessages.push(message);
+          return { ok: true };
+        },
+        onMessage: { addListener() {} }
+      }
+    },
+    crypto: webcrypto,
+    Date,
+    setTimeout,
+    clearTimeout,
+    setInterval,
+    clearInterval,
+    console
+  });
+
+  vm.runInContext(contentSource, context, { filename: contentPath });
+  windowMessageHandler({
+    source: pageWindow,
+    origin: 'https://chatgpt.com',
+    data: {
+      source: 'moondesk-provider-correlation-observed',
+      v: 1,
+      correlation: { conversationId, requestIds: ['wfr_new_chat'] }
+    }
+  });
+  await flushMicrotasks();
+  assert.equal(runtimeMessages.length, 0, 'new-chat proof must not publish before route identity exists');
+
+  currentConversation = conversationId;
+  await new Promise((resolve) => setTimeout(resolve, 140));
+  assert.deepEqual(JSON.parse(JSON.stringify(runtimeMessages)), [{
+    type: 'MOONDESK_PROVIDER_CORRELATION',
+    correlation: { conversationId, requestIds: ['wfr_new_chat'] }
+  }]);
+});
+
+test('background accepts provider correlation only from the exact sending ChatGPT tab', async () => {
+  const conversationId = '9ac52738-64a0-83ee-bff8-59ffcc9f8c94';
+  const requests = [];
+  const fetchImpl = async (url, options = {}) => {
+    requests.push({ url: String(url), options });
+    if (String(url).endsWith('/__moondesk/companion/v1/hello')) {
+      return {
+        ok: true,
+        status: 200,
+        async json() { return { app: 'moondesk-worker-companion', protocolVersion: 2 }; },
+        async text() { return JSON.stringify({ app: 'moondesk-worker-companion', protocolVersion: 2 }); }
+      };
+    }
+    if (String(url).endsWith('/__moondesk/companion/v1/pair')) {
+      return { ok: true, status: 200, async text() { return '{}'; } };
+    }
+    if (String(url).endsWith('/__moondesk/companion/v1/status')) {
+      return {
+        ok: true,
+        status: 200,
+        async text() { return JSON.stringify({ clientId: 'client-provider', paired: true, protocolVersion: 2 }); }
+      };
+    }
+    if (String(url).endsWith('/__moondesk/companion/v1/correlations')) {
+      return { ok: true, status: 200, async text() { return JSON.stringify({ stored: 1 }); } };
+    }
+    return { ok: false, status: 404, async text() { return '{}'; }, async json() { return {}; } };
+  };
+  const { dispatchRuntimeMessage, evaluate } = loadBackground({ fetchImpl });
+  await evaluate(`writeState({
+    ...freshState(),
+    baseUrl: 'http://127.0.0.1:47650',
+    clientId: 'client-provider',
+    credential: '${'a'.repeat(64)}'
+  })`);
+
+  const response = await dispatchRuntimeMessage({
+    type: 'MOONDESK_PROVIDER_CORRELATION',
+    correlation: { conversationId, requestIds: ['wfr_provider_exact'] }
+  }, {
+    tab: {
+      id: 42,
+      url: `https://chatgpt.com/g/g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-moondesk/c/${conversationId}`
+    }
+  });
+  assert.equal(response.ok, true);
+  const posted = requests.find((request) => request.url.endsWith('/__moondesk/companion/v1/correlations'));
+  assert.ok(posted, 'provider correlation must be published without waiting for the presence pump');
+  assert.deepEqual(JSON.parse(posted.options.body), {
+    conversationId,
+    conversationUrl: `https://chatgpt.com/g/g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-moondesk/c/${conversationId}`,
+    projectId: 'g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+    projectUrl: 'https://chatgpt.com/g/g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-moondesk/project',
+    requestIds: ['wfr_provider_exact']
+  });
+
+  const rejected = await dispatchRuntimeMessage({
+    type: 'MOONDESK_PROVIDER_CORRELATION',
+    correlation: { conversationId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee', requestIds: ['wfr_forged'] }
+  }, {
+    tab: { id: 42, url: `https://chatgpt.com/c/${conversationId}` }
+  });
+  assert.equal(rejected.ok, false);
 });
 
 test('MAIN-world correlation reader joins metadata.request_id only to the exact current Fiber conversation', () => {
@@ -684,6 +1070,16 @@ test('ChatGPT URL routing extracts exact conversation and Project IDs without us
   assert.equal(project.projectId, 'g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
   assert.equal(
     project.projectUrl,
+    'https://chatgpt.com/g/g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-totally-unrelated-visible-name/project'
+  );
+
+  const sharedProject = parse(
+    'https://chatgpt.com/g/g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-totally-unrelated-visible-name/shared/c/6aad7eb1-4b10-83ee-97bd-d98b338864de'
+  );
+  assert.equal(sharedProject.conversationId, '6aad7eb1-4b10-83ee-97bd-d98b338864de');
+  assert.equal(sharedProject.projectId, 'g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
+  assert.equal(
+    sharedProject.projectUrl,
     'https://chatgpt.com/g/g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-totally-unrelated-visible-name/project'
   );
 

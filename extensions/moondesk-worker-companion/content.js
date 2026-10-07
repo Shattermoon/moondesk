@@ -5,6 +5,101 @@
   if (!DOM) return;
 
   const LAUNCH_SESSION_KEY = 'moondesk-worker-launch-v1';
+  const PROVIDER_CORRELATION_OBSERVED = 'moondesk-provider-correlation-observed';
+  const PROVIDER_CORRELATION_ASK = 'moondesk-provider-correlation-ask';
+  const PROVIDER_CORRELATION_REPLY = 'moondesk-provider-correlation-reply';
+  const PROVIDER_CORRELATION_TTL_MS = 15000;
+  const pendingProviderCorrelations = new Map();
+  let providerCorrelationTimer = null;
+
+  function validProviderCorrelation(value) {
+    if (!value || typeof value !== 'object') return null;
+    const conversationId = typeof value.conversationId === 'string'
+      ? value.conversationId.trim().toLowerCase()
+      : '';
+    if (!/^[0-9a-f-]{16,64}$/i.test(conversationId) || !Array.isArray(value.requestIds)) return null;
+    const requestIds = [...new Set(value.requestIds.filter(
+      (requestId) => typeof requestId === 'string' && /^[a-z0-9_-]{1,100}$/i.test(requestId)
+    ))].slice(0, 16);
+    return requestIds.length ? { conversationId, requestIds } : null;
+  }
+
+  async function publishProviderCorrelation(correlation) {
+    const currentConversation = DOM.conversationIdFromPath()?.toLowerCase() || null;
+    if (currentConversation !== correlation.conversationId) return false;
+    for (const delayMs of [0, 150, 600]) {
+      if (delayMs) await new Promise((resolve) => setTimeout(resolve, delayMs));
+      try {
+        const response = await chrome.runtime.sendMessage({
+          type: 'MOONDESK_PROVIDER_CORRELATION',
+          correlation
+        });
+        if (response?.ok) return true;
+      } catch {}
+    }
+    return false;
+  }
+
+  function scheduleProviderCorrelationFlush() {
+    if (providerCorrelationTimer || !pendingProviderCorrelations.size) return;
+    providerCorrelationTimer = setInterval(() => {
+      const now = Date.now();
+      const currentConversation = DOM.conversationIdFromPath()?.toLowerCase() || null;
+      for (const [conversationId, pending] of pendingProviderCorrelations) {
+        if (now >= pending.expiresAt) {
+          pendingProviderCorrelations.delete(conversationId);
+          continue;
+        }
+        if (currentConversation === conversationId) {
+          pendingProviderCorrelations.delete(conversationId);
+          void publishProviderCorrelation(pending.correlation);
+        } else if (currentConversation) {
+          pendingProviderCorrelations.delete(conversationId);
+        }
+      }
+      if (!pendingProviderCorrelations.size) {
+        clearInterval(providerCorrelationTimer);
+        providerCorrelationTimer = null;
+      }
+    }, 100);
+  }
+
+  function acceptProviderCorrelation(value) {
+    const correlation = validProviderCorrelation(value);
+    if (!correlation) return;
+    const currentConversation = DOM.conversationIdFromPath()?.toLowerCase() || null;
+    if (currentConversation === correlation.conversationId) {
+      void publishProviderCorrelation(correlation);
+      return;
+    }
+    if (currentConversation) return;
+    pendingProviderCorrelations.set(correlation.conversationId, {
+      correlation,
+      expiresAt: Date.now() + PROVIDER_CORRELATION_TTL_MS
+    });
+    scheduleProviderCorrelationFlush();
+  }
+
+  if (typeof window.addEventListener === 'function') {
+    window.addEventListener('message', (event) => {
+      if (event.source !== window || event.origin !== location.origin) return;
+      const data = event.data;
+      if (!data || data.v !== 1) return;
+      if (data.source === PROVIDER_CORRELATION_OBSERVED) {
+        acceptProviderCorrelation(data.correlation);
+      } else if (data.source === PROVIDER_CORRELATION_REPLY && Array.isArray(data.correlations)) {
+        for (const correlation of data.correlations) acceptProviderCorrelation(correlation);
+      }
+    });
+  }
+
+  try {
+    window.postMessage?.({
+      source: PROVIDER_CORRELATION_ASK,
+      nonce: crypto.randomUUID(),
+      v: 1
+    }, location.origin);
+  } catch {}
 
   function rememberLaunch(record) {
     try {

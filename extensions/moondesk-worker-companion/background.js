@@ -245,7 +245,7 @@ async function ensureContent(tabId) {
     await chrome.scripting.executeScript({
       target: { tabId },
       world: 'MAIN',
-      files: ['model-state-main.js']
+      files: ['provider-correlation-main.js', 'model-state-main.js']
     });
   } catch {}
 
@@ -297,6 +297,35 @@ function browserLabel() {
   return 'Chromium';
 }
 
+function normalizedProviderCorrelation(value) {
+  if (!value || typeof value !== 'object') return null;
+  const conversationId = typeof value.conversationId === 'string'
+    ? value.conversationId.trim().toLowerCase()
+    : '';
+  if (!/^[0-9a-f-]{16,64}$/i.test(conversationId) || !Array.isArray(value.requestIds)) return null;
+  const requestIds = [...new Set(value.requestIds.filter(
+    (requestId) => typeof requestId === 'string' && /^[a-z0-9_-]{1,100}$/i.test(requestId)
+  ))].slice(0, 16);
+  return requestIds.length ? { conversationId, requestIds } : null;
+}
+
+async function publishProviderCorrelation(state, context, correlation) {
+  const exact = normalizedProviderCorrelation(correlation);
+  if (!context || !exact || context.conversationId.toLowerCase() !== exact.conversationId) {
+    throw new Error('provider correlation did not match the exact ChatGPT conversation route');
+  }
+  return api(state, CORRELATIONS_PATH, {
+    method: 'POST',
+    body: {
+      conversationId: context.conversationId,
+      conversationUrl: context.conversationUrl,
+      projectId: context.projectId,
+      projectUrl: context.projectUrl,
+      requestIds: exact.requestIds
+    }
+  });
+}
+
 function chatContextFromUrl(value) {
   try {
     const url = new URL(value);
@@ -306,7 +335,7 @@ function chatContextFromUrl(value) {
 
     let projectId = null;
     let projectUrl = null;
-    const projectPath = /^\/g\/([^/]+)\/c\//i.exec(url.pathname);
+    const projectPath = /^\/g\/([^/]+)\/(?:shared\/)?c\//i.exec(url.pathname);
     if (projectPath) {
       const candidate = projectPath[1].slice(0, 36).toLowerCase();
       if (!/^g-p-[0-9a-f]{32}$/.test(candidate)) return null;
@@ -1272,7 +1301,7 @@ async function discoverModelCatalog() {
   }
 }
 
-chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (!message || typeof message.type !== 'string') return false;
   const task = (() => {
     switch (message.type) {
@@ -1283,6 +1312,14 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       case 'MOONDESK_PROFILE': return profile();
       case 'MOONDESK_SET_PROFILE': return setProfile(message);
       case 'MOONDESK_DISCOVER_MODELS': return discoverModelCatalog();
+      case 'MOONDESK_PROVIDER_CORRELATION': return (async () => {
+        const context = chatContextFromUrl(sender?.tab?.url || sender?.url || '');
+        if (!context || !Number.isInteger(sender?.tab?.id)) {
+          throw new Error('provider correlation sender was not an exact ChatGPT conversation tab');
+        }
+        const state = await ensureConnected();
+        return publishProviderCorrelation(state, context, message.correlation);
+      })();
       case 'MOONDESK_RETRY_BLOCKED': return (async () => {
         const state = await ensureConnected();
         const blocked = blockedCommandList(state);

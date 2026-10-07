@@ -289,7 +289,6 @@ pub struct CompanionAuth {
     path: PathBuf,
     state: Mutex<CompanionAuthState>,
     presence: Mutex<BTreeMap<String, CompanionClientPresence>>,
-    generation_started_ms: Mutex<BTreeMap<(String, String), u64>>,
     correlations: Mutex<BTreeMap<String, (CompanionAnchorRoute, u64)>>,
     anchor_affinities: Mutex<BTreeMap<String, (CompanionAnchorRoute, u64)>>,
     pairing_token: RwLock<String>,
@@ -310,7 +309,6 @@ impl CompanionAuth {
             path,
             state: Mutex::new(state),
             presence: Mutex::new(BTreeMap::new()),
-            generation_started_ms: Mutex::new(BTreeMap::new()),
             correlations: Mutex::new(BTreeMap::new()),
             anchor_affinities: Mutex::new(BTreeMap::new()),
             pairing_token: RwLock::new(random_secret()),
@@ -512,10 +510,6 @@ impl CompanionAuth {
         persist_state(&self.path, &candidate).await?;
         *guard = candidate;
         self.presence.lock().await.remove(client_id);
-        self.generation_started_ms
-            .lock()
-            .await
-            .retain(|(candidate_client, _), _| candidate_client != client_id);
         self.correlations
             .lock()
             .await
@@ -544,28 +538,10 @@ impl CompanionAuth {
             last_seen_ms: now_ms,
             tabs: update.tabs,
         };
-        let mut presence_guard = self.presence.lock().await;
-        let previous = presence_guard.get(client_id).cloned();
-        let mut generation_guard = self.generation_started_ms.lock().await;
-        generation_guard.retain(|(candidate_client, candidate_conversation), _| {
-            candidate_client != client_id
-                || presence
-                    .tabs
-                    .iter()
-                    .any(|tab| tab.generating && tab.conversation_id == *candidate_conversation)
-        });
-        for tab in presence.tabs.iter().filter(|tab| tab.generating) {
-            let was_generating = previous.as_ref().is_some_and(|previous_presence| {
-                previous_presence.tabs.iter().any(|previous_tab| {
-                    previous_tab.conversation_id == tab.conversation_id && previous_tab.generating
-                })
-            });
-            if !was_generating {
-                generation_guard
-                    .insert((client_id.to_string(), tab.conversation_id.clone()), now_ms);
-            }
-        }
-        presence_guard.insert(client_id.to_string(), presence.clone());
+        self.presence
+            .lock()
+            .await
+            .insert(client_id.to_string(), presence.clone());
         Ok(presence)
     }
 
@@ -651,55 +627,6 @@ impl CompanionAuth {
         }
         self.anchor_affinities.lock().await.remove(session_digest);
         None
-    }
-
-    pub async fn wait_for_generating_anchor_after(
-        &self,
-        started_ms: u64,
-        timeout: std::time::Duration,
-    ) -> Result<Option<CompanionAnchorRoute>, String> {
-        let started = tokio::time::Instant::now();
-        let settle_after = started + std::time::Duration::from_millis(1_700);
-        let deadline = started + timeout;
-
-        loop {
-            let recent_generation_cutoff_ms = started_ms.saturating_sub(2_500);
-            let generation_started = self.generation_started_ms.lock().await.clone();
-            let mut generating = self
-                .fresh_presence(unix_time_ms())
-                .await
-                .into_iter()
-                .flat_map(|client| {
-                    let generation_started = generation_started.clone();
-                    client.tabs.into_iter().filter_map(move |tab| {
-                        let key = (client.client_id.clone(), tab.conversation_id.clone());
-                        (tab.generating
-                            && generation_started.get(&key).is_some_and(|observed_ms| {
-                                *observed_ms >= recent_generation_cutoff_ms
-                            }))
-                        .then_some(CompanionAnchorRoute {
-                            client_id: client.client_id.clone(),
-                            tab,
-                        })
-                    })
-                })
-                .collect::<Vec<_>>();
-            if generating.len() > 1 {
-                return Err(
-                    "multiple paired ChatGPT conversations are generating; wait for the other response to finish and retry from the Anchor chat".into(),
-                );
-            }
-            if tokio::time::Instant::now() >= settle_after
-                && let Some(route) = generating.pop()
-            {
-                return Ok(Some(route));
-            }
-
-            if tokio::time::Instant::now() >= deadline {
-                return Ok(None);
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(75)).await;
-        }
     }
 
     #[cfg(test)]

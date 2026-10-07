@@ -203,7 +203,7 @@
         return { state: 'failed', reason: stillOnTarget() ? 'worker_conversation_not_ready' : 'worker_launch_target_changed' };
       }
     } else {
-      // Fresh Workers V1 chats are always ordinary ChatGPT chats. Anchor Project metadata is only
+      // Fresh Workers V1 chats are always ordinary ChatGPT chats. Core Project metadata is only
       // routing context; a Project route or any existing conversation here is the wrong target.
       stillOnTarget = () =>
         launchAlive() &&

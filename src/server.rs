@@ -4623,7 +4623,7 @@ document.getElementById('upload').addEventListener('change',event=>{document.get
             runtime_root.to_string_lossy()
         );
         println!(
-            "The companion should auto-connect. Focus the ChatGPT Anchor conversation in the browser being tested, then create enqueue; create reuse after launch #1 succeeds; create stop to exit."
+            "The companion should auto-connect. Focus the ChatGPT Core conversation in the browser being tested, then create enqueue; create reuse after launch #1 succeeds; create stop to exit."
         );
 
         let first_marker = "moondesk-worker-e2e-first-20260917";

@@ -263,9 +263,9 @@ async function render() {
   currentContext = await currentChatContext();
   $('chatContext').textContent = currentContext?.conversationId
     ? currentContext.projectId
-      ? `Current chat: Project ${currentContext.projectId} · conversation ${currentContext.conversationId}`
-      : `Current chat: normal conversation ${currentContext.conversationId}`
-    : 'Open an existing ChatGPT conversation to make it an Anchor for worker routing.';
+      ? `Core: Project ${currentContext.projectId} · conversation ${currentContext.conversationId}`
+      : `Core: normal conversation ${currentContext.conversationId}`
+    : 'Open an existing ChatGPT conversation to make it the Core for worker routing.';
 
   if (modelCatalog.length) renderCatalog();
 }

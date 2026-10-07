@@ -2,7 +2,7 @@
 
 ## Goal
 
-A worker is not considered launched until MoonDesk can trace one durable lifecycle from Anchor spawn through ChatGPT send acceptance, worker claim, task finish, and Anchor collection.
+A worker is not considered launched until MoonDesk can trace one durable lifecycle from Core spawn through ChatGPT send acceptance, worker claim, task finish, and Core collection.
 
 The implementation must remain correct across:
 - ChatGPT SPA/full-document navigation during first send;
@@ -148,7 +148,7 @@ Rust integration lifecycle:
 6. worker waiting_claim
 7. child claim
 8. child finish/report
-9. Anchor collect
+9. Core collect
 10. worker idle
 
 Recovery matrix:

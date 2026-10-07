@@ -589,7 +589,7 @@ impl CompanionAuth {
         if session_digest.len() != 64
             || !session_digest.bytes().all(|byte| byte.is_ascii_hexdigit())
         {
-            return Err("companion Anchor session digest is invalid".into());
+            return Err("companion Core session digest is invalid".into());
         }
         if !self
             .state
@@ -598,7 +598,7 @@ impl CompanionAuth {
             .clients
             .contains_key(&route.client_id)
         {
-            return Err("companion Anchor browser is not paired".into());
+            return Err("companion Core browser is not paired".into());
         }
         let mut guard = self.anchor_affinities.lock().await;
         if guard.len() >= MAX_COMPANION_ANCHOR_AFFINITIES
@@ -657,7 +657,7 @@ impl CompanionAuth {
             .collect::<Vec<_>>();
         if candidates.len() > 1 {
             return Err(
-                "multiple paired browsers report a focused ChatGPT Anchor; focus only the Anchor browser and retry".into(),
+                "multiple paired browsers report a focused ChatGPT Core; focus only the Core browser and retry".into(),
             );
         }
         Ok(candidates.pop())

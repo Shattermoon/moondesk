@@ -1671,7 +1671,7 @@ mod tests {
             broker
                 .redeem_for_anchors("chrome", 20, Some(&wrong))
                 .await
-                .expect("wrong Anchor browser")
+                .expect("wrong Core browser")
                 .is_none()
         );
 

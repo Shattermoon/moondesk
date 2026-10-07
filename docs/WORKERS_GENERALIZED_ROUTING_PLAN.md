@@ -32,13 +32,13 @@ This plan removes those assumptions without weakening the workspace/session isol
    - A path or workspace name included in a worker prompt is informational only.
    - The model never chooses or changes its authoritative workspace by writing a path/name in text.
 
-3. **Anchor/worker authority remains exact-session based.**
-   - Anchor and worker identities continue to derive from OpenAI session metadata and the route-resolved workspace.
-   - A different conversation cannot become an Anchor or worker by claiming an ID in text.
+3. **Core/worker authority remains exact-session based.**
+   - Core and worker identities continue to derive from OpenAI session metadata and the route-resolved workspace.
+   - A different conversation cannot become the Core or a worker by claiming an ID in text.
 
-4. **Projects are Anchor routing metadata, not fresh-worker placement.**
-   - Every fresh Workers V1 conversation opens as an ordinary ChatGPT chat, even when the Anchor is inside a ChatGPT Project.
-   - Project metadata may identify the exact Anchor during routing, but MoonDesk never clones the Anchor conversation or enters its Project to create a fresh worker.
+4. **Projects are Core routing metadata, not fresh-worker placement.**
+   - Every fresh Workers V1 conversation opens as an ordinary ChatGPT chat, even when the Core is inside a ChatGPT Project.
+   - Project metadata may identify the exact Core during routing, but MoonDesk never clones the Core conversation or enters its Project to create a fresh worker.
    - A durable existing worker is reused by its exact confirmed conversation binding; legacy workers that already live inside a Project remain reusable without making that Project authoritative for new workers.
 
 5. **Multiple paired browsers are allowed, but one exact browser owns each in-flight send.**
@@ -63,9 +63,9 @@ This plan removes those assumptions without weakening the workspace/session isol
 
 These checks prevent us from baking an unverified ChatGPT implementation detail into MoonDesk.
 
-### 0A. Prove Anchor session correlation
+### 0A. Prove Core session correlation
 
-MoonDesk currently receives the Anchor as `_meta["openai/session"]` and hashes it into `ChatIdentity.session_digest`.
+MoonDesk currently receives the Core as `_meta["openai/session"]` and hashes it into `ChatIdentity.session_digest`.
 
 The extension independently sees the browser conversation ID from `/c/<conversation-id>`.
 
@@ -76,7 +76,7 @@ openai/session == URL conversation id
 ```
 
 If yes:
-- compare only a server-computed session digest; do not persist the raw Anchor session just for routing.
+- compare only a server-computed session digest; do not persist the raw Core session just for routing.
 - extension reports `conversationId`; MoonDesk hashes it with the same session-digest function and matches exact digests.
 
 If no:
@@ -93,10 +93,10 @@ Acceptance:
 A worker cannot do local work merely because its bootstrap says `D:\project`. The new worker conversation must actually have the correct MoonDesk custom connector/tool surface.
 
 Test:
-- Anchor is a normal ChatGPT conversation using a MoonDesk workspace connector.
+- Core is a normal ChatGPT conversation using a MoonDesk workspace connector.
 - Open a fresh normal ChatGPT conversation in the same browser.
 - Determine whether the MoonDesk connector remains available/selected automatically.
-- If not, inspect ChatGPT's current UI/runtime for a stable connector/plugin identifier that can be carried from the Anchor and selected in the worker chat.
+- If not, inspect ChatGPT's current UI/runtime for a stable connector/plugin identifier that can be carried from the Core and selected in the worker chat.
 
 Rules:
 - connector **display name is never a routing key**.
@@ -209,11 +209,11 @@ Presence is ephemeral:
 - no config write on every heartbeat;
 - browser restart simply rebuilds presence.
 
-Selection for a fresh Anchor command:
-1. exact Anchor session-digest match;
+Selection for a fresh Core command:
+1. exact Core session-digest match;
 2. if exactly one matching client -> use it;
-3. if several match -> focused/active exact Anchor wins;
-4. otherwise existing Anchor affinity wins;
+3. if several match -> focused/active exact Core wins;
+4. otherwise existing Core affinity wins;
 5. otherwise fail with an actionable ambiguity instead of guessing.
 
 No name participates.
@@ -222,7 +222,7 @@ Tests:
 - same Project/name in two workspaces cannot cross-route;
 - different names with exact IDs route correctly;
 - stale presence is ignored;
-- multiple browsers observing unrelated chats cannot steal an Anchor.
+- multiple browsers observing unrelated chats cannot steal the Core.
 
 ## Phase 3 — Durable managed-chat browser targeting
 
@@ -270,14 +270,14 @@ and remove `workspace_not_bound` as a prerequisite for worker spawn.
 
 ### Fresh worker placement
 
-Resolved independently from Anchor placement:
+Resolved independently from Core placement:
 
 ```text
-Anchor in Project or normal chat:
+Core in Project or normal chat:
   fresh worker destination = ordinary ChatGPT new chat
 ```
 
-The exact Anchor presence still carries conversation/Project metadata for browser ownership and routing, but fresh worker placement never compares names, clones the Anchor, or enters its Project.
+The exact Core presence still carries conversation/Project metadata for browser ownership and routing, but fresh worker placement never compares names, clones the Core, or enters its Project.
 
 ### Extension behavior
 
@@ -289,7 +289,7 @@ For every `new_thread`:
 - prepare/send once.
 
 For `existing_thread`:
-- ignore Anchor placement;
+- ignore Core placement;
 - open the exact confirmed worker conversation;
 - verify conversation identity before typing;
 - allow exact legacy worker conversations that already live inside a Project.
@@ -298,10 +298,10 @@ Remove the normal popup's **Bind this Project** workflow.
 
 Tests:
 - Project names/workspace names/connector names all intentionally different;
-- normal Anchor -> normal worker;
-- Project Anchor -> normal worker;
-- a fresh worker launch URL never contains the Anchor conversation ID or a Project-entry marker;
-- two Projects with identical visible names do not cross-route their Anchors;
+- normal Core -> normal worker;
+- Project Core -> normal worker;
+- a fresh worker launch URL never contains the Core conversation ID or a Project-entry marker;
+- two Projects with identical visible names do not cross-route their Cores;
 - old manual binding data is ignored/migrated without breaking extension startup.
 
 ## Phase 5 — Preserve connector/tool context for normal workers
@@ -313,7 +313,7 @@ Goal:
 
 Preferred order:
 1. inherit existing ChatGPT behavior if it is stable and positively verified;
-2. otherwise capture a stable ChatGPT connector/plugin identifier from the Anchor and select that exact identifier in the new worker UI;
+2. otherwise capture a stable ChatGPT connector/plugin identifier from the Core and select that exact identifier in the new worker UI;
 3. never choose a connector based on visible/fuzzy name.
 
 Before Send, fail closed if the required connector/tool context cannot be positively confirmed.
@@ -331,8 +331,8 @@ which is safe to retry after the user refreshes/repairs the ChatGPT connector.
 ### Fresh commands
 
 If target browser disappears before lease/Send:
-- if command is still safely pre-Send, router may choose another exact Anchor-matching online client;
-- recompute placement from that exact client's Anchor observation;
+- if command is still safely pre-Send, router may choose another exact Core-matching online client;
+- recompute placement from that exact client's Core observation;
 - persist retarget before lease.
 
 ### Durable worker reuse
@@ -355,7 +355,7 @@ Never:
 - open a fresh chat and pretend it is the same worker.
 
 Tests:
-- close Edge before Send -> Chrome safe takeover only when exact Anchor is observed there;
+- close Edge before Send -> Chrome safe takeover only when exact Core is observed there;
 - close Edge after ambiguous Send -> no Chrome resend;
 - exact worker conversation opened in Chrome -> safe reuse migration;
 - no exact worker conversation -> wait/fail actionable.
@@ -416,8 +416,8 @@ Automated gates:
 Browser E2E matrix:
 
 ### Placement
-- normal Anchor / normal worker;
-- Project Anchor / same exact Project ID worker;
+- normal Core / normal worker;
+- Project Core / normal worker;
 - completely unrelated human-readable names;
 - two Projects with same visible name;
 - two workspaces with similar names;
@@ -427,9 +427,9 @@ Browser E2E matrix:
 - Chrome only;
 - Edge only;
 - Chrome + Edge paired concurrently;
-- Anchor in Chrome -> worker Chrome;
-- Anchor in Edge -> worker Edge;
-- same Anchor open in both -> deterministic focus/affinity rule;
+- Core in Chrome -> worker Chrome;
+- Core in Edge -> worker Edge;
+- same Core open in both -> deterministic focus/affinity rule;
 - one browser closes before Send;
 - one browser closes after possible Send.
 
@@ -446,7 +446,7 @@ Browser E2E matrix:
 - fresh worker can claim;
 - worker can call `moondesk_instruction`;
 - exact workspace is enforced by connector route;
-- another workspace/Anchor cannot claim or message the worker.
+- another workspace or Core cannot claim or message the worker.
 
 ### Schema refresh
 - upgraded MoonDesk exposes `workers`;
@@ -468,7 +468,7 @@ Keep each slice reviewable and independently testable.
    - list/revoke/status;
    - Edge + Chrome can pair simultaneously.
 
-3. **C — Browser presence + exact Anchor routing**
+3. **C — Browser presence + exact Core routing**
    - presence endpoint/registry;
    - bounded tab observations;
    - exact session-digest resolver;
@@ -507,8 +507,8 @@ Do not call generalized Workers complete until all are true:
 
 - `workers` is visible in a refreshed ChatGPT connector conversation;
 - Chrome and Edge can remain paired simultaneously;
-- a normal non-Project Anchor can spawn a functional worker;
-- a Project Anchor automatically places a worker in the same exact Project ID;
+- a normal non-Project Core can spawn a functional worker;
+- a Project Core automatically opens each fresh worker as a normal ChatGPT conversation;
 - no manual Project binding is required;
 - visible names can all differ without affecting routing;
 - same-thread reuse remains exact;

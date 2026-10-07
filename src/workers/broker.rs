@@ -2256,7 +2256,7 @@ mod tests {
                 worker_identity,
                 worker_id: spawned.worker_id,
                 task_id: spawned.task_id,
-                body: "wake the waiting Anchor".into(),
+                body: "wake the waiting Core".into(),
             })
             .await
             .expect("store report");
@@ -2267,7 +2267,7 @@ mod tests {
             .expect("collect task should join")
             .expect("collect updates");
         assert_eq!(updates.reports.len(), 1);
-        assert_eq!(updates.reports[0].body, "wake the waiting Anchor");
+        assert_eq!(updates.reports[0].body, "wake the waiting Core");
         assert!(updates.completed.is_empty());
 
         let empty = broker

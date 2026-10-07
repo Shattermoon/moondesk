@@ -107,12 +107,7 @@ pub async fn handle(
                 .await
                 .map_err(broker_error)?;
 
-            let opening_message = prompt::bootstrap_message(
-                workspace_name,
-                &assignment,
-                &receipt,
-                &execution_profile,
-            );
+            let opening_message = prompt::bootstrap_message(workspace_name, &assignment, &receipt);
             let (target_client_id, anchor_context) = launch_context
                 .anchor_route
                 .map(|route| {
@@ -263,7 +258,6 @@ pub async fn handle(
                 &receipt.display_id,
                 &receipt.worker_id,
                 &receipt.task_id,
-                &receipt.execution_profile,
             );
             let dedupe_key = format!("worker:{}:task:{}", receipt.worker_id, receipt.task_id);
             let launch = match launch_context

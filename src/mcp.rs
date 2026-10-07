@@ -453,7 +453,7 @@ fn workers_tool_descriptor() -> Value {
     json!({
         "name": "workers",
         "title": "Coordinate workers",
-        "description": "Coordinate MoonDesk experimental workers for this exact workspace and ChatGPT conversation. The workspace is resolved from this connector; never pass or guess a workspace. Anchor actions are spawn, reuse, retire, status, send, collect. Worker actions are claim, start, inbox, ack, report, finish. Call status before creating a worker group: targetWorkerCount is the user's configured concurrency target, recommendedWorkerCount is the product recommendation, and maxWorkerCount is the hard ceiling. Respect an explicit user-requested count when it is within the maximum; otherwise use targetWorkerCount. Reuse creates a new durable task on an idle claimed worker and wakes its existing ChatGPT conversation. Retire frees an idle worker slot or safely abandons a launch only when MoonDesk can prove the assignment never crossed the Send boundary. collect can wait up to 60 seconds for a report/completion so the Anchor does not need polling loops. Worker coordination requires exact ChatGPT session metadata and fails closed when that identity is unavailable. operation_id must be a stable UUID reused when retrying the same spawn/reuse/send/report after an ambiguous response.",
+        "description": "Coordinate MoonDesk experimental workers for this exact workspace and ChatGPT conversation. The workspace is resolved from this connector; never pass or guess a workspace. Core actions are spawn, reuse, retire, status, send, collect. Worker actions are claim, start, inbox, ack, report, finish. Call status before creating a worker group: targetWorkerCount is the user's configured concurrency target, recommendedWorkerCount is the product recommendation, and maxWorkerCount is the hard ceiling. Respect an explicit user-requested count when it is within the maximum; otherwise use targetWorkerCount. Reuse creates a new durable task on an idle claimed worker and wakes its existing ChatGPT conversation. Retire frees an idle worker slot or safely abandons a launch only when MoonDesk can prove the assignment never crossed the Send boundary. collect can wait up to 60 seconds for a report/completion so the Core does not need polling loops. Worker coordination requires exact ChatGPT session metadata and fails closed when that identity is unavailable. operation_id must be a stable UUID reused when retrying the same spawn/reuse/send/report after an ambiguous response.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1129,7 +1129,7 @@ async fn handle_tools_call_for_workspace(
                         if correlation_ids.is_empty() {
                             return tool_error_response_text_only(
                                 req,
-                                "workers spawn could not identify the originating ChatGPT Anchor because neither a usable OpenAI x-request-id nor a valid spawn operation_id was available, and no remembered Anchor affinity existed".into(),
+                                "workers spawn could not identify the originating ChatGPT Core because neither a usable OpenAI x-request-id nor a valid spawn operation_id was available, and no remembered Core affinity existed".into(),
                             );
                         }
                         route = match auth
@@ -1147,7 +1147,7 @@ async fn handle_tools_call_for_workspace(
                     let Some(route) = route else {
                         return tool_error_response_text_only(
                             req,
-                            "workers spawn could not identify the originating ChatGPT Anchor; no exact provider-stream request/operation correlation or remembered Anchor affinity was available".into(),
+                            "workers spawn could not identify the originating ChatGPT Core; no exact provider-stream request/operation correlation or remembered Core affinity was available".into(),
                         );
                     };
                     if let Err(error) = auth
@@ -4707,7 +4707,7 @@ mod tests {
                 },
             )
             .await
-            .expect("remember Anchor affinity");
+            .expect("remember Core affinity");
 
         let request = tool_call_request_with_session(
             "workers",

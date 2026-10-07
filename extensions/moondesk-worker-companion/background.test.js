@@ -615,7 +615,7 @@ test('provider correlation fails closed when one stream event claims conflicting
   assert.equal(
     posted.filter((message) => message.source === 'moondesk-provider-correlation-observed').length,
     0,
-    'ambiguous provider evidence must never be promoted into Anchor authority'
+    'ambiguous provider evidence must never be promoted into Core authority'
   );
 });
 
@@ -1688,10 +1688,10 @@ test('model discovery runs in one owned clean helper tab and closes it after a c
   const result = await evaluate('discoverModelCatalog()');
   assert.deepEqual(JSON.parse(JSON.stringify(result)), catalog);
   assert.equal(createdTabs.length, 1);
-  assert.equal(createdTabs[0].active, false, 'discovery must not steal focus from the Anchor');
+  assert.equal(createdTabs[0].active, false, 'discovery must not steal focus from the Core');
   assert.match(createdTabs[0].url, /^https:\/\/chatgpt\.com\/\?moondesk-model-catalog=/);
   assert.deepEqual(removedTabs, [createdTabs[0].id]);
-  assert.equal(existingTabs[7].url.includes('/c/anchor'), true, 'active Anchor tab must remain untouched');
+  assert.equal(existingTabs[7].url.includes('/c/anchor'), true, 'active Core tab must remain untouched');
   assert.equal(seen.filter((entry) => entry.message.type === 'MOONDESK_MODEL_CATALOG').length, 1);
 });
 
@@ -1762,7 +1762,7 @@ test('presence reports the generating conversation independently of browser focu
   assert.equal(generating.generating, true);
 });
 
-test('existing worker placement survives without Anchor presence by using its durable thread record', () => {
+test('existing worker placement survives without Core presence by using its durable thread record', () => {
   const { evaluate } = loadBackground();
   const placementForOffer = evaluate('placementForOffer');
   const workerUrl = 'https://chatgpt.com/g/g-p-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-any-name/c/6aad7eb1-4b10-83ee-97bd-d98b338864de';
@@ -1792,7 +1792,7 @@ test('existing worker placement survives without Anchor presence by using its du
   assert.equal(placement.projectUrl, null);
 });
 
-test('fresh workers always start from normal ChatGPT home regardless of Anchor Project placement', () => {
+test('fresh workers always start from normal ChatGPT home regardless of Core Project placement', () => {
   const { evaluate } = loadBackground();
   const sourceUrlForCommand = evaluate('sourceUrlForCommand');
   const anchorConversationId = '11111111-2222-4333-8444-555555555555';
@@ -1812,7 +1812,7 @@ test('fresh workers always start from normal ChatGPT home regardless of Anchor P
   assert.equal(
     sourceUrlForCommand(projectPlacement, 'new_thread', null).includes(anchorConversationId),
     false,
-    'a fresh worker URL must never contain the Anchor conversation id'
+    'a fresh worker URL must never contain the Core conversation id'
   );
 });
 
@@ -1881,7 +1881,7 @@ test('uncertain reconciliation never adopts the inspected source conversation as
   );
 });
 
-test('record creation opens every fresh worker on normal ChatGPT home and never clones the Anchor', async () => {
+test('record creation opens every fresh worker on normal ChatGPT home and never clones the Core', async () => {
   const { createdTabs, evaluate } = loadBackground();
   const recordForCommand = evaluate('recordForCommand');
   const command = {
@@ -1908,14 +1908,14 @@ test('record creation opens every fresh worker on normal ChatGPT home and never 
   const state = { launchRecords: {}, threadRecords: {} };
   const { record } = await recordForCommand(state, command, projectPlacement);
   assert.equal(record.sourceUrl, 'https://chatgpt.com/');
-  const projectAnchorWorkerUrl = new URL(createdTabs[0].url);
-  assert.equal(projectAnchorWorkerUrl.origin + projectAnchorWorkerUrl.pathname, 'https://chatgpt.com/');
-  assert.equal(projectAnchorWorkerUrl.href.includes(anchorConversationId), false);
-  assert.equal(projectAnchorWorkerUrl.searchParams.get('moondesk-project-entry'), null);
-  assert.equal(projectAnchorWorkerUrl.searchParams.get('moondesk-launch'), record.launchToken);
-  assert.equal(projectAnchorWorkerUrl.searchParams.get('model'), 'gpt-5.6-sol');
-  assert.equal(projectAnchorWorkerUrl.searchParams.get('reasoning_effort'), 'high');
-  assert.equal(projectAnchorWorkerUrl.hash, `#moondesk-launch=${encodeURIComponent(record.launchToken)}`);
+  const projectCoreWorkerUrl = new URL(createdTabs[0].url);
+  assert.equal(projectCoreWorkerUrl.origin + projectCoreWorkerUrl.pathname, 'https://chatgpt.com/');
+  assert.equal(projectCoreWorkerUrl.href.includes(anchorConversationId), false);
+  assert.equal(projectCoreWorkerUrl.searchParams.get('moondesk-project-entry'), null);
+  assert.equal(projectCoreWorkerUrl.searchParams.get('moondesk-launch'), record.launchToken);
+  assert.equal(projectCoreWorkerUrl.searchParams.get('model'), 'gpt-5.6-sol');
+  assert.equal(projectCoreWorkerUrl.searchParams.get('reasoning_effort'), 'high');
+  assert.equal(projectCoreWorkerUrl.hash, `#moondesk-launch=${encodeURIComponent(record.launchToken)}`);
 
   const normalState = { launchRecords: {}, threadRecords: {} };
   const normalCommand = {
@@ -1963,7 +1963,7 @@ test('reconciliation without a durable launch record never creates a fresh worke
   assert.equal(createdTabs.length, 0);
 });
 
-test('reconciliation without a confirmed conversation URL never reopens the Anchor or Project home', async () => {
+test('reconciliation without a confirmed conversation URL never reopens the Core or Project home', async () => {
   const { createdTabs, evaluate } = loadBackground();
   const recordForCommand = evaluate('recordForCommand');
   const command = {
@@ -2029,7 +2029,7 @@ test('new-thread recovery never matches an older launch only by durable thread k
   assert.equal(matches(newThread, { commandId: 'command-new', threadKey: 'different' }), true);
 });
 
-test('existing-thread reuse is owned by workspace and exact thread, not the Anchor Project', async () => {
+test('existing-thread reuse is owned by workspace and exact thread, not the Core Project', async () => {
   const legacyWorkerUrl = 'https://chatgpt.com/g/g-p-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-legacy/c/aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeee1';
   const { createdTabs, evaluate } = loadBackground({
     existingTabs: { 77: { id: 77, url: legacyWorkerUrl } }
@@ -2328,7 +2328,7 @@ test('existing-thread preparation waits for the recovered conversation composer 
   assert.equal(selectCalls, 1);
 });
 
-test('fresh worker preparation stays on normal ChatGPT home even when the Anchor is in a Project', async () => {
+test('fresh worker preparation stays on normal ChatGPT home even when the Core is in a Project', async () => {
   let messageHandler = null;
   const projectId = 'g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
   const storage = new Map();
@@ -2405,7 +2405,7 @@ test('fresh worker preparation stays on normal ChatGPT home even when the Anchor
   assert.equal('sourceConversationId' in remembered, false);
 });
 
-test('fresh worker preparation refuses a duplicated Project Anchor instead of transforming it', async () => {
+test('fresh worker preparation refuses a duplicated Project Core instead of transforming it', async () => {
   let messageHandler = null;
   const projectId = 'g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
   const anchorConversationId = '11111111-2222-4333-8444-555555555555';

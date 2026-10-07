@@ -180,7 +180,7 @@ impl ManagedChatLaunch {
         if self.anchor_session_digest.as_deref().is_some_and(|digest| {
             digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit())
         }) {
-            return Err("managed chat anchor session digest is invalid".into());
+            return Err("managed chat Core session digest is invalid".into());
         }
         Ok(())
     }
@@ -200,27 +200,27 @@ pub struct ManagedChatAnchorContext {
 impl ManagedChatAnchorContext {
     pub(crate) fn validate(&self) -> Result<(), String> {
         if self.conversation_id.trim().is_empty() || self.conversation_id.len() > 128 {
-            return Err("managed chat Anchor conversation id is invalid".into());
+            return Err("managed chat Core conversation id is invalid".into());
         }
         if self.conversation_url.trim().is_empty() || self.conversation_url.len() > 2048 {
-            return Err("managed chat Anchor conversation URL is invalid".into());
+            return Err("managed chat Core conversation URL is invalid".into());
         }
         if self
             .project_id
             .as_deref()
             .is_some_and(|value| value.trim().is_empty() || value.len() > 128)
         {
-            return Err("managed chat Anchor Project id is invalid".into());
+            return Err("managed chat Core Project id is invalid".into());
         }
         if self
             .project_url
             .as_deref()
             .is_some_and(|value| value.trim().is_empty() || value.len() > 2048)
         {
-            return Err("managed chat Anchor Project URL is invalid".into());
+            return Err("managed chat Core Project URL is invalid".into());
         }
         if self.project_id.is_some() != self.project_url.is_some() {
-            return Err("managed chat Anchor Project metadata is incomplete".into());
+            return Err("managed chat Core Project metadata is incomplete".into());
         }
         Ok(())
     }

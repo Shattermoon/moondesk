@@ -501,7 +501,7 @@ function placementForOffer(state, offer) {
     }
   }
 
-  // Compatibility only for commands created before automatic Anchor routing existed.
+  // Compatibility only for commands created before automatic Core routing existed.
   const workspaceId = command?.launch?.workspaceId;
   const legacy = workspaceId ? state.bindings?.[workspaceId] : null;
   if (legacy?.projectId && legacy?.sourceUrl) {
@@ -516,8 +516,8 @@ function placementForOffer(state, offer) {
 
 function sourceUrlForCommand(_placement, openMode, existingConversation) {
   if (openMode === 'existing_thread') return existingConversation;
-  // Workers V1 always creates fresh workers from ordinary ChatGPT home. Anchor Project metadata
-  // still identifies/routes the owning Anchor, but it is never used as a worker placement target.
+  // Workers V1 always creates fresh workers from ordinary ChatGPT home. Core Project metadata
+  // still identifies/routes the owning Core, but it is never used as a worker placement target.
   return 'https://chatgpt.com/';
 }
 

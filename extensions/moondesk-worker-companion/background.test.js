@@ -1058,6 +1058,182 @@ test('MAIN-world model reader understands the current shell power-selection pick
   assert.equal(panel.attributes['data-moondesk-selected-effort'], 'max');
 });
 
+test('MAIN-world model reader follows React committed branch instead of a stale DOM Fiber pointer', () => {
+  const state = { current: null };
+  const oldRoot = { tag: 3, stateNode: state, return: null, child: null };
+  const nextRoot = { tag: 3, stateNode: state, return: null, child: null };
+  oldRoot.alternate = nextRoot;
+  nextRoot.alternate = oldRoot;
+
+  const shellProps = (effort, bucket) => ({
+    selectedPowerSelection: {
+      model: 'gpt-5.6-sol',
+      modelLabel: 'GPT-5.6 Sol',
+      powerSettingIndex: bucket,
+      labels: { effort },
+      reasoningEffort: effort.toLowerCase()
+    },
+    powerSelections: [
+      {
+        model: 'gpt-5.6-sol',
+        modelLabel: 'GPT-5.6 Sol',
+        powerSettingIndex: 0,
+        labels: { effort: 'Medium' },
+        reasoningEffort: 'medium',
+        availability: { status: 'available' }
+      },
+      {
+        model: 'gpt-5.6-sol',
+        modelLabel: 'GPT-5.6 Sol',
+        powerSettingIndex: 1,
+        labels: { effort: 'High' },
+        reasoningEffort: 'high',
+        availability: { status: 'available' }
+      }
+    ],
+    modelListConfig: { options: [{ id: 'gpt-5.6', label: 'GPT-5.6', selected: true }] },
+    modelSelectionDisabled: false,
+    modelSwitcherDenialsBySlug: {}
+  });
+  const oldFiber = { tag: 0, memoizedProps: shellProps('Medium', 0), return: oldRoot };
+  const nextFiber = { tag: 0, memoizedProps: shellProps('High', 1), return: nextRoot };
+  oldFiber.alternate = nextFiber;
+  nextFiber.alternate = oldFiber;
+  oldRoot.child = oldFiber;
+  nextRoot.child = nextFiber;
+  state.current = nextRoot;
+
+  const trigger = {
+    id: '',
+    isConnected: true,
+    __reactFiber$stale: oldFiber,
+    attributes: Object.create(null),
+    matches(selector) {
+      return selector.includes('data-codex-intelligence-trigger') || selector.includes('button');
+    },
+    closest() { return null; },
+    getClientRects() { return [{ width: 1, height: 1 }]; },
+    getAttribute(name) {
+      if (name === 'data-codex-intelligence-trigger') return '';
+      return this.attributes[name] ?? null;
+    },
+    setAttribute(name, value) { this.attributes[name] = String(value); },
+    removeAttribute(name) { delete this.attributes[name]; },
+    textContent: 'High'
+  };
+  let messageHandler = null;
+  const posted = [];
+  const pageWindow = {
+    addEventListener(type, handler) { if (type === 'message') messageHandler = handler; },
+    postMessage(message) { posted.push(message); }
+  };
+  const context = vm.createContext({
+    window: pageWindow,
+    document: {
+      querySelector(selector) {
+        return selector.includes('data-codex-intelligence-trigger') ? trigger : null;
+      },
+      querySelectorAll(selector) {
+        return selector.includes('data-codex-intelligence-trigger') ? [trigger] : [];
+      }
+    },
+    location: { origin: 'https://chatgpt.com', pathname: '/' }
+  });
+
+  vm.runInContext(modelStateMainSource, context, { filename: modelStateMainPath });
+  messageHandler({
+    source: pageWindow,
+    origin: 'https://chatgpt.com',
+    data: { source: 'moondesk-picker-ask', nonce: 'committed-picker', v: 1 }
+  });
+
+  const reply = posted.find((message) => message.source === 'moondesk-picker-reply');
+  assert.equal(reply?.picker?.currentBucket, 1, 'reader must follow React root.current, not the stale DOM Fiber');
+  assert.equal(reply?.picker?.choices?.[1]?.effort, 'high');
+});
+
+test('MAIN-world model reader reaches a committed picker more than 400 Fibers below React root', () => {
+  const state = { current: null };
+  const oldRoot = { tag: 3, stateNode: state, return: null, child: null };
+  const nextRoot = { tag: 3, stateNode: state, return: null, child: null };
+  oldRoot.alternate = nextRoot;
+  nextRoot.alternate = oldRoot;
+
+  let oldParent = oldRoot;
+  let nextParent = nextRoot;
+  for (let depth = 0; depth < 450; depth += 1) {
+    const oldWrapper = { tag: 0, memoizedProps: {}, return: oldParent, child: null };
+    const nextWrapper = { tag: 0, memoizedProps: {}, return: nextParent, child: null };
+    oldWrapper.alternate = nextWrapper;
+    nextWrapper.alternate = oldWrapper;
+    oldParent.child = oldWrapper;
+    nextParent.child = nextWrapper;
+    oldParent = oldWrapper;
+    nextParent = nextWrapper;
+  }
+  const pickerProps = (effort, bucket) => ({
+    selectedPowerSelection: {
+      model: 'gpt-5.6-sol', modelLabel: 'GPT-5.6 Sol', powerSettingIndex: bucket,
+      labels: { effort }, reasoningEffort: effort.toLowerCase()
+    },
+    powerSelections: [
+      {
+        model: 'gpt-5.6-sol', modelLabel: 'GPT-5.6 Sol', powerSettingIndex: 0,
+        labels: { effort: 'Medium' }, reasoningEffort: 'medium', availability: { status: 'available' }
+      },
+      {
+        model: 'gpt-5.6-sol', modelLabel: 'GPT-5.6 Sol', powerSettingIndex: 1,
+        labels: { effort: 'High' }, reasoningEffort: 'high', availability: { status: 'available' }
+      }
+    ],
+    modelListConfig: { options: [{ id: 'gpt-5.6', label: 'GPT-5.6', selected: true }] },
+    modelSelectionDisabled: false,
+    modelSwitcherDenialsBySlug: {}
+  });
+  const oldFiber = { tag: 0, memoizedProps: pickerProps('Medium', 0), return: oldParent };
+  const nextFiber = { tag: 0, memoizedProps: pickerProps('High', 1), return: nextParent };
+  oldFiber.alternate = nextFiber;
+  nextFiber.alternate = oldFiber;
+  oldParent.child = oldFiber;
+  nextParent.child = nextFiber;
+  state.current = nextRoot;
+
+  const trigger = {
+    id: '', isConnected: true, __reactFiber$deep: oldFiber, attributes: Object.create(null),
+    matches(selector) { return selector.includes('data-codex-intelligence-trigger') || selector.includes('button'); },
+    closest() { return null; },
+    getClientRects() { return [{ width: 1, height: 1 }]; },
+    getAttribute(name) { return name === 'data-codex-intelligence-trigger' ? '' : this.attributes[name] ?? null; },
+    setAttribute(name, value) { this.attributes[name] = String(value); },
+    removeAttribute(name) { delete this.attributes[name]; },
+    textContent: 'High'
+  };
+  let messageHandler = null;
+  const posted = [];
+  const pageWindow = {
+    addEventListener(type, handler) { if (type === 'message') messageHandler = handler; },
+    postMessage(message) { posted.push(message); }
+  };
+  const context = vm.createContext({
+    window: pageWindow,
+    document: {
+      querySelector(selector) { return selector.includes('data-codex-intelligence-trigger') ? trigger : null; },
+      querySelectorAll(selector) { return selector.includes('data-codex-intelligence-trigger') ? [trigger] : []; }
+    },
+    location: { origin: 'https://chatgpt.com', pathname: '/' },
+    structuredClone
+  });
+
+  vm.runInContext(modelStateMainSource, context, { filename: modelStateMainPath });
+  messageHandler({
+    source: pageWindow,
+    origin: 'https://chatgpt.com',
+    data: { source: 'moondesk-picker-ask', nonce: 'deep-picker', v: 1 }
+  });
+  const reply = posted.find((message) => message.source === 'moondesk-picker-reply');
+  assert.equal(reply?.picker?.currentBucket, 1);
+});
+
 test('MAIN-world model reader uses the reported current-shell trigger as closed-picker selection proof', () => {
   const trigger = {
     id: '',
@@ -1856,6 +2032,66 @@ test('existing-thread preparation waits for the recovered conversation composer 
   assert.equal(response.result.state, 'ready');
   assert.equal(waitCalls, 2, 'reuse waits once before model selection and reacquires the composer after it');
   assert.equal(selectCalls, 1);
+});
+
+test('worker preparation reports the exact model-picker stage that failed', async () => {
+  let messageHandler = null;
+  const storage = new Map();
+  const DOM = {
+    conversationIdFromPath() { return 'worker-conversation'; },
+    projectIdFromPath() { return 'g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'; },
+    async waitForComposerReady() { return true; },
+    composerReady() { return true; },
+    async selectModelSettings(_profile, failure) {
+      failure('version_unconfirmed');
+      return false;
+    },
+    taskMarkerPresent() { return false; },
+    insertPrompt() { throw new Error('prompt insertion must not run after model failure'); },
+    workerEvidence() { throw new Error('worker evidence must not run after model failure'); }
+  };
+  const pageWindow = { MOONDESK_CHATGPT_DOM: DOM };
+  const context = vm.createContext({
+    window: pageWindow,
+    sessionStorage: {
+      setItem(key, value) { storage.set(key, value); },
+      getItem(key) { return storage.get(key) || null; }
+    },
+    location: {
+      hash: '',
+      pathname: '/g/g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-moondesk/c/worker-conversation',
+      search: '',
+      href: 'https://chatgpt.com/g/g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-moondesk/c/worker-conversation'
+    },
+    history: { state: null, replaceState() {} },
+    chrome: { runtime: { onMessage: { addListener(handler) { messageHandler = handler; } } } },
+    console
+  });
+
+  vm.runInContext(contentSource, context, { filename: contentPath });
+  const response = await new Promise((resolve) => {
+    const returned = messageHandler({
+      type: 'MOONDESK_PREPARE_WORKER',
+      commandId: 'model-stage-command',
+      launchToken: 'model-stage-token',
+      placement: { projectId: 'g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' },
+      launch: {
+        workspaceId: 'workspace-a',
+        taskMarker: 'moondesk-worker-task:model-stage',
+        openingMessage: 'model-stage',
+        threadKey: 'worker:model-stage',
+        openMode: 'existing_thread',
+        executionProfile: { modelId: 'gpt-5.6-sol', reasoningEffort: 'high' }
+      }
+    }, null, resolve);
+    assert.equal(returned, true);
+  });
+
+  assert.equal(response.ok, true);
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(response.result)),
+    { state: 'failed', reason: 'model_or_effort_unconfirmed:version_unconfirmed' }
+  );
 });
 
 test('model-catalog content request is helper-owned and returns a bounded readiness failure', async () => {

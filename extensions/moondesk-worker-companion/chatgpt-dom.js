@@ -833,17 +833,32 @@
     return restored && closed && stillCurrent() && result.size ? [...result.values()] : null;
   }
 
-  async function selectModelSettings(profile) {
+  async function selectModelSettings(profile, failure = () => {}) {
+    let failureCode = null;
+    const fail = (code) => {
+      if (!failureCode) failureCode = code;
+      return false;
+    };
+    const publishFailure = () => {
+      try { failure(failureCode || 'selection_unconfirmed'); } catch {}
+      return false;
+    };
+
     const desiredEfforts = providerEfforts(profile?.reasoningEffort);
-    if (!desiredEfforts.length) return false;
+    if (!desiredEfforts.length) {
+      fail('effort_invalid');
+      return publishFailure();
+    }
     const ui = modelPickerAccess();
     const original = await ui.open();
     if (!original) {
       await ui.close();
-      return false;
+      fail('picker_unavailable');
+      return publishFailure();
     }
 
     let selected = false;
+    let closed = false;
     try {
       const current = original.choices.find((choice) => choice.bucket === original.currentBucket);
       if (
@@ -852,77 +867,105 @@
         desiredEfforts.includes(current.effort)
       ) {
         selected = true;
-        return true;
-      }
+      } else {
+        const currentVersion = original.versions.find((version) => version.id === original.version);
+        const versions = [currentVersion, ...original.versions.filter((version) => version.id !== original.version)].filter(Boolean);
+        const offered = [];
+        for (const version of versions) {
+          const state = await ui.version(version.id);
+          if (!state) {
+            fail('version_unconfirmed');
+            break;
+          }
+          for (const choice of state.choices) {
+            const rank = choice.available ? modelRank(choice, profile) : 0;
+            if (rank) offered.push({ version: version.id, choice, rank });
+          }
+        }
+        if (!failureCode && !offered.length) fail('model_unavailable');
 
-      const currentVersion = original.versions.find((version) => version.id === original.version);
-      const versions = [currentVersion, ...original.versions.filter((version) => version.id !== original.version)].filter(Boolean);
-      const offered = [];
-      for (const version of versions) {
-        const state = await ui.version(version.id);
-        if (!state) return false;
-        for (const choice of state.choices) {
-          const rank = choice.available ? modelRank(choice, profile) : 0;
-          if (rank) offered.push({ version: version.id, choice, rank });
+        let wantedEffort = null;
+        if (!failureCode) {
+          wantedEffort = desiredEfforts.find((effort) =>
+            offered.some((entry) => entry.choice.effort === effort)
+          ) || null;
+          if (!wantedEffort) {
+            const ladder = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
+            const target = ladder.indexOf(desiredEfforts[0]);
+            const efforts = [...new Set(offered.map((entry) => entry.choice.effort))]
+              .filter((effort) => ladder.includes(effort));
+            if (target >= 0 && efforts.length) {
+              efforts.sort((left, right) => {
+                const leftDistance = Math.abs(ladder.indexOf(left) - target);
+                const rightDistance = Math.abs(ladder.indexOf(right) - target);
+                return leftDistance - rightDistance || ladder.indexOf(right) - ladder.indexOf(left);
+              });
+              wantedEffort = efforts[0];
+            }
+          }
+          if (!wantedEffort) fail('effort_unavailable');
+        }
+
+        let wanted = null;
+        if (!failureCode) {
+          const candidates = offered.filter((entry) => entry.choice.effort === wantedEffort);
+          const rank = Math.max(0, ...candidates.map((candidate) => candidate.rank));
+          const matches = candidates.filter((candidate) => candidate.rank === rank);
+          if (
+            !matches.length ||
+            new Set(matches.map((candidate) => candidate.choice.familyId)).size !== 1 ||
+            new Set(matches.map((candidate) => `${candidate.choice.id}\u0000${candidate.choice.effort}`)).size !== 1
+          ) {
+            fail('candidate_ambiguous');
+          } else {
+            wanted = matches.find((candidate) =>
+              candidate.version === original.version && candidate.choice.bucket === original.currentBucket
+            ) || matches[0];
+          }
+        }
+
+        if (!failureCode && wanted) {
+          const state = await ui.version(wanted.version);
+          const choice = wanted.choice;
+          if (!state?.choices.some((next) =>
+            next.bucket === choice.bucket &&
+            next.available &&
+            next.id === choice.id &&
+            next.effort === choice.effort
+          )) {
+            fail('choice_stale');
+          } else {
+            const after = await ui.bucket(choice.bucket);
+            if (!after) {
+              fail('bucket_unconfirmed');
+            } else {
+              const confirmed = after.choices.find((entry) => entry.bucket === after.currentBucket);
+              selected = Boolean(
+                confirmed?.available === true &&
+                confirmed.id === choice.id &&
+                confirmed.effort === choice.effort &&
+                modelRank(confirmed, profile) > 0
+              );
+              if (!selected) fail('selection_unconfirmed');
+            }
+          }
         }
       }
-      if (!offered.length) return false;
-
-      let wantedEffort = desiredEfforts.find((effort) =>
-        offered.some((entry) => entry.choice.effort === effort)
-      ) || null;
-      if (!wantedEffort) {
-        const ladder = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
-        const target = ladder.indexOf(desiredEfforts[0]);
-        const efforts = [...new Set(offered.map((entry) => entry.choice.effort))]
-          .filter((effort) => ladder.includes(effort));
-        if (target >= 0 && efforts.length) {
-          efforts.sort((left, right) => {
-            const leftDistance = Math.abs(ladder.indexOf(left) - target);
-            const rightDistance = Math.abs(ladder.indexOf(right) - target);
-            return leftDistance - rightDistance || ladder.indexOf(right) - ladder.indexOf(left);
-          });
-          wantedEffort = efforts[0];
-        }
-      }
-      if (!wantedEffort) return false;
-
-      const candidates = offered.filter((entry) => entry.choice.effort === wantedEffort);
-      const rank = Math.max(0, ...candidates.map((candidate) => candidate.rank));
-      const matches = candidates.filter((candidate) => candidate.rank === rank);
-      if (
-        !matches.length ||
-        new Set(matches.map((candidate) => candidate.choice.familyId)).size !== 1 ||
-        new Set(matches.map((candidate) => `${candidate.choice.id}\u0000${candidate.choice.effort}`)).size !== 1
-      ) return false;
-
-      const wanted = matches.find((candidate) =>
-        candidate.version === original.version && candidate.choice.bucket === original.currentBucket
-      ) || matches[0];
-      const state = await ui.version(wanted.version);
-      const choice = wanted.choice;
-      if (!state?.choices.some((next) =>
-        next.bucket === choice.bucket &&
-        next.available &&
-        next.id === choice.id &&
-        next.effort === choice.effort
-      )) return false;
-      const after = await ui.bucket(choice.bucket);
-      const confirmed = after?.choices.find((entry) => entry.bucket === after.currentBucket);
-      selected = Boolean(
-        confirmed?.available === true &&
-        confirmed.id === choice.id &&
-        confirmed.effort === choice.effort &&
-        modelRank(confirmed, profile) > 0
-      );
-      return selected;
     } finally {
       if (!selected) {
         const restoredVersion = await ui.version(original.version);
-        if (restoredVersion) await ui.bucket(original.currentBucket);
+        const restored = restoredVersion ? await ui.bucket(original.currentBucket) : null;
+        if (!restored && !failureCode) fail('restore_failed');
       }
-      await ui.close();
+      closed = await ui.close();
     }
+
+    if (!selected) return publishFailure();
+    if (!closed) {
+      fail('picker_close_failed');
+      return publishFailure();
+    }
+    return true;
   }
 
   function composerText(box = composer()) {

@@ -181,8 +181,12 @@
       }
     }
 
-    if (!(await DOM.selectModelSettings(launch.executionProfile))) {
-      return { state: 'failed', reason: 'model_or_effort_unconfirmed' };
+    let modelFailure = 'selection_unconfirmed';
+    const modelSelected = await DOM.selectModelSettings(launch.executionProfile, (code) => {
+      if (typeof code === 'string' && /^[a-z_]{1,64}$/.test(code)) modelFailure = code;
+    });
+    if (!modelSelected) {
+      return { state: 'failed', reason: `model_or_effort_unconfirmed:${modelFailure}` };
     }
     // Chat/Work/model transitions can replace or temporarily disable the composer after the
     // picker has already confirmed the selection. Reacquire a writable host before any marker

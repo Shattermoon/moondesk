@@ -7,13 +7,85 @@
   const CORRELATION_ASK = 'moondesk-correlation-ask';
   const CORRELATION_REPLY = 'moondesk-correlation-reply';
   const MAX_CLIMB = 80;
+  // React's DOM Fiber pointer can retain the previous render. ChatGPT's tree has exceeded
+  // 400 levels in the live shell, so first prove the committed root and rebuild only that
+  // exact child path before reading picker/correlation state.
+  const MAX_ROOT_DEPTH = 2048;
+  const MAX_ROOT_CHILD_VISITS = 4096;
   const MAX_CORRELATION_TURNS = 16;
   const MAX_CORRELATION_IDS = 32;
+
+  // Cache reconstructed path views only within one synchronous helper request. Never retain a
+  // React tree across page mutations, and never rewrite React's own return pointers.
+  let currentPaths = null;
+
+  function committedPath(fiber) {
+    if (!fiber || typeof fiber !== 'object') return null;
+    const path = [];
+    const seen = new Set();
+    let at = fiber;
+    let base = null;
+    let paired = false;
+    const view = (node, parent) => ({
+      memoizedProps: node.memoizedProps,
+      memoizedState: node.memoizedState,
+      updateQueue: node.updateQueue,
+      return: parent
+    });
+    const remember = (node, value) => {
+      currentPaths?.set(node, value);
+      if (node.alternate && typeof node.alternate === 'object') currentPaths?.set(node.alternate, value);
+    };
+
+    while (at && path.length < MAX_ROOT_DEPTH) {
+      if (seen.has(at)) return null;
+      seen.add(at);
+      const cached = currentPaths?.get(at);
+      if (cached && cached.root.current === cached.current) {
+        base = cached;
+        break;
+      }
+      paired ||= Boolean(at.alternate);
+      if (at.tag === 3) {
+        const root = at.stateNode;
+        const current = root?.current;
+        if (!current || (current !== at && current !== at.alternate)) return null;
+        base = { root, current, node: current, view: view(current, null) };
+        remember(at, base);
+        break;
+      }
+      path.push(at);
+      at = at.return;
+    }
+
+    // Older unpaired owner facades have no root bookkeeping. A double-buffered or actual React
+    // tree must prove its committed root, including after unmount or interrupted renders.
+    if (!base) {
+      return !paired && !at && path.every((node) => typeof node.tag !== 'number') ? fiber : null;
+    }
+
+    let budget = MAX_ROOT_CHILD_VISITS;
+    for (let index = path.length - 1; index >= 0; index -= 1) {
+      const wanted = path[index];
+      let selected = null;
+      for (let child = base.node.child; child; child = child.sibling) {
+        budget -= 1;
+        if (budget < 0) return null;
+        if (child !== wanted && child !== wanted.alternate) continue;
+        if (selected) return null;
+        selected = child;
+      }
+      if (!selected || base.root.current !== base.current) return null;
+      base = { root: base.root, current: base.current, node: selected, view: view(selected, base.view) };
+      remember(wanted, base);
+    }
+    return base.view;
+  }
 
   function fiberOf(node) {
     if (!node) return null;
     for (const key in node) {
-      if (key.startsWith('__reactFiber$')) return node[key];
+      if (key.startsWith('__reactFiber$')) return committedPath(node[key]);
     }
     return null;
   }
@@ -453,28 +525,34 @@
     const nonce = typeof data.nonce === 'string' ? data.nonce.slice(0, 64) : '';
     if (!nonce) return;
 
-    if (data.source === ASK) {
-      let picker = null;
-      try {
-        picker = pickerSnapshot();
-      } catch {
-        picker = null;
+    const previousPaths = currentPaths;
+    currentPaths = new WeakMap();
+    try {
+      if (data.source === ASK) {
+        let picker = null;
+        try {
+          picker = pickerSnapshot();
+        } catch {
+          picker = null;
+        }
+        window.postMessage({ source: REPLY, nonce, v: 1, picker }, location.origin);
+        return;
       }
-      window.postMessage({ source: REPLY, nonce, v: 1, picker }, location.origin);
-      return;
-    }
 
-    if (data.source === CORRELATION_ASK) {
-      let correlation = null;
-      try {
-        correlation = correlationSnapshot();
-      } catch {
-        correlation = null;
+      if (data.source === CORRELATION_ASK) {
+        let correlation = null;
+        try {
+          correlation = correlationSnapshot();
+        } catch {
+          correlation = null;
+        }
+        window.postMessage(
+          { source: CORRELATION_REPLY, nonce, v: 1, correlation },
+          location.origin
+        );
       }
-      window.postMessage(
-        { source: CORRELATION_REPLY, nonce, v: 1, correlation },
-        location.origin
-      );
+    } finally {
+      currentPaths = previousPaths;
     }
   });
 })();

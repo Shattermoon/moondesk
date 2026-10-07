@@ -1345,6 +1345,113 @@ test('isolated model readback accepts a legacy Extra High profile when the curre
   );
 });
 
+test('legacy GPT-5.6 Sol default resolves to ChatGPT live gpt-5-6-thinking execution id', async () => {
+  const picker = {
+    version: '5.6',
+    currentBucket: 1,
+    versions: [{ id: '5.6', label: '5.6' }],
+    choices: [{
+      bucket: 1,
+      id: 'gpt-5-6-thinking',
+      label: '5.6 Thinking',
+      familyId: '5.6',
+      familyLabel: '5.6',
+      effort: 'high',
+      available: true
+    }]
+  };
+  const listeners = new Set();
+  const pageWindow = {
+    addEventListener(type, handler) {
+      if (type === 'message') listeners.add(handler);
+    },
+    removeEventListener(type, handler) {
+      if (type === 'message') listeners.delete(handler);
+    },
+    postMessage(message) {
+      if (message?.source !== 'moondesk-picker-ask') return;
+      for (const handler of [...listeners]) {
+        handler({
+          source: pageWindow,
+          origin: 'https://chatgpt.com',
+          data: { source: 'moondesk-picker-reply', nonce: message.nonce, v: 1, picker }
+        });
+      }
+    }
+  };
+  const context = vm.createContext({
+    window: pageWindow,
+    document: { querySelector() { return null; }, querySelectorAll() { return []; } },
+    location: { origin: 'https://chatgpt.com', pathname: '/' },
+    crypto: webcrypto,
+    URL,
+    setTimeout,
+    clearTimeout
+  });
+
+  vm.runInContext(chatgptDomSource, context, { filename: chatgptDomPath });
+  const selection = await pageWindow.MOONDESK_CHATGPT_DOM.selectedModelAndEffort({
+    modelKey: 'gpt-5.6-sol',
+    modelLabel: 'GPT-5.6 Sol',
+    reasoningEffort: 'high'
+  });
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(selection)),
+    { model: 'gpt-5-6-thinking', reasoningEffort: 'high' }
+  );
+});
+
+test('legacy GPT-5.6 Sol compatibility never admits the separate Pro execution id', async () => {
+  const picker = {
+    version: '5.6',
+    currentBucket: 2,
+    versions: [{ id: '5.6', label: '5.6' }],
+    choices: [{
+      bucket: 2,
+      id: 'gpt-5-6-pro',
+      label: '5.6 Pro',
+      familyId: '5.6-pro',
+      familyLabel: '5.6 Pro',
+      effort: 'pro',
+      available: true
+    }]
+  };
+  const listeners = new Set();
+  const pageWindow = {
+    addEventListener(type, handler) {
+      if (type === 'message') listeners.add(handler);
+    },
+    removeEventListener(type, handler) {
+      if (type === 'message') listeners.delete(handler);
+    },
+    postMessage(message) {
+      if (message?.source !== 'moondesk-picker-ask') return;
+      for (const handler of [...listeners]) {
+        handler({ source: pageWindow, origin: 'https://chatgpt.com', data: {
+          source: 'moondesk-picker-reply', nonce: message.nonce, v: 1, picker
+        } });
+      }
+    }
+  };
+  const context = vm.createContext({
+    window: pageWindow,
+    document: { querySelector() { return null; }, querySelectorAll() { return []; } },
+    location: { origin: 'https://chatgpt.com', pathname: '/' },
+    crypto: webcrypto,
+    URL,
+    setTimeout,
+    clearTimeout
+  });
+
+  vm.runInContext(chatgptDomSource, context, { filename: chatgptDomPath });
+  const selection = await pageWindow.MOONDESK_CHATGPT_DOM.selectedModelAndEffort({
+    modelKey: 'gpt-5.6-sol',
+    modelLabel: 'GPT-5.6 Sol',
+    reasoningEffort: 'high'
+  });
+  assert.equal(selection, null);
+});
+
 test('model catalog merges duplicate execution slugs into one visible family with all efforts', () => {
   const { evaluate } = loadBackground();
   const normalize = evaluate('normalizeModelCatalog');

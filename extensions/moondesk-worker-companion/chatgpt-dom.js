@@ -701,15 +701,32 @@
     };
   }
 
+  function legacyDisplayFamilyMatches(choice, profile) {
+    const requested = [profile?.modelKey, profile?.modelLabel]
+      .filter((value) => typeof value === 'string' && value.trim())
+      .map(normalizeModel);
+    // GPT-5.6 Sol is the product/display family. ChatGPT's live picker uses execution ids
+    // `gpt-5-6` (Instant) and `gpt-5-6-thinking` (reasoning); `gpt-5-6-pro` is a different
+    // family and must never be admitted by this compatibility rule. This mirrors CoS's
+    // account-observed stale-default resolution without turning arbitrary labels into aliases.
+    const wantsGpt56Sol = requested.some((value) =>
+      value === 'gpt5.6sol' || value === '5.6sol' || value === 'sol'
+    );
+    if (!wantsGpt56Sol) return false;
+    const executionId = String(choice?.id || '').trim().toLowerCase();
+    return executionId === 'gpt-5-6' || executionId === 'gpt-5-6-thinking';
+  }
+
   function modelRank(choice, profile) {
     const requested = [profile?.modelKey, profile?.modelLabel].filter(
       (value) => typeof value === 'string' && value.trim()
     );
     if (requested.some((model) => choice.familyId === model || choice.id === model)) return 2;
-    return requested.some((model) =>
+    if (requested.some((model) =>
       normalizeModel(choice.familyLabel) === normalizeModel(model) ||
       normalizeModel(choice.label) === normalizeModel(model)
-    ) ? 1 : 0;
+    )) return 1;
+    return legacyDisplayFamilyMatches(choice, profile) ? 1 : 0;
   }
 
   function modelMatches(choice, profile) {

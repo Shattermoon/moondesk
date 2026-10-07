@@ -218,7 +218,7 @@
 
   async function enterProject(projectId, stillCurrent = () => true) {
     const sourceConversation = conversationIdFromPath();
-    if (!/^g-p-[0-9a-f]{32}$/.test(projectId || '') || projectIdFromPath() !== projectId) return false;
+    if (!/^g-p-[0-9a-f]{32}$/.test(projectId || '')) return false;
     if (projectHomeId() === projectId) {
       return Boolean(await waitForComposerReady(15000, stillCurrent)) && !conversationIdFromPath();
     }
@@ -995,6 +995,16 @@
     return typeof box.innerText === 'string' ? box.innerText.trim() : (box.textContent || '').trim();
   }
 
+  function preparedPromptMatches(value) {
+    return Boolean(
+      typeof value === 'string' &&
+      value &&
+      composerWritable() &&
+      !generating() &&
+      compact(composerText()) === compact(value)
+    );
+  }
+
   function insertPrompt(value) {
     const box = composer();
     if (!visible(box) || generating() || composerText(box) || typeof value !== 'string' || !value) return false;
@@ -1115,6 +1125,7 @@
     selectModelSettings,
     visibleModelSelection,
     selectedModelAndEffort,
+    preparedPromptMatches,
     insertPrompt,
     workerEvidence,
     commitSendOnce,

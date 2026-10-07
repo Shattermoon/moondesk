@@ -258,11 +258,12 @@ async function ensureContent(tabId) {
   return sendToTab(tabId, { type: 'MOONDESK_CONTEXT' }, 5000);
 }
 
-function launchHash(token) {
-  return `#moondesk-launch=${encodeURIComponent(token)}`;
+function launchHash(token, projectEntry = false) {
+  const marker = `moondesk-launch=${encodeURIComponent(token)}`;
+  return `#${marker}${projectEntry ? '&moondesk-project-entry=1' : ''}`;
 }
 
-function sourceWithLaunchToken(sourceUrl, token, executionProfile = null) {
+function sourceWithLaunchToken(sourceUrl, token, executionProfile = null, projectEntry = false) {
   const url = new URL(sourceUrl);
   const model = typeof executionProfile?.modelKey === 'string' && /^[a-zA-Z0-9._-]{1,80}$/.test(executionProfile.modelKey)
     ? executionProfile.modelKey
@@ -274,9 +275,10 @@ function sourceWithLaunchToken(sourceUrl, token, executionProfile = null) {
   // because the shell has rewritten either one during startup across builds, and seed the exact
   // provider model/effort before the content bootstrap ever touches the picker.
   url.searchParams.set('moondesk-launch', token);
+  if (projectEntry) url.searchParams.set('moondesk-project-entry', '1');
   if (model) url.searchParams.set('model', model);
   if (effort) url.searchParams.set('reasoning_effort', effort);
-  url.hash = launchHash(token);
+  url.hash = launchHash(token, projectEntry);
   return url.toString();
 }
 
@@ -508,10 +510,15 @@ function placementForOffer(state, offer) {
 
 function sourceUrlForCommand(placement, openMode, existingConversation) {
   if (openMode === 'existing_thread') return existingConversation;
-  // Current ChatGPT Project homes are not a reliable cold-entry surface. Start from the exact
-  // Anchor conversation and let the content script follow that page's one native Project link;
-  // this preserves exact Project identity without guessing a display name or direct route.
-  if (placement?.projectId) return canonicalChatUrl(placement.anchorConversationUrl);
+  // Project workers use the exact Anchor conversation only as a temporary native Project-entry
+  // source. Open the canonical /c/<id> form rather than cloning the Project-scoped Anchor URL;
+  // ChatGPT can redirect it back into /g/<project>/c/<id>, but the explicit project-entry marker
+  // remains the authority that this duplicate page must enter the Project home and never act as
+  // the worker conversation itself.
+  if (placement?.projectId) {
+    const anchor = chatContextFromUrl(placement.anchorConversationUrl);
+    return anchor?.conversationId ? `https://chatgpt.com/c/${anchor.conversationId}` : null;
+  }
   return 'https://chatgpt.com/';
 }
 
@@ -639,6 +646,10 @@ async function recordForCommand(state, command, placement, reconcileRequired = f
     if (openMode === 'existing_thread' && !existingConversation) {
       throw new Error('Existing worker thread has no confirmed ChatGPT conversation binding for this workspace and placement context');
     }
+    const sourceUrl = sourceUrlForCommand(placement, openMode, existingConversation);
+    if (!sourceUrl) {
+      throw new Error('Worker launch has no exact ChatGPT source URL for this placement');
+    }
     record = {
       commandId: command.id,
       workspaceId: command.launch.workspaceId,
@@ -646,7 +657,7 @@ async function recordForCommand(state, command, placement, reconcileRequired = f
       threadKey,
       openMode,
       launchToken: crypto.randomUUID(),
-      sourceUrl: sourceUrlForCommand(placement, openMode, existingConversation),
+      sourceUrl,
       tabId: null,
       conversationUrl: existingConversation,
       phase: 'creating',
@@ -661,8 +672,9 @@ async function recordForCommand(state, command, placement, reconcileRequired = f
       throw new Error('Reconciliation has no confirmed worker conversation URL and cannot create a fresh worker thread');
     }
     const targetUrl = record.conversationUrl || record.sourceUrl;
+    const projectEntry = command.launch.openMode !== 'existing_thread' && Boolean(placement?.projectId);
     tab = await chrome.tabs.create({
-      url: sourceWithLaunchToken(targetUrl, record.launchToken, command.launch.executionProfile),
+      url: sourceWithLaunchToken(targetUrl, record.launchToken, command.launch.executionProfile, projectEntry),
       active: false
     });
     record.tabId = tab.id ?? null;
@@ -914,6 +926,10 @@ async function processCommand(state, offer) {
     }
     if (message.includes('no confirmed ChatGPT conversation binding')) {
       await failBeforeSend('worker_thread_binding_missing');
+      return;
+    }
+    if (message.includes('no exact ChatGPT source URL')) {
+      await failBeforeSend('worker_source_url_unconfirmed');
       return;
     }
     throw error;

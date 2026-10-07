@@ -1595,15 +1595,19 @@ test('existing worker placement survives without Anchor presence by using its du
   assert.equal(placement.projectUrl, null);
 });
 
-test('new worker threads in a Project start from the exact Anchor conversation before native Project entry', () => {
+test('new worker threads in a Project start from canonical Anchor conversation entry before native Project entry', () => {
   const { evaluate } = loadBackground();
   const sourceUrlForCommand = evaluate('sourceUrlForCommand');
+  const anchorConversationId = '11111111-2222-4333-8444-555555555555';
   const placement = {
     projectId: 'g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
     projectUrl: 'https://chatgpt.com/g/g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-any-human-name/project',
-    anchorConversationUrl: 'https://chatgpt.com/g/g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-any-human-name/c/anchor'
+    anchorConversationUrl: `https://chatgpt.com/g/g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-any-human-name/c/${anchorConversationId}`
   };
-  assert.equal(sourceUrlForCommand(placement, 'new_thread', null), placement.anchorConversationUrl);
+  assert.equal(
+    sourceUrlForCommand(placement, 'new_thread', null),
+    `https://chatgpt.com/c/${anchorConversationId}`
+  );
 });
 
 test('new worker threads from normal Anchors start from normal ChatGPT home', () => {
@@ -1680,20 +1684,25 @@ test('record creation opens Project launches on the exact Anchor conversation an
     }
   };
 
+  const anchorConversationId = '11111111-2222-4333-8444-555555555555';
   const projectPlacement = {
     projectId: 'g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
     projectUrl: 'https://chatgpt.com/g/g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-unrelated-name/project',
-    anchorConversationUrl: 'https://chatgpt.com/g/g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-unrelated-name/c/anchor'
+    anchorConversationUrl: `https://chatgpt.com/g/g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-unrelated-name/c/${anchorConversationId}`
   };
   const state = { launchRecords: {}, threadRecords: {} };
   const { record } = await recordForCommand(state, command, projectPlacement);
-  assert.equal(record.sourceUrl, projectPlacement.anchorConversationUrl);
+  assert.equal(record.sourceUrl, `https://chatgpt.com/c/${anchorConversationId}`);
   const projectUrl = new URL(createdTabs[0].url);
-  assert.equal(projectUrl.pathname.endsWith('/c/anchor'), true);
+  assert.equal(projectUrl.pathname, `/c/${anchorConversationId}`);
   assert.equal(projectUrl.searchParams.get('moondesk-launch'), record.launchToken);
+  assert.equal(projectUrl.searchParams.get('moondesk-project-entry'), '1');
   assert.equal(projectUrl.searchParams.get('model'), 'gpt-5.6-sol');
   assert.equal(projectUrl.searchParams.get('reasoning_effort'), 'high');
-  assert.equal(projectUrl.hash, `#moondesk-launch=${encodeURIComponent(record.launchToken)}`);
+  assert.equal(
+    projectUrl.hash,
+    `#moondesk-launch=${encodeURIComponent(record.launchToken)}&moondesk-project-entry=1`
+  );
 
   const normalState = { launchRecords: {}, threadRecords: {} };
   const normalCommand = {
@@ -2056,12 +2065,14 @@ test('existing-thread preparation waits for the recovered conversation composer 
 
 test('Project worker preparation keeps launch authority across the exact source-to-Project transition', async () => {
   let messageHandler = null;
-  let conversationId = 'anchor-conversation';
+  const anchorConversationId = '11111111-2222-4333-8444-555555555555';
+  let conversationId = anchorConversationId;
   const projectId = 'g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
   const storage = new Map();
   const DOM = {
     conversationIdFromPath() { return conversationId; },
-    projectIdFromPath() { return projectId; },
+    projectIdFromPath() { return conversationId === null ? projectId : null; },
+    projectHomeId() { return conversationId === null ? projectId : null; },
     async enterProject(expectedProjectId, stillCurrent) {
       assert.equal(expectedProjectId, projectId);
       assert.equal(stillCurrent(), true);
@@ -2101,10 +2112,10 @@ test('Project worker preparation keeps launch authority across the exact source-
     },
     location: {
       origin: 'https://chatgpt.com',
-      hash: '#moondesk-launch=project-token',
-      pathname: `/g/${projectId}-moondesk/c/anchor-conversation`,
-      search: '',
-      href: `https://chatgpt.com/g/${projectId}-moondesk/c/anchor-conversation#moondesk-launch=project-token`
+      hash: '#moondesk-launch=project-token&moondesk-project-entry=1',
+      pathname: `/c/${anchorConversationId}`,
+      search: '?moondesk-launch=project-token&moondesk-project-entry=1',
+      href: `https://chatgpt.com/c/${anchorConversationId}?moondesk-launch=project-token&moondesk-project-entry=1#moondesk-launch=project-token&moondesk-project-entry=1`
     },
     history: { state: null, replaceState() {} },
     chrome: { runtime: { onMessage: { addListener(handler) { messageHandler = handler; } } } },
@@ -2122,7 +2133,10 @@ test('Project worker preparation keeps launch authority across the exact source-
       type: 'MOONDESK_PREPARE_WORKER',
       commandId: 'project-transition-command',
       launchToken: 'project-token',
-      placement: { projectId },
+      placement: {
+        projectId,
+        anchorConversationUrl: `https://chatgpt.com/g/${projectId}-moondesk/c/${anchorConversationId}`
+      },
       launch: {
         workspaceId: 'workspace-a',
         taskMarker: 'moondesk-worker-task:project-transition',
@@ -2177,10 +2191,10 @@ test('Project worker preparation resumes from the exact Project home after a doc
     },
     location: {
       origin: 'https://chatgpt.com',
-      hash: '#moondesk-launch=project-resume-token',
+      hash: '#moondesk-launch=project-resume-token&moondesk-project-entry=1',
       pathname: `/g/${projectId}-moondesk/project`,
-      search: '?moondesk-launch=project-resume-token',
-      href: `https://chatgpt.com/g/${projectId}-moondesk/project?moondesk-launch=project-resume-token#moondesk-launch=project-resume-token`
+      search: '?moondesk-launch=project-resume-token&moondesk-project-entry=1',
+      href: `https://chatgpt.com/g/${projectId}-moondesk/project?moondesk-launch=project-resume-token&moondesk-project-entry=1#moondesk-launch=project-resume-token&moondesk-project-entry=1`
     },
     history: { state: null, replaceState() {} },
     chrome: { runtime: { onMessage: { addListener(handler) { messageHandler = handler; } } } },
@@ -2214,6 +2228,81 @@ test('Project worker preparation resumes from the exact Project home after a doc
   assert.equal(response.result.state, 'ready');
   assert.equal(enterProjectCalls, 0);
 });
+
+test('Project worker preparation refuses a duplicated Anchor without explicit Project-entry authority', async () => {
+  let messageHandler = null;
+  let enterProjectCalls = 0;
+  const projectId = 'g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+  const anchorConversationId = '11111111-2222-4333-8444-555555555555';
+  const storage = new Map();
+  const DOM = {
+    conversationIdFromPath() { return anchorConversationId; },
+    projectIdFromPath() { return projectId; },
+    projectHomeId() { return null; },
+    async enterProject() {
+      enterProjectCalls += 1;
+      return true;
+    },
+    composerReady() { return true; },
+    async waitForComposerReady() { return true; },
+    async selectModelSettings() { return true; },
+    taskMarkerPresent() { return false; },
+    insertPrompt() { return true; },
+    workerEvidence() { return {}; }
+  };
+  const context = vm.createContext({
+    window: { MOONDESK_CHATGPT_DOM: DOM },
+    sessionStorage: {
+      setItem(key, value) { storage.set(key, value); },
+      getItem(key) { return storage.get(key) || null; }
+    },
+    location: {
+      origin: 'https://chatgpt.com',
+      hash: '#moondesk-launch=project-no-authority-token',
+      pathname: `/g/${projectId}-moondesk/c/${anchorConversationId}`,
+      search: '?moondesk-launch=project-no-authority-token',
+      href: `https://chatgpt.com/g/${projectId}-moondesk/c/${anchorConversationId}?moondesk-launch=project-no-authority-token#moondesk-launch=project-no-authority-token`
+    },
+    history: { state: null, replaceState() {} },
+    chrome: { runtime: { onMessage: { addListener(handler) { messageHandler = handler; } } } },
+    crypto: webcrypto,
+    setTimeout,
+    clearTimeout,
+    setInterval,
+    clearInterval,
+    console
+  });
+  vm.runInContext(contentSource, context, { filename: contentPath });
+
+  const response = await new Promise((resolve) => {
+    const returned = messageHandler({
+      type: 'MOONDESK_PREPARE_WORKER',
+      commandId: 'project-no-authority-command',
+      launchToken: 'project-no-authority-token',
+      placement: {
+        projectId,
+        anchorConversationUrl: `https://chatgpt.com/g/${projectId}-moondesk/c/${anchorConversationId}`
+      },
+      launch: {
+        workspaceId: 'workspace-a',
+        taskMarker: 'moondesk-worker-task:project-no-authority',
+        openingMessage: 'project-no-authority',
+        threadKey: 'worker:project-no-authority',
+        openMode: 'new_thread',
+        executionProfile: { modelKey: 'gpt-5.6-sol', modelLabel: 'GPT-5.6 Sol', reasoningEffort: 'high' }
+      }
+    }, null, resolve);
+    assert.equal(returned, true);
+  });
+
+  assert.equal(response.ok, true);
+  assert.deepEqual(JSON.parse(JSON.stringify(response.result)), {
+    state: 'failed',
+    reason: 'project_entry_not_authorized'
+  });
+  assert.equal(enterProjectCalls, 0, 'an unmarked duplicate Anchor must never enter Project bootstrap');
+});
+
 test('worker preparation aborts when the target route changes during model selection', async () => {
   let messageHandler = null;
   let conversationId = null;
@@ -2541,6 +2630,7 @@ test('worker launch transaction survives ChatGPT navigation and ACKs the confirm
   const commandId = '11111111-2222-4333-8444-555555555555';
   const leaseId = '66666666-7777-4888-8999-aaaaaaaaaaaa';
   const taskMarker = 'moondesk-worker-task:transaction-test';
+  const anchorConversationId = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
   const conversationUrl = `https://chatgpt.com/g/${projectId}-moondesk/c/bbbbbbbb-cccc-4ddd-8eee-ffffffffffff`;
   const events = [];
   const ackPayloads = [];
@@ -2551,8 +2641,8 @@ test('worker launch transaction survives ChatGPT navigation and ACKs the confirm
     state: 'leased',
     lease: { leaseId, clientId: 'browser-current' },
     anchorContext: {
-      conversationId: 'anchor-conversation',
-      conversationUrl: `https://chatgpt.com/g/${projectId}-moondesk/c/anchor-conversation`,
+      conversationId: anchorConversationId,
+      conversationUrl: `https://chatgpt.com/g/${projectId}-moondesk/c/${anchorConversationId}`,
       projectId,
       projectUrl: `https://chatgpt.com/g/${projectId}-moondesk/project`
     },

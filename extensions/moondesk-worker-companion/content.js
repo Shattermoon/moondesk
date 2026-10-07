@@ -5,6 +5,12 @@
   if (!DOM) return;
 
   const LAUNCH_SESSION_KEY = 'moondesk-worker-launch-v1';
+  const OPENED_PROJECT_ENTRY = (() => {
+    const query = String(location.search || '');
+    const hash = String(location.hash || '');
+    return /(?:^|[?&])moondesk-project-entry=1(?:&|$)/.test(query) ||
+      /(?:^|[#&])moondesk-project-entry=1(?:&|$)/.test(hash);
+  })();
   const PROVIDER_CORRELATION_OBSERVED = 'moondesk-provider-correlation-observed';
   const PROVIDER_CORRELATION_ASK = 'moondesk-provider-correlation-ask';
   const PROVIDER_CORRELATION_REPLY = 'moondesk-provider-correlation-reply';
@@ -121,7 +127,9 @@
         threadKey: record.threadKey || null,
         openMode: record.openMode || null,
         targetConversationId: record.targetConversationId || null,
-        projectId: record.projectId || null
+        projectId: record.projectId || null,
+        projectEntry: record.projectEntry === true,
+        sourceConversationId: record.sourceConversationId || null
       }));
     } catch {}
     if (location.hash.startsWith('#moondesk-launch=')) {
@@ -145,16 +153,41 @@
     if (!commandId || !launchToken || !placement || !launch?.taskMarker || !launch?.openingMessage || !launch?.executionProfile) {
       return { state: 'failed', reason: 'invalid_launch_payload' };
     }
+    const expectedProjectId = placement.projectId || null;
+    const existingThread = launch.openMode === 'existing_thread';
+    const previousLaunch = rememberedLaunch();
+    const samePreviousLaunch = Boolean(
+      previousLaunch &&
+      previousLaunch.commandId === commandId &&
+      previousLaunch.launchToken === launchToken &&
+      previousLaunch.taskMarker === launch.taskMarker
+    );
+    const projectEntryAuthorized = Boolean(
+      !existingThread &&
+      expectedProjectId &&
+      (
+        OPENED_PROJECT_ENTRY ||
+        (
+          samePreviousLaunch &&
+          previousLaunch.projectEntry === true &&
+          previousLaunch.projectId === expectedProjectId
+        )
+      )
+    );
+    const sourceConversationAtStart = DOM.conversationIdFromPath();
     rememberLaunch({
       commandId,
       launchToken,
       taskMarker: launch.taskMarker,
       workspaceId: launch.workspaceId,
-      threadKey: launch.threadKey || null
+      threadKey: launch.threadKey || null,
+      openMode: launch.openMode || 'new_thread',
+      projectId: expectedProjectId,
+      projectEntry: projectEntryAuthorized,
+      sourceConversationId: projectEntryAuthorized
+        ? (previousLaunch?.sourceConversationId || sourceConversationAtStart || null)
+        : null
     });
-
-    const expectedProjectId = placement.projectId || null;
-    const existingThread = launch.openMode === 'existing_thread';
     const launchAlive = () => {
       const current = rememberedLaunch();
       return Boolean(
@@ -181,6 +214,9 @@
         return { state: 'failed', reason: stillOnTarget() ? 'worker_conversation_not_ready' : 'worker_launch_target_changed' };
       }
     } else if (expectedProjectId) {
+      if (!projectEntryAuthorized) {
+        return { state: 'failed', reason: 'project_entry_not_authorized' };
+      }
       const sourceConversation = DOM.conversationIdFromPath();
       const alreadyOnProjectHome =
         DOM.projectIdFromPath() === expectedProjectId &&
@@ -199,25 +235,39 @@
           return { state: 'failed', reason: stillOnTarget() ? 'project_composer_not_ready' : 'worker_launch_target_changed' };
         }
       } else {
-        if (DOM.projectIdFromPath() !== expectedProjectId || !sourceConversation) {
-          return { state: 'failed', reason: 'wrong_chatgpt_project' };
+        let expectedSourceConversation = null;
+        try {
+          expectedSourceConversation = /\/c\/([0-9a-f-]{16,64})(?:\/|$)/i.exec(
+            new URL(placement.anchorConversationUrl).pathname
+          )?.[1] || null;
+        } catch {}
+        if (!sourceConversation || (expectedSourceConversation && sourceConversation !== expectedSourceConversation)) {
+          return { state: 'failed', reason: 'project_source_conversation_mismatch' };
         }
         const stillOnSource = () =>
           launchAlive() &&
-          DOM.projectIdFromPath() === expectedProjectId &&
           DOM.conversationIdFromPath() === sourceConversation;
         if (!stillOnSource()) {
           return { state: 'failed', reason: 'worker_launch_target_changed' };
         }
-        // enterProject owns the exact source-conversation -> Project-home transition proof. Its
-        // cancellation fence must cover the launch lifetime, not require the source route to remain
-        // unchanged after the one native Project click.
+        // The canonical /c/<anchor> entry may redirect into the Project-scoped route before this
+        // script runs. The exact native Project link, not the source URL shape, proves membership.
         if (!(await DOM.enterProject(expectedProjectId, launchAlive))) {
           return { state: 'failed', reason: launchAlive() ? 'project_entry_unconfirmed' : 'worker_launch_target_changed' };
         }
+        // Match the proven browser bootstrap contract: carry the command marker onto the Project
+        // home after ChatGPT consumes the source URL so this exact launch remains recoverable.
+        try {
+          const marked = new URL(location.href);
+          marked.searchParams.set('moondesk-launch', launchToken);
+          marked.searchParams.set('moondesk-project-entry', '1');
+          marked.hash = `moondesk-launch=${encodeURIComponent(launchToken)}&moondesk-project-entry=1`;
+          history.replaceState(history.state, '', marked.href);
+        } catch {}
         stillOnTarget = () =>
           launchAlive() &&
           DOM.projectIdFromPath() === expectedProjectId &&
+          DOM.projectHomeId?.() === expectedProjectId &&
           DOM.conversationIdFromPath() === null;
         if (!stillOnTarget() || !DOM.composerReady()) {
           return { state: 'failed', reason: stillOnTarget() ? 'project_composer_not_ready' : 'worker_launch_target_changed' };
@@ -247,7 +297,9 @@
       threadKey: launch.threadKey || null,
       openMode: launch.openMode || 'new_thread',
       targetConversationId: DOM.conversationIdFromPath() || null,
-      projectId: expectedProjectId
+      projectId: expectedProjectId,
+      projectEntry: projectEntryAuthorized,
+      sourceConversationId: rememberedLaunch()?.sourceConversationId || null
     });
 
     let modelFailure = 'selection_unconfirmed';
@@ -280,7 +332,7 @@
         evidence
       };
     }
-    if (!DOM.insertPrompt(launch.openingMessage)) {
+    if (!DOM.preparedPromptMatches?.(launch.openingMessage) && !DOM.insertPrompt(launch.openingMessage)) {
       return { state: 'failed', reason: 'prompt_insert_unconfirmed' };
     }
     return {

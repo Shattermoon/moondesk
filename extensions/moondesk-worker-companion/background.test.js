@@ -1702,30 +1702,28 @@ test('existing worker placement survives without Anchor presence by using its du
   assert.equal(placement.projectUrl, null);
 });
 
-test('new worker threads in a Project start from canonical Anchor conversation entry before native Project entry', () => {
+test('fresh workers always start from normal ChatGPT home regardless of Anchor Project placement', () => {
   const { evaluate } = loadBackground();
   const sourceUrlForCommand = evaluate('sourceUrlForCommand');
   const anchorConversationId = '11111111-2222-4333-8444-555555555555';
-  const placement = {
+  const projectPlacement = {
     projectId: 'g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
     projectUrl: 'https://chatgpt.com/g/g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-any-human-name/project',
     anchorConversationUrl: `https://chatgpt.com/g/g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-any-human-name/c/${anchorConversationId}`
   };
-  assert.equal(
-    sourceUrlForCommand(placement, 'new_thread', null),
-    `https://chatgpt.com/c/${anchorConversationId}`
-  );
-});
-
-test('new worker threads from normal Anchors start from normal ChatGPT home', () => {
-  const { evaluate } = loadBackground();
-  const sourceUrlForCommand = evaluate('sourceUrlForCommand');
-  const placement = {
+  const normalPlacement = {
     projectId: null,
     projectUrl: null,
     anchorConversationUrl: 'https://chatgpt.com/c/anchor-normal'
   };
-  assert.equal(sourceUrlForCommand(placement, 'new_thread', null), 'https://chatgpt.com/');
+
+  assert.equal(sourceUrlForCommand(projectPlacement, 'new_thread', null), 'https://chatgpt.com/');
+  assert.equal(sourceUrlForCommand(normalPlacement, 'new_thread', null), 'https://chatgpt.com/');
+  assert.equal(
+    sourceUrlForCommand(projectPlacement, 'new_thread', null).includes(anchorConversationId),
+    false,
+    'a fresh worker URL must never contain the Anchor conversation id'
+  );
 });
 
 test('existing worker threads always reuse the confirmed worker conversation', () => {
@@ -1773,7 +1771,7 @@ test('uncertain reconciliation never adopts the inspected source conversation as
   );
 });
 
-test('record creation opens Project launches on the exact Anchor conversation and normal launches on normal home', async () => {
+test('record creation opens every fresh worker on normal ChatGPT home and never clones the Anchor', async () => {
   const { createdTabs, evaluate } = loadBackground();
   const recordForCommand = evaluate('recordForCommand');
   const command = {
@@ -1799,17 +1797,15 @@ test('record creation opens Project launches on the exact Anchor conversation an
   };
   const state = { launchRecords: {}, threadRecords: {} };
   const { record } = await recordForCommand(state, command, projectPlacement);
-  assert.equal(record.sourceUrl, `https://chatgpt.com/c/${anchorConversationId}`);
-  const projectUrl = new URL(createdTabs[0].url);
-  assert.equal(projectUrl.pathname, `/c/${anchorConversationId}`);
-  assert.equal(projectUrl.searchParams.get('moondesk-launch'), record.launchToken);
-  assert.equal(projectUrl.searchParams.get('moondesk-project-entry'), '1');
-  assert.equal(projectUrl.searchParams.get('model'), 'gpt-5.6-sol');
-  assert.equal(projectUrl.searchParams.get('reasoning_effort'), 'high');
-  assert.equal(
-    projectUrl.hash,
-    `#moondesk-launch=${encodeURIComponent(record.launchToken)}&moondesk-project-entry=1`
-  );
+  assert.equal(record.sourceUrl, 'https://chatgpt.com/');
+  const projectAnchorWorkerUrl = new URL(createdTabs[0].url);
+  assert.equal(projectAnchorWorkerUrl.origin + projectAnchorWorkerUrl.pathname, 'https://chatgpt.com/');
+  assert.equal(projectAnchorWorkerUrl.href.includes(anchorConversationId), false);
+  assert.equal(projectAnchorWorkerUrl.searchParams.get('moondesk-project-entry'), null);
+  assert.equal(projectAnchorWorkerUrl.searchParams.get('moondesk-launch'), record.launchToken);
+  assert.equal(projectAnchorWorkerUrl.searchParams.get('model'), 'gpt-5.6-sol');
+  assert.equal(projectAnchorWorkerUrl.searchParams.get('reasoning_effort'), 'high');
+  assert.equal(projectAnchorWorkerUrl.hash, `#moondesk-launch=${encodeURIComponent(record.launchToken)}`);
 
   const normalState = { launchRecords: {}, threadRecords: {} };
   const normalCommand = {
@@ -1923,8 +1919,11 @@ test('new-thread recovery never matches an older launch only by durable thread k
   assert.equal(matches(newThread, { commandId: 'command-new', threadKey: 'different' }), true);
 });
 
-test('existing-thread reuse fails closed across workspace or exact placement boundaries', async () => {
-  const { createdTabs, evaluate } = loadBackground();
+test('existing-thread reuse is owned by workspace and exact thread, not the Anchor Project', async () => {
+  const legacyWorkerUrl = 'https://chatgpt.com/g/g-p-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-legacy/c/worker-thread';
+  const { createdTabs, evaluate } = loadBackground({
+    existingTabs: { 77: { id: 77, url: legacyWorkerUrl } }
+  });
   const recordForCommand = evaluate('recordForCommand');
   const placement = {
     projectId: 'g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
@@ -1940,7 +1939,6 @@ test('existing-thread reuse fails closed across workspace or exact placement bou
       openMode: 'existing_thread'
     }
   };
-  const conversationUrl = 'https://chatgpt.com/g/g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-moondesk/c/worker-thread';
 
   await assert.rejects(
     recordForCommand({
@@ -1949,27 +1947,27 @@ test('existing-thread reuse fails closed across workspace or exact placement bou
         'worker:reuse': {
           workspaceId: 'workspace-other',
           projectId: placement.projectId,
-          conversationUrl
+          conversationUrl: legacyWorkerUrl
         }
       }
     }, command, placement),
-    /no confirmed ChatGPT conversation binding for this workspace and placement context/
+    /no confirmed ChatGPT conversation binding for this workspace and thread identity/
   );
 
-  await assert.rejects(
-    recordForCommand({
-      launchRecords: {},
-      threadRecords: {
-        'worker:reuse': {
-          workspaceId: command.launch.workspaceId,
-          projectId: 'g-p-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
-          conversationUrl
-        }
+  const state = {
+    launchRecords: {},
+    threadRecords: {
+      'worker:reuse': {
+        workspaceId: command.launch.workspaceId,
+        projectId: 'g-p-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+        conversationUrl: legacyWorkerUrl,
+        tabId: 77
       }
-    }, command, placement),
-    /no confirmed ChatGPT conversation binding for this workspace and placement context/
-  );
-
+    }
+  };
+  const reused = await recordForCommand(state, command, placement);
+  assert.equal(reused.record.conversationUrl, legacyWorkerUrl);
+  assert.equal(reused.tab.id, 77);
   assert.equal(createdTabs.length, 0);
 });
 
@@ -2032,7 +2030,7 @@ test('existing-thread reuse self-heals a missing thread record from a succeeded 
   assert.equal(createdTabs.length, 0);
 });
 
-test('existing-thread reuse accepts a confirmed thread owned by the same workspace and exact placement', async () => {
+test('existing-thread reuse accepts the exact confirmed thread owned by the same workspace', async () => {
   const conversationUrl = 'https://chatgpt.com/g/g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-moondesk/c/worker-thread';
   const { createdTabs, evaluate } = loadBackground({
     existingTabs: {
@@ -2170,118 +2168,23 @@ test('existing-thread preparation waits for the recovered conversation composer 
   assert.equal(selectCalls, 1);
 });
 
-test('Project worker preparation keeps launch authority across the exact source-to-Project transition', async () => {
+test('fresh worker preparation stays on normal ChatGPT home even when the Anchor is in a Project', async () => {
   let messageHandler = null;
-  const anchorConversationId = '11111111-2222-4333-8444-555555555555';
-  let conversationId = anchorConversationId;
-  const projectId = 'g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
-  const storage = new Map();
-  const DOM = {
-    conversationIdFromPath() { return conversationId; },
-    projectIdFromPath() { return conversationId === null ? projectId : null; },
-    projectHomeId() { return conversationId === null ? projectId : null; },
-    async enterProject(expectedProjectId, stillCurrent) {
-      assert.equal(expectedProjectId, projectId);
-      assert.equal(stillCurrent(), true);
-      conversationId = null;
-      assert.equal(stillCurrent(), true, 'launch lifetime stays valid after the native Project transition');
-      return true;
-    },
-    composerReady() { return true; },
-    async waitForComposerReady(_timeoutMs, stillCurrent) {
-      assert.equal(stillCurrent(), true);
-      return true;
-    },
-    async selectModelSettings(_profile, _failure, stillCurrent) {
-      assert.equal(stillCurrent(), true, 'model selection is fenced to the Project-home target');
-      return true;
-    },
-    visibleModelSelection() { return { model: 'gpt-5.6-sol', reasoningEffort: 'high' }; },
-    taskMarkerPresent() { return false; },
-    insertPrompt() { return true; },
-    workerEvidence() {
-      return {
-        conversationId,
-        projectId,
-        markerPresent: false,
-        generating: false,
-        userTurnCount: 0,
-        assistantTurnCount: 0,
-        composerEmpty: false
-      };
-    }
-  };
-  const context = vm.createContext({
-    window: { MOONDESK_CHATGPT_DOM: DOM },
-    sessionStorage: {
-      setItem(key, value) { storage.set(key, value); },
-      getItem(key) { return storage.get(key) || null; }
-    },
-    location: {
-      origin: 'https://chatgpt.com',
-      hash: '#moondesk-launch=project-token&moondesk-project-entry=1',
-      pathname: `/c/${anchorConversationId}`,
-      search: '?moondesk-launch=project-token&moondesk-project-entry=1',
-      href: `https://chatgpt.com/c/${anchorConversationId}?moondesk-launch=project-token&moondesk-project-entry=1#moondesk-launch=project-token&moondesk-project-entry=1`
-    },
-    history: { state: null, replaceState() {} },
-    chrome: { runtime: { onMessage: { addListener(handler) { messageHandler = handler; } } } },
-    crypto: webcrypto,
-    setTimeout,
-    clearTimeout,
-    setInterval,
-    clearInterval,
-    console
-  });
-  vm.runInContext(contentSource, context, { filename: contentPath });
-
-  const response = await new Promise((resolve) => {
-    const returned = messageHandler({
-      type: 'MOONDESK_PREPARE_WORKER',
-      commandId: 'project-transition-command',
-      launchToken: 'project-token',
-      placement: {
-        projectId,
-        anchorConversationUrl: `https://chatgpt.com/g/${projectId}-moondesk/c/${anchorConversationId}`
-      },
-      launch: {
-        workspaceId: 'workspace-a',
-        taskMarker: 'moondesk-worker-task:project-transition',
-        openingMessage: 'project-transition',
-        threadKey: 'worker:project-transition',
-        openMode: 'new_thread',
-        executionProfile: { modelKey: 'gpt-5.6-sol', modelLabel: 'GPT-5.6 Sol', reasoningEffort: 'high' }
-      }
-    }, null, resolve);
-    assert.equal(returned, true);
-  });
-  assert.equal(response.ok, true);
-  assert.equal(response.result.state, 'ready');
-});
-
-test('Project worker preparation resumes from the exact Project home after a document transition', async () => {
-  let messageHandler = null;
-  let enterProjectCalls = 0;
   const projectId = 'g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
   const storage = new Map();
   const DOM = {
     conversationIdFromPath() { return null; },
-    projectIdFromPath() { return projectId; },
-    projectHomeId() { return projectId; },
-    async enterProject() {
-      enterProjectCalls += 1;
-      throw new Error('a resumed Project-home bootstrap must not click Project entry again');
-    },
-    composerReady() { return true; },
+    projectIdFromPath() { return null; },
     async waitForComposerReady(_timeoutMs, stillCurrent) { return stillCurrent(); },
     async selectModelSettings(_profile, _failure, stillCurrent) { return stillCurrent(); },
-    visibleModelSelection() { return { model: 'gpt-5.6-sol', reasoningEffort: 'high' }; },
+    visibleModelSelection() { return { model: 'gpt-5-6-thinking', reasoningEffort: 'high' }; },
     taskMarkerPresent() { return false; },
+    preparedPromptMatches() { return false; },
     insertPrompt() { return true; },
     workerEvidence() {
       return {
         conversationId: null,
-        projectId,
+        projectId: null,
         markerPresent: false,
         generating: false,
         userTurnCount: 0,
@@ -2298,10 +2201,10 @@ test('Project worker preparation resumes from the exact Project home after a doc
     },
     location: {
       origin: 'https://chatgpt.com',
-      hash: '#moondesk-launch=project-resume-token&moondesk-project-entry=1',
-      pathname: `/g/${projectId}-moondesk/project`,
-      search: '?moondesk-launch=project-resume-token&moondesk-project-entry=1',
-      href: `https://chatgpt.com/g/${projectId}-moondesk/project?moondesk-launch=project-resume-token&moondesk-project-entry=1#moondesk-launch=project-resume-token&moondesk-project-entry=1`
+      hash: '#moondesk-launch=normal-worker-token',
+      pathname: '/',
+      search: '?moondesk-launch=normal-worker-token',
+      href: 'https://chatgpt.com/?moondesk-launch=normal-worker-token#moondesk-launch=normal-worker-token'
     },
     history: { state: null, replaceState() {} },
     chrome: { runtime: { onMessage: { addListener(handler) { messageHandler = handler; } } } },
@@ -2317,14 +2220,17 @@ test('Project worker preparation resumes from the exact Project home after a doc
   const response = await new Promise((resolve) => {
     const returned = messageHandler({
       type: 'MOONDESK_PREPARE_WORKER',
-      commandId: 'project-resume-command',
-      launchToken: 'project-resume-token',
-      placement: { projectId },
+      commandId: 'normal-worker-command',
+      launchToken: 'normal-worker-token',
+      placement: {
+        projectId,
+        anchorConversationUrl: `https://chatgpt.com/g/${projectId}-moondesk/c/11111111-2222-4333-8444-555555555555`
+      },
       launch: {
         workspaceId: 'workspace-a',
-        taskMarker: 'moondesk-worker-task:project-resume',
-        openingMessage: 'project-resume',
-        threadKey: 'worker:project-resume',
+        taskMarker: 'moondesk-worker-task:normal-worker',
+        openingMessage: 'normal-worker',
+        threadKey: 'worker:normal-worker',
         openMode: 'new_thread',
         executionProfile: { modelKey: 'gpt-5.6-sol', modelLabel: 'GPT-5.6 Sol', reasoningEffort: 'high' }
       }
@@ -2333,28 +2239,24 @@ test('Project worker preparation resumes from the exact Project home after a doc
   });
   assert.equal(response.ok, true);
   assert.equal(response.result.state, 'ready');
-  assert.equal(enterProjectCalls, 0);
+  const remembered = JSON.parse(storage.get('moondesk-worker-launch-v1'));
+  assert.equal(remembered.projectId, null);
+  assert.equal('projectEntry' in remembered, false);
+  assert.equal('sourceConversationId' in remembered, false);
 });
 
-test('Project worker preparation refuses a duplicated Anchor without explicit Project-entry authority', async () => {
+test('fresh worker preparation refuses a duplicated Project Anchor instead of transforming it', async () => {
   let messageHandler = null;
-  let enterProjectCalls = 0;
   const projectId = 'g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
   const anchorConversationId = '11111111-2222-4333-8444-555555555555';
   const storage = new Map();
   const DOM = {
     conversationIdFromPath() { return anchorConversationId; },
     projectIdFromPath() { return projectId; },
-    projectHomeId() { return null; },
-    async enterProject() {
-      enterProjectCalls += 1;
-      return true;
-    },
-    composerReady() { return true; },
-    async waitForComposerReady() { return true; },
-    async selectModelSettings() { return true; },
+    async waitForComposerReady() { throw new Error('wrong-route fresh worker must fail before waiting on the composer'); },
+    async selectModelSettings() { throw new Error('wrong-route fresh worker must fail before model selection'); },
     taskMarkerPresent() { return false; },
-    insertPrompt() { return true; },
+    insertPrompt() { throw new Error('wrong-route fresh worker must never insert a prompt'); },
     workerEvidence() { return {}; }
   };
   const context = vm.createContext({
@@ -2365,10 +2267,10 @@ test('Project worker preparation refuses a duplicated Anchor without explicit Pr
     },
     location: {
       origin: 'https://chatgpt.com',
-      hash: '#moondesk-launch=project-no-authority-token',
+      hash: '#moondesk-launch=duplicate-anchor-token',
       pathname: `/g/${projectId}-moondesk/c/${anchorConversationId}`,
-      search: '?moondesk-launch=project-no-authority-token',
-      href: `https://chatgpt.com/g/${projectId}-moondesk/c/${anchorConversationId}?moondesk-launch=project-no-authority-token#moondesk-launch=project-no-authority-token`
+      search: '?moondesk-launch=duplicate-anchor-token',
+      href: `https://chatgpt.com/g/${projectId}-moondesk/c/${anchorConversationId}?moondesk-launch=duplicate-anchor-token#moondesk-launch=duplicate-anchor-token`
     },
     history: { state: null, replaceState() {} },
     chrome: { runtime: { onMessage: { addListener(handler) { messageHandler = handler; } } } },
@@ -2384,30 +2286,28 @@ test('Project worker preparation refuses a duplicated Anchor without explicit Pr
   const response = await new Promise((resolve) => {
     const returned = messageHandler({
       type: 'MOONDESK_PREPARE_WORKER',
-      commandId: 'project-no-authority-command',
-      launchToken: 'project-no-authority-token',
+      commandId: 'duplicate-anchor-command',
+      launchToken: 'duplicate-anchor-token',
       placement: {
         projectId,
         anchorConversationUrl: `https://chatgpt.com/g/${projectId}-moondesk/c/${anchorConversationId}`
       },
       launch: {
         workspaceId: 'workspace-a',
-        taskMarker: 'moondesk-worker-task:project-no-authority',
-        openingMessage: 'project-no-authority',
-        threadKey: 'worker:project-no-authority',
+        taskMarker: 'moondesk-worker-task:duplicate-anchor',
+        openingMessage: 'duplicate-anchor',
+        threadKey: 'worker:duplicate-anchor',
         openMode: 'new_thread',
         executionProfile: { modelKey: 'gpt-5.6-sol', modelLabel: 'GPT-5.6 Sol', reasoningEffort: 'high' }
       }
     }, null, resolve);
     assert.equal(returned, true);
   });
-
   assert.equal(response.ok, true);
   assert.deepEqual(JSON.parse(JSON.stringify(response.result)), {
     state: 'failed',
-    reason: 'project_entry_not_authorized'
+    reason: 'normal_chat_entry_unconfirmed'
   });
-  assert.equal(enterProjectCalls, 0, 'an unmarked duplicate Anchor must never enter Project bootstrap');
 });
 
 test('worker preparation aborts when the target route changes during model selection', async () => {
@@ -2671,7 +2571,7 @@ test('worker acceptance binds on the exact new marker user turn without waiting 
   const { evaluate } = loadBackground();
   const acceptanceMatches = evaluate('acceptanceMatches');
   const projectId = 'g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
-  const conversationUrl = `https://chatgpt.com/g/${projectId}-moondesk/c/bbbbbbbb-cccc-4ddd-8eee-ffffffffffff`;
+  const conversationUrl = 'https://chatgpt.com/c/bbbbbbbb-cccc-4ddd-8eee-ffffffffffff';
   const command = {
     id: 'acceptance-command',
     launch: {
@@ -2703,6 +2603,18 @@ test('worker acceptance binds on the exact new marker user turn without waiting 
     acceptanceMatches(command, placement, baseline, posted, conversationUrl, rememberedLaunch),
     true,
     'the newly committed exact marker user row is sufficient Send acceptance proof'
+  );
+  assert.equal(
+    acceptanceMatches(
+      command,
+      placement,
+      baseline,
+      posted,
+      `https://chatgpt.com/g/${projectId}-moondesk/c/bbbbbbbb-cccc-4ddd-8eee-ffffffffffff`,
+      rememberedLaunch
+    ),
+    false,
+    'a fresh worker must never bind to a Project conversation'
   );
 
   assert.equal(
@@ -2738,7 +2650,7 @@ test('worker launch transaction survives ChatGPT navigation and ACKs the confirm
   const leaseId = '66666666-7777-4888-8999-aaaaaaaaaaaa';
   const taskMarker = 'moondesk-worker-task:transaction-test';
   const anchorConversationId = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
-  const conversationUrl = `https://chatgpt.com/g/${projectId}-moondesk/c/bbbbbbbb-cccc-4ddd-8eee-ffffffffffff`;
+  const conversationUrl = 'https://chatgpt.com/c/bbbbbbbb-cccc-4ddd-8eee-ffffffffffff';
   const events = [];
   const ackPayloads = [];
   let launchIdentity = null;
@@ -2802,8 +2714,8 @@ test('worker launch transaction survives ChatGPT navigation and ACKs the confirm
       return {
         ok: true,
         context: {
-          projectId,
-          projectUrl: command.anchorContext.projectUrl,
+          projectId: null,
+          projectUrl: null,
           conversationId: existingTabs[tabId].url.includes('/c/')
             ? 'bbbbbbbb-cccc-4ddd-8eee-ffffffffffff'
             : null,
@@ -2864,7 +2776,7 @@ test('worker launch transaction survives ChatGPT navigation and ACKs the confirm
         evidence: {
           conversationId: 'bbbbbbbb-cccc-4ddd-8eee-ffffffffffff',
           conversationUrl,
-          projectId,
+          projectId: null,
           markerPresent: true,
           generating: true,
           userTurnCount: 1,
@@ -2912,7 +2824,7 @@ test('reconciliation commits a newly observed marker user turn without waiting f
   const projectId = 'g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
   const commandId = '21111111-2222-4333-8444-555555555555';
   const leaseId = '26666666-7777-4888-8999-aaaaaaaaaaaa';
-  const conversationUrl = `https://chatgpt.com/g/${projectId}-moondesk/c/cbbbbbbb-cccc-4ddd-8eee-ffffffffffff`;
+  const conversationUrl = 'https://chatgpt.com/c/cbbbbbbb-cccc-4ddd-8eee-ffffffffffff';
   const threadKey = 'worker:reconcile-marker-only';
   const rememberedLaunch = { commandId, threadKey };
   const ackPayloads = [];
@@ -2953,8 +2865,8 @@ test('reconciliation commits a newly observed marker user turn without waiting f
       return {
         ok: true,
         context: {
-          projectId,
-          projectUrl: command.anchorContext.projectUrl,
+          projectId: null,
+          projectUrl: null,
           conversationId: 'cbbbbbbb-cccc-4ddd-8eee-ffffffffffff',
           sourceUrl: conversationUrl,
           generating: false
@@ -2972,7 +2884,7 @@ test('reconciliation commits a newly observed marker user turn without waiting f
           conversationUrl,
           evidence: {
             conversationId: 'cbbbbbbb-cccc-4ddd-8eee-ffffffffffff',
-            projectId,
+            projectId: null,
             markerPresent: true,
             generating: false,
             userTurnCount: 1,
@@ -3025,7 +2937,7 @@ test('reconciliation commits a newly observed marker user turn without waiting f
   assert.equal(state.threadRecords[threadKey].conversationUrl, conversationUrl);
 });
 
-test('transient Project readiness retries preparation on the same tab before Send', async () => {
+test('transient normal-chat readiness retries preparation on the same tab before Send', async () => {
   let prepareCalls = 0;
   const tabIds = [];
   const { evaluate } = loadBackground({
@@ -3036,7 +2948,7 @@ test('transient Project readiness retries preparation on the same tab before Sen
       if (prepareCalls === 1) {
         return {
           ok: true,
-          result: { state: 'failed', reason: 'project_entry_unconfirmed' }
+          result: { state: 'failed', reason: 'normal_chat_composer_not_ready' }
         };
       }
       return {
@@ -3092,14 +3004,14 @@ test('worker preparation uses the full remaining deadline instead of the old 40 
   );
 });
 
-test('worker preparation reacquires content and retries after a Project navigation closes the message port', async () => {
+test('worker preparation reacquires content and retries after a ChatGPT remount closes the message port', async () => {
   let prepareCalls = 0;
   let contextCalls = 0;
   const { evaluate } = loadBackground({
     sendMessageImpl: async (_tabId, message) => {
       if (message.type === 'MOONDESK_CONTEXT') {
         contextCalls += 1;
-        return { ok: true, context: { projectId: 'g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' } };
+        return { ok: true, context: { projectId: null } };
       }
       assert.equal(message.type, 'MOONDESK_PREPARE_WORKER');
       prepareCalls += 1;
@@ -3124,7 +3036,7 @@ test('worker preparation reacquires content and retries after a Project navigati
   const response = await prepareWorkerWithRetry(42, { type: 'MOONDESK_PREPARE_WORKER' });
   assert.equal(response.result.state, 'ready');
   assert.equal(prepareCalls, 2);
-  assert.ok(contextCalls >= 1, 'the retry must reacquire the post-navigation content script first');
+  assert.ok(contextCalls >= 1, 'the retry must reacquire the remounted content script first');
 });
 test('non-transient preparation failure is not retried', async () => {
   let prepareCalls = 0;
@@ -3263,7 +3175,7 @@ test('companion starts a four-worker launch batch concurrently and isolates fail
   );
 });
 
-test('a hung Project worker does not block three sibling launches from reaching Send', async () => {
+test('a hung fresh worker does not block three sibling normal-chat launches from reaching Send', async () => {
   const projectId = 'g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
   const commands = Array.from({ length: 4 }, (_, index) => {
     const suffix = String(index + 1).padStart(12, '0');
@@ -3295,6 +3207,7 @@ test('a hung Project worker does not block three sibling launches from reaching 
   const commandById = new Map(commands.map((command) => [command.id, command]));
   const indexById = new Map(commands.map((command, index) => [command.id, index]));
   const rememberedByTab = new Map();
+  const launchUrlByTab = new Map();
   const ackPayloads = [];
   const sendStartedCommandIds = [];
   let releaseHungWorker;
@@ -3337,8 +3250,8 @@ test('a hung Project worker does not block three sibling launches from reaching 
       return {
         ok: true,
         context: {
-          projectId,
-          projectUrl: `https://chatgpt.com/g/${projectId}-moondesk/project`,
+          projectId: null,
+          projectUrl: null,
           conversationId,
           sourceUrl: existingTabs[tabId].url,
           generating: Boolean(conversationId)
@@ -3348,6 +3261,7 @@ test('a hung Project worker does not block three sibling launches from reaching 
     }
 
     if (message.type === 'MOONDESK_PREPARE_WORKER') {
+      if (!launchUrlByTab.has(tabId)) launchUrlByTab.set(tabId, existingTabs[tabId].url);
       rememberedByTab.set(tabId, {
         commandId: message.commandId,
         launchToken: message.launchToken,
@@ -3359,7 +3273,7 @@ test('a hung Project worker does not block three sibling launches from reaching 
         await hungWorkerGate;
         return {
           ok: true,
-          result: { state: 'failed', reason: 'project_entry_unconfirmed' }
+          result: { state: 'failed', reason: 'model_or_effort_unconfirmed:picker_unavailable' }
         };
       }
       await new Promise((resolve) => setImmediate(resolve));
@@ -3383,7 +3297,7 @@ test('a hung Project worker does not block three sibling launches from reaching 
     if (message.type === 'MOONDESK_COMMIT_WORKER_SEND') {
       const index = indexById.get(message.commandId);
       const conversationId = `${String(index + 1).padStart(8, '0')}-0000-4000-8000-${String(index + 1).padStart(12, '0')}`;
-      existingTabs[tabId].url = `https://chatgpt.com/g/${projectId}-moondesk/c/${conversationId}`;
+      existingTabs[tabId].url = `https://chatgpt.com/c/${conversationId}`;
       return {
         ok: true,
         result: {
@@ -3407,7 +3321,7 @@ test('a hung Project worker does not block three sibling launches from reaching 
         evidence: {
           conversationId: conversationUrl.split('/c/')[1],
           conversationUrl,
-          projectId,
+          projectId: null,
           markerPresent: true,
           generating: true,
           userTurnCount: 1,
@@ -3419,7 +3333,7 @@ test('a hung Project worker does not block three sibling launches from reaching 
     throw new Error(`unexpected tab message: ${message.type}`);
   };
 
-  const { evaluate } = loadBackground({
+  const { createdTabs, evaluate } = loadBackground({
     fetchImpl,
     sendMessageImpl,
     setTimeoutImpl(fn, delay) {
@@ -3444,6 +3358,14 @@ test('a hung Project worker does not block three sibling launches from reaching 
 
   for (let attempt = 0; attempt < 20 && sendStartedCommandIds.length < 3; attempt += 1) {
     await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert.equal(createdTabs.length, 4);
+  assert.equal(launchUrlByTab.size, 4);
+  for (const launchUrl of launchUrlByTab.values()) {
+    const url = new URL(launchUrl);
+    assert.equal(url.origin + url.pathname, 'https://chatgpt.com/');
+    assert.equal(url.searchParams.get('moondesk-project-entry'), null);
+    assert.equal(url.href.includes('aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'), false);
   }
   assert.deepEqual(
     Array.from(sendStartedCommandIds).sort(),

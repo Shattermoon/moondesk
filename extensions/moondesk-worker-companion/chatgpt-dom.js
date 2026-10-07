@@ -154,29 +154,12 @@
     return null;
   }
 
-  const projectHomeId = (pathname = location.pathname) =>
-    /^\/g\/(g-p-[0-9a-f]{32})(?:-[^/]+)?\/project\/?$/i.exec(pathname)?.[1]?.toLowerCase() || null;
-  const projectHome = () => Boolean(projectHomeId());
-
   function projectHomeUrl() {
     const projectId = projectIdFromPath();
     if (!projectId) return null;
     const match = /^\/g\/([^/]+)/i.exec(location.pathname);
     if (!match) return null;
     return location.origin + '/g/' + match[1] + '/project';
-  }
-
-  function projectLink(projectId) {
-    const matched = [...document.querySelectorAll('a[href]')].filter((link) => {
-      try {
-        if (link.closest(TURN) || !composerCssVisible(link)) return false;
-        const url = new URL(link.href, location.href);
-        return url.origin === location.origin && projectHomeId(url.pathname) === projectId;
-      } catch {
-        return false;
-      }
-    });
-    return matched.length === 1 ? matched[0] : null;
   }
 
   function waitForComposerReady(timeoutMs = 15000, stillCurrent = () => true) {
@@ -206,61 +189,6 @@
         ]
       });
       const timer = setTimeout(() => finish(false), timeoutMs);
-      check();
-    });
-  }
-
-  function currentTurnNodes() {
-    return [...document.querySelectorAll(TURN)].filter((node) =>
-      !onKeptPage(node) && !node.closest('.markdown,[contenteditable]')
-    );
-  }
-
-  async function enterProject(projectId, stillCurrent = () => true) {
-    const sourceConversation = conversationIdFromPath();
-    if (!/^g-p-[0-9a-f]{32}$/.test(projectId || '')) return false;
-    if (projectHomeId() === projectId) {
-      return Boolean(await waitForComposerReady(15000, stillCurrent)) && !conversationIdFromPath();
-    }
-    if (!sourceConversation) return false;
-
-    return new Promise((resolve) => {
-      let clicked = false;
-      let done = false;
-      let timer = null;
-      const finish = (value) => {
-        if (done) return;
-        done = true;
-        observer.disconnect();
-        clearTimeout(timer);
-        resolve(value);
-      };
-      const check = () => {
-        if (done) return;
-        if (!stillCurrent()) return finish(false);
-        if (
-          clicked &&
-          projectHomeId() === projectId &&
-          !conversationIdFromPath() &&
-          composerSubmitReady() &&
-          currentTurnNodes().length === 0
-        ) return finish(true);
-        if (conversationIdFromPath() !== sourceConversation) {
-          if (projectHomeId() !== projectId) finish(false);
-          return;
-        }
-        if (clicked || !composerSubmitReady()) return;
-        const link = projectLink(projectId);
-        if (!link) return;
-        clicked = true;
-        clearTimeout(timer);
-        timer = setTimeout(() => finish(false), 12000);
-        link.click();
-        check();
-      };
-      const observer = new MutationObserver(check);
-      observer.observe(document.documentElement, { childList: true, subtree: true, attributes: true });
-      timer = setTimeout(() => finish(false), 60000);
       check();
     });
   }
@@ -1134,9 +1062,7 @@
     context,
     correlationEvidence: readCorrelationEvidence,
     projectIdFromPath,
-    projectHomeId,
     conversationIdFromPath,
-    enterProject,
     taskMarkerPresent,
     inspectModelSettings,
     selectModelSettings,

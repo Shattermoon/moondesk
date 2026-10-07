@@ -36,10 +36,10 @@ This plan removes those assumptions without weakening the workspace/session isol
    - Anchor and worker identities continue to derive from OpenAI session metadata and the route-resolved workspace.
    - A different conversation cannot become an Anchor or worker by claiming an ID in text.
 
-4. **Projects become optional placement context, never authority.**
-   - If the Anchor is in a ChatGPT Project, a new worker should preferably open in that exact Project ID.
-   - If the Anchor is a normal ChatGPT conversation, a new worker should be a normal ChatGPT conversation.
-   - No Project binding is required for either path.
+4. **Projects are Anchor routing metadata, not fresh-worker placement.**
+   - Every fresh Workers V1 conversation opens as an ordinary ChatGPT chat, even when the Anchor is inside a ChatGPT Project.
+   - Project metadata may identify the exact Anchor during routing, but MoonDesk never clones the Anchor conversation or enters its Project to create a fresh worker.
+   - A durable existing worker is reused by its exact confirmed conversation binding; legacy workers that already live inside a Project remain reusable without making that Project authoritative for new workers.
 
 5. **Multiple paired browsers are allowed, but one exact browser owns each in-flight send.**
    - Chrome, Edge, Brave, etc. may all remain authenticated concurrently.
@@ -270,29 +270,18 @@ and remove `workspace_not_bound` as a prerequisite for worker spawn.
 
 ### Fresh worker placement
 
-Resolved from the exact Anchor presence:
+Resolved independently from Anchor placement:
 
 ```text
-Anchor in Project:
-  placement.kind = project
-  placement.projectId = exact g-p-...
-  placement.projectUrl = canonical observed project entry URL
-
-Anchor in normal chat:
-  placement.kind = normal
+Anchor in Project or normal chat:
+  fresh worker destination = ordinary ChatGPT new chat
 ```
 
-No workspace name/Project name comparison.
+The exact Anchor presence still carries conversation/Project metadata for browser ownership and routing, but fresh worker placement never compares names, clones the Anchor, or enters its Project.
 
 ### Extension behavior
 
-For `new_thread + project`:
-- navigate to the exact stored Project entry;
-- positively verify exact `projectId`;
-- select/read back model + effort;
-- prepare/send once.
-
-For `new_thread + normal`:
+For every `new_thread`:
 - navigate to a fresh normal ChatGPT composer;
 - positively verify there is no existing conversation and no Project context;
 - ensure the correct MoonDesk connector/tool context from Phase 0B;
@@ -300,17 +289,19 @@ For `new_thread + normal`:
 - prepare/send once.
 
 For `existing_thread`:
-- ignore new-thread placement;
+- ignore Anchor placement;
 - open the exact confirmed worker conversation;
-- verify conversation identity before typing.
+- verify conversation identity before typing;
+- allow exact legacy worker conversations that already live inside a Project.
 
 Remove the normal popup's **Bind this Project** workflow.
 
 Tests:
 - Project names/workspace names/connector names all intentionally different;
 - normal Anchor -> normal worker;
-- Project Anchor -> exact same Project ID;
-- two Projects with identical visible names do not cross;
+- Project Anchor -> normal worker;
+- a fresh worker launch URL never contains the Anchor conversation ID or a Project-entry marker;
+- two Projects with identical visible names do not cross-route their Anchors;
 - old manual binding data is ignored/migrated without breaking extension startup.
 
 ## Phase 5 — Preserve connector/tool context for normal workers

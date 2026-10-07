@@ -258,12 +258,11 @@ async function ensureContent(tabId) {
   return sendToTab(tabId, { type: 'MOONDESK_CONTEXT' }, 5000);
 }
 
-function launchHash(token, projectEntry = false) {
-  const marker = `moondesk-launch=${encodeURIComponent(token)}`;
-  return `#${marker}${projectEntry ? '&moondesk-project-entry=1' : ''}`;
+function launchHash(token) {
+  return `#moondesk-launch=${encodeURIComponent(token)}`;
 }
 
-function sourceWithLaunchToken(sourceUrl, token, executionProfile = null, projectEntry = false) {
+function sourceWithLaunchToken(sourceUrl, token, executionProfile = null) {
   const url = new URL(sourceUrl);
   const model = typeof executionProfile?.modelKey === 'string' && /^[a-zA-Z0-9._-]{1,80}$/.test(executionProfile.modelKey)
     ? executionProfile.modelKey
@@ -271,14 +270,12 @@ function sourceWithLaunchToken(sourceUrl, token, executionProfile = null, projec
   const effort = typeof executionProfile?.reasoningEffort === 'string' && CHATGPT_MODEL_EFFORTS.has(executionProfile.reasoningEffort)
     ? executionProfile.reasoningEffort
     : null;
-  // Match the proven ChatGPT bootstrap shape: keep the launch marker in both query and fragment
-  // because the shell has rewritten either one during startup across builds, and seed the exact
-  // provider model/effort before the content bootstrap ever touches the picker.
+  // Keep the launch marker in both query and fragment because the shell has rewritten either one
+  // during startup across builds, and seed the requested model/effort before content preparation.
   url.searchParams.set('moondesk-launch', token);
-  if (projectEntry) url.searchParams.set('moondesk-project-entry', '1');
   if (model) url.searchParams.set('model', model);
   if (effort) url.searchParams.set('reasoning_effort', effort);
-  url.hash = launchHash(token, projectEntry);
+  url.hash = launchHash(token);
   return url.toString();
 }
 
@@ -508,17 +505,10 @@ function placementForOffer(state, offer) {
   return null;
 }
 
-function sourceUrlForCommand(placement, openMode, existingConversation) {
+function sourceUrlForCommand(_placement, openMode, existingConversation) {
   if (openMode === 'existing_thread') return existingConversation;
-  // Project workers use the exact Anchor conversation only as a temporary native Project-entry
-  // source. Open the canonical /c/<id> form rather than cloning the Project-scoped Anchor URL;
-  // ChatGPT can redirect it back into /g/<project>/c/<id>, but the explicit project-entry marker
-  // remains the authority that this duplicate page must enter the Project home and never act as
-  // the worker conversation itself.
-  if (placement?.projectId) {
-    const anchor = chatContextFromUrl(placement.anchorConversationUrl);
-    return anchor?.conversationId ? `https://chatgpt.com/c/${anchor.conversationId}` : null;
-  }
+  // Workers V1 always creates fresh workers from ordinary ChatGPT home. Anchor Project metadata
+  // still identifies/routes the owning Anchor, but it is never used as a worker placement target.
   return 'https://chatgpt.com/';
 }
 
@@ -541,12 +531,8 @@ function projectIdFromChatUrl(value) {
   }
 }
 
-function threadRecordOwnedByContext(thread, workspaceId, projectId) {
-  return Boolean(
-    thread &&
-    thread.workspaceId === workspaceId &&
-    (thread.projectId || null) === (projectId || null)
-  );
+function threadRecordOwnedByWorkspace(thread, workspaceId) {
+  return Boolean(thread && thread.workspaceId === workspaceId);
 }
 
 function rememberedLaunchMatchesRecord(record, rememberedLaunch) {
@@ -586,7 +572,7 @@ async function recoverTab(record) {
   return null;
 }
 
-async function recoverThreadRecord(state, threadKey, workspaceId, placement) {
+async function recoverThreadRecord(state, threadKey, workspaceId) {
   const candidates = Object.values(state.launchRecords || {}).filter((record) =>
     record?.threadKey === threadKey &&
     record?.workspaceId === workspaceId &&
@@ -597,10 +583,10 @@ async function recoverThreadRecord(state, threadKey, workspaceId, placement) {
     const tab = await recoverTab(candidate);
     if (!tab) continue;
     const conversationUrl = canonicalConversationUrl(tab.url);
-    if (!conversationUrl || projectIdFromChatUrl(conversationUrl) !== (placement?.projectId || null)) continue;
+    if (!conversationUrl) continue;
     const next = {
       workspaceId,
-      projectId: placement?.projectId || null,
+      projectId: projectIdFromChatUrl(conversationUrl),
       conversationUrl,
       tabId: tab.id ?? null,
       updatedAt: Date.now()
@@ -621,30 +607,21 @@ async function recordForCommand(state, command, placement, reconcileRequired = f
   let thread = state.threadRecords?.[threadKey] || null;
   if (
     openMode === 'existing_thread' &&
-    !threadRecordOwnedByContext(thread, command.launch.workspaceId, placement?.projectId || null)
+    !threadRecordOwnedByWorkspace(thread, command.launch.workspaceId)
   ) {
-    thread = await recoverThreadRecord(
-      state,
-      threadKey,
-      command.launch.workspaceId,
-      placement
-    );
+    thread = await recoverThreadRecord(state, threadKey, command.launch.workspaceId);
   }
   let record = state.launchRecords[command.id];
   if (!record && reconcileRequired) {
     throw new Error('Reconciliation has no durable browser launch record and cannot create a fresh worker thread');
   }
   if (!record) {
-    const threadOwnedByContext = threadRecordOwnedByContext(
-      thread,
-      command.launch.workspaceId,
-      placement?.projectId || null
-    );
-    const existingConversation = openMode === 'existing_thread' && threadOwnedByContext
+    const threadOwnedByWorkspace = threadRecordOwnedByWorkspace(thread, command.launch.workspaceId);
+    const existingConversation = openMode === 'existing_thread' && threadOwnedByWorkspace
       ? canonicalChatUrl(thread.conversationUrl)
       : null;
     if (openMode === 'existing_thread' && !existingConversation) {
-      throw new Error('Existing worker thread has no confirmed ChatGPT conversation binding for this workspace and placement context');
+      throw new Error('Existing worker thread has no confirmed ChatGPT conversation binding for this workspace and thread identity');
     }
     const sourceUrl = sourceUrlForCommand(placement, openMode, existingConversation);
     if (!sourceUrl) {
@@ -672,9 +649,8 @@ async function recordForCommand(state, command, placement, reconcileRequired = f
       throw new Error('Reconciliation has no confirmed worker conversation URL and cannot create a fresh worker thread');
     }
     const targetUrl = record.conversationUrl || record.sourceUrl;
-    const projectEntry = command.launch.openMode !== 'existing_thread' && Boolean(placement?.projectId);
     tab = await chrome.tabs.create({
-      url: sourceWithLaunchToken(targetUrl, record.launchToken, command.launch.executionProfile, projectEntry),
+      url: sourceWithLaunchToken(targetUrl, record.launchToken, command.launch.executionProfile),
       active: false
     });
     record.tabId = tab.id ?? null;
@@ -726,7 +702,7 @@ function acceptanceMatches(command, placement, baseline, evidence, conversationU
     threadKey: command.launch.threadKey || null
   }, rememberedLaunch)) return false;
   const conversationProjectId = projectIdFromChatUrl(conversationUrl);
-  if ((conversationProjectId || null) !== (placement?.projectId || null)) return false;
+  if (command.launch.openMode !== 'existing_thread' && conversationProjectId !== null) return false;
   if (
     command.launch.openMode === 'existing_thread' &&
     baseline?.conversationId &&
@@ -819,8 +795,6 @@ async function reconcileOrBlock(state, command, record, workspaceId, reason) {
 }
 
 const TRANSIENT_PREPARE_FAILURES = new Set([
-  'project_entry_unconfirmed',
-  'project_composer_not_ready',
   'worker_conversation_not_ready',
   'normal_chat_composer_not_ready',
   'composer_after_model_not_ready'
@@ -835,9 +809,9 @@ async function prepareWorkerWithRetry(tabId, payload, deadlineMs = Date.now() + 
     const remainingMs = deadlineMs - Date.now();
     if (remainingMs <= 0) throw new Error('worker_prepare_timeout');
     try {
-      // One overall preparation deadline owns the whole bootstrap. Project source hydration is
-      // allowed to consume most of that window, so never nest the old 40 s transport cutoff
-      // inside the 60 s Project readiness budget.
+      // One overall preparation deadline owns the whole bootstrap. Do not nest a shorter
+      // transport cutoff inside it; slow ChatGPT shell/model readiness must remain independently
+      // bounded per worker rather than escaping as an ambiguous preparing state.
       response = await sendToTab(tabId, payload, remainingMs);
       lastTransportError = null;
     } catch (error) {
@@ -845,9 +819,9 @@ async function prepareWorkerWithRetry(tabId, payload, deadlineMs = Date.now() + 
       if (attempt === MAX_PREPARE_ATTEMPTS) throw error;
       const afterFailureMs = deadlineMs - Date.now();
       if (afterFailureMs <= 0) throw new Error('worker_prepare_timeout');
-      // A native Project transition can replace the document/message port. Preparation has not
-      // crossed Send, so it is safe to reacquire the content script and re-run the idempotent
-      // prepare step on the same tab under the same durable launch identity.
+      // ChatGPT can replace the document/message port during shell/model transitions. Preparation
+      // has not crossed Send, so it is safe to reacquire the content script and re-run the
+      // idempotent prepare step on the same tab under the same durable launch identity.
       try {
         await waitForContent(tabId, Math.min(10000, afterFailureMs));
       } catch {}
@@ -902,12 +876,6 @@ async function processCommand(state, offer) {
     else await failBeforeSend('anchor_context_unconfirmed');
     return;
   }
-  if (placement.projectId && !placement.projectUrl && command.launch.openMode !== 'existing_thread') {
-    if (offer.reconcileRequired) await pauseAfterSend('anchor_project_url_unconfirmed');
-    else await failBeforeSend('anchor_project_url_unconfirmed');
-    return;
-  }
-
   let recordAndTab;
   try {
     recordAndTab = await recordForCommand(state, command, placement, offer.reconcileRequired === true);
@@ -972,7 +940,7 @@ async function processCommand(state, offer) {
         if (record.threadKey) {
           state.threadRecords[record.threadKey] = {
             workspaceId,
-            projectId: placement.projectId || null,
+            projectId: projectIdFromChatUrl(confirmedConversation),
             conversationUrl: confirmedConversation,
             tabId: tab.id,
             updatedAt: Date.now()
@@ -1096,7 +1064,7 @@ async function processCommand(state, offer) {
   if (record.threadKey) {
     state.threadRecords[record.threadKey] = {
       workspaceId,
-      projectId: placement.projectId || null,
+      projectId: projectIdFromChatUrl(accepted.conversationUrl),
       conversationUrl: accepted.conversationUrl,
       tabId: record.tabId,
       updatedAt: Date.now()

@@ -208,7 +208,10 @@ pub struct CompanionCorrelationUpdate {
     pub project_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_url: Option<String>,
+    #[serde(default)]
     pub request_ids: Vec<String>,
+    #[serde(default)]
+    pub operation_ids: Vec<String>,
 }
 
 impl CompanionCorrelationUpdate {
@@ -223,11 +226,10 @@ impl CompanionCorrelationUpdate {
             generating: false,
         };
         tab.validate()?;
-        if self.request_ids.is_empty()
-            || self.request_ids.len() > MAX_COMPANION_CORRELATION_REQUEST_IDS
-        {
+        let correlation_count = self.request_ids.len() + self.operation_ids.len();
+        if correlation_count == 0 || correlation_count > MAX_COMPANION_CORRELATION_REQUEST_IDS {
             return Err(format!(
-                "companion correlation must contain 1..={MAX_COMPANION_CORRELATION_REQUEST_IDS} request ids"
+                "companion correlation must contain 1..={MAX_COMPANION_CORRELATION_REQUEST_IDS} exact ids"
             ));
         }
         let mut seen = BTreeSet::new();
@@ -238,7 +240,17 @@ impl CompanionCorrelationUpdate {
                 return Err("companion correlation request id must already be normalized".into());
             }
             if !seen.insert(request_id) {
-                return Err("companion correlation contains duplicate request ids".into());
+                return Err("companion correlation contains duplicate exact ids".into());
+            }
+        }
+        for operation_id in &self.operation_ids {
+            let parsed = Uuid::parse_str(operation_id)
+                .map_err(|_| "companion correlation operation id is invalid".to_string())?;
+            if parsed.hyphenated().to_string() != operation_id.as_str() {
+                return Err("companion correlation operation id must already be normalized".into());
+            }
+            if !seen.insert(operation_id) {
+                return Err("companion correlation contains duplicate exact ids".into());
             }
         }
         Ok(())
@@ -664,13 +676,14 @@ impl CompanionAuth {
         }
 
         let route = update.route(client_id);
+        let exact_ids = update.request_ids.into_iter().chain(update.operation_ids);
         let mut guard = self.correlations.lock().await;
         let mut stored = 0usize;
-        for request_id in update.request_ids {
-            if let Some((existing, observed_at)) = guard.get_mut(&request_id) {
+        for exact_id in exact_ids {
+            if let Some((existing, observed_at)) = guard.get_mut(&exact_id) {
                 if existing.tab.conversation_id != route.tab.conversation_id {
                     return Err(
-                        "companion request id was already proved by a different ChatGPT conversation"
+                        "companion exact correlation id was already proved by a different ChatGPT conversation"
                             .into(),
                     );
                 }
@@ -687,36 +700,58 @@ impl CompanionAuth {
                 && let Some(oldest) = guard
                     .iter()
                     .min_by_key(|(_, (_, observed_at))| *observed_at)
-                    .map(|(request_id, _)| request_id.clone())
+                    .map(|(correlation_id, _)| correlation_id.clone())
             {
                 guard.remove(&oldest);
             }
-            guard.insert(request_id, (route.clone(), now_ms));
+            guard.insert(exact_id, (route.clone(), now_ms));
             stored += 1;
         }
         Ok(stored)
     }
 
-    pub async fn correlation_for(&self, request_id: &str) -> Option<CompanionAnchorRoute> {
-        let normalized = normalize_request_id(request_id)?;
-        self.correlations
-            .lock()
-            .await
-            .get(normalized)
-            .map(|(route, _)| route.clone())
+    pub async fn correlation_for_any(
+        &self,
+        correlation_ids: &[&str],
+    ) -> Result<Option<CompanionAnchorRoute>, String> {
+        let mut normalized = Vec::with_capacity(correlation_ids.len());
+        for correlation_id in correlation_ids {
+            let key = normalize_request_id(correlation_id)
+                .ok_or_else(|| "exact companion correlation id is invalid".to_string())?;
+            if !normalized.contains(&key) {
+                normalized.push(key);
+            }
+        }
+
+        let guard = self.correlations.lock().await;
+        let mut route: Option<CompanionAnchorRoute> = None;
+        for key in normalized {
+            let Some((candidate, _)) = guard.get(key) else {
+                continue;
+            };
+            if let Some(existing) = route.as_ref()
+                && existing != candidate
+            {
+                return Err(
+                    "exact companion correlation ids resolved to different ChatGPT routes".into(),
+                );
+            }
+            route = Some(candidate.clone());
+        }
+        Ok(route)
     }
 
-    pub async fn wait_for_correlation(
+    pub async fn wait_for_any_correlation(
         &self,
-        request_id: &str,
+        correlation_ids: &[&str],
         timeout: std::time::Duration,
     ) -> Result<Option<CompanionAnchorRoute>, String> {
-        let normalized = normalize_request_id(request_id)
-            .ok_or_else(|| "OpenAI request id is invalid".to_string())?
-            .to_string();
+        if correlation_ids.is_empty() {
+            return Ok(None);
+        }
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
-            if let Some(route) = self.correlation_for(&normalized).await {
+            if let Some(route) = self.correlation_for_any(correlation_ids).await? {
                 return Ok(Some(route));
             }
             if tokio::time::Instant::now() >= deadline {
@@ -1323,6 +1358,7 @@ mod tests {
                     project_id: None,
                     project_url: None,
                     request_ids: vec![request_id.into()],
+                    operation_ids: Vec::new(),
                 },
                 100,
             )
@@ -1330,8 +1366,9 @@ mod tests {
             .expect("store exact correlation");
         assert_eq!(stored, 1);
         let route = auth
-            .correlation_for(request_id)
+            .correlation_for_any(&[request_id])
             .await
+            .expect("lookup exact correlation")
             .expect("exact correlation");
         assert_eq!(route.client_id, "edge-install");
         assert_eq!(route.tab.conversation_id, edge_conversation);
@@ -1346,6 +1383,7 @@ mod tests {
                     project_id: None,
                     project_url: None,
                     request_ids: vec![request_id.into()],
+                    operation_ids: Vec::new(),
                 },
                 200,
             )
@@ -1353,8 +1391,9 @@ mod tests {
             .expect_err("different conversation cannot steal request id");
         assert!(conflict.contains("different ChatGPT conversation"));
         assert_eq!(
-            auth.correlation_for(request_id)
+            auth.correlation_for_any(&[request_id])
                 .await
+                .expect("lookup retained owner")
                 .expect("first owner retained")
                 .client_id,
             "edge-install"
@@ -1363,6 +1402,59 @@ mod tests {
         let persisted = fs::read_to_string(&path).expect("read auth state");
         assert!(!persisted.contains(request_id));
         assert!(!persisted.contains(edge_conversation));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn mixed_exact_correlation_keys_fail_closed_when_routes_disagree() {
+        let root = temp_root("moondesk-companion-mixed-correlation");
+        let path = root.join(COMPANION_AUTH_FILE_NAME);
+        let auth = CompanionAuth::open(&path).expect("open companion auth");
+        auth.auto_pair("chrome-install", &"a".repeat(64), Some(ORIGIN_A))
+            .await
+            .expect("pair chrome");
+        auth.auto_pair("edge-install", &"b".repeat(64), Some(ORIGIN_B))
+            .await
+            .expect("pair edge");
+
+        let request_id = "wfr_mixed_exact_request";
+        let operation_id = Uuid::new_v4().to_string();
+        let chrome_conversation = "6aad7eb1-4b10-83ee-97bd-d98b338864de";
+        let edge_conversation = "7bbd8fc2-5c21-94ff-a8ce-e09c449975ef";
+        auth.observe_correlations(
+            "chrome-install",
+            CompanionCorrelationUpdate {
+                conversation_id: chrome_conversation.into(),
+                conversation_url: format!("https://chatgpt.com/c/{chrome_conversation}"),
+                project_id: None,
+                project_url: None,
+                request_ids: vec![request_id.into()],
+                operation_ids: Vec::new(),
+            },
+            100,
+        )
+        .await
+        .expect("store request correlation");
+        auth.observe_correlations(
+            "edge-install",
+            CompanionCorrelationUpdate {
+                conversation_id: edge_conversation.into(),
+                conversation_url: format!("https://chatgpt.com/c/{edge_conversation}"),
+                project_id: None,
+                project_url: None,
+                request_ids: Vec::new(),
+                operation_ids: vec![operation_id.clone()],
+            },
+            200,
+        )
+        .await
+        .expect("store operation correlation");
+
+        let error = auth
+            .correlation_for_any(&[request_id, operation_id.as_str()])
+            .await
+            .expect_err("conflicting exact keys must fail closed");
+        assert!(error.contains("different ChatGPT routes"));
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1391,6 +1483,7 @@ mod tests {
                         project_id: None,
                         project_url: None,
                         request_ids: vec![request_id_owned],
+                        operation_ids: Vec::new(),
                     },
                     unix_time_ms(),
                 )
@@ -1399,7 +1492,7 @@ mod tests {
         });
 
         let route = auth
-            .wait_for_correlation(request_id, std::time::Duration::from_secs(1))
+            .wait_for_any_correlation(&[request_id], std::time::Duration::from_secs(1))
             .await
             .expect("wait for exact evidence")
             .expect("late evidence route");

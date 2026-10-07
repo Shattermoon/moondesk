@@ -266,6 +266,52 @@ test('provider correlation captures exact request identity from live conversatio
   assert.deepEqual(Array.from(replay.correlations[0].requestIds), ['wfr_live_request']);
 });
 
+test('provider correlation captures exact worker operation id when the MCP header is unavailable', async () => {
+  const conversationId = '6fc52738-64a0-83ee-bff8-59ffcc9f8c96';
+  const operationId = '11111111-2222-4333-8444-555555555555';
+  const posted = [];
+  const payload = {
+    conversation_id: conversationId,
+    message: {
+      content: {
+        parts: [JSON.stringify({ operation_id: operationId, task: 'not retained' })]
+      }
+    }
+  };
+  const response = eventStreamResponse(`data: ${JSON.stringify(payload)}\n\n`);
+  const pageWindow = {
+    fetch: async () => response,
+    addEventListener() {},
+    postMessage(message) { posted.push(message); }
+  };
+  const context = vm.createContext({
+    window: pageWindow,
+    location: {
+      origin: 'https://chatgpt.com',
+      href: `https://chatgpt.com/c/${conversationId}`,
+      pathname: `/c/${conversationId}`
+    },
+    URL,
+    TextDecoder,
+    Uint8Array,
+    Date,
+    console
+  });
+
+  vm.runInContext(providerCorrelationMainSource, context, { filename: providerCorrelationMainPath });
+  await pageWindow.fetch('https://chatgpt.com/backend-api/f/conversation');
+  await flushMicrotasks();
+
+  const observed = posted.find((message) =>
+    message.source === 'moondesk-provider-correlation-observed' &&
+    Array.isArray(message.correlation.operationIds)
+  );
+  assert.ok(observed, 'worker operation id must be projected as exact conversation evidence');
+  assert.equal(observed.correlation.conversationId, conversationId);
+  assert.deepEqual(Array.from(observed.correlation.operationIds), [operationId]);
+  assert.equal(observed.correlation.requestIds, undefined);
+});
+
 test('provider correlation reattaches after ChatGPT replaces fetch during page startup', async () => {
   const conversationId = '6bc52738-64a0-83ee-bff8-59ffcc9f8c92';
   const posted = [];
@@ -741,6 +787,28 @@ test('background accepts provider correlation only from the exact sending ChatGP
     projectId: 'g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
     projectUrl: 'https://chatgpt.com/g/g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-moondesk/project',
     requestIds: ['wfr_provider_exact']
+  });
+
+  const operationId = '22222222-3333-4444-8555-666666666666';
+  const operationResponse = await dispatchRuntimeMessage({
+    type: 'MOONDESK_PROVIDER_CORRELATION',
+    correlation: { conversationId, operationIds: [operationId] }
+  }, {
+    tab: {
+      id: 42,
+      url: `https://chatgpt.com/g/g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-moondesk/c/${conversationId}`
+    }
+  });
+  assert.equal(operationResponse.ok, true);
+  const operationPost = requests
+    .filter((request) => request.url.endsWith('/__moondesk/companion/v1/correlations'))
+    .at(-1);
+  assert.deepEqual(JSON.parse(operationPost.options.body), {
+    conversationId,
+    conversationUrl: `https://chatgpt.com/g/g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-moondesk/c/${conversationId}`,
+    projectId: 'g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+    projectUrl: 'https://chatgpt.com/g/g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-moondesk/project',
+    operationIds: [operationId]
   });
 
   const rejected = await dispatchRuntimeMessage({

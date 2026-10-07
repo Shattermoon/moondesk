@@ -17,11 +17,21 @@
     const conversationId = typeof value.conversationId === 'string'
       ? value.conversationId.trim().toLowerCase()
       : '';
-    if (!/^[0-9a-f-]{16,64}$/i.test(conversationId) || !Array.isArray(value.requestIds)) return null;
-    const requestIds = [...new Set(value.requestIds.filter(
+    if (!/^[0-9a-f-]{16,64}$/i.test(conversationId)) return null;
+    const requestIds = [...new Set((Array.isArray(value.requestIds) ? value.requestIds : []).filter(
       (requestId) => typeof requestId === 'string' && /^[a-z0-9_-]{1,100}$/i.test(requestId)
     ))].slice(0, 16);
-    return requestIds.length ? { conversationId, requestIds } : null;
+    const operationIds = [...new Set((Array.isArray(value.operationIds) ? value.operationIds : []).filter(
+      (operationId) => typeof operationId === 'string' &&
+        /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(operationId)
+    ).map((operationId) => operationId.toLowerCase()))].slice(0, 8);
+    return requestIds.length || operationIds.length
+      ? {
+          conversationId,
+          ...(requestIds.length ? { requestIds } : {}),
+          ...(operationIds.length ? { operationIds } : {})
+        }
+      : null;
   }
 
   async function publishProviderCorrelation(correlation) {

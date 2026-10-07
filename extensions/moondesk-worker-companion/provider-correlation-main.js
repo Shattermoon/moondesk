@@ -1,11 +1,12 @@
 (() => {
-  const OBSERVER_VERSION = 2;
+  const OBSERVER_VERSION = 3;
   const prior = window.__MOONDESK_PROVIDER_CORRELATION_MAIN__;
   if (
     prior?.version === OBSERVER_VERSION &&
     typeof prior.refresh === 'function' &&
     prior.refresh() === true
   ) return;
+  try { prior?.dispose?.(); } catch {}
 
   let active = true;
   const OBSERVED = 'moondesk-provider-correlation-observed';
@@ -16,6 +17,7 @@
   const MAX_WEBSOCKET_BYTES = 2 * 1024 * 1024;
   const MAX_BUFFERED_PROOFS = 32;
   const MAX_REQUEST_IDS = 16;
+  const MAX_OPERATION_IDS = 8;
   const MAX_SCAN_NODES = 1024;
   const MAX_SCAN_DEPTH = 10;
   const PROOF_TTL_MS = 2 * 60 * 1000;
@@ -39,6 +41,12 @@
     return /^[a-z0-9_-]{1,100}$/i.test(id) ? id : null;
   }
 
+  function normalizedOperationId(value) {
+    if (typeof value !== 'string') return null;
+    const id = value.trim().toLowerCase();
+    return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id) ? id : null;
+  }
+
   function normalizedConversationId(value) {
     if (typeof value !== 'string') return null;
     const id = value.trim().toLowerCase();
@@ -59,8 +67,12 @@
 
   function forgetProof(proof) {
     if (!proof) return;
-    for (const requestId of proof.requestIds) {
-      const key = `${proof.conversationId}\u0000${requestId}`;
+    for (const requestId of proof.requestIds || []) {
+      const key = `request\u0000${proof.conversationId}\u0000${requestId}`;
+      if (proofKeys.get(key) === proof.observedAt) proofKeys.delete(key);
+    }
+    for (const operationId of proof.operationIds || []) {
+      const key = `operation\u0000${proof.conversationId}\u0000${operationId}`;
       if (proofKeys.get(key) === proof.observedAt) proofKeys.delete(key);
     }
   }
@@ -124,28 +136,59 @@
     return { conversationId, messageIds: messageIds.slice(0, 16) };
   }
 
-  function emitProof(conversationId, requestIds) {
+  // Worker spawn arguments can be present in ChatGPT's provider/page model before an MCP
+  // transport header reaches MoonDesk. Project only our opaque idempotency UUID; never copy or
+  // parse any other tool argument, prompt text, or result across the MAIN-world boundary.
+  function collectOperationIdsFromText(value, operationIds) {
+    if (
+      typeof value !== 'string' || value.length > MAX_EVENT_BYTES ||
+      (!value.includes('operation_id') && !value.includes('operationId'))
+    ) return;
+    const pattern = /["']?(?:operation_id|operationId)["']?\s*[:=]\s*["']([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})["']/ig;
+    for (let match; operationIds.size < MAX_OPERATION_IDS && (match = pattern.exec(value));) {
+      const operationId = normalizedOperationId(match[1]);
+      if (operationId) operationIds.add(operationId);
+    }
+  }
+
+  function emitProof(conversationId, requestIds = [], operationIds = []) {
     const conversation = normalizedConversationId(conversationId);
-    if (!conversation || !Array.isArray(requestIds)) return;
-    const ids = [...new Set(requestIds.map(normalizedRequestId).filter(Boolean))].slice(0, MAX_REQUEST_IDS);
-    if (!ids.length) return;
+    if (!conversation) return;
+    const requests = [...new Set(requestIds.map(normalizedRequestId).filter(Boolean))].slice(0, MAX_REQUEST_IDS);
+    const operations = [...new Set(operationIds.map(normalizedOperationId).filter(Boolean))].slice(0, MAX_OPERATION_IDS);
+    if (!requests.length && !operations.length) return;
     const now = Date.now();
     prune(now);
-    const fresh = ids.filter((requestId) => !proofKeys.has(`${conversation}\u0000${requestId}`));
-    if (!fresh.length) return;
-    const proof = { conversationId: conversation, requestIds: fresh, observedAt: now };
+    const freshRequests = requests.filter((requestId) =>
+      !proofKeys.has(`request\u0000${conversation}\u0000${requestId}`));
+    const freshOperations = operations.filter((operationId) =>
+      !proofKeys.has(`operation\u0000${conversation}\u0000${operationId}`));
+    if (!freshRequests.length && !freshOperations.length) return;
+    const proof = {
+      conversationId: conversation,
+      requestIds: freshRequests,
+      operationIds: freshOperations,
+      observedAt: now
+    };
     proofs.push(proof);
     while (proofs.length > MAX_BUFFERED_PROOFS) forgetProof(proofs.shift());
-    for (const requestId of fresh) proofKeys.set(`${conversation}\u0000${requestId}`, now);
+    for (const requestId of freshRequests) {
+      proofKeys.set(`request\u0000${conversation}\u0000${requestId}`, now);
+    }
+    for (const operationId of freshOperations) {
+      proofKeys.set(`operation\u0000${conversation}\u0000${operationId}`, now);
+    }
     window.postMessage({ source: OBSERVED, v: 1, correlation: {
       conversationId: conversation,
-      requestIds: fresh
+      ...(freshRequests.length ? { requestIds: freshRequests } : {}),
+      ...(freshOperations.length ? { operationIds: freshOperations } : {})
     } }, location.origin);
   }
 
   function collectIdentifiers(value) {
     const conversationIds = new Set();
     const requestIds = new Set();
+    const operationIds = new Set();
     const topicIds = new Set();
     const messageIds = new Set();
     const encodedItems = [];
@@ -158,6 +201,10 @@
       const depth = item.depth;
       scanned += 1;
       if (!current || depth > MAX_SCAN_DEPTH) continue;
+      if (typeof current === 'string') {
+        collectOperationIdsFromText(current, operationIds);
+        continue;
+      }
       if (Array.isArray(current)) {
         for (let index = current.length - 1; index >= 0; index -= 1) {
           stack.push({ value: current[index], depth: depth + 1 });
@@ -167,12 +214,16 @@
       if (typeof current !== 'object') continue;
 
       for (const [key, child] of Object.entries(current)) {
+        if (typeof child === 'string') collectOperationIdsFromText(child, operationIds);
         if (key === 'conversation_id' || key === 'conversationId') {
           const conversation = normalizedConversationId(child);
           if (conversation) conversationIds.add(conversation);
         } else if (key === 'request_id' || key === 'requestId') {
           const requestId = normalizedRequestId(child);
           if (requestId) requestIds.add(requestId);
+        } else if (key === 'operation_id' || key === 'operationId') {
+          const operationId = normalizedOperationId(child);
+          if (operationId) operationIds.add(operationId);
         } else if (key === 'topic_id' || key === 'topicId' || key === 'topic') {
           const topic = normalizedTopicId(child);
           if (topic) topicIds.add(topic);
@@ -190,7 +241,7 @@
         if (child && typeof child === 'object') stack.push({ value: child, depth: depth + 1 });
       }
     }
-    return { conversationIds, requestIds, topicIds, messageIds, encodedItems };
+    return { conversationIds, requestIds, operationIds, topicIds, messageIds, encodedItems };
   }
 
   function parseJson(value) {
@@ -217,7 +268,13 @@
     if (conversationId) {
       for (const topic of identifiers.topicIds) rememberTopic(topic, conversationId);
       for (const messageId of identifiers.messageIds) rememberMessage(messageId, conversationId);
-      if (identifiers.requestIds.size) emitProof(conversationId, [...identifiers.requestIds]);
+      if (identifiers.requestIds.size || identifiers.operationIds.size) {
+        emitProof(
+          conversationId,
+          [...identifiers.requestIds],
+          [...identifiers.operationIds]
+        );
+      }
     }
 
     for (const encoded of identifiers.encodedItems) {
@@ -389,7 +446,8 @@
       v: 1,
       correlations: proofs.map((proof) => ({
         conversationId: proof.conversationId,
-        requestIds: [...proof.requestIds]
+        ...((proof.requestIds || []).length ? { requestIds: [...proof.requestIds] } : {}),
+        ...((proof.operationIds || []).length ? { operationIds: [...proof.operationIds] } : {})
       }))
     }, location.origin);
   });

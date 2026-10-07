@@ -1105,9 +1105,18 @@ async fn handle_tools_call_for_workspace(
             match companion_auth.as_ref() {
                 Some(auth) => {
                     let request_id = inbound_request_id.as_deref();
-                    let mut route = match request_id {
-                        Some(request_id) => auth.correlation_for(request_id).await,
-                        None => None,
+                    let operation_id = arguments
+                        .get("operation_id")
+                        .and_then(Value::as_str)
+                        .and_then(|value| uuid::Uuid::parse_str(value).ok())
+                        .map(|value| value.hyphenated().to_string());
+                    let correlation_ids = request_id
+                        .into_iter()
+                        .chain(operation_id.as_deref())
+                        .collect::<Vec<_>>();
+                    let mut route = match auth.correlation_for_any(&correlation_ids).await {
+                        Ok(route) => route,
+                        Err(error) => return tool_error_response_text_only(req, error),
                     };
 
                     if route.is_none() {
@@ -1117,15 +1126,15 @@ async fn handle_tools_call_for_workspace(
                     }
 
                     if route.is_none() {
-                        let Some(request_id) = request_id else {
+                        if correlation_ids.is_empty() {
                             return tool_error_response_text_only(
                                 req,
-                                "workers spawn could not identify the originating ChatGPT Anchor because the MCP request did not include a usable OpenAI x-request-id and no remembered Anchor affinity was available".into(),
+                                "workers spawn could not identify the originating ChatGPT Anchor because neither a usable OpenAI x-request-id nor a valid spawn operation_id was available, and no remembered Anchor affinity existed".into(),
                             );
-                        };
+                        }
                         route = match auth
-                            .wait_for_correlation(
-                                request_id,
+                            .wait_for_any_correlation(
+                                &correlation_ids,
                                 std::time::Duration::from_millis(5_000),
                             )
                             .await
@@ -1138,7 +1147,7 @@ async fn handle_tools_call_for_workspace(
                     let Some(route) = route else {
                         return tool_error_response_text_only(
                             req,
-                            "workers spawn could not identify the originating ChatGPT Anchor; no exact provider-stream request correlation or remembered Anchor affinity was available".into(),
+                            "workers spawn could not identify the originating ChatGPT Anchor; no exact provider-stream request/operation correlation or remembered Anchor affinity was available".into(),
                         );
                     };
                     if let Err(error) = auth
@@ -4280,6 +4289,7 @@ mod tests {
                         project_id: None,
                         project_url: None,
                         request_ids: vec![delayed_request_id],
+                        operation_ids: Vec::new(),
                     },
                     crate::companion::unix_time_ms(),
                 )
@@ -4352,6 +4362,116 @@ mod tests {
         assert_ne!(
             command.launch.anchor_session_digest.as_deref(),
             Some(ChatIdentity::session_digest_for(anchor_conversation).as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn workers_mcp_spawn_uses_exact_operation_correlation_without_request_header() {
+        let root = TestTempDir::new("moondesk-workers-mcp-operation-correlation");
+        let workspace_root = root.path().join("workspace");
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        let workspace_id = WorkspaceId::new();
+        let broker = Arc::new(
+            WorkerBroker::open(root.path().join("worker-state-v1.json"))
+                .expect("open worker broker"),
+        );
+        let managed_chat_broker = Arc::new(
+            ManagedChatBroker::open(root.path().join("managed-chat-state-v1.json"))
+                .expect("open managed chat broker"),
+        );
+        let companion_auth = Arc::new(
+            CompanionAuth::open(root.path().join("companion-auth-v1.json"))
+                .expect("open companion auth"),
+        );
+        companion_auth
+            .auto_pair(
+                "chrome-install",
+                &"a".repeat(64),
+                Some("chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            )
+            .await
+            .expect("pair chrome");
+
+        let operation_id = Uuid::new_v4().to_string();
+        let anchor_conversation = "5aad7eb1-4b10-83ee-97bd-d98b338864de";
+        let delayed_auth = companion_auth.clone();
+        let delayed_operation_id = operation_id.clone();
+        let delayed_conversation = anchor_conversation.to_string();
+        let correlation_task = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+            delayed_auth
+                .observe_correlations(
+                    "chrome-install",
+                    crate::companion::CompanionCorrelationUpdate {
+                        conversation_id: delayed_conversation.clone(),
+                        conversation_url: format!("https://chatgpt.com/c/{delayed_conversation}"),
+                        project_id: None,
+                        project_url: None,
+                        request_ids: Vec::new(),
+                        operation_ids: vec![delayed_operation_id],
+                    },
+                    crate::companion::unix_time_ms(),
+                )
+                .await
+                .expect("publish delayed operation correlation");
+        });
+
+        let request = tool_call_request_with_session(
+            "workers",
+            json!({
+                "action": "spawn",
+                "operation_id": operation_id,
+                "label": "operation correlation proof",
+                "task": "Inspect without editing."
+            }),
+            "opaque-openai-session-operation-correlation",
+        );
+        let command_jobs = CommandJobManager::new();
+        let browser_runtime = None;
+        let response = handle_tools_call_for_workspace(
+            &request,
+            McpRequestContext {
+                workspace_id: &workspace_id,
+                workspace_name: "MoonDesk Operation Correlation",
+                workspace_root: &workspace_root.to_string_lossy(),
+                mode: Mode::Both,
+                tool_mode: ToolMode::MultiTools,
+                set_moondesk_as_co_author: false,
+                handoff_store_root: None,
+                command_jobs: &command_jobs,
+                browser_runtime: &browser_runtime,
+                worker_execution_profile: ChatExecutionProfile::default(),
+                worker_target_count: crate::workers::RECOMMENDED_WORKERS_PER_FAMILY,
+                worker_broker: broker,
+                managed_chat_broker: managed_chat_broker.clone(),
+                companion_auth: Some(companion_auth),
+                inbound_request_id: None,
+            },
+        )
+        .await;
+        correlation_task.await.expect("operation correlation task");
+        assert_ne!(
+            response
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+
+        let snapshot = managed_chat_broker.snapshot().await;
+        let command = snapshot
+            .commands
+            .values()
+            .next()
+            .expect("managed worker launch");
+        assert_eq!(command.target_client_id.as_deref(), Some("chrome-install"));
+        assert_eq!(
+            command
+                .anchor_context
+                .as_ref()
+                .map(|context| context.conversation_id.as_str()),
+            Some(anchor_conversation)
         );
     }
 
@@ -4492,7 +4612,10 @@ mod tests {
                 .and_then(Value::as_bool),
             Some(true)
         );
-        assert!(result_text(&response).contains("no exact provider-stream request correlation"));
+        assert!(
+            result_text(&response)
+                .contains("no exact provider-stream request/operation correlation")
+        );
         assert!(managed_chat_broker.snapshot().await.commands.is_empty());
         assert!(broker.snapshot().await.families.is_empty());
     }

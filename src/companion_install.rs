@@ -50,7 +50,12 @@ const RUNTIME_FILES: &[(&str, &[u8])] = &[
 #[derive(Debug, Clone)]
 pub struct CompanionInstall {
     pub directory: PathBuf,
-    pub refreshed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompanionInstallState {
+    pub directory: PathBuf,
+    pub update_available: bool,
 }
 
 fn embedded_fingerprint() -> String {
@@ -106,6 +111,27 @@ fn published_tree_matches(directory: &Path) -> bool {
     })
 }
 
+pub fn prepare_initial_for_config(config_path: &Path) -> io::Result<CompanionInstallState> {
+    let directory = directory_for_config(config_path)?;
+    let manifest = directory.join("manifest.json");
+    if !manifest.is_file() {
+        let install = materialize_for_config(config_path)?;
+        return Ok(CompanionInstallState {
+            directory: install.directory,
+            update_available: false,
+        });
+    }
+
+    // An existing unpacked-extension root may already be loaded by Chromium. Do not replace its
+    // files merely because MoonDesk restarted into a newer build: Chrome can otherwise combine a
+    // still-running old service worker with newly published content scripts. Settings offers an
+    // explicit, activity-guarded update instead.
+    Ok(CompanionInstallState {
+        update_available: !published_tree_matches(&directory),
+        directory,
+    })
+}
+
 pub fn materialize_for_config(config_path: &Path) -> io::Result<CompanionInstall> {
     let directory = directory_for_config(config_path)?;
     fs::create_dir_all(&directory)?;
@@ -113,10 +139,7 @@ pub fn materialize_for_config(config_path: &Path) -> io::Result<CompanionInstall
     if published_tree_matches(&directory)
         && read_fingerprint(&directory).as_deref() == Some(fingerprint.as_str())
     {
-        return Ok(CompanionInstall {
-            directory,
-            refreshed: false,
-        });
+        return Ok(CompanionInstall { directory });
     }
 
     let allowed = RUNTIME_FILES
@@ -158,10 +181,7 @@ pub fn materialize_for_config(config_path: &Path) -> io::Result<CompanionInstall
         ));
     }
 
-    Ok(CompanionInstall {
-        directory,
-        refreshed: true,
-    })
+    Ok(CompanionInstall { directory })
 }
 
 pub fn open_folder(directory: &Path) -> Result<(), String> {
@@ -216,16 +236,14 @@ mod tests {
         let root = temp_root();
         let config = root.join("config.toml");
         let first = materialize_for_config(&config).expect("materialize companion");
-        assert!(first.refreshed);
         assert!(first.directory.join("manifest.json").is_file());
 
         let second = materialize_for_config(&config).expect("reuse stable companion");
-        assert!(!second.refreshed);
         assert_eq!(first.directory, second.directory);
 
         fs::write(first.directory.join("popup.js"), b"tampered").expect("tamper popup");
         let third = materialize_for_config(&config).expect("refresh companion");
-        assert!(third.refreshed);
+        assert_eq!(first.directory, third.directory);
         assert_eq!(
             fs::read(first.directory.join("popup.js")).expect("read refreshed popup"),
             RUNTIME_FILES
@@ -234,6 +252,36 @@ mod tests {
                 .map(|(_, bytes)| bytes.to_vec())
                 .expect("embedded popup")
         );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn startup_detects_existing_update_without_replacing_loaded_files() {
+        let root = temp_root();
+        let config = root.join("config.toml");
+        let first = materialize_for_config(&config).expect("materialize companion");
+        fs::write(first.directory.join("popup.js"), b"older-running-build")
+            .expect("simulate older loaded companion");
+
+        let state = prepare_initial_for_config(&config).expect("inspect existing companion");
+        assert_eq!(state.directory, first.directory);
+        assert!(state.update_available);
+        assert_eq!(
+            fs::read(first.directory.join("popup.js")).expect("read untouched popup"),
+            b"older-running-build"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn startup_materializes_first_install_when_no_manifest_exists() {
+        let root = temp_root();
+        let config = root.join("config.toml");
+        let state = prepare_initial_for_config(&config).expect("prepare first install");
+        assert!(!state.update_available);
+        assert!(published_tree_matches(&state.directory));
 
         let _ = fs::remove_dir_all(root);
     }

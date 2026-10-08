@@ -12,7 +12,7 @@ The MoonDesk native binary embeds the exact Worker Companion runtime files from 
 
 The browser installation remains optional and explicit: normal MoonDesk does not require the companion. Users who want Workers choose **Set up Workers (open companion folder)** in MoonDesk Settings, then load that stable folder with **Load unpacked**.
 
-The stable directory itself is kept in place across MoonDesk updates so Chromium can keep remembering the same unpacked-extension path. MoonDesk refreshes the known runtime files in place and publishes `manifest.json` last; it does not treat updated files on disk as proof that the running Manifest V3 extension has reloaded.
+The stable directory itself is kept in place across MoonDesk updates so Chromium can keep remembering the same unpacked-extension path. On startup MoonDesk materializes the folder only for a first install. If an existing folder differs from the newly shipped companion, MoonDesk leaves those loaded bytes untouched and shows **Update Worker Companion (when idle)** instead. That action refuses to update while any Worker or managed ChatGPT launch is live/ambiguous, then refreshes the known runtime files in place, publishes `manifest.json` last, and tells the user to click Reload on the browser extensions page before using Workers again.
 
 ### Release ZIP fallback
 
@@ -55,9 +55,11 @@ App and companion versions should move together.
 
 For the first production version, the safe update UX is:
 
-1. MoonDesk updates/replaces the files in its stable Worker Companion folder.
-2. If the browser is still running the previous companion build, MoonDesk says **Reload Worker Companion**.
-3. The user opens the extensions page and clicks Reload for MoonDesk Worker Companion, then refreshes open ChatGPT tabs if required.
+1. MoonDesk notices that the stable folder differs from the companion embedded in the new app, but leaves the existing folder untouched on startup.
+2. Settings shows **Update Worker Companion (when idle)**.
+3. The update action refuses while any Worker or managed ChatGPT launch is active, crossing Send, or awaiting reconciliation.
+4. Once idle, MoonDesk replaces the runtime files in the same stable folder and says **Reload Worker Companion**.
+5. The user opens the extensions page and clicks Reload for MoonDesk Worker Companion, then refreshes open ChatGPT tabs if required.
 
 Later, after live validation, MoonDesk can adopt the CoS-style convenience path: only when no Core/worker browser operation is busy, prepare the stable folder and let the extension call `chrome.runtime.reload()` on itself. That must remain guarded by exact activity/version evidence so an update cannot interrupt an active Send or worker turn.
 

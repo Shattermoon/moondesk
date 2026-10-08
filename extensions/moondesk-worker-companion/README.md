@@ -22,7 +22,7 @@ It does **not** match ChatGPT Projects, MoonDesk workspaces, connectors, or loca
 
 ## Distribution
 
-MoonDesk distributes the Worker Companion as an **optional** local unpacked extension. The native MoonDesk binary embeds these runtime files and refreshes the stable `~/.moondesk/worker-companion` folder; production setup enables browser Developer mode once and loads that folder with **Load unpacked**. Normal MoonDesk does not require the extension. GitHub Releases also include the exact checksummed `moondesk-worker-companion.zip` as a beta/recovery fallback. Distribution and onboarding requirements are tracked in [`docs/WORKER_COMPANION_DISTRIBUTION.md`](../../docs/WORKER_COMPANION_DISTRIBUTION.md).
+MoonDesk distributes the Worker Companion as an **optional** local unpacked extension. The native MoonDesk binary embeds these runtime files and prepares the stable `~/.moondesk/worker-companion` folder; later version changes are offered as an explicit idle-only update so MoonDesk never replaces files under an active worker/browser launch. Production setup enables browser Developer mode once and loads that folder with **Load unpacked**. Normal MoonDesk does not require the extension. GitHub Releases also include the exact checksummed `moondesk-worker-companion.zip` as a beta/recovery fallback. Distribution and onboarding requirements are tracked in [`docs/WORKER_COMPANION_DISTRIBUTION.md`](../../docs/WORKER_COMPANION_DISTRIBUTION.md).
 
 ## Local install
 

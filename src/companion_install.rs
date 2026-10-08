@@ -52,12 +52,6 @@ pub struct CompanionInstall {
     pub directory: PathBuf,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CompanionInstallState {
-    pub directory: PathBuf,
-    pub update_available: bool,
-}
-
 fn embedded_fingerprint() -> String {
     let mut hash = Sha256::new();
     for (name, bytes) in RUNTIME_FILES {
@@ -108,27 +102,6 @@ fn published_tree_matches(directory: &Path) -> bool {
         fs::read(directory.join(name))
             .map(|current| current.as_slice() == *bytes)
             .unwrap_or(false)
-    })
-}
-
-pub fn prepare_initial_for_config(config_path: &Path) -> io::Result<CompanionInstallState> {
-    let directory = directory_for_config(config_path)?;
-    let manifest = directory.join("manifest.json");
-    if !manifest.is_file() {
-        let install = materialize_for_config(config_path)?;
-        return Ok(CompanionInstallState {
-            directory: install.directory,
-            update_available: false,
-        });
-    }
-
-    // An existing unpacked-extension root may already be loaded by Chromium. Do not replace its
-    // files merely because MoonDesk restarted into a newer build: Chrome can otherwise combine a
-    // still-running old service worker with newly published content scripts. Settings offers an
-    // explicit, activity-guarded update instead.
-    Ok(CompanionInstallState {
-        update_available: !published_tree_matches(&directory),
-        directory,
     })
 }
 
@@ -232,7 +205,7 @@ mod tests {
     }
 
     #[test]
-    fn materialization_is_stable_and_refreshes_tampered_files() {
+    fn startup_sync_is_stable_and_refreshes_existing_files() {
         let root = temp_root();
         let config = root.join("config.toml");
         let first = materialize_for_config(&config).expect("materialize companion");
@@ -252,36 +225,6 @@ mod tests {
                 .map(|(_, bytes)| bytes.to_vec())
                 .expect("embedded popup")
         );
-
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn startup_detects_existing_update_without_replacing_loaded_files() {
-        let root = temp_root();
-        let config = root.join("config.toml");
-        let first = materialize_for_config(&config).expect("materialize companion");
-        fs::write(first.directory.join("popup.js"), b"older-running-build")
-            .expect("simulate older loaded companion");
-
-        let state = prepare_initial_for_config(&config).expect("inspect existing companion");
-        assert_eq!(state.directory, first.directory);
-        assert!(state.update_available);
-        assert_eq!(
-            fs::read(first.directory.join("popup.js")).expect("read untouched popup"),
-            b"older-running-build"
-        );
-
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn startup_materializes_first_install_when_no_manifest_exists() {
-        let root = temp_root();
-        let config = root.join("config.toml");
-        let state = prepare_initial_for_config(&config).expect("prepare first install");
-        assert!(!state.update_available);
-        assert!(published_tree_matches(&state.directory));
 
         let _ = fs::remove_dir_all(root);
     }

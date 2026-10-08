@@ -1015,7 +1015,6 @@ pub struct AppState {
     pub companion_auth: Arc<CompanionAuth>,
     pub companion_bridge_port: Option<u16>,
     pub companion_directory: Option<PathBuf>,
-    pub companion_update_available: bool,
     pub companion_materialize_error: Option<String>,
     config_path: PathBuf,
     pub server_handle: Option<tokio::task::JoinHandle<()>>,
@@ -1602,10 +1601,10 @@ impl AppState {
             ManagedChatBroker::open(managed_chat_store_path).map_err(std::io::Error::other)?,
         );
         let companion_auth = Arc::new(CompanionAuth::open_for_config(&config_path)?);
-        let (companion_directory, companion_update_available, companion_materialize_error) =
-            match companion_install::prepare_initial_for_config(&config_path) {
-                Ok(install) => (Some(install.directory), install.update_available, None),
-                Err(error) => (None, false, Some(error.to_string())),
+        let (companion_directory, companion_materialize_error) =
+            match companion_install::materialize_for_config(&config_path) {
+                Ok(install) => (Some(install.directory), None),
+                Err(error) => (None, Some(error.to_string())),
             };
 
         let mut app = Self {
@@ -1650,7 +1649,6 @@ impl AppState {
             companion_auth,
             companion_bridge_port: None,
             companion_directory,
-            companion_update_available,
             companion_materialize_error,
             config_path,
             server_handle: None,
@@ -1658,16 +1656,12 @@ impl AppState {
             ngrok_task: None,
         };
         match (&app.companion_directory, &app.companion_materialize_error) {
-            (Some(directory), _) if app.companion_update_available => app.log(
-                "INFO",
-                format!(
-                    "Worker Companion update available at {}; existing loaded files were left untouched until an idle explicit update",
-                    directory.to_string_lossy()
-                ),
-            ),
             (Some(directory), _) => app.log(
                 "INFO",
-                format!("Worker Companion ready at {}", directory.to_string_lossy()),
+                format!(
+                    "Worker Companion runtime synchronized at {}",
+                    directory.to_string_lossy()
+                ),
             ),
             (None, Some(error)) => app.log(
                 "WARN",

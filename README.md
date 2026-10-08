@@ -127,12 +127,12 @@ Workers let one ChatGPT conversation act as the **Core** and delegate independen
 
 ### Optional Worker Companion setup
 
-You do **not** need the extension for normal MoonDesk use. Install it only when you want Workers/sub-agents. MoonDesk embeds the exact companion files from its own build and keeps them in the stable `~/.moondesk/worker-companion` folder; browser installation remains an explicit user opt-in. Each GitHub Release also carries the same checksummed `moondesk-worker-companion.zip` as a beta/recovery fallback. The full release/onboarding plan is in [`docs/WORKER_COMPANION_DISTRIBUTION.md`](docs/WORKER_COMPANION_DISTRIBUTION.md).
+You do **not** need the extension for normal MoonDesk use. Install it only when you want Workers/sub-agents. MoonDesk embeds the exact companion files from its own build and synchronizes them into the stable `~/.moondesk/worker-companion` folder whenever MoonDesk starts; browser installation remains an explicit user opt-in, but later MoonDesk upgrades do not require a second companion-update step. An already-loaded companion can self-reload once when its MoonDesk release version or runtime revision no longer matches. Each GitHub Release also carries the same checksummed `moondesk-worker-companion.zip` as a beta/recovery fallback. The full release/onboarding plan is in [`docs/WORKER_COMPANION_DISTRIBUTION.md`](docs/WORKER_COMPANION_DISTRIBUTION.md).
 
 To enable Workers:
 
 1. Start MoonDesk and open **Settings → Workers**.
-2. Choose **Set up Workers (open companion folder)**. MoonDesk opens its stable Worker Companion folder.
+2. Choose **Open Worker Companion folder**. MoonDesk opens its stable Worker Companion folder.
 3. Open `chrome://extensions` (or `edge://extensions` / `brave://extensions`), enable **Developer mode**, choose **Load unpacked**, and select the folder MoonDesk opened.
 4. Open ChatGPT in that same browser. The extension discovers MoonDesk's loopback-only bridge and pairs automatically; there is no per-chat token step. Multiple browser installations may remain paired independently.
 5. Open the ChatGPT conversation you want to use as the Core. No Project/workspace binding step is required.

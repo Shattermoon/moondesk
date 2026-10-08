@@ -465,10 +465,6 @@ impl CompanionAuth {
         })
     }
 
-    pub async fn paired_client_id(&self) -> Option<String> {
-        self.state.lock().await.clients.keys().next().cloned()
-    }
-
     pub async fn paired_client_ids(&self) -> Vec<String> {
         self.state.lock().await.clients.keys().cloned().collect()
     }

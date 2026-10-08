@@ -10,9 +10,11 @@ MoonDesk should **not** depend on browser-store approval for this companion. The
 
 The MoonDesk native binary embeds the exact Worker Companion runtime files from the same source revision. On startup MoonDesk materializes those bytes into the stable `~/.moondesk/worker-companion` directory. This works for npm-installed MoonDesk and direct native-binary installs without requiring a repository checkout.
 
-The browser installation remains optional and explicit: normal MoonDesk does not require the companion. Users who want Workers choose **Set up Workers (open companion folder)** in MoonDesk Settings, then load that stable folder with **Load unpacked**.
+The browser installation remains optional and explicit: normal MoonDesk does not require the companion. Users who want Workers choose **Open Worker Companion folder** in MoonDesk Settings, then load that stable folder with **Load unpacked**.
 
-The stable directory itself is kept in place across MoonDesk updates so Chromium can keep remembering the same unpacked-extension path. On startup MoonDesk materializes the folder only for a first install. If an existing folder differs from the newly shipped companion, MoonDesk leaves those loaded bytes untouched and shows **Update Worker Companion (when idle)** instead. That action refuses to update while any Worker or managed ChatGPT launch is live/ambiguous, then refreshes the known runtime files in place, publishes `manifest.json` last, and tells the user to click Reload on the browser extensions page before using Workers again.
+The stable directory itself is kept in place across MoonDesk updates so Chromium can keep remembering the same unpacked-extension path. On every MoonDesk startup the native binary synchronizes that directory to the exact companion runtime embedded in the running MoonDesk build. There is no separate companion-update action and no worker-idle gate: updating MoonDesk is the update mechanism for the bundled companion files.
+
+A loaded Chromium extension can still be running an older service-worker generation while those files are replaced on disk. The companion therefore compares both the MoonDesk release version and a runtime revision from the local bridge handshake. When a previously loaded companion sees a different shipped version or runtime revision, it calls `chrome.runtime.reload()` once and reconnects using the newly synchronized files. A one-time manual Reload remains only a recovery fallback if Chromium refuses that self-reload; it is not part of the normal update flow.
 
 ### Release ZIP fallback
 
@@ -36,7 +38,7 @@ Repository contributors may load `extensions/moondesk-worker-companion` directly
 The production instructions should be short and shown inside MoonDesk rather than buried in documentation:
 
 1. Install/update MoonDesk and start it. No extension is required for normal MoonDesk use.
-2. Only if Workers are wanted, open **Settings → Workers** and choose **Set up Workers (open companion folder)**.
+2. Only if Workers are wanted, open **Settings → Workers** and choose **Open Worker Companion folder**.
 3. MoonDesk opens its stable `~/.moondesk/worker-companion` folder.
 4. In the browser used for ChatGPT, open `chrome://extensions`, `edge://extensions`, or `brave://extensions`.
 5. Turn on **Developer mode** and click **Load unpacked**.
@@ -51,17 +53,11 @@ Fresh workers are ordinary ChatGPT conversations even when Core lives in a ChatG
 
 ## Updating the companion
 
-App and companion versions should move together.
+App and companion versions move together. MoonDesk synchronizes the stable companion directory from the running native binary every time MoonDesk starts, so users do not perform a second companion-update step after updating MoonDesk.
 
-For the first production version, the safe update UX is:
+If Chromium already has the unpacked extension loaded when MoonDesk starts with newer companion files, the old service worker may remain alive briefly. Release builds compare the loaded extension manifest version with MoonDesk's app version, and the bridge also carries a runtime revision for source/dev compatibility changes. Either mismatch makes the extension request one self-reload with `chrome.runtime.reload()` and then reconnect. The reload attempt is persisted so a broken/missing update cannot enter an infinite reload loop. If Chromium still serves the old generation after that single attempt, the popup reports an explicit one-time manual Reload instruction.
 
-1. MoonDesk notices that the stable folder differs from the companion embedded in the new app, but leaves the existing folder untouched on startup.
-2. Settings shows **Update Worker Companion (when idle)**.
-3. The update action refuses while any Worker or managed ChatGPT launch is active, crossing Send, or awaiting reconciliation.
-4. Once idle, MoonDesk replaces the runtime files in the same stable folder and says **Reload Worker Companion**.
-5. The user opens the extensions page and clicks Reload for MoonDesk Worker Companion, then refreshes open ChatGPT tabs if required.
-
-Later, after live validation, MoonDesk can adopt the CoS-style convenience path: only when no Core/worker browser operation is busy, prepare the stable folder and let the extension call `chrome.runtime.reload()` on itself. That must remain guarded by exact activity/version evidence so an update cannot interrupt an active Send or worker turn.
+This deliberately favors a short recoverable interruption during an app upgrade over a permanent Settings-only update workflow. Worker Send remains fail-closed: a stale companion cannot silently send with an unconfirmed model/effort or route, and after reload the durable command/reconciliation state resumes from MoonDesk rather than replaying an uncertain Send.
 
 ## Pairing and compatibility
 
@@ -69,7 +65,7 @@ The extension discovers only MoonDesk's dedicated loopback bridge ports (`127.0.
 
 Pairing is installation-scoped and automatic. Multiple browser installations may remain paired independently. MoonDesk never uses the workspace MCP URL as a browser-extension credential.
 
-A version/protocol mismatch should be explicit and actionable: **MoonDesk and Worker Companion do not match — update/reload the companion from this MoonDesk installation.** Do not expose a generic connection failure when the real issue is incompatible bytes.
+A runtime/protocol mismatch should be explicit and actionable. Runtime-revision mismatches self-reload once after MoonDesk synchronizes the stable folder; protocol mismatches explain that MoonDesk should be restarted and the extension reloaded once only if Chromium does not recover automatically. Do not expose a generic connection failure when the real issue is incompatible bytes.
 
 ## Release automation implemented in this branch
 
@@ -85,7 +81,7 @@ The release pipeline treats the Worker Companion as a first-class release artifa
 8. `SHA256SUMS` covers the companion ZIP together with the five native binaries;
 9. tag-context verification requires the companion version to match the immutable MoonDesk tag and re-verifies the checksum set before npm publication.
 
-The native binary now also embeds those exact runtime files and materializes them into the stable MoonDesk-owned `~/.moondesk/worker-companion` folder. Settings exposes **Set up Workers (open companion folder)** / **Open Worker Companion folder**, so production users never need a repository checkout or Cargo/npm cache path.
+The native binary now also embeds those exact runtime files and synchronizes them into the stable MoonDesk-owned `~/.moondesk/worker-companion` folder on startup. Settings exposes **Open Worker Companion folder**, so production users never need a repository checkout or Cargo/npm cache path.
 
 ## Production gate
 

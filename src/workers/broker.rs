@@ -129,15 +129,6 @@ impl WorkerBroker {
         self.data.lock().await.clone()
     }
 
-    pub async fn has_live_activity(&self) -> bool {
-        self.data.lock().await.families.values().any(|family| {
-            family
-                .workers
-                .values()
-                .any(|worker| !matches!(worker.state, WorkerState::Idle | WorkerState::Retired))
-        })
-    }
-
     pub async fn spawn_worker(
         &self,
         request: SpawnWorkerRequest,

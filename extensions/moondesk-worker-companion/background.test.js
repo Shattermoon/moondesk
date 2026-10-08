@@ -23,9 +23,10 @@ const popupSource = fs.readFileSync(popupPath, 'utf8');
 const serverSource = fs.readFileSync(serverPath, 'utf8');
 const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
 
-function loadBackground({ existingTabs = {}, contentByTab = {}, sendMessageImpl = null, scriptingExecuteImpl = null, fetchImpl = async () => { throw new Error('network not used'); }, setTimeoutImpl = null } = {}) {
+function loadBackground({ existingTabs = {}, contentByTab = {}, sendMessageImpl = null, scriptingExecuteImpl = null, fetchImpl = async () => { throw new Error('network not used'); }, setTimeoutImpl = null, runtimeManifest = manifest } = {}) {
   const createdTabs = [];
   const removedTabs = [];
+  const runtimeReloads = [];
   let stored = {};
   let runtimeMessageHandler = null;
   let tabRemovedHandler = null;
@@ -84,7 +85,8 @@ function loadBackground({ existingTabs = {}, contentByTab = {}, sendMessageImpl 
       onAlarm: { addListener(handler) { alarmHandler = handler; } }
     },
     runtime: {
-      getManifest() { return manifest; },
+      getManifest() { return runtimeManifest; },
+      reload() { runtimeReloads.push(true); },
       onMessage: { addListener(handler) { runtimeMessageHandler = handler; } },
       onInstalled: { addListener() {} },
       onStartup: { addListener() {} }
@@ -108,6 +110,7 @@ function loadBackground({ existingTabs = {}, contentByTab = {}, sendMessageImpl 
   return {
     createdTabs,
     removedTabs,
+    runtimeReloads,
     evaluate(expression) {
       return vm.runInContext(expression, context);
     },
@@ -212,6 +215,13 @@ test('closing a browser tab schedules immediate presence publication instead of 
   assert.match(source, /closed worker tab is not a finished worker/);
 });
 
+test('companion runtime revision stays aligned with the MoonDesk bridge', () => {
+  const javascriptRevision = Number(source.match(/const COMPANION_RUNTIME_REVISION = (\d+);/)?.[1]);
+  const rustRevision = Number(serverSource.match(/pub const COMPANION_RUNTIME_REVISION: u32 = (\d+);/)?.[1]);
+  assert.ok(Number.isInteger(javascriptRevision));
+  assert.equal(javascriptRevision, rustRevision);
+});
+
 test('bridge discovery selects protocol V2 without unresolved runtime constants', async () => {
   const fetchImpl = async (url) => {
     const port = new URL(url).port;
@@ -234,6 +244,121 @@ test('bridge discovery selects protocol V2 without unresolved runtime constants'
   const { evaluate } = loadBackground({ fetchImpl });
   const hello = await evaluate('discoverBridge(freshState())');
   assert.equal(hello.protocolVersion, 2);
+});
+
+test('bridge discovery prefers an exact runtime match over another MoonDesk version', async () => {
+  const fetchImpl = async (url) => {
+    const port = new URL(url).port;
+    if (port === '47650') {
+      return {
+        ok: true,
+        status: 200,
+        async json() {
+          return {
+            app: 'moondesk-worker-companion',
+            appVersion: '0.13.0',
+            protocolVersion: 2,
+            companionRuntimeRevision: 2
+          };
+        }
+      };
+    }
+    if (port === '47651') {
+      return {
+        ok: true,
+        status: 200,
+        async json() {
+          return {
+            app: 'moondesk-worker-companion',
+            appVersion: '0.12.0',
+            protocolVersion: 2,
+            companionRuntimeRevision: 1
+          };
+        }
+      };
+    }
+    return {
+      ok: false,
+      status: 404,
+      async json() { return {}; }
+    };
+  };
+
+  const { evaluate, runtimeReloads } = loadBackground({ fetchImpl });
+  const hello = await evaluate('discoverBridge(freshState())');
+  assert.equal(hello.companionRuntimeRevision, 1);
+  assert.equal(runtimeReloads.length, 0);
+});
+
+test('bridge runtime revision mismatch reloads the unpacked companion once', async () => {
+  const fetchImpl = async (url) => {
+    const port = new URL(url).port;
+    if (port === '47651') {
+      return {
+        ok: true,
+        status: 200,
+        async json() {
+          return {
+            app: 'moondesk-worker-companion',
+            appVersion: '0.13.0',
+            protocolVersion: 2,
+            companionRuntimeRevision: 2
+          };
+        }
+      };
+    }
+    return {
+      ok: false,
+      status: 404,
+      async json() { return {}; }
+    };
+  };
+
+  const { evaluate, runtimeReloads } = loadBackground({ fetchImpl });
+  await assert.rejects(
+    evaluate('discoverBridge(freshState())'),
+    /reloading the extension/
+  );
+  assert.equal(runtimeReloads.length, 1);
+
+  await assert.rejects(
+    evaluate('discoverBridge(freshState())'),
+    /Reload MoonDesk Worker Companion once/
+  );
+  assert.equal(runtimeReloads.length, 1, 'mismatch recovery must not enter a reload loop');
+});
+
+test('release version mismatch reloads the unpacked companion even when protocol and runtime revision match', async () => {
+  const fetchImpl = async (url) => {
+    const port = new URL(url).port;
+    if (port === '47651') {
+      return {
+        ok: true,
+        status: 200,
+        async json() {
+          return {
+            app: 'moondesk-worker-companion',
+            appVersion: '0.13.0',
+            protocolVersion: 2,
+            companionRuntimeRevision: 1
+          };
+        }
+      };
+    }
+    return {
+      ok: false,
+      status: 404,
+      async json() { return {}; }
+    };
+  };
+
+  const runtimeManifest = { ...manifest, version: '0.12.0' };
+  const { evaluate, runtimeReloads } = loadBackground({ fetchImpl, runtimeManifest });
+  await assert.rejects(
+    evaluate('discoverBridge(freshState())'),
+    /reloading the extension/
+  );
+  assert.equal(runtimeReloads.length, 1);
 });
 
 test('model-state bridge is injected in ChatGPT MAIN world before isolated content scripts', () => {

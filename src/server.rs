@@ -60,6 +60,9 @@ pub const COMPANION_SEND_STARTED_ROUTE: &str = "/__moondesk/companion/v1/command
 pub const COMPANION_ACK_ROUTE: &str = "/__moondesk/companion/v1/commands/ack";
 pub const COMPANION_CLEAR_WORKERS_ROUTE: &str = "/__moondesk/companion/v1/workers/clear";
 pub const COMPANION_TOKEN_HEADER: &str = "x-moondesk-companion-token";
+// Bump with any shipped companion runtime change that requires Chromium to load new bytes. Keep
+// this aligned with COMPANION_RUNTIME_REVISION in background.js.
+pub const COMPANION_RUNTIME_REVISION: u32 = 1;
 const MAX_COMPANION_BODY_BYTES: usize = 16 * 1024;
 
 #[derive(Clone)]
@@ -396,6 +399,7 @@ async fn companion_hello(State(state): State<ServerState>, headers: HeaderMap) -
             "app": "moondesk-worker-companion",
             "appVersion": env!("CARGO_PKG_VERSION"),
             "protocolVersion": 2,
+            "companionRuntimeRevision": COMPANION_RUNTIME_REVISION,
             "paired": auth.paired_client_count().await > 0,
             "pairedClientCount": auth.paired_client_count().await
         }),
@@ -483,6 +487,7 @@ async fn companion_status(State(state): State<ServerState>, headers: HeaderMap) 
         json!({
             "appVersion": env!("CARGO_PKG_VERSION"),
             "protocolVersion": 2,
+            "companionRuntimeRevision": COMPANION_RUNTIME_REVISION,
             "paired": true,
             "clientId": client_id,
             "pairedClientCount": auth.paired_client_count().await
@@ -2676,6 +2681,12 @@ mod tests {
         assert_eq!(
             hello_json.get("protocolVersion").and_then(Value::as_u64),
             Some(2)
+        );
+        assert_eq!(
+            hello_json
+                .get("companionRuntimeRevision")
+                .and_then(Value::as_u64),
+            Some(u64::from(COMPANION_RUNTIME_REVISION))
         );
 
         let credential = "a".repeat(64);

@@ -4062,6 +4062,7 @@ async fn run_settings(
     let browser_presentations = BrowserPresentation::all();
     let config_path_text = app_config_path()?.to_string_lossy().into_owned();
     let mut confirm_reset_token_billing = false;
+    let mut companion_action_notice: Option<String> = None;
     let mut selected_row = {
         let app = state.lock().await;
         themes.iter().position(|t| t.id == app.theme).unwrap_or(0)
@@ -4079,11 +4080,8 @@ async fn run_settings(
             set_moondesk_as_co_author,
             ngrok_authtoken_configured,
             ngrok_domain,
-            companion_auth,
             companion_pairing_code,
-            companion_local_url,
             companion_directory,
-            companion_update_available,
             companion_materialize_error,
         ) = {
             let app = state.lock().await;
@@ -4097,19 +4095,13 @@ async fn run_settings(
                 app.set_moondesk_as_co_author,
                 app.ngrok_authtoken().is_some(),
                 app.ngrok_domain.clone(),
-                app.companion_auth.clone(),
                 app.companion_auth.pairing_token(),
-                app.companion_bridge_port
-                    .map(|port| format!("http://127.0.0.1:{port}"))
-                    .unwrap_or_else(|| "unavailable".into()),
                 app.companion_directory
                     .as_ref()
                     .map(|path| path.to_string_lossy().into_owned()),
-                app.companion_update_available,
                 app.companion_materialize_error.clone(),
             )
         };
-        let companion_client_id = companion_auth.paired_client_id().await;
         terminal.draw(|f| {
             draw_settings(
                 f,
@@ -4120,11 +4112,9 @@ async fn run_settings(
                     worker_execution_profile: &worker_execution_profile,
                     worker_target_count,
                     companion_pairing_code: &companion_pairing_code,
-                    companion_client_id: companion_client_id.as_deref(),
-                    companion_local_url: &companion_local_url,
                     companion_directory: companion_directory.as_deref(),
-                    companion_update_available,
                     companion_materialize_error: companion_materialize_error.as_deref(),
+                    companion_action_notice: companion_action_notice.as_deref(),
                     set_moondesk_as_co_author,
                     ngrok_authtoken_configured,
                     ngrok_domain: ngrok_domain.as_deref(),
@@ -4240,63 +4230,48 @@ async fn run_settings(
                             app.log("INFO", format!("Worker target count: {count}"));
                             app.mark_config_dirty();
                         } else if selected_row == settings_action_start + 3 {
-                            let update_available = app.companion_update_available;
                             let existing_directory = app.companion_directory.clone();
-                            let worker_broker = app.worker_broker.clone();
-                            let managed_chat_broker = app.managed_chat_broker.clone();
                             drop(app);
 
-                            if update_available
-                                && (worker_broker.has_live_activity().await
-                                    || managed_chat_broker.has_live_or_ambiguous_activity().await)
-                            {
-                                state.lock().await.log(
-                                    "WARN",
-                                    "Worker Companion update is waiting until all Workers and browser launches are idle/resolved. Normal MoonDesk remains available.".into(),
-                                );
-                                continue;
-                            }
-
                             let config_path = app_config_path()?;
-                            let result = if update_available || existing_directory.is_none() {
-                                companion_install::materialize_for_config(&config_path)
-                                    .map(|install| (install.directory, update_available))
-                            } else {
-                                existing_directory
-                                    .ok_or_else(|| {
-                                        std::io::Error::other(
-                                            "Worker Companion folder is unavailable",
-                                        )
-                                    })
-                                    .map(|directory| (directory, false))
+                            let result = match existing_directory {
+                                Some(directory) => Ok(directory),
+                                None => companion_install::materialize_for_config(&config_path)
+                                    .map(|install| install.directory),
                             };
                             match result {
-                                Ok((directory, updated)) => {
+                                Ok(directory) => {
                                     {
                                         let mut app = state.lock().await;
                                         app.companion_directory = Some(directory.clone());
-                                        app.companion_update_available = false;
                                         app.companion_materialize_error = None;
                                         app.log(
                                             "INFO",
-                                            if updated {
-                                                format!(
-                                                    "Worker Companion files updated at {}. In the browser extensions page, click Reload for MoonDesk Worker Companion, then refresh open ChatGPT tabs.",
-                                                    directory.to_string_lossy()
-                                                )
-                                            } else {
-                                                format!(
-                                                    "Optional Worker Companion ready at {}",
-                                                    directory.to_string_lossy()
-                                                )
-                                            },
+                                            format!(
+                                                "Optional Worker Companion ready at {}",
+                                                directory.to_string_lossy()
+                                            ),
                                         );
                                     }
-                                    if let Err(error) = companion_install::open_folder(&directory) {
-                                        state.lock().await.log("WARN", error);
+                                    match companion_install::open_folder(&directory) {
+                                        Ok(()) => {
+                                            companion_action_notice = Some(
+                                                "Worker Companion folder opened. Use this folder with Developer mode -> Load unpacked."
+                                                    .into(),
+                                            );
+                                        }
+                                        Err(error) => {
+                                            companion_action_notice = Some(format!(
+                                                "Could not open Worker Companion folder: {error}"
+                                            ));
+                                            state.lock().await.log("WARN", error);
+                                        }
                                     }
                                 }
                                 Err(error) => {
+                                    companion_action_notice = Some(format!(
+                                        "Could not prepare optional Worker Companion: {error}"
+                                    ));
                                     let mut app = state.lock().await;
                                     app.companion_materialize_error = Some(error.to_string());
                                     app.log(
@@ -4406,11 +4381,9 @@ struct SettingsView<'a> {
     worker_execution_profile: &'a ChatExecutionProfile,
     worker_target_count: usize,
     companion_pairing_code: &'a str,
-    companion_client_id: Option<&'a str>,
-    companion_local_url: &'a str,
     companion_directory: Option<&'a str>,
-    companion_update_available: bool,
     companion_materialize_error: Option<&'a str>,
+    companion_action_notice: Option<&'a str>,
     set_moondesk_as_co_author: bool,
     ngrok_authtoken_configured: bool,
     ngrok_domain: Option<&'a str>,
@@ -4428,11 +4401,9 @@ fn draw_settings(f: &mut Frame, view: SettingsView<'_>) {
         worker_execution_profile,
         worker_target_count,
         companion_pairing_code,
-        companion_client_id,
-        companion_local_url,
         companion_directory,
-        companion_update_available,
         companion_materialize_error,
+        companion_action_notice,
         set_moondesk_as_co_author,
         ngrok_authtoken_configured,
         ngrok_domain,
@@ -4689,18 +4660,8 @@ fn draw_settings(f: &mut Frame, view: SettingsView<'_>) {
         Style::default().fg(palette.muted_fg),
     )));
     lines.push(Line::from(Span::styled(
-        format!(
-            "     Companion: {} · {}",
-            companion_client_id
-                .map(|_| "paired")
-                .unwrap_or("not installed/paired"),
-            companion_local_url
-        ),
-        Style::default().fg(if companion_client_id.is_some() {
-            palette.success_fg
-        } else {
-            palette.muted_fg
-        }),
+        "     MoonDesk keeps the unpacked companion files synchronized automatically on startup.",
+        Style::default().fg(palette.muted_fg),
     )));
     if worker_setup_selected {
         selected_line_idx = lines.len();
@@ -4710,12 +4671,10 @@ fn draw_settings(f: &mut Frame, view: SettingsView<'_>) {
             " {} [{}] {}",
             if worker_setup_selected { ">" } else { " " },
             worker_setup_row + 1,
-            if companion_update_available {
-                "Update Worker Companion (when idle)"
-            } else if companion_client_id.is_some() {
+            if companion_directory.is_some() {
                 "Open Worker Companion folder"
             } else {
-                "Set up Workers (open companion folder)"
+                "Prepare Worker Companion folder"
             }
         ),
         worker_setup_style,
@@ -4726,12 +4685,6 @@ fn draw_settings(f: &mut Frame, view: SettingsView<'_>) {
                 format!("     Developer mode -> Load unpacked -> {directory}"),
                 Style::default().fg(palette.muted_fg),
             )));
-            if companion_update_available {
-                lines.push(Line::from(Span::styled(
-                    "     Update available. MoonDesk leaves the loaded folder untouched until you choose Update while Workers are idle.",
-                    Style::default().fg(palette.warning_fg),
-                )));
-            }
         }
         (None, Some(error)) => lines.push(Line::from(Span::styled(
             format!("     Companion folder unavailable: {error}"),
@@ -4741,6 +4694,16 @@ fn draw_settings(f: &mut Frame, view: SettingsView<'_>) {
             "     Companion folder is not prepared yet.",
             Style::default().fg(palette.muted_fg),
         ))),
+    }
+    if let Some(notice) = companion_action_notice {
+        lines.push(Line::from(Span::styled(
+            format!("     {notice}"),
+            Style::default().fg(if notice.starts_with("Could not") {
+                palette.danger_fg
+            } else {
+                palette.success_fg
+            }),
+        )));
     }
     lines.push(Line::from(Span::styled(
         format!("     Manual repair code: {companion_pairing_code}"),
@@ -10467,12 +10430,10 @@ mod tests {
                             worker_execution_profile: &super::ChatExecutionProfile::default(),
                             worker_target_count: crate::workers::RECOMMENDED_WORKERS_PER_FAMILY,
                             companion_pairing_code: "test-pairing-code",
-                            companion_client_id: None,
-                            companion_local_url: "http://127.0.0.1:3200",
                             companion_directory: Some(
                                 r"C:\Users\tester\.moondesk\worker-companion",
                             ),
-                            companion_update_available: false,
+                            companion_action_notice: None,
                             companion_materialize_error: None,
                             set_moondesk_as_co_author: false,
                             ngrok_authtoken_configured: false,
@@ -10508,10 +10469,8 @@ mod tests {
                         worker_execution_profile: &super::ChatExecutionProfile::default(),
                         worker_target_count: crate::workers::RECOMMENDED_WORKERS_PER_FAMILY,
                         companion_pairing_code: "test-pairing-code",
-                        companion_client_id: None,
-                        companion_local_url: "http://127.0.0.1:3200",
                         companion_directory: Some(r"C:\Users\tester\.moondesk\worker-companion"),
-                        companion_update_available: false,
+                        companion_action_notice: None,
                         companion_materialize_error: None,
                         set_moondesk_as_co_author: false,
                         ngrok_authtoken_configured: false,
@@ -10567,11 +10526,9 @@ mod tests {
                         worker_execution_profile: &profile,
                         worker_target_count: crate::workers::RECOMMENDED_WORKERS_PER_FAMILY,
                         companion_pairing_code: "test-pairing-code",
-                        companion_client_id: Some("extension-install-a"),
-                        companion_local_url: "http://127.0.0.1:3200",
                         companion_directory: Some(r"C:\Users\tester\.moondesk\worker-companion"),
-                        companion_update_available: false,
                         companion_materialize_error: None,
+                        companion_action_notice: Some("Worker Companion folder opened. Use this folder with Developer mode -> Load unpacked."),
                         set_moondesk_as_co_author: false,
                         ngrok_authtoken_configured: false,
                         ngrok_domain: None,
@@ -10601,10 +10558,11 @@ mod tests {
         assert!(rendered.contains("Worker Companion is optional"));
         assert!(rendered.contains("MoonDesk works normally without it"));
         assert!(rendered.contains("chrome://extensions"));
-        assert!(rendered.contains("Companion: paired"));
+        assert!(rendered.contains("synchronized automatically on startup"));
         assert!(rendered.contains("Open Worker Companion folder"));
         assert!(rendered.contains("Developer mode -> Load unpacked"));
-        assert!(rendered.contains("http://127.0.0.1:3200"));
+        assert!(rendered.contains("Worker Companion folder opened"));
+        assert!(!rendered.contains("unavailable"));
         assert!(rendered.contains("Manual repair code: test-pairing-code"));
     }
 
@@ -10631,10 +10589,8 @@ mod tests {
                         worker_execution_profile: &super::ChatExecutionProfile::default(),
                         worker_target_count: crate::workers::RECOMMENDED_WORKERS_PER_FAMILY,
                         companion_pairing_code: "test-pairing-code",
-                        companion_client_id: None,
-                        companion_local_url: "http://127.0.0.1:3200",
                         companion_directory: Some(r"C:\Users\tester\.moondesk\worker-companion"),
-                        companion_update_available: false,
+                        companion_action_notice: None,
                         companion_materialize_error: None,
                         set_moondesk_as_co_author: false,
                         ngrok_authtoken_configured: true,
@@ -10713,10 +10669,8 @@ mod tests {
                         worker_execution_profile: &super::ChatExecutionProfile::default(),
                         worker_target_count: crate::workers::RECOMMENDED_WORKERS_PER_FAMILY,
                         companion_pairing_code: "test-pairing-code",
-                        companion_client_id: None,
-                        companion_local_url: "http://127.0.0.1:3200",
                         companion_directory: Some(r"C:\Users\tester\.moondesk\worker-companion"),
-                        companion_update_available: false,
+                        companion_action_notice: None,
                         companion_materialize_error: None,
                         set_moondesk_as_co_author: false,
                         ngrok_authtoken_configured: false,

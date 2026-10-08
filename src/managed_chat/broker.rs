@@ -83,13 +83,6 @@ impl ManagedChatBroker {
         self.data.lock().await.clone()
     }
 
-    pub async fn has_live_or_ambiguous_activity(&self) -> bool {
-        self.data.lock().await.commands.values().any(|command| {
-            command.state != ManagedChatCommandState::Succeeded
-                && !(command.state == ManagedChatCommandState::Failed && !command.reconcile_history)
-        })
-    }
-
     pub async fn purge_workspace(
         &self,
         workspace_id: &WorkspaceId,

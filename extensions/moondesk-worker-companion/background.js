@@ -2,6 +2,11 @@ const STORAGE_KEY = 'moondeskWorkerCompanionV1';
 const POLL_ALARM = 'moondesk-worker-companion-poll';
 const BRIDGE_PORTS = [47650, 47651, 47652, 47653, 47654];
 const REQUIRED_PROTOCOL_VERSION = 2;
+// Bump with any shipped companion runtime change that requires Chromium to load new bytes. Keep
+// this aligned with COMPANION_RUNTIME_REVISION in src/server.rs.
+const COMPANION_RUNTIME_REVISION = 1;
+const SOURCE_DEV_MANIFEST_VERSION = '0.1.0';
+const RUNTIME_RELOAD_STORAGE_KEY = 'moondeskWorkerCompanionReloadRevisionV1';
 const HELLO_PATH = '/__moondesk/companion/v1/hello';
 const PAIR_PATH = '/__moondesk/companion/v1/pair';
 const REPAIR_PATH = '/__moondesk/companion/v1/repair';
@@ -143,7 +148,11 @@ async function hello(baseUrl) {
     });
     if (!response.ok) return null;
     const body = await response.json().catch(() => null);
-    return body?.app === 'moondesk-worker-companion' && [1, 2].includes(body?.protocolVersion) ? body : null;
+    return body?.app === 'moondesk-worker-companion'
+      && Number.isInteger(body?.protocolVersion)
+      && body.protocolVersion > 0
+      ? body
+      : null;
   } catch {
     return null;
   } finally {
@@ -162,14 +171,66 @@ function bridgeBaseUrl(value) {
   }
 }
 
+function companionRuntimeMismatch(helloBody) {
+  const remoteRevision = helloBody?.companionRuntimeRevision;
+  const revisionMismatch = Number.isInteger(remoteRevision)
+    && remoteRevision !== COMPANION_RUNTIME_REVISION;
+  const localVersion = String(chrome.runtime.getManifest()?.version || '');
+  const remoteVersion = typeof helloBody?.appVersion === 'string' ? helloBody.appVersion : '';
+  // Source contributors load manifest 0.1.0 directly while Cargo keeps the project version. Release
+  // candidates version the manifest and MoonDesk together, so version mismatch is authoritative there.
+  const versionMismatch = localVersion
+    && localVersion !== SOURCE_DEV_MANIFEST_VERSION
+    && remoteVersion
+    && localVersion !== remoteVersion;
+  return { revisionMismatch, versionMismatch, localVersion, remoteVersion, remoteRevision };
+}
+
+function hasCompanionRuntimeMismatch(helloBody) {
+  const mismatch = companionRuntimeMismatch(helloBody);
+  return mismatch.revisionMismatch || mismatch.versionMismatch;
+}
+
+async function maybeReloadForRuntimeMismatch(helloBody) {
+  const mismatch = companionRuntimeMismatch(helloBody);
+  if (!mismatch.revisionMismatch && !mismatch.versionMismatch) return false;
+
+  const target = `${mismatch.remoteVersion || 'unknown'}:${Number.isInteger(mismatch.remoteRevision) ? mismatch.remoteRevision : 'legacy'}`;
+  const stored = await chrome.storage.local.get(RUNTIME_RELOAD_STORAGE_KEY);
+  if (stored[RUNTIME_RELOAD_STORAGE_KEY] === target) {
+    throw requestError(
+      `MoonDesk refreshed the Worker Companion files, but Chromium is still running the previous extension generation. Reload MoonDesk Worker Companion once on the browser extensions page.`,
+      0,
+      'companion_runtime_reload_required'
+    );
+  }
+
+  await chrome.storage.local.set({ [RUNTIME_RELOAD_STORAGE_KEY]: target });
+  chrome.runtime.reload();
+  return true;
+}
+
 async function discoverBridge(state) {
   const preferred = bridgeBaseUrl(state.baseUrl);
   const candidates = preferred
     ? [preferred, ...BRIDGE_PORTS.map((port) => `http://127.0.0.1:${port}`).filter((url) => url !== preferred)]
     : BRIDGE_PORTS.map((port) => `http://127.0.0.1:${port}`);
   const probes = await Promise.all(candidates.map(async (baseUrl) => ({ baseUrl, hello: await hello(baseUrl) })));
-  const compatible = probes.filter((probe) => probe.hello?.protocolVersion === REQUIRED_PROTOCOL_VERSION);
-  const match = compatible.find((probe) => probe.baseUrl === preferred) || compatible[0];
+  const runtimeCompatible = probes.filter((probe) => {
+    if (probe.hello?.protocolVersion !== REQUIRED_PROTOCOL_VERSION) return false;
+    const mismatch = companionRuntimeMismatch(probe.hello);
+    return !mismatch.revisionMismatch && !mismatch.versionMismatch;
+  });
+  const exactCompatible = runtimeCompatible.filter((probe) =>
+    probe.hello?.companionRuntimeRevision === COMPANION_RUNTIME_REVISION
+  );
+  const legacyCompatible = runtimeCompatible.filter((probe) =>
+    !Number.isInteger(probe.hello?.companionRuntimeRevision)
+  );
+  const match = exactCompatible.find((probe) => probe.baseUrl === preferred)
+    || exactCompatible[0]
+    || legacyCompatible.find((probe) => probe.baseUrl === preferred)
+    || legacyCompatible[0];
   if (match) {
     if (state.baseUrl !== match.baseUrl) {
       state.baseUrl = match.baseUrl;
@@ -177,10 +238,22 @@ async function discoverBridge(state) {
     }
     return match.hello;
   }
+  const runtimeMismatch = probes.find((probe) =>
+    probe.baseUrl === preferred
+    && probe.hello
+    && hasCompanionRuntimeMismatch(probe.hello)
+  ) || probes.find((probe) => probe.hello && hasCompanionRuntimeMismatch(probe.hello));
+  if (runtimeMismatch && await maybeReloadForRuntimeMismatch(runtimeMismatch.hello)) {
+    throw requestError(
+      'MoonDesk refreshed the Worker Companion runtime; Chromium is reloading the extension.',
+      0,
+      'companion_runtime_reloading'
+    );
+  }
   const older = probes.find((probe) => probe.hello);
   if (older) {
     throw requestError(
-      `MoonDesk and Worker Companion do not match (bridge protocol ${older.hello.protocolVersion}; expected ${REQUIRED_PROTOCOL_VERSION}). Update the companion from MoonDesk → Settings → Workers, then reload MoonDesk Worker Companion on the browser extensions page.`,
+      `MoonDesk and Worker Companion do not match (bridge protocol ${older.hello.protocolVersion}; expected ${REQUIRED_PROTOCOL_VERSION}). Restart MoonDesk so it can synchronize the companion files, then reload MoonDesk Worker Companion once if Chromium does not reload it automatically.`,
       0,
       'bridge_protocol_mismatch'
     );

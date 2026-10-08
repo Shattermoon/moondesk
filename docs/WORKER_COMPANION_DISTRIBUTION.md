@@ -1,6 +1,6 @@
 # MoonDesk Worker Companion distribution plan
 
-MoonDesk Workers depend on the Chromium companion extension for exact ChatGPT routing, model/effort confirmation, durable Send reconciliation, and worker-tab presence.
+The Worker Companion is **optional for MoonDesk itself**. Normal MoonDesk features—files, shell commands, browser automation, workspaces, handoffs, and ordinary MCP use—do not require it. Only the experimental **Workers/sub-agents** feature depends on the Chromium companion for exact ChatGPT routing, model/effort confirmation, durable Send reconciliation, and worker-tab presence.
 
 MoonDesk should **not** depend on browser-store approval for this companion. The production path is the same class of installation used by Chat On Steroids: MoonDesk ships the extension files itself, the user enables browser Developer mode once, and loads MoonDesk's stable local extension folder with **Load unpacked**.
 

@@ -301,7 +301,17 @@ jobs:
           node --check npm/install-binary.js
           node --check npm/update-manager.js
           node --check .github/scripts/verify-npm-package.mjs
+          node --check extensions/moondesk-worker-companion/background.js
+          node --check extensions/moondesk-worker-companion/content.js
+          node --check extensions/moondesk-worker-companion/chatgpt-dom.js
+          node --check extensions/moondesk-worker-companion/model-state-main.js
+          node --check extensions/moondesk-worker-companion/provider-correlation-main.js
+          node --check extensions/moondesk-worker-companion/popup.js
           node --test npm/install-binary.test.js npm/update-manager.test.js npm/moondesk.test.js
+          node --test extensions/moondesk-worker-companion/background.test.js
+          python3 -m py_compile .github/scripts/package-worker-companion.py
+          python3 .github/scripts/package-worker-companion.py --output "$RUNNER_TEMP/companion-source.zip"
+          test -s "$RUNNER_TEMP/companion-source.zip"
           test "$(node -p "require('./package.json').repository.url")" = "git+https://github.com/Shattermoon/moondesk.git"
           node -e "const p=require('./package.json'); const s=p.scripts||{}; if (s.preinstall||s.install||s.postinstall) process.exit(1)"
           node -e "const p=require('./package.json'); if (Object.keys(p.bin||{}).length !== 1 || p.bin.moondesk !== 'npm/moondesk.js') throw new Error('MoonDesk must expose exactly one CLI bin'); for (const f of ['npm/moondesk.js','npm/install-binary.js','npm/update-manager.js','skills/browser/SKILL.md']) if (!p.files?.includes(f)) throw new Error('missing packaged runtime file: '+f)"
@@ -315,6 +325,13 @@ jobs:
         run: |
           set -euo pipefail
           version="$(node .github/scripts/release-version.mjs --bump "$RELEASE_BUMP" --apply)"
+          VERSION="$version" node - <<'NODE'
+          const fs = require('node:fs');
+          const path = 'extensions/moondesk-worker-companion/manifest.json';
+          const manifest = JSON.parse(fs.readFileSync(path, 'utf8'));
+          manifest.version = process.env.VERSION;
+          fs.writeFileSync(path, `${JSON.stringify(manifest, null, 2)}\n`);
+          NODE
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "tag=v$version" >> "$GITHUB_OUTPUT"
           echo "Preparing MoonDesk v$version from merged PR #${{ needs.gate.outputs.pr_number }}"
@@ -326,6 +343,7 @@ jobs:
           expected="${{ steps.version.outputs.version }}"
           test "$(node -p "require('./package.json').version")" = "$expected"
           grep -q "^version = \"$expected\"$" Cargo.toml
+          test "$(node -p "require('./extensions/moondesk-worker-companion/manifest.json').version")" = "$expected"
           cargo +stable check --locked
           node --test npm/install-binary.test.js npm/update-manager.test.js npm/moondesk.test.js
           node .github/scripts/verify-npm-package.mjs
@@ -343,7 +361,7 @@ jobs:
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add package.json Cargo.toml Cargo.lock
+          git add package.json Cargo.toml Cargo.lock extensions/moondesk-worker-companion/manifest.json
           git commit --allow-empty -m "chore(release): ${TAG}"
           candidate_sha="$(git rev-parse HEAD)"
           git push origin "HEAD:refs/heads/${candidate_branch}"
@@ -510,12 +528,67 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  companion:
+    name: Package Worker Companion
+    needs: prepare
+    if: needs.prepare.result == 'success'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ needs.prepare.outputs.candidate_branch }}
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          package-manager-cache: false
+
+      - name: Verify companion candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "${{ needs.prepare.outputs.candidate_sha }}"
+          expected="${{ needs.prepare.outputs.version }}"
+          test "$(node -p "require('./extensions/moondesk-worker-companion/manifest.json').version")" = "$expected"
+          node --check extensions/moondesk-worker-companion/background.js
+          node --check extensions/moondesk-worker-companion/content.js
+          node --check extensions/moondesk-worker-companion/chatgpt-dom.js
+          node --check extensions/moondesk-worker-companion/model-state-main.js
+          node --check extensions/moondesk-worker-companion/provider-correlation-main.js
+          node --check extensions/moondesk-worker-companion/popup.js
+          node --test extensions/moondesk-worker-companion/background.test.js
+
+      - name: Create store-ready companion ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/package-worker-companion.py \
+            --output dist/moondesk-worker-companion.zip \
+            --expected-version "${{ needs.prepare.outputs.version }}"
+          test -s dist/moondesk-worker-companion.zip
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: moondesk-worker-companion
+          path: dist/moondesk-worker-companion.zip
+          if-no-files-found: error
+          retention-days: 7
+
   release:
     name: Commit, tag, create GitHub Release, and publish npm
     needs:
       - prepare
       - build
-    if: needs.prepare.result == 'success' && needs.build.result == 'success'
+      - companion
+    if: >-
+      needs.prepare.result == 'success' &&
+      needs.build.result == 'success' &&
+      needs.companion.result == 'success'
     runs-on: ubuntu-22.04
     timeout-minutes: 40
     permissions:
@@ -594,7 +667,8 @@ jobs:
           mkdir -p release
           find artifacts -type f -name 'moondesk-*' -exec cp {} release/ \;
           cd release
-          test "$(find . -maxdepth 1 -type f -name 'moondesk-*' | wc -l)" -eq 5
+          test "$(find . -maxdepth 1 -type f -name 'moondesk-*' | wc -l)" -eq 6
+          test -f moondesk-worker-companion.zip
           sha256sum moondesk-* > SHA256SUMS
           ls -la
 
@@ -624,7 +698,8 @@ jobs:
             moondesk-darwin-x64 \
             moondesk-linux-arm64 \
             moondesk-linux-x64 \
-            moondesk-win32-x64.exe | sort)"
+            moondesk-win32-x64.exe \
+            moondesk-worker-companion.zip | sort)"
           test "$actual_assets" = "$expected_assets"
 
           verify_dir="$RUNNER_TEMP/release-download"
@@ -707,6 +782,7 @@ jobs:
           version="$(node -p "require('./package.json').version")"
           test "$GITHUB_REF_NAME" = "v${version}"
           grep -q "^version = \"${version}\"$" Cargo.toml
+          test "$(node -p "require('./extensions/moondesk-worker-companion/manifest.json').version")" = "$version"
           test -f npm/install-binary.js
           test -f npm/update-manager.js
           test ! -e npm/postinstall.js
@@ -728,7 +804,8 @@ jobs:
             moondesk-darwin-x64 \
             moondesk-linux-arm64 \
             moondesk-linux-x64 \
-            moondesk-win32-x64.exe | sort)"
+            moondesk-win32-x64.exe \
+            moondesk-worker-companion.zip | sort)"
           test "$actual_assets" = "$expected_assets"
 
           verify_dir="$RUNNER_TEMP/release-assets"

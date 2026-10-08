@@ -20,7 +20,13 @@ It intentionally owns only a small surface:
 
 It does **not** match ChatGPT Projects, MoonDesk workspaces, connectors, or local folders by display name. Workspace authority remains the exact MoonDesk connector route / WorkspaceId. It also does **not** record transcripts, spawn nested workers, mirror agent state, or use the workspace MCP URL as an authentication credential.
 
+## Distribution
+
+Production users should install the Worker Companion from the Chrome Web Store (Chrome/Brave) or Microsoft Edge Add-ons (Edge). GitHub Releases also include the exact checksummed `moondesk-worker-companion.zip` as a beta/recovery fallback. Store publication and onboarding requirements are tracked in [`docs/WORKER_COMPANION_DISTRIBUTION.md`](../../docs/WORKER_COMPANION_DISTRIBUTION.md).
+
 ## Local install
+
+The steps below are for experimental/developer builds only.
 
 1. Build/run the matching experimental MoonDesk branch.
 2. Open `chrome://extensions` (or `edge://extensions`), enable Developer mode, and choose **Load unpacked**.

@@ -1104,6 +1104,12 @@ async fn handle_tools_call_for_workspace(
         let anchor_route = if arguments.get("action").and_then(Value::as_str) == Some("spawn") {
             match companion_auth.as_ref() {
                 Some(auth) => {
+                    if auth.paired_client_count().await == 0 {
+                        return tool_error_response_text_only(
+                            req,
+                            "Workers require the optional MoonDesk Worker Companion. MoonDesk works normally without it. Open MoonDesk Settings -> Workers, choose Set up Workers, then load the companion folder with Developer mode -> Load unpacked and retry.".into(),
+                        );
+                    }
                     let request_id = inbound_request_id.as_deref();
                     let operation_id = arguments
                         .get("operation_id")
@@ -4198,6 +4204,74 @@ mod tests {
             Some("text")
         );
         assert!(broker.snapshot().await.families.is_empty());
+    }
+
+    #[tokio::test]
+    async fn workers_mcp_spawn_explains_optional_companion_when_unpaired() {
+        let root = TestTempDir::new("moondesk-workers-mcp-unpaired-companion");
+        let workspace_root = root.path().join("workspace");
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        let workspace_root = workspaces::canonicalize_existing_workspace_root(&workspace_root)
+            .expect("canonicalize workspace like production registration");
+        let workspace_id = WorkspaceId::new();
+        let broker = Arc::new(
+            WorkerBroker::open(root.path().join("worker-state-v1.json"))
+                .expect("open worker broker"),
+        );
+        let managed_chat_broker = Arc::new(
+            ManagedChatBroker::open(root.path().join("managed-chat-state-v1.json"))
+                .expect("open managed chat broker"),
+        );
+        let companion_auth = Arc::new(
+            CompanionAuth::open(root.path().join("companion-auth-v1.json"))
+                .expect("open companion auth"),
+        );
+        let command_jobs = CommandJobManager::new();
+        let browser_runtime = None;
+        let response = handle_tools_call_for_workspace(
+            &tool_call_request_with_session(
+                "workers",
+                json!({
+                    "action": "spawn",
+                    "operation_id": Uuid::new_v4().to_string(),
+                    "label": "optional companion",
+                    "task": "Inspect without editing."
+                }),
+                "unpaired-companion-core",
+            ),
+            McpRequestContext {
+                workspace_id: &workspace_id,
+                workspace_name: "Test Workspace",
+                workspace_root: &workspace_root.to_string_lossy(),
+                mode: Mode::Both,
+                tool_mode: ToolMode::MultiTools,
+                set_moondesk_as_co_author: false,
+                handoff_store_root: None,
+                command_jobs: &command_jobs,
+                browser_runtime: &browser_runtime,
+                worker_execution_profile: ChatExecutionProfile::default(),
+                worker_target_count: crate::workers::RECOMMENDED_WORKERS_PER_FAMILY,
+                worker_broker: broker.clone(),
+                managed_chat_broker: managed_chat_broker.clone(),
+                companion_auth: Some(companion_auth),
+                inbound_request_id: None,
+            },
+        )
+        .await;
+
+        assert_eq!(
+            response
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        let text = result_text(&response);
+        assert!(text.contains("optional MoonDesk Worker Companion"));
+        assert!(text.contains("Set up Workers"));
+        assert!(broker.snapshot().await.families.is_empty());
+        assert!(managed_chat_broker.snapshot().await.commands.is_empty());
     }
 
     #[tokio::test]

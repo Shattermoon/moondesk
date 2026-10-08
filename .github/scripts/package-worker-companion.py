@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build the exact MoonDesk Worker Companion ZIP used for releases/store upload."""
+"""Build the exact MoonDesk Worker Companion ZIP used for release/recovery distribution."""
 
 from __future__ import annotations
 

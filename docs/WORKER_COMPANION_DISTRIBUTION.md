@@ -6,15 +6,13 @@ MoonDesk should **not** depend on browser-store approval for this companion. The
 
 ## Distribution model
 
-### Primary: bundled local extension folder
+### Primary: embedded companion → stable local folder
 
-The normal MoonDesk installation should materialize a stable local folder containing the exact Worker Companion version shipped with that MoonDesk release.
+The MoonDesk native binary embeds the exact Worker Companion runtime files from the same source revision. On startup MoonDesk materializes those bytes into the stable `~/.moondesk/worker-companion` directory. This works for npm-installed MoonDesk and direct native-binary installs without requiring a repository checkout.
 
-The user should never need to clone the repository or copy source files manually. MoonDesk setup should expose the folder directly (for example, **Open Worker Companion folder**) and explain the browser steps.
+The browser installation remains optional and explicit: normal MoonDesk does not require the companion. Users who want Workers choose **Set up Workers (open companion folder)** in MoonDesk Settings, then load that stable folder with **Load unpacked**.
 
-The folder must be stable across MoonDesk updates. Do not point Chrome at an ephemeral build, temporary extraction directory, Cargo target directory, npm cache entry, or version-specific release folder that disappears on update.
-
-A future update path may replace the files in that stable folder and ask/reload the extension only when no worker/Core browser operation is busy. Updating the bytes and reloading the running Manifest V3 extension are separate operations; MoonDesk must never claim the new companion is active merely because the files on disk changed.
+The stable directory itself is kept in place across MoonDesk updates so Chromium can keep remembering the same unpacked-extension path. MoonDesk refreshes the known runtime files in place and publishes `manifest.json` last; it does not treat updated files on disk as proof that the running Manifest V3 extension has reloaded.
 
 ### Release ZIP fallback
 
@@ -37,21 +35,17 @@ Repository contributors may load `extensions/moondesk-worker-companion` directly
 
 The production instructions should be short and shown inside MoonDesk rather than buried in documentation:
 
-1. Install/update MoonDesk and start it.
-2. In MoonDesk, choose **Set up Worker Companion**.
-3. Choose the browser used for ChatGPT: Chrome, Edge, or Brave.
-4. MoonDesk opens that browser's extensions page:
-   - Chrome: `chrome://extensions`
-   - Edge: `edge://extensions`
-   - Brave: `brave://extensions`
-5. Turn on **Developer mode**.
-6. Click **Load unpacked**.
-7. In MoonDesk, click **Open Worker Companion folder** and choose that exact folder in the browser picker.
-8. Open ChatGPT in the same browser and sign in normally.
-9. The companion discovers MoonDesk's loopback bridge and pairs automatically. There is no per-chat pairing code or token to copy.
-10. Open the ChatGPT conversation that will act as the **Core**.
-11. In the companion popup, click **Discover available ChatGPT models**, select model/reasoning effort, and save the worker profile.
-12. Ask Core to create workers. MoonDesk recommends **1–4 simultaneous workers**; 8 remains the hard product ceiling, not the recommended everyday setting.
+1. Install/update MoonDesk and start it. No extension is required for normal MoonDesk use.
+2. Only if Workers are wanted, open **Settings → Workers** and choose **Set up Workers (open companion folder)**.
+3. MoonDesk opens its stable `~/.moondesk/worker-companion` folder.
+4. In the browser used for ChatGPT, open `chrome://extensions`, `edge://extensions`, or `brave://extensions`.
+5. Turn on **Developer mode** and click **Load unpacked**.
+6. Select the Worker Companion folder MoonDesk opened.
+7. Open ChatGPT in the same browser and sign in normally.
+8. The companion discovers MoonDesk's loopback bridge and pairs automatically. There is no per-chat pairing code or token to copy.
+9. Open the ChatGPT conversation that will act as the **Core**.
+10. In the companion popup, click **Discover available ChatGPT models**, select model/reasoning effort, and save the worker profile.
+11. Ask Core to create workers. MoonDesk recommends **1–4 simultaneous workers**; 8 remains the hard product ceiling, not the recommended everyday setting.
 
 Fresh workers are ordinary ChatGPT conversations even when Core lives in a ChatGPT Project. Existing workers reuse their exact durable conversation.
 
@@ -89,7 +83,7 @@ The release pipeline treats the Worker Companion as a first-class release artifa
 8. `SHA256SUMS` covers the companion ZIP together with the five native binaries;
 9. tag-context verification requires the companion version to match the immutable MoonDesk tag and re-verifies the checksum set before npm publication.
 
-The next distribution implementation step is to materialize those exact release companion files into a stable MoonDesk-owned local folder and expose **Open Worker Companion folder** from MoonDesk setup. That is preferable to a browser-store dependency.
+The native binary now also embeds those exact runtime files and materializes them into the stable MoonDesk-owned `~/.moondesk/worker-companion` folder. Settings exposes **Set up Workers (open companion folder)** / **Open Worker Companion folder**, so production users never need a repository checkout or Cargo/npm cache path.
 
 ## Production gate
 

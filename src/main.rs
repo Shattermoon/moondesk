@@ -6,6 +6,7 @@ mod clippymoon_gen;
 mod command;
 mod command_jobs;
 mod companion;
+mod companion_install;
 mod handoff;
 mod managed_chat;
 
@@ -4065,7 +4066,7 @@ async fn run_settings(
         let app = state.lock().await;
         themes.iter().position(|t| t.id == app.theme).unwrap_or(0)
     };
-    let total_rows = themes.len() + tool_modes.len() + browser_presentations.len() + 6;
+    let total_rows = themes.len() + tool_modes.len() + browser_presentations.len() + 7;
 
     loop {
         let (
@@ -4081,6 +4082,8 @@ async fn run_settings(
             companion_auth,
             companion_pairing_code,
             companion_local_url,
+            companion_directory,
+            companion_materialize_error,
         ) = {
             let app = state.lock().await;
             (
@@ -4098,6 +4101,10 @@ async fn run_settings(
                 app.companion_bridge_port
                     .map(|port| format!("http://127.0.0.1:{port}"))
                     .unwrap_or_else(|| "unavailable".into()),
+                app.companion_directory
+                    .as_ref()
+                    .map(|path| path.to_string_lossy().into_owned()),
+                app.companion_materialize_error.clone(),
             )
         };
         let companion_client_id = companion_auth.paired_client_id().await;
@@ -4113,6 +4120,8 @@ async fn run_settings(
                     companion_pairing_code: &companion_pairing_code,
                     companion_client_id: companion_client_id.as_deref(),
                     companion_local_url: &companion_local_url,
+                    companion_directory: companion_directory.as_deref(),
+                    companion_materialize_error: companion_materialize_error.as_deref(),
                     set_moondesk_as_co_author,
                     ngrok_authtoken_configured,
                     ngrok_domain: ngrok_domain.as_deref(),
@@ -4228,6 +4237,40 @@ async fn run_settings(
                             app.log("INFO", format!("Worker target count: {count}"));
                             app.mark_config_dirty();
                         } else if selected_row == settings_action_start + 3 {
+                            drop(app);
+                            let config_path = app_config_path()?;
+                            match companion_install::materialize_for_config(&config_path) {
+                                Ok(install) => {
+                                    let directory = install.directory.clone();
+                                    {
+                                        let mut app = state.lock().await;
+                                        app.companion_directory = Some(directory.clone());
+                                        app.companion_materialize_error = None;
+                                        app.log(
+                                            "INFO",
+                                            format!(
+                                                "Optional Worker Companion ready at {}",
+                                                directory.to_string_lossy()
+                                            ),
+                                        );
+                                    }
+                                    if let Err(error) = companion_install::open_folder(&directory) {
+                                        state.lock().await.log("WARN", error);
+                                    }
+                                }
+                                Err(error) => {
+                                    let mut app = state.lock().await;
+                                    app.companion_directory = None;
+                                    app.companion_materialize_error = Some(error.to_string());
+                                    app.log(
+                                        "WARN",
+                                        format!(
+                                            "Could not prepare optional Worker Companion: {error}"
+                                        ),
+                                    );
+                                }
+                            }
+                        } else if selected_row == settings_action_start + 4 {
                             app.set_moondesk_as_co_author = !app.set_moondesk_as_co_author;
                             let enabled = app.set_moondesk_as_co_author;
                             app.log(
@@ -4238,11 +4281,11 @@ async fn run_settings(
                                 ),
                             );
                             app.mark_config_dirty();
-                        } else if selected_row == settings_action_start + 4 {
+                        } else if selected_row == settings_action_start + 5 {
                             drop(app);
                             let _ =
                                 run_ngrok_auth_setup(terminal, state.clone(), None, true).await?;
-                        } else if selected_row == settings_action_start + 5 {
+                        } else if selected_row == settings_action_start + 6 {
                             let previous_domain = app.ngrok_domain.clone();
                             let current_domain = previous_domain.clone().unwrap_or_default();
                             drop(app);
@@ -4328,6 +4371,8 @@ struct SettingsView<'a> {
     companion_pairing_code: &'a str,
     companion_client_id: Option<&'a str>,
     companion_local_url: &'a str,
+    companion_directory: Option<&'a str>,
+    companion_materialize_error: Option<&'a str>,
     set_moondesk_as_co_author: bool,
     ngrok_authtoken_configured: bool,
     ngrok_domain: Option<&'a str>,
@@ -4347,6 +4392,8 @@ fn draw_settings(f: &mut Frame, view: SettingsView<'_>) {
         companion_pairing_code,
         companion_client_id,
         companion_local_url,
+        companion_directory,
+        companion_materialize_error,
         set_moondesk_as_co_author,
         ngrok_authtoken_configured,
         ngrok_domain,
@@ -4515,6 +4562,8 @@ fn draw_settings(f: &mut Frame, view: SettingsView<'_>) {
     let worker_model_selected = worker_model_row == selected_row;
     let worker_effort_selected = worker_effort_row == selected_row;
     let worker_count_selected = worker_count_row == selected_row;
+    let worker_setup_row = worker_count_row + 1;
+    let worker_setup_selected = worker_setup_row == selected_row;
     let worker_model_style = if worker_model_selected {
         Style::default()
             .fg(palette.key_fg)
@@ -4530,6 +4579,13 @@ fn draw_settings(f: &mut Frame, view: SettingsView<'_>) {
         Style::default().fg(palette.primary_fg)
     };
     let worker_count_style = if worker_count_selected {
+        Style::default()
+            .fg(palette.key_fg)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(palette.primary_fg)
+    };
+    let worker_setup_style = if worker_setup_selected {
         Style::default()
             .fg(palette.key_fg)
             .add_modifier(Modifier::BOLD)
@@ -4586,11 +4642,19 @@ fn draw_settings(f: &mut Frame, view: SettingsView<'_>) {
         Style::default().fg(palette.muted_fg),
     )));
     lines.push(Line::from(Span::styled(
+        "     Worker Companion is optional. MoonDesk works normally without it; only Workers need it.",
+        Style::default().fg(palette.muted_fg),
+    )));
+    lines.push(Line::from(Span::styled(
+        "     Setup: chrome://extensions (or edge://extensions / brave://extensions) -> Developer mode -> Load unpacked.",
+        Style::default().fg(palette.muted_fg),
+    )));
+    lines.push(Line::from(Span::styled(
         format!(
             "     Companion: {} · {}",
             companion_client_id
                 .map(|_| "paired")
-                .unwrap_or("not paired"),
+                .unwrap_or("not installed/paired"),
             companion_local_url
         ),
         Style::default().fg(if companion_client_id.is_some() {
@@ -4599,16 +4663,42 @@ fn draw_settings(f: &mut Frame, view: SettingsView<'_>) {
             palette.muted_fg
         }),
     )));
+    if worker_setup_selected {
+        selected_line_idx = lines.len();
+    }
+    lines.push(Line::from(Span::styled(
+        format!(
+            " {} [{}] {}",
+            if worker_setup_selected { ">" } else { " " },
+            worker_setup_row + 1,
+            if companion_client_id.is_some() {
+                "Open Worker Companion folder"
+            } else {
+                "Set up Workers (open companion folder)"
+            }
+        ),
+        worker_setup_style,
+    )));
+    match (companion_directory, companion_materialize_error) {
+        (Some(directory), _) => lines.push(Line::from(Span::styled(
+            format!("     Developer mode -> Load unpacked -> {directory}"),
+            Style::default().fg(palette.muted_fg),
+        ))),
+        (None, Some(error)) => lines.push(Line::from(Span::styled(
+            format!("     Companion folder unavailable: {error}"),
+            Style::default().fg(palette.danger_fg),
+        ))),
+        (None, None) => lines.push(Line::from(Span::styled(
+            "     Companion folder is not prepared yet.",
+            Style::default().fg(palette.muted_fg),
+        ))),
+    }
     lines.push(Line::from(Span::styled(
         format!("     Manual repair code: {companion_pairing_code}"),
         Style::default().fg(palette.muted_fg),
     )));
-    lines.push(Line::from(Span::styled(
-        "     The companion verifies model + effort before it sends a worker assignment.",
-        Style::default().fg(palette.muted_fg),
-    )));
 
-    let co_author_row = worker_count_row + 1;
+    let co_author_row = worker_setup_row + 1;
     let co_author_selected = co_author_row == selected_row;
     let co_author_marker = if co_author_selected { ">" } else { " " };
     let co_author_name_style = if co_author_selected {
@@ -10330,6 +10420,10 @@ mod tests {
                             companion_pairing_code: "test-pairing-code",
                             companion_client_id: None,
                             companion_local_url: "http://127.0.0.1:3200",
+                            companion_directory: Some(
+                                r"C:\Users\tester\.moondesk\worker-companion",
+                            ),
+                            companion_materialize_error: None,
                             set_moondesk_as_co_author: false,
                             ngrok_authtoken_configured: false,
                             ngrok_domain: None,
@@ -10366,6 +10460,8 @@ mod tests {
                         companion_pairing_code: "test-pairing-code",
                         companion_client_id: None,
                         companion_local_url: "http://127.0.0.1:3200",
+                        companion_directory: Some(r"C:\Users\tester\.moondesk\worker-companion"),
+                        companion_materialize_error: None,
                         set_moondesk_as_co_author: false,
                         ngrok_authtoken_configured: false,
                         ngrok_domain: None,
@@ -10422,6 +10518,8 @@ mod tests {
                         companion_pairing_code: "test-pairing-code",
                         companion_client_id: Some("extension-install-a"),
                         companion_local_url: "http://127.0.0.1:3200",
+                        companion_directory: Some(r"C:\Users\tester\.moondesk\worker-companion"),
+                        companion_materialize_error: None,
                         set_moondesk_as_co_author: false,
                         ngrok_authtoken_configured: false,
                         ngrok_domain: None,
@@ -10448,7 +10546,12 @@ mod tests {
         assert!(rendered.contains("Reasoning effort: High"));
         assert!(rendered.contains("Worker count: 4 (recommended 1-4, max 8)"));
         assert!(rendered.contains("5-8 workers can hit ChatGPT/provider rate limits"));
+        assert!(rendered.contains("Worker Companion is optional"));
+        assert!(rendered.contains("MoonDesk works normally without it"));
+        assert!(rendered.contains("chrome://extensions"));
         assert!(rendered.contains("Companion: paired"));
+        assert!(rendered.contains("Open Worker Companion folder"));
+        assert!(rendered.contains("Developer mode -> Load unpacked"));
         assert!(rendered.contains("http://127.0.0.1:3200"));
         assert!(rendered.contains("Manual repair code: test-pairing-code"));
     }
@@ -10461,7 +10564,7 @@ mod tests {
         let auth_token_row = super::theme::all().len()
             + super::ToolMode::all().len()
             + super::BrowserPresentation::all().len()
-            + 3;
+            + 5;
         let backend = TestBackend::new(100, 32);
         let mut terminal = Terminal::new(backend).expect("create ngrok auth settings terminal");
 
@@ -10478,6 +10581,8 @@ mod tests {
                         companion_pairing_code: "test-pairing-code",
                         companion_client_id: None,
                         companion_local_url: "http://127.0.0.1:3200",
+                        companion_directory: Some(r"C:\Users\tester\.moondesk\worker-companion"),
+                        companion_materialize_error: None,
                         set_moondesk_as_co_author: false,
                         ngrok_authtoken_configured: true,
                         ngrok_domain: Some("example.ngrok-free.app"),
@@ -10557,6 +10662,8 @@ mod tests {
                         companion_pairing_code: "test-pairing-code",
                         companion_client_id: None,
                         companion_local_url: "http://127.0.0.1:3200",
+                        companion_directory: Some(r"C:\Users\tester\.moondesk\worker-companion"),
+                        companion_materialize_error: None,
                         set_moondesk_as_co_author: false,
                         ngrok_authtoken_configured: false,
                         ngrok_domain: None,

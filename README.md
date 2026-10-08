@@ -125,17 +125,20 @@ Select the connector and start working.
 
 Workers let one ChatGPT conversation act as the **Core** and delegate independent tasks to durable worker conversations in the same MoonDesk workspace. The configurable target is **1-8 workers**, defaults to **4**, and has a hard maximum of **8 active workers per Core family**. **1-4 workers is the recommended operating range.** Using **5-8 workers** is supported but can trigger ChatGPT/provider rate limits, especially when the account already has other conversations generating at the same time, so higher counts are best treated as an advanced/high-load mode. MoonDesk launches up to four fresh worker conversations concurrently so the recommended group does not serialize behind one slow launch. Worker identity is bound to the route-resolved workspace plus ChatGPT's exact session metadata; a different conversation in the same workspace does not inherit Core or worker authority. ChatGPT Project names, connector names, MoonDesk workspace names, and folder names are display-only and are never used as routing or authorization keys.
 
-### Install the companion
+### Optional Worker Companion setup
 
-MoonDesk ships the Worker Companion as a local unpacked extension, following the same practical model as Chat On Steroids: enable browser Developer mode once, then load MoonDesk's companion folder with **Load unpacked**. Each MoonDesk GitHub Release also carries the exact checksummed `moondesk-worker-companion.zip` as a beta/recovery fallback. The full release/onboarding plan is in [`docs/WORKER_COMPANION_DISTRIBUTION.md`](docs/WORKER_COMPANION_DISTRIBUTION.md).
+You do **not** need the extension for normal MoonDesk use. Install it only when you want Workers/sub-agents. MoonDesk embeds the exact companion files from its own build and keeps them in the stable `~/.moondesk/worker-companion` folder; browser installation remains an explicit user opt-in. Each GitHub Release also carries the same checksummed `moondesk-worker-companion.zip` as a beta/recovery fallback. The full release/onboarding plan is in [`docs/WORKER_COMPANION_DISTRIBUTION.md`](docs/WORKER_COMPANION_DISTRIBUTION.md).
 
-Experimental/source builds use the repository folder directly:
+To enable Workers:
 
-1. Open `chrome://extensions` (or `edge://extensions`), enable **Developer mode**, and choose **Load unpacked**.
-2. Select `extensions/moondesk-worker-companion`.
-3. Start MoonDesk. The extension discovers MoonDesk's dedicated loopback-only companion bridge and pairs automatically; there is no per-chat token step. Multiple browser installations may remain paired independently.
-4. Open the ChatGPT conversation you want to use as the Core. No Project/workspace binding step is required.
-5. Click **Discover available ChatGPT models**, choose a confirmed model and reasoning effort, and save the worker profile. The companion reads ChatGPT's provider-owned picker state instead of relying on translated labels, and supports the current provider effort lanes (`Instant`, `Minimal`, `Low`, `Medium`, `High`, `Extra High`, `Max`, `Ultra`, and `Pro`) when the account actually offers them. Existing `Extra High` profiles remain compatible with the provider's `xhigh`/`max` migration.
+1. Start MoonDesk and open **Settings → Workers**.
+2. Choose **Set up Workers (open companion folder)**. MoonDesk opens its stable Worker Companion folder.
+3. Open `chrome://extensions` (or `edge://extensions` / `brave://extensions`), enable **Developer mode**, choose **Load unpacked**, and select the folder MoonDesk opened.
+4. Open ChatGPT in that same browser. The extension discovers MoonDesk's loopback-only bridge and pairs automatically; there is no per-chat token step. Multiple browser installations may remain paired independently.
+5. Open the ChatGPT conversation you want to use as the Core. No Project/workspace binding step is required.
+6. In the companion popup, click **Discover available ChatGPT models**, choose a confirmed model and reasoning effort, and save the worker profile. The companion reads ChatGPT's provider-owned picker state instead of relying on translated labels, and supports the current provider effort lanes (`Instant`, `Minimal`, `Low`, `Medium`, `High`, `Extra High`, `Max`, `Ultra`, and `Pro`) when the account actually offers them. Existing `Extra High` profiles remain compatible with the provider's `xhigh`/`max` migration.
+
+Contributors running from source can still load `extensions/moondesk-worker-companion` directly.
 
 Workers V1 always creates fresh workers as ordinary ChatGPT conversations, even when the Core is inside a ChatGPT Project. Project membership remains useful Core routing metadata, but it is not a worker placement target and MoonDesk never clones the Core conversation to create a worker. Fresh workers are routed to the paired browser that positively observes the exact Core. After the worker conversation is confirmed, reuse remains attached to that durable thread/browser affinity; legacy workers that were previously created inside a Project can still be reused by their exact confirmed conversation binding.
 

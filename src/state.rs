@@ -13,6 +13,7 @@ use uuid::Uuid;
 
 use crate::command_jobs::CommandJobManager;
 use crate::companion::CompanionAuth;
+use crate::companion_install;
 use crate::managed_chat::{self, broker::ManagedChatBroker, types::ChatExecutionProfile};
 use crate::mascot::{self, MascotPack};
 use crate::theme;
@@ -1013,6 +1014,8 @@ pub struct AppState {
     pub managed_chat_broker: Arc<ManagedChatBroker>,
     pub companion_auth: Arc<CompanionAuth>,
     pub companion_bridge_port: Option<u16>,
+    pub companion_directory: Option<PathBuf>,
+    pub companion_materialize_error: Option<String>,
     config_path: PathBuf,
     pub server_handle: Option<tokio::task::JoinHandle<()>>,
     pub companion_server_handle: Option<tokio::task::JoinHandle<()>>,
@@ -1598,6 +1601,11 @@ impl AppState {
             ManagedChatBroker::open(managed_chat_store_path).map_err(std::io::Error::other)?,
         );
         let companion_auth = Arc::new(CompanionAuth::open_for_config(&config_path)?);
+        let (companion_directory, companion_materialize_error, companion_refreshed) =
+            match companion_install::materialize_for_config(&config_path) {
+                Ok(install) => (Some(install.directory), None, install.refreshed),
+                Err(error) => (None, Some(error.to_string()), false),
+            };
 
         let mut app = Self {
             theme: config.theme,
@@ -1640,11 +1648,30 @@ impl AppState {
             managed_chat_broker,
             companion_auth,
             companion_bridge_port: None,
+            companion_directory,
+            companion_materialize_error,
             config_path,
             server_handle: None,
             companion_server_handle: None,
             ngrok_task: None,
         };
+        match (&app.companion_directory, &app.companion_materialize_error) {
+            (Some(directory), _) => app.log(
+                "INFO",
+                format!(
+                    "Worker Companion {} at {}",
+                    if companion_refreshed { "refreshed" } else { "ready" },
+                    directory.to_string_lossy()
+                ),
+            ),
+            (None, Some(error)) => app.log(
+                "WARN",
+                format!(
+                    "Optional Worker Companion could not be prepared; normal MoonDesk remains available: {error}"
+                ),
+            ),
+            (None, None) => {}
+        }
         app.log("INFO", format!("ClippyMoon seed: {mascot_seed:016x}"));
         if !had_existing_workspace {
             app.log(

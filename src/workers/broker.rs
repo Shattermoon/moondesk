@@ -12,6 +12,7 @@ use super::{
 use crate::workspaces::WorkspaceId;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 use std::fmt;
 use std::path::PathBuf;
 use subtle::ConstantTimeEq;
@@ -379,6 +380,57 @@ impl WorkerBroker {
         self.commit_candidate(&mut guard, candidate).await?;
         self.updates.notify_waiters();
         Ok(Some(updated))
+    }
+
+    pub async fn sync_browser_presence(
+        &self,
+        open_conversation_ids: &BTreeSet<String>,
+    ) -> Result<Vec<WorkerRecord>, WorkerBrokerError> {
+        let mut guard = self.data.lock().await;
+        let mut candidate = guard.clone();
+        let mut changed = Vec::new();
+
+        for family in candidate.families.values_mut() {
+            for worker in family.workers.values_mut() {
+                let Some(conversation_id) = worker
+                    .conversation_url
+                    .as_deref()
+                    .and_then(conversation_id_from_url)
+                else {
+                    continue;
+                };
+                let open = open_conversation_ids.contains(&conversation_id);
+                let desired = match worker.state {
+                    WorkerState::Running => {
+                        if open {
+                            BrowserAttachmentState::Attached
+                        } else {
+                            BrowserAttachmentState::Detached
+                        }
+                    }
+                    WorkerState::Idle => {
+                        if open {
+                            BrowserAttachmentState::Attached
+                        } else {
+                            BrowserAttachmentState::Absent
+                        }
+                    }
+                    WorkerState::Retired => BrowserAttachmentState::Absent,
+                    WorkerState::Provisioning | WorkerState::Waking => continue,
+                };
+                if worker.attachment_state != desired {
+                    worker.attachment_state = desired;
+                    changed.push(worker.clone());
+                }
+            }
+        }
+
+        if changed.is_empty() {
+            return Ok(changed);
+        }
+        self.commit_candidate(&mut guard, candidate).await?;
+        self.updates.notify_waiters();
+        Ok(changed)
     }
 
     pub async fn settle_pre_send_failure_by_command(
@@ -1429,6 +1481,9 @@ impl WorkerBroker {
         if worker.current_task_id.as_ref() == Some(&request.task_id) {
             worker.current_task_id = None;
             worker.state = WorkerState::Idle;
+            if worker.attachment_state == BrowserAttachmentState::Detached {
+                worker.attachment_state = BrowserAttachmentState::Absent;
+            }
         }
 
         self.commit_candidate(&mut guard, candidate).await?;
@@ -1460,6 +1515,25 @@ fn new_claim_token() -> String {
 
 fn storage_error(error: std::io::Error) -> WorkerBrokerError {
     WorkerBrokerError::Storage(format!("failed to persist worker state: {error}"))
+}
+
+fn conversation_id_from_url(value: &str) -> Option<String> {
+    let url = reqwest::Url::parse(value).ok()?;
+    if url.scheme() != "https" || url.host_str() != Some("chatgpt.com") {
+        return None;
+    }
+    let segments = url.path_segments()?.collect::<Vec<_>>();
+    let conversation_id = segments
+        .windows(2)
+        .find_map(|pair| (pair[0] == "c").then_some(pair[1]))?;
+    if !(16..=64).contains(&conversation_id.len())
+        || !conversation_id
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() || byte == b'-')
+    {
+        return None;
+    }
+    Some(conversation_id.to_ascii_lowercase())
 }
 
 fn validate_spawn_request(request: &SpawnWorkerRequest) -> Result<(), WorkerBrokerError> {
@@ -1565,6 +1639,128 @@ mod tests {
             validation: "tests passed".into(),
             blockers: Vec::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn browser_presence_detaches_running_worker_without_ending_its_task() {
+        let root = temp_root("moondesk-worker-detached-tab");
+        let path = root.join("worker-state-v1.json");
+        let broker = WorkerBroker::open(&path).expect("open worker broker");
+        let workspace = WorkspaceId::new();
+        let core = anchor("core-detached-tab");
+        let worker_identity = anchor("worker-detached-tab");
+        let spawned = broker
+            .spawn_worker(spawn_request(
+                OperationId::new(),
+                workspace.clone(),
+                core.clone(),
+                "keep working after the tab closes",
+            ))
+            .await
+            .expect("spawn worker");
+        let command_id = Uuid::new_v4().to_string();
+        broker
+            .link_launch_command(
+                &workspace,
+                &core,
+                &spawned.worker_id,
+                &spawned.task_id,
+                &command_id,
+            )
+            .await
+            .expect("link worker launch");
+        let conversation_id = "6aad7eb1-4b10-83ee-97bd-d98b338864de";
+        broker
+            .update_launch_by_command(
+                &command_id,
+                WorkerLaunchState::WaitingClaim,
+                None,
+                Some(format!("https://chatgpt.com/c/{conversation_id}")),
+            )
+            .await
+            .expect("bind durable worker conversation");
+        broker
+            .claim_worker(
+                &workspace,
+                &spawned.worker_id,
+                &spawned.task_id,
+                &spawned.claim_token,
+                worker_identity.clone(),
+            )
+            .await
+            .expect("claim worker");
+
+        let changed = broker
+            .sync_browser_presence(&BTreeSet::new())
+            .await
+            .expect("publish closed-tab presence");
+        assert_eq!(changed.len(), 1);
+        assert_eq!(changed[0].state, WorkerState::Running);
+        assert_eq!(
+            changed[0].attachment_state,
+            BrowserAttachmentState::Detached
+        );
+        assert_eq!(changed[0].current_task_id.as_ref(), Some(&spawned.task_id));
+        assert_eq!(
+            changed[0]
+                .tasks
+                .get(&spawned.task_id)
+                .map(|task| task.state),
+            Some(TaskState::Running)
+        );
+
+        broker
+            .report_worker(ReportWorkerRequest {
+                operation_id: OperationId::new(),
+                workspace_id: workspace.clone(),
+                worker_identity: worker_identity.clone(),
+                worker_id: spawned.worker_id.clone(),
+                task_id: spawned.task_id.clone(),
+                body: "server-side work continued after the browser view disappeared".into(),
+            })
+            .await
+            .expect("detached worker report remains valid");
+
+        let open = BTreeSet::from([conversation_id.to_string()]);
+        let reattached = broker
+            .sync_browser_presence(&open)
+            .await
+            .expect("publish returning page presence");
+        assert_eq!(reattached.len(), 1);
+        assert_eq!(
+            reattached[0].attachment_state,
+            BrowserAttachmentState::Attached
+        );
+        assert_eq!(reattached[0].state, WorkerState::Running);
+
+        broker
+            .sync_browser_presence(&BTreeSet::new())
+            .await
+            .expect("detach worker again before finish");
+        broker
+            .finish_task(FinishTaskRequest {
+                workspace_id: workspace.clone(),
+                worker_identity,
+                worker_id: spawned.worker_id.clone(),
+                task_id: spawned.task_id.clone(),
+                result: finished_result(),
+            })
+            .await
+            .expect("detached worker can finish normally");
+        let family = broker
+            .family_for_anchor(&workspace, &core)
+            .await
+            .expect("read worker family")
+            .expect("worker family exists");
+        let finished = family
+            .workers
+            .get(&spawned.worker_id)
+            .expect("worker remains reusable");
+        assert_eq!(finished.state, WorkerState::Idle);
+        assert_eq!(finished.attachment_state, BrowserAttachmentState::Absent);
+        assert!(finished.current_task_id.is_none());
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]

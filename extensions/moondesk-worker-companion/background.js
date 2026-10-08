@@ -1430,6 +1430,11 @@ chrome.tabs.onUpdated.addListener((_tabId, changeInfo, tab) => {
     schedulePump(25);
   }
 });
+chrome.tabs.onRemoved.addListener(() => {
+  // A closed worker tab is not a finished worker. Publish fresh presence quickly so MoonDesk can
+  // mark the durable worker as detached/no-tab without guessing that its server-side turn stopped.
+  schedulePump(25);
+});
 chrome.windows.onFocusChanged.addListener(() => {
   schedulePump(25);
 });

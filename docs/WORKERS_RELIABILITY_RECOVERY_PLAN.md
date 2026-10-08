@@ -126,6 +126,8 @@ After WorkerBroker creates the pending worker:
 - The popup never offers delayed manual replay of failed worker assignments; failed launches stay terminal and Core may create a replacement.
 - Browser-local state loss cannot create a fresh thread for an ambiguous command.
 - Clear workers may remove idle/retired and proven pre-Send-failed state for the exact Core, but refuses active or ambiguous work.
+- Closing the last browser tab for a running worker changes only browser attachment: the durable worker stays `Running`, keeps its current task/conversation binding, and becomes `Detached`/no-tab. Exact reports and `finish` remain valid, and presence of that exact conversation reattaches it.
+- Workers V1 does not free/reuse a detached running worker from silence alone. MoonDesk currently has durable worker-session identity but not the turn/request-level fence required to distinguish a late old-turn call from a newly reused assignment safely.
 
 ### H. Companion installation lifecycle
 
@@ -160,6 +162,7 @@ Recovery matrix:
 - enqueue failure -> no ghost worker
 - reconciliation missing local record -> zero tabs
 - first-send navigation destroys old document -> background still confirms new conversation
+- running worker tab closes -> worker remains running with detached/no-tab attachment; exact worker report/finish still succeeds; reopening the same conversation restores attached state
 
 Concurrency:
 - 4 fresh workers start independently

@@ -9,6 +9,7 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::collections::BTreeSet;
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -608,12 +609,30 @@ async fn update_companion_presence(
     let Some(client_id) = companion_client_id(&state, &headers).await else {
         return companion_unauthorized();
     };
-    let auth = { state.app.lock().await.companion_auth.clone() };
-    match auth
-        .update_presence(&client_id, update, unix_time_ms())
-        .await
-    {
-        Ok(presence) => json_response(StatusCode::OK, json!({ "presence": presence })),
+    let (auth, worker_broker) = {
+        let app = state.app.lock().await;
+        (app.companion_auth.clone(), app.worker_broker.clone())
+    };
+    let now_ms = unix_time_ms();
+    match auth.update_presence(&client_id, update, now_ms).await {
+        Ok(presence) => {
+            let open_conversation_ids = auth
+                .fresh_presence(now_ms)
+                .await
+                .into_iter()
+                .flat_map(|client| client.tabs.into_iter().map(|tab| tab.conversation_id))
+                .collect::<BTreeSet<_>>();
+            if let Err(error) = worker_broker
+                .sync_browser_presence(&open_conversation_ids)
+                .await
+            {
+                return json_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    json!({ "error": format!("worker browser presence sync failed: {error}") }),
+                );
+            }
+            json_response(StatusCode::OK, json!({ "presence": presence }))
+        }
         Err(error) => json_response(StatusCode::BAD_REQUEST, json!({ "error": error })),
     }
 }
@@ -2429,6 +2448,176 @@ mod tests {
             HeaderValue::from_static("wfr invalid/attempt"),
         );
         assert_eq!(normalized_openai_request_id(&invalid), None);
+    }
+
+    #[tokio::test]
+    async fn companion_presence_detaches_a_running_worker_without_ending_its_task() {
+        let workspace_root = unique_temp_path("moondesk-companion-detached-workspace");
+        let config_root = unique_temp_path("moondesk-companion-detached-config");
+        let config_path = config_root.join("config.toml");
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        std::fs::create_dir_all(&config_root).expect("create config dir");
+
+        let app = AppState::new_for_test(
+            8787,
+            workspace_root.to_string_lossy().into_owned(),
+            config_path.clone(),
+        )
+        .expect("create app state");
+        let workspace_id = app.workspaces[0].id.clone();
+        let broker = app.worker_broker.clone();
+        let auth = app.companion_auth.clone();
+        let origin = "chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let credential = "a".repeat(64);
+        auth.auto_pair("chrome-install", &credential, Some(origin))
+            .await
+            .expect("pair companion browser");
+
+        let core = crate::workers::types::ChatIdentity::from_openai_meta(
+            Some("test-subject"),
+            "core-detached-presence",
+        );
+        let worker_identity = crate::workers::types::ChatIdentity::from_openai_meta(
+            Some("test-subject"),
+            "worker-detached-presence",
+        );
+        let spawned = broker
+            .spawn_worker(crate::workers::broker::SpawnWorkerRequest {
+                operation_id: crate::workers::types::OperationId::new(),
+                workspace_id: workspace_id.clone(),
+                anchor_identity: core.clone(),
+                label: "detached presence".into(),
+                assignment: "keep working if the browser tab closes".into(),
+                execution_profile: ChatExecutionProfile::default(),
+            })
+            .await
+            .expect("spawn worker");
+        let command_id = Uuid::new_v4().to_string();
+        broker
+            .link_launch_command(
+                &workspace_id,
+                &core,
+                &spawned.worker_id,
+                &spawned.task_id,
+                &command_id,
+            )
+            .await
+            .expect("link worker launch command");
+        let worker_conversation = "6aad7eb1-4b10-83ee-97bd-d98b338864de";
+        broker
+            .update_launch_by_command(
+                &command_id,
+                crate::workers::types::WorkerLaunchState::WaitingClaim,
+                None,
+                Some(format!("https://chatgpt.com/c/{worker_conversation}")),
+            )
+            .await
+            .expect("store durable worker conversation");
+        broker
+            .claim_worker(
+                &workspace_id,
+                &spawned.worker_id,
+                &spawned.task_id,
+                &spawned.claim_token,
+                worker_identity,
+            )
+            .await
+            .expect("claim worker");
+
+        let app_state = Arc::new(Mutex::new(app));
+        let (ui_tx, _ui_rx) = ui_event_channel();
+        let server_state = ServerState {
+            app: app_state,
+            browser_runtime: None,
+            command_jobs: CommandJobManager::new(),
+            ui_events: ui_tx,
+            host_control_token: Arc::from("unused-host-token"),
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            COMPANION_TOKEN_HEADER,
+            HeaderValue::from_str(&credential).expect("credential header"),
+        );
+        headers.insert(header::ORIGIN, HeaderValue::from_static(origin));
+
+        let attached = update_companion_presence(
+            State(server_state.clone()),
+            headers.clone(),
+            Json(CompanionPresenceUpdate {
+                browser_label: Some("Chrome".into()),
+                tabs: vec![crate::companion::CompanionTabPresence {
+                    conversation_id: worker_conversation.into(),
+                    conversation_url: format!("https://chatgpt.com/c/{worker_conversation}"),
+                    project_id: None,
+                    project_url: None,
+                    active: false,
+                    window_focused: false,
+                    generating: true,
+                }],
+            }),
+        )
+        .await;
+        assert_eq!(attached.status(), StatusCode::OK);
+
+        let closed = update_companion_presence(
+            State(server_state.clone()),
+            headers.clone(),
+            Json(CompanionPresenceUpdate {
+                browser_label: Some("Chrome".into()),
+                tabs: Vec::new(),
+            }),
+        )
+        .await;
+        assert_eq!(closed.status(), StatusCode::OK);
+        let family = broker
+            .family_for_anchor(&workspace_id, &core)
+            .await
+            .expect("read family")
+            .expect("worker family exists");
+        let detached = family
+            .workers
+            .get(&spawned.worker_id)
+            .expect("worker exists");
+        assert_eq!(detached.state, crate::workers::types::WorkerState::Running);
+        assert_eq!(
+            detached.attachment_state,
+            crate::workers::types::BrowserAttachmentState::Detached
+        );
+        assert_eq!(detached.current_task_id.as_ref(), Some(&spawned.task_id));
+
+        let returned = update_companion_presence(
+            State(server_state),
+            headers,
+            Json(CompanionPresenceUpdate {
+                browser_label: Some("Chrome".into()),
+                tabs: vec![crate::companion::CompanionTabPresence {
+                    conversation_id: worker_conversation.into(),
+                    conversation_url: format!("https://chatgpt.com/c/{worker_conversation}"),
+                    project_id: None,
+                    project_url: None,
+                    active: true,
+                    window_focused: true,
+                    generating: false,
+                }],
+            }),
+        )
+        .await;
+        assert_eq!(returned.status(), StatusCode::OK);
+        let family = broker
+            .family_for_anchor(&workspace_id, &core)
+            .await
+            .expect("read returned family")
+            .expect("worker family exists");
+        assert_eq!(
+            family
+                .workers
+                .get(&spawned.worker_id)
+                .map(|worker| worker.attachment_state),
+            Some(crate::workers::types::BrowserAttachmentState::Attached)
+        );
+
+        let _ = std::fs::remove_dir_all(config_root);
+        let _ = std::fs::remove_dir_all(workspace_root);
     }
 
     #[tokio::test]

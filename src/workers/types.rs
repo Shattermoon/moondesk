@@ -129,6 +129,7 @@ pub enum BrowserAttachmentState {
     Absent,
     Opening,
     Attached,
+    Detached,
     Unknown,
 }
 

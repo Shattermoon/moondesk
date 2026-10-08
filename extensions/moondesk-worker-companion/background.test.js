@@ -28,6 +28,7 @@ function loadBackground({ existingTabs = {}, contentByTab = {}, sendMessageImpl 
   const removedTabs = [];
   let stored = {};
   let runtimeMessageHandler = null;
+  let tabRemovedHandler = null;
 
   const chrome = {
     storage: {
@@ -66,7 +67,8 @@ function loadBackground({ existingTabs = {}, contentByTab = {}, sendMessageImpl 
         throw new Error('not used');
       },
       onActivated: { addListener() {} },
-      onUpdated: { addListener() {} }
+      onUpdated: { addListener() {} },
+      onRemoved: { addListener(handler) { tabRemovedHandler = handler; } }
     },
     windows: {
       async getLastFocused() { return { id: 1, focused: true }; },
@@ -112,6 +114,10 @@ function loadBackground({ existingTabs = {}, contentByTab = {}, sendMessageImpl 
         const keepAlive = runtimeMessageHandler(message, sender, resolve);
         if (!keepAlive) resolve(undefined);
       });
+    },
+    dispatchTabRemoved(tabId = 1, removeInfo = { windowId: 1, isWindowClosing: false }) {
+      if (!tabRemovedHandler) throw new Error('tab removed handler was not registered');
+      tabRemovedHandler(tabId, removeInfo);
     }
   };
 }
@@ -179,6 +185,20 @@ test('companion exposes destructive Core reset but no stale launch replay contro
   assert.doesNotMatch(source, /\/__moondesk\/companion\/v1\/commands\/retry/);
   assert.match(popupSource, /MOONDESK_CLEAR_WORKERS/);
   assert.doesNotMatch(popupSource, /Retry safe launch|MOONDESK_RETRY_BLOCKED/);
+});
+
+test('closing a browser tab schedules immediate presence publication instead of ending a worker locally', () => {
+  const delays = [];
+  const { dispatchTabRemoved } = loadBackground({
+    setTimeoutImpl(_callback, delayMs) {
+      delays.push(delayMs);
+      return delays.length;
+    }
+  });
+  delays.length = 0;
+  dispatchTabRemoved(42);
+  assert.deepEqual(delays, [25]);
+  assert.match(source, /closed worker tab is not a finished worker/);
 });
 
 test('bridge discovery selects protocol V2 without unresolved runtime constants', async () => {

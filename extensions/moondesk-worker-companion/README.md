@@ -10,6 +10,7 @@ It intentionally owns only a small surface:
 - redeem durable managed-chat launch commands for the browser that owns the exact Core or durable worker thread;
 - process up to four fresh worker launches concurrently while tracking failures independently; MoonDesk recommends 1-4 workers for normal use because higher totals can hit ChatGPT/provider rate limits, especially alongside other active conversations;
 - open/recover a worker ChatGPT tab;
+- publish tab closure quickly so MoonDesk can mark a running worker as `detached`/no-tab without treating browser disappearance as task completion; the same durable worker can still report/finish server-side and reattaches when its exact conversation page returns;
 - create every fresh worker as an ordinary ChatGPT conversation, regardless of the Core's Project membership;
 - select and read back the requested model + reasoning effort;
 - insert the worker bootstrap and click Send once;
@@ -30,6 +31,6 @@ It does **not** match ChatGPT Projects, MoonDesk workspaces, connectors, or loca
 
 Workers V1 deliberately keeps fresh placement simple: every fresh worker starts as an ordinary ChatGPT conversation, even when the Core is inside a ChatGPT Project. Core Project metadata is used only for exact Core routing/diagnostics; MoonDesk never clones the Core conversation as a worker bootstrap. Later tasks for the same durable worker reuse its exact confirmed worker conversation, including legacy worker conversations that were previously created inside a Project.
 
-Multiple Chromium browser installations can remain paired at once. Fresh workers are routed to the browser that positively observes the exact Core conversation; once a worker thread exists, reuse stays pinned to the browser that owns that exact worker thread unless a safe recovery path is established.
+Multiple Chromium browser installations can remain paired at once. Fresh workers are routed to the browser that positively observes the exact Core conversation; once a worker thread exists, reuse stays pinned to the browser that owns that exact worker thread unless a safe recovery path is established. A running worker whose tab is closed remains running with `attachmentState: detached`; MoonDesk does not automatically declare it idle from silence alone because Workers V1 does not yet carry the turn/request-level provenance needed to distinguish a late old-turn call from a new assignment safely.
 
 Workers remain experimental until the signed-in normal-chat connector/tool-context and multi-browser browser-E2E matrix pass.

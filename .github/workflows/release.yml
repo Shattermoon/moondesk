@@ -563,7 +563,7 @@ jobs:
           node --check extensions/moondesk-worker-companion/popup.js
           node --test extensions/moondesk-worker-companion/background.test.js
 
-      - name: Create store-ready companion ZIP
+      - name: Create Worker Companion release ZIP
         shell: bash
         run: |
           set -euo pipefail

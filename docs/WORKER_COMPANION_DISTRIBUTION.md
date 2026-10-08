@@ -1,44 +1,71 @@
 # MoonDesk Worker Companion distribution plan
 
-MoonDesk Workers depend on the Chromium companion extension for exact ChatGPT routing, model/effort confirmation, durable Send reconciliation, and worker-tab presence. Production users should not be expected to enable Developer mode or manage an unpacked extension directory.
+MoonDesk Workers depend on the Chromium companion extension for exact ChatGPT routing, model/effort confirmation, durable Send reconciliation, and worker-tab presence.
 
-## Distribution channels
+MoonDesk should **not** depend on browser-store approval for this companion. The production path is the same class of installation used by Chat On Steroids: MoonDesk ships the extension files itself, the user enables browser Developer mode once, and loads MoonDesk's stable local extension folder with **Load unpacked**.
 
-### Primary: browser stores
+## Distribution model
 
-Use the same Manifest V3 extension source for both store listings:
+### Primary: bundled local extension folder
 
-- **Chrome Web Store** — primary install path for Google Chrome and Chromium browsers that support Chrome Web Store extensions, including Brave.
-- **Microsoft Edge Add-ons** — primary install path for Microsoft Edge.
+The normal MoonDesk installation should materialize a stable local folder containing the exact Worker Companion version shipped with that MoonDesk release.
 
-A store installation gives users a stable extension identity and automatic browser-managed updates. It also avoids the fragile production workflow of asking users to unzip files, enable Developer mode, and reload the extension after every MoonDesk update.
+The user should never need to clone the repository or copy source files manually. MoonDesk setup should expose the folder directly (for example, **Open Worker Companion folder**) and explain the browser steps.
 
-The Chrome and Edge listings should use the same release version as MoonDesk. The release workflow now synchronizes `extensions/moondesk-worker-companion/manifest.json` to the MoonDesk release version before creating the tested release candidate.
+The folder must be stable across MoonDesk updates. Do not point Chrome at an ephemeral build, temporary extraction directory, Cargo target directory, npm cache entry, or version-specific release folder that disappears on update.
 
-### Fallback: signed/checksummed GitHub Release asset
+A future update path may replace the files in that stable folder and ask/reload the extension only when no worker/Core browser operation is busy. Updating the bytes and reloading the running Manifest V3 extension are separate operations; MoonDesk must never claim the new companion is active merely because the files on disk changed.
 
-Every MoonDesk GitHub Release also carries `moondesk-worker-companion.zip`, built from the exact tested release candidate and included in `SHA256SUMS`.
+### Release ZIP fallback
 
-This ZIP is a recovery/beta/developer fallback, not the normal production onboarding path. A user using this fallback must unzip it and load the folder as an unpacked extension; Chromium does not treat an arbitrary GitHub ZIP as a normal store-installed extension.
+Every MoonDesk GitHub Release carries `moondesk-worker-companion.zip`, built from the exact tested release candidate and covered by `SHA256SUMS`.
 
-### Developer builds
+The ZIP is useful for:
 
-Repository contributors can continue using `extensions/moondesk-worker-companion` with **Load unpacked**. Developer mode instructions belong in contributor/beta documentation, not the normal product onboarding flow.
+- beta/manual installations;
+- recovery when the locally materialized folder is missing;
+- contributors and support diagnostics;
+- verifying that the installed companion bytes match the MoonDesk release.
 
-## What the user should do
+A user installing from the ZIP must extract it first and choose that extracted folder with **Load unpacked**. Chromium cannot load the ZIP itself as an unpacked extension.
 
-The production setup should be short:
+### Developer/source builds
 
-1. Install or update MoonDesk.
-2. Click **Install Worker Companion** in MoonDesk documentation/setup and install the extension from the browser's official store.
-3. Start MoonDesk if it is not already running.
-4. Open ChatGPT in the same browser and sign in normally.
-5. Open the Worker Companion popup. It should discover MoonDesk's loopback companion bridge and pair automatically. There is no per-chat pairing code or token to copy.
-6. Open the ChatGPT conversation that will act as the **Core**.
-7. In the companion popup, click **Discover available ChatGPT models**, select the desired model/reasoning effort, and save the worker profile.
-8. Ask Core to create workers. MoonDesk recommends **1–4 simultaneous workers**; 8 is the hard product limit and should be treated as high-load/advanced usage.
+Repository contributors may load `extensions/moondesk-worker-companion` directly. That is a development path, not the normal end-user path.
 
-Fresh workers are normal ChatGPT conversations even when Core lives inside a ChatGPT Project. Users do not need to move workers into Projects or bind Project names to MoonDesk workspaces.
+## User onboarding
+
+The production instructions should be short and shown inside MoonDesk rather than buried in documentation:
+
+1. Install/update MoonDesk and start it.
+2. In MoonDesk, choose **Set up Worker Companion**.
+3. Choose the browser used for ChatGPT: Chrome, Edge, or Brave.
+4. MoonDesk opens that browser's extensions page:
+   - Chrome: `chrome://extensions`
+   - Edge: `edge://extensions`
+   - Brave: `brave://extensions`
+5. Turn on **Developer mode**.
+6. Click **Load unpacked**.
+7. In MoonDesk, click **Open Worker Companion folder** and choose that exact folder in the browser picker.
+8. Open ChatGPT in the same browser and sign in normally.
+9. The companion discovers MoonDesk's loopback bridge and pairs automatically. There is no per-chat pairing code or token to copy.
+10. Open the ChatGPT conversation that will act as the **Core**.
+11. In the companion popup, click **Discover available ChatGPT models**, select model/reasoning effort, and save the worker profile.
+12. Ask Core to create workers. MoonDesk recommends **1–4 simultaneous workers**; 8 remains the hard product ceiling, not the recommended everyday setting.
+
+Fresh workers are ordinary ChatGPT conversations even when Core lives in a ChatGPT Project. Existing workers reuse their exact durable conversation.
+
+## Updating the companion
+
+App and companion versions should move together.
+
+For the first production version, the safe update UX is:
+
+1. MoonDesk updates/replaces the files in its stable Worker Companion folder.
+2. If the browser is still running the previous companion build, MoonDesk says **Reload Worker Companion**.
+3. The user opens the extensions page and clicks Reload for MoonDesk Worker Companion, then refreshes open ChatGPT tabs if required.
+
+Later, after live validation, MoonDesk can adopt the CoS-style convenience path: only when no Core/worker browser operation is busy, prepare the stable folder and let the extension call `chrome.runtime.reload()` on itself. That must remain guarded by exact activity/version evidence so an update cannot interrupt an active Send or worker turn.
 
 ## Pairing and compatibility
 
@@ -46,49 +73,23 @@ The extension discovers only MoonDesk's dedicated loopback bridge ports (`127.0.
 
 Pairing is installation-scoped and automatic. Multiple browser installations may remain paired independently. MoonDesk never uses the workspace MCP URL as a browser-extension credential.
 
-Before store launch, the popup/setup UX should make protocol mismatch explicit with an actionable message such as **Update MoonDesk** or **Update Worker Companion** rather than surfacing a generic connection failure.
-
-## Browser-store permission explanation
-
-The store listing and privacy disclosure should explain each permission in plain language:
-
-- `storage` — stores the companion's local pairing/profile state.
-- `tabs` and `windows` — finds the exact open ChatGPT conversation and tracks whether that worker page is present.
-- `scripting` — installs MoonDesk's ChatGPT-side routing/model helpers into `chatgpt.com` pages.
-- `alarms` — wakes the Manifest V3 service worker for bounded command/presence polling.
-- `https://chatgpt.com/*` — required because workers are created and controlled in ChatGPT's web UI.
-- loopback `http://127.0.0.1/*` / `http://localhost/*` — required to communicate with the local MoonDesk companion bridge.
-
-The companion is designed to report bounded routing state such as exact conversation IDs, Project IDs when present, focus/generation state, and provider correlation needed for worker routing. It does not act as a general browsing-history collector and does not need host access outside ChatGPT and the local MoonDesk bridge.
+A version/protocol mismatch should be explicit and actionable: **MoonDesk and Worker Companion do not match — update/reload the companion from this MoonDesk installation.** Do not expose a generic connection failure when the real issue is incompatible bytes.
 
 ## Release automation implemented in this branch
 
-The release pipeline now treats the Worker Companion as a first-class release artifact:
+The release pipeline treats the Worker Companion as a first-class release artifact:
 
-1. merged-source validation runs the companion JS syntax checks and full companion test suite;
-2. the release version is written into `manifest.json` alongside the Rust/npm version update;
-3. a dedicated release job checks out the exact candidate SHA and reruns the companion checks;
+1. merged-source validation runs companion JavaScript syntax checks and the full companion test suite;
+2. the release version is written into `extensions/moondesk-worker-companion/manifest.json` alongside the Rust/npm version update;
+3. a dedicated release job checks out the exact candidate SHA and reruns companion validation;
 4. only runtime extension files are placed into `moondesk-worker-companion.zip`;
-5. the ZIP is uploaded as a build artifact;
-6. the GitHub Release requires the ZIP in its exact asset list;
-7. `SHA256SUMS` covers the extension ZIP together with the five native binaries;
-8. tag-context release verification requires the extension version to match the immutable MoonDesk tag and re-verifies the released checksum set before npm publication.
+5. packaging is reproducible from identical source bytes;
+6. the ZIP is uploaded with the release artifacts;
+7. the GitHub Release requires the ZIP in its exact asset list;
+8. `SHA256SUMS` covers the companion ZIP together with the five native binaries;
+9. tag-context verification requires the companion version to match the immutable MoonDesk tag and re-verifies the checksum set before npm publication.
 
-This gives us one exact extension package per MoonDesk release even before browser-store publishing is automated.
-
-## External setup still required before automatic store publishing
-
-Store publication cannot be completed only in repository code. We still need the external publisher identities and listing IDs:
-
-- Chrome Web Store developer account and MoonDesk extension listing/item ID;
-- Microsoft Partner Center / Edge Add-ons publisher account and product ID;
-- store API credentials or approved CI authentication mechanism;
-- production extension icons, screenshots, listing copy, support URL, and privacy-policy URL;
-- final permission/privacy review and store approval.
-
-Once those exist, add a post-release store-publish job that uploads **the exact `moondesk-worker-companion.zip` already checksummed on the GitHub Release**. Do not rebuild a separate store ZIP from `main`, because that would break the one-release/one-extension-bytes invariant.
-
-Store upload should be retryable and idempotent. A transient Chrome/Edge review or API failure must not rewrite a Git tag or change the already-published MoonDesk/npm release.
+The next distribution implementation step is to materialize those exact release companion files into a stable MoonDesk-owned local folder and expose **Open Worker Companion folder** from MoonDesk setup. That is preferable to a browser-store dependency.
 
 ## Production gate
 
@@ -96,11 +97,11 @@ Do not call Workers production-ready until all of these pass:
 
 - fresh one-worker lifecycle;
 - two simultaneous workers with distinct durable ChatGPT conversation IDs;
-- exact existing-worker reuse;
+- exact existing-worker reuse, including reopening a closed idle worker tab;
 - recommended four-worker concurrency;
-- running-worker tab-close behavior (worker remains running/detached and can finish);
+- running-worker tab-close behavior: worker stays running/detached and can report/finish;
 - extension reload/browser restart recovery;
-- Chrome Web Store install/update smoke;
-- Edge Add-ons install/update smoke;
-- clear user-facing compatibility error for app/extension protocol mismatch;
-- published privacy/support documentation matching the permissions actually requested by the manifest.
+- release/package installation from the stable local Worker Companion folder;
+- update from one companion version to the next without changing the browser's loaded folder;
+- explicit app/companion protocol mismatch guidance;
+- user instructions for Chrome, Edge, and Brave Developer mode + Load unpacked.

@@ -53,7 +53,7 @@ A merged PR may explicitly choose the bump by carrying exactly one of these labe
 
 Conflicting bump labels fail at the read-only merge gate before OIDC, builds, or repository mutation.
 
-`package.json`, `Cargo.toml`, the root `moondesk` entry in `Cargo.lock`, and `extensions/moondesk-worker-companion/manifest.json` stay on the same release version. The Rust binary embeds `CARGO_PKG_VERSION`, and the browser-store/GitHub companion package is built from the same versioned candidate/tag rather than from an unversioned source tree.
+`package.json`, `Cargo.toml`, the root `moondesk` entry in `Cargo.lock`, and `extensions/moondesk-worker-companion/manifest.json` stay on the same release version. The Rust binary embeds `CARGO_PKG_VERSION`, and the bundled/GitHub companion package is built from the same versioned candidate/tag rather than from an unversioned source tree.
 
 ## Interrupted-release recovery
 

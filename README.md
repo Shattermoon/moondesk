@@ -127,9 +127,9 @@ Workers let one ChatGPT conversation act as the **Core** and delegate independen
 
 ### Install the companion
 
-For production, MoonDesk will distribute the Worker Companion through the **Chrome Web Store** (Chrome/Brave) and **Microsoft Edge Add-ons** (Edge), with browser-managed updates. Each MoonDesk GitHub Release also carries the exact checksummed `moondesk-worker-companion.zip` as a beta/recovery fallback. The full release/onboarding plan is in [`docs/WORKER_COMPANION_DISTRIBUTION.md`](docs/WORKER_COMPANION_DISTRIBUTION.md).
+MoonDesk ships the Worker Companion as a local unpacked extension, following the same practical model as Chat On Steroids: enable browser Developer mode once, then load MoonDesk's companion folder with **Load unpacked**. Each MoonDesk GitHub Release also carries the exact checksummed `moondesk-worker-companion.zip` as a beta/recovery fallback. The full release/onboarding plan is in [`docs/WORKER_COMPANION_DISTRIBUTION.md`](docs/WORKER_COMPANION_DISTRIBUTION.md).
 
-Until the store listings are live, experimental builds use the unpacked fallback:
+Experimental/source builds use the repository folder directly:
 
 1. Open `chrome://extensions` (or `edge://extensions`), enable **Developer mode**, and choose **Load unpacked**.
 2. Select `extensions/moondesk-worker-companion`.

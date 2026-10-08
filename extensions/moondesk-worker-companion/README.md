@@ -22,7 +22,7 @@ It does **not** match ChatGPT Projects, MoonDesk workspaces, connectors, or loca
 
 ## Distribution
 
-Production users should install the Worker Companion from the Chrome Web Store (Chrome/Brave) or Microsoft Edge Add-ons (Edge). GitHub Releases also include the exact checksummed `moondesk-worker-companion.zip` as a beta/recovery fallback. Store publication and onboarding requirements are tracked in [`docs/WORKER_COMPANION_DISTRIBUTION.md`](../../docs/WORKER_COMPANION_DISTRIBUTION.md).
+MoonDesk distributes the Worker Companion as a local unpacked extension. Production setup enables browser Developer mode once and loads MoonDesk's stable companion folder with **Load unpacked**. GitHub Releases also include the exact checksummed `moondesk-worker-companion.zip` as a beta/recovery fallback. Distribution and onboarding requirements are tracked in [`docs/WORKER_COMPANION_DISTRIBUTION.md`](../../docs/WORKER_COMPANION_DISTRIBUTION.md).
 
 ## Local install
 

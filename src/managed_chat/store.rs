@@ -4,6 +4,7 @@ use std::io::{Read, Write};
 use std::path::Path;
 #[cfg(test)]
 use std::path::PathBuf;
+#[cfg(windows)]
 use std::time::Duration;
 use uuid::Uuid;
 

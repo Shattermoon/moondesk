@@ -1040,13 +1040,13 @@ impl WorkerBroker {
             .filter(|family| family.anchor_identity.session_digest == session_digest)
             .flat_map(|family| family.workers.values().cloned())
             .collect::<Vec<_>>();
-        if workers.iter().any(|worker| {
-            !matches!(worker.state, WorkerState::Idle | WorkerState::Retired)
-                && !(matches!(
-                    worker.state,
-                    WorkerState::Provisioning | WorkerState::Waking
-                ) && worker.launch_state == WorkerLaunchState::Failed
-                    && worker.conversation_url.is_none())
+        if workers.iter().any(|worker| match worker.state {
+            WorkerState::Idle | WorkerState::Retired => false,
+            WorkerState::Provisioning | WorkerState::Waking => {
+                worker.launch_state != WorkerLaunchState::Failed
+                    || worker.conversation_url.is_some()
+            }
+            _ => true,
         }) {
             return Err(WorkerBrokerError::Conflict(
                 "Core workers cannot be cleared while a worker is active or a launch outcome is unresolved"

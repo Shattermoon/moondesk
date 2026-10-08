@@ -23,7 +23,7 @@ const popupSource = fs.readFileSync(popupPath, 'utf8');
 const serverSource = fs.readFileSync(serverPath, 'utf8');
 const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
 
-function loadBackground({ existingTabs = {}, contentByTab = {}, sendMessageImpl = null, scriptingExecuteImpl = null, fetchImpl = async () => { throw new Error('network not used'); }, setTimeoutImpl = null, runtimeManifest = manifest, initialStored = {} } = {}) {
+function loadBackground({ existingTabs = {}, contentByTab = {}, sendMessageImpl = null, scriptingExecuteImpl = null, fetchImpl = async () => { throw new Error('network not used'); }, setTimeoutImpl = null, runtimeManifest = manifest, initialStored = {}, createdTabIdStart = 101 } = {}) {
   const createdTabs = [];
   const removedTabs = [];
   const runtimeReloads = [];
@@ -49,7 +49,7 @@ function loadBackground({ existingTabs = {}, contentByTab = {}, sendMessageImpl 
         return Object.values(existingTabs);
       },
       async create(options) {
-        const tab = { id: 101 + createdTabs.length, url: options.url, active: options.active !== false };
+        const tab = { id: createdTabIdStart + createdTabs.length, url: options.url, active: options.active !== false };
         createdTabs.push(tab);
         existingTabs[tab.id] = tab;
         return tab;
@@ -258,7 +258,7 @@ test('bridge discovery prefers an exact runtime match over another MoonDesk vers
             app: 'moondesk-worker-companion',
             appVersion: '0.13.0',
             protocolVersion: 2,
-            companionRuntimeRevision: 3
+            companionRuntimeRevision: 4
           };
         }
       };
@@ -272,7 +272,7 @@ test('bridge discovery prefers an exact runtime match over another MoonDesk vers
             app: 'moondesk-worker-companion',
             appVersion: '0.12.0',
             protocolVersion: 2,
-            companionRuntimeRevision: 2
+            companionRuntimeRevision: 3
           };
         }
       };
@@ -286,7 +286,7 @@ test('bridge discovery prefers an exact runtime match over another MoonDesk vers
 
   const { evaluate, runtimeReloads } = loadBackground({ fetchImpl });
   const hello = await evaluate('discoverBridge(freshState())');
-  assert.equal(hello.companionRuntimeRevision, 2);
+  assert.equal(hello.companionRuntimeRevision, 3);
   assert.equal(runtimeReloads.length, 0);
 });
 
@@ -302,7 +302,7 @@ test('bridge runtime revision mismatch reloads the unpacked companion once', asy
             app: 'moondesk-worker-companion',
             appVersion: '0.13.0',
             protocolVersion: 2,
-            companionRuntimeRevision: 3
+            companionRuntimeRevision: 4
           };
         }
       };
@@ -340,7 +340,7 @@ test('release version mismatch reloads the unpacked companion even when protocol
             app: 'moondesk-worker-companion',
             appVersion: '0.13.0',
             protocolVersion: 2,
-            companionRuntimeRevision: 2
+            companionRuntimeRevision: 3
           };
         }
       };
@@ -1864,6 +1864,30 @@ test('model discovery runs in one owned clean helper tab and closes it after a c
   assert.deepEqual(removedTabs, [createdTabs[0].id]);
   assert.equal(existingTabs[7].url.includes('/c/anchor'), true, 'active Core tab must remain untouched');
   assert.equal(seen.filter((entry) => entry.message.type === 'MOONDESK_MODEL_CATALOG').length, 1);
+});
+
+test('model discovery closes its owned helper even when Chromium assigns tab id zero', async () => {
+  const catalog = [{
+    id: 'gpt-5.6-sol',
+    label: 'GPT-5.6 Sol',
+    efforts: ['high'],
+    aliases: ['gpt-5.6-sol'],
+    choices: [{ id: 'gpt-5.6-sol', effort: 'high' }]
+  }];
+  const { removedTabs, evaluate } = loadBackground({
+    createdTabIdStart: 0,
+    scriptingExecuteImpl: async () => [{ result: false }],
+    sendMessageImpl: async (_id, message) => {
+      if (message.type === 'MOONDESK_CONTEXT') return { ok: true, context: {} };
+      if (message.type === 'MOONDESK_MODEL_CATALOG') return { ok: true, catalog };
+      throw new Error('unexpected message');
+    }
+  });
+
+  await flushMicrotasks();
+  await flushMicrotasks();
+  await evaluate('discoverModelCatalog({ force: true })');
+  assert.deepEqual(removedTabs, [0]);
 });
 
 test('automatic model discovery waits for ChatGPT, persists the catalog, and avoids repeated picker work', async () => {

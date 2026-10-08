@@ -4,7 +4,7 @@ const BRIDGE_PORTS = [47650, 47651, 47652, 47653, 47654];
 const REQUIRED_PROTOCOL_VERSION = 2;
 // Bump with any shipped companion runtime change that requires Chromium to load new bytes. Keep
 // this aligned with COMPANION_RUNTIME_REVISION in src/server.rs.
-const COMPANION_RUNTIME_REVISION = 2;
+const COMPANION_RUNTIME_REVISION = 3;
 const SOURCE_DEV_MANIFEST_VERSION = '0.1.0';
 const RUNTIME_RELOAD_STORAGE_KEY = 'moondeskWorkerCompanionReloadRevisionV1';
 const HELLO_PATH = '/__moondesk/companion/v1/hello';
@@ -1495,7 +1495,7 @@ async function discoverModelCatalog({ force = false, requireExistingPage = false
       await writeModelCatalogCache({ catalog, updatedAt: Date.now(), lastAttemptAt: now });
       return catalog;
     } finally {
-      if (tab?.id) await closeModelCatalogHelper(tab.id);
+      if (Number.isInteger(tab?.id)) await closeModelCatalogHelper(tab.id);
     }
   })();
   try {

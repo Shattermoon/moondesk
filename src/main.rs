@@ -4234,6 +4234,10 @@ async fn run_settings(
                             drop(app);
 
                             let config_path = app_config_path()?;
+                            // AppState synchronizes the embedded companion during startup and only
+                            // stores this directory on success. A missing directory is the retry path
+                            // for a startup materialization failure; an existing one is already
+                            // synchronized to the running MoonDesk binary.
                             let result = match existing_directory {
                                 Some(directory) => Ok(directory),
                                 None => companion_install::materialize_for_config(&config_path)

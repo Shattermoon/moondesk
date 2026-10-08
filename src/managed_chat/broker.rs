@@ -166,9 +166,10 @@ impl ManagedChatBroker {
         if matching.is_empty() {
             return Ok(Vec::new());
         }
-        if matching.iter().any(|command| {
-            !matches!(command.state, ManagedChatCommandState::Succeeded)
-                && !(command.state == ManagedChatCommandState::Failed && !command.reconcile_history)
+        if matching.iter().any(|command| match command.state {
+            ManagedChatCommandState::Succeeded => false,
+            ManagedChatCommandState::Failed => command.reconcile_history,
+            _ => true,
         }) {
             return Err(ManagedChatError::Conflict(
                 "Core workers cannot be cleared while a launch is active or its Send outcome is ambiguous"

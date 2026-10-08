@@ -1705,11 +1705,17 @@ mod tests {
     #[tokio::test]
     async fn persistence_failure_does_not_publish_command() {
         let root = temp_root("moondesk-managed-chat-persist-failure");
-        std::fs::create_dir_all(&root).expect("create test root");
-        let blocked = root.join("blocked");
-        std::fs::write(&blocked, "not a directory").expect("create blocked parent");
-        let broker = ManagedChatBroker::open(blocked.join("state.json"))
+        let state_parent = root.join("state-parent");
+        std::fs::create_dir_all(&state_parent).expect("create valid state parent");
+        let broker = ManagedChatBroker::open(state_parent.join("state.json"))
             .expect("open broker before state exists");
+
+        // Make only the next durable write impossible. Constructing the broker must succeed on
+        // every platform so this regression tests commit rollback rather than path lookup
+        // differences (Unix reports ENOTDIR where Windows can report NotFound).
+        std::fs::remove_dir(&state_parent).expect("remove empty state parent");
+        std::fs::write(&state_parent, "not a directory").expect("block future persistence");
+
         let error = broker
             .enqueue(EnqueueManagedChatRequest {
                 dedupe_key: "worker:one:task:persist".into(),

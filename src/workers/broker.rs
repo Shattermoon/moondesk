@@ -2572,11 +2572,15 @@ mod tests {
     #[tokio::test]
     async fn persistence_failure_does_not_publish_worker_in_memory() {
         let root = temp_root("moondesk-worker-persist-failure");
-        std::fs::create_dir_all(&root).expect("create worker persistence test root");
-        let blocked_parent = root.join("blocked-parent");
-        std::fs::write(&blocked_parent, "not a directory").expect("create blocked parent file");
-        let broker = WorkerBroker::open(blocked_parent.join("worker-state-v1.json"))
+        let state_parent = root.join("state-parent");
+        std::fs::create_dir_all(&state_parent).expect("create valid worker state parent");
+        let broker = WorkerBroker::open(state_parent.join("worker-state-v1.json"))
             .expect("open broker before first worker state file exists");
+
+        // Make only the mutation's durable write fail. This keeps the regression independent of
+        // platform-specific metadata errors for a path whose parent is already a regular file.
+        std::fs::remove_dir(&state_parent).expect("remove empty worker state parent");
+        std::fs::write(&state_parent, "not a directory").expect("block future worker persistence");
 
         let error = broker
             .spawn_worker(spawn_request(

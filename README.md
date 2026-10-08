@@ -110,10 +110,18 @@ Authentication: None
 
 Allow write actions only when you trust the workspace and task.
 
-### 5. Add the recommended instruction
+### 5. Add this to ChatGPT Custom Instructions
+
+In ChatGPT, open **Settings → Personalization → Custom Instructions** and add the following instruction so ChatGPT routes project work to the correct MoonDesk connector:
 
 ```text
-MoonDesk is a coding tool and a custom connector. Always use MoonDesk if the user wants to do anything related to file operations. Always call `moondesk_instruction` after `list_resources`, and follow the instructions it contains.
+The user may have multiple MoonDesk custom connectors, with each connector bound to a different project/workspace.
+
+For any request involving local files, code, commands, or project operations, use the MoonDesk connector that matches the project/workspace being discussed. Never use a different project’s connector unless the user explicitly asks.
+
+Before using a MoonDesk connector for the first time in a conversation, call its moondesk_instruction tool and follow the instructions it returns. If the connector tools are unavailable or stale, refresh that connector with api_tool.list_resources first, then call moondesk_instruction.
+
+Workspace routing is determined by the connector itself. Do not ask for or invent a workspace argument.
 ```
 
 Select the connector and start working.
@@ -127,7 +135,7 @@ Workers let one ChatGPT conversation act as the **Core** and delegate independen
 
 ### Optional Worker Companion setup
 
-You do **not** need the extension for normal MoonDesk use. Install it only when you want Workers/sub-agents. MoonDesk embeds the exact companion files from its own build and synchronizes them into the stable `~/.moondesk/worker-companion` folder whenever MoonDesk starts; browser installation remains an explicit user opt-in, but later MoonDesk upgrades do not require a second companion-update step. An already-loaded companion can self-reload once when its MoonDesk release version or runtime revision no longer matches. Each GitHub Release also carries the same checksummed `moondesk-worker-companion.zip` as a beta/recovery fallback. The full release/onboarding plan is in [`docs/WORKER_COMPANION_DISTRIBUTION.md`](docs/WORKER_COMPANION_DISTRIBUTION.md).
+You do **not** need the extension for normal MoonDesk use. Install it only when you want Workers/sub-agents. MoonDesk embeds the exact companion files from its own build and synchronizes them into the stable `~/.moondesk/worker-companion` folder whenever MoonDesk starts; browser installation remains an explicit user opt-in, but later MoonDesk upgrades do not require a second companion-update step. An already-loaded companion can self-reload once when its MoonDesk release version or runtime revision no longer matches. The supported browser targets are **Google Chrome, Microsoft Edge, and Brave**. Other Chromium-based browsers may work but are not part of the supported/tested matrix; Firefox and Safari are not currently supported. Each GitHub Release also carries the same checksummed `moondesk-worker-companion.zip` as a beta/recovery fallback. The full release/onboarding plan is in [`docs/WORKER_COMPANION_DISTRIBUTION.md`](docs/WORKER_COMPANION_DISTRIBUTION.md).
 
 To enable Workers:
 

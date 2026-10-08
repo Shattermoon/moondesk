@@ -3954,7 +3954,7 @@ document.getElementById('upload').addEventListener('change',event=>{document.get
         assert!(mobile_snapshot_text.contains("MoonDesk Host Browser E2E"));
         let input_uid = snapshot_uid(mobile_snapshot_text, "textbox");
         let button_uid = snapshot_uid(mobile_snapshot_text, "button \"Toggle state\"");
-        let upload_uid = snapshot_uid(mobile_snapshot_text, "button \"Upload \"");
+        let upload_uid = snapshot_uid(mobile_snapshot_text, "button \"Upload");
         let external_upload_arg = external_upload_fixture.to_string_lossy().into_owned();
         let upload = host_browser_request(
             host_address,

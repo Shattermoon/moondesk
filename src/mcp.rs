@@ -3856,6 +3856,12 @@ mod tests {
         fn new(prefix: &str) -> Self {
             let path = std::env::temp_dir().join(format!("{prefix}-{}", Uuid::new_v4()));
             std::fs::create_dir_all(&path).expect("create test temp dir");
+            // Mirror production workspace registration. On macOS std::env::temp_dir() commonly
+            // returns a /var/... alias whose canonical spelling is /private/var/...; Workers
+            // deliberately reject non-canonical workspace roots, so MCP fixtures must register
+            // their temp root before passing child workspaces into the production dispatcher.
+            let path = workspaces::canonicalize_existing_workspace_root(&path)
+                .expect("canonicalize test temp dir like production registration");
             Self { path }
         }
 

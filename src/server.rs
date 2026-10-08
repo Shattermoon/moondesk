@@ -62,7 +62,7 @@ pub const COMPANION_CLEAR_WORKERS_ROUTE: &str = "/__moondesk/companion/v1/worker
 pub const COMPANION_TOKEN_HEADER: &str = "x-moondesk-companion-token";
 // Bump with any shipped companion runtime change that requires Chromium to load new bytes. Keep
 // this aligned with COMPANION_RUNTIME_REVISION in background.js.
-pub const COMPANION_RUNTIME_REVISION: u32 = 1;
+pub const COMPANION_RUNTIME_REVISION: u32 = 2;
 const MAX_COMPANION_BODY_BYTES: usize = 16 * 1024;
 
 #[derive(Clone)]

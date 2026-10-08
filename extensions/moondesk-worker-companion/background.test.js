@@ -23,11 +23,11 @@ const popupSource = fs.readFileSync(popupPath, 'utf8');
 const serverSource = fs.readFileSync(serverPath, 'utf8');
 const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
 
-function loadBackground({ existingTabs = {}, contentByTab = {}, sendMessageImpl = null, scriptingExecuteImpl = null, fetchImpl = async () => { throw new Error('network not used'); }, setTimeoutImpl = null, runtimeManifest = manifest } = {}) {
+function loadBackground({ existingTabs = {}, contentByTab = {}, sendMessageImpl = null, scriptingExecuteImpl = null, fetchImpl = async () => { throw new Error('network not used'); }, setTimeoutImpl = null, runtimeManifest = manifest, initialStored = {} } = {}) {
   const createdTabs = [];
   const removedTabs = [];
   const runtimeReloads = [];
-  let stored = {};
+  let stored = { ...initialStored };
   let runtimeMessageHandler = null;
   let tabRemovedHandler = null;
   let tabUpdatedHandler = null;
@@ -258,7 +258,7 @@ test('bridge discovery prefers an exact runtime match over another MoonDesk vers
             app: 'moondesk-worker-companion',
             appVersion: '0.13.0',
             protocolVersion: 2,
-            companionRuntimeRevision: 2
+            companionRuntimeRevision: 3
           };
         }
       };
@@ -272,7 +272,7 @@ test('bridge discovery prefers an exact runtime match over another MoonDesk vers
             app: 'moondesk-worker-companion',
             appVersion: '0.12.0',
             protocolVersion: 2,
-            companionRuntimeRevision: 1
+            companionRuntimeRevision: 2
           };
         }
       };
@@ -286,7 +286,7 @@ test('bridge discovery prefers an exact runtime match over another MoonDesk vers
 
   const { evaluate, runtimeReloads } = loadBackground({ fetchImpl });
   const hello = await evaluate('discoverBridge(freshState())');
-  assert.equal(hello.companionRuntimeRevision, 1);
+  assert.equal(hello.companionRuntimeRevision, 2);
   assert.equal(runtimeReloads.length, 0);
 });
 
@@ -302,7 +302,7 @@ test('bridge runtime revision mismatch reloads the unpacked companion once', asy
             app: 'moondesk-worker-companion',
             appVersion: '0.13.0',
             protocolVersion: 2,
-            companionRuntimeRevision: 2
+            companionRuntimeRevision: 3
           };
         }
       };
@@ -340,7 +340,7 @@ test('release version mismatch reloads the unpacked companion even when protocol
             app: 'moondesk-worker-companion',
             appVersion: '0.13.0',
             protocolVersion: 2,
-            companionRuntimeRevision: 1
+            companionRuntimeRevision: 2
           };
         }
       };
@@ -1845,6 +1845,9 @@ test('model discovery runs in one owned clean helper tab and closes it after a c
         assert.equal(helper.pathname, '/');
         assert.equal(helper.searchParams.get('moondesk-model-catalog'), message.nonce);
         assert.ok(Number.isFinite(message.expiresAt) && message.expiresAt > Date.now());
+        // ChatGPT may rewrite the helper route while the picker is open. The disposable helper
+        // still belongs to this discovery flight and must be closed by its exact created tab id.
+        tabs[id].url = 'https://chatgpt.com/c/helper-route-rewritten-by-chatgpt';
         return { ok: true, catalog };
       }
       throw new Error('unexpected message');
@@ -1904,6 +1907,30 @@ test('automatic model discovery waits for ChatGPT, persists the catalog, and avo
   dispatchAlarm();
   await flushMicrotasks();
   assert.equal(createdTabs.length, 1, 'the periodic fallback must reuse a fresh cache instead of reopening the picker');
+});
+
+test('extension reload reuses a fresh model catalog instead of opening another helper tab', async () => {
+  const catalog = [{
+    id: 'gpt-5.6-sol',
+    label: 'GPT-5.6 Sol',
+    efforts: ['high'],
+    aliases: ['gpt-5.6-sol'],
+    choices: [{ id: 'gpt-5.6-sol', effort: 'high' }]
+  }];
+  const initialStored = {
+    moondeskWorkerModelCatalogV1: {
+      catalog,
+      updatedAt: Date.now(),
+      lastAttemptAt: Date.now()
+    }
+  };
+  const { createdTabs, evaluate } = loadBackground({ initialStored });
+
+  await flushMicrotasks();
+  await flushMicrotasks();
+  assert.equal(createdTabs.length, 0, 'service-worker reload must not repeat picker discovery while cache is fresh');
+  const cached = await evaluate('readModelCatalogCache()');
+  assert.deepEqual(JSON.parse(JSON.stringify(cached.catalog)), catalog);
 });
 
 test('manual model refresh bypasses the automatic cache while stale automatic cache revalidates', async () => {

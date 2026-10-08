@@ -4,7 +4,7 @@ const BRIDGE_PORTS = [47650, 47651, 47652, 47653, 47654];
 const REQUIRED_PROTOCOL_VERSION = 2;
 // Bump with any shipped companion runtime change that requires Chromium to load new bytes. Keep
 // this aligned with COMPANION_RUNTIME_REVISION in src/server.rs.
-const COMPANION_RUNTIME_REVISION = 1;
+const COMPANION_RUNTIME_REVISION = 2;
 const SOURCE_DEV_MANIFEST_VERSION = '0.1.0';
 const RUNTIME_RELOAD_STORAGE_KEY = 'moondeskWorkerCompanionReloadRevisionV1';
 const HELLO_PATH = '/__moondesk/companion/v1/hello';
@@ -1358,22 +1358,13 @@ function modelCatalogHelperUrl(nonce) {
   return `https://chatgpt.com/?moondesk-model-catalog=${encodeURIComponent(nonce)}`;
 }
 
-function modelCatalogHelperOwned(tab, nonce) {
-  try {
-    const url = new URL(tab?.pendingUrl || tab?.url || '');
-    return url.origin === 'https://chatgpt.com' &&
-      url.pathname === '/' &&
-      url.searchParams.get('moondesk-model-catalog') === nonce;
-  } catch {
-    return false;
-  }
-}
-
-async function closeModelCatalogHelper(tabId, nonce) {
+async function closeModelCatalogHelper(tabId) {
   if (!Number.isInteger(tabId)) return;
   try {
-    const tab = await chrome.tabs.get(tabId);
-    if (modelCatalogHelperOwned(tab, nonce)) await chrome.tabs.remove(tabId);
+    // This tab id is created exclusively for the current discovery flight. ChatGPT is allowed to
+    // rewrite its URL while the picker opens, so URL-based ownership checks can leak the helper tab.
+    // Closing by the exact created tab id keeps discovery disposable without touching user tabs.
+    await chrome.tabs.remove(tabId);
   } catch {}
 }
 
@@ -1504,7 +1495,7 @@ async function discoverModelCatalog({ force = false, requireExistingPage = false
       await writeModelCatalogCache({ catalog, updatedAt: Date.now(), lastAttemptAt: now });
       return catalog;
     } finally {
-      if (tab?.id) await closeModelCatalogHelper(tab.id, nonce);
+      if (tab?.id) await closeModelCatalogHelper(tab.id);
     }
   })();
   try {

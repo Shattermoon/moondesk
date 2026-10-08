@@ -394,6 +394,7 @@ async fn companion_hello(State(state): State<ServerState>, headers: HeaderMap) -
         StatusCode::OK,
         json!({
             "app": "moondesk-worker-companion",
+            "appVersion": env!("CARGO_PKG_VERSION"),
             "protocolVersion": 2,
             "paired": auth.paired_client_count().await > 0,
             "pairedClientCount": auth.paired_client_count().await
@@ -480,6 +481,7 @@ async fn companion_status(State(state): State<ServerState>, headers: HeaderMap) 
     json_response(
         StatusCode::OK,
         json!({
+            "appVersion": env!("CARGO_PKG_VERSION"),
             "protocolVersion": 2,
             "paired": true,
             "clientId": client_id,
@@ -2662,6 +2664,10 @@ mod tests {
         assert_eq!(
             hello_json.get("app").and_then(Value::as_str),
             Some("moondesk-worker-companion")
+        );
+        assert_eq!(
+            hello_json.get("appVersion").and_then(Value::as_str),
+            Some(env!("CARGO_PKG_VERSION"))
         );
         assert_eq!(
             hello_json.get("paired").and_then(Value::as_bool),

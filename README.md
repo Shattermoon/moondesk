@@ -136,7 +136,7 @@ To enable Workers:
 3. Open `chrome://extensions` (or `edge://extensions` / `brave://extensions`), enable **Developer mode**, choose **Load unpacked**, and select the folder MoonDesk opened.
 4. Open ChatGPT in that same browser. The extension discovers MoonDesk's loopback-only bridge and pairs automatically; there is no per-chat token step. Multiple browser installations may remain paired independently.
 5. Open the ChatGPT conversation you want to use as the Core. No Project/workspace binding step is required.
-6. In the companion popup, click **Discover available ChatGPT models**, choose a confirmed model and reasoning effort, and save the worker profile. The companion reads ChatGPT's provider-owned picker state instead of relying on translated labels, and supports the current provider effort lanes (`Instant`, `Minimal`, `Low`, `Medium`, `High`, `Extra High`, `Max`, `Ultra`, and `Pro`) when the account actually offers them. Existing `Extra High` profiles remain compatible with the provider's `xhigh`/`max` migration.
+6. The companion automatically discovers the signed-in account's available ChatGPT models and reasoning efforts. Open the popup, choose from the confirmed catalog, and save the worker profile. **Refresh models** is only a repair/revalidation fallback. The companion reads ChatGPT's provider-owned picker state instead of relying on translated labels, and supports the current provider effort lanes (`Instant`, `Minimal`, `Low`, `Medium`, `High`, `Extra High`, `Max`, `Ultra`, and `Pro`) when the account actually offers them. Existing `Extra High` profiles remain compatible with the provider's `xhigh`/`max` migration.
 
 Contributors running from source can still load `extensions/moondesk-worker-companion` directly.
 

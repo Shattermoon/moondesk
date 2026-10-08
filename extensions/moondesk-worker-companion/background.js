@@ -16,6 +16,9 @@ const FAST_POLL_MS = 1500;
 const MAX_RECONCILE_ATTEMPTS = 3;
 const MAX_PARALLEL_COMMANDS = 4;
 const CHATGPT_MODEL_EFFORTS = new Set(['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra', 'pro']);
+const MODEL_CATALOG_STORAGE_KEY = 'moondeskWorkerModelCatalogV1';
+const MODEL_CATALOG_MAX_AGE_MS = 6 * 60 * 60 * 1000;
+const MODEL_CATALOG_RETRY_MS = 5 * 60 * 1000;
 
 let pumpTimer = null;
 let pumpActive = false;
@@ -177,7 +180,7 @@ async function discoverBridge(state) {
   const older = probes.find((probe) => probe.hello);
   if (older) {
     throw requestError(
-      `MoonDesk Worker Companion requires bridge protocol ${REQUIRED_PROTOCOL_VERSION}; found protocol ${older.hello.protocolVersion}. Start the matching experimental MoonDesk build.`,
+      `MoonDesk and Worker Companion do not match (bridge protocol ${older.hello.protocolVersion}; expected ${REQUIRED_PROTOCOL_VERSION}). Update the companion from MoonDesk → Settings → Workers, then reload MoonDesk Worker Companion on the browser extensions page.`,
       0,
       'bridge_protocol_mismatch'
     );
@@ -1190,7 +1193,9 @@ async function status() {
       ...remote,
       paired: true,
       connected: true,
-      baseUrl: state.baseUrl
+      baseUrl: state.baseUrl,
+      companionVersion: chrome.runtime.getManifest().version,
+      requiredProtocolVersion: REQUIRED_PROTOCOL_VERSION
     };
   } catch (error) {
     const state = await readState();
@@ -1198,6 +1203,8 @@ async function status() {
       paired: Boolean(state.credential),
       connected: false,
       baseUrl: state.baseUrl,
+      companionVersion: chrome.runtime.getManifest().version,
+      requiredProtocolVersion: REQUIRED_PROTOCOL_VERSION,
       error: String(error?.message || error),
       errorCode: error?.code || null,
       repairRequired: error?.status === 409
@@ -1345,11 +1352,63 @@ function normalizeModelCatalog(catalog) {
   return [...families.values()].filter((family) => family.choices.length > 0);
 }
 
-async function discoverModelCatalog() {
+async function readModelCatalogCache() {
+  try {
+    const stored = await chrome.storage.local.get(MODEL_CATALOG_STORAGE_KEY);
+    const record = stored[MODEL_CATALOG_STORAGE_KEY];
+    return record && typeof record === 'object' && !Array.isArray(record) ? record : {};
+  } catch {
+    return {};
+  }
+}
+
+async function writeModelCatalogCache(record) {
+  await chrome.storage.local.set({ [MODEL_CATALOG_STORAGE_KEY]: record });
+}
+
+async function signedInChatGptPageAvailable() {
+  let tabs = [];
+  try {
+    tabs = await chrome.tabs.query({ url: 'https://chatgpt.com/*' });
+  } catch {
+    return false;
+  }
+  for (const tab of tabs) {
+    if (!Number.isInteger(tab?.id) || tab.incognito || tab.discarded || tab.status !== 'complete') continue;
+    try {
+      const [frame] = await chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        func: async () => {
+          try {
+            const response = await fetch('/api/auth/session', { credentials: 'include', cache: 'no-store' });
+            if (!response.ok) return false;
+            const session = await response.json();
+            return Boolean(session && typeof session === 'object' && (session.accessToken || session.user));
+          } catch {
+            return false;
+          }
+        }
+      });
+      if (frame?.result === true) return true;
+    } catch {}
+  }
+  return false;
+}
+
+async function discoverModelCatalog({ force = false, requireExistingPage = false } = {}) {
   if (modelCatalogFlight) return modelCatalogFlight;
   modelCatalogFlight = (async () => {
     const nonce = crypto.randomUUID();
-    const expiresAt = Date.now() + 60000;
+    const now = Date.now();
+    const cached = await readModelCatalogCache();
+    const cachedCatalog = Array.isArray(cached.catalog) ? cached.catalog : [];
+    const updatedAt = Number(cached.updatedAt) || 0;
+    const lastAttemptAt = Number(cached.lastAttemptAt) || 0;
+    if (!force && cachedCatalog.length && now - updatedAt < MODEL_CATALOG_MAX_AGE_MS) return cachedCatalog;
+    if (!force && lastAttemptAt && now - lastAttemptAt < MODEL_CATALOG_RETRY_MS) return cachedCatalog;
+    if (requireExistingPage && !(await signedInChatGptPageAvailable())) return cachedCatalog;
+    await writeModelCatalogCache({ ...cached, lastAttemptAt: now });
+    const expiresAt = now + 60000;
     let tab = null;
     try {
       tab = await chrome.tabs.create({ url: modelCatalogHelperUrl(nonce), active: false });
@@ -1369,6 +1428,7 @@ async function discoverModelCatalog() {
       }
       const catalog = normalizeModelCatalog(response.catalog);
       if (!catalog.length) throw new Error('Could not confirm ChatGPT model catalog (catalog_empty_after_normalization)');
+      await writeModelCatalogCache({ catalog, updatedAt: Date.now(), lastAttemptAt: now });
       return catalog;
     } finally {
       if (tab?.id) await closeModelCatalogHelper(tab.id, nonce);
@@ -1391,7 +1451,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       case 'MOONDESK_REVOKE_CLIENT': return revokeClient(message);
       case 'MOONDESK_PROFILE': return profile();
       case 'MOONDESK_SET_PROFILE': return setProfile(message);
-      case 'MOONDESK_DISCOVER_MODELS': return discoverModelCatalog();
+      case 'MOONDESK_DISCOVER_MODELS': return discoverModelCatalog({ force: true });
       case 'MOONDESK_CLEAR_WORKERS': return clearWorkers(message);
       case 'MOONDESK_PROVIDER_CORRELATION': return (async () => {
         const context = chatContextFromUrl(sender?.tab?.url || sender?.url || '');
@@ -1414,19 +1474,25 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 chrome.runtime.onInstalled.addListener(() => {
   void chrome.alarms.create(POLL_ALARM, { periodInMinutes: 0.5 });
   schedulePump(200);
+  void discoverModelCatalog({ requireExistingPage: true }).catch(() => {});
 });
 chrome.runtime.onStartup.addListener(() => {
   void chrome.alarms.create(POLL_ALARM, { periodInMinutes: 0.5 });
   schedulePump(200);
+  void discoverModelCatalog({ requireExistingPage: true }).catch(() => {});
 });
 chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name === POLL_ALARM) void pump();
+  if (alarm.name === POLL_ALARM) {
+    void pump();
+    void discoverModelCatalog({ requireExistingPage: true }).catch(() => {});
+  }
 });
 chrome.tabs.onActivated.addListener(() => {
   schedulePump(25);
 });
 chrome.tabs.onUpdated.addListener((_tabId, changeInfo, tab) => {
-  if (changeInfo.url && tab.url?.startsWith('https://chatgpt.com/')) {
+  if ((changeInfo.url || changeInfo.status === 'complete') && tab.url?.startsWith('https://chatgpt.com/')) {
+    void discoverModelCatalog({ requireExistingPage: true }).catch(() => {});
     schedulePump(25);
   }
 });
@@ -1441,3 +1507,4 @@ chrome.windows.onFocusChanged.addListener(() => {
 
 void chrome.alarms.create(POLL_ALARM, { periodInMinutes: 0.5 });
 schedulePump(500);
+void discoverModelCatalog({ requireExistingPage: true }).catch(() => {});

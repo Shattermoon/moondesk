@@ -23,12 +23,14 @@ const popupSource = fs.readFileSync(popupPath, 'utf8');
 const serverSource = fs.readFileSync(serverPath, 'utf8');
 const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
 
-function loadBackground({ existingTabs = {}, contentByTab = {}, sendMessageImpl = null, fetchImpl = async () => { throw new Error('network not used'); }, setTimeoutImpl = null } = {}) {
+function loadBackground({ existingTabs = {}, contentByTab = {}, sendMessageImpl = null, scriptingExecuteImpl = null, fetchImpl = async () => { throw new Error('network not used'); }, setTimeoutImpl = null } = {}) {
   const createdTabs = [];
   const removedTabs = [];
   let stored = {};
   let runtimeMessageHandler = null;
   let tabRemovedHandler = null;
+  let tabUpdatedHandler = null;
+  let alarmHandler = null;
 
   const chrome = {
     storage: {
@@ -67,7 +69,7 @@ function loadBackground({ existingTabs = {}, contentByTab = {}, sendMessageImpl 
         throw new Error('not used');
       },
       onActivated: { addListener() {} },
-      onUpdated: { addListener() {} },
+      onUpdated: { addListener(handler) { tabUpdatedHandler = handler; } },
       onRemoved: { addListener(handler) { tabRemovedHandler = handler; } }
     },
     windows: {
@@ -75,13 +77,14 @@ function loadBackground({ existingTabs = {}, contentByTab = {}, sendMessageImpl 
       onFocusChanged: { addListener() {} }
     },
     scripting: {
-      async executeScript() { return []; }
+      async executeScript(options) { return scriptingExecuteImpl ? scriptingExecuteImpl(options) : []; }
     },
     alarms: {
       async create() {},
-      onAlarm: { addListener() {} }
+      onAlarm: { addListener(handler) { alarmHandler = handler; } }
     },
     runtime: {
+      getManifest() { return manifest; },
       onMessage: { addListener(handler) { runtimeMessageHandler = handler; } },
       onInstalled: { addListener() {} },
       onStartup: { addListener() {} }
@@ -114,6 +117,14 @@ function loadBackground({ existingTabs = {}, contentByTab = {}, sendMessageImpl 
         const keepAlive = runtimeMessageHandler(message, sender, resolve);
         if (!keepAlive) resolve(undefined);
       });
+    },
+    dispatchTabUpdated(tabId, changeInfo, tab) {
+      if (!tabUpdatedHandler) throw new Error('tab updated handler was not registered');
+      tabUpdatedHandler(tabId, changeInfo, tab);
+    },
+    dispatchAlarm(alarm = { name: 'moondesk-worker-companion-poll' }) {
+      if (!alarmHandler) throw new Error('alarm handler was not registered');
+      alarmHandler(alarm);
     },
     dispatchTabRemoved(tabId = 1, removeInfo = { windowId: 1, isWindowClosing: false }) {
       if (!tabRemovedHandler) throw new Error('tab removed handler was not registered');
@@ -1699,6 +1710,7 @@ test('model discovery runs in one owned clean helper tab and closes it after a c
   }];
   const { createdTabs, removedTabs, evaluate } = loadBackground({
     existingTabs,
+    scriptingExecuteImpl: async () => [{ result: false }],
     sendMessageImpl: async (id, message, { existingTabs: tabs }) => {
       seen.push({ id, message });
       if (message.type === 'MOONDESK_CONTEXT') return { ok: true, context: {} };
@@ -1714,7 +1726,9 @@ test('model discovery runs in one owned clean helper tab and closes it after a c
     }
   });
 
-  const result = await evaluate('discoverModelCatalog()');
+  await flushMicrotasks();
+  await flushMicrotasks();
+  const result = await evaluate('discoverModelCatalog({ force: true })');
   assert.deepEqual(JSON.parse(JSON.stringify(result)), catalog);
   assert.equal(createdTabs.length, 1);
   assert.equal(createdTabs[0].active, false, 'discovery must not steal focus from the Core');
@@ -1722,6 +1736,82 @@ test('model discovery runs in one owned clean helper tab and closes it after a c
   assert.deepEqual(removedTabs, [createdTabs[0].id]);
   assert.equal(existingTabs[7].url.includes('/c/anchor'), true, 'active Core tab must remain untouched');
   assert.equal(seen.filter((entry) => entry.message.type === 'MOONDESK_MODEL_CATALOG').length, 1);
+});
+
+test('automatic model discovery waits for ChatGPT, persists the catalog, and avoids repeated picker work', async () => {
+  const existingTabs = {};
+  const catalog = [{
+    id: 'gpt-5.6-sol',
+    label: 'GPT-5.6 Sol',
+    efforts: ['high'],
+    aliases: ['gpt-5.6-sol'],
+    choices: [{ id: 'gpt-5.6-sol', effort: 'high' }]
+  }];
+  let signedIn = false;
+  const { createdTabs, evaluate, dispatchTabUpdated, dispatchAlarm } = loadBackground({
+    existingTabs,
+    scriptingExecuteImpl: async () => [{ result: signedIn }],
+    sendMessageImpl: async (id, message, { existingTabs: tabs }) => {
+      if (message.type === 'MOONDESK_CONTEXT') return { ok: true, context: {} };
+      if (message.type !== 'MOONDESK_MODEL_CATALOG') throw new Error('unexpected message');
+      assert.ok(tabs[id].url.includes('moondesk-model-catalog='));
+      return { ok: true, catalog };
+    }
+  });
+
+  await flushMicrotasks();
+  assert.equal(createdTabs.length, 0, 'startup without ChatGPT must wait instead of opening a browser tab');
+
+  existingTabs[7] = { id: 7, url: 'https://chatgpt.com/c/anchor', active: true, status: 'complete' };
+  dispatchTabUpdated(7, { status: 'complete' }, existingTabs[7]);
+  await flushMicrotasks();
+  assert.equal(createdTabs.length, 0, 'signed-out ChatGPT must not trigger picker discovery');
+
+  signedIn = true;
+  dispatchTabUpdated(7, { status: 'complete' }, existingTabs[7]);
+  await flushMicrotasks();
+  await flushMicrotasks();
+  assert.equal(createdTabs.length, 1, 'opening a signed-in ChatGPT page later must trigger automatic discovery');
+  const cached = await evaluate('readModelCatalogCache()');
+  assert.deepEqual(JSON.parse(JSON.stringify(cached.catalog)), catalog);
+  assert.ok(Number.isFinite(cached.updatedAt));
+
+  dispatchAlarm();
+  await flushMicrotasks();
+  assert.equal(createdTabs.length, 1, 'the periodic fallback must reuse a fresh cache instead of reopening the picker');
+});
+
+test('manual model refresh bypasses the automatic cache while stale automatic cache revalidates', async () => {
+  const existingTabs = {
+    7: { id: 7, url: 'https://chatgpt.com/c/anchor', active: true, status: 'complete' }
+  };
+  const catalog = [{
+    id: 'gpt-5.6-sol', label: 'GPT-5.6 Sol', efforts: ['high'], aliases: ['gpt-5.6-sol'],
+    choices: [{ id: 'gpt-5.6-sol', effort: 'high' }]
+  }];
+  let signedIn = false;
+  const { createdTabs, evaluate } = loadBackground({
+    existingTabs,
+    scriptingExecuteImpl: async () => [{ result: signedIn }],
+    sendMessageImpl: async (_id, message) => {
+      if (message.type === 'MOONDESK_CONTEXT') return { ok: true, context: {} };
+      if (message.type !== 'MOONDESK_MODEL_CATALOG') throw new Error('unexpected message');
+      return { ok: true, catalog };
+    }
+  });
+
+  await flushMicrotasks();
+  signedIn = true;
+  await evaluate(`writeModelCatalogCache(${JSON.stringify({ catalog, updatedAt: Date.now(), lastAttemptAt: 0 })})`);
+  await evaluate('discoverModelCatalog({ requireExistingPage: true })');
+  assert.equal(createdTabs.length, 0, 'fresh automatic cache should be reused');
+
+  await evaluate('discoverModelCatalog({ force: true })');
+  assert.equal(createdTabs.length, 1, 'explicit repair refresh must inspect again');
+
+  await evaluate(`writeModelCatalogCache(${JSON.stringify({ catalog, updatedAt: Date.now() - 7 * 60 * 60 * 1000, lastAttemptAt: 0 })})`);
+  await evaluate('discoverModelCatalog({ requireExistingPage: true })');
+  assert.equal(createdTabs.length, 2, 'stale automatic cache should be revalidated when ChatGPT is available');
 });
 
 test('ChatGPT URL routing extracts exact conversation and Project IDs without using visible names', () => {
@@ -2639,6 +2729,62 @@ test('worker commit refuses a route change that occurs after preparation but bef
     state: 'failed', reason: 'prepared_launch_target_changed'
   });
   assert.equal(commitCalls, 0, 'the native Send path must not run after the prepared target changes');
+});
+
+test('worker commit revalidates the exact model and effort immediately before Send', async () => {
+  let messageHandler = null;
+  let sendCalls = 0;
+  let readbackCalls = 0;
+  const storage = new Map();
+  const conversationId = 'worker-conversation';
+  const DOM = {
+    conversationIdFromPath() { return conversationId; },
+    projectIdFromPath() { return null; },
+    async waitForComposerReady(_timeoutMs, stillCurrent) { return stillCurrent(); },
+    async selectModelSettings(_profile, _failure, stillCurrent) { return stillCurrent(); },
+    visibleModelSelection() { return { model: 'gpt-5.6-sol', reasoningEffort: 'high' }; },
+    async selectedModelAndEffort() { readbackCalls += 1; return null; },
+    taskMarkerPresent() { return false; },
+    preparedPromptMatches() { return false; },
+    insertPrompt() { return true; },
+    workerEvidence() {
+      return { conversationId, projectId: null, markerPresent: false, generating: false, userTurnCount: 0, assistantTurnCount: 0, composerEmpty: false };
+    },
+    async commitSendOnce() { sendCalls += 1; return { state: 'committed' }; }
+  };
+  const context = vm.createContext({
+    window: { MOONDESK_CHATGPT_DOM: DOM },
+    sessionStorage: {
+      setItem(key, value) { storage.set(key, value); },
+      getItem(key) { return storage.get(key) || null; }
+    },
+    location: { origin: 'https://chatgpt.com', hash: '', pathname: `/c/${conversationId}`, search: '', href: `https://chatgpt.com/c/${conversationId}` },
+    history: { state: null, replaceState() {} },
+    chrome: { runtime: { onMessage: { addListener(handler) { messageHandler = handler; } } } },
+    crypto: webcrypto,
+    setTimeout,
+    clearTimeout,
+    setInterval,
+    clearInterval,
+    console
+  });
+  vm.runInContext(contentSource, context, { filename: contentPath });
+  const launch = {
+    workspaceId: 'workspace-a', taskMarker: 'moondesk-worker-task:pre-send-model', openingMessage: 'pre-send-model',
+    threadKey: 'worker:pre-send-model', openMode: 'existing_thread',
+    executionProfile: { modelKey: 'gpt-5.6-sol', modelLabel: 'GPT-5.6 Sol', reasoningEffort: 'high' }
+  };
+  const prepare = await new Promise((resolve) => {
+    messageHandler({ type: 'MOONDESK_PREPARE_WORKER', commandId: 'pre-send-command', launchToken: 'pre-send-token', placement: { projectId: null }, launch }, null, resolve);
+  });
+  assert.equal(prepare.result.state, 'ready');
+
+  const commit = await new Promise((resolve) => {
+    messageHandler({ type: 'MOONDESK_COMMIT_WORKER_SEND', commandId: 'pre-send-command', launchToken: 'pre-send-token', placement: { projectId: null }, launch }, null, resolve);
+  });
+  assert.deepEqual(JSON.parse(JSON.stringify(commit.result)), { state: 'failed', reason: 'model_or_effort_unconfirmed_before_send' });
+  assert.equal(readbackCalls, 1);
+  assert.equal(sendCalls, 0, 'Send must not run when the final provider selection cannot be confirmed');
 });
 
 test('worker preparation reports the exact model-picker stage that failed', async () => {

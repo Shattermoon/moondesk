@@ -274,7 +274,7 @@
 
   async function commitWorkerSend(message) {
     const { commandId, launchToken, launch } = message;
-    if (!commandId || !launchToken || !launch?.taskMarker || !launch?.openingMessage) {
+    if (!commandId || !launchToken || !launch?.taskMarker || !launch?.openingMessage || !launch?.executionProfile) {
       return { state: 'failed', reason: 'invalid_commit_payload' };
     }
     const remembered = rememberedLaunch();
@@ -291,6 +291,13 @@
       (DOM.projectIdFromPath() || null) === (remembered.projectId || null);
     if (!stillOnPreparedTarget()) {
       return { state: 'failed', reason: 'prepared_launch_target_changed' };
+    }
+    const selection = await DOM.selectedModelAndEffort(launch.executionProfile);
+    if (!selection || !stillOnPreparedTarget()) {
+      return {
+        state: 'failed',
+        reason: stillOnPreparedTarget() ? 'model_or_effort_unconfirmed_before_send' : 'prepared_launch_target_changed'
+      };
     }
     return DOM.commitSendOnce(launch.openingMessage, launch.taskMarker, stillOnPreparedTarget);
   }

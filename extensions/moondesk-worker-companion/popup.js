@@ -303,7 +303,11 @@ async function render() {
 
   // Cached model catalog
   modelCatalog = await loadCachedModelCatalog();
-  if (modelCatalog.length) renderCatalog();
+  if (modelCatalog.length) {
+    renderCatalog();
+  } else {
+    $('catalogStatus').textContent = 'Models are discovered automatically when ChatGPT is available.';
+  }
 
   // Chat context detection
   currentContext = await currentChatContext();
@@ -436,6 +440,15 @@ $('clearWorkers').addEventListener('click', async () => {
     showError(error);
     $('clearWorkers').disabled = false;
   }
+});
+
+// ── Automatic catalog updates ────────────────────────────────────
+chrome.storage?.onChanged?.addListener?.((changes, areaName) => {
+  if (areaName !== 'local') return;
+  const cached = changes?.[MODEL_CATALOG_STORAGE_KEY]?.newValue;
+  if (!Array.isArray(cached?.catalog) || !cached.catalog.length) return;
+  modelCatalog = cached.catalog;
+  renderCatalog();
 });
 
 // ── Boot ─────────────────────────────────────────────────────────

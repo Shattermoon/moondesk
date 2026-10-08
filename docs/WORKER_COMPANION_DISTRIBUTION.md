@@ -44,7 +44,7 @@ The production instructions should be short and shown inside MoonDesk rather tha
 7. Open ChatGPT in the same browser and sign in normally.
 8. The companion discovers MoonDesk's loopback bridge and pairs automatically. There is no per-chat pairing code or token to copy.
 9. Open the ChatGPT conversation that will act as the **Core**.
-10. In the companion popup, click **Discover available ChatGPT models**, select model/reasoning effort, and save the worker profile.
+10. Models and reasoning efforts are discovered automatically once signed-in ChatGPT is available. Open the companion popup, choose from the confirmed catalog, and save the worker profile. **Refresh models** is only a repair/revalidation fallback.
 11. Ask Core to create workers. MoonDesk recommends **1–4 simultaneous workers**; 8 remains the hard product ceiling, not the recommended everyday setting.
 
 Fresh workers are ordinary ChatGPT conversations even when Core lives in a ChatGPT Project. Existing workers reuse their exact durable conversation.

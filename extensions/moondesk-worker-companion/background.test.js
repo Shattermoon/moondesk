@@ -162,7 +162,7 @@ test('companion HTTP paths used by the extension match server route constants', 
       'COMPANION_REDEEM_ROUTE',
       'COMPANION_SEND_STARTED_ROUTE',
       'COMPANION_ACK_ROUTE',
-      'COMPANION_RETRY_ROUTE'
+      'COMPANION_CLEAR_WORKERS_ROUTE'
     ].includes(name));
 
   assert.equal(routes.length, 13, 'expected the complete companion route set from src/server.rs');
@@ -170,6 +170,15 @@ test('companion HTTP paths used by the extension match server route constants', 
     assert.ok(source.includes(route), `${name} must be used verbatim by background.js`);
   }
   assert.doesNotMatch(source, /['"]\/__moondesk\/companion\/v1\/ack['"]/);
+});
+
+test('companion exposes destructive Core reset but no stale launch replay control', () => {
+  assert.match(source, /MOONDESK_CLEAR_WORKERS/);
+  assert.match(source, /\/__moondesk\/companion\/v1\/workers\/clear/);
+  assert.doesNotMatch(source, /MOONDESK_RETRY_BLOCKED/);
+  assert.doesNotMatch(source, /\/__moondesk\/companion\/v1\/commands\/retry/);
+  assert.match(popupSource, /MOONDESK_CLEAR_WORKERS/);
+  assert.doesNotMatch(popupSource, /Retry safe launch|MOONDESK_RETRY_BLOCKED/);
 });
 
 test('bridge discovery selects protocol V2 without unresolved runtime constants', async () => {

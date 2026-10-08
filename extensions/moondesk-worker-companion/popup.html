@@ -1,5 +1,5 @@
 <!doctype html>
-<html>
+<html lang="en">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
@@ -8,49 +8,91 @@
 </head>
 <body>
   <main>
-    <h1>MoonDesk Workers</h1>
-    <p id="status" class="status">Checking…</p>
-    <div id="bridgeStatus" class="muted">Searching for local MoonDesk…</div>
+    <!-- Header -->
+    <header id="header">
+      <div class="brand">
+        <svg class="logo" width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+          <circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="2"/>
+          <path d="M8 12a4 4 0 0 1 8 0" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+          <circle cx="12" cy="8" r="1.5" fill="currentColor"/>
+        </svg>
+        <span class="brand-text">MoonDesk Workers</span>
+      </div>
+      <span id="connPill" class="conn-pill pill-checking" role="status" aria-live="polite">Checking…</span>
+    </header>
 
-    <details id="manualRepair">
-      <summary>Manual repair</summary>
-      <section id="pairing">
-        <label>Manual repair code
-          <input id="pairingToken" type="password" autocomplete="off" spellcheck="false" />
-        </label>
-        <button id="pair">Repair companion pairing</button>
-      </section>
+    <!-- Core Card -->
+    <section id="coreCard" class="card" hidden>
+      <h2 class="card-title">Core</h2>
+      <div class="card-rows">
+        <div class="row">
+          <span class="row-label">Bridge</span>
+          <span id="bridgeValue" class="row-value">—</span>
+        </div>
+        <div class="row">
+          <span class="row-label">Chat</span>
+          <span id="coreChat" class="row-value dim">No conversation detected</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- Worker Profile Card -->
+    <section id="profileCard" class="card" hidden>
+      <h2 class="card-title">Worker Profile</h2>
+      <div id="currentProfile" class="profile-current dim">Not configured</div>
+
+      <div class="profile-controls">
+        <button id="discoverModels" type="button" class="btn btn-subtle btn-sm" aria-label="Refresh available ChatGPT models">
+          <svg class="icon-refresh" width="13" height="13" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+            <path d="M13.65 2.35A7.96 7.96 0 0 0 8 0a8 8 0 1 0 8 8h-2a6 6 0 1 1-1.76-4.24" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+          <span>Refresh models</span>
+        </button>
+        <span id="catalogStatus" class="catalog-hint"></span>
+      </div>
+
+      <div id="modelLabel" class="selector-row" hidden>
+        <div class="selector-group">
+          <label for="model" class="selector-label">Model</label>
+          <select id="model" class="sel"></select>
+        </div>
+        <div class="selector-group" id="effortLabel" hidden>
+          <label for="effort" class="selector-label">Reasoning</label>
+          <select id="effort" class="sel"></select>
+        </div>
+      </div>
+
+      <button id="saveProfile" type="button" class="btn btn-primary" hidden>Save</button>
+    </section>
+
+    <!-- Advanced -->
+    <details id="advancedSection" class="advanced" hidden>
+      <summary class="advanced-summary">Advanced</summary>
+
+      <div id="browsersBlock" class="adv-block" hidden>
+        <div class="adv-block-title">Paired Browsers</div>
+        <div id="browserStatus" class="dim"></div>
+        <div id="browserList"></div>
+      </div>
+
+      <div id="repairBlock" class="adv-block" hidden>
+        <div class="adv-block-title">Manual Repair</div>
+        <div class="repair-row">
+          <label for="pairingToken" class="sr-only">Repair code</label>
+          <input id="pairingToken" type="password" autocomplete="off" spellcheck="false" class="input" placeholder="Paste repair code" aria-label="Manual repair code" />
+          <button id="pair" type="button" class="btn btn-subtle btn-sm">Repair pairing</button>
+        </div>
+      </div>
+
+      <div id="clearBlock" class="adv-block adv-danger" hidden>
+        <div class="adv-block-title danger-text">Clear Workers</div>
+        <p class="danger-desc">Removes all worker history and bindings for the current Core conversation. ChatGPT chats are preserved. Cannot clear while workers are active.</p>
+        <button id="clearWorkers" type="button" class="btn btn-danger" disabled aria-label="Clear workers for current Core conversation">Clear workers</button>
+      </div>
     </details>
 
-    <section id="routing" hidden>
-      <div id="browserStatus" class="muted"></div>
-      <details id="browserManager" hidden>
-        <summary>Manage paired browsers</summary>
-        <div id="browserList"></div>
-      </details>
-      <div id="chatContext" class="muted">Open a ChatGPT conversation to expose it to MoonDesk Workers.</div>
-      <div class="muted">Fresh Workers V1 chats always open as normal ChatGPT conversations, even when the Core is inside a Project. Existing workers reuse their exact confirmed conversation.</div>
-    </section>
-
-    <section id="profile" hidden>
-      <div id="currentProfile" class="muted">Worker profile unavailable.</div>
-      <button id="discoverModels">Discover available ChatGPT models</button>
-      <div id="catalogStatus" class="muted"></div>
-      <label id="modelLabel" hidden>Worker model
-        <select id="model"></select>
-      </label>
-      <label id="effortLabel" hidden>Reasoning effort
-        <select id="effort"></select>
-      </label>
-      <button id="saveProfile" hidden>Save worker profile</button>
-    </section>
-
-    <section id="blocked" hidden>
-      <p id="blockedText"></p>
-      <button id="retry">Retry reconciliation</button>
-    </section>
-
-    <p id="error" class="error"></p>
+    <!-- Global error -->
+    <p id="error" class="error-bar" role="alert" aria-live="assertive"></p>
   </main>
   <script src="popup.js"></script>
 </body>

@@ -10,6 +10,7 @@ const CLIENTS_PATH = '/__moondesk/companion/v1/clients';
 const PRESENCE_PATH = '/__moondesk/companion/v1/presence';
 const CORRELATIONS_PATH = '/__moondesk/companion/v1/correlations';
 const SEND_STARTED_PATH = '/__moondesk/companion/v1/commands/send-started';
+const CLEAR_WORKERS_PATH = '/__moondesk/companion/v1/workers/clear';
 const HELLO_TIMEOUT_MS = 1200;
 const FAST_POLL_MS = 1500;
 const MAX_RECONCILE_ATTEMPTS = 3;
@@ -1185,27 +1186,21 @@ async function status() {
   try {
     const state = await ensureConnected();
     const remote = await api(state, STATUS_PATH);
-    const blockedCommands = blockedCommandList(state);
     return {
       ...remote,
       paired: true,
       connected: true,
-      baseUrl: state.baseUrl,
-      blockedCommand: blockedCommands[0] || null,
-      blockedCommands
+      baseUrl: state.baseUrl
     };
   } catch (error) {
     const state = await readState();
-    const blockedCommands = blockedCommandList(state);
     return {
       paired: Boolean(state.credential),
       connected: false,
       baseUrl: state.baseUrl,
       error: String(error?.message || error),
       errorCode: error?.code || null,
-      repairRequired: error?.status === 409,
-      blockedCommand: blockedCommands[0] || null,
-      blockedCommands
+      repairRequired: error?.status === 409
     };
   }
 }
@@ -1247,6 +1242,36 @@ async function setProfile({ profile: nextProfile }) {
     body: nextProfile
   });
   return response.profile || null;
+}
+
+async function clearWorkers({ conversationId }) {
+  if (!conversationId) throw new Error('Open the Core conversation before clearing workers');
+  const state = await ensureConnected();
+  const response = await api(state, CLEAR_WORKERS_PATH, {
+    method: 'POST',
+    body: { conversationId }
+  });
+  const commandIds = new Set(Array.isArray(response.commandIds) ? response.commandIds : []);
+  const workerIds = new Set(Array.isArray(response.workerIds) ? response.workerIds : []);
+  const threadKeys = new Set([...workerIds].map((workerId) => `worker:${workerId}`));
+
+  for (const commandId of commandIds) {
+    delete state.launchRecords?.[commandId];
+    clearBlockedCommand(state, commandId);
+    sessionReconcileCommandIds.delete(commandId);
+  }
+  for (const [commandId, record] of Object.entries(state.launchRecords || {})) {
+    if (threadKeys.has(record?.threadKey)) {
+      delete state.launchRecords[commandId];
+      clearBlockedCommand(state, commandId);
+      sessionReconcileCommandIds.delete(commandId);
+    }
+  }
+  for (const threadKey of threadKeys) {
+    delete state.threadRecords?.[threadKey];
+  }
+  await writeState(state);
+  return response;
 }
 
 function modelCatalogHelperUrl(nonce) {
@@ -1367,6 +1392,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       case 'MOONDESK_PROFILE': return profile();
       case 'MOONDESK_SET_PROFILE': return setProfile(message);
       case 'MOONDESK_DISCOVER_MODELS': return discoverModelCatalog();
+      case 'MOONDESK_CLEAR_WORKERS': return clearWorkers(message);
       case 'MOONDESK_PROVIDER_CORRELATION': return (async () => {
         const context = chatContextFromUrl(sender?.tab?.url || sender?.url || '');
         if (!context || !Number.isInteger(sender?.tab?.id)) {
@@ -1374,33 +1400,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         }
         const state = await ensureConnected();
         return publishProviderCorrelation(state, context, message.correlation);
-      })();
-      case 'MOONDESK_RETRY_BLOCKED': return (async () => {
-        const state = await ensureConnected();
-        const blocked = blockedCommandList(state);
-        if (!blocked.length) return { ok: true, retried: 0, manual: 0 };
-        let retried = 0;
-        let manual = 0;
-        for (const entry of blocked) {
-          if (entry.retryMode === 'none') {
-            manual += 1;
-            continue;
-          }
-          if (entry.retryMode === 'fresh' || entry.retryMode === 'reconcile') {
-            await api(state, '/__moondesk/companion/v1/commands/retry', {
-              method: 'POST',
-              body: { commandId: entry.commandId }
-            });
-            if (entry.retryMode === 'reconcile') {
-              sessionReconcileCommandIds.add(entry.commandId);
-            }
-          }
-          clearBlockedCommand(state, entry.commandId);
-          retried += 1;
-        }
-        await writeState(state);
-        if (retried) schedulePump(50);
-        return { ok: true, retried, manual };
       })();
       default: return null;
     }

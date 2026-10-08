@@ -1,3 +1,7 @@
+/* ── MoonDesk Worker Companion — popup.js ──────────────────────── */
+/* eslint-env browser */
+/* global chrome */
+
 const $ = (id) => document.getElementById(id);
 const MODEL_CATALOG_STORAGE_KEY = 'moondeskWorkerModelCatalogV1';
 let currentContext = null;
@@ -30,12 +34,14 @@ const CONFIG_EFFORT_LABEL = {
   pro: 'Pro'
 };
 
+// ── Background messaging ─────────────────────────────────────────
 async function bg(message) {
   const response = await chrome.runtime.sendMessage(message);
   if (!response?.ok) throw new Error(response?.error || 'MoonDesk companion request failed');
   return response.result;
 }
 
+// ── ChatGPT context detection ────────────────────────────────────
 async function activeChatTab() {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   return tab?.id && tab.url?.startsWith('https://chatgpt.com/') ? tab : null;
@@ -67,6 +73,7 @@ async function currentChatContext() {
   }
 }
 
+// ── Model catalog ────────────────────────────────────────────────
 async function currentModelCatalog() {
   const catalog = await bg({ type: 'MOONDESK_DISCOVER_MODELS' });
   if (!Array.isArray(catalog) || !catalog.length) {
@@ -94,39 +101,15 @@ async function saveCachedModelCatalog(catalog) {
   });
 }
 
+// ── UI helpers ───────────────────────────────────────────────────
 function showError(error) {
   $('error').textContent = error ? String(error.message || error) : '';
 }
 
 function profileText(profile) {
-  if (!profile) return 'Worker profile unavailable.';
-  return `Current worker profile: ${profile.modelLabel} / ${CONFIG_EFFORT_LABEL[profile.reasoningEffort] || profile.reasoningEffort}`;
-}
-
-function renderBrowserClients(clients) {
-  const list = $('browserList');
-  list.textContent = '';
-  const stale = (clients || []).filter((client) => !client.current);
-  $('browserManager').hidden = stale.length === 0;
-  for (const client of clients || []) {
-    const row = document.createElement('div');
-    row.className = 'browser-row';
-    const text = document.createElement('div');
-    text.className = 'browser-copy';
-    const label = client.browserLabel || 'Browser';
-    const presence = client.online ? 'online' : 'offline';
-    text.textContent = `${label} · ${presence} · ${client.clientId}${client.current ? ' · current' : ''}`;
-    row.append(text);
-    if (!client.current) {
-      const button = document.createElement('button');
-      button.type = 'button';
-      button.className = 'browser-revoke';
-      button.dataset.clientId = client.clientId;
-      button.textContent = 'Revoke';
-      row.append(button);
-    }
-    list.append(row);
-  }
+  if (!profile) return 'Not configured';
+  const effortLabel = CONFIG_EFFORT_LABEL[profile.reasoningEffort] || profile.reasoningEffort;
+  return `${profile.modelLabel} · ${effortLabel}`;
 }
 
 function supportedEfforts(model) {
@@ -156,6 +139,7 @@ function isPreferredDefaultModel(model) {
   );
 }
 
+// ── Render: effort selector ──────────────────────────────────────
 function renderEfforts() {
   const selectedModel = modelCatalog.find((entry) => entry.id === $('model').value);
   const efforts = supportedEfforts(selectedModel);
@@ -183,6 +167,7 @@ function renderEfforts() {
   $('saveProfile').hidden = efforts.length === 0;
 }
 
+// ── Render: model catalog ────────────────────────────────────────
 function renderCatalog() {
   const usable = modelCatalog.filter((model) => supportedEfforts(model).length > 0);
   const select = $('model');
@@ -197,79 +182,156 @@ function renderCatalog() {
   $('effortLabel').hidden = usable.length === 0;
   $('saveProfile').hidden = usable.length === 0;
   if (!usable.length) {
-    $('catalogStatus').textContent = 'No MoonDesk-supported model/effort combinations were confirmed.';
+    $('catalogStatus').textContent = 'No supported models confirmed.';
     return;
   }
   const configured = usable.find((model) => profileBelongsToModel(currentProfile, model));
   const preferredDefault = usable.find(isPreferredDefaultModel);
   const selected = configured || preferredDefault || usable[0];
   if (selected) select.value = selected.id;
-  $('catalogStatus').textContent = `${usable.length} available model famil${usable.length === 1 ? 'y' : 'ies'} confirmed from this ChatGPT account.`;
+  $('catalogStatus').textContent = `${usable.length} model${usable.length === 1 ? '' : 's'} available`;
   renderEfforts();
 }
 
+// ── Render: paired browsers ──────────────────────────────────────
+function renderBrowserClients(clients) {
+  const list = $('browserList');
+  list.textContent = '';
+  const all = clients || [];
+  const stale = all.filter((client) => !client.current);
+  $('browsersBlock').hidden = all.length === 0;
+  if (!all.length) return;
+
+  for (const client of all) {
+    const row = document.createElement('div');
+    row.className = 'browser-row';
+
+    const dot = document.createElement('span');
+    dot.className = `browser-dot ${client.online ? 'browser-dot-online' : 'browser-dot-offline'}`;
+    dot.setAttribute('aria-label', client.online ? 'Online' : 'Offline');
+    row.append(dot);
+
+    const text = document.createElement('span');
+    text.className = `browser-copy${client.current ? ' browser-current' : ''}`;
+    const label = client.browserLabel || 'Browser';
+    text.textContent = client.current ? `${label} (this)` : label;
+    text.title = client.clientId;
+    row.append(text);
+
+    if (!client.current) {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'btn btn-subtle btn-sm browser-revoke';
+      button.dataset.clientId = client.clientId;
+      button.textContent = 'Revoke';
+      button.setAttribute('aria-label', `Revoke paired browser ${client.clientId}`);
+      row.append(button);
+    }
+    list.append(row);
+  }
+
+  $('browserStatus').textContent = `${all.length} paired browser${all.length === 1 ? '' : 's'}${stale.length ? ` · ${stale.length} stale` : ''}`;
+}
+
+// ── Render: clear workers button state ───────────────────────────
+function renderClearWorkers() {
+  const hasConversation = Boolean(currentContext?.conversationId);
+  $('clearBlock').hidden = false;
+  $('clearWorkers').disabled = !hasConversation;
+  if (!hasConversation) {
+    $('clearWorkers').title = 'Open the Core conversation first';
+  } else {
+    $('clearWorkers').title = '';
+  }
+}
+
+// ── Main render ──────────────────────────────────────────────────
 async function render() {
   showError('');
   const status = await bg({ type: 'MOONDESK_STATUS' });
   const connected = status.connected === true;
-  $('routing').hidden = !connected;
-  $('profile').hidden = !connected;
-  $('manualRepair').hidden = !status.repairRequired;
-  $('manualRepair').open = Boolean(status.repairRequired);
-  $('status').textContent = connected
-    ? 'Connected'
-    : status.repairRequired
-      ? 'Manual repair required'
-      : status.errorCode === 'bridge_not_found'
-        ? 'MoonDesk companion bridge not found'
-        : 'Connecting to MoonDesk…';
-  $('bridgeStatus').textContent = status.baseUrl
-    ? `Local bridge: ${status.baseUrl}`
-    : 'Searching for local MoonDesk…';
-  if (!connected && status.error) showError(status.error);
 
-  const blockedCommands = Array.isArray(status.blockedCommands)
-    ? status.blockedCommands
-    : status.blockedCommand
-      ? [status.blockedCommand]
-      : [];
-  const retryableBlocked = blockedCommands.filter((entry) => entry.retryMode !== 'none');
-  const manualBlocked = blockedCommands.length - retryableBlocked.length;
-  $('blocked').hidden = blockedCommands.length === 0;
-  if (blockedCommands.length) {
-    const first = blockedCommands[0];
-    $('blockedText').textContent = blockedCommands.length === 1
-      ? `Worker launch ${first.commandId} is paused: ${first.reason}`
-      : `${blockedCommands.length} worker launches need attention (${retryableBlocked.length} retryable, ${manualBlocked} manual inspection).`;
-    $('retry').disabled = retryableBlocked.length === 0;
-    $('retry').textContent = retryableBlocked.length > 1
-      ? `Retry ${retryableBlocked.length} safe launches`
-      : retryableBlocked.length === 1
-        ? 'Retry safe launch'
-        : 'Manual inspection required';
+  // Connection pill
+  const pill = $('connPill');
+  pill.className = 'conn-pill';
+  if (connected) {
+    pill.textContent = 'Connected';
+    pill.classList.add('pill-connected');
+  } else if (status.repairRequired) {
+    pill.textContent = 'Repair needed';
+    pill.classList.add('pill-repair');
+  } else if (status.errorCode === 'bridge_not_found') {
+    pill.textContent = 'Bridge not found';
+    pill.classList.add('pill-error');
   } else {
-    $('retry').disabled = false;
-    $('retry').textContent = 'Retry reconciliation';
+    pill.textContent = 'Connecting…';
+    pill.classList.add('pill-checking');
   }
 
+  // Cards visibility
+  $('coreCard').hidden = !connected;
+  $('profileCard').hidden = !connected;
+  $('advancedSection').hidden = !connected;
+
+  // Bridge status
+  $('bridgeValue').textContent = status.baseUrl
+    ? new URL(status.baseUrl).host
+    : '—';
+
+  // Repair block visibility
+  $('repairBlock').hidden = !status.repairRequired;
+
+  if (!connected && status.error) showError(status.error);
   if (!connected) return;
+
+  // Profile
   currentProfile = await bg({ type: 'MOONDESK_PROFILE' });
+  const profileEl = $('currentProfile');
+  const text = profileText(currentProfile);
+  profileEl.textContent = text;
+  if (currentProfile) {
+    profileEl.classList.add('profile-active');
+    profileEl.classList.remove('dim');
+  } else {
+    profileEl.classList.remove('profile-active');
+    profileEl.classList.add('dim');
+  }
+
+  // Clients
   const pairedClients = await bg({ type: 'MOONDESK_CLIENTS' });
   renderBrowserClients(pairedClients);
+
+  // Cached model catalog
   modelCatalog = await loadCachedModelCatalog();
-  $('currentProfile').textContent = profileText(currentProfile);
-  $('browserStatus').textContent = `${status.pairedClientCount || 1} paired browser installation${(status.pairedClientCount || 1) === 1 ? '' : 's'} · this client ${status.clientId || 'connected'}`;
-
-  currentContext = await currentChatContext();
-  $('chatContext').textContent = currentContext?.conversationId
-    ? currentContext.projectId
-      ? `Core: Project ${currentContext.projectId} · conversation ${currentContext.conversationId}`
-      : `Core: normal conversation ${currentContext.conversationId}`
-    : 'Open an existing ChatGPT conversation to make it the Core for worker routing.';
-
   if (modelCatalog.length) renderCatalog();
+
+  // Chat context detection
+  currentContext = await currentChatContext();
+  const chatEl = $('coreChat');
+  if (currentContext?.conversationId) {
+    chatEl.innerHTML = '';
+    const convSpan = document.createElement('span');
+    convSpan.className = 'core-conv';
+    convSpan.textContent = currentContext.conversationId;
+    chatEl.append(convSpan);
+    if (currentContext.projectId) {
+      const projSpan = document.createElement('span');
+      projSpan.className = 'core-proj';
+      projSpan.textContent = ` · Project`;
+      projSpan.title = currentContext.projectId;
+      chatEl.append(projSpan);
+    }
+    chatEl.classList.remove('dim');
+  } else {
+    chatEl.textContent = 'Open a ChatGPT conversation';
+    chatEl.classList.add('dim');
+  }
+
+  // Advanced: clear workers
+  renderClearWorkers();
 }
 
+// ── Event: repair pairing ────────────────────────────────────────
 $('pair').addEventListener('click', async () => {
   showError('');
   try {
@@ -284,17 +346,17 @@ $('pair').addEventListener('click', async () => {
   }
 });
 
+// ── Event: revoke paired browser ─────────────────────────────────
 $('browserList').addEventListener('click', async (event) => {
   const button = event.target.closest('button[data-client-id]');
   if (!button) return;
   const clientId = button.dataset.clientId;
   if (!clientId) return;
-  if (!confirm(`Revoke paired browser ${clientId}? Any ambiguous launch pinned to it will be paused, not resent.`)) return;
+  if (!confirm(`Revoke paired browser ${clientId}?\n\nAmbiguous launches will be paused, not resent.`)) return;
   showError('');
   button.disabled = true;
   try {
-    const result = await bg({ type: 'MOONDESK_REVOKE_CLIENT', clientId });
-    $('browserStatus').textContent = `Stale browser revoked · ${result.retargetedCommands || 0} safe command(s) retargeted · ${result.pausedCommands || 0} ambiguous command(s) paused`;
+    await bg({ type: 'MOONDESK_REVOKE_CLIENT', clientId });
     await render();
   } catch (error) {
     showError(error);
@@ -302,11 +364,12 @@ $('browserList').addEventListener('click', async (event) => {
   }
 });
 
+// ── Event: discover models ───────────────────────────────────────
 $('discoverModels').addEventListener('click', async () => {
   showError('');
   const button = $('discoverModels');
   button.disabled = true;
-  $('catalogStatus').textContent = 'Inspecting ChatGPT model picker…';
+  $('catalogStatus').textContent = 'Inspecting models…';
   try {
     modelCatalog = await currentModelCatalog();
     await saveCachedModelCatalog(modelCatalog);
@@ -314,7 +377,7 @@ $('discoverModels').addEventListener('click', async () => {
   } catch (error) {
     if (modelCatalog.length) {
       renderCatalog();
-      $('catalogStatus').textContent = 'Using the last confirmed model catalog; refresh failed.';
+      $('catalogStatus').textContent = 'Using cached catalog; refresh failed.';
     } else {
       $('catalogStatus').textContent = '';
     }
@@ -324,8 +387,10 @@ $('discoverModels').addEventListener('click', async () => {
   }
 });
 
+// ── Event: model change ──────────────────────────────────────────
 $('model').addEventListener('change', renderEfforts);
 
+// ── Event: save profile ──────────────────────────────────────────
 $('saveProfile').addEventListener('click', async () => {
   showError('');
   try {
@@ -343,21 +408,35 @@ $('saveProfile').addEventListener('click', async () => {
         reasoningEffort
       }
     });
-    $('currentProfile').textContent = profileText(currentProfile);
-    $('catalogStatus').textContent = 'Worker profile saved to MoonDesk.';
+    const profileEl = $('currentProfile');
+    profileEl.textContent = profileText(currentProfile);
+    profileEl.classList.add('profile-active');
+    profileEl.classList.remove('dim');
+    $('catalogStatus').textContent = 'Profile saved.';
   } catch (error) {
     showError(error);
   }
 });
 
-$('retry').addEventListener('click', async () => {
+// ── Event: clear workers ─────────────────────────────────────────
+$('clearWorkers').addEventListener('click', async () => {
+  if (!currentContext?.conversationId) return;
+  if (!confirm('Clear all worker history and bindings for this Core conversation?\n\nChatGPT chats are preserved. Active/ambiguous work will be refused.')) return;
   showError('');
+  $('clearWorkers').disabled = true;
   try {
-    await bg({ type: 'MOONDESK_RETRY_BLOCKED' });
+    const result = await bg({
+      type: 'MOONDESK_CLEAR_WORKERS',
+      conversationId: currentContext.conversationId
+    });
+    const count = (result.workerIds?.length || 0);
+    $('catalogStatus').textContent = `Cleared ${count} worker${count === 1 ? '' : 's'}.`;
     await render();
   } catch (error) {
     showError(error);
+    $('clearWorkers').disabled = false;
   }
 });
 
+// ── Boot ─────────────────────────────────────────────────────────
 void render().catch(showError);

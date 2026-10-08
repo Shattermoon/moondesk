@@ -123,8 +123,9 @@ After WorkerBroker creates the pending worker:
 - SendStarted -> NeedsReconcile after lease expiry.
 - NeedsReconcile/Paused never creates a new thread.
 - Extension reload does not authorize old reconciliation automatically.
-- Explicit user Retry moves Paused -> NeedsReconcile only.
+- The popup never offers delayed manual replay of failed worker assignments; failed launches stay terminal and Core may create a replacement.
 - Browser-local state loss cannot create a fresh thread for an ambiguous command.
+- Clear workers may remove idle/retired and proven pre-Send-failed state for the exact Core, but refuses active or ambiguous work.
 
 ### H. Companion installation lifecycle
 

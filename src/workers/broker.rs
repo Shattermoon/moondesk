@@ -381,6 +381,103 @@ impl WorkerBroker {
         Ok(Some(updated))
     }
 
+    pub async fn settle_pre_send_failure_by_command(
+        &self,
+        command_id: &str,
+        launch_error: Option<String>,
+    ) -> Result<Option<WorkerRecord>, WorkerBrokerError> {
+        if Uuid::parse_str(command_id).is_err() {
+            return Err(WorkerBrokerError::Invalid(
+                "worker launch command id is invalid".into(),
+            ));
+        }
+        if launch_error
+            .as_deref()
+            .is_some_and(|value| value.len() > 1000)
+        {
+            return Err(WorkerBrokerError::Invalid(
+                "worker launch error is too long".into(),
+            ));
+        }
+        let mut guard = self.data.lock().await;
+        let mut location = None;
+        'families: for (family_id, family) in &guard.families {
+            for (worker_id, worker) in &family.workers {
+                if worker.launch_command_id.as_deref() == Some(command_id) {
+                    location = Some((family_id.clone(), worker_id.clone()));
+                    break 'families;
+                }
+            }
+        }
+        let Some((family_id, worker_id)) = location else {
+            return Ok(None);
+        };
+        let worker = guard
+            .families
+            .get(&family_id)
+            .and_then(|family| family.workers.get(&worker_id))
+            .ok_or(WorkerBrokerError::NotFound)?;
+        if worker.launch_state == WorkerLaunchState::Claimed
+            || matches!(worker.state, WorkerState::Idle | WorkerState::Retired)
+        {
+            return Ok(Some(worker.clone()));
+        }
+        let task_id = worker.current_task_id.clone().ok_or_else(|| {
+            WorkerBrokerError::Conflict(
+                "pre-Send worker failure has no pending task to settle".into(),
+            )
+        })?;
+        if worker
+            .tasks
+            .get(&task_id)
+            .is_none_or(|task| task.state != TaskState::Pending)
+        {
+            return Err(WorkerBrokerError::Conflict(
+                "pre-Send worker failure no longer owns a pending task".into(),
+            ));
+        }
+
+        let was_fresh = worker.state == WorkerState::Provisioning && worker.chat_identity.is_none();
+        let was_reuse = worker.state == WorkerState::Waking && worker.chat_identity.is_some();
+        if !was_fresh && !was_reuse {
+            return Err(WorkerBrokerError::Conflict(
+                "worker launch cannot be settled as pre-Send failure after claim or task start"
+                    .into(),
+            ));
+        }
+
+        let mut candidate = guard.clone();
+        let family = candidate
+            .families
+            .get_mut(&family_id)
+            .ok_or(WorkerBrokerError::NotFound)?;
+        let worker = family
+            .workers
+            .get_mut(&worker_id)
+            .ok_or(WorkerBrokerError::NotFound)?;
+        let task = worker
+            .tasks
+            .get_mut(&task_id)
+            .ok_or(WorkerBrokerError::NotFound)?;
+        task.state = TaskState::Failed;
+        worker.current_task_id = None;
+        worker.launch_error = launch_error;
+        worker.attachment_state = BrowserAttachmentState::Absent;
+        if was_fresh {
+            worker.claim_token = None;
+            worker.state = WorkerState::Retired;
+            worker.launch_state = WorkerLaunchState::Failed;
+        } else {
+            worker.state = WorkerState::Idle;
+            worker.launch_state = WorkerLaunchState::Claimed;
+            worker.launch_command_id = None;
+        }
+        let settled = worker.clone();
+        self.commit_candidate(&mut guard, candidate).await?;
+        self.updates.notify_waiters();
+        Ok(Some(settled))
+    }
+
     pub async fn rollback_linked_spawn(
         &self,
         workspace_id: &WorkspaceId,
@@ -871,6 +968,58 @@ impl WorkerBroker {
         self.commit_candidate(&mut guard, candidate).await?;
         self.updates.notify_waiters();
         Ok(removed)
+    }
+
+    pub async fn ensure_clearable_session_digest(
+        &self,
+        session_digest: &str,
+    ) -> Result<Vec<WorkerRecord>, WorkerBrokerError> {
+        if session_digest.len() != 64
+            || !session_digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(WorkerBrokerError::Invalid(
+                "worker Core session digest is invalid".into(),
+            ));
+        }
+        let guard = self.data.lock().await;
+        let workers = guard
+            .families
+            .values()
+            .filter(|family| family.anchor_identity.session_digest == session_digest)
+            .flat_map(|family| family.workers.values().cloned())
+            .collect::<Vec<_>>();
+        if workers.iter().any(|worker| {
+            !matches!(worker.state, WorkerState::Idle | WorkerState::Retired)
+                && !(matches!(
+                    worker.state,
+                    WorkerState::Provisioning | WorkerState::Waking
+                ) && worker.launch_state == WorkerLaunchState::Failed
+                    && worker.conversation_url.is_none())
+        }) {
+            return Err(WorkerBrokerError::Conflict(
+                "Core workers cannot be cleared while a worker is active or a launch outcome is unresolved"
+                    .into(),
+            ));
+        }
+        Ok(workers)
+    }
+
+    pub async fn clear_session_digest(
+        &self,
+        session_digest: &str,
+    ) -> Result<Vec<WorkerRecord>, WorkerBrokerError> {
+        let workers = self.ensure_clearable_session_digest(session_digest).await?;
+        if workers.is_empty() {
+            return Ok(workers);
+        }
+        let mut guard = self.data.lock().await;
+        let mut candidate = guard.clone();
+        candidate
+            .families
+            .retain(|_, family| family.anchor_identity.session_digest != session_digest);
+        self.commit_candidate(&mut guard, candidate).await?;
+        self.updates.notify_waiters();
+        Ok(workers)
     }
 
     pub async fn claim_worker(
@@ -1848,6 +1997,184 @@ mod tests {
                 .await
                 .expect("read persisted B")
                 .is_none()
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn clear_session_refuses_live_launch_but_removes_proven_failed_worker_family() {
+        let root = temp_root("moondesk-worker-clear-session");
+        let path = root.join("worker-state-v1.json");
+        let broker = WorkerBroker::open(&path).expect("open worker broker");
+        let workspace = WorkspaceId::new();
+        let identity = anchor("core-clear-session");
+        let spawned = broker
+            .spawn_worker(spawn_request(
+                OperationId::new(),
+                workspace.clone(),
+                identity.clone(),
+                "safe failed launch",
+            ))
+            .await
+            .expect("spawn worker");
+
+        let active_error = broker
+            .ensure_clearable_session_digest(&identity.session_digest)
+            .await
+            .expect_err("queued provisioning worker is still active");
+        assert!(matches!(active_error, WorkerBrokerError::Conflict(_)));
+
+        let command_id = Uuid::new_v4().to_string();
+        broker
+            .link_launch_command(
+                &workspace,
+                &identity,
+                &spawned.worker_id,
+                &spawned.task_id,
+                &command_id,
+            )
+            .await
+            .expect("link launch command");
+        broker
+            .update_launch_by_command(
+                &command_id,
+                WorkerLaunchState::Failed,
+                Some("model_unavailable".into()),
+                None,
+            )
+            .await
+            .expect("mark launch failed");
+
+        let clearable = broker
+            .ensure_clearable_session_digest(&identity.session_digest)
+            .await
+            .expect("failed pre-send worker is clearable");
+        assert_eq!(clearable.len(), 1);
+        let cleared = broker
+            .clear_session_digest(&identity.session_digest)
+            .await
+            .expect("clear worker family");
+        assert_eq!(cleared.len(), 1);
+        assert!(
+            broker
+                .family_for_anchor(&workspace, &identity)
+                .await
+                .expect("read cleared family")
+                .is_none()
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn pre_send_failure_retires_fresh_worker_and_restores_reuse_to_idle() {
+        let root = temp_root("moondesk-worker-pre-send-settle");
+        let path = root.join("worker-state-v1.json");
+        let broker = WorkerBroker::open(&path).expect("open worker broker");
+        let workspace = WorkspaceId::new();
+        let core = anchor("core-pre-send-settle");
+
+        let fresh = broker
+            .spawn_worker(spawn_request(
+                OperationId::new(),
+                workspace.clone(),
+                core.clone(),
+                "fresh failure",
+            ))
+            .await
+            .expect("spawn fresh worker");
+        let fresh_command = Uuid::new_v4().to_string();
+        broker
+            .link_launch_command(
+                &workspace,
+                &core,
+                &fresh.worker_id,
+                &fresh.task_id,
+                &fresh_command,
+            )
+            .await
+            .expect("link fresh command");
+        let fresh_settled = broker
+            .settle_pre_send_failure_by_command(&fresh_command, Some("model unavailable".into()))
+            .await
+            .expect("settle fresh failure")
+            .expect("fresh worker found");
+        assert_eq!(fresh_settled.state, WorkerState::Retired);
+        assert_eq!(fresh_settled.launch_state, WorkerLaunchState::Failed);
+        assert!(fresh_settled.current_task_id.is_none());
+        assert_eq!(
+            fresh_settled
+                .tasks
+                .get(&fresh.task_id)
+                .map(|task| task.state),
+            Some(TaskState::Failed)
+        );
+
+        let durable = broker
+            .spawn_worker(spawn_request(
+                OperationId::new(),
+                workspace.clone(),
+                core.clone(),
+                "durable worker",
+            ))
+            .await
+            .expect("spawn durable worker");
+        let worker_identity = anchor("worker-pre-send-settle");
+        broker
+            .claim_worker(
+                &workspace,
+                &durable.worker_id,
+                &durable.task_id,
+                &durable.claim_token,
+                worker_identity.clone(),
+            )
+            .await
+            .expect("claim durable worker");
+        broker
+            .finish_task(FinishTaskRequest {
+                workspace_id: workspace.clone(),
+                worker_identity,
+                worker_id: durable.worker_id.clone(),
+                task_id: durable.task_id.clone(),
+                result: finished_result(),
+            })
+            .await
+            .expect("finish initial durable task");
+        let reused = broker
+            .reuse_worker(ReuseWorkerRequest {
+                operation_id: OperationId::new(),
+                workspace_id: workspace.clone(),
+                anchor_identity: core.clone(),
+                worker_id: durable.worker_id.clone(),
+                assignment: "reuse failure".into(),
+            })
+            .await
+            .expect("reuse durable worker");
+        let reuse_command = Uuid::new_v4().to_string();
+        broker
+            .link_launch_command(
+                &workspace,
+                &core,
+                &reused.worker_id,
+                &reused.task_id,
+                &reuse_command,
+            )
+            .await
+            .expect("link reuse command");
+        let reused_settled = broker
+            .settle_pre_send_failure_by_command(&reuse_command, Some("composer unavailable".into()))
+            .await
+            .expect("settle reuse failure")
+            .expect("reused worker found");
+        assert_eq!(reused_settled.state, WorkerState::Idle);
+        assert_eq!(reused_settled.launch_state, WorkerLaunchState::Claimed);
+        assert!(reused_settled.chat_identity.is_some());
+        assert!(reused_settled.current_task_id.is_none());
+        assert_eq!(
+            reused_settled
+                .tasks
+                .get(&reused.task_id)
+                .map(|task| task.state),
+            Some(TaskState::Failed)
         );
         let _ = std::fs::remove_dir_all(root);
     }

@@ -13,7 +13,9 @@ It intentionally owns only a small surface:
 - create every fresh worker as an ordinary ChatGPT conversation, regardless of the Core's Project membership;
 - select and read back the requested model + reasoning effort;
 - insert the worker bootstrap and click Send once;
-- reconcile ambiguous sends by looking for the durable task marker, never by blindly clicking Send again.
+- reconcile ambiguous sends by looking for the durable task marker, never by blindly clicking Send again;
+- never expose failed worker launches as delayed manual replay buttons; proven pre-Send fresh-launch failures automatically free their worker slot, while failed durable-worker wakes return that worker to idle;
+- provide an explicit **Clear workers** reset for the current Core that removes idle/retired and proven pre-Send-failed MoonDesk worker history/bindings without deleting ChatGPT conversations, while refusing active or ambiguous work.
 
 It does **not** match ChatGPT Projects, MoonDesk workspaces, connectors, or local folders by display name. Workspace authority remains the exact MoonDesk connector route / WorkspaceId. It also does **not** record transcripts, spawn nested workers, mirror agent state, or use the workspace MCP URL as an authentication credential.
 

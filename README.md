@@ -143,7 +143,7 @@ The MCP `workers` tool supports Core operations such as spawn, status, send, col
 
 Workers survive MoonDesk/browser tab restarts as durable records. Completing a task leaves the worker idle so a later task can reopen the same confirmed ChatGPT conversation. Retiring an idle worker frees its display slot; MoonDesk refuses retirement once a browser launch may have crossed the Send boundary.
 
-Browser commands use durable leases and acknowledgements. If MoonDesk cannot tell whether ChatGPT accepted a Send, the command moves to reconciliation and **never blindly sends the assignment again**. Proven pre-Send failures can be retried; ambiguous post-Send failures require reconciliation or manual inspection.
+Browser commands use durable leases and acknowledgements. If MoonDesk cannot tell whether ChatGPT accepted a Send, the command moves to reconciliation and **never blindly sends the assignment again**. Failed worker launches are not exposed as delayed manual replays: a proven pre-Send failure automatically frees a fresh worker slot, while a failed pre-Send wake returns an existing durable worker to idle so Core can choose the next assignment. The companion's **Clear workers** action removes this Core's idle/retired and proven pre-Send-failed worker history and bindings while leaving the ChatGPT conversations themselves untouched. Clear workers refuses to run while a worker is active or a Send outcome is ambiguous.
 
 ## Browser control
 

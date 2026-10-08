@@ -108,6 +108,83 @@ impl ManagedChatBroker {
         Ok(removed_ids.len())
     }
 
+    pub async fn anchor_session_digest_for_conversation(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<String>, ManagedChatError> {
+        if conversation_id.trim().is_empty() || conversation_id.len() > 128 {
+            return Err(ManagedChatError::Invalid(
+                "managed chat Core conversation id is invalid".into(),
+            ));
+        }
+        let guard = self.data.lock().await;
+        let mut digest: Option<String> = None;
+        for command in guard.commands.values() {
+            if command
+                .anchor_context
+                .as_ref()
+                .is_none_or(|context| context.conversation_id != conversation_id)
+            {
+                continue;
+            }
+            let Some(candidate) = command.launch.anchor_session_digest.as_ref() else {
+                continue;
+            };
+            if digest
+                .as_ref()
+                .is_some_and(|existing| existing != candidate)
+            {
+                return Err(ManagedChatError::Conflict(
+                    "Core conversation maps to multiple worker session identities".into(),
+                ));
+            }
+            digest = Some(candidate.clone());
+        }
+        Ok(digest)
+    }
+
+    pub async fn purge_terminal_for_anchor_session(
+        &self,
+        session_digest: &str,
+    ) -> Result<Vec<ManagedChatCommand>, ManagedChatError> {
+        if session_digest.len() != 64
+            || !session_digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(ManagedChatError::Invalid(
+                "managed chat Core session digest is invalid".into(),
+            ));
+        }
+        let mut guard = self.data.lock().await;
+        let matching = guard
+            .commands
+            .values()
+            .filter(|command| {
+                command.launch.anchor_session_digest.as_deref() == Some(session_digest)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if matching.is_empty() {
+            return Ok(Vec::new());
+        }
+        if matching.iter().any(|command| {
+            !matches!(command.state, ManagedChatCommandState::Succeeded)
+                && !(command.state == ManagedChatCommandState::Failed && !command.reconcile_history)
+        }) {
+            return Err(ManagedChatError::Conflict(
+                "Core workers cannot be cleared while a launch is active or its Send outcome is ambiguous"
+                    .into(),
+            ));
+        }
+
+        let mut candidate = guard.clone();
+        for command in &matching {
+            candidate.commands.remove(&command.id);
+            candidate.dedupe.remove(&command.dedupe_key);
+        }
+        self.commit_candidate(&mut guard, candidate).await?;
+        Ok(matching)
+    }
+
     pub async fn settle_revoked_client(
         &self,
         client_id: &str,
@@ -689,50 +766,6 @@ impl ManagedChatBroker {
         Ok(acknowledged)
     }
 
-    pub async fn retry_failed(
-        &self,
-        command_id: &ManagedChatCommandId,
-    ) -> Result<ManagedChatCommand, ManagedChatError> {
-        let mut guard = self.data.lock().await;
-        let command = guard
-            .commands
-            .get(command_id)
-            .ok_or(ManagedChatError::NotFound)?;
-        match command.state {
-            ManagedChatCommandState::Queued
-            | ManagedChatCommandState::Leased
-            | ManagedChatCommandState::SendStarted
-            | ManagedChatCommandState::NeedsReconcile => return Ok(command.clone()),
-            ManagedChatCommandState::Paused | ManagedChatCommandState::Failed => {}
-            ManagedChatCommandState::Succeeded => {
-                return Err(ManagedChatError::Conflict(
-                    "succeeded managed chat command cannot be retried".into(),
-                ));
-            }
-        }
-
-        let mut candidate = guard.clone();
-        let command = candidate
-            .commands
-            .get_mut(command_id)
-            .ok_or(ManagedChatError::NotFound)?;
-        command.state =
-            if command.state == ManagedChatCommandState::Paused || command.reconcile_history {
-                command.reconcile_history = true;
-                ManagedChatCommandState::NeedsReconcile
-            } else {
-                ManagedChatCommandState::Queued
-            };
-        command.lease = None;
-        command.terminal = None;
-        if !command.reconcile_history {
-            command.target_client_id = None;
-        }
-        let retried = command.clone();
-        self.commit_candidate(&mut guard, candidate).await?;
-        Ok(retried)
-    }
-
     async fn commit_candidate(
         &self,
         guard: &mut tokio::sync::MutexGuard<'_, ManagedChatStoreData>,
@@ -979,6 +1012,71 @@ mod tests {
         let snapshot = reopened.snapshot().await;
         assert_eq!(snapshot.commands.len(), 1);
         assert_eq!(snapshot.commands.get(&command_a.id), Some(&command_a));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn core_clear_refuses_active_work_and_removes_proven_pre_send_failure() {
+        let root = temp_root("moondesk-managed-chat-Core-clear");
+        let broker = ManagedChatBroker::open(root.join("state.json")).expect("open broker");
+        let conversation_id = "6ac62769-0c94-83e8-a8ef-95a21c7f3e7f";
+        let session_digest = "a".repeat(64);
+        let mut launch = launch("Core-clear-safe");
+        launch.anchor_session_digest = Some(session_digest.clone());
+        let command = broker
+            .enqueue_with_route(
+                EnqueueManagedChatRequest {
+                    dedupe_key: "Core-clear-safe".into(),
+                    launch,
+                },
+                Some("extension-a".into()),
+                Some(anchor_context(conversation_id)),
+            )
+            .await
+            .expect("enqueue Core command");
+
+        assert_eq!(
+            broker
+                .anchor_session_digest_for_conversation(conversation_id)
+                .await
+                .expect("resolve Core session"),
+            Some(session_digest.clone())
+        );
+        let active_error = broker
+            .purge_terminal_for_anchor_session(&session_digest)
+            .await
+            .expect_err("queued command must block clear");
+        assert!(matches!(active_error, ManagedChatError::Conflict(_)));
+
+        let offer = broker
+            .redeem("extension-a", 1_000)
+            .await
+            .expect("redeem Core command")
+            .expect("Core command lease");
+        let lease_id = offer
+            .command
+            .lease
+            .as_ref()
+            .expect("lease")
+            .lease_id
+            .clone();
+        broker
+            .acknowledge(
+                &command.id,
+                &lease_id,
+                "extension-a",
+                ManagedChatAckOutcome::Failed {
+                    details: Some("failed before Send".into()),
+                },
+            )
+            .await
+            .expect("ack safe failure");
+        let removed = broker
+            .purge_terminal_for_anchor_session(&session_digest)
+            .await
+            .expect("clear terminal Core commands");
+        assert_eq!(removed.len(), 1);
+        assert!(broker.snapshot().await.commands.is_empty());
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -1278,8 +1376,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_pre_send_command_retries_fresh_but_ambiguous_failure_retries_reconcile_only() {
-        let root = temp_root("moondesk-managed-chat-safe-retry");
+    async fn failed_and_paused_commands_remain_terminal_without_manual_replay() {
+        let root = temp_root("moondesk-managed-chat-no-manual-replay");
         let broker = ManagedChatBroker::open(root.join("state.json")).expect("open broker");
 
         let pre_send = broker
@@ -1314,19 +1412,13 @@ mod tests {
             .expect("ack pre-send failure");
         assert_eq!(failed.state, ManagedChatCommandState::Failed);
         assert!(!failed.reconcile_history);
-
-        let retried = broker
-            .retry_failed(&pre_send.id)
-            .await
-            .expect("fresh retry pre-send failure");
-        assert_eq!(retried.state, ManagedChatCommandState::Queued);
-        assert!(retried.terminal.is_none());
-        let retry_offer = broker
-            .redeem("extension-a", 200)
-            .await
-            .expect("redeem retried command")
-            .expect("retried command offer");
-        assert!(!retry_offer.reconcile_required);
+        assert!(
+            broker
+                .redeem("extension-a", 200)
+                .await
+                .expect("redeem after terminal failure")
+                .is_none()
+        );
 
         let ambiguous = broker
             .enqueue(EnqueueManagedChatRequest {
@@ -1365,7 +1457,6 @@ mod tests {
             .await
             .expect("redeem reconciliation")
             .expect("reconciliation lease");
-        assert!(reconcile.reconcile_required);
         let reconcile_lease = reconcile
             .command
             .lease
@@ -1373,7 +1464,7 @@ mod tests {
             .expect("reconcile lease")
             .lease_id
             .clone();
-        let terminal_after_reconcile = broker
+        let paused = broker
             .acknowledge(
                 &ambiguous.id,
                 &reconcile_lease,
@@ -1383,28 +1474,19 @@ mod tests {
                 },
             )
             .await
-            .expect("terminal failure after reconcile");
-        assert!(terminal_after_reconcile.reconcile_history);
-        let reconcile_retry = broker
-            .retry_failed(&ambiguous.id)
-            .await
-            .expect("retry ambiguous command as reconciliation only");
-        assert_eq!(
-            reconcile_retry.state,
-            ManagedChatCommandState::NeedsReconcile
+            .expect("pause after reconciliation failure");
+        assert_eq!(paused.state, ManagedChatCommandState::Paused);
+        assert!(paused.reconcile_history);
+        assert!(
+            broker
+                .redeem("extension-a", 500)
+                .await
+                .expect("redeem after paused terminal command")
+                .is_none()
         );
-        assert!(reconcile_retry.reconcile_history);
-        assert!(reconcile_retry.terminal.is_none());
-        let retry_offer = broker
-            .redeem("extension-a", 500)
-            .await
-            .expect("redeem retried reconciliation")
-            .expect("retried reconciliation offer");
-        assert!(retry_offer.reconcile_required);
 
         let _ = std::fs::remove_dir_all(root);
     }
-
     #[tokio::test]
     async fn untargeted_routed_command_is_redeemable_only_by_browser_observing_exact_anchor() {
         let root = temp_root("moondesk-managed-chat-anchor-routing");
@@ -1617,71 +1699,6 @@ mod tests {
         assert_eq!(queued.target_client_id, None);
         assert!(!queued.reconcile_history);
 
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[tokio::test]
-    async fn safe_pre_send_retry_clears_browser_target_for_exact_anchor_failover() {
-        let root = temp_root("moondesk-managed-chat-safe-retarget");
-        let broker = ManagedChatBroker::open(root.join("state.json")).expect("open broker");
-        let conversation_id = "6aad7eb1-4b10-83ee-97bd-d98b338864de";
-        let command = broker
-            .enqueue_with_route(
-                EnqueueManagedChatRequest {
-                    dedupe_key: "worker:retarget:task:first".into(),
-                    launch: launch("retarget"),
-                },
-                Some("edge".into()),
-                Some(anchor_context(conversation_id)),
-            )
-            .await
-            .expect("enqueue");
-
-        let empty = std::collections::BTreeSet::new();
-        let edge = broker
-            .redeem_for_anchors("edge", 10, Some(&empty))
-            .await
-            .expect("edge redeem")
-            .expect("edge lease");
-        let lease_id = edge.command.lease.as_ref().expect("lease").lease_id.clone();
-        broker
-            .acknowledge(
-                &command.id,
-                &lease_id,
-                "edge",
-                ManagedChatAckOutcome::Failed {
-                    details: Some("model_unavailable_before_send".into()),
-                },
-            )
-            .await
-            .expect("pre-send fail");
-        let retried = broker.retry_failed(&command.id).await.expect("retry");
-        assert_eq!(retried.target_client_id, None);
-        assert_eq!(
-            retried
-                .anchor_context
-                .as_ref()
-                .map(|context| context.conversation_id.as_str()),
-            Some(conversation_id)
-        );
-
-        let wrong =
-            std::collections::BTreeSet::from(["7bbd8fc2-5c21-94ff-a8ce-e09c449975ef".to_string()]);
-        assert!(
-            broker
-                .redeem_for_anchors("chrome", 20, Some(&wrong))
-                .await
-                .expect("wrong Core browser")
-                .is_none()
-        );
-
-        let exact = std::collections::BTreeSet::from([conversation_id.to_string()]);
-        let chrome = broker
-            .redeem_for_anchors("chrome", 30, Some(&exact))
-            .await
-            .expect("chrome redeem")
-            .expect("chrome gets safe retry");
-        assert_eq!(chrome.command.target_client_id.as_deref(), Some("chrome"));
         let _ = std::fs::remove_dir_all(root);
     }
 

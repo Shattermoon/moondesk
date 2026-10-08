@@ -641,6 +641,49 @@ impl CompanionAuth {
         None
     }
 
+    pub async fn session_digest_for_route(
+        &self,
+        client_id: &str,
+        conversation_id: &str,
+    ) -> Result<Option<String>, String> {
+        validate_client_id(client_id)?;
+        if conversation_id.trim().is_empty() || conversation_id.len() > 128 {
+            return Err("companion Core conversation id is invalid".into());
+        }
+        let present = self
+            .fresh_presence(unix_time_ms())
+            .await
+            .into_iter()
+            .find(|presence| presence.client_id == client_id)
+            .is_some_and(|presence| {
+                presence
+                    .tabs
+                    .iter()
+                    .any(|tab| tab.conversation_id == conversation_id)
+            });
+        if !present {
+            return Err("Core conversation is not open in this paired browser".into());
+        }
+
+        let guard = self.anchor_affinities.lock().await;
+        let mut digest: Option<String> = None;
+        for (candidate, (route, _)) in guard.iter() {
+            if route.client_id != client_id || route.tab.conversation_id != conversation_id {
+                continue;
+            }
+            if digest
+                .as_ref()
+                .is_some_and(|existing| existing != candidate)
+            {
+                return Err(
+                    "companion Core route is associated with multiple session identities".into(),
+                );
+            }
+            digest = Some(candidate.clone());
+        }
+        Ok(digest)
+    }
+
     #[cfg(test)]
     pub async fn focused_anchor_route(&self) -> Result<Option<CompanionAnchorRoute>, String> {
         let presence = self.fresh_presence(unix_time_ms()).await;
@@ -1499,6 +1542,56 @@ mod tests {
         assert_eq!(route.client_id, "edge-install");
         assert_eq!(route.tab.conversation_id, conversation_id);
         task.await.expect("correlation writer");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn core_session_digest_lookup_requires_exact_current_browser_presence() {
+        let root = temp_root("moondesk-companion-Core-session-route");
+        let path = root.join(COMPANION_AUTH_FILE_NAME);
+        let auth = CompanionAuth::open(&path).expect("open companion auth");
+        auth.auto_pair("chrome-install", &"a".repeat(64), Some(ORIGIN_A))
+            .await
+            .expect("pair chrome");
+        let conversation_id = "6aad7eb1-4b10-83ee-97bd-d98b338864de";
+        let route = CompanionAnchorRoute {
+            client_id: "chrome-install".into(),
+            tab: CompanionTabPresence {
+                conversation_id: conversation_id.into(),
+                conversation_url: format!("https://chatgpt.com/c/{conversation_id}"),
+                project_id: None,
+                project_url: None,
+                active: true,
+                window_focused: true,
+                generating: false,
+            },
+        };
+        let digest = "b".repeat(64);
+        auth.remember_anchor_affinity(&digest, &route)
+            .await
+            .expect("remember Core affinity");
+        let absent = auth
+            .session_digest_for_route("chrome-install", conversation_id)
+            .await
+            .expect_err("closed Core tab must not authorize destructive reset");
+        assert!(absent.contains("not open"));
+
+        auth.update_presence(
+            "chrome-install",
+            CompanionPresenceUpdate {
+                browser_label: Some("Chrome".into()),
+                tabs: vec![route.tab.clone()],
+            },
+            unix_time_ms(),
+        )
+        .await
+        .expect("publish Core presence");
+        assert_eq!(
+            auth.session_digest_for_route("chrome-install", conversation_id)
+                .await
+                .expect("resolve exact Core route"),
+            Some(digest)
+        );
         let _ = fs::remove_dir_all(root);
     }
 

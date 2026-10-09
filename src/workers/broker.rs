@@ -177,8 +177,21 @@ impl WorkerBroker {
         } else {
             compact_inactive_families(&mut candidate);
             if candidate.families.len() >= MAX_WORKER_FAMILIES {
+                let cleanup_candidates = candidate
+                    .families
+                    .values()
+                    .filter(|family| family_can_be_freed_by_user_cleanup(family))
+                    .count();
+                let cleanup_guidance = if cleanup_candidates > 0 {
+                    format!(
+                        "; {cleanup_candidates} retained Core families have no active workers. Open an older Core, collect any pending worker results, then retire its idle workers or use Clear Workers before creating workers from a new Core"
+                    )
+                } else {
+                    "; no retained Core family is currently inactive enough to clean up safely; finish active worker tasks before freeing older Core history"
+                        .to_string()
+                };
                 return Err(WorkerBrokerError::Limit(format!(
-                    "worker store is limited to {MAX_WORKER_FAMILIES} Core families with retained live/history state"
+                    "worker store is limited to {MAX_WORKER_FAMILIES} Core families with retained live/history state{cleanup_guidance}"
                 )));
             }
             let id = WorkerFamilyId::new();
@@ -1719,19 +1732,32 @@ fn collected_updates_from_receipt(receipt: &CollectReceipt) -> CollectedUpdates 
     }
 }
 
+fn retired_family_is_reclaimable(family: &WorkerFamily) -> bool {
+    family.reports.is_empty()
+        && family.workers.values().all(|worker| {
+            worker.state == WorkerState::Retired
+                && worker.messages.is_empty()
+                && worker.current_task_id.is_none()
+                && worker
+                    .tasks
+                    .values()
+                    .all(|task| task.result.is_none() || task.collected)
+        })
+}
+
+fn family_can_be_freed_by_user_cleanup(family: &WorkerFamily) -> bool {
+    family.workers.values().all(|worker| {
+        matches!(worker.state, WorkerState::Idle | WorkerState::Retired)
+            && worker.current_task_id.is_none()
+    })
+}
+
 fn compact_inactive_families(data: &mut WorkerStoreData) {
     while data.families.len() >= MAX_WORKER_FAMILIES {
         let removable = data
             .families
             .iter()
-            .find(|(_, family)| {
-                family.reports.is_empty()
-                    && family.workers.values().all(|worker| {
-                        worker.state == WorkerState::Retired
-                            && worker.messages.is_empty()
-                            && worker.current_task_id.is_none()
-                    })
-            })
+            .find(|(_, family)| retired_family_is_reclaimable(family))
             .map(|(family_id, _)| family_id.clone());
         let Some(family_id) = removable else {
             break;
@@ -2025,6 +2051,54 @@ mod tests {
             changes: "none".into(),
             validation: "tests passed".into(),
             blockers: Vec::new(),
+        }
+    }
+
+    fn inactive_family(
+        workspace_id: WorkspaceId,
+        anchor_identity: ChatIdentity,
+        worker_state: WorkerState,
+        result_collected: bool,
+    ) -> WorkerFamily {
+        let family_id = WorkerFamilyId::new();
+        let worker_id = WorkerId::new();
+        let task_id = TaskId::new();
+        let task = WorkerTask {
+            id: task_id.clone(),
+            assignment: "completed history".into(),
+            state: TaskState::Completed,
+            result: Some(finished_result()),
+            collected: result_collected,
+        };
+        let worker = WorkerRecord {
+            id: worker_id.clone(),
+            display_id: "worker-1".into(),
+            label: "inactive".into(),
+            state: worker_state,
+            attachment_state: BrowserAttachmentState::Absent,
+            execution_profile: profile(),
+            launch_state: WorkerLaunchState::Claimed,
+            launch_command_id: None,
+            launch_error: None,
+            conversation_url: Some(format!("https://chatgpt.com/c/{worker_id}")),
+            chat_identity: Some(anchor(&format!("worker-{worker_id}"))),
+            claim_token: None,
+            current_task_id: None,
+            tasks: [(task_id, task)].into_iter().collect(),
+            messages: Vec::new(),
+        };
+        WorkerFamily {
+            id: family_id,
+            workspace_id,
+            anchor_identity,
+            next_receipt_sequence: 0,
+            workers: [(worker_id, worker)].into_iter().collect(),
+            reports: Vec::new(),
+            spawn_requests: Default::default(),
+            reuse_requests: Default::default(),
+            message_requests: Default::default(),
+            report_requests: Default::default(),
+            collect_requests: Default::default(),
         }
     }
 
@@ -4064,6 +4138,77 @@ mod tests {
             .len();
         assert!(persisted_bytes < 4 * 1024 * 1024);
         assert!(persisted_bytes <= crate::workers::MAX_WORKER_STORE_BYTES);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn global_family_limit_keeps_idle_history_and_reports_actionable_cleanup() {
+        let root = temp_root("moondesk-worker-family-global-idle-limit");
+        std::fs::create_dir_all(&root).expect("create worker family root");
+        let path = root.join("worker-state-v1.json");
+        let workspace = WorkspaceId::new();
+        let mut data = WorkerStoreData::default();
+        for index in 0..MAX_WORKER_FAMILIES {
+            let family = inactive_family(
+                workspace.clone(),
+                anchor(&format!("idle-family-{index}")),
+                WorkerState::Idle,
+                true,
+            );
+            data.families.insert(family.id.clone(), family);
+        }
+        store::save(&path, &data).expect("seed maximum idle Core families");
+        let broker = WorkerBroker::open(&path).expect("open bounded worker broker");
+        let error = broker
+            .spawn_worker(spawn_request(
+                OperationId::new(),
+                workspace,
+                anchor("new-core-at-idle-limit"),
+                "new Core waits for explicit old-Core cleanup",
+            ))
+            .await
+            .expect_err("idle reusable workers must not be silently evicted");
+        let message = error.to_string();
+        assert!(message.contains("64 Core families"));
+        assert!(message.contains("no active workers"));
+        assert!(message.contains("retire its idle workers") || message.contains("Clear Workers"));
+        assert_eq!(broker.snapshot().await.families.len(), MAX_WORKER_FAMILIES);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn global_family_compaction_preserves_retired_uncollected_results() {
+        let root = temp_root("moondesk-worker-family-uncollected-result-limit");
+        std::fs::create_dir_all(&root).expect("create worker family root");
+        let path = root.join("worker-state-v1.json");
+        let workspace = WorkspaceId::new();
+        let mut data = WorkerStoreData::default();
+        for index in 0..MAX_WORKER_FAMILIES {
+            let family = inactive_family(
+                workspace.clone(),
+                anchor(&format!("retired-uncollected-family-{index}")),
+                WorkerState::Retired,
+                false,
+            );
+            data.families.insert(family.id.clone(), family);
+        }
+        store::save(&path, &data).expect("seed retired families with uncollected results");
+        let broker = WorkerBroker::open(&path).expect("open bounded worker broker");
+        let error = broker
+            .spawn_worker(spawn_request(
+                OperationId::new(),
+                workspace,
+                anchor("new-core-before-result-collection"),
+                "do not erase undelivered result history",
+            ))
+            .await
+            .expect_err("uncollected results must block automatic family eviction");
+        assert!(
+            error
+                .to_string()
+                .contains("collect any pending worker results")
+        );
+        assert_eq!(broker.snapshot().await.families.len(), MAX_WORKER_FAMILIES);
         let _ = std::fs::remove_dir_all(root);
     }
 

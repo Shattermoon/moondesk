@@ -1165,7 +1165,7 @@ async fn handle_tools_call_for_workspace(
                 );
             }
         }
-        let anchor_route = if action == Some("spawn") {
+        let anchor_route = if matches!(action, Some("spawn") | Some("reuse")) {
             match companion_auth.as_ref() {
                 Some(auth) => {
                     if auth.paired_client_count().await == 0 {
@@ -1174,6 +1174,7 @@ async fn handle_tools_call_for_workspace(
                             "Workers require the optional MoonDesk Worker Companion. MoonDesk works normally without it. Open MoonDesk Settings -> Workers, choose Set up Workers, then load the companion folder with Developer mode -> Load unpacked and retry.".into(),
                         );
                     }
+                    let launch_action = action.unwrap_or("worker launch");
                     let request_id = inbound_request_id.as_deref();
                     let operation_id = arguments
                         .get("operation_id")
@@ -1199,7 +1200,9 @@ async fn handle_tools_call_for_workspace(
                         if correlation_ids.is_empty() {
                             return tool_error_response_text_only(
                                 req,
-                                "workers spawn could not identify the originating ChatGPT Core because neither a usable OpenAI x-request-id nor a valid spawn operation_id was available, and no remembered Core affinity existed".into(),
+                                format!(
+                                    "workers {launch_action} could not identify the originating ChatGPT Core because neither a usable OpenAI x-request-id nor a valid operation_id was available, and no remembered Core affinity existed"
+                                ),
                             );
                         }
                         route = match auth
@@ -1217,7 +1220,9 @@ async fn handle_tools_call_for_workspace(
                     let Some(route) = route else {
                         return tool_error_response_text_only(
                             req,
-                            "workers spawn could not identify the originating ChatGPT Core; no exact provider-stream request/operation correlation or remembered Core affinity was available".into(),
+                            format!(
+                                "workers {launch_action} could not identify the originating ChatGPT Core; no exact provider-stream request/operation correlation or remembered Core affinity was available"
+                            ),
                         );
                     };
                     if let Err(error) = auth
@@ -3978,6 +3983,25 @@ mod tests {
         worker_broker: Arc<WorkerBroker>,
         managed_chat_broker: Arc<ManagedChatBroker>,
     ) -> JsonRpcResponse {
+        call_workers_for_test_with_companion(
+            request,
+            workspace_id,
+            workspace_root,
+            worker_broker,
+            managed_chat_broker,
+            None,
+        )
+        .await
+    }
+
+    async fn call_workers_for_test_with_companion(
+        request: &JsonRpcRequest,
+        workspace_id: &WorkspaceId,
+        workspace_root: &str,
+        worker_broker: Arc<WorkerBroker>,
+        managed_chat_broker: Arc<ManagedChatBroker>,
+        companion_auth: Option<Arc<CompanionAuth>>,
+    ) -> JsonRpcResponse {
         let command_jobs = CommandJobManager::new();
         let browser_runtime = None;
         handle_tools_call_for_workspace(
@@ -3996,7 +4020,7 @@ mod tests {
                 worker_target_count: crate::workers::RECOMMENDED_WORKERS_PER_FAMILY,
                 worker_broker,
                 managed_chat_broker,
-                companion_auth: None,
+                companion_auth,
                 inbound_request_id: None,
             },
         )
@@ -5403,8 +5427,51 @@ mod tests {
                 .is_some_and(Vec::is_empty)
         );
 
+        let companion_auth = Arc::new(
+            CompanionAuth::open(root.path().join("companion-auth-reuse-v1.json"))
+                .expect("open reuse companion auth"),
+        );
+        companion_auth
+            .auto_pair(
+                "chrome-install",
+                &"a".repeat(64),
+                Some("chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            )
+            .await
+            .expect("pair reuse browser");
+        let core_conversation = "6aad7eb1-4b10-83ee-97bd-d98b338864de";
+        let core_route = crate::companion::CompanionAnchorRoute {
+            client_id: "chrome-install".into(),
+            tab: crate::companion::CompanionTabPresence {
+                conversation_id: core_conversation.into(),
+                conversation_url: format!("https://chatgpt.com/c/{core_conversation}"),
+                project_id: None,
+                project_url: None,
+                active: true,
+                window_focused: true,
+                generating: false,
+            },
+        };
+        companion_auth
+            .update_presence(
+                "chrome-install",
+                crate::companion::CompanionPresenceUpdate {
+                    browser_label: Some("Chrome".into()),
+                    tabs: vec![core_route.tab.clone()],
+                },
+                crate::companion::unix_time_ms(),
+            )
+            .await
+            .expect("publish reuse Core presence");
+        let core_identity =
+            ChatIdentity::from_openai_meta(Some("worker-test-subject"), "anchor-chat-a");
+        companion_auth
+            .remember_anchor_affinity(&core_identity.session_digest, &core_route)
+            .await
+            .expect("remember reuse Core route");
+
         let reuse_operation = Uuid::new_v4().to_string();
-        let reuse = call_workers_for_test(
+        let reuse = call_workers_for_test_with_companion(
             &tool_call_request_with_session(
                 "workers",
                 json!({
@@ -5419,6 +5486,7 @@ mod tests {
             &workspace_root.to_string_lossy(),
             broker.clone(),
             managed_chat_broker.clone(),
+            Some(companion_auth),
         )
         .await;
         let reused = reuse
@@ -5446,6 +5514,13 @@ mod tests {
         assert_eq!(
             wake.launch.thread_key.as_deref(),
             Some(format!("worker:{worker_id}").as_str())
+        );
+        assert_eq!(wake.target_client_id.as_deref(), Some("chrome-install"));
+        assert_eq!(
+            wake.anchor_context
+                .as_ref()
+                .map(|context| context.conversation_id.as_str()),
+            Some(core_conversation)
         );
 
         let forged_start = call_workers_for_test(

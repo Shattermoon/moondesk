@@ -297,11 +297,20 @@ pub(crate) async fn recover_registered_workspaces(
     managed_chat_broker: &ManagedChatBroker,
 ) -> Result<(), String> {
     let _lifecycle_guard = super::WORKER_LIFECYCLE_LOCK.lock().await;
+    let mut errors = Vec::new();
     for workspace_id in workspace_ids {
-        recover_incomplete_launch_transactions(workspace_id, worker_broker, managed_chat_broker)
-            .await?;
+        if let Err(error) =
+            recover_incomplete_launch_transactions(workspace_id, worker_broker, managed_chat_broker)
+                .await
+        {
+            errors.push(format!("{}: {error}", workspace_id.as_str()));
+        }
     }
-    Ok(())
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
 }
 
 pub async fn handle(
@@ -481,6 +490,9 @@ pub async fn handle(
                 launch_context.managed_chat_broker,
             )
             .await?;
+            let route = launch_context.anchor_route.ok_or_else(|| {
+                "worker reuse requires a confirmed companion Core route".to_string()
+            })?;
             let assignment = required_string(arguments, "task")?.to_string();
             let operation_id = parse_operation_id(arguments)?;
             let receipt = broker
@@ -518,8 +530,13 @@ pub async fn handle(
                             anchor_session_digest: Some(caller_identity.session_digest.clone()),
                         },
                     },
-                    None,
-                    None,
+                    Some(route.client_id.clone()),
+                    Some(ManagedChatAnchorContext {
+                        conversation_id: route.tab.conversation_id.clone(),
+                        conversation_url: route.tab.conversation_url.clone(),
+                        project_id: route.tab.project_id.clone(),
+                        project_url: route.tab.project_url.clone(),
+                    }),
                 )
                 .await
             {
@@ -872,6 +889,7 @@ pub async fn handle(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::companion::CompanionTabPresence;
     use crate::managed_chat::types::ChatExecutionProfile;
     use uuid::Uuid;
 
@@ -883,6 +901,22 @@ mod tests {
 
     fn identity(name: &str) -> ChatIdentity {
         ChatIdentity::from_openai_meta(Some("protocol-test-subject"), name)
+    }
+
+    fn core_route() -> CompanionAnchorRoute {
+        let conversation_id = "6aad7eb1-4b10-83ee-97bd-d98b338864de";
+        CompanionAnchorRoute {
+            client_id: "extension-a".into(),
+            tab: CompanionTabPresence {
+                conversation_id: conversation_id.into(),
+                conversation_url: format!("https://chatgpt.com/c/{conversation_id}"),
+                project_id: None,
+                project_url: None,
+                active: true,
+                window_focused: true,
+                generating: false,
+            },
+        }
     }
 
     fn spawn_request(
@@ -1067,6 +1101,103 @@ mod tests {
                 .get(&command.id)
                 .expect("same command")
                 .dispatch_ready
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn startup_recovery_continues_after_one_workspace_fails() {
+        let root = temp_root("moondesk-worker-recovery-multi-workspace");
+        let worker =
+            WorkerBroker::open(root.join("worker-state-v1.json")).expect("open worker broker");
+        let managed = ManagedChatBroker::open(root.join("managed-chat-state-v1.json"))
+            .expect("open managed broker");
+        let broken_workspace = WorkspaceId::new();
+        let healthy_workspace = WorkspaceId::new();
+        let broken_anchor = identity("anchor-recovery-broken-workspace");
+        let healthy_anchor = identity("anchor-recovery-healthy-workspace");
+
+        let broken = worker
+            .spawn_worker(spawn_request(
+                OperationId::new(),
+                broken_workspace.clone(),
+                broken_anchor.clone(),
+            ))
+            .await
+            .expect("persist broken workspace worker");
+        let broken_command = managed
+            .enqueue_held_with_route(
+                launch_for(broken_workspace.clone(), &broken.worker_id, &broken.task_id),
+                None,
+                None,
+            )
+            .await
+            .expect("persist broken workspace command");
+        worker
+            .link_launch_command(
+                &broken_workspace,
+                &broken_anchor,
+                &broken.worker_id,
+                &broken.task_id,
+                &Uuid::new_v4().to_string(),
+            )
+            .await
+            .expect("seed conflicting broken workspace link");
+
+        let healthy = worker
+            .spawn_worker(spawn_request(
+                OperationId::new(),
+                healthy_workspace.clone(),
+                healthy_anchor.clone(),
+            ))
+            .await
+            .expect("persist healthy workspace worker");
+        let healthy_command = managed
+            .enqueue_held_with_route(
+                launch_for(
+                    healthy_workspace.clone(),
+                    &healthy.worker_id,
+                    &healthy.task_id,
+                ),
+                None,
+                None,
+            )
+            .await
+            .expect("persist healthy workspace command");
+        worker
+            .link_launch_command(
+                &healthy_workspace,
+                &healthy_anchor,
+                &healthy.worker_id,
+                &healthy.task_id,
+                &healthy_command.id.to_string(),
+            )
+            .await
+            .expect("persist healthy workspace link");
+
+        let error = recover_registered_workspaces(
+            &[broken_workspace.clone(), healthy_workspace.clone()],
+            &worker,
+            &managed,
+        )
+        .await
+        .expect_err("broken workspace should still be reported");
+        assert!(error.contains(broken_workspace.as_str()));
+        let snapshot = managed.snapshot().await;
+        assert!(
+            !snapshot
+                .commands
+                .get(&broken_command.id)
+                .expect("broken command remains")
+                .dispatch_ready
+        );
+        assert!(
+            snapshot
+                .commands
+                .get(&healthy_command.id)
+                .expect("healthy command remains")
+                .dispatch_ready,
+            "later workspace recovery must proceed even after an earlier workspace fails"
         );
         let _ = std::fs::remove_dir_all(root);
     }
@@ -1259,11 +1390,13 @@ mod tests {
 
         let reuse_operation = OperationId::new();
         let pause = register_transaction_pause(&reuse_operation);
+        let route = core_route();
         let reuse = {
             let worker = worker.clone();
             let managed = managed.clone();
             let workspace = workspace.clone();
             let anchor = anchor.clone();
+            let route = route.clone();
             let worker_id = spawned.worker_id.to_string();
             let operation = reuse_operation.to_string();
             tokio::spawn(async move {
@@ -1281,7 +1414,7 @@ mod tests {
                     worker.as_ref(),
                     WorkerLaunchContext {
                         managed_chat_broker: managed.as_ref(),
-                        anchor_route: None,
+                        anchor_route: Some(&route),
                         worker_target_count: super::super::RECOMMENDED_WORKERS_PER_FAMILY,
                     },
                 )
@@ -1342,7 +1475,21 @@ mod tests {
                 .state,
             WorkerState::Waking
         );
-        assert_eq!(managed.snapshot().await.commands.len(), 1);
+        let managed_snapshot = managed.snapshot().await;
+        assert_eq!(managed_snapshot.commands.len(), 1);
+        let command = managed_snapshot
+            .commands
+            .values()
+            .next()
+            .expect("reuse command remains");
+        assert_eq!(command.target_client_id.as_deref(), Some("extension-a"));
+        assert_eq!(
+            command
+                .anchor_context
+                .as_ref()
+                .map(|context| context.conversation_id.as_str()),
+            Some(route.tab.conversation_id.as_str())
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 

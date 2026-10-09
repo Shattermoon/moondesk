@@ -159,13 +159,7 @@ impl ManagedChatBroker {
         &self,
         session_digest: &str,
     ) -> Result<Vec<ManagedChatCommand>, ManagedChatError> {
-        if session_digest.len() != 64
-            || !session_digest.bytes().all(|byte| byte.is_ascii_hexdigit())
-        {
-            return Err(ManagedChatError::Invalid(
-                "managed chat Core session digest is invalid".into(),
-            ));
-        }
+        validate_core_session_digest(session_digest)?;
         let guard = self.data.lock().await;
         let matching = guard
             .commands
@@ -175,16 +169,7 @@ impl ManagedChatBroker {
             })
             .cloned()
             .collect::<Vec<_>>();
-        if matching.iter().any(|command| match command.state {
-            ManagedChatCommandState::Succeeded => false,
-            ManagedChatCommandState::Failed => command.reconcile_history,
-            _ => true,
-        }) {
-            return Err(ManagedChatError::Conflict(
-                "Core workers cannot be cleared while a launch is active or its Send outcome is ambiguous"
-                    .into(),
-            ));
-        }
+        ensure_commands_clearable(&matching)?;
         Ok(matching)
     }
 
@@ -192,13 +177,7 @@ impl ManagedChatBroker {
         &self,
         session_digest: &str,
     ) -> Result<Vec<ManagedChatCommand>, ManagedChatError> {
-        if session_digest.len() != 64
-            || !session_digest.bytes().all(|byte| byte.is_ascii_hexdigit())
-        {
-            return Err(ManagedChatError::Invalid(
-                "managed chat Core session digest is invalid".into(),
-            ));
-        }
+        validate_core_session_digest(session_digest)?;
         let mut guard = self.data.lock().await;
         let matching = guard
             .commands
@@ -211,16 +190,7 @@ impl ManagedChatBroker {
         if matching.is_empty() {
             return Ok(Vec::new());
         }
-        if matching.iter().any(|command| match command.state {
-            ManagedChatCommandState::Succeeded => false,
-            ManagedChatCommandState::Failed => command.reconcile_history,
-            _ => true,
-        }) {
-            return Err(ManagedChatError::Conflict(
-                "Core workers cannot be cleared while a launch is active or its Send outcome is ambiguous"
-                    .into(),
-            ));
-        }
+        ensure_commands_clearable(&matching)?;
 
         let mut candidate = guard.clone();
         for command in &matching {
@@ -859,6 +829,29 @@ impl ManagedChatBroker {
         **guard = candidate;
         Ok(())
     }
+}
+
+fn validate_core_session_digest(session_digest: &str) -> Result<(), ManagedChatError> {
+    if session_digest.len() != 64 || !session_digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(ManagedChatError::Invalid(
+            "managed chat Core session digest is invalid".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_commands_clearable(commands: &[ManagedChatCommand]) -> Result<(), ManagedChatError> {
+    if commands.iter().any(|command| match command.state {
+        ManagedChatCommandState::Succeeded => false,
+        ManagedChatCommandState::Failed => command.reconcile_history,
+        _ => true,
+    }) {
+        return Err(ManagedChatError::Conflict(
+            "Core workers cannot be cleared while a launch is active or its Send outcome is ambiguous"
+                .into(),
+        ));
+    }
+    Ok(())
 }
 
 fn anchor_is_eligible(

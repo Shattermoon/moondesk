@@ -2936,6 +2936,7 @@ mod tests {
                         task_marker: format!("clear-saga:{}", spawned.task_id),
                         thread_key: Some(format!("worker:{}", spawned.worker_id)),
                         open_mode: ManagedChatOpenMode::NewThread,
+                        existing_conversation_url: None,
                         anchor_session_digest: Some(session_digest.clone()),
                     },
                 },
@@ -3072,6 +3073,7 @@ mod tests {
                         task_marker: "revoke-saga-task".into(),
                         thread_key: Some("worker:revoke-saga".into()),
                         open_mode: ManagedChatOpenMode::NewThread,
+                        existing_conversation_url: None,
                         anchor_session_digest: Some("e".repeat(64)),
                     },
                 },
@@ -3346,6 +3348,7 @@ mod tests {
                         task_marker: "task-marker-http".into(),
                         thread_key: Some("worker:test-http".into()),
                         open_mode: ManagedChatOpenMode::NewThread,
+                        existing_conversation_url: None,
                         anchor_session_digest: Some(core_session_digest.clone()),
                     },
                 },
@@ -5403,6 +5406,7 @@ document.getElementById('upload').addEventListener('change',event=>{document.get
                                         task_marker: first_marker.into(),
                                         thread_key: Some(thread_key.into()),
                                         open_mode: ManagedChatOpenMode::NewThread,
+                        existing_conversation_url: None,
                                         anchor_session_digest: None,
                                     },
                                 },
@@ -5448,6 +5452,11 @@ document.getElementById('upload').addEventListener('change',event=>{document.get
                                 task_marker: second_marker.into(),
                                 thread_key: Some(thread_key.into()),
                                 open_mode: ManagedChatOpenMode::ExistingThread,
+                                existing_conversation_url: first_command_id
+                                    .as_ref()
+                                    .and_then(|command_id| snapshot.commands.get(command_id))
+                                    .and_then(|command| command.terminal.as_ref())
+                                    .and_then(|terminal| terminal.conversation_url.clone()),
                                 anchor_session_digest: None,
                             },
                         })

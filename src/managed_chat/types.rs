@@ -152,6 +152,8 @@ pub struct ManagedChatLaunch {
     #[serde(default)]
     pub open_mode: ManagedChatOpenMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub existing_conversation_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anchor_session_digest: Option<String>,
 }
 
@@ -176,6 +178,40 @@ impl ManagedChatLaunch {
         }
         if self.open_mode == ManagedChatOpenMode::ExistingThread && self.thread_key.is_none() {
             return Err("existing managed chat launch requires a thread key".into());
+        }
+        if let Some(existing_conversation_url) = self.existing_conversation_url.as_deref() {
+            let url = reqwest::Url::parse(existing_conversation_url)
+                .map_err(|_| "existing managed chat conversation URL is invalid")?;
+            let mut segments = url
+                .path_segments()
+                .ok_or("existing managed chat conversation URL is invalid")?;
+            let canonical = url.scheme() == "https"
+                && url.host_str() == Some("chatgpt.com")
+                && segments.next() == Some("c")
+                && segments
+                    .next()
+                    .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok())
+                && segments.next().is_none()
+                && url.query().is_none()
+                && url.fragment().is_none();
+            if !canonical {
+                return Err("existing managed chat conversation URL must be a canonical https://chatgpt.com/c/<uuid> URL".into());
+            }
+        }
+        if self.open_mode == ManagedChatOpenMode::ExistingThread
+            && self.purpose == ManagedChatPurpose::Worker
+            && self.existing_conversation_url.is_none()
+        {
+            return Err(
+                "existing Worker launch requires its durable canonical conversation URL".into(),
+            );
+        }
+        if self.open_mode != ManagedChatOpenMode::ExistingThread
+            && self.existing_conversation_url.is_some()
+        {
+            return Err(
+                "new-thread managed chat launch cannot provide an existing conversation URL".into(),
+            );
         }
         if self.anchor_session_digest.as_deref().is_some_and(|digest| {
             digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit())

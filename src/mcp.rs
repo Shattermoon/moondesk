@@ -4987,6 +4987,7 @@ mod tests {
                     task_marker: format!("moondesk-worker-task:{}", spawned.task_id),
                     thread_key: None,
                     open_mode: ManagedChatOpenMode::NewThread,
+                    existing_conversation_url: None,
                     anchor_session_digest: Some(core_identity.session_digest.clone()),
                 },
             })

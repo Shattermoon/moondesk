@@ -272,6 +272,8 @@ pub struct ReuseReceipt {
     pub task_id: TaskId,
     pub display_id: String,
     pub execution_profile: WorkerExecutionProfile,
+    #[serde(default)]
+    pub conversation_url: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

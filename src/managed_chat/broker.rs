@@ -177,6 +177,45 @@ impl ManagedChatBroker {
         &self,
         session_digest: &str,
     ) -> Result<Vec<ManagedChatCommand>, ManagedChatError> {
+        self.purge_terminal_matching(session_digest, None).await
+    }
+
+    pub async fn ensure_clearable_anchor_session_for_workspace(
+        &self,
+        workspace_id: &WorkspaceId,
+        session_digest: &str,
+    ) -> Result<Vec<ManagedChatCommand>, ManagedChatError> {
+        workspace_id.validate().map_err(ManagedChatError::Invalid)?;
+        validate_core_session_digest(session_digest)?;
+        let guard = self.data.lock().await;
+        let matching = guard
+            .commands
+            .values()
+            .filter(|command| {
+                &command.launch.workspace_id == workspace_id
+                    && command.launch.anchor_session_digest.as_deref() == Some(session_digest)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        ensure_commands_clearable(&matching)?;
+        Ok(matching)
+    }
+
+    pub async fn purge_terminal_for_anchor_session_for_workspace(
+        &self,
+        workspace_id: &WorkspaceId,
+        session_digest: &str,
+    ) -> Result<Vec<ManagedChatCommand>, ManagedChatError> {
+        workspace_id.validate().map_err(ManagedChatError::Invalid)?;
+        self.purge_terminal_matching(session_digest, Some(workspace_id))
+            .await
+    }
+
+    async fn purge_terminal_matching(
+        &self,
+        session_digest: &str,
+        workspace_id: Option<&WorkspaceId>,
+    ) -> Result<Vec<ManagedChatCommand>, ManagedChatError> {
         validate_core_session_digest(session_digest)?;
         let mut guard = self.data.lock().await;
         let matching = guard
@@ -184,6 +223,8 @@ impl ManagedChatBroker {
             .values()
             .filter(|command| {
                 command.launch.anchor_session_digest.as_deref() == Some(session_digest)
+                    && workspace_id
+                        .is_none_or(|workspace_id| &command.launch.workspace_id == workspace_id)
             })
             .cloned()
             .collect::<Vec<_>>();
@@ -696,6 +737,28 @@ impl ManagedChatBroker {
             .commands
             .get(command_id)
             .ok_or(ManagedChatError::NotFound)?;
+        if command.launch.open_mode == super::types::ManagedChatOpenMode::ExistingThread
+            && let ManagedChatAckOutcome::Succeeded {
+                conversation_url: Some(conversation_url),
+                ..
+            } = &outcome
+        {
+            let expected = command
+                .launch
+                .existing_conversation_url
+                .as_deref()
+                .ok_or_else(|| {
+                    ManagedChatError::Conflict(
+                        "existing-thread command lost its durable conversation binding".into(),
+                    )
+                })?;
+            if conversation_url != expected {
+                return Err(ManagedChatError::Conflict(
+                    "existing-thread success conversation URL does not match the durable worker binding"
+                        .into(),
+                ));
+            }
+        }
         if matches!(
             command.state,
             ManagedChatCommandState::Succeeded
@@ -1052,6 +1115,7 @@ mod tests {
             task_marker: marker.into(),
             thread_key: Some("worker:test-thread".into()),
             open_mode: ManagedChatOpenMode::NewThread,
+            existing_conversation_url: None,
             anchor_session_digest: None,
         }
     }
@@ -1765,6 +1829,8 @@ mod tests {
 
         let mut reuse_launch = launch("reuse");
         reuse_launch.open_mode = ManagedChatOpenMode::ExistingThread;
+        reuse_launch.existing_conversation_url =
+            Some("https://chatgpt.com/c/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".into());
         let reuse = broker
             .enqueue(EnqueueManagedChatRequest {
                 dedupe_key: "worker:affinity:task:reuse".into(),
@@ -1799,6 +1865,70 @@ mod tests {
         assert_eq!(
             reuse_offer.command.target_client_id.as_deref(),
             Some("edge")
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn existing_thread_success_rejects_conversation_url_drift() {
+        let root = temp_root("moondesk-managed-chat-existing-url-drift");
+        let broker = ManagedChatBroker::open(root.join("state.json")).expect("open broker");
+        let expected = "https://chatgpt.com/c/aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeee1";
+        let mut existing = launch("existing-url-drift");
+        existing.open_mode = ManagedChatOpenMode::ExistingThread;
+        existing.existing_conversation_url = Some(expected.into());
+        let command = broker
+            .enqueue(EnqueueManagedChatRequest {
+                dedupe_key: "worker:existing-url-drift".into(),
+                launch: existing,
+            })
+            .await
+            .expect("enqueue existing thread");
+        let offer = broker
+            .redeem("browser", 1)
+            .await
+            .expect("redeem existing thread")
+            .expect("existing offer");
+        let lease = offer
+            .command
+            .lease
+            .as_ref()
+            .expect("lease")
+            .lease_id
+            .clone();
+        broker
+            .mark_send_started(&command.id, &lease, "browser")
+            .await
+            .expect("mark send started");
+        let error = broker
+            .acknowledge(
+                &command.id,
+                &lease,
+                "browser",
+                ManagedChatAckOutcome::Succeeded {
+                    details: Some("sent on wrong conversation".into()),
+                    conversation_url: Some(
+                        "https://chatgpt.com/c/aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeee2".into(),
+                    ),
+                },
+            )
+            .await
+            .expect_err("existing-thread URL drift must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("does not match the durable worker binding")
+        );
+        assert_eq!(
+            broker
+                .snapshot()
+                .await
+                .commands
+                .get(&command.id)
+                .expect("command retained")
+                .state,
+            ManagedChatCommandState::SendStarted,
+            "mismatched success must not become terminal or rewrite affinity"
         );
         let _ = std::fs::remove_dir_all(root);
     }

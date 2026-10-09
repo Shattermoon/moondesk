@@ -4609,6 +4609,7 @@ toolMode = "multiTools"
                         task_marker: marker.into(),
                         thread_key: Some(format!("worker:{marker}")),
                         open_mode: crate::managed_chat::types::ManagedChatOpenMode::NewThread,
+                        existing_conversation_url: None,
                         anchor_session_digest: None,
                     },
                 })

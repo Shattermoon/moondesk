@@ -580,31 +580,15 @@ function placementForOffer(state, offer) {
   }
 
   if (command?.launch?.openMode === 'existing_thread') {
-    const threadKey = command.launch.threadKey;
-    const thread = threadKey ? state.threadRecords?.[threadKey] : null;
-    if (thread?.conversationUrl && thread.workspaceId === command.launch.workspaceId) {
+    const durableConversationUrl = canonicalConversationUrl(command.launch.existingConversationUrl);
+    if (durableConversationUrl) {
       return {
-        projectId: thread.projectId || projectIdFromChatUrl(thread.conversationUrl),
+        projectId: projectIdFromChatUrl(durableConversationUrl),
         projectUrl: null,
         anchorConversationUrl: null
       };
     }
-
-    const prior = Object.values(state.launchRecords || {})
-      .filter((record) =>
-        record?.threadKey === threadKey &&
-        record?.workspaceId === command.launch.workspaceId &&
-        record?.phase === 'succeeded'
-      )
-      .sort((left, right) => (right.updatedAt || 0) - (left.updatedAt || 0))[0];
-    if (prior) {
-      const priorUrl = prior.conversationUrl || prior.sourceUrl || null;
-      return {
-        projectId: projectIdFromChatUrl(priorUrl),
-        projectUrl: null,
-        anchorConversationUrl: null
-      };
-    }
+    return null;
   }
 
   // Compatibility only for commands created before automatic Core routing existed.
@@ -724,23 +708,47 @@ async function recordForCommand(state, command, placement, reconcileRequired = f
   const threadKey = command.launch.threadKey || `command:${command.id}`;
   const openMode = command.launch.openMode || 'new_thread';
   let thread = state.threadRecords?.[threadKey] || null;
+  const durableExistingConversation = openMode === 'existing_thread'
+    ? canonicalConversationUrl(command.launch.existingConversationUrl)
+    : null;
+  if (openMode === 'existing_thread' && !durableExistingConversation) {
+    throw new Error('Existing worker thread has no valid durable ChatGPT conversation URL from MoonDesk');
+  }
+  if (
+    openMode === 'existing_thread' &&
+    threadRecordOwnedByWorkspace(thread, command.launch.workspaceId) &&
+    canonicalConversationUrl(thread.conversationUrl) !== durableExistingConversation
+  ) {
+    throw new Error('Existing worker thread durable binding conflicts with companion-local history');
+  }
   if (
     openMode === 'existing_thread' &&
     !threadRecordOwnedByWorkspace(thread, command.launch.workspaceId)
   ) {
-    thread = await recoverThreadRecord(state, threadKey, command.launch.workspaceId);
+    thread = null;
   }
   let record = state.launchRecords[command.id];
+  if (
+    record &&
+    openMode === 'existing_thread' &&
+    canonicalConversationUrl(record.conversationUrl || record.sourceUrl) !== durableExistingConversation
+  ) {
+    throw new Error('Existing worker launch record conflicts with MoonDesk durable conversation binding');
+  }
   if (!record && reconcileRequired) {
     throw new Error('Reconciliation has no durable browser launch record and cannot create a fresh worker thread');
   }
   if (!record) {
     const threadOwnedByWorkspace = threadRecordOwnedByWorkspace(thread, command.launch.workspaceId);
-    const existingConversation = openMode === 'existing_thread' && threadOwnedByWorkspace
-      ? canonicalConversationUrl(thread.conversationUrl)
+    const existingConversation = openMode === 'existing_thread'
+      ? durableExistingConversation
       : null;
-    if (openMode === 'existing_thread' && !existingConversation) {
-      throw new Error('Existing worker thread has no confirmed ChatGPT conversation binding for this workspace and thread identity');
+    if (
+      openMode === 'existing_thread' &&
+      threadOwnedByWorkspace &&
+      canonicalConversationUrl(thread.conversationUrl) !== existingConversation
+    ) {
+      throw new Error('Existing worker thread durable binding conflicts with companion-local history');
     }
     const sourceUrl = sourceUrlForCommand(placement, openMode, existingConversation);
     if (!sourceUrl) {

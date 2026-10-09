@@ -4464,24 +4464,24 @@ async fn run_inactive_worker_capacity_cleanup(
             return Ok(message);
         }
     };
-    if preview.family_count == 0 {
+    if preview.summary.family_count == 0 {
         return Ok(format!(
             "No inactive Worker families in '{}' are safe to release. Active/ambiguous work and uncollected results remain protected.",
             workspace.name
         ));
     }
 
-    let replay_warning = if preview.replay_receipt_count == 0 {
+    let replay_warning = if preview.summary.replay_receipt_count == 0 {
         String::new()
     } else {
         format!(
             " This also discards {} retained collect replay receipt(s) for those inactive families.",
-            preview.replay_receipt_count
+            preview.summary.replay_receipt_count
         )
     };
     let confirmation_prompt = format!(
         "Type CLEANUP to release {} inactive Core family/families ({} worker record(s)) from '{}'. ChatGPT conversations are preserved; retained terminal MoonDesk launch history for those families is also removed.{}",
-        preview.family_count, preview.worker_count, workspace.name, replay_warning
+        preview.summary.family_count, preview.summary.worker_count, workspace.name, replay_warning
     );
     let Some(confirmation) = run_prompt(terminal, palette, &confirmation_prompt, "").await? else {
         return Ok("Inactive Worker cleanup cancelled.".into());
@@ -4492,6 +4492,7 @@ async fn run_inactive_worker_capacity_cleanup(
 
     let removed = match workers::protocol::cleanup_inactive_capacity_for_workspace(
         &workspace.id,
+        &preview,
         worker_broker.as_ref(),
         managed_chat_broker.as_ref(),
     )

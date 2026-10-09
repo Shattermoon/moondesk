@@ -2276,33 +2276,24 @@ test('presence reports the generating conversation independently of browser focu
   assert.equal(generating.generating, true);
 });
 
-test('existing worker placement survives without Core presence by using its durable thread record', () => {
+test('existing worker placement survives without Core presence by using the host durable conversation URL', () => {
   const { evaluate } = loadBackground();
   const placementForOffer = evaluate('placementForOffer');
-  const workerUrl = 'https://chatgpt.com/g/g-p-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-any-name/c/6aad7eb1-4b10-83ee-97bd-d98b338864de';
-  const state = {
-    bindings: {},
-    launchRecords: {},
-    threadRecords: {
-      'worker:pinned': {
-        workspaceId: 'workspace-a',
-        projectId: 'g-p-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
-        conversationUrl: workerUrl
-      }
-    }
-  };
+  const workerUrl = 'https://chatgpt.com/c/6aad7eb1-4b10-83ee-97bd-d98b338864de';
+  const state = { bindings: {}, launchRecords: {}, threadRecords: {} };
   const offer = {
     anchorContext: null,
     command: {
       launch: {
         workspaceId: 'workspace-a',
         threadKey: 'worker:pinned',
-        openMode: 'existing_thread'
+        openMode: 'existing_thread',
+        existingConversationUrl: workerUrl
       }
     }
   };
   const placement = placementForOffer(state, offer);
-  assert.equal(placement.projectId, 'g-p-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb');
+  assert.equal(placement.projectId, null);
   assert.equal(placement.projectUrl, null);
 });
 
@@ -2543,56 +2534,40 @@ test('new-thread recovery never matches an older launch only by durable thread k
   assert.equal(matches(newThread, { commandId: 'command-new', threadKey: 'different' }), true);
 });
 
-test('existing-thread reuse is owned by workspace and exact thread, not the Core Project', async () => {
-  const legacyWorkerUrl = 'https://chatgpt.com/g/g-p-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-legacy/c/aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeee1';
+test('existing-thread reuse treats the host durable URL as authority instead of another workspace local record', async () => {
+  const durableWorkerUrl = 'https://chatgpt.com/c/aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeee1';
+  const unrelatedWorkerUrl = 'https://chatgpt.com/c/aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeee9';
   const { createdTabs, evaluate } = loadBackground({
-    existingTabs: { 77: { id: 77, url: legacyWorkerUrl } }
+    existingTabs: { 77: { id: 77, url: unrelatedWorkerUrl } }
   });
   const recordForCommand = evaluate('recordForCommand');
-  const placement = {
-    projectId: 'g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
-    projectUrl: 'https://chatgpt.com/g/g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-anything/project',
-    anchorConversationUrl: 'https://chatgpt.com/g/g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-anything/c/anchor'
-  };
   const command = {
     id: 'command-reuse',
     launch: {
       workspaceId: 'workspace-current',
       taskMarker: 'marker-reuse',
       threadKey: 'worker:reuse',
-      openMode: 'existing_thread'
+      openMode: 'existing_thread',
+      existingConversationUrl: durableWorkerUrl
     }
   };
-
-  await assert.rejects(
-    recordForCommand({
-      launchRecords: {},
-      threadRecords: {
-        'worker:reuse': {
-          workspaceId: 'workspace-other',
-          projectId: placement.projectId,
-          conversationUrl: legacyWorkerUrl
-        }
-      }
-    }, command, placement),
-    /no confirmed ChatGPT conversation binding for this workspace and thread identity/
-  );
-
   const state = {
     launchRecords: {},
     threadRecords: {
       'worker:reuse': {
-        workspaceId: command.launch.workspaceId,
-        projectId: 'g-p-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
-        conversationUrl: legacyWorkerUrl,
+        workspaceId: 'workspace-other',
+        projectId: null,
+        conversationUrl: unrelatedWorkerUrl,
         tabId: 77
       }
     }
   };
-  const reused = await recordForCommand(state, command, placement);
-  assert.equal(reused.record.conversationUrl, legacyWorkerUrl);
-  assert.equal(reused.tab.id, 77);
-  assert.equal(createdTabs.length, 0);
+
+  const reused = await recordForCommand(state, command, null);
+  assert.equal(reused.record.conversationUrl, durableWorkerUrl);
+  assert.notEqual(reused.tab.id, 77);
+  assert.equal(createdTabs.length, 1);
+  assert.equal(new URL(createdTabs[0].url).pathname, '/c/aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeee1');
 });
 
 test('existing-thread reuse never adopts a remembered local-chatgpt placeholder instead of its durable conversation', async () => {
@@ -2615,6 +2590,7 @@ test('existing-thread reuse never adopts a remembered local-chatgpt placeholder 
       taskMarker: 'marker-durable-reuse',
       threadKey: 'worker:durable-reuse',
       openMode: 'existing_thread',
+      existingConversationUrl: durableUrl,
       executionProfile: {
         modelKey: 'gpt-5.6-sol',
         modelLabel: 'GPT-5.6 Sol',
@@ -2645,67 +2621,39 @@ test('existing-thread reuse never adopts a remembered local-chatgpt placeholder 
   assert.equal(new URL(createdTabs[0].url).pathname, '/c/aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeee5');
 });
 
-test('existing-thread reuse self-heals a missing thread record from a succeeded launch tab', async () => {
-  const workerUrl = 'https://chatgpt.com/g/g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-moondesk/c/aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeee2';
-  const { createdTabs, evaluate } = loadBackground({
-    existingTabs: {
-      77: { id: 77, url: workerUrl }
-    },
-    contentByTab: {
-      77: {
-        ok: true,
-        rememberedLaunch: {
-          commandId: 'command-first',
-          threadKey: 'worker:recover'
-        }
-      }
-    }
-  });
-
+test('existing-thread reuse survives companion reinstall with empty local thread and launch records', async () => {
+  const workerUrl = 'https://chatgpt.com/c/aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeee2';
+  const { createdTabs, evaluate } = loadBackground();
   const recordForCommand = evaluate('recordForCommand');
-  const placement = {
-    projectId: 'g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
-    projectUrl: 'https://chatgpt.com/g/g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-random/project',
-    anchorConversationUrl: 'https://chatgpt.com/g/g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-random/c/anchor'
-  };
-  const state = {
-    launchRecords: {
-      'command-first': {
-        commandId: 'command-first',
-        workspaceId: 'workspace-current',
-        taskMarker: 'marker-first',
-        threadKey: 'worker:recover',
-        openMode: 'new_thread',
-        launchToken: 'launch-first',
-        sourceUrl: placement.projectUrl,
-        tabId: 77,
-        conversationUrl: null,
-        phase: 'succeeded',
-        reconcileAttempts: 0
-      }
-    },
-    threadRecords: {}
-  };
+  const state = { launchRecords: {}, threadRecords: {} };
   const command = {
     id: 'command-reuse-recovered',
     launch: {
       workspaceId: 'workspace-current',
       taskMarker: 'marker-reuse-recovered',
       threadKey: 'worker:recover',
-      openMode: 'existing_thread'
+      openMode: 'existing_thread',
+      existingConversationUrl: workerUrl,
+      executionProfile: {
+        modelKey: 'gpt-5.6-sol',
+        modelLabel: 'GPT-5.6 Sol',
+        reasoningEffort: 'high'
+      }
     }
   };
 
-  const { record, tab } = await recordForCommand(state, command, placement);
-  assert.equal(state.threadRecords['worker:recover'].conversationUrl, workerUrl);
+  const { record, tab } = await recordForCommand(state, command, null);
   assert.equal(record.sourceUrl, workerUrl);
   assert.equal(record.conversationUrl, workerUrl);
-  assert.equal(tab.id, 77);
-  assert.equal(createdTabs.length, 0);
+  assert.equal(createdTabs.length, 1);
+  assert.equal(tab.id, createdTabs[0].id);
+  const opened = new URL(createdTabs[0].url);
+  assert.equal(opened.pathname, '/c/aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeee2');
+  assert.equal(opened.searchParams.get('moondesk-launch'), record.launchToken);
 });
 
-test('existing-thread reuse accepts the exact confirmed thread owned by the same workspace', async () => {
-  const conversationUrl = 'https://chatgpt.com/g/g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-moondesk/c/aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeee3';
+test('existing-thread reuse accepts the exact durable thread owned by the same workspace', async () => {
+  const conversationUrl = 'https://chatgpt.com/c/aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeee3';
   const { createdTabs, evaluate } = loadBackground({
     existingTabs: {
       77: { id: 77, url: conversationUrl }
@@ -2723,7 +2671,8 @@ test('existing-thread reuse accepts the exact confirmed thread owned by the same
       workspaceId: 'workspace-current',
       taskMarker: 'marker-reuse-owned',
       threadKey: 'worker:reuse-owned',
-      openMode: 'existing_thread'
+      openMode: 'existing_thread',
+      existingConversationUrl: conversationUrl
     }
   };
   const state = {

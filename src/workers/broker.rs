@@ -118,6 +118,20 @@ pub struct InactiveWorkerCleanupSummary {
     pub replay_receipt_count: usize,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct InactiveWorkerCleanupFamily {
+    pub family_id: WorkerFamilyId,
+    pub session_digest: String,
+    pub expected_family: WorkerFamily,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct InactiveWorkerCleanupPlan {
+    pub workspace_id: WorkspaceId,
+    pub summary: InactiveWorkerCleanupSummary,
+    pub families: Vec<InactiveWorkerCleanupFamily>,
+}
+
 pub struct WorkerBroker {
     path: PathBuf,
     data: Mutex<WorkerStoreData>,
@@ -346,7 +360,13 @@ impl WorkerBroker {
         worker.launch_command_id = Some(command_id.to_string());
         worker.launch_state = WorkerLaunchState::Queued;
         worker.launch_error = None;
-        worker.conversation_url = None;
+        if worker.state == WorkerState::Provisioning {
+            worker.conversation_url = None;
+        } else if worker.state == WorkerState::Waking && worker.conversation_url.is_none() {
+            return Err(WorkerBrokerError::Conflict(
+                "existing worker wake lost its durable ChatGPT conversation URL".into(),
+            ));
+        }
         let linked = worker.clone();
         self.commit_candidate(&mut guard, candidate).await?;
         Ok(linked)
@@ -853,7 +873,20 @@ impl WorkerBroker {
         }
         if let Some(receipt) = family.reuse_requests.get(&request.operation_id) {
             if receipt.request_fingerprint == fingerprint {
-                return Ok(receipt.clone());
+                let mut receipt = receipt.clone();
+                if receipt.conversation_url.is_empty() {
+                    receipt.conversation_url = family
+                        .workers
+                        .get(&request.worker_id)
+                        .and_then(|worker| worker.conversation_url.clone())
+                        .ok_or_else(|| {
+                            WorkerBrokerError::Conflict(
+                                "replayed worker reuse has no durable canonical ChatGPT conversation URL"
+                                    .into(),
+                            )
+                        })?;
+                }
+                return Ok(receipt);
             }
             return Err(WorkerBrokerError::Conflict(
                 "worker reuse operation id was reused with different input".into(),
@@ -873,6 +906,11 @@ impl WorkerBroker {
                 "worker can only be reused while idle".into(),
             ));
         }
+        let conversation_url = worker.conversation_url.clone().ok_or_else(|| {
+            WorkerBrokerError::Conflict(
+                "claimed worker has no durable canonical ChatGPT conversation URL".into(),
+            )
+        })?;
 
         let mut candidate = guard.clone();
         let family = candidate
@@ -911,6 +949,7 @@ impl WorkerBroker {
             task_id,
             display_id,
             execution_profile,
+            conversation_url,
         };
         family
             .reuse_requests
@@ -918,6 +957,43 @@ impl WorkerBroker {
         compact_family_history(family)?;
         self.commit_candidate(&mut guard, candidate).await?;
         Ok(receipt)
+    }
+
+    pub async fn ensure_existing_thread_binding(
+        &self,
+        workspace_id: &WorkspaceId,
+        anchor_identity: &ChatIdentity,
+        worker_id: &WorkerId,
+        conversation_url: &str,
+    ) -> Result<(), WorkerBrokerError> {
+        let guard = self.data.lock().await;
+        let family_id = find_family_for_worker(&guard, workspace_id, worker_id)
+            .ok_or(WorkerBrokerError::NotFound)?;
+        let family = guard
+            .families
+            .get(&family_id)
+            .ok_or(WorkerBrokerError::NotFound)?;
+        if &family.anchor_identity != anchor_identity {
+            return Err(WorkerBrokerError::NotFound);
+        }
+        let worker = family
+            .workers
+            .get(worker_id)
+            .ok_or(WorkerBrokerError::NotFound)?;
+        let durable_url = worker.conversation_url.as_deref().ok_or_else(|| {
+            WorkerBrokerError::Conflict(
+                "worker has no durable canonical ChatGPT conversation URL".into(),
+            )
+        })?;
+        if canonical_conversation_id_from_url(durable_url).is_none()
+            || durable_url != conversation_url
+        {
+            return Err(WorkerBrokerError::Conflict(
+                "existing-thread URL does not match this workspace/Core/worker durable binding"
+                    .into(),
+            ));
+        }
+        Ok(())
     }
 
     pub async fn start_task(
@@ -1096,66 +1172,64 @@ impl WorkerBroker {
     pub async fn inactive_cleanup_preview_for_workspace(
         &self,
         workspace_id: &WorkspaceId,
-    ) -> Result<InactiveWorkerCleanupSummary, WorkerBrokerError> {
+    ) -> Result<InactiveWorkerCleanupPlan, WorkerBrokerError> {
         workspace_id
             .validate()
             .map_err(WorkerBrokerError::Invalid)?;
         let guard = self.data.lock().await;
-        Ok(inactive_cleanup_summary(&guard, workspace_id))
-    }
-
-    pub async fn inactive_cleanup_session_digests_for_workspace(
-        &self,
-        workspace_id: &WorkspaceId,
-    ) -> Result<Vec<String>, WorkerBrokerError> {
-        workspace_id
-            .validate()
-            .map_err(WorkerBrokerError::Invalid)?;
-        let guard = self.data.lock().await;
-        Ok(guard
-            .families
-            .values()
-            .filter(|family| {
-                &family.workspace_id == workspace_id
-                    && family_is_safe_for_explicit_host_cleanup(family)
-            })
-            .map(|family| family.anchor_identity.session_digest.clone())
-            .collect())
-    }
-
-    pub async fn cleanup_inactive_families_for_workspace(
-        &self,
-        workspace_id: &WorkspaceId,
-    ) -> Result<InactiveWorkerCleanupSummary, WorkerBrokerError> {
-        workspace_id
-            .validate()
-            .map_err(WorkerBrokerError::Invalid)?;
-        let mut guard = self.data.lock().await;
-        let removable = guard
+        let families = guard
             .families
             .iter()
             .filter(|(_, family)| {
                 &family.workspace_id == workspace_id
                     && family_is_safe_for_explicit_host_cleanup(family)
             })
-            .map(|(family_id, _)| family_id.clone())
+            .map(|(family_id, family)| InactiveWorkerCleanupFamily {
+                family_id: family_id.clone(),
+                session_digest: family.anchor_identity.session_digest.clone(),
+                expected_family: family.clone(),
+            })
             .collect::<Vec<_>>();
-        if removable.is_empty() {
+        let summary =
+            cleanup_summary_for_families(families.iter().map(|entry| &entry.expected_family));
+        Ok(InactiveWorkerCleanupPlan {
+            workspace_id: workspace_id.clone(),
+            summary,
+            families,
+        })
+    }
+
+    pub async fn ensure_inactive_cleanup_plan_unchanged(
+        &self,
+        plan: &InactiveWorkerCleanupPlan,
+    ) -> Result<(), WorkerBrokerError> {
+        plan.workspace_id
+            .validate()
+            .map_err(WorkerBrokerError::Invalid)?;
+        let guard = self.data.lock().await;
+        ensure_cleanup_plan_matches(&guard, plan)
+    }
+
+    pub async fn cleanup_inactive_families_for_plan(
+        &self,
+        plan: &InactiveWorkerCleanupPlan,
+    ) -> Result<InactiveWorkerCleanupSummary, WorkerBrokerError> {
+        plan.workspace_id
+            .validate()
+            .map_err(WorkerBrokerError::Invalid)?;
+        let mut guard = self.data.lock().await;
+        ensure_cleanup_plan_matches(&guard, plan)?;
+        if plan.families.is_empty() {
             return Ok(InactiveWorkerCleanupSummary::default());
         }
 
         let mut candidate = guard.clone();
-        let mut summary = InactiveWorkerCleanupSummary::default();
-        for family_id in removable {
-            if let Some(family) = candidate.families.remove(&family_id) {
-                summary.family_count += 1;
-                summary.worker_count += family.workers.len();
-                summary.replay_receipt_count += family.collect_requests.len();
-            }
+        for entry in &plan.families {
+            candidate.families.remove(&entry.family_id);
         }
         self.commit_candidate(&mut guard, candidate).await?;
         self.updates.notify_waiters();
-        Ok(summary)
+        Ok(plan.summary.clone())
     }
 
     pub async fn ensure_clearable_session_digest(
@@ -1850,19 +1924,41 @@ fn family_can_be_freed_by_user_cleanup(family: &WorkerFamily) -> bool {
     family_is_safe_for_explicit_host_cleanup(family)
 }
 
-fn inactive_cleanup_summary(
-    data: &WorkerStoreData,
-    workspace_id: &WorkspaceId,
+fn cleanup_summary_for_families<'a>(
+    families: impl IntoIterator<Item = &'a WorkerFamily>,
 ) -> InactiveWorkerCleanupSummary {
     let mut summary = InactiveWorkerCleanupSummary::default();
-    for family in data.families.values().filter(|family| {
-        &family.workspace_id == workspace_id && family_is_safe_for_explicit_host_cleanup(family)
-    }) {
+    for family in families {
         summary.family_count += 1;
         summary.worker_count += family.workers.len();
         summary.replay_receipt_count += family.collect_requests.len();
     }
     summary
+}
+
+fn ensure_cleanup_plan_matches(
+    data: &WorkerStoreData,
+    plan: &InactiveWorkerCleanupPlan,
+) -> Result<(), WorkerBrokerError> {
+    for entry in &plan.families {
+        let Some(current) = data.families.get(&entry.family_id) else {
+            return Err(WorkerBrokerError::Conflict(
+                "inactive Worker cleanup preview changed; review and confirm the cleanup again"
+                    .into(),
+            ));
+        };
+        if current != &entry.expected_family
+            || current.workspace_id != plan.workspace_id
+            || current.anchor_identity.session_digest != entry.session_digest
+            || !family_is_safe_for_explicit_host_cleanup(current)
+        {
+            return Err(WorkerBrokerError::Conflict(
+                "inactive Worker cleanup preview changed; review and confirm the cleanup again"
+                    .into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn compact_inactive_families(data: &mut WorkerStoreData) {
@@ -4078,6 +4174,7 @@ mod tests {
                     task_id: TaskId::new(),
                     display_id: "worker-history".into(),
                     execution_profile: profile(),
+                    conversation_url: format!("https://chatgpt.com/c/{}", Uuid::new_v4()),
                 },
             );
         }
@@ -4352,14 +4449,14 @@ mod tests {
             .inactive_cleanup_preview_for_workspace(&workspace)
             .await
             .expect("preview host cleanup");
-        assert_eq!(preview.family_count, MAX_WORKER_FAMILIES - 2);
-        assert_eq!(preview.replay_receipt_count, 1);
+        assert_eq!(preview.summary.family_count, MAX_WORKER_FAMILIES - 2);
+        assert_eq!(preview.summary.replay_receipt_count, 1);
 
         let removed = broker
-            .cleanup_inactive_families_for_workspace(&workspace)
+            .cleanup_inactive_families_for_plan(&preview)
             .await
             .expect("explicit host cleanup");
-        assert_eq!(removed, preview);
+        assert_eq!(removed, preview.summary);
         let snapshot = broker.snapshot().await;
         assert!(snapshot.families.contains_key(&protected_id));
         assert!(snapshot.families.contains_key(&other_id));
@@ -4420,10 +4517,10 @@ mod tests {
             .inactive_cleanup_preview_for_workspace(&workspace)
             .await
             .expect("preview all unreachable idle Cores");
-        assert_eq!(preview.family_count, MAX_WORKER_FAMILIES);
+        assert_eq!(preview.summary.family_count, MAX_WORKER_FAMILIES);
 
         let removed = broker
-            .cleanup_inactive_families_for_workspace(&workspace)
+            .cleanup_inactive_families_for_plan(&preview)
             .await
             .expect("host cleanup does not require any old Core conversation");
         assert_eq!(removed.family_count, MAX_WORKER_FAMILIES);
@@ -4482,13 +4579,292 @@ mod tests {
             .inactive_cleanup_preview_for_workspace(&workspace)
             .await
             .expect("preview active family cleanup");
-        assert_eq!(preview.family_count, 0);
+        assert_eq!(preview.summary.family_count, 0);
         let removed = broker
-            .cleanup_inactive_families_for_workspace(&workspace)
+            .cleanup_inactive_families_for_plan(&preview)
             .await
             .expect("active cleanup attempt is safely a no-op");
         assert_eq!(removed.family_count, 0);
         assert_eq!(broker.snapshot().await.families.len(), 1);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn existing_thread_binding_rejects_other_worker_workspace_or_core_url() {
+        let root = temp_root("moondesk-worker-existing-thread-binding");
+        let path = root.join("worker-state-v1.json");
+        let workspace = WorkspaceId::new();
+        let core = anchor("binding-core");
+        let family = inactive_family(workspace.clone(), core.clone(), WorkerState::Idle, true);
+        let worker = family.workers.values().next().expect("worker").clone();
+        let durable_url = worker.conversation_url.clone().expect("durable URL");
+        let mut data = WorkerStoreData::default();
+        data.families.insert(family.id.clone(), family);
+        store::save(&path, &data).expect("seed binding family");
+        let broker = WorkerBroker::open(&path).expect("open worker broker");
+
+        broker
+            .ensure_existing_thread_binding(&workspace, &core, &worker.id, &durable_url)
+            .await
+            .expect("exact workspace/Core/worker binding");
+        let wrong_url = format!("https://chatgpt.com/c/{}", WorkerId::new());
+        assert!(
+            broker
+                .ensure_existing_thread_binding(&workspace, &core, &worker.id, &wrong_url)
+                .await
+                .is_err(),
+            "another worker conversation URL must be rejected"
+        );
+        assert!(
+            broker
+                .ensure_existing_thread_binding(
+                    &WorkspaceId::new(),
+                    &core,
+                    &worker.id,
+                    &durable_url,
+                )
+                .await
+                .is_err(),
+            "another workspace must be rejected"
+        );
+        assert!(
+            broker
+                .ensure_existing_thread_binding(
+                    &workspace,
+                    &anchor("binding-other-core"),
+                    &worker.id,
+                    &durable_url,
+                )
+                .await
+                .is_err(),
+            "another Core must be rejected"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn confirmed_cleanup_plan_does_not_sweep_newly_eligible_family() {
+        let root = temp_root("moondesk-worker-cleanup-exact-plan");
+        let path = root.join("worker-state-v1.json");
+        let workspace = WorkspaceId::new();
+        let first = inactive_family(
+            workspace.clone(),
+            anchor("cleanup-preview-first"),
+            WorkerState::Idle,
+            true,
+        );
+        let first_id = first.id.clone();
+        let mut data = WorkerStoreData::default();
+        data.families.insert(first.id.clone(), first);
+        store::save(&path, &data).expect("seed first cleanup family");
+        let broker = WorkerBroker::open(&path).expect("open worker broker");
+        let plan = broker
+            .inactive_cleanup_preview_for_workspace(&workspace)
+            .await
+            .expect("preview exact cleanup plan");
+        assert_eq!(plan.summary.family_count, 1);
+
+        let second = inactive_family(
+            workspace.clone(),
+            anchor("cleanup-preview-second"),
+            WorkerState::Idle,
+            true,
+        );
+        let second_id = second.id.clone();
+        {
+            let mut guard = broker.data.lock().await;
+            let mut candidate = guard.clone();
+            candidate.families.insert(second.id.clone(), second);
+            broker
+                .commit_candidate(&mut guard, candidate)
+                .await
+                .expect("make second family eligible after preview");
+        }
+
+        let removed = broker
+            .cleanup_inactive_families_for_plan(&plan)
+            .await
+            .expect("commit exact previewed cleanup plan");
+        assert_eq!(removed.family_count, 1);
+        let snapshot = broker.snapshot().await;
+        assert!(!snapshot.families.contains_key(&first_id));
+        assert!(
+            snapshot.families.contains_key(&second_id),
+            "family that became eligible after confirmation preview must survive"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn family_finished_and_collected_after_preview_is_not_swept() {
+        let root = temp_root("moondesk-worker-cleanup-finish-collect-newly-eligible");
+        let path = root.join("worker-state-v1.json");
+        let workspace = WorkspaceId::new();
+        let first = inactive_family(
+            workspace.clone(),
+            anchor("cleanup-confirmed-first"),
+            WorkerState::Idle,
+            true,
+        );
+        let first_id = first.id.clone();
+        let mut data = WorkerStoreData::default();
+        data.families.insert(first.id.clone(), first);
+        store::save(&path, &data).expect("seed confirmed family");
+        let broker = WorkerBroker::open(&path).expect("open worker broker");
+
+        let second_core = anchor("cleanup-later-finished-core");
+        let spawned = broker
+            .spawn_worker(spawn_request(
+                OperationId::new(),
+                workspace.clone(),
+                second_core.clone(),
+                "become eligible after confirmation",
+            ))
+            .await
+            .expect("spawn second family");
+        make_claimable(&broker, &workspace, &second_core, &spawned).await;
+        let second_identity = anchor("cleanup-later-finished-worker");
+        broker
+            .claim_worker(
+                &workspace,
+                &spawned.worker_id,
+                &spawned.task_id,
+                &spawned.claim_token,
+                second_identity.clone(),
+            )
+            .await
+            .expect("claim second worker");
+
+        let plan = broker
+            .inactive_cleanup_preview_for_workspace(&workspace)
+            .await
+            .expect("preview before second family is eligible");
+        assert_eq!(plan.summary.family_count, 1);
+        assert_eq!(plan.families[0].family_id, first_id);
+
+        broker
+            .finish_task(FinishTaskRequest {
+                workspace_id: workspace.clone(),
+                worker_identity: second_identity,
+                worker_id: spawned.worker_id.clone(),
+                task_id: spawned.task_id.clone(),
+                result: finished_result(),
+            })
+            .await
+            .expect("finish second family after preview");
+        let updates = broker
+            .collect_updates(&workspace, &second_core)
+            .await
+            .expect("collect second family after preview");
+        assert_eq!(updates.completed.len(), 1);
+
+        broker
+            .cleanup_inactive_families_for_plan(&plan)
+            .await
+            .expect("delete only confirmed first family");
+        let snapshot = broker.snapshot().await;
+        assert!(!snapshot.families.contains_key(&first_id));
+        assert!(
+            snapshot
+                .families
+                .values()
+                .any(|family| family.anchor_identity == second_core),
+            "family made eligible by finish+collect after preview must survive"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn confirmed_cleanup_plan_aborts_after_report_and_collect_transition() {
+        let root = temp_root("moondesk-worker-cleanup-report-collect-race");
+        let path = root.join("worker-state-v1.json");
+        let workspace = WorkspaceId::new();
+        let core = anchor("cleanup-report-core");
+        let family = inactive_family(workspace.clone(), core.clone(), WorkerState::Idle, true);
+        let family_id = family.id.clone();
+        let worker = family.workers.values().next().expect("worker").clone();
+        let worker_identity = worker.chat_identity.clone().expect("worker identity");
+        let task_id = worker.tasks.keys().next().expect("task").clone();
+        let mut data = WorkerStoreData::default();
+        data.families.insert(family.id.clone(), family);
+        store::save(&path, &data).expect("seed cleanup family");
+        let broker = WorkerBroker::open(&path).expect("open worker broker");
+        let plan = broker
+            .inactive_cleanup_preview_for_workspace(&workspace)
+            .await
+            .expect("preview cleanup plan");
+        broker
+            .ensure_inactive_cleanup_plan_unchanged(&plan)
+            .await
+            .expect("precheck selected cleanup family");
+
+        broker
+            .report_worker(ReportWorkerRequest {
+                operation_id: OperationId::new(),
+                workspace_id: workspace.clone(),
+                worker_identity,
+                worker_id: worker.id.clone(),
+                task_id,
+                body: "late report between cleanup precheck and commit".into(),
+            })
+            .await
+            .expect("append late report");
+        let collected = broker
+            .collect_updates(&workspace, &core)
+            .await
+            .expect("collect late report");
+        assert_eq!(collected.reports.len(), 1);
+
+        let error = broker
+            .cleanup_inactive_families_for_plan(&plan)
+            .await
+            .expect_err("report/collect transition must invalidate confirmed snapshot");
+        assert!(error.to_string().contains("preview changed"));
+        assert!(broker.snapshot().await.families.contains_key(&family_id));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn confirmed_cleanup_plan_aborts_when_selected_family_changes() {
+        let root = temp_root("moondesk-worker-cleanup-plan-change");
+        let path = root.join("worker-state-v1.json");
+        let workspace = WorkspaceId::new();
+        let family = inactive_family(
+            workspace.clone(),
+            anchor("cleanup-plan-change"),
+            WorkerState::Idle,
+            true,
+        );
+        let family_id = family.id.clone();
+        let mut data = WorkerStoreData::default();
+        data.families.insert(family.id.clone(), family);
+        store::save(&path, &data).expect("seed cleanup family");
+        let broker = WorkerBroker::open(&path).expect("open worker broker");
+        let plan = broker
+            .inactive_cleanup_preview_for_workspace(&workspace)
+            .await
+            .expect("preview cleanup plan");
+
+        {
+            let mut guard = broker.data.lock().await;
+            let mut candidate = guard.clone();
+            candidate
+                .families
+                .get_mut(&family_id)
+                .expect("selected family")
+                .next_receipt_sequence += 1;
+            broker
+                .commit_candidate(&mut guard, candidate)
+                .await
+                .expect("mutate selected family after preview");
+        }
+
+        let error = broker
+            .cleanup_inactive_families_for_plan(&plan)
+            .await
+            .expect_err("changed selected family must require reconfirmation");
+        assert!(error.to_string().contains("preview changed"));
+        assert!(broker.snapshot().await.families.contains_key(&family_id));
         let _ = std::fs::remove_dir_all(root);
     }
 

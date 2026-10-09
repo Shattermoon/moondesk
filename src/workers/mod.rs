@@ -4,6 +4,7 @@ pub(crate) mod protocol;
 mod store;
 pub(crate) mod types;
 
+use crate::workspaces::WorkspaceId;
 use std::path::{Path, PathBuf};
 
 pub const WORKER_STORE_SCHEMA_VERSION: u32 = 1;
@@ -35,4 +36,25 @@ pub(crate) fn store_path_for_config(config_path: &Path) -> std::io::Result<PathB
         std::io::Error::other("failed to resolve MoonDesk data directory for worker state")
     })?;
     Ok(parent.join(WORKER_STORE_FILE_NAME))
+}
+
+pub(crate) fn durable_conversation_url_for_legacy_thread(
+    worker_store_path: &Path,
+    workspace_id: &WorkspaceId,
+    thread_key: &str,
+) -> std::io::Result<Option<String>> {
+    let Some(worker_id) = thread_key.strip_prefix("worker:") else {
+        return Ok(None);
+    };
+    if worker_id.is_empty() {
+        return Ok(None);
+    }
+    let data = store::load(worker_store_path)?;
+    Ok(data
+        .families
+        .values()
+        .filter(|family| &family.workspace_id == workspace_id)
+        .flat_map(|family| family.workers.values())
+        .find(|worker| worker.id.to_string() == worker_id)
+        .and_then(|worker| worker.conversation_url.clone()))
 }

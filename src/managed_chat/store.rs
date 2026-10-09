@@ -1,6 +1,13 @@
 use super::{
-    MANAGED_CHAT_STORE_FILE_NAME, MAX_MANAGED_CHAT_STORE_BYTES, types::ManagedChatStoreData,
+    MANAGED_CHAT_STORE_FILE_NAME, MAX_MANAGED_CHAT_STORE_BYTES,
+    types::{
+        ManagedChatCommand, ManagedChatCommandState, ManagedChatLaunch, ManagedChatOpenMode,
+        ManagedChatPurpose, ManagedChatStoreData, ManagedChatTerminalResult,
+        canonical_chatgpt_conversation_id,
+    },
 };
+use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -16,6 +23,123 @@ const WINDOWS_STORE_RETRY_DELAYS: [Duration; 5] = [
     Duration::from_millis(200),
     Duration::from_millis(400),
 ];
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct EnqueueFingerprint<'a> {
+    dedupe_key: &'a str,
+    launch: &'a ManagedChatLaunch,
+}
+
+fn fingerprint_after_launch_migration(command: &ManagedChatCommand) -> std::io::Result<String> {
+    let bytes = serde_json::to_vec(&EnqueueFingerprint {
+        dedupe_key: &command.dedupe_key,
+        launch: &command.launch,
+    })
+    .map_err(|error| {
+        std::io::Error::other(format!(
+            "failed to fingerprint migrated managed chat command: {error}"
+        ))
+    })?;
+    let digest = Sha256::digest(bytes);
+    let mut output = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(&mut output, "{byte:02x}");
+    }
+    Ok(output)
+}
+
+fn legacy_binding_from_history(
+    commands: &[ManagedChatCommand],
+    command: &ManagedChatCommand,
+    worker_store_path: Option<&Path>,
+) -> Option<String> {
+    if let Some(url) = command
+        .terminal
+        .as_ref()
+        .filter(|terminal| terminal.succeeded)
+        .and_then(|terminal| terminal.conversation_url.as_ref())
+        .filter(|url| canonical_chatgpt_conversation_id(url).is_some())
+    {
+        return Some(url.clone());
+    }
+    let thread_key = command.launch.thread_key.as_deref()?;
+    let history_url = commands
+        .iter()
+        .filter(|candidate| {
+            candidate.sequence < command.sequence
+                && candidate.launch.workspace_id == command.launch.workspace_id
+                && candidate.launch.thread_key.as_deref() == Some(thread_key)
+                && candidate.state == ManagedChatCommandState::Succeeded
+        })
+        .filter_map(|candidate| {
+            candidate
+                .terminal
+                .as_ref()
+                .filter(|terminal| terminal.succeeded)
+                .and_then(|terminal| terminal.conversation_url.as_ref())
+                .filter(|url| canonical_chatgpt_conversation_id(url).is_some())
+                .map(|url| (candidate.sequence, url.clone()))
+        })
+        .max_by_key(|(sequence, _)| *sequence)
+        .map(|(_, url)| url);
+    if history_url.is_some() {
+        return history_url;
+    }
+    let worker_store_path = worker_store_path?;
+    crate::workers::durable_conversation_url_for_legacy_thread(
+        worker_store_path,
+        &command.launch.workspace_id,
+        thread_key,
+    )
+    .ok()
+    .flatten()
+    .filter(|url| canonical_chatgpt_conversation_id(url).is_some())
+}
+
+fn migrate_legacy_existing_thread_commands(
+    data: &mut ManagedChatStoreData,
+    worker_store_path: Option<&Path>,
+) -> std::io::Result<bool> {
+    let snapshot = data.commands.values().cloned().collect::<Vec<_>>();
+    let mut changed = false;
+    for command in data.commands.values_mut() {
+        if command.launch.purpose != ManagedChatPurpose::Worker
+            || command.launch.open_mode != ManagedChatOpenMode::ExistingThread
+            || command.launch.existing_conversation_url.is_some()
+        {
+            continue;
+        }
+        if let Some(url) = legacy_binding_from_history(&snapshot, command, worker_store_path) {
+            command.launch.existing_conversation_url = Some(url);
+            command.request_fingerprint = fingerprint_after_launch_migration(command)?;
+            changed = true;
+            continue;
+        }
+        if !matches!(
+            command.state,
+            ManagedChatCommandState::Paused
+                | ManagedChatCommandState::Succeeded
+                | ManagedChatCommandState::Failed
+        ) {
+            command.state = ManagedChatCommandState::Paused;
+            command.dispatch_ready = true;
+            command.reconcile_history = true;
+            command.lease = None;
+            command.terminal = Some(ManagedChatTerminalResult {
+                succeeded: false,
+                details: Some(
+                    "Legacy ExistingThread command has no durable canonical conversation URL; retry reuse from Core after MoonDesk starts"
+                        .into(),
+                ),
+                conversation_url: None,
+            });
+            changed = true;
+        }
+    }
+    Ok(changed)
+}
 
 pub(crate) fn load(path: &Path) -> std::io::Result<ManagedChatStoreData> {
     let metadata = match fs::metadata(path) {
@@ -49,9 +173,13 @@ pub(crate) fn load(path: &Path) -> std::io::Result<ManagedChatStoreData> {
         )));
     }
 
-    let data = serde_json::from_slice::<ManagedChatStoreData>(&bytes).map_err(|error| {
+    let mut data = serde_json::from_slice::<ManagedChatStoreData>(&bytes).map_err(|error| {
         std::io::Error::other(format!("failed to parse managed chat state: {error}"))
     })?;
+    let worker_store_path = path
+        .parent()
+        .map(|parent| parent.join(crate::workers::WORKER_STORE_FILE_NAME));
+    migrate_legacy_existing_thread_commands(&mut data, worker_store_path.as_deref())?;
     data.validate().map_err(std::io::Error::other)?;
     Ok(data)
 }
@@ -192,9 +320,36 @@ fn replace_store_file(temp_path: &Path, target_path: &Path) -> std::io::Result<(
 mod tests {
     use super::*;
     use crate::managed_chat::MANAGED_CHAT_STORE_SCHEMA_VERSION;
+    use crate::managed_chat::types::{
+        ChatExecutionProfile, ManagedChatCommand, ManagedChatCommandId, ManagedChatCommandState,
+        ManagedChatLaunch, ManagedChatLease, ManagedChatLeaseId, ManagedChatOpenMode,
+        ManagedChatPurpose, ManagedChatTerminalResult,
+    };
+    use crate::workers::broker::{SpawnWorkerRequest, WorkerBroker};
+    use crate::workers::types::{ChatIdentity, OperationId, WorkerLaunchState};
+    use crate::workspaces::WorkspaceId;
 
     fn temp_root(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("{name}-{}", Uuid::new_v4()))
+    }
+
+    fn legacy_launch(
+        workspace_id: WorkspaceId,
+        marker: &str,
+        open_mode: ManagedChatOpenMode,
+        thread_key: &str,
+    ) -> ManagedChatLaunch {
+        ManagedChatLaunch {
+            workspace_id,
+            purpose: ManagedChatPurpose::Worker,
+            execution_profile: ChatExecutionProfile::default(),
+            opening_message: format!("legacy worker launch {marker}"),
+            task_marker: marker.into(),
+            thread_key: Some(thread_key.into()),
+            open_mode,
+            existing_conversation_url: None,
+            anchor_session_digest: None,
+        }
     }
 
     #[test]
@@ -215,6 +370,255 @@ mod tests {
             .expect("write unsupported store");
         let error = load(&path).expect_err("unsupported schema must fail closed");
         assert!(error.to_string().contains("managed chat store schema"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn load_migrates_legacy_existing_thread_binding_from_prior_success() {
+        let root = temp_root("moondesk-managed-chat-store-legacy-binding");
+        fs::create_dir_all(&root).expect("create legacy migration root");
+        let path = root.join(MANAGED_CHAT_STORE_FILE_NAME);
+        let workspace = WorkspaceId::new();
+        let thread_key = format!("worker:{}", Uuid::new_v4());
+        let project = "g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-moondesk";
+        let conversation = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+        let conversation_url = format!("https://chatgpt.com/g/{project}/c/{conversation}");
+        let first_id = ManagedChatCommandId::new();
+        let reuse_id = ManagedChatCommandId::new();
+
+        let first = ManagedChatCommand {
+            id: first_id.clone(),
+            sequence: 0,
+            dedupe_key: "legacy-first".into(),
+            request_fingerprint: "a".repeat(64),
+            launch: legacy_launch(
+                workspace.clone(),
+                "legacy-first",
+                ManagedChatOpenMode::NewThread,
+                &thread_key,
+            ),
+            state: ManagedChatCommandState::Succeeded,
+            dispatch_ready: true,
+            reconcile_history: true,
+            lease: None,
+            terminal: Some(ManagedChatTerminalResult {
+                succeeded: true,
+                details: Some("sent".into()),
+                conversation_url: Some(conversation_url.clone()),
+            }),
+            target_client_id: Some("legacy-browser".into()),
+            target_client_pinned_by_request: true,
+            anchor_context: None,
+        };
+        let reuse = ManagedChatCommand {
+            id: reuse_id.clone(),
+            sequence: 1,
+            dedupe_key: "legacy-reuse".into(),
+            request_fingerprint: "b".repeat(64),
+            launch: legacy_launch(
+                workspace,
+                "legacy-reuse",
+                ManagedChatOpenMode::ExistingThread,
+                &thread_key,
+            ),
+            state: ManagedChatCommandState::Queued,
+            dispatch_ready: true,
+            reconcile_history: false,
+            lease: None,
+            terminal: None,
+            target_client_id: Some("legacy-browser".into()),
+            target_client_pinned_by_request: true,
+            anchor_context: None,
+        };
+        let mut data = ManagedChatStoreData {
+            next_sequence: 2,
+            ..Default::default()
+        };
+        data.dedupe
+            .insert(first.dedupe_key.clone(), first_id.clone());
+        data.dedupe
+            .insert(reuse.dedupe_key.clone(), reuse_id.clone());
+        data.commands.insert(first_id, first);
+        data.commands.insert(reuse_id.clone(), reuse);
+        let fixture_bytes =
+            serde_json::to_vec_pretty(&data).expect("serialize prior-version fixture");
+        fs::write(&path, &fixture_bytes).expect("write prior-version fixture");
+
+        let loaded = load(&path).expect("legacy ExistingThread store must migrate on open");
+        let migrated = loaded
+            .commands
+            .get(&reuse_id)
+            .expect("migrated reuse command");
+        assert_eq!(
+            migrated.launch.existing_conversation_url.as_deref(),
+            Some(conversation_url.as_str())
+        );
+        assert_eq!(migrated.state, ManagedChatCommandState::Queued);
+        assert_ne!(migrated.request_fingerprint, "b".repeat(64));
+        assert_eq!(
+            fs::read(&path).expect("read prior-version bytes after migration"),
+            fixture_bytes,
+            "load-time migration must not mutate shared durable state before host ownership"
+        );
+        let reopened = load(&path).expect("migrated state must remain loadable on a later startup");
+        assert_eq!(reopened, loaded);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn load_migrates_legacy_existing_thread_from_durable_worker_binding() {
+        let root = temp_root("moondesk-managed-chat-store-legacy-worker-binding");
+        fs::create_dir_all(&root).expect("create legacy worker migration root");
+        let managed_path = root.join(MANAGED_CHAT_STORE_FILE_NAME);
+        let worker_path = root.join(crate::workers::WORKER_STORE_FILE_NAME);
+        let workspace = WorkspaceId::new();
+        let anchor = ChatIdentity::from_openai_meta(Some("legacy-subject"), "legacy-core");
+        let worker = WorkerBroker::open(&worker_path).expect("open worker broker");
+        let receipt = worker
+            .spawn_worker(SpawnWorkerRequest {
+                operation_id: OperationId::new(),
+                workspace_id: workspace.clone(),
+                anchor_identity: anchor.clone(),
+                label: "legacy worker binding".into(),
+                assignment: "preserve durable project conversation".into(),
+                execution_profile: ChatExecutionProfile::default(),
+            })
+            .await
+            .expect("spawn durable worker");
+        let launch_command_id = Uuid::new_v4().to_string();
+        worker
+            .link_launch_command(
+                &workspace,
+                &anchor,
+                &receipt.worker_id,
+                &receipt.task_id,
+                &launch_command_id,
+            )
+            .await
+            .expect("link launch command");
+        let project = "g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-moondesk";
+        let conversation = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+        let conversation_url = format!("https://chatgpt.com/g/{project}/c/{conversation}");
+        worker
+            .update_launch_by_command(
+                &launch_command_id,
+                WorkerLaunchState::WaitingClaim,
+                None,
+                Some(conversation_url.clone()),
+            )
+            .await
+            .expect("persist durable project conversation");
+        drop(worker);
+
+        let command_id = ManagedChatCommandId::new();
+        let command = ManagedChatCommand {
+            id: command_id.clone(),
+            sequence: 0,
+            dedupe_key: format!("worker:{}:task:legacy-reuse", receipt.worker_id),
+            request_fingerprint: "d".repeat(64),
+            launch: legacy_launch(
+                workspace,
+                "legacy-reuse-from-worker-store",
+                ManagedChatOpenMode::ExistingThread,
+                &format!("worker:{}", receipt.worker_id),
+            ),
+            state: ManagedChatCommandState::Queued,
+            dispatch_ready: true,
+            reconcile_history: false,
+            lease: None,
+            terminal: None,
+            target_client_id: Some("legacy-browser".into()),
+            target_client_pinned_by_request: true,
+            anchor_context: None,
+        };
+        let mut data = ManagedChatStoreData {
+            next_sequence: 1,
+            ..Default::default()
+        };
+        data.dedupe
+            .insert(command.dedupe_key.clone(), command_id.clone());
+        data.commands.insert(command_id.clone(), command);
+        fs::write(
+            &managed_path,
+            serde_json::to_vec_pretty(&data).expect("serialize worker-backed fixture"),
+        )
+        .expect("write worker-backed fixture");
+
+        let loaded = load(&managed_path).expect("legacy command must use durable worker binding");
+        let migrated = loaded
+            .commands
+            .get(&command_id)
+            .expect("worker-backed command retained");
+        assert_eq!(
+            migrated.launch.existing_conversation_url.as_deref(),
+            Some(conversation_url.as_str())
+        );
+        assert_eq!(migrated.state, ManagedChatCommandState::Queued);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn load_pauses_unresolvable_legacy_existing_thread_without_resending() {
+        let root = temp_root("moondesk-managed-chat-store-legacy-unresolved");
+        fs::create_dir_all(&root).expect("create unresolved migration root");
+        let path = root.join(MANAGED_CHAT_STORE_FILE_NAME);
+        let command_id = ManagedChatCommandId::new();
+        let lease_id = ManagedChatLeaseId::new();
+        let command = ManagedChatCommand {
+            id: command_id.clone(),
+            sequence: 0,
+            dedupe_key: "legacy-ambiguous-reuse".into(),
+            request_fingerprint: "c".repeat(64),
+            launch: legacy_launch(
+                WorkspaceId::new(),
+                "legacy-ambiguous-reuse",
+                ManagedChatOpenMode::ExistingThread,
+                &format!("worker:{}", Uuid::new_v4()),
+            ),
+            state: ManagedChatCommandState::SendStarted,
+            dispatch_ready: true,
+            reconcile_history: true,
+            lease: Some(ManagedChatLease {
+                lease_id,
+                client_id: "legacy-browser".into(),
+                expires_at_ms: 123,
+            }),
+            terminal: None,
+            target_client_id: Some("legacy-browser".into()),
+            target_client_pinned_by_request: true,
+            anchor_context: None,
+        };
+        let mut data = ManagedChatStoreData {
+            next_sequence: 1,
+            ..Default::default()
+        };
+        data.dedupe
+            .insert(command.dedupe_key.clone(), command_id.clone());
+        data.commands.insert(command_id.clone(), command);
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&data).expect("serialize ambiguous prior-version fixture"),
+        )
+        .expect("write ambiguous prior-version fixture");
+
+        let loaded = load(&path).expect("unresolvable legacy command must not brick startup");
+        let migrated = loaded
+            .commands
+            .get(&command_id)
+            .expect("paused legacy command retained");
+        assert_eq!(migrated.state, ManagedChatCommandState::Paused);
+        assert!(migrated.lease.is_none());
+        assert!(migrated.reconcile_history);
+        assert!(migrated.launch.existing_conversation_url.is_none());
+        assert!(
+            migrated
+                .terminal
+                .as_ref()
+                .and_then(|terminal| terminal.details.as_deref())
+                .is_some_and(|details| details.contains("retry reuse from Core"))
+        );
+        let reopened = load(&path).expect("paused legacy state must remain loadable");
+        assert_eq!(reopened, loaded);
         let _ = fs::remove_dir_all(root);
     }
 

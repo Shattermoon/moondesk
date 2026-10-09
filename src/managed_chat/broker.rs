@@ -2,7 +2,7 @@ use super::store;
 use super::types::{
     ManagedChatAnchorContext, ManagedChatCommand, ManagedChatCommandId, ManagedChatCommandState,
     ManagedChatLaunch, ManagedChatLease, ManagedChatLeaseId, ManagedChatStoreData,
-    ManagedChatTerminalResult,
+    ManagedChatTerminalResult, canonical_chatgpt_conversation_id,
 };
 use super::{
     DEFAULT_COMMAND_LEASE_MS, MAX_MANAGED_CHAT_COMMANDS, MAX_MANAGED_CHAT_DETAIL_BYTES,
@@ -982,47 +982,6 @@ fn compact_terminal_history(data: &mut ManagedChatStoreData) {
         .retain(|command_id, _| !remove.contains(command_id));
     data.dedupe
         .retain(|_, command_id| data.commands.contains_key(command_id));
-}
-
-fn canonical_chatgpt_conversation_id(value: &str) -> Option<String> {
-    let url = reqwest::Url::parse(value).ok()?;
-    if url.scheme() != "https"
-        || url.host_str() != Some("chatgpt.com")
-        || !url.username().is_empty()
-        || url.password().is_some()
-        || url.query().is_some()
-        || url.fragment().is_some()
-    {
-        return None;
-    }
-    let segments = url
-        .path_segments()?
-        .filter(|segment| !segment.is_empty())
-        .collect::<Vec<_>>();
-    let valid_project_segment = |segment: &str| {
-        segment
-            .get(..36)
-            .and_then(|prefix| prefix.strip_prefix("g-p-"))
-            .is_some_and(|suffix| {
-                suffix.len() == 32 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
-            })
-    };
-    let conversation_id = match segments.as_slice() {
-        ["c", conversation_id] => *conversation_id,
-        ["g", project, "c", conversation_id] if valid_project_segment(project) => *conversation_id,
-        ["g", project, "shared", "c", conversation_id] if valid_project_segment(project) => {
-            *conversation_id
-        }
-        _ => return None,
-    };
-    if !(16..=64).contains(&conversation_id.len())
-        || !conversation_id
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() || byte == b'-')
-    {
-        return None;
-    }
-    Some(conversation_id.to_ascii_lowercase())
 }
 
 fn terminal_matches(command: &ManagedChatCommand, outcome: &ManagedChatAckOutcome) -> bool {

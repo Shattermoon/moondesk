@@ -13,6 +13,7 @@ use super::{
     MAX_WORKER_FAMILIES, MAX_WORKER_MESSAGE_BYTES, MAX_WORKER_RECORDS_PER_FAMILY,
     MAX_WORKERS_PER_FAMILY,
 };
+use crate::managed_chat::types::canonical_chatgpt_conversation_id;
 use crate::workspaces::WorkspaceId;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -2114,44 +2115,7 @@ fn storage_error(error: std::io::Error) -> WorkerBrokerError {
 }
 
 fn canonical_conversation_id_from_url(value: &str) -> Option<String> {
-    let url = reqwest::Url::parse(value).ok()?;
-    if url.scheme() != "https"
-        || url.host_str() != Some("chatgpt.com")
-        || !url.username().is_empty()
-        || url.password().is_some()
-        || url.query().is_some()
-        || url.fragment().is_some()
-    {
-        return None;
-    }
-    let segments = url
-        .path_segments()?
-        .filter(|segment| !segment.is_empty())
-        .collect::<Vec<_>>();
-    let valid_project_segment = |segment: &str| {
-        segment
-            .get(..36)
-            .and_then(|prefix| prefix.strip_prefix("g-p-"))
-            .is_some_and(|suffix| {
-                suffix.len() == 32 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
-            })
-    };
-    let conversation_id = match segments.as_slice() {
-        ["c", conversation_id] => *conversation_id,
-        ["g", project, "c", conversation_id] if valid_project_segment(project) => *conversation_id,
-        ["g", project, "shared", "c", conversation_id] if valid_project_segment(project) => {
-            *conversation_id
-        }
-        _ => return None,
-    };
-    if !(16..=64).contains(&conversation_id.len())
-        || !conversation_id
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() || byte == b'-')
-    {
-        return None;
-    }
-    Some(conversation_id.to_ascii_lowercase())
+    canonical_chatgpt_conversation_id(value)
 }
 
 fn conversation_id_from_url(value: &str) -> Option<String> {

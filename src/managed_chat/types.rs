@@ -157,8 +157,52 @@ pub struct ManagedChatLaunch {
     pub anchor_session_digest: Option<String>,
 }
 
+pub(crate) fn canonical_chatgpt_conversation_id(value: &str) -> Option<String> {
+    let url = reqwest::Url::parse(value).ok()?;
+    if url.scheme() != "https"
+        || url.host_str() != Some("chatgpt.com")
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return None;
+    }
+    let segments = url
+        .path_segments()?
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    let valid_project_segment = |segment: &str| {
+        segment
+            .get(..36)
+            .and_then(|prefix| prefix.strip_prefix("g-p-"))
+            .is_some_and(|suffix| {
+                suffix.len() == 32 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+    };
+    let conversation_id = match segments.as_slice() {
+        ["c", conversation_id] => *conversation_id,
+        ["g", project, "c", conversation_id] if valid_project_segment(project) => *conversation_id,
+        ["g", project, "shared", "c", conversation_id] if valid_project_segment(project) => {
+            *conversation_id
+        }
+        _ => return None,
+    };
+    if !(16..=64).contains(&conversation_id.len())
+        || !conversation_id
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() || byte == b'-')
+    {
+        return None;
+    }
+    Some(conversation_id.to_ascii_lowercase())
+}
+
 impl ManagedChatLaunch {
-    pub(crate) fn validate(&self) -> Result<(), String> {
+    fn validate_with_legacy_terminal_binding(
+        &self,
+        allow_missing_existing_worker_url: bool,
+    ) -> Result<(), String> {
         self.execution_profile.validate()?;
         if self.opening_message.is_empty()
             || self.opening_message.len() > super::MAX_MANAGED_CHAT_OPENING_MESSAGE_BYTES
@@ -179,28 +223,20 @@ impl ManagedChatLaunch {
         if self.open_mode == ManagedChatOpenMode::ExistingThread && self.thread_key.is_none() {
             return Err("existing managed chat launch requires a thread key".into());
         }
-        if let Some(existing_conversation_url) = self.existing_conversation_url.as_deref() {
-            let url = reqwest::Url::parse(existing_conversation_url)
-                .map_err(|_| "existing managed chat conversation URL is invalid")?;
-            let mut segments = url
-                .path_segments()
-                .ok_or("existing managed chat conversation URL is invalid")?;
-            let canonical = url.scheme() == "https"
-                && url.host_str() == Some("chatgpt.com")
-                && segments.next() == Some("c")
-                && segments
-                    .next()
-                    .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok())
-                && segments.next().is_none()
-                && url.query().is_none()
-                && url.fragment().is_none();
-            if !canonical {
-                return Err("existing managed chat conversation URL must be a canonical https://chatgpt.com/c/<uuid> URL".into());
-            }
+        if self
+            .existing_conversation_url
+            .as_deref()
+            .is_some_and(|url| canonical_chatgpt_conversation_id(url).is_none())
+        {
+            return Err(
+                "existing managed chat conversation URL must be a canonical ChatGPT conversation URL"
+                    .into(),
+            );
         }
         if self.open_mode == ManagedChatOpenMode::ExistingThread
             && self.purpose == ManagedChatPurpose::Worker
             && self.existing_conversation_url.is_none()
+            && !allow_missing_existing_worker_url
         {
             return Err(
                 "existing Worker launch requires its durable canonical conversation URL".into(),
@@ -219,6 +255,19 @@ impl ManagedChatLaunch {
             return Err("managed chat Core session digest is invalid".into());
         }
         Ok(())
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        self.validate_with_legacy_terminal_binding(false)
+    }
+
+    fn validate_persisted(&self, state: ManagedChatCommandState) -> Result<(), String> {
+        self.validate_with_legacy_terminal_binding(matches!(
+            state,
+            ManagedChatCommandState::Paused
+                | ManagedChatCommandState::Succeeded
+                | ManagedChatCommandState::Failed
+        ))
     }
 }
 
@@ -371,7 +420,7 @@ impl ManagedChatStoreData {
             if command_id != &command.id {
                 return Err("managed chat command map key does not match command id".into());
             }
-            command.launch.validate()?;
+            command.launch.validate_persisted(command.state)?;
             if command.dedupe_key.trim().is_empty() || command.dedupe_key.len() > 256 {
                 return Err("managed chat dedupe key is invalid".into());
             }
@@ -486,7 +535,11 @@ impl ManagedChatStoreData {
 
 #[cfg(test)]
 mod tests {
-    use super::ReasoningEffort;
+    use super::{
+        ChatExecutionProfile, ManagedChatLaunch, ManagedChatOpenMode, ManagedChatPurpose,
+        ReasoningEffort,
+    };
+    use crate::workspaces::WorkspaceId;
 
     #[test]
     fn reasoning_effort_serde_keeps_legacy_and_current_provider_values_stable() {
@@ -510,5 +563,31 @@ mod tests {
             serde_json::to_string(&ReasoningEffort::Ultra).expect("ultra serialization"),
             "\"ultra\""
         );
+    }
+
+    #[test]
+    fn existing_worker_launch_accepts_direct_and_project_conversation_urls() {
+        let project = "g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-moondesk";
+        let conversation = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+        for url in [
+            format!("https://chatgpt.com/c/{conversation}"),
+            format!("https://chatgpt.com/g/{project}/c/{conversation}"),
+            format!("https://chatgpt.com/g/{project}/shared/c/{conversation}"),
+        ] {
+            let launch = ManagedChatLaunch {
+                workspace_id: WorkspaceId::new(),
+                purpose: ManagedChatPurpose::Worker,
+                execution_profile: ChatExecutionProfile::default(),
+                opening_message: "reuse worker".into(),
+                task_marker: "moondesk-worker-task:test".into(),
+                thread_key: Some("worker:test".into()),
+                open_mode: ManagedChatOpenMode::ExistingThread,
+                existing_conversation_url: Some(url),
+                anchor_session_digest: None,
+            };
+            launch
+                .validate()
+                .expect("canonical direct and Project worker URLs must share one policy");
+        }
     }
 }

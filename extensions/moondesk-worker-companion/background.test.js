@@ -23,7 +23,7 @@ const popupSource = fs.readFileSync(popupPath, 'utf8');
 const serverSource = fs.readFileSync(serverPath, 'utf8');
 const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
 
-function loadBackground({ existingTabs = {}, contentByTab = {}, sendMessageImpl = null, scriptingExecuteImpl = null, fetchImpl = async () => { throw new Error('network not used'); }, setTimeoutImpl = null, runtimeManifest = manifest, initialStored = {}, createdTabIdStart = 101 } = {}) {
+function loadBackground({ existingTabs = {}, contentByTab = {}, sendMessageImpl = null, scriptingExecuteImpl = null, fetchImpl = async () => { throw new Error('network not used'); }, setTimeoutImpl = null, runtimeManifest = manifest, initialStored = {}, createdTabIdStart = 101, bootstrapAvailable = true, bootstrapToken = 'b'.repeat(64) } = {}) {
   const createdTabs = [];
   const removedTabs = [];
   const runtimeReloads = [];
@@ -106,7 +106,15 @@ function loadBackground({ existingTabs = {}, contentByTab = {}, sendMessageImpl 
     navigator: { userAgent: 'Mozilla/5.0 Chrome/153.0.0.0 Safari/537.36' },
     fetch: async (url, options = {}) => {
       if (String(url) === 'chrome-extension://test/moondesk-bootstrap.json') {
-        const body = { pairingToken: 'b'.repeat(64) };
+        if (!bootstrapAvailable) {
+          return {
+            ok: false,
+            status: 404,
+            async json() { return null; },
+            async text() { return ''; }
+          };
+        }
+        const body = { pairingToken: bootstrapToken };
         return {
           ok: true,
           status: 200,
@@ -301,7 +309,7 @@ test('bridge discovery prefers an exact runtime match over another MoonDesk vers
 
   const { evaluate, runtimeReloads } = loadBackground({ fetchImpl });
   const hello = await evaluate('discoverBridge(freshState())');
-  assert.equal(hello.companionRuntimeRevision, 4);
+  assert.equal(hello.companionRuntimeRevision, 5);
   assert.equal(runtimeReloads.length, 0);
 });
 
@@ -317,7 +325,7 @@ test('bridge runtime revision mismatch reloads the unpacked companion once', asy
             app: 'moondesk-worker-companion',
             appVersion: '0.13.0',
             protocolVersion: 2,
-            companionRuntimeRevision: 5
+            companionRuntimeRevision: 6
           };
         }
       };
@@ -356,7 +364,7 @@ test('compatible bridge clears the one-shot runtime reload marker for a future m
             app: 'moondesk-worker-companion',
             appVersion: '0.12.0',
             protocolVersion: 2,
-            companionRuntimeRevision: 4
+            companionRuntimeRevision: 5
           };
         }
       };
@@ -369,7 +377,7 @@ test('compatible bridge clears the one-shot runtime reload marker for a future m
   });
 
   const hello = await evaluate('discoverBridge(freshState())');
-  assert.equal(hello.companionRuntimeRevision, 4);
+  assert.equal(hello.companionRuntimeRevision, 5);
   const stored = await evaluate(`chrome.storage.local.get('${reloadKey}')`);
   assert.equal(stored[reloadKey], undefined);
 });
@@ -387,7 +395,7 @@ test('automatic pairing proves the extension was loaded from the MoonDesk-prepar
             app: 'moondesk-worker-companion',
             appVersion: '0.12.0',
             protocolVersion: 2,
-            companionRuntimeRevision: 4
+            companionRuntimeRevision: 5
           };
         }
       };
@@ -420,6 +428,43 @@ test('automatic pairing proves the extension was loaded from the MoonDesk-prepar
   assert.equal(body.clientId, 'client-bootstrap');
   assert.match(body.credential, /^[0-9a-f]{64}$/);
   assert.equal(body.bootstrapToken, 'b'.repeat(64));
+});
+
+test('source and release-ZIP installs without a bootstrap capability expose Manual Repair', async () => {
+  const fetchImpl = async (url) => {
+    if (String(url).endsWith('/__moondesk/companion/v1/hello')) {
+      const body = {
+        app: 'moondesk-worker-companion',
+        appVersion: '0.12.0',
+        protocolVersion: 2,
+        companionRuntimeRevision: 5
+      };
+      return {
+        ok: true,
+        status: 200,
+        async json() { return body; },
+        async text() { return JSON.stringify(body); }
+      };
+    }
+    return { ok: false, status: 404, async json() { return {}; }, async text() { return '{}'; } };
+  };
+  const { evaluate } = loadBackground({ fetchImpl, bootstrapAvailable: false });
+  await evaluate(`writeState({
+    ...freshState(),
+    baseUrl: 'http://127.0.0.1:47651',
+    clientId: 'client-source',
+    credential: null
+  })`);
+  const result = await evaluate('status()');
+  assert.equal(result.connected, false);
+  assert.equal(result.repairRequired, true);
+  assert.equal(result.errorCode, 'companion_installation_capability_missing');
+  assert.match(result.error, /Manual Repair/);
+  assert.match(
+    popupSource,
+    /advancedSection'\)\.hidden = !\(connected \|\| status\.repairRequired\)/,
+    'Manual Repair controls must remain visible while automatic pairing is unavailable'
+  );
 });
 
 test('worker tab recovery accepts Chromium tab id zero', async () => {
@@ -461,7 +506,7 @@ test('release version mismatch reloads the unpacked companion even when protocol
             app: 'moondesk-worker-companion',
             appVersion: '0.13.0',
             protocolVersion: 2,
-            companionRuntimeRevision: 4
+            companionRuntimeRevision: 5
           };
         }
       };

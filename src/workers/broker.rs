@@ -10,7 +10,8 @@ use super::{
     MAX_COLLECT_RECEIPTS_PER_FAMILY, MAX_COLLECTED_TASK_HISTORY_PER_WORKER,
     MAX_IDEMPOTENCY_RECEIPTS_PER_FAMILY, MAX_PENDING_MESSAGES_PER_WORKER, MAX_REPORTS_PER_FAMILY,
     MAX_TASK_RECORDS_PER_WORKER, MAX_UPDATES_PER_COLLECT, MAX_WORKER_ASSIGNMENT_BYTES,
-    MAX_WORKER_MESSAGE_BYTES, MAX_WORKER_RECORDS_PER_FAMILY, MAX_WORKERS_PER_FAMILY,
+    MAX_WORKER_FAMILIES, MAX_WORKER_MESSAGE_BYTES, MAX_WORKER_RECORDS_PER_FAMILY,
+    MAX_WORKERS_PER_FAMILY,
 };
 use crate::workspaces::WorkspaceId;
 use serde::Serialize;
@@ -114,6 +115,8 @@ pub struct WorkerBroker {
     path: PathBuf,
     data: Mutex<WorkerStoreData>,
     updates: Notify,
+    #[cfg(test)]
+    fail_next_commit: std::sync::atomic::AtomicBool,
 }
 
 impl WorkerBroker {
@@ -124,11 +127,19 @@ impl WorkerBroker {
             path,
             data: Mutex::new(data),
             updates: Notify::new(),
+            #[cfg(test)]
+            fail_next_commit: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
     pub(crate) async fn snapshot(&self) -> WorkerStoreData {
         self.data.lock().await.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_commit_for_test(&self) {
+        self.fail_next_commit
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     pub async fn spawn_worker(
@@ -153,7 +164,7 @@ impl WorkerBroker {
         }
 
         let mut candidate = guard.clone();
-        let family_id = candidate
+        let family_id = if let Some(existing) = candidate
             .families
             .values()
             .find(|family| {
@@ -161,26 +172,34 @@ impl WorkerBroker {
                     && family.anchor_identity == request.anchor_identity
             })
             .map(|family| family.id.clone())
-            .unwrap_or_else(|| {
-                let id = WorkerFamilyId::new();
-                candidate.families.insert(
-                    id.clone(),
-                    WorkerFamily {
-                        id: id.clone(),
-                        workspace_id: request.workspace_id.clone(),
-                        anchor_identity: request.anchor_identity.clone(),
-                        next_receipt_sequence: 0,
-                        workers: Default::default(),
-                        reports: Vec::new(),
-                        spawn_requests: Default::default(),
-                        reuse_requests: Default::default(),
-                        message_requests: Default::default(),
-                        report_requests: Default::default(),
-                        collect_requests: Default::default(),
-                    },
-                );
-                id
-            });
+        {
+            existing
+        } else {
+            compact_inactive_families(&mut candidate);
+            if candidate.families.len() >= MAX_WORKER_FAMILIES {
+                return Err(WorkerBrokerError::Limit(format!(
+                    "worker store is limited to {MAX_WORKER_FAMILIES} Core families with retained live/history state"
+                )));
+            }
+            let id = WorkerFamilyId::new();
+            candidate.families.insert(
+                id.clone(),
+                WorkerFamily {
+                    id: id.clone(),
+                    workspace_id: request.workspace_id.clone(),
+                    anchor_identity: request.anchor_identity.clone(),
+                    next_receipt_sequence: 0,
+                    workers: Default::default(),
+                    reports: Vec::new(),
+                    spawn_requests: Default::default(),
+                    reuse_requests: Default::default(),
+                    message_requests: Default::default(),
+                    report_requests: Default::default(),
+                    collect_requests: Default::default(),
+                },
+            );
+            id
+        };
         let family = candidate.families.get_mut(&family_id).ok_or_else(|| {
             WorkerBrokerError::Storage("worker family disappeared during mutation".into())
         })?;
@@ -576,6 +595,12 @@ impl WorkerBroker {
             || worker.current_task_id.as_ref() != Some(task_id)
             || worker.chat_identity.is_some()
             || worker.launch_command_id.as_deref() != Some(command_id)
+            || !matches!(
+                worker.launch_state,
+                WorkerLaunchState::Unknown
+                    | WorkerLaunchState::Queued
+                    | WorkerLaunchState::Preparing
+            )
             || worker
                 .tasks
                 .get(task_id)
@@ -629,6 +654,12 @@ impl WorkerBroker {
             || worker.current_task_id.as_ref() != Some(task_id)
             || worker.chat_identity.is_none()
             || worker.launch_command_id.as_deref() != Some(command_id)
+            || !matches!(
+                worker.launch_state,
+                WorkerLaunchState::Unknown
+                    | WorkerLaunchState::Queued
+                    | WorkerLaunchState::Preparing
+            )
             || worker
                 .tasks
                 .get(task_id)
@@ -1417,7 +1448,6 @@ impl WorkerBroker {
     }
 
     #[cfg(test)]
-    #[cfg(test)]
     async fn collect_updates(
         &self,
         workspace_id: &WorkspaceId,
@@ -1647,6 +1677,15 @@ impl WorkerBroker {
         guard: &mut tokio::sync::MutexGuard<'_, WorkerStoreData>,
         candidate: WorkerStoreData,
     ) -> Result<(), WorkerBrokerError> {
+        #[cfg(test)]
+        if self
+            .fail_next_commit
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(WorkerBrokerError::Storage(
+                "injected worker persistence failure".into(),
+            ));
+        }
         let path = self.path.clone();
         let persisted = candidate.clone();
         let prepared = tokio::task::spawn_blocking(move || store::prepare_save(&path, &persisted))
@@ -1677,6 +1716,27 @@ fn collected_updates_from_receipt(receipt: &CollectReceipt) -> CollectedUpdates 
                 result: update.result.clone(),
             })
             .collect(),
+    }
+}
+
+fn compact_inactive_families(data: &mut WorkerStoreData) {
+    while data.families.len() >= MAX_WORKER_FAMILIES {
+        let removable = data
+            .families
+            .iter()
+            .find(|(_, family)| {
+                family.reports.is_empty()
+                    && family.workers.values().all(|worker| {
+                        worker.state == WorkerState::Retired
+                            && worker.messages.is_empty()
+                            && worker.current_task_id.is_none()
+                    })
+            })
+            .map(|(family_id, _)| family_id.clone());
+        let Some(family_id) = removable else {
+            break;
+        };
+        data.families.remove(&family_id);
     }
 }
 
@@ -3007,11 +3067,7 @@ mod tests {
         let broker = WorkerBroker::open(state_parent.join("worker-state-v1.json"))
             .expect("open broker before first worker state file exists");
 
-        // Make only the mutation's durable write fail. This keeps the regression independent of
-        // platform-specific metadata errors for a path whose parent is already a regular file.
-        std::fs::remove_dir(&state_parent).expect("remove empty worker state parent");
-        std::fs::write(&state_parent, "not a directory").expect("block future worker persistence");
-
+        broker.fail_next_commit_for_test();
         let error = broker
             .spawn_worker(spawn_request(
                 OperationId::new(),
@@ -3480,6 +3536,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn collect_replay_window_is_bounded_and_old_receipts_eventually_evict() {
+        let root = temp_root("moondesk-worker-collect-replay-window");
+        let path = root.join("worker-state-v1.json");
+        let broker = WorkerBroker::open(&path).expect("open worker broker");
+        let workspace = WorkspaceId::new();
+        let anchor_identity = anchor("anchor-collect-window");
+        let worker_identity = anchor("worker-collect-window");
+        let spawned = broker
+            .spawn_worker(spawn_request(
+                OperationId::new(),
+                workspace.clone(),
+                anchor_identity.clone(),
+                "produce one dropped collection",
+            ))
+            .await
+            .expect("spawn worker");
+        make_claimable(&broker, &workspace, &anchor_identity, &spawned).await;
+        broker
+            .claim_worker(
+                &workspace,
+                &spawned.worker_id,
+                &spawned.task_id,
+                &spawned.claim_token,
+                worker_identity.clone(),
+            )
+            .await
+            .expect("claim worker");
+        broker
+            .report_worker(ReportWorkerRequest {
+                operation_id: OperationId::new(),
+                workspace_id: workspace.clone(),
+                worker_identity: worker_identity.clone(),
+                worker_id: spawned.worker_id.clone(),
+                task_id: spawned.task_id.clone(),
+                body: "delivery-window".into(),
+            })
+            .await
+            .expect("store report");
+
+        let dropped_operation = OperationId::new();
+        let delivered = broker
+            .collect_updates_for_operation(&workspace, &anchor_identity, &dropped_operation)
+            .await
+            .expect("persist collection whose transport response is dropped");
+        assert_eq!(delivered.reports.len(), 1);
+        let replay = broker
+            .collect_updates_for_operation(&workspace, &anchor_identity, &dropped_operation)
+            .await
+            .expect("prompt retry replays the durable batch");
+        assert_eq!(replay, delivered);
+
+        for index in 0..MAX_COLLECT_RECEIPTS_PER_FAMILY {
+            broker
+                .report_worker(ReportWorkerRequest {
+                    operation_id: OperationId::new(),
+                    workspace_id: workspace.clone(),
+                    worker_identity: worker_identity.clone(),
+                    worker_id: spawned.worker_id.clone(),
+                    task_id: spawned.task_id.clone(),
+                    body: format!("advance replay window {index}"),
+                })
+                .await
+                .expect("store report that advances replay history");
+            let updates = broker
+                .collect_updates_for_operation(&workspace, &anchor_identity, &OperationId::new())
+                .await
+                .expect("advance bounded collection replay history");
+            assert_eq!(updates.reports.len(), 1);
+        }
+        let snapshot = broker.snapshot().await;
+        let family = snapshot
+            .families
+            .values()
+            .find(|family| family.workspace_id == workspace)
+            .expect("worker family");
+        assert_eq!(
+            family.collect_requests.len(),
+            MAX_COLLECT_RECEIPTS_PER_FAMILY
+        );
+        assert!(
+            !family.collect_requests.contains_key(&dropped_operation),
+            "Workers V1 intentionally guarantees replay only inside the documented bounded window"
+        );
+        let expired_retry = broker
+            .collect_updates_for_operation(&workspace, &anchor_identity, &dropped_operation)
+            .await
+            .expect("expired operation becomes a new empty collection");
+        assert!(expired_retry.reports.is_empty());
+        assert!(expired_retry.completed.is_empty());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn claim_requires_confirmed_canonical_worker_conversation_and_rejects_core_identity() {
         let root = temp_root("moondesk-worker-claim-conversation");
         let path = root.join("worker-state-v1.json");
@@ -3915,6 +4064,47 @@ mod tests {
             .len();
         assert!(persisted_bytes < 4 * 1024 * 1024);
         assert!(persisted_bytes <= crate::workers::MAX_WORKER_STORE_BYTES);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn creating_a_new_core_family_compacts_inactive_family_history_at_global_limit() {
+        let root = temp_root("moondesk-worker-family-global-limit");
+        std::fs::create_dir_all(&root).expect("create worker family root");
+        let path = root.join("worker-state-v1.json");
+        let workspace = WorkspaceId::new();
+        let mut data = WorkerStoreData::default();
+        for index in 0..MAX_WORKER_FAMILIES {
+            let family_id = WorkerFamilyId::new();
+            data.families.insert(
+                family_id.clone(),
+                WorkerFamily {
+                    id: family_id,
+                    workspace_id: workspace.clone(),
+                    anchor_identity: anchor(&format!("retired-family-{index}")),
+                    next_receipt_sequence: 0,
+                    workers: Default::default(),
+                    reports: Vec::new(),
+                    spawn_requests: Default::default(),
+                    reuse_requests: Default::default(),
+                    message_requests: Default::default(),
+                    report_requests: Default::default(),
+                    collect_requests: Default::default(),
+                },
+            );
+        }
+        store::save(&path, &data).expect("seed maximum inactive Core families");
+        let broker = WorkerBroker::open(&path).expect("open bounded worker broker");
+        broker
+            .spawn_worker(spawn_request(
+                OperationId::new(),
+                workspace,
+                anchor("new-core-after-compaction"),
+                "new Core replaces inactive history",
+            ))
+            .await
+            .expect("inactive family history must be compacted before rejecting a new Core");
+        assert_eq!(broker.snapshot().await.families.len(), MAX_WORKER_FAMILIES);
         let _ = std::fs::remove_dir_all(root);
     }
 

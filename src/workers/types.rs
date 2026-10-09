@@ -365,6 +365,10 @@ impl WorkerStoreData {
             ));
         }
 
+        if self.families.len() > super::MAX_WORKER_FAMILIES {
+            return Err("worker store exceeds configured family limit".into());
+        }
+
         for (family_id, family) in &self.families {
             if family_id != &family.id {
                 return Err("worker family map key does not match family id".into());
@@ -448,14 +452,6 @@ impl WorkerStoreData {
                     }
                 }
             }
-        }
-        let persisted = serde_json::to_vec_pretty(self)
-            .map_err(|error| format!("failed to measure worker store: {error}"))?;
-        if persisted.len() as u64 > super::MAX_WORKER_STORE_BYTES {
-            return Err(format!(
-                "worker state exceeds {} byte safety limit",
-                super::MAX_WORKER_STORE_BYTES
-            ));
         }
         Ok(())
     }

@@ -271,7 +271,7 @@ async function render() {
   // Cards visibility
   $('coreCard').hidden = !connected;
   $('profileCard').hidden = !connected;
-  $('advancedSection').hidden = !connected;
+  $('advancedSection').hidden = !(connected || status.repairRequired);
 
   // Bridge status
   $('bridgeValue').textContent = status.baseUrl

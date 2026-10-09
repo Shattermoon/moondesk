@@ -5127,9 +5127,18 @@ async fn start_services(
     state: SharedState,
     ui_events: UiEventSender,
 ) -> Result<StartedServices, String> {
-    let (port, mode) = {
+    let (port, mode, workspace_ids, worker_broker, managed_chat_broker) = {
         let app = state.lock().await;
-        (app.port, app.mode)
+        (
+            app.port,
+            app.mode,
+            app.workspaces
+                .iter()
+                .map(|workspace| workspace.id.clone())
+                .collect::<Vec<_>>(),
+            app.worker_broker.clone(),
+            app.managed_chat_broker.clone(),
+        )
     };
 
     // Reserve the HTTP port before creating host services. A second MoonDesk instance should
@@ -5148,6 +5157,22 @@ async fn start_services(
             return Err(message);
         }
     };
+
+    // Only the instance that owns the local service port may reconcile durable Worker state. This
+    // keeps a second MoonDesk launch from mutating the shared stores before it discovers the
+    // already-running host.
+    if let Err(error) = workers::protocol::recover_registered_workspaces(
+        &workspace_ids,
+        &worker_broker,
+        &managed_chat_broker,
+    )
+    .await
+    {
+        state.lock().await.log(
+            "WARN",
+            format!("Worker launch recovery did not fully complete at startup: {error}"),
+        );
+    }
 
     if mode.browser_enabled() {
         state.lock().await.log(

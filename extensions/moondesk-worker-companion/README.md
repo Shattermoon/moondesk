@@ -31,7 +31,7 @@ The steps below are for experimental/developer builds only.
 1. Build/run the matching experimental MoonDesk branch.
 2. Open `chrome://extensions` (or `edge://extensions`), enable Developer mode, and choose **Load unpacked**.
 3. Select `extensions/moondesk-worker-companion`.
-4. Open the extension popup. The extension should automatically discover and pair with the local MoonDesk companion bridge. Manual repair is only a fallback when this installation's stored credential can no longer be accepted.
+4. Open the extension popup. A direct source checkout intentionally has no MoonDesk-private bootstrap capability, so open **Advanced → Manual Repair**, copy the current **Manual repair code** from **MoonDesk Settings → Workers**, paste it once, and pair this browser. Automatic pairing is reserved for the recommended stable companion folder prepared by the running MoonDesk binary. Manual Repair is also the recovery path when an existing installation's stored credential can no longer be accepted.
 5. Open the ChatGPT conversation you want to use as the Core. No Project/workspace binding step is required.
 6. Available ChatGPT models and reasoning efforts are discovered automatically once signed-in ChatGPT is available. Open the popup, choose a confirmed model and reasoning effort, and save the worker profile. **Refresh models** is only a repair/revalidation fallback. Discovery reads ChatGPT's provider-owned picker state and supports the current effort lanes (`Instant`, `Minimal`, `Low`, `Medium`, `High`, `Extra High`, `Max`, `Ultra`, and `Pro`) when the account offers them. Existing `Extra High` profiles remain compatible with the provider's `xhigh`/`max` migration.
 

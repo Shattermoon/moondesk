@@ -444,14 +444,6 @@ impl ManagedChatStoreData {
                 return Err("managed chat dedupe entry does not match command".into());
             }
         }
-        let persisted = serde_json::to_vec_pretty(self)
-            .map_err(|error| format!("failed to measure managed chat store: {error}"))?;
-        if persisted.len() as u64 > super::MAX_MANAGED_CHAT_STORE_BYTES {
-            return Err(format!(
-                "managed chat state exceeds {} byte safety limit",
-                super::MAX_MANAGED_CHAT_STORE_BYTES
-            ));
-        }
         Ok(())
     }
 }

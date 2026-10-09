@@ -4,7 +4,7 @@ const BRIDGE_PORTS = [47650, 47651, 47652, 47653, 47654];
 const REQUIRED_PROTOCOL_VERSION = 2;
 // Bump with any shipped companion runtime change that requires Chromium to load new bytes. Keep
 // this aligned with COMPANION_RUNTIME_REVISION in src/server.rs.
-const COMPANION_RUNTIME_REVISION = 4;
+const COMPANION_RUNTIME_REVISION = 5;
 const SOURCE_DEV_MANIFEST_VERSION = '0.1.0';
 const RUNTIME_RELOAD_STORAGE_KEY = 'moondeskWorkerCompanionReloadRevisionV1';
 const INSTALLATION_BOOTSTRAP_FILE = 'moondesk-bootstrap.json';
@@ -115,7 +115,7 @@ async function installationBootstrapToken() {
   }
   if (!response?.ok) {
     throw requestError(
-      'MoonDesk Worker Companion was not loaded from the folder prepared by MoonDesk. Open MoonDesk Settings -> Workers and load that folder unpacked.',
+      'This Worker Companion copy has no MoonDesk installation capability. For the recommended install, load the folder shown in MoonDesk Settings -> Workers. For a source or release-ZIP recovery install, open Manual Repair in this popup and paste the current repair code from MoonDesk Settings -> Workers.',
       0,
       'companion_installation_capability_missing'
     );
@@ -1310,6 +1310,8 @@ async function status() {
       error: String(error?.message || error),
       errorCode: error?.code || null,
       repairRequired: error?.status === 409
+        || error?.code === 'companion_installation_capability_missing'
+        || error?.code === 'companion_installation_capability_invalid'
     };
   }
 }

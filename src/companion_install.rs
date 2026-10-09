@@ -1,6 +1,6 @@
 use sha2::{Digest, Sha256};
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use uuid::Uuid;
@@ -87,7 +87,24 @@ where
         .and_then(|name| name.to_str())
         .ok_or_else(|| io::Error::other("Worker Companion file name is invalid"))?;
     let temporary = parent.join(format!(".{file_name}.moondesk-next-{}", Uuid::new_v4()));
-    fs::write(&temporary, bytes)?;
+    let mut options = fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&temporary)?;
+    if let Err(error) = file
+        .write_all(bytes)
+        .and_then(|_| file.flush())
+        .and_then(|_| file.sync_all())
+    {
+        drop(file);
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
+    drop(file);
 
     let result = replacer(&temporary, target);
     if result.is_err() {
@@ -417,6 +434,38 @@ mod tests {
                     .contains(".moondesk-next-"))
         );
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_replacement_temp_file_is_private_before_secret_bytes_are_published() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = temp_root();
+        let target = root.join(COMPANION_BOOTSTRAP_FILE_NAME);
+        replace_file_atomic_using(
+            &target,
+            br#"{"pairingToken":"secret"}"#,
+            |temporary, target| {
+                let mode = fs::metadata(temporary)?.permissions().mode() & 0o777;
+                if mode != 0o600 {
+                    return Err(io::Error::other(format!(
+                        "temporary bootstrap mode was {mode:o}, expected 600"
+                    )));
+                }
+                fs::rename(temporary, target)
+            },
+        )
+        .expect("publish private bootstrap temp");
+        assert_eq!(
+            fs::metadata(&target)
+                .expect("bootstrap metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
         let _ = fs::remove_dir_all(root);
     }
 

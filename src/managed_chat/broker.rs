@@ -69,6 +69,8 @@ pub enum ManagedChatAckOutcome {
 pub struct ManagedChatBroker {
     path: PathBuf,
     data: Mutex<ManagedChatStoreData>,
+    #[cfg(test)]
+    fail_next_commit: std::sync::atomic::AtomicBool,
 }
 
 impl ManagedChatBroker {
@@ -78,11 +80,19 @@ impl ManagedChatBroker {
         Ok(Self {
             path,
             data: Mutex::new(data),
+            #[cfg(test)]
+            fail_next_commit: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
     pub(crate) async fn snapshot(&self) -> ManagedChatStoreData {
         self.data.lock().await.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_commit_for_test(&self) {
+        self.fail_next_commit
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     pub async fn purge_workspace(
@@ -143,6 +153,39 @@ impl ManagedChatBroker {
             digest = Some(candidate.clone());
         }
         Ok(digest)
+    }
+
+    pub async fn ensure_clearable_anchor_session(
+        &self,
+        session_digest: &str,
+    ) -> Result<Vec<ManagedChatCommand>, ManagedChatError> {
+        if session_digest.len() != 64
+            || !session_digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(ManagedChatError::Invalid(
+                "managed chat Core session digest is invalid".into(),
+            ));
+        }
+        let guard = self.data.lock().await;
+        let matching = guard
+            .commands
+            .values()
+            .filter(|command| {
+                command.launch.anchor_session_digest.as_deref() == Some(session_digest)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if matching.iter().any(|command| match command.state {
+            ManagedChatCommandState::Succeeded => false,
+            ManagedChatCommandState::Failed => command.reconcile_history,
+            _ => true,
+        }) {
+            return Err(ManagedChatError::Conflict(
+                "Core workers cannot be cleared while a launch is active or its Send outcome is ambiguous"
+                    .into(),
+            ));
+        }
+        Ok(matching)
     }
 
     pub async fn purge_terminal_for_anchor_session(
@@ -503,16 +546,16 @@ impl ManagedChatBroker {
             if !expired {
                 continue;
             }
-            if !command.target_client_pinned_by_request {
-                command.target_client_id = None;
-            }
             match command.state {
                 ManagedChatCommandState::Leased => {
-                    command.state = if command.reconcile_history {
-                        ManagedChatCommandState::NeedsReconcile
+                    if command.reconcile_history {
+                        command.state = ManagedChatCommandState::NeedsReconcile;
                     } else {
-                        ManagedChatCommandState::Queued
-                    };
+                        command.state = ManagedChatCommandState::Queued;
+                        if !command.target_client_pinned_by_request {
+                            command.target_client_id = None;
+                        }
+                    }
                     command.lease = None;
                 }
                 ManagedChatCommandState::SendStarted => {
@@ -792,6 +835,15 @@ impl ManagedChatBroker {
         guard: &mut tokio::sync::MutexGuard<'_, ManagedChatStoreData>,
         candidate: ManagedChatStoreData,
     ) -> Result<(), ManagedChatError> {
+        #[cfg(test)]
+        if self
+            .fail_next_commit
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(ManagedChatError::Storage(
+                "injected managed-chat persistence failure".into(),
+            ));
+        }
         let path = self.path.clone();
         let persisted = candidate.clone();
         let prepared = tokio::task::spawn_blocking(move || store::prepare_save(&path, &persisted))
@@ -1145,13 +1197,13 @@ mod tests {
         let broker = ManagedChatBroker::open(root.join("state.json")).expect("open broker");
         let conversation_id = "6ac62769-0c94-83e8-a8ef-95a21c7f3e7f";
         let session_digest = "a".repeat(64);
-        let mut launch = launch("Core-clear-safe");
-        launch.anchor_session_digest = Some(session_digest.clone());
+        let mut safe_launch = launch("Core-clear-safe");
+        safe_launch.anchor_session_digest = Some(session_digest.clone());
         let command = broker
             .enqueue_with_route(
                 EnqueueManagedChatRequest {
                     dedupe_key: "Core-clear-safe".into(),
-                    launch,
+                    launch: safe_launch,
                 },
                 Some("extension-a".into()),
                 Some(anchor_context(conversation_id)),
@@ -1399,13 +1451,25 @@ mod tests {
         drop(reopened);
 
         let reopened = ManagedChatBroker::open(&path).expect("reopen after send started");
+        assert!(
+            reopened
+                .redeem("extension-c", 1_000 + (DEFAULT_COMMAND_LEASE_MS * 2) + 2)
+                .await
+                .expect("other browser redemption remains safe")
+                .is_none(),
+            "post-Send reconciliation must stay with the browser that crossed the Send boundary"
+        );
         let third = reopened
-            .redeem("extension-c", 1_000 + (DEFAULT_COMMAND_LEASE_MS * 2) + 2)
+            .redeem("extension-b", 1_000 + (DEFAULT_COMMAND_LEASE_MS * 2) + 2)
             .await
             .expect("redeem expired post-send command")
             .expect("reconciliation command");
         assert!(third.reconcile_required);
         assert_eq!(third.command.id, command.id);
+        assert_eq!(
+            third.command.target_client_id.as_deref(),
+            Some("extension-b")
+        );
         assert!(third.command.reconcile_history);
         assert_eq!(reopened.snapshot().await.commands.len(), 1);
         let _ = std::fs::remove_dir_all(root);
@@ -2164,12 +2228,7 @@ mod tests {
         let broker = ManagedChatBroker::open(state_parent.join("state.json"))
             .expect("open broker before state exists");
 
-        // Make only the next durable write impossible. Constructing the broker must succeed on
-        // every platform so this regression tests commit rollback rather than path lookup
-        // differences (Unix reports ENOTDIR where Windows can report NotFound).
-        std::fs::remove_dir(&state_parent).expect("remove empty state parent");
-        std::fs::write(&state_parent, "not a directory").expect("block future persistence");
-
+        broker.fail_next_commit_for_test();
         let error = broker
             .enqueue(EnqueueManagedChatRequest {
                 dedupe_key: "worker:one:task:persist".into(),

@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 pub const MANAGED_CHAT_STORE_SCHEMA_VERSION: u32 = 1;
 pub const MANAGED_CHAT_STORE_FILE_NAME: &str = "managed-chat-state-v1.json";
 // Sized so MAX_MANAGED_CHAT_COMMANDS commands with maximum opening messages remain persistable;
-// ManagedChatStoreData::validate also enforces the exact serialized byte budget.
+// store::prepare_save enforces the exact serialized byte budget before publication.
 pub const MAX_MANAGED_CHAT_STORE_BYTES: u64 = 64 * 1024 * 1024;
 pub const DEFAULT_COMMAND_LEASE_MS: u64 = 120_000;
 pub const MAX_MANAGED_CHAT_OPENING_MESSAGE_BYTES: usize = 128 * 1024;

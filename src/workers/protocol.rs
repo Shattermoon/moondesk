@@ -4,10 +4,12 @@ use super::broker::{
 };
 use super::prompt;
 use super::types::{
-    ChatIdentity, OperationId, TaskId, WorkerExecutionProfile, WorkerId, WorkerMessageId,
-    WorkerResult, WorkerState,
+    ChatIdentity, OperationId, TaskId, WorkerExecutionProfile, WorkerId, WorkerLaunchState,
+    WorkerMessageId, WorkerResult, WorkerState,
 };
 use crate::companion::CompanionAnchorRoute;
+#[cfg(test)]
+use crate::managed_chat::broker::ManagedChatAckOutcome;
 use crate::managed_chat::broker::{EnqueueManagedChatRequest, ManagedChatBroker};
 use crate::managed_chat::types::{
     ManagedChatAnchorContext, ManagedChatCommandState, ManagedChatLaunch, ManagedChatOpenMode,
@@ -81,6 +83,54 @@ pub struct WorkerLaunchContext<'a> {
     pub worker_target_count: usize,
 }
 
+#[cfg(test)]
+struct TransactionPause {
+    reached: tokio::sync::Notify,
+    resume: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+fn transaction_pause_registry()
+-> &'static std::sync::Mutex<std::collections::BTreeMap<String, std::sync::Arc<TransactionPause>>> {
+    static REGISTRY: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::BTreeMap<String, std::sync::Arc<TransactionPause>>>,
+    > = std::sync::OnceLock::new();
+    REGISTRY.get_or_init(|| std::sync::Mutex::new(std::collections::BTreeMap::new()))
+}
+
+#[cfg(test)]
+fn register_transaction_pause(operation_id: &OperationId) -> std::sync::Arc<TransactionPause> {
+    let pause = std::sync::Arc::new(TransactionPause {
+        reached: tokio::sync::Notify::new(),
+        resume: tokio::sync::Notify::new(),
+    });
+    transaction_pause_registry()
+        .lock()
+        .expect("transaction pause registry")
+        .insert(operation_id.to_string(), pause.clone());
+    pause
+}
+
+#[cfg(test)]
+async fn maybe_pause_after_worker_persist(operation_id: &OperationId) {
+    let pause = transaction_pause_registry()
+        .lock()
+        .expect("transaction pause registry")
+        .get(&operation_id.to_string())
+        .cloned();
+    if let Some(pause) = pause {
+        pause.reached.notify_one();
+        pause.resume.notified().await;
+        transaction_pause_registry()
+            .lock()
+            .expect("transaction pause registry")
+            .remove(&operation_id.to_string());
+    }
+}
+
+#[cfg(not(test))]
+async fn maybe_pause_after_worker_persist(_operation_id: &OperationId) {}
+
 async fn recover_incomplete_launch_transactions(
     workspace_id: &WorkspaceId,
     worker_broker: &WorkerBroker,
@@ -107,13 +157,25 @@ async fn recover_incomplete_launch_transactions(
                     task_id,
                     worker.state,
                     worker.chat_identity.is_some(),
+                    worker.launch_state,
+                    worker.conversation_url.clone(),
                     worker.launch_command_id.clone(),
                 ))
             })
         })
         .collect::<Vec<_>>();
 
-    for (anchor_identity, worker_id, task_id, worker_state, claimed, linked_command_id) in pending {
+    for (
+        anchor_identity,
+        worker_id,
+        task_id,
+        worker_state,
+        claimed,
+        launch_state,
+        conversation_url,
+        linked_command_id,
+    ) in pending
+    {
         let dedupe_key = format!("worker:{worker_id}:task:{task_id}");
         let command = managed_snapshot
             .dedupe
@@ -139,7 +201,9 @@ async fn recover_incomplete_launch_transactions(
                             &command_id,
                         )
                         .await
-                        .map_err(|error| format!("worker launch recovery could not restore link: {error}"))?;
+                        .map_err(|error| {
+                            format!("worker launch recovery could not restore link: {error}")
+                        })?;
                 }
                 if !command.dispatch_ready {
                     if command.state != ManagedChatCommandState::Queued
@@ -154,46 +218,50 @@ async fn recover_incomplete_launch_transactions(
                     managed_chat_broker
                         .activate_dispatch(&command.id)
                         .await
-                        .map_err(|error| format!("worker launch recovery could not activate command: {error}"))?;
+                        .map_err(|error| {
+                            format!("worker launch recovery could not activate command: {error}")
+                        })?;
                 }
             }
-            None => {
-                match (worker_state, claimed, linked_command_id.as_deref()) {
-                    (WorkerState::Provisioning, false, None) => worker_broker
-                        .rollback_unlinked_spawn(workspace_id, &anchor_identity, &worker_id, &task_id)
-                        .await
-                        .map_err(|error| format!("worker launch recovery could not roll back orphan spawn: {error}"))?,
-                    (WorkerState::Waking, true, None) => worker_broker
-                        .rollback_unlinked_reuse(workspace_id, &anchor_identity, &worker_id, &task_id)
-                        .await
-                        .map_err(|error| format!("worker launch recovery could not roll back orphan reuse: {error}"))?,
-                    (WorkerState::Provisioning, false, Some(command_id)) => worker_broker
-                        .rollback_linked_spawn(
-                            workspace_id,
-                            &anchor_identity,
-                            &worker_id,
-                            &task_id,
-                            command_id,
-                        )
-                        .await
-                        .map_err(|error| format!("worker launch recovery could not roll back missing linked spawn command: {error}"))?,
-                    (WorkerState::Waking, true, Some(command_id)) => worker_broker
-                        .rollback_linked_reuse(
-                            workspace_id,
-                            &anchor_identity,
-                            &worker_id,
-                            &task_id,
-                            command_id,
-                        )
-                        .await
-                        .map_err(|error| format!("worker launch recovery could not roll back missing linked reuse command: {error}"))?,
-                    _ => {
-                        return Err(format!(
-                            "worker launch recovery found inconsistent pending state for {worker_id}"
-                        ));
+            None => match (worker_state, claimed, linked_command_id.as_deref()) {
+                (WorkerState::Provisioning, false, None) => worker_broker
+                    .rollback_unlinked_spawn(workspace_id, &anchor_identity, &worker_id, &task_id)
+                    .await
+                    .map_err(|error| {
+                        format!("worker launch recovery could not roll back orphan spawn: {error}")
+                    })?,
+                (WorkerState::Waking, true, None) => worker_broker
+                    .rollback_unlinked_reuse(workspace_id, &anchor_identity, &worker_id, &task_id)
+                    .await
+                    .map_err(|error| {
+                        format!("worker launch recovery could not roll back orphan reuse: {error}")
+                    })?,
+                (WorkerState::Provisioning | WorkerState::Waking, _, Some(command_id)) => {
+                    // A missing linked command is not proof that Send never happened: terminal
+                    // managed-chat history may have been compacted after a successful launch, or
+                    // persistence may have advanced farther than the worker mirror before a crash.
+                    // Preserve canonical/WaitingClaim workers exactly so their claim capability
+                    // remains valid. Otherwise fail closed by pausing the launch instead of deleting
+                    // a potentially-real ChatGPT conversation.
+                    if launch_state != WorkerLaunchState::WaitingClaim && conversation_url.is_none()
+                    {
+                        worker_broker
+                            .update_launch_by_command(
+                                command_id,
+                                WorkerLaunchState::Paused,
+                                Some("linked launch command is missing; automatic rollback was refused because the Send boundary cannot be proven safe".into()),
+                                None,
+                            )
+                            .await
+                            .map_err(|error| format!("worker launch recovery could not pause missing linked command: {error}"))?;
                     }
                 }
-            }
+                _ => {
+                    return Err(format!(
+                        "worker launch recovery found inconsistent pending state for {worker_id}"
+                    ));
+                }
+            },
         }
     }
 
@@ -223,6 +291,19 @@ async fn recover_incomplete_launch_transactions(
     Ok(())
 }
 
+pub(crate) async fn recover_registered_workspaces(
+    workspace_ids: &[WorkspaceId],
+    worker_broker: &WorkerBroker,
+    managed_chat_broker: &ManagedChatBroker,
+) -> Result<(), String> {
+    let _lifecycle_guard = super::WORKER_LIFECYCLE_LOCK.lock().await;
+    for workspace_id in workspace_ids {
+        recover_incomplete_launch_transactions(workspace_id, worker_broker, managed_chat_broker)
+            .await?;
+    }
+    Ok(())
+}
+
 pub async fn handle(
     arguments: &Value,
     workspace_id: &WorkspaceId,
@@ -233,20 +314,22 @@ pub async fn handle(
     launch_context: WorkerLaunchContext<'_>,
 ) -> Result<Value, String> {
     let worker_target_count = launch_context.worker_target_count;
-    recover_incomplete_launch_transactions(
-        workspace_id,
-        broker,
-        launch_context.managed_chat_broker,
-    )
-    .await?;
     let action = required_string(arguments, "action")?;
     match action {
         "spawn" => {
+            let _lifecycle_guard = super::WORKER_LIFECYCLE_LOCK.lock().await;
+            recover_incomplete_launch_transactions(
+                workspace_id,
+                broker,
+                launch_context.managed_chat_broker,
+            )
+            .await?;
             let assignment = required_string(arguments, "task")?.to_string();
             let execution_profile = execution_profile.clone();
+            let operation_id = parse_operation_id(arguments)?;
             let receipt = broker
                 .spawn_worker(SpawnWorkerRequest {
-                    operation_id: parse_operation_id(arguments)?,
+                    operation_id: operation_id.clone(),
                     workspace_id: workspace_id.clone(),
                     anchor_identity: caller_identity.clone(),
                     label: required_string(arguments, "label")?.to_string(),
@@ -255,6 +338,7 @@ pub async fn handle(
                 })
                 .await
                 .map_err(broker_error)?;
+            maybe_pause_after_worker_persist(&operation_id).await;
 
             let opening_message = prompt::bootstrap_message(workspace_name, &assignment, &receipt);
             let (target_client_id, anchor_context) = launch_context
@@ -390,10 +474,18 @@ pub async fn handle(
             }))
         }
         "reuse" => {
+            let _lifecycle_guard = super::WORKER_LIFECYCLE_LOCK.lock().await;
+            recover_incomplete_launch_transactions(
+                workspace_id,
+                broker,
+                launch_context.managed_chat_broker,
+            )
+            .await?;
             let assignment = required_string(arguments, "task")?.to_string();
+            let operation_id = parse_operation_id(arguments)?;
             let receipt = broker
                 .reuse_worker(ReuseWorkerRequest {
-                    operation_id: parse_operation_id(arguments)?,
+                    operation_id: operation_id.clone(),
                     workspace_id: workspace_id.clone(),
                     anchor_identity: caller_identity.clone(),
                     worker_id: parse_worker_id(arguments)?,
@@ -401,6 +493,7 @@ pub async fn handle(
                 })
                 .await
                 .map_err(broker_error)?;
+            maybe_pause_after_worker_persist(&operation_id).await;
             let opening_message = prompt::reuse_message(
                 workspace_name,
                 &assignment,
@@ -566,6 +659,13 @@ pub async fn handle(
             }))
         }
         "retire" => {
+            let _lifecycle_guard = super::WORKER_LIFECYCLE_LOCK.lock().await;
+            recover_incomplete_launch_transactions(
+                workspace_id,
+                broker,
+                launch_context.managed_chat_broker,
+            )
+            .await?;
             let worker_id = parse_worker_id(arguments)?;
             let family = broker
                 .family_for_anchor(workspace_id, caller_identity)
@@ -917,7 +1017,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recovery_activates_linked_held_command_without_creating_a_second_command() {
+    async fn startup_recovery_activates_linked_held_command_without_new_workers_call() {
         let root = temp_root("moondesk-worker-recovery-linked-held");
         let worker_path = root.join("worker-state-v1.json");
         let managed_path = root.join("managed-chat-state-v1.json");
@@ -956,9 +1056,9 @@ mod tests {
 
         let worker = WorkerBroker::open(&worker_path).expect("reopen worker broker");
         let managed = ManagedChatBroker::open(&managed_path).expect("reopen managed broker");
-        recover_incomplete_launch_transactions(&workspace, &worker, &managed)
+        recover_registered_workspaces(std::slice::from_ref(&workspace), &worker, &managed)
             .await
-            .expect("recover linked held command");
+            .expect("startup recovery restores linked held command");
         let snapshot = managed.snapshot().await;
         assert_eq!(snapshot.commands.len(), 1);
         assert!(
@@ -968,6 +1068,489 @@ mod tests {
                 .expect("same command")
                 .dispatch_ready
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn concurrent_spawn_status_and_spawn_cannot_rollback_live_transaction() {
+        let root = temp_root("moondesk-worker-spawn-concurrency");
+        let workspace = WorkspaceId::new();
+        let anchor = identity("anchor-spawn-concurrency");
+        let worker = std::sync::Arc::new(
+            WorkerBroker::open(root.join("worker-state-v1.json")).expect("open worker broker"),
+        );
+        let managed = std::sync::Arc::new(
+            ManagedChatBroker::open(root.join("managed-chat-state-v1.json"))
+                .expect("open managed broker"),
+        );
+        let first_operation = OperationId::new();
+        let pause = register_transaction_pause(&first_operation);
+        let first = {
+            let worker = worker.clone();
+            let managed = managed.clone();
+            let workspace = workspace.clone();
+            let anchor = anchor.clone();
+            let operation = first_operation.to_string();
+            tokio::spawn(async move {
+                handle(
+                    &json!({
+                        "action": "spawn",
+                        "operation_id": operation,
+                        "label": "first",
+                        "task": "first concurrent task"
+                    }),
+                    &workspace,
+                    "spawn-concurrency",
+                    &anchor,
+                    &ChatExecutionProfile::default(),
+                    worker.as_ref(),
+                    WorkerLaunchContext {
+                        managed_chat_broker: managed.as_ref(),
+                        anchor_route: None,
+                        worker_target_count: super::super::RECOMMENDED_WORKERS_PER_FAMILY,
+                    },
+                )
+                .await
+            })
+        };
+        pause.reached.notified().await;
+
+        let status = handle(
+            &json!({ "action": "status" }),
+            &workspace,
+            "spawn-concurrency",
+            &anchor,
+            &ChatExecutionProfile::default(),
+            worker.as_ref(),
+            WorkerLaunchContext {
+                managed_chat_broker: managed.as_ref(),
+                anchor_route: None,
+                worker_target_count: super::super::RECOMMENDED_WORKERS_PER_FAMILY,
+            },
+        )
+        .await
+        .expect("status remains read-only during paused transaction");
+        assert_eq!(status["workers"].as_array().map(Vec::len), Some(1));
+
+        let second = {
+            let worker = worker.clone();
+            let managed = managed.clone();
+            let workspace = workspace.clone();
+            let anchor = anchor.clone();
+            tokio::spawn(async move {
+                handle(
+                    &json!({
+                        "action": "spawn",
+                        "operation_id": OperationId::new().to_string(),
+                        "label": "second",
+                        "task": "second concurrent task"
+                    }),
+                    &workspace,
+                    "spawn-concurrency",
+                    &anchor,
+                    &ChatExecutionProfile::default(),
+                    worker.as_ref(),
+                    WorkerLaunchContext {
+                        managed_chat_broker: managed.as_ref(),
+                        anchor_route: None,
+                        worker_target_count: super::super::RECOMMENDED_WORKERS_PER_FAMILY,
+                    },
+                )
+                .await
+            })
+        };
+        tokio::pin!(second);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut second)
+                .await
+                .is_err(),
+            "another spawn must wait for the full cross-store lifecycle boundary"
+        );
+        pause.resume.notify_one();
+        first.await.expect("first task join").expect("first spawn");
+        second
+            .await
+            .expect("second task join")
+            .expect("second spawn after serialization");
+
+        let family = worker
+            .family_for_anchor(&workspace, &anchor)
+            .await
+            .expect("read family")
+            .expect("family remains");
+        assert_eq!(family.workers.len(), 2);
+        let managed_snapshot = managed.snapshot().await;
+        assert_eq!(managed_snapshot.commands.len(), 2);
+        assert!(
+            managed_snapshot
+                .commands
+                .values()
+                .all(|command| command.dispatch_ready)
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn concurrent_reuse_report_and_status_do_not_trigger_crash_recovery() {
+        let root = temp_root("moondesk-worker-reuse-concurrency");
+        let workspace = WorkspaceId::new();
+        let anchor = identity("anchor-reuse-concurrency");
+        let worker_identity = identity("worker-reuse-concurrency");
+        let worker = std::sync::Arc::new(
+            WorkerBroker::open(root.join("worker-state-v1.json")).expect("open worker broker"),
+        );
+        let managed = std::sync::Arc::new(
+            ManagedChatBroker::open(root.join("managed-chat-state-v1.json"))
+                .expect("open managed broker"),
+        );
+        let spawned = worker
+            .spawn_worker(spawn_request(
+                OperationId::new(),
+                workspace.clone(),
+                anchor.clone(),
+            ))
+            .await
+            .expect("seed reusable worker");
+        let seed_command = Uuid::new_v4().to_string();
+        worker
+            .link_launch_command(
+                &workspace,
+                &anchor,
+                &spawned.worker_id,
+                &spawned.task_id,
+                &seed_command,
+            )
+            .await
+            .expect("seed launch link");
+        worker
+            .update_launch_by_command(
+                &seed_command,
+                WorkerLaunchState::WaitingClaim,
+                None,
+                Some("https://chatgpt.com/c/aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee".into()),
+            )
+            .await
+            .expect("seed canonical conversation");
+        worker
+            .claim_worker(
+                &workspace,
+                &spawned.worker_id,
+                &spawned.task_id,
+                &spawned.claim_token,
+                worker_identity.clone(),
+            )
+            .await
+            .expect("claim reusable worker");
+        worker
+            .finish_task(FinishTaskRequest {
+                workspace_id: workspace.clone(),
+                worker_identity: worker_identity.clone(),
+                worker_id: spawned.worker_id.clone(),
+                task_id: spawned.task_id.clone(),
+                result: WorkerResult {
+                    result: "seed complete".into(),
+                    changes: "none".into(),
+                    validation: "seed reusable worker".into(),
+                    blockers: Vec::new(),
+                },
+            })
+            .await
+            .expect("make worker idle before reuse");
+
+        let reuse_operation = OperationId::new();
+        let pause = register_transaction_pause(&reuse_operation);
+        let reuse = {
+            let worker = worker.clone();
+            let managed = managed.clone();
+            let workspace = workspace.clone();
+            let anchor = anchor.clone();
+            let worker_id = spawned.worker_id.to_string();
+            let operation = reuse_operation.to_string();
+            tokio::spawn(async move {
+                handle(
+                    &json!({
+                        "action": "reuse",
+                        "operation_id": operation,
+                        "worker_id": worker_id,
+                        "task": "paused reuse assignment"
+                    }),
+                    &workspace,
+                    "reuse-concurrency",
+                    &anchor,
+                    &ChatExecutionProfile::default(),
+                    worker.as_ref(),
+                    WorkerLaunchContext {
+                        managed_chat_broker: managed.as_ref(),
+                        anchor_route: None,
+                        worker_target_count: super::super::RECOMMENDED_WORKERS_PER_FAMILY,
+                    },
+                )
+                .await
+            })
+        };
+        pause.reached.notified().await;
+        let family = worker
+            .family_for_anchor(&workspace, &anchor)
+            .await
+            .expect("read paused reuse family")
+            .expect("family remains");
+        let waking = family
+            .workers
+            .get(&spawned.worker_id)
+            .expect("worker remains");
+        assert_eq!(waking.state, WorkerState::Waking);
+        let reuse_task_id = waking.current_task_id.clone().expect("reuse task id");
+        worker
+            .report_worker(ReportWorkerRequest {
+                operation_id: OperationId::new(),
+                workspace_id: workspace.clone(),
+                worker_identity,
+                worker_id: spawned.worker_id.clone(),
+                task_id: reuse_task_id,
+                body: "concurrent worker report".into(),
+            })
+            .await
+            .expect("report cannot invoke crash recovery");
+        let status = handle(
+            &json!({ "action": "status" }),
+            &workspace,
+            "reuse-concurrency",
+            &anchor,
+            &ChatExecutionProfile::default(),
+            worker.as_ref(),
+            WorkerLaunchContext {
+                managed_chat_broker: managed.as_ref(),
+                anchor_route: None,
+                worker_target_count: super::super::RECOMMENDED_WORKERS_PER_FAMILY,
+            },
+        )
+        .await
+        .expect("status cannot invoke crash recovery");
+        assert_eq!(status["workers"].as_array().map(Vec::len), Some(1));
+        pause.resume.notify_one();
+        reuse.await.expect("reuse join").expect("reuse completes");
+        let family = worker
+            .family_for_anchor(&workspace, &anchor)
+            .await
+            .expect("read completed reuse family")
+            .expect("family remains");
+        assert_eq!(
+            family
+                .workers
+                .get(&spawned.worker_id)
+                .expect("worker remains")
+                .state,
+            WorkerState::Waking
+        );
+        assert_eq!(managed.snapshot().await.commands.len(), 1);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn status_never_reconciles_an_inflight_cross_store_launch() {
+        let root = temp_root("moondesk-worker-status-no-recovery");
+        let worker_path = root.join("worker-state-v1.json");
+        let managed_path = root.join("managed-chat-state-v1.json");
+        let workspace = WorkspaceId::new();
+        let anchor = identity("anchor-status-no-recovery");
+        let worker = WorkerBroker::open(&worker_path).expect("open worker broker");
+        let managed = ManagedChatBroker::open(&managed_path).expect("open managed broker");
+        let receipt = worker
+            .spawn_worker(spawn_request(
+                OperationId::new(),
+                workspace.clone(),
+                anchor.clone(),
+            ))
+            .await
+            .expect("persist worker before command commit");
+
+        let status = handle(
+            &json!({ "action": "status" }),
+            &workspace,
+            "status-no-recovery",
+            &anchor,
+            &ChatExecutionProfile::default(),
+            &worker,
+            WorkerLaunchContext {
+                managed_chat_broker: &managed,
+                anchor_route: None,
+                worker_target_count: super::super::RECOMMENDED_WORKERS_PER_FAMILY,
+            },
+        )
+        .await
+        .expect("status while launch transaction is in flight");
+        assert_eq!(status["workers"].as_array().map(Vec::len), Some(1));
+        assert!(
+            worker
+                .family_for_anchor(&workspace, &anchor)
+                .await
+                .expect("read worker family")
+                .expect("family remains")
+                .workers
+                .contains_key(&receipt.worker_id),
+            "read-only worker actions must not run crash recovery against a live transaction"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn recovery_preserves_waiting_claim_when_linked_command_history_is_gone() {
+        let root = temp_root("moondesk-worker-recovery-post-send-barrier");
+        let worker_path = root.join("worker-state-v1.json");
+        let managed_path = root.join("managed-chat-state-v1.json");
+        let workspace = WorkspaceId::new();
+        let anchor = identity("anchor-post-send-barrier");
+        let worker_identity = identity("worker-post-send-barrier");
+        let worker = WorkerBroker::open(&worker_path).expect("open worker broker");
+        let managed = ManagedChatBroker::open(&managed_path).expect("open managed broker");
+        let receipt = worker
+            .spawn_worker(spawn_request(
+                OperationId::new(),
+                workspace.clone(),
+                anchor.clone(),
+            ))
+            .await
+            .expect("persist worker");
+        let mut initial_launch =
+            launch_for(workspace.clone(), &receipt.worker_id, &receipt.task_id);
+        initial_launch.launch.thread_key = Some(format!("worker:{}", receipt.worker_id));
+        let initial_command = managed
+            .enqueue(initial_launch)
+            .await
+            .expect("persist the real worker launch command");
+        let compacted_command_id = initial_command.id.to_string();
+        worker
+            .link_launch_command(
+                &workspace,
+                &anchor,
+                &receipt.worker_id,
+                &receipt.task_id,
+                &compacted_command_id,
+            )
+            .await
+            .expect("link command before terminal history is compacted");
+        let initial_offer = managed
+            .redeem("extension-a", 1_000)
+            .await
+            .expect("redeem original worker launch")
+            .expect("original worker launch lease");
+        let initial_lease = initial_offer
+            .command
+            .lease
+            .as_ref()
+            .expect("original worker launch lease id")
+            .lease_id
+            .clone();
+        managed
+            .mark_send_started(&initial_command.id, &initial_lease, "extension-a")
+            .await
+            .expect("cross original worker Send boundary");
+        let conversation_url = "https://chatgpt.com/c/6aaef8db-ecf0-83ee-bfcc-d6f94853c540";
+        managed
+            .acknowledge(
+                &initial_command.id,
+                &initial_lease,
+                "extension-a",
+                ManagedChatAckOutcome::Succeeded {
+                    details: Some("original Send accepted".into()),
+                    conversation_url: Some(conversation_url.into()),
+                },
+            )
+            .await
+            .expect("persist original successful worker launch");
+        worker
+            .update_launch_by_command(
+                &compacted_command_id,
+                WorkerLaunchState::WaitingClaim,
+                None,
+                Some(conversation_url.into()),
+            )
+            .await
+            .expect("record durable post-Send conversation");
+
+        let filler_count = crate::managed_chat::MAX_MANAGED_CHAT_THREAD_AFFINITIES
+            + crate::managed_chat::MAX_MANAGED_CHAT_TERMINAL_HISTORY
+            + 1;
+        for index in 0..filler_count {
+            let filler_worker = WorkerId::new();
+            let filler_task = TaskId::new();
+            let mut filler = launch_for(workspace.clone(), &filler_worker, &filler_task);
+            filler.dedupe_key = format!("worker:compaction:{index}");
+            filler.launch.thread_key = Some(format!("worker:compaction:{index}"));
+            filler.launch.task_marker = format!("compaction-{index}");
+            let command = managed
+                .enqueue(filler)
+                .await
+                .expect("enqueue compaction filler");
+            let offer = managed
+                .redeem("extension-a", 10_000 + index as u64)
+                .await
+                .expect("redeem compaction filler")
+                .expect("compaction filler lease");
+            let lease_id = offer
+                .command
+                .lease
+                .as_ref()
+                .expect("compaction filler lease id")
+                .lease_id
+                .clone();
+            managed
+                .mark_send_started(&command.id, &lease_id, "extension-a")
+                .await
+                .expect("cross filler Send boundary");
+            managed
+                .acknowledge(
+                    &command.id,
+                    &lease_id,
+                    "extension-a",
+                    ManagedChatAckOutcome::Succeeded {
+                        details: Some("filler accepted".into()),
+                        conversation_url: Some(format!("https://chatgpt.com/c/{:032x}", index + 1)),
+                    },
+                )
+                .await
+                .expect("persist filler success");
+        }
+        assert!(
+            !managed
+                .snapshot()
+                .await
+                .commands
+                .contains_key(&initial_command.id),
+            "terminal compaction must actually remove the old successful command in this regression"
+        );
+        drop(worker);
+        drop(managed);
+
+        let worker = WorkerBroker::open(&worker_path).expect("reopen worker broker");
+        let managed = ManagedChatBroker::open(&managed_path).expect("reopen empty managed broker");
+        recover_registered_workspaces(std::slice::from_ref(&workspace), &worker, &managed)
+            .await
+            .expect("missing terminal history must not roll back accepted Send");
+        let family = worker
+            .family_for_anchor(&workspace, &anchor)
+            .await
+            .expect("read family")
+            .expect("family remains");
+        let recovered = family
+            .workers
+            .get(&receipt.worker_id)
+            .expect("WaitingClaim worker survives recovery");
+        assert_eq!(recovered.launch_state, WorkerLaunchState::WaitingClaim);
+        assert_eq!(
+            recovered.conversation_url.as_deref(),
+            Some(conversation_url)
+        );
+        worker
+            .claim_worker(
+                &workspace,
+                &receipt.worker_id,
+                &receipt.task_id,
+                &receipt.claim_token,
+                worker_identity,
+            )
+            .await
+            .expect("preserved claim capability remains usable");
         let _ = std::fs::remove_dir_all(root);
     }
 

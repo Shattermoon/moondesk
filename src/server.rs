@@ -62,7 +62,7 @@ pub const COMPANION_CLEAR_WORKERS_ROUTE: &str = "/__moondesk/companion/v1/worker
 pub const COMPANION_TOKEN_HEADER: &str = "x-moondesk-companion-token";
 // Bump with any shipped companion runtime change that requires Chromium to load new bytes. Keep
 // this aligned with COMPANION_RUNTIME_REVISION in background.js.
-pub const COMPANION_RUNTIME_REVISION: u32 = 4;
+pub const COMPANION_RUNTIME_REVISION: u32 = 5;
 const MAX_COMPANION_BODY_BYTES: usize = 16 * 1024;
 
 #[derive(Clone)]
@@ -550,63 +550,56 @@ async fn revoke_companion_client(
             json!({ "error": "revoke this browser from the browser you want to keep connected" }),
         );
     }
+    let _lifecycle_guard = crate::workers::WORKER_LIFECYCLE_LOCK.lock().await;
     let (auth, managed_chat_broker) = {
         let app = state.app.lock().await;
         (app.companion_auth.clone(), app.managed_chat_broker.clone())
     };
-    if !auth
-        .paired_client_ids()
+
+    // Settle every durable command before revoking the credential. If any persistence/sync step
+    // fails, the browser remains paired so the exact same request can be retried safely. Once the
+    // credential removal succeeds there is no remaining cross-store work to strand.
+    let (retargeted_commands, paused_commands, _changed_commands) = match managed_chat_broker
+        .settle_revoked_client(&request.client_id)
         .await
-        .iter()
-        .any(|client_id| client_id == &request.client_id)
     {
-        return json_response(
-            StatusCode::NOT_FOUND,
-            json!({ "error": "paired browser was not found" }),
-        );
-    }
-    match auth.revoke_client(&request.client_id).await {
-        Ok(true) => {
-            let (retargeted_commands, paused_commands, changed_commands) = match managed_chat_broker
-                .settle_revoked_client(&request.client_id)
-                .await
-            {
-                Ok(counts) => counts,
-                Err(error) => {
-                    return json_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        json!({
-                            "error": format!(
-                                "paired browser was revoked but its managed-chat commands could not be settled: {error}"
-                            )
-                        }),
-                    );
-                }
-            };
-            for command in &changed_commands {
-                if let Err(error) = sync_worker_launch_from_command(&state, command).await {
-                    return json_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        json!({
-                            "error": format!(
-                                "paired browser was revoked and its managed-chat commands were settled, but worker launch state sync failed: {error}"
-                            )
-                        }),
-                    );
-                }
-            }
-            json_response(
-                StatusCode::OK,
+        Ok(counts) => counts,
+        Err(error) => return managed_chat_error_response(error),
+    };
+    // Re-sync every retained worker command, not only commands changed by this invocation. That
+    // makes a retry repair the worker mirror even if a previous request durably settled the
+    // managed command and then failed before its worker record was updated.
+    let retained_worker_commands = managed_chat_broker
+        .snapshot()
+        .await
+        .commands
+        .into_values()
+        .filter(|command| {
+            command.launch.purpose == crate::managed_chat::types::ManagedChatPurpose::Worker
+        })
+        .collect::<Vec<_>>();
+    for command in &retained_worker_commands {
+        if let Err(error) = sync_worker_launch_from_command(&state, command).await {
+            return json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
                 json!({
-                    "revoked": true,
-                    "retargetedCommands": retargeted_commands,
-                    "pausedCommands": paused_commands
+                    "error": format!(
+                        "paired browser commands were settled but worker launch state sync did not complete; retry revoke to resume safely: {error}"
+                    )
                 }),
-            )
+            );
         }
-        Ok(false) => json_response(
-            StatusCode::NOT_FOUND,
-            json!({ "error": "paired browser was not found" }),
+    }
+
+    match auth.revoke_client(&request.client_id).await {
+        Ok(revoked) => json_response(
+            StatusCode::OK,
+            json!({
+                "revoked": revoked,
+                "alreadyRevoked": !revoked,
+                "retargetedCommands": retargeted_commands,
+                "pausedCommands": paused_commands
+            }),
         ),
         Err(error) => json_response(StatusCode::BAD_REQUEST, json!({ "error": error })),
     }
@@ -877,6 +870,7 @@ async fn redeem_companion_command(
     let Some(client_id) = companion_client_id(&state, &headers).await else {
         return companion_unauthorized();
     };
+    let _lifecycle_guard = crate::workers::WORKER_LIFECYCLE_LOCK.lock().await;
     let now_ms = unix_time_ms();
     let eligible = eligible_anchor_conversations_for_client(&state, &client_id, now_ms).await;
     let broker = { state.app.lock().await.managed_chat_broker.clone() };
@@ -925,6 +919,7 @@ async fn mark_companion_send_started(
         Ok(value) => value,
         Err(error) => return json_response(StatusCode::BAD_REQUEST, json!({ "error": error })),
     };
+    let _lifecycle_guard = crate::workers::WORKER_LIFECYCLE_LOCK.lock().await;
     let broker = { state.app.lock().await.managed_chat_broker.clone() };
     match broker
         .mark_send_started(&command_id, &lease_id, &client_id)
@@ -1005,6 +1000,7 @@ async fn ack_companion_command(
             );
         }
     };
+    let _lifecycle_guard = crate::workers::WORKER_LIFECYCLE_LOCK.lock().await;
     let broker = { state.app.lock().await.managed_chat_broker.clone() };
     match broker
         .acknowledge(&command_id, &lease_id, &client_id, outcome)
@@ -1047,6 +1043,7 @@ async fn clear_companion_workers(
         );
     }
 
+    let _lifecycle_guard = crate::workers::WORKER_LIFECYCLE_LOCK.lock().await;
     let (auth, managed_chat_broker, worker_broker) = {
         let app = state.app.lock().await;
         (
@@ -1080,14 +1077,21 @@ async fn clear_companion_workers(
         }
         (Some(value), _) | (_, Some(value)) => value,
         (None, None) => {
+            // A repeated clear after the prior response was lost must be harmless. Once both
+            // durable stores are empty there is intentionally no ownership record left to resolve.
             return json_response(
-                StatusCode::NOT_FOUND,
-                json!({ "error": "This Core has no MoonDesk worker history to clear" }),
+                StatusCode::OK,
+                json!({
+                    "cleared": true,
+                    "alreadyCleared": true,
+                    "workerIds": [],
+                    "commandIds": []
+                }),
             );
         }
     };
 
-    let preview = match worker_broker
+    let preview_workers = match worker_broker
         .ensure_clearable_session_digest(&session_digest)
         .await
     {
@@ -1107,31 +1111,48 @@ async fn clear_companion_workers(
             return json_response(status, json!({ "error": error.to_string() }));
         }
     };
-    let commands = match managed_chat_broker
-        .purge_terminal_for_anchor_session(&session_digest)
+    let preview_commands = match managed_chat_broker
+        .ensure_clearable_anchor_session(&session_digest)
         .await
     {
         Ok(value) => value,
         Err(error) => return managed_chat_error_response(error),
     };
+
+    // Clear the worker family first. If this durable write fails, managed-chat state is untouched.
+    // If the following terminal-command purge fails, those commands are non-dispatchable and still
+    // carry the session digest, so a retry can resolve ownership and finish the same clear safely.
     let workers = match worker_broker.clear_session_digest(&session_digest).await {
+        Ok(value) => value,
+        Err(error) => {
+            return json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({ "error": format!("worker family cleanup did not complete; retry is safe: {error}") }),
+            );
+        }
+    };
+    let commands = match managed_chat_broker
+        .purge_terminal_for_anchor_session(&session_digest)
+        .await
+    {
         Ok(value) => value,
         Err(error) => {
             return json_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 json!({
                     "error": format!(
-                        "managed-chat worker commands were cleared but worker family cleanup did not complete: {error}"
+                        "worker family was cleared but terminal command cleanup did not complete; retry clear to resume safely: {error}"
                     )
                 }),
             );
         }
     };
-    debug_assert_eq!(preview.len(), workers.len());
+
     json_response(
         StatusCode::OK,
         json!({
             "cleared": true,
+            "alreadyCleared": preview_workers.is_empty() && preview_commands.is_empty(),
             "workerIds": workers.iter().map(|worker| worker.id.to_string()).collect::<Vec<_>>(),
             "commandIds": commands.iter().map(|command| command.id.to_string()).collect::<Vec<_>>()
         }),
@@ -2822,6 +2843,40 @@ mod tests {
             .expect("second browser is authorized");
         assert_eq!(second_status.status(), StatusCode::OK);
 
+        let revoke_url = format!("http://{address}{COMPANION_CLIENTS_ROUTE}");
+        let revoke_body = json!({ "clientId": "extension-install-b" });
+        let revoked = client
+            .post(&revoke_url)
+            .header(COMPANION_TOKEN_HEADER, &credential)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(reqwest_json_body(&revoke_body))
+            .send()
+            .await
+            .expect("revoke second browser");
+        assert_eq!(revoked.status(), StatusCode::OK);
+        let revoked_json = reqwest_response_json(revoked).await;
+        assert_eq!(
+            revoked_json.get("revoked").and_then(Value::as_bool),
+            Some(true)
+        );
+
+        let revoked_retry = client
+            .post(&revoke_url)
+            .header(COMPANION_TOKEN_HEADER, &credential)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(reqwest_json_body(&revoke_body))
+            .send()
+            .await
+            .expect("retry revoke after response loss");
+        assert_eq!(revoked_retry.status(), StatusCode::OK);
+        let revoked_retry_json = reqwest_response_json(revoked_retry).await;
+        assert_eq!(
+            revoked_retry_json
+                .get("alreadyRevoked")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+
         let web_origin = client
             .post(&pair_url)
             .header(reqwest::header::ORIGIN, "https://chatgpt.com")
@@ -2837,6 +2892,250 @@ mod tests {
         let _ = std::fs::remove_file(config_path);
         let _ = std::fs::remove_dir_all(config_root);
         let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn clear_worker_history_saga_resumes_after_restart_between_store_commits() {
+        let root = unique_temp_path("moondesk-clear-saga-restart");
+        std::fs::create_dir_all(&root).expect("create clear saga root");
+        let worker_path = root.join("worker-state-v1.json");
+        let managed_path = root.join("managed-chat-state-v1.json");
+        let workspace_id = crate::workspaces::WorkspaceId::new();
+        let conversation_id = "6ac62769-0c94-83e8-a8ef-95a21c7f3e7f";
+        let session_digest = "d".repeat(64);
+        let anchor_identity = crate::workers::types::ChatIdentity {
+            session_digest: session_digest.clone(),
+            subject_digest: None,
+        };
+        let worker_broker = crate::workers::broker::WorkerBroker::open(&worker_path)
+            .expect("open clear saga worker broker");
+        let managed_chat_broker =
+            crate::managed_chat::broker::ManagedChatBroker::open(&managed_path)
+                .expect("open clear saga managed broker");
+
+        let spawned = worker_broker
+            .spawn_worker(crate::workers::broker::SpawnWorkerRequest {
+                operation_id: crate::workers::types::OperationId::new(),
+                workspace_id: workspace_id.clone(),
+                anchor_identity: anchor_identity.clone(),
+                label: "clear saga".into(),
+                assignment: "prove restart-safe clear ordering".into(),
+                execution_profile: ChatExecutionProfile::default(),
+            })
+            .await
+            .expect("seed clear saga worker");
+        let command = managed_chat_broker
+            .enqueue_with_route(
+                EnqueueManagedChatRequest {
+                    dedupe_key: format!("worker:{}:task:{}", spawned.worker_id, spawned.task_id),
+                    launch: ManagedChatLaunch {
+                        workspace_id: workspace_id.clone(),
+                        purpose: ManagedChatPurpose::Worker,
+                        execution_profile: ChatExecutionProfile::default(),
+                        opening_message: "clear saga launch".into(),
+                        task_marker: format!("clear-saga:{}", spawned.task_id),
+                        thread_key: Some(format!("worker:{}", spawned.worker_id)),
+                        open_mode: ManagedChatOpenMode::NewThread,
+                        anchor_session_digest: Some(session_digest.clone()),
+                    },
+                },
+                Some("clear-saga-browser".into()),
+                Some(crate::managed_chat::types::ManagedChatAnchorContext {
+                    conversation_id: conversation_id.into(),
+                    conversation_url: format!("https://chatgpt.com/c/{conversation_id}"),
+                    project_id: None,
+                    project_url: None,
+                }),
+            )
+            .await
+            .expect("seed clear saga command");
+        worker_broker
+            .link_launch_command(
+                &workspace_id,
+                &anchor_identity,
+                &spawned.worker_id,
+                &spawned.task_id,
+                &command.id.to_string(),
+            )
+            .await
+            .expect("link clear saga command");
+        let offer = managed_chat_broker
+            .redeem("clear-saga-browser", 1_000)
+            .await
+            .expect("redeem clear saga command")
+            .expect("clear saga lease");
+        let lease_id = offer
+            .command
+            .lease
+            .as_ref()
+            .expect("clear saga lease id")
+            .lease_id
+            .clone();
+        managed_chat_broker
+            .acknowledge(
+                &command.id,
+                &lease_id,
+                "clear-saga-browser",
+                ManagedChatAckOutcome::Failed {
+                    details: Some("proven pre-Send failure".into()),
+                },
+            )
+            .await
+            .expect("settle clear saga managed command");
+        worker_broker
+            .settle_pre_send_failure_by_command(
+                &command.id.to_string(),
+                Some("proven pre-Send failure".into()),
+            )
+            .await
+            .expect("settle clear saga worker")
+            .expect("clear saga worker exists");
+        worker_broker
+            .ensure_clearable_session_digest(&session_digest)
+            .await
+            .expect("worker side is clearable");
+        managed_chat_broker
+            .ensure_clearable_anchor_session(&session_digest)
+            .await
+            .expect("managed side is clearable");
+
+        worker_broker
+            .clear_session_digest(&session_digest)
+            .await
+            .expect("commit worker side of clear saga");
+        managed_chat_broker.fail_next_commit_for_test();
+        let interrupted = managed_chat_broker
+            .purge_terminal_for_anchor_session(&session_digest)
+            .await
+            .expect_err("inject managed-store failure after worker clear commit");
+        assert!(matches!(
+            interrupted,
+            crate::managed_chat::broker::ManagedChatError::Storage(_)
+        ));
+        drop(worker_broker);
+        drop(managed_chat_broker);
+
+        let worker_broker = crate::workers::broker::WorkerBroker::open(&worker_path)
+            .expect("reopen worker broker after simulated restart");
+        let managed_chat_broker =
+            crate::managed_chat::broker::ManagedChatBroker::open(&managed_path)
+                .expect("reopen managed broker after simulated restart");
+        assert!(
+            worker_broker
+                .family_for_anchor(&workspace_id, &anchor_identity)
+                .await
+                .expect("read cleared worker family after restart")
+                .is_none()
+        );
+        assert_eq!(
+            managed_chat_broker
+                .anchor_session_digest_for_conversation(conversation_id)
+                .await
+                .expect("recover Core digest from retained managed command"),
+            Some(session_digest.clone())
+        );
+        let removed = managed_chat_broker
+            .purge_terminal_for_anchor_session(&session_digest)
+            .await
+            .expect("resume clear saga after restart");
+        assert_eq!(removed.len(), 1);
+        assert!(managed_chat_broker.snapshot().await.commands.is_empty());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn revoke_saga_survives_restart_after_command_settlement_before_credential_removal() {
+        let root = unique_temp_path("moondesk-revoke-saga-restart");
+        std::fs::create_dir_all(&root).expect("create revoke saga root");
+        let auth_path = root.join("companion-auth.json");
+        let managed_path = root.join("managed-chat-state-v1.json");
+        let origin = "chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let client_id = "revoke-saga-browser";
+        let credential = "a".repeat(64);
+        let auth = crate::companion::CompanionAuth::open(&auth_path)
+            .expect("open revoke saga companion auth");
+        auth.auto_pair(client_id, &credential, Some(origin))
+            .await
+            .expect("pair revoke saga browser");
+        let managed_chat_broker =
+            crate::managed_chat::broker::ManagedChatBroker::open(&managed_path)
+                .expect("open revoke saga managed broker");
+        let command = managed_chat_broker
+            .enqueue_with_route(
+                EnqueueManagedChatRequest {
+                    dedupe_key: "revoke-saga-command".into(),
+                    launch: ManagedChatLaunch {
+                        workspace_id: crate::workspaces::WorkspaceId::new(),
+                        purpose: ManagedChatPurpose::Worker,
+                        execution_profile: ChatExecutionProfile::default(),
+                        opening_message: "revoke saga launch".into(),
+                        task_marker: "revoke-saga-task".into(),
+                        thread_key: Some("worker:revoke-saga".into()),
+                        open_mode: ManagedChatOpenMode::NewThread,
+                        anchor_session_digest: Some("e".repeat(64)),
+                    },
+                },
+                Some(client_id.into()),
+                None,
+            )
+            .await
+            .expect("seed revoke saga command");
+        let offer = managed_chat_broker
+            .redeem(client_id, 1_000)
+            .await
+            .expect("redeem revoke saga command")
+            .expect("revoke saga lease");
+        let lease_id = offer
+            .command
+            .lease
+            .as_ref()
+            .expect("revoke saga lease id")
+            .lease_id
+            .clone();
+        managed_chat_broker
+            .mark_send_started(&command.id, &lease_id, client_id)
+            .await
+            .expect("cross Send boundary before revoke");
+        let (retargeted, paused, changed) = managed_chat_broker
+            .settle_revoked_client(client_id)
+            .await
+            .expect("settle revoke saga commands before credential removal");
+        assert_eq!((retargeted, paused), (0, 1));
+        assert_eq!(changed.len(), 1);
+        assert_eq!(changed[0].state, ManagedChatCommandState::Paused);
+        assert!(changed[0].target_client_id.is_none());
+        drop(managed_chat_broker);
+        drop(auth);
+
+        let auth = crate::companion::CompanionAuth::open(&auth_path)
+            .expect("reopen revoke saga auth after simulated restart");
+        let managed_chat_broker =
+            crate::managed_chat::broker::ManagedChatBroker::open(&managed_path)
+                .expect("reopen revoke saga managed broker after simulated restart");
+        assert_eq!(
+            auth.authorize(&credential, Some(origin)).await.as_deref(),
+            Some(client_id),
+            "credential removal had not happened before the simulated crash"
+        );
+        let restored = managed_chat_broker
+            .snapshot()
+            .await
+            .commands
+            .get(&command.id)
+            .cloned()
+            .expect("settled command survives restart");
+        assert_eq!(restored.state, ManagedChatCommandState::Paused);
+        assert!(restored.target_client_id.is_none());
+        assert!(
+            auth.revoke_client(client_id)
+                .await
+                .expect("resume credential removal after restart")
+        );
+        drop(auth);
+        let auth = crate::companion::CompanionAuth::open(&auth_path)
+            .expect("reopen auth after completed revoke saga");
+        assert!(auth.authorize(&credential, Some(origin)).await.is_none());
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]
@@ -2861,6 +3160,7 @@ mod tests {
             .id
             .clone();
         let managed_chat_broker = app.managed_chat_broker.clone();
+        let worker_broker = app.worker_broker.clone();
         let app_state = Arc::new(Mutex::new(app));
         let (ui_tx, _ui_rx) = ui_event_channel();
         let app = companion_bridge_router(
@@ -2995,6 +3295,41 @@ mod tests {
 
         let core_conversation_id = "6ac62769-0c94-83e8-a8ef-95a21c7f3e7f";
         let core_session_digest = "c".repeat(64);
+        let core_identity = crate::workers::types::ChatIdentity {
+            session_digest: core_session_digest.clone(),
+            subject_digest: None,
+        };
+        let clear_worker = worker_broker
+            .spawn_worker(crate::workers::broker::SpawnWorkerRequest {
+                operation_id: crate::workers::types::OperationId::new(),
+                workspace_id: workspace_id.clone(),
+                anchor_identity: core_identity.clone(),
+                label: "clear saga worker".into(),
+                assignment: "seed clear retry coverage".into(),
+                execution_profile: ChatExecutionProfile::default(),
+            })
+            .await
+            .expect("seed clearable worker history");
+        let clear_worker_command = Uuid::new_v4().to_string();
+        worker_broker
+            .link_launch_command(
+                &workspace_id,
+                &core_identity,
+                &clear_worker.worker_id,
+                &clear_worker.task_id,
+                &clear_worker_command,
+            )
+            .await
+            .expect("link clearable worker command");
+        worker_broker
+            .settle_pre_send_failure_by_command(
+                &clear_worker_command,
+                Some("seeded pre-Send failure".into()),
+            )
+            .await
+            .expect("settle clearable worker")
+            .expect("worker exists");
+
         let command = managed_chat_broker
             .enqueue_with_route(
                 EnqueueManagedChatRequest {
@@ -3185,6 +3520,38 @@ mod tests {
             .expect("publish Core presence");
         assert_eq!(presence.status(), StatusCode::OK);
 
+        managed_chat_broker.fail_next_commit_for_test();
+        let interrupted_clear = client
+            .post(format!("http://{address}{COMPANION_CLEAR_WORKERS_ROUTE}"))
+            .header(COMPANION_TOKEN_HEADER, &credential)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(reqwest_json_body(
+                &json!({ "conversationId": core_conversation_id }),
+            ))
+            .send()
+            .await
+            .expect("inject clear failure after worker-store commit");
+        assert_eq!(
+            interrupted_clear.status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert!(
+            worker_broker
+                .family_for_anchor(&workspace_id, &core_identity)
+                .await
+                .expect("read family after interrupted clear")
+                .is_none(),
+            "worker store must commit first so a managed-store failure cannot strand live worker state"
+        );
+        assert!(
+            managed_chat_broker
+                .snapshot()
+                .await
+                .commands
+                .contains_key(&command.id),
+            "terminal managed command must remain retryable after injected persistence failure"
+        );
+
         let cleared = client
             .post(format!("http://{address}{COMPANION_CLEAR_WORKERS_ROUTE}"))
             .header(COMPANION_TOKEN_HEADER, &credential)
@@ -3194,7 +3561,7 @@ mod tests {
             ))
             .send()
             .await
-            .expect("clear Core worker history");
+            .expect("retry interrupted Core worker clear");
         assert_eq!(cleared.status(), StatusCode::OK);
         let cleared_json = reqwest_response_json(cleared).await;
         assert_eq!(
@@ -3208,6 +3575,25 @@ mod tests {
                 .is_some_and(|ids| ids
                     .iter()
                     .any(|id| id.as_str() == Some(command_id.as_str())))
+        );
+
+        let cleared_retry = client
+            .post(format!("http://{address}{COMPANION_CLEAR_WORKERS_ROUTE}"))
+            .header(COMPANION_TOKEN_HEADER, &credential)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(reqwest_json_body(
+                &json!({ "conversationId": core_conversation_id }),
+            ))
+            .send()
+            .await
+            .expect("retry clear after response loss");
+        assert_eq!(cleared_retry.status(), StatusCode::OK);
+        let cleared_retry_json = reqwest_response_json(cleared_retry).await;
+        assert_eq!(
+            cleared_retry_json
+                .get("alreadyCleared")
+                .and_then(Value::as_bool),
+            Some(true)
         );
 
         let removed_retry_endpoint = client

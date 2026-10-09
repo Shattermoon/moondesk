@@ -54,7 +54,7 @@ fn legacy_binding_from_history(
     commands: &[ManagedChatCommand],
     command: &ManagedChatCommand,
     worker_store_path: Option<&Path>,
-) -> Option<String> {
+) -> std::io::Result<Option<String>> {
     if let Some(url) = command
         .terminal
         .as_ref()
@@ -62,9 +62,11 @@ fn legacy_binding_from_history(
         .and_then(|terminal| terminal.conversation_url.as_ref())
         .filter(|url| canonical_chatgpt_conversation_id(url).is_some())
     {
-        return Some(url.clone());
+        return Ok(Some(url.clone()));
     }
-    let thread_key = command.launch.thread_key.as_deref()?;
+    let Some(thread_key) = command.launch.thread_key.as_deref() else {
+        return Ok(None);
+    };
     let history_url = commands
         .iter()
         .filter(|candidate| {
@@ -85,17 +87,17 @@ fn legacy_binding_from_history(
         .max_by_key(|(sequence, _)| *sequence)
         .map(|(_, url)| url);
     if history_url.is_some() {
-        return history_url;
+        return Ok(history_url);
     }
-    let worker_store_path = worker_store_path?;
-    crate::workers::durable_conversation_url_for_legacy_thread(
+    let Some(worker_store_path) = worker_store_path else {
+        return Ok(None);
+    };
+    let durable = crate::workers::durable_conversation_url_for_legacy_thread(
         worker_store_path,
         &command.launch.workspace_id,
         thread_key,
-    )
-    .ok()
-    .flatten()
-    .filter(|url| canonical_chatgpt_conversation_id(url).is_some())
+    )?;
+    Ok(durable.filter(|url| canonical_chatgpt_conversation_id(url).is_some()))
 }
 
 fn migrate_legacy_existing_thread_commands(
@@ -111,7 +113,7 @@ fn migrate_legacy_existing_thread_commands(
         {
             continue;
         }
-        if let Some(url) = legacy_binding_from_history(&snapshot, command, worker_store_path) {
+        if let Some(url) = legacy_binding_from_history(&snapshot, command, worker_store_path)? {
             command.launch.existing_conversation_url = Some(url);
             command.request_fingerprint = fingerprint_after_launch_migration(command)?;
             changed = true;
@@ -554,6 +556,55 @@ mod tests {
             Some(conversation_url.as_str())
         );
         assert_eq!(migrated.state, ManagedChatCommandState::Queued);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn legacy_binding_migration_propagates_worker_store_read_failure() {
+        let root = temp_root("moondesk-managed-chat-store-legacy-worker-error");
+        fs::create_dir_all(&root).expect("create worker error migration root");
+        let managed_path = root.join(MANAGED_CHAT_STORE_FILE_NAME);
+        let worker_path = root.join(crate::workers::WORKER_STORE_FILE_NAME);
+        let command_id = ManagedChatCommandId::new();
+        let command = ManagedChatCommand {
+            id: command_id.clone(),
+            sequence: 0,
+            dedupe_key: "legacy-worker-store-error".into(),
+            request_fingerprint: "e".repeat(64),
+            launch: legacy_launch(
+                WorkspaceId::new(),
+                "legacy-worker-store-error",
+                ManagedChatOpenMode::ExistingThread,
+                &format!("worker:{}", Uuid::new_v4()),
+            ),
+            state: ManagedChatCommandState::Queued,
+            dispatch_ready: true,
+            reconcile_history: false,
+            lease: None,
+            terminal: None,
+            target_client_id: Some("legacy-browser".into()),
+            target_client_pinned_by_request: true,
+            anchor_context: None,
+        };
+        let mut data = ManagedChatStoreData {
+            next_sequence: 1,
+            ..Default::default()
+        };
+        data.dedupe
+            .insert(command.dedupe_key.clone(), command_id.clone());
+        data.commands.insert(command_id, command);
+        fs::write(
+            &managed_path,
+            serde_json::to_vec_pretty(&data).expect("serialize worker error fixture"),
+        )
+        .expect("write worker error fixture");
+        fs::write(&worker_path, b"{not-valid-worker-json")
+            .expect("write corrupt authoritative worker store");
+
+        let error = load(&managed_path).expect_err(
+            "authoritative worker-store read failure must not be treated as no binding",
+        );
+        assert!(error.to_string().contains("failed to parse worker state"));
         let _ = fs::remove_dir_all(root);
     }
 

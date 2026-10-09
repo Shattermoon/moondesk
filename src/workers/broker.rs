@@ -401,16 +401,6 @@ impl WorkerBroker {
                 "worker conversation URL is invalid".into(),
             ));
         }
-        if launch_state == WorkerLaunchState::WaitingClaim
-            && conversation_url
-                .as_deref()
-                .and_then(canonical_conversation_id_from_url)
-                .is_none()
-        {
-            return Err(WorkerBrokerError::Invalid(
-                "worker WaitingClaim state requires a canonical ChatGPT conversation URL".into(),
-            ));
-        }
         let mut guard = self.data.lock().await;
         let mut location = None;
         'families: for (family_id, family) in &guard.families {
@@ -434,6 +424,16 @@ impl WorkerBroker {
             && launch_state != WorkerLaunchState::Claimed
         {
             return Ok(Some(worker.clone()));
+        }
+        if launch_state == WorkerLaunchState::WaitingClaim
+            && conversation_url
+                .as_deref()
+                .and_then(canonical_conversation_id_from_url)
+                .is_none()
+        {
+            return Err(WorkerBrokerError::Invalid(
+                "worker WaitingClaim state requires a canonical ChatGPT conversation URL".into(),
+            ));
         }
         worker.launch_state = launch_state;
         worker.launch_error = launch_error;
@@ -3964,6 +3964,86 @@ mod tests {
             )
             .await
             .expect("worker conversation claims exact launch");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn claimed_and_unlinked_history_ignore_obsolete_waiting_claim_urls() {
+        let root = temp_root("moondesk-worker-claimed-legacy-sync");
+        let path = root.join("worker-state-v1.json");
+        let broker = WorkerBroker::open(&path).expect("open worker broker");
+        let workspace = WorkspaceId::new();
+        let core = anchor("core-claimed-legacy-sync");
+        let worker_identity = anchor("worker-claimed-legacy-sync");
+        let spawned = broker
+            .spawn_worker(spawn_request(
+                OperationId::new(),
+                workspace.clone(),
+                core.clone(),
+                "claimed legacy launch sync",
+            ))
+            .await
+            .expect("spawn worker");
+        let command_id = Uuid::new_v4().to_string();
+        broker
+            .link_launch_command(
+                &workspace,
+                &core,
+                &spawned.worker_id,
+                &spawned.task_id,
+                &command_id,
+            )
+            .await
+            .expect("link worker launch");
+        let canonical_url = format!("https://chatgpt.com/c/{}", spawned.worker_id);
+        broker
+            .update_launch_by_command(
+                &command_id,
+                WorkerLaunchState::WaitingClaim,
+                None,
+                Some(canonical_url.clone()),
+            )
+            .await
+            .expect("confirm canonical worker conversation");
+        broker
+            .claim_worker(
+                &workspace,
+                &spawned.worker_id,
+                &spawned.task_id,
+                &spawned.claim_token,
+                worker_identity,
+            )
+            .await
+            .expect("claim worker");
+
+        let obsolete_placeholder =
+            "https://chatgpt.com/c/local-chatgpt%3A422be40f-2871-4c05-9110-62ac6e7854cd";
+        let claimed = broker
+            .update_launch_by_command(
+                &command_id,
+                WorkerLaunchState::WaitingClaim,
+                None,
+                Some(obsolete_placeholder.into()),
+            )
+            .await
+            .expect("claimed historical launch sync must be a no-op")
+            .expect("claimed worker remains linked");
+        assert_eq!(claimed.launch_state, WorkerLaunchState::Claimed);
+        assert_eq!(
+            claimed.conversation_url.as_deref(),
+            Some(canonical_url.as_str())
+        );
+
+        let unlinked = broker
+            .update_launch_by_command(
+                &Uuid::new_v4().to_string(),
+                WorkerLaunchState::WaitingClaim,
+                None,
+                Some(obsolete_placeholder.into()),
+            )
+            .await
+            .expect("unlinked historical launch sync must be ignored");
+        assert!(unlinked.is_none());
         let _ = std::fs::remove_dir_all(root);
     }
 

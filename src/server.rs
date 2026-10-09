@@ -2065,7 +2065,8 @@ mod tests {
     use super::*;
     use crate::managed_chat::broker::EnqueueManagedChatRequest;
     use crate::managed_chat::types::{
-        ChatExecutionProfile, ManagedChatLaunch, ManagedChatOpenMode, ManagedChatPurpose,
+        ChatExecutionProfile, ManagedChatCommand, ManagedChatCommandId, ManagedChatCommandState,
+        ManagedChatLaunch, ManagedChatOpenMode, ManagedChatPurpose, ManagedChatTerminalResult,
         ReasoningEffort,
     };
     use crate::state::{AppState, Mode, ToolMode, rotate_workspace_secret, ui_event_channel};
@@ -2483,6 +2484,139 @@ mod tests {
             HeaderValue::from_static("wfr invalid/attempt"),
         );
         assert_eq!(normalized_openai_request_id(&invalid), None);
+    }
+
+    #[tokio::test]
+    async fn legacy_claimed_success_sync_ignores_obsolete_placeholder_url() {
+        let workspace_root = unique_temp_path("moondesk-legacy-claimed-sync-workspace");
+        let config_root = unique_temp_path("moondesk-legacy-claimed-sync-config");
+        let config_path = config_root.join("config.toml");
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        std::fs::create_dir_all(&config_root).expect("create config dir");
+
+        let app = AppState::new_for_test(
+            8787,
+            workspace_root.to_string_lossy().into_owned(),
+            config_path.clone(),
+        )
+        .expect("create app state");
+        let workspace_id = app.workspaces[0].id.clone();
+        let broker = app.worker_broker.clone();
+        let core = crate::workers::types::ChatIdentity::from_openai_meta(
+            Some("test-subject"),
+            "core-legacy-claimed-sync",
+        );
+        let worker_identity = crate::workers::types::ChatIdentity::from_openai_meta(
+            Some("test-subject"),
+            "worker-legacy-claimed-sync",
+        );
+        let spawned = broker
+            .spawn_worker(crate::workers::broker::SpawnWorkerRequest {
+                operation_id: crate::workers::types::OperationId::new(),
+                workspace_id: workspace_id.clone(),
+                anchor_identity: core.clone(),
+                label: "legacy claimed sync".into(),
+                assignment: "preserve claimed durable binding".into(),
+                execution_profile: ChatExecutionProfile::default(),
+            })
+            .await
+            .expect("spawn worker");
+        let command_id = Uuid::new_v4().to_string();
+        broker
+            .link_launch_command(
+                &workspace_id,
+                &core,
+                &spawned.worker_id,
+                &spawned.task_id,
+                &command_id,
+            )
+            .await
+            .expect("link launch command");
+        let canonical_url = format!("https://chatgpt.com/c/{}", spawned.worker_id);
+        broker
+            .update_launch_by_command(
+                &command_id,
+                crate::workers::types::WorkerLaunchState::WaitingClaim,
+                None,
+                Some(canonical_url.clone()),
+            )
+            .await
+            .expect("bind canonical worker conversation");
+        broker
+            .claim_worker(
+                &workspace_id,
+                &spawned.worker_id,
+                &spawned.task_id,
+                &spawned.claim_token,
+                worker_identity,
+            )
+            .await
+            .expect("claim worker");
+
+        let app_state = Arc::new(Mutex::new(app));
+        let (ui_tx, _ui_rx) = ui_event_channel();
+        let server_state = ServerState {
+            app: app_state,
+            browser_runtime: None,
+            command_jobs: CommandJobManager::new(),
+            ui_events: ui_tx,
+            host_control_token: Arc::from("unused-host-token"),
+        };
+        let legacy_command = ManagedChatCommand {
+            id: ManagedChatCommandId::parse(&command_id).expect("command id"),
+            sequence: 0,
+            dedupe_key: format!("worker:{}:task:{}", spawned.worker_id, spawned.task_id),
+            request_fingerprint: "a".repeat(64),
+            launch: ManagedChatLaunch {
+                workspace_id: workspace_id.clone(),
+                purpose: ManagedChatPurpose::Worker,
+                execution_profile: ChatExecutionProfile::default(),
+                opening_message: "legacy worker launch".into(),
+                task_marker: "legacy-worker-launch".into(),
+                thread_key: Some(format!("worker:{}", spawned.worker_id)),
+                open_mode: ManagedChatOpenMode::NewThread,
+                existing_conversation_url: None,
+                anchor_session_digest: Some(core.session_digest.clone()),
+            },
+            state: ManagedChatCommandState::Succeeded,
+            dispatch_ready: true,
+            reconcile_history: true,
+            lease: None,
+            terminal: Some(ManagedChatTerminalResult {
+                succeeded: true,
+                details: Some("legacy placeholder accepted by an older build".into()),
+                conversation_url: Some(
+                    "https://chatgpt.com/c/local-chatgpt%3A422be40f-2871-4c05-9110-62ac6e7854cd"
+                        .into(),
+                ),
+            }),
+            target_client_id: None,
+            target_client_pinned_by_request: false,
+            anchor_context: None,
+        };
+
+        sync_worker_launch_from_command(&server_state, &legacy_command)
+            .await
+            .expect("already-claimed legacy history must not block revoke reconciliation");
+        let family = broker
+            .family_for_anchor(&workspace_id, &core)
+            .await
+            .expect("read family")
+            .expect("family exists");
+        let worker = family
+            .workers
+            .get(&spawned.worker_id)
+            .expect("worker exists");
+        assert_eq!(
+            worker.launch_state,
+            crate::workers::types::WorkerLaunchState::Claimed
+        );
+        assert_eq!(
+            worker.conversation_url.as_deref(),
+            Some(canonical_url.as_str())
+        );
+        let _ = std::fs::remove_dir_all(workspace_root);
+        let _ = std::fs::remove_dir_all(config_root);
     }
 
     #[tokio::test]

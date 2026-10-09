@@ -1,13 +1,16 @@
 use super::store;
 use super::types::{
-    BrowserAttachmentState, ChatIdentity, MessageReceipt, OperationId, ReportReceipt, ReuseReceipt,
-    SpawnReceipt, TaskId, TaskState, WorkerExecutionProfile, WorkerFamily, WorkerFamilyId,
-    WorkerId, WorkerLaunchState, WorkerMessage, WorkerMessageId, WorkerMessageState, WorkerRecord,
-    WorkerReport, WorkerReportId, WorkerResult, WorkerState, WorkerStoreData, WorkerTask,
+    BrowserAttachmentState, ChatIdentity, CollectReceipt, CollectedTaskReceipt, MessageReceipt,
+    OperationId, ReportReceipt, ReuseReceipt, SpawnReceipt, TaskId, TaskState,
+    WorkerExecutionProfile, WorkerFamily, WorkerFamilyId, WorkerId, WorkerLaunchState,
+    WorkerMessage, WorkerMessageId, WorkerMessageState, WorkerRecord, WorkerReport, WorkerReportId,
+    WorkerResult, WorkerState, WorkerStoreData, WorkerTask,
 };
 use super::{
-    MAX_PENDING_MESSAGES_PER_WORKER, MAX_WORKER_ASSIGNMENT_BYTES, MAX_WORKER_MESSAGE_BYTES,
-    MAX_WORKER_RECORDS_PER_FAMILY, MAX_WORKERS_PER_FAMILY,
+    MAX_COLLECT_RECEIPTS_PER_FAMILY, MAX_COLLECTED_TASK_HISTORY_PER_WORKER,
+    MAX_IDEMPOTENCY_RECEIPTS_PER_FAMILY, MAX_PENDING_MESSAGES_PER_WORKER, MAX_REPORTS_PER_FAMILY,
+    MAX_TASK_RECORDS_PER_WORKER, MAX_UPDATES_PER_COLLECT, MAX_WORKER_ASSIGNMENT_BYTES,
+    MAX_WORKER_MESSAGE_BYTES, MAX_WORKER_RECORDS_PER_FAMILY, MAX_WORKERS_PER_FAMILY,
 };
 use crate::workspaces::WorkspaceId;
 use serde::Serialize;
@@ -124,8 +127,7 @@ impl WorkerBroker {
         })
     }
 
-    #[cfg(test)]
-    pub async fn snapshot(&self) -> WorkerStoreData {
+    pub(crate) async fn snapshot(&self) -> WorkerStoreData {
         self.data.lock().await.clone()
     }
 
@@ -167,12 +169,14 @@ impl WorkerBroker {
                         id: id.clone(),
                         workspace_id: request.workspace_id.clone(),
                         anchor_identity: request.anchor_identity.clone(),
+                        next_receipt_sequence: 0,
                         workers: Default::default(),
                         reports: Vec::new(),
                         spawn_requests: Default::default(),
                         reuse_requests: Default::default(),
                         message_requests: Default::default(),
                         report_requests: Default::default(),
+                        collect_requests: Default::default(),
                     },
                 );
                 id
@@ -231,8 +235,10 @@ impl WorkerBroker {
         };
         family.workers.insert(worker_id.clone(), worker);
 
+        let sequence = allocate_receipt_sequence(family)?;
         let receipt = SpawnReceipt {
             request_fingerprint: fingerprint,
+            sequence,
             family_id,
             worker_id,
             task_id,
@@ -242,6 +248,7 @@ impl WorkerBroker {
         family
             .spawn_requests
             .insert(request.operation_id, receipt.clone());
+        compact_family_history(family)?;
 
         self.commit_candidate(&mut guard, candidate).await?;
         Ok(receipt)
@@ -332,6 +339,16 @@ impl WorkerBroker {
         {
             return Err(WorkerBrokerError::Invalid(
                 "worker conversation URL is invalid".into(),
+            ));
+        }
+        if launch_state == WorkerLaunchState::WaitingClaim
+            && conversation_url
+                .as_deref()
+                .and_then(canonical_conversation_id_from_url)
+                .is_none()
+        {
+            return Err(WorkerBrokerError::Invalid(
+                "worker WaitingClaim state requires a canonical ChatGPT conversation URL".into(),
             ));
         }
         let mut guard = self.data.lock().await;
@@ -835,8 +852,10 @@ impl WorkerBroker {
             worker.attachment_state = BrowserAttachmentState::Opening;
             (worker.display_id.clone(), worker.execution_profile.clone())
         };
+        let sequence = allocate_receipt_sequence(family)?;
         let receipt = ReuseReceipt {
             request_fingerprint: fingerprint,
+            sequence,
             worker_id: request.worker_id,
             task_id,
             display_id,
@@ -845,6 +864,7 @@ impl WorkerBroker {
         family
             .reuse_requests
             .insert(request.operation_id, receipt.clone());
+        compact_family_history(family)?;
         self.commit_candidate(&mut guard, candidate).await?;
         Ok(receipt)
     }
@@ -1074,6 +1094,39 @@ impl WorkerBroker {
         Ok(workers)
     }
 
+    pub async fn expected_claim_conversation_id(
+        &self,
+        workspace_id: &WorkspaceId,
+        worker_id: &WorkerId,
+        task_id: &TaskId,
+    ) -> Result<String, WorkerBrokerError> {
+        let guard = self.data.lock().await;
+        let family_id = find_family_for_worker(&guard, workspace_id, worker_id)
+            .ok_or(WorkerBrokerError::NotFound)?;
+        let worker = guard
+            .families
+            .get(&family_id)
+            .and_then(|family| family.workers.get(worker_id))
+            .ok_or(WorkerBrokerError::NotFound)?;
+        if worker.current_task_id.as_ref() != Some(task_id) || !worker.tasks.contains_key(task_id) {
+            return Err(WorkerBrokerError::NotFound);
+        }
+        if worker.launch_state != WorkerLaunchState::WaitingClaim {
+            return Err(WorkerBrokerError::Conflict(
+                "worker cannot be claimed before MoonDesk confirms its launch".into(),
+            ));
+        }
+        worker
+            .conversation_url
+            .as_deref()
+            .and_then(canonical_conversation_id_from_url)
+            .ok_or_else(|| {
+                WorkerBrokerError::Conflict(
+                    "worker launch does not have a canonical ChatGPT conversation".into(),
+                )
+            })
+    }
+
     pub async fn claim_worker(
         &self,
         workspace_id: &WorkspaceId,
@@ -1088,13 +1141,33 @@ impl WorkerBroker {
         let mut guard = self.data.lock().await;
         let family_id = find_family_for_worker(&guard, workspace_id, worker_id)
             .ok_or(WorkerBrokerError::NotFound)?;
-        let worker = guard
+        let family = guard
             .families
             .get(&family_id)
-            .and_then(|family| family.workers.get(worker_id))
+            .ok_or(WorkerBrokerError::NotFound)?;
+        if family.anchor_identity == worker_identity {
+            return Err(WorkerBrokerError::Conflict(
+                "the Core conversation cannot claim one of its own workers".into(),
+            ));
+        }
+        let worker = family
+            .workers
+            .get(worker_id)
             .ok_or(WorkerBrokerError::NotFound)?;
         if worker.current_task_id.as_ref() != Some(task_id) || !worker.tasks.contains_key(task_id) {
             return Err(WorkerBrokerError::NotFound);
+        }
+        if worker.launch_state != WorkerLaunchState::WaitingClaim
+            || worker
+                .conversation_url
+                .as_deref()
+                .and_then(canonical_conversation_id_from_url)
+                .is_none()
+        {
+            return Err(WorkerBrokerError::Conflict(
+                "worker cannot be claimed before MoonDesk confirms its canonical ChatGPT conversation"
+                    .into(),
+            ));
         }
         if let Some(existing) = &worker.chat_identity {
             if existing == &worker_identity {
@@ -1196,14 +1269,17 @@ impl WorkerBroker {
             body: request.body,
             state: WorkerMessageState::Pending,
         });
+        let sequence = allocate_receipt_sequence(family)?;
         let receipt = MessageReceipt {
             request_fingerprint: fingerprint,
+            sequence,
             worker_id: request.worker_id,
             message_id,
         };
         family
             .message_requests
             .insert(request.operation_id, receipt.clone());
+        compact_family_history(family)?;
 
         self.commit_candidate(&mut guard, candidate).await?;
         Ok(receipt)
@@ -1310,6 +1386,12 @@ impl WorkerBroker {
             .families
             .get_mut(&family_id)
             .ok_or(WorkerBrokerError::NotFound)?;
+        compact_family_history(family)?;
+        if family.reports.len() >= MAX_REPORTS_PER_FAMILY {
+            return Err(WorkerBrokerError::Limit(format!(
+                "worker family is limited to {MAX_REPORTS_PER_FAMILY} uncollected reports; collect existing updates before reporting more"
+            )));
+        }
         let report_id = WorkerReportId::new();
         family.reports.push(WorkerReport {
             id: report_id.clone(),
@@ -1318,24 +1400,45 @@ impl WorkerBroker {
             body: request.body,
             collected: false,
         });
+        let sequence = allocate_receipt_sequence(family)?;
         let receipt = ReportReceipt {
             request_fingerprint: fingerprint,
+            sequence,
             worker_id: request.worker_id,
             report_id,
         };
         family
             .report_requests
             .insert(request.operation_id, receipt.clone());
+        compact_family_history(family)?;
         self.commit_candidate(&mut guard, candidate).await?;
         self.updates.notify_waiters();
         Ok(receipt)
     }
 
-    pub async fn collect_updates(
+    #[cfg(test)]
+    #[cfg(test)]
+    async fn collect_updates(
         &self,
         workspace_id: &WorkspaceId,
         anchor_identity: &ChatIdentity,
     ) -> Result<CollectedUpdates, WorkerBrokerError> {
+        let operation_id = OperationId::new();
+        self.collect_updates_for_operation(workspace_id, anchor_identity, &operation_id)
+            .await
+    }
+
+    async fn collect_updates_for_operation(
+        &self,
+        workspace_id: &WorkspaceId,
+        anchor_identity: &ChatIdentity,
+        operation_id: &OperationId,
+    ) -> Result<CollectedUpdates, WorkerBrokerError> {
+        let fingerprint = request_fingerprint(&(
+            "collect",
+            workspace_id.as_str(),
+            anchor_identity.session_digest.as_str(),
+        ))?;
         let mut guard = self.data.lock().await;
         let family_id = guard
             .families
@@ -1349,57 +1452,97 @@ impl WorkerBroker {
             .families
             .get(&family_id)
             .ok_or(WorkerBrokerError::NotFound)?;
-        let reports: Vec<_> = family
+        if let Some(receipt) = family.collect_requests.get(operation_id) {
+            if receipt.request_fingerprint != fingerprint {
+                return Err(WorkerBrokerError::Conflict(
+                    "worker collect operation id was reused with different input".into(),
+                ));
+            }
+            return Ok(collected_updates_from_receipt(receipt));
+        }
+
+        let reports = family
             .reports
             .iter()
             .filter(|report| !report.collected)
+            .take(MAX_UPDATES_PER_COLLECT)
             .cloned()
-            .collect();
+            .collect::<Vec<_>>();
         let mut completed = Vec::new();
-        for worker in family.workers.values() {
+        'workers: for worker in family.workers.values() {
             for task in worker.tasks.values() {
                 if task.collected {
                     continue;
                 }
                 if let Some(result) = &task.result {
-                    completed.push(CollectedWorkerUpdate {
+                    completed.push(CollectedTaskReceipt {
                         worker_id: worker.id.clone(),
                         display_id: worker.display_id.clone(),
                         task_id: task.id.clone(),
                         result: result.clone(),
                     });
+                    if completed.len() >= MAX_UPDATES_PER_COLLECT {
+                        break 'workers;
+                    }
                 }
             }
         }
         if reports.is_empty() && completed.is_empty() {
-            return Ok(CollectedUpdates { reports, completed });
+            return Ok(CollectedUpdates {
+                reports,
+                completed: Vec::new(),
+            });
         }
 
+        let report_ids = reports
+            .iter()
+            .map(|report| report.id.clone())
+            .collect::<BTreeSet<_>>();
+        let task_ids = completed
+            .iter()
+            .map(|task| task.task_id.clone())
+            .collect::<BTreeSet<_>>();
         let mut candidate = guard.clone();
         let family = candidate
             .families
             .get_mut(&family_id)
             .ok_or(WorkerBrokerError::NotFound)?;
-        for report in &mut family.reports {
-            if !report.collected {
-                report.collected = true;
-            }
-        }
+        family
+            .reports
+            .retain(|report| !report_ids.contains(&report.id));
         for worker in family.workers.values_mut() {
             for task in worker.tasks.values_mut() {
-                if task.result.is_some() {
+                if task_ids.contains(&task.id) {
                     task.collected = true;
                 }
             }
         }
+        let sequence = allocate_receipt_sequence(family)?;
+        let receipt = CollectReceipt {
+            request_fingerprint: fingerprint,
+            sequence,
+            reports,
+            completed,
+        };
+        family
+            .collect_requests
+            .insert(operation_id.clone(), receipt.clone());
+        compact_family_history(family)?;
         self.commit_candidate(&mut guard, candidate).await?;
-        Ok(CollectedUpdates { reports, completed })
+        Ok(collected_updates_from_receipt(&receipt))
+    }
+
+    fn enabled_update_waiter(&self) -> impl std::future::Future<Output = ()> + '_ {
+        let mut notified = Box::pin(self.updates.notified());
+        notified.as_mut().enable();
+        notified
     }
 
     pub async fn collect_updates_wait(
         &self,
         workspace_id: &WorkspaceId,
         anchor_identity: &ChatIdentity,
+        operation_id: &OperationId,
         wait_ms: u64,
     ) -> Result<CollectedUpdates, WorkerBrokerError> {
         const MAX_WAIT_MS: u64 = 60_000;
@@ -1409,15 +1552,19 @@ impl WorkerBroker {
             )));
         }
         if wait_ms == 0 {
-            return self.collect_updates(workspace_id, anchor_identity).await;
+            return self
+                .collect_updates_for_operation(workspace_id, anchor_identity, operation_id)
+                .await;
         }
 
         let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(wait_ms);
         loop {
-            // Register the waiter before inspecting durable state so a report/finish
-            // committed between the check and await cannot be missed.
-            let notified = self.updates.notified();
-            let updates = self.collect_updates(workspace_id, anchor_identity).await?;
+            // Register and enable the waiter before inspecting durable state. Tokio's Notify can
+            // otherwise hand a permit to a later waiter between Notified creation and first poll.
+            let notified = self.enabled_update_waiter();
+            let updates = self
+                .collect_updates_for_operation(workspace_id, anchor_identity, operation_id)
+                .await?;
             if !updates.reports.is_empty() || !updates.completed.is_empty() {
                 return Ok(updates);
             }
@@ -1442,6 +1589,10 @@ impl WorkerBroker {
         &self,
         request: FinishTaskRequest,
     ) -> Result<WorkerResult, WorkerBrokerError> {
+        request
+            .result
+            .validate()
+            .map_err(WorkerBrokerError::Invalid)?;
         let mut guard = self.data.lock().await;
         let family_id = find_family_for_worker(&guard, &request.workspace_id, &request.worker_id)
             .ok_or(WorkerBrokerError::NotFound)?;
@@ -1498,15 +1649,165 @@ impl WorkerBroker {
     ) -> Result<(), WorkerBrokerError> {
         let path = self.path.clone();
         let persisted = candidate.clone();
-        tokio::task::spawn_blocking(move || store::save(&path, &persisted))
+        let prepared = tokio::task::spawn_blocking(move || store::prepare_save(&path, &persisted))
             .await
             .map_err(|error| {
                 WorkerBrokerError::Storage(format!("worker state persistence task failed: {error}"))
             })?
             .map_err(storage_error)?;
+        // The only await is before the canonical store changes. Once execution resumes, commit the
+        // prepared temp file and publish the identical in-memory candidate without another
+        // cancellation point, so a dropped HTTP/MCP future cannot leave disk ahead of memory.
+        store::commit_prepared(prepared).map_err(storage_error)?;
         **guard = candidate;
         Ok(())
     }
+}
+
+fn collected_updates_from_receipt(receipt: &CollectReceipt) -> CollectedUpdates {
+    CollectedUpdates {
+        reports: receipt.reports.clone(),
+        completed: receipt
+            .completed
+            .iter()
+            .map(|update| CollectedWorkerUpdate {
+                worker_id: update.worker_id.clone(),
+                display_id: update.display_id.clone(),
+                task_id: update.task_id.clone(),
+                result: update.result.clone(),
+            })
+            .collect(),
+    }
+}
+
+fn allocate_receipt_sequence(family: &mut WorkerFamily) -> Result<u64, WorkerBrokerError> {
+    let sequence = family.next_receipt_sequence;
+    family.next_receipt_sequence = family
+        .next_receipt_sequence
+        .checked_add(1)
+        .ok_or_else(|| WorkerBrokerError::Limit("worker receipt sequence is exhausted".into()))?;
+    Ok(sequence)
+}
+
+fn prune_receipt_map<T, F, S>(
+    map: &mut std::collections::BTreeMap<OperationId, T>,
+    limit: usize,
+    is_protected: F,
+    sequence: S,
+) -> bool
+where
+    F: Fn(&T) -> bool,
+    S: Fn(&T) -> u64,
+{
+    while map.len() > limit {
+        let removable = map
+            .iter()
+            .filter(|(_, receipt)| !is_protected(receipt))
+            .min_by_key(|(_, receipt)| sequence(receipt))
+            .map(|(operation_id, _)| operation_id.clone());
+        let Some(operation_id) = removable else {
+            return false;
+        };
+        map.remove(&operation_id);
+    }
+    true
+}
+
+fn compact_family_history(family: &mut WorkerFamily) -> Result<(), WorkerBrokerError> {
+    // Older experimental stores marked delivered reports instead of removing them. They are no
+    // longer replayable obligations, so reclaim them before applying the bounded-history policy.
+    family.reports.retain(|report| !report.collected);
+
+    let task_sequences = family
+        .spawn_requests
+        .values()
+        .map(|receipt| (receipt.task_id.clone(), receipt.sequence))
+        .chain(
+            family
+                .reuse_requests
+                .values()
+                .map(|receipt| (receipt.task_id.clone(), receipt.sequence)),
+        )
+        .collect::<std::collections::BTreeMap<_, _>>();
+
+    for worker in family.workers.values_mut() {
+        let mut collected = worker
+            .tasks
+            .values()
+            .filter(|task| task.collected && worker.current_task_id.as_ref() != Some(&task.id))
+            .map(|task| {
+                (
+                    task.id.clone(),
+                    task_sequences.get(&task.id).copied().unwrap_or(0),
+                )
+            })
+            .collect::<Vec<_>>();
+        collected.sort_by_key(|(_, sequence)| std::cmp::Reverse(*sequence));
+        let keep = collected
+            .into_iter()
+            .take(MAX_COLLECTED_TASK_HISTORY_PER_WORKER)
+            .map(|(task_id, _)| task_id)
+            .collect::<BTreeSet<_>>();
+        worker.tasks.retain(|task_id, task| {
+            !task.collected
+                || worker.current_task_id.as_ref() == Some(task_id)
+                || keep.contains(task_id)
+        });
+        if worker.tasks.len() > MAX_TASK_RECORDS_PER_WORKER {
+            return Err(WorkerBrokerError::Limit(format!(
+                "worker task history is limited to {MAX_TASK_RECORDS_PER_WORKER} records"
+            )));
+        }
+    }
+
+    let task_ids = family
+        .workers
+        .values()
+        .flat_map(|worker| worker.tasks.keys().cloned())
+        .collect::<BTreeSet<_>>();
+    let message_ids = family
+        .workers
+        .values()
+        .flat_map(|worker| worker.messages.iter().map(|message| message.id.clone()))
+        .collect::<BTreeSet<_>>();
+    let report_ids = family
+        .reports
+        .iter()
+        .map(|report| report.id.clone())
+        .collect::<BTreeSet<_>>();
+
+    if !prune_receipt_map(
+        &mut family.spawn_requests,
+        MAX_IDEMPOTENCY_RECEIPTS_PER_FAMILY,
+        |receipt| task_ids.contains(&receipt.task_id),
+        |receipt| receipt.sequence,
+    ) || !prune_receipt_map(
+        &mut family.reuse_requests,
+        MAX_IDEMPOTENCY_RECEIPTS_PER_FAMILY,
+        |receipt| task_ids.contains(&receipt.task_id),
+        |receipt| receipt.sequence,
+    ) || !prune_receipt_map(
+        &mut family.message_requests,
+        MAX_IDEMPOTENCY_RECEIPTS_PER_FAMILY,
+        |receipt| message_ids.contains(&receipt.message_id),
+        |receipt| receipt.sequence,
+    ) || !prune_receipt_map(
+        &mut family.report_requests,
+        MAX_IDEMPOTENCY_RECEIPTS_PER_FAMILY,
+        |receipt| report_ids.contains(&receipt.report_id),
+        |receipt| receipt.sequence,
+    ) || !prune_receipt_map(
+        &mut family.collect_requests,
+        MAX_COLLECT_RECEIPTS_PER_FAMILY,
+        |_| false,
+        |receipt| receipt.sequence,
+    ) {
+        return Err(WorkerBrokerError::Limit(
+            "worker idempotency history cannot be compacted while every retained receipt is still active"
+                .into(),
+        ));
+    }
+    Ok(())
 }
 
 fn new_claim_token() -> String {
@@ -1517,15 +1818,37 @@ fn storage_error(error: std::io::Error) -> WorkerBrokerError {
     WorkerBrokerError::Storage(format!("failed to persist worker state: {error}"))
 }
 
-fn conversation_id_from_url(value: &str) -> Option<String> {
+fn canonical_conversation_id_from_url(value: &str) -> Option<String> {
     let url = reqwest::Url::parse(value).ok()?;
-    if url.scheme() != "https" || url.host_str() != Some("chatgpt.com") {
+    if url.scheme() != "https"
+        || url.host_str() != Some("chatgpt.com")
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
         return None;
     }
-    let segments = url.path_segments()?.collect::<Vec<_>>();
-    let conversation_id = segments
-        .windows(2)
-        .find_map(|pair| (pair[0] == "c").then_some(pair[1]))?;
+    let segments = url
+        .path_segments()?
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    let valid_project_segment = |segment: &str| {
+        segment
+            .get(..36)
+            .and_then(|prefix| prefix.strip_prefix("g-p-"))
+            .is_some_and(|suffix| {
+                suffix.len() == 32 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+    };
+    let conversation_id = match segments.as_slice() {
+        ["c", conversation_id] => *conversation_id,
+        ["g", project, "c", conversation_id] if valid_project_segment(project) => *conversation_id,
+        ["g", project, "shared", "c", conversation_id] if valid_project_segment(project) => {
+            *conversation_id
+        }
+        _ => return None,
+    };
     if !(16..=64).contains(&conversation_id.len())
         || !conversation_id
             .bytes()
@@ -1534,6 +1857,10 @@ fn conversation_id_from_url(value: &str) -> Option<String> {
         return None;
     }
     Some(conversation_id.to_ascii_lowercase())
+}
+
+fn conversation_id_from_url(value: &str) -> Option<String> {
+    canonical_conversation_id_from_url(value)
 }
 
 fn validate_spawn_request(request: &SpawnWorkerRequest) -> Result<(), WorkerBrokerError> {
@@ -1639,6 +1966,34 @@ mod tests {
             validation: "tests passed".into(),
             blockers: Vec::new(),
         }
+    }
+
+    async fn make_claimable(
+        broker: &WorkerBroker,
+        workspace: &WorkspaceId,
+        anchor_identity: &ChatIdentity,
+        receipt: &SpawnReceipt,
+    ) {
+        let command_id = Uuid::new_v4().to_string();
+        broker
+            .link_launch_command(
+                workspace,
+                anchor_identity,
+                &receipt.worker_id,
+                &receipt.task_id,
+                &command_id,
+            )
+            .await
+            .expect("link worker launch before claim");
+        broker
+            .update_launch_by_command(
+                &command_id,
+                WorkerLaunchState::WaitingClaim,
+                None,
+                Some(format!("https://chatgpt.com/c/{}", receipt.worker_id)),
+            )
+            .await
+            .expect("confirm canonical worker conversation before claim");
     }
 
     #[tokio::test]
@@ -1862,6 +2217,7 @@ mod tests {
             ))
             .await
             .expect("spawn real worker");
+        make_claimable(&broker, &workspace, &anchor_identity, &live).await;
         broker
             .claim_worker(
                 &workspace,
@@ -1928,6 +2284,7 @@ mod tests {
             ))
             .await
             .expect("spawn durable worker");
+        make_claimable(&broker, &workspace, &identity, &spawned).await;
         broker
             .claim_worker(
                 &workspace,
@@ -2004,6 +2361,7 @@ mod tests {
             ))
             .await
             .expect("spawn worker");
+        make_claimable(&broker, &workspace, &anchor_identity, &spawned).await;
         broker
             .claim_worker(
                 &workspace,
@@ -2314,6 +2672,7 @@ mod tests {
             ))
             .await
             .expect("spawn durable worker");
+        make_claimable(&broker, &workspace, &core, &durable).await;
         let worker_identity = anchor("worker-pre-send-settle");
         broker
             .claim_worker(
@@ -2421,21 +2780,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn oversized_finish_result_is_rejected_without_completing_the_task() {
+        let root = temp_root("moondesk-worker-finish-size-limit");
+        let path = root.join("worker-state-v1.json");
+        let broker = WorkerBroker::open(&path).expect("open worker broker");
+        let workspace = WorkspaceId::new();
+        let anchor_identity = anchor("anchor-finish-size-limit");
+        let worker_identity = anchor("worker-finish-size-limit");
+        let spawned = broker
+            .spawn_worker(spawn_request(
+                OperationId::new(),
+                workspace.clone(),
+                anchor_identity.clone(),
+                "finish size limit",
+            ))
+            .await
+            .expect("spawn worker");
+        make_claimable(&broker, &workspace, &anchor_identity, &spawned).await;
+        broker
+            .claim_worker(
+                &workspace,
+                &spawned.worker_id,
+                &spawned.task_id,
+                &spawned.claim_token,
+                worker_identity.clone(),
+            )
+            .await
+            .expect("claim worker");
+
+        let error = broker
+            .finish_task(FinishTaskRequest {
+                workspace_id: workspace.clone(),
+                worker_identity,
+                worker_id: spawned.worker_id.clone(),
+                task_id: spawned.task_id.clone(),
+                result: WorkerResult {
+                    result: "x".repeat(crate::workers::MAX_WORKER_RESULT_BYTES),
+                    changes: "overflow".into(),
+                    validation: "overflow".into(),
+                    blockers: Vec::new(),
+                },
+            })
+            .await
+            .expect_err("oversized result must fail before durable mutation");
+        assert!(matches!(error, WorkerBrokerError::Invalid(_)));
+
+        let snapshot = broker.snapshot().await;
+        let worker = snapshot
+            .families
+            .values()
+            .next()
+            .and_then(|family| family.workers.get(&spawned.worker_id))
+            .expect("worker remains");
+        assert_eq!(worker.current_task_id.as_ref(), Some(&spawned.task_id));
+        assert_eq!(
+            worker.tasks.get(&spawned.task_id).map(|task| task.state),
+            Some(TaskState::Running)
+        );
+        assert!(
+            worker
+                .tasks
+                .get(&spawned.task_id)
+                .and_then(|task| task.result.as_ref())
+                .is_none()
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn finish_is_idempotent_but_conflicting_second_result_is_rejected() {
         let root = temp_root("moondesk-worker-finish-idempotent");
         let path = root.join("worker-state-v1.json");
         let broker = WorkerBroker::open(&path).expect("open worker broker");
         let workspace = WorkspaceId::new();
+        let anchor_identity = anchor("anchor-finish");
         let worker_identity = anchor("worker-finish");
         let spawned = broker
             .spawn_worker(spawn_request(
                 OperationId::new(),
                 workspace.clone(),
-                anchor("anchor-finish"),
+                anchor_identity.clone(),
                 "finish task",
             ))
             .await
             .expect("spawn worker");
+        make_claimable(&broker, &workspace, &anchor_identity, &spawned).await;
         broker
             .claim_worker(
                 &workspace,
@@ -2497,6 +2926,7 @@ mod tests {
             ))
             .await
             .expect("spawn worker");
+        make_claimable(&broker, &workspace, &anchor_identity, &spawned).await;
         broker
             .claim_worker(
                 &workspace,
@@ -2652,6 +3082,7 @@ mod tests {
             ))
             .await
             .expect("spawn worker");
+        make_claimable(&broker, &workspace, &anchor_identity, &spawned).await;
         let bad_claim = broker
             .claim_worker(
                 &workspace,
@@ -2756,6 +3187,7 @@ mod tests {
             ))
             .await
             .expect("spawn worker");
+        make_claimable(&broker, &workspace, &anchor_identity, &spawned).await;
         broker
             .claim_worker(
                 &workspace,
@@ -2772,7 +3204,12 @@ mod tests {
         let waiting_anchor = anchor_identity.clone();
         let waiter = tokio::spawn(async move {
             waiting_broker
-                .collect_updates_wait(&waiting_workspace, &waiting_anchor, 2_000)
+                .collect_updates_wait(
+                    &waiting_workspace,
+                    &waiting_anchor,
+                    &OperationId::new(),
+                    2_000,
+                )
                 .await
         });
         tokio::time::sleep(tokio::time::Duration::from_millis(25)).await;
@@ -2798,17 +3235,76 @@ mod tests {
         assert!(updates.completed.is_empty());
 
         let empty = broker
-            .collect_updates_wait(&workspace, &anchor_identity, 25)
+            .collect_updates_wait(&workspace, &anchor_identity, &OperationId::new(), 25)
             .await
             .expect("bounded empty wait");
         assert!(empty.reports.is_empty());
         assert!(empty.completed.is_empty());
 
         let too_long = broker
-            .collect_updates_wait(&workspace, &anchor_identity, 60_001)
+            .collect_updates_wait(&workspace, &anchor_identity, &OperationId::new(), 60_001)
             .await
             .expect_err("oversized wait must fail");
         assert!(matches!(too_long, WorkerBrokerError::Invalid(_)));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn enabled_collect_waiter_catches_report_committed_after_empty_read_before_await() {
+        let root = temp_root("moondesk-worker-collect-race");
+        let path = root.join("worker-state-v1.json");
+        let broker = WorkerBroker::open(&path).expect("open worker broker");
+        let workspace = WorkspaceId::new();
+        let anchor_identity = anchor("anchor-collect-race");
+        let worker_identity = anchor("worker-collect-race");
+        let spawned = broker
+            .spawn_worker(spawn_request(
+                OperationId::new(),
+                workspace.clone(),
+                anchor_identity.clone(),
+                "exercise notify gap",
+            ))
+            .await
+            .expect("spawn worker");
+        make_claimable(&broker, &workspace, &anchor_identity, &spawned).await;
+        broker
+            .claim_worker(
+                &workspace,
+                &spawned.worker_id,
+                &spawned.task_id,
+                &spawned.claim_token,
+                worker_identity.clone(),
+            )
+            .await
+            .expect("claim worker");
+
+        // This is the exact ordering collect_updates_wait relies on: register the Notify waiter,
+        // inspect durable state, then let a report commit before the waiter is awaited.
+        let notified = broker.enabled_update_waiter();
+        let empty = broker
+            .collect_updates(&workspace, &anchor_identity)
+            .await
+            .expect("initial collection is empty");
+        assert!(empty.reports.is_empty());
+        broker
+            .report_worker(ReportWorkerRequest {
+                operation_id: OperationId::new(),
+                workspace_id: workspace.clone(),
+                worker_identity,
+                worker_id: spawned.worker_id,
+                task_id: spawned.task_id,
+                body: "committed inside the former lost-wakeup gap".into(),
+            })
+            .await
+            .expect("commit report before awaiting notification");
+        tokio::time::timeout(tokio::time::Duration::from_millis(100), notified)
+            .await
+            .expect("enabled waiter must retain notify_waiters wakeup");
+        let updates = broker
+            .collect_updates(&workspace, &anchor_identity)
+            .await
+            .expect("collect committed report");
+        assert_eq!(updates.reports.len(), 1);
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -2842,6 +3338,7 @@ mod tests {
         assert_eq!(first.display_id, "worker-1");
         assert_eq!(second.display_id, "worker-2");
 
+        make_claimable(&broker, &workspace, &anchor_identity, &first).await;
         broker
             .claim_worker(
                 &workspace,
@@ -2906,6 +3403,518 @@ mod tests {
                 .and_then(|task| task.result.as_ref()),
             Some(&finished_result())
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn collect_operation_is_replayable_after_a_dropped_response() {
+        let root = temp_root("moondesk-worker-collect-replay");
+        let path = root.join("worker-state-v1.json");
+        let broker = WorkerBroker::open(&path).expect("open worker broker");
+        let workspace = WorkspaceId::new();
+        let anchor_identity = anchor("anchor-collect-replay");
+        let worker_identity = anchor("worker-collect-replay");
+        let spawned = broker
+            .spawn_worker(spawn_request(
+                OperationId::new(),
+                workspace.clone(),
+                anchor_identity.clone(),
+                "produce replayable updates",
+            ))
+            .await
+            .expect("spawn worker");
+        make_claimable(&broker, &workspace, &anchor_identity, &spawned).await;
+        broker
+            .claim_worker(
+                &workspace,
+                &spawned.worker_id,
+                &spawned.task_id,
+                &spawned.claim_token,
+                worker_identity.clone(),
+            )
+            .await
+            .expect("claim worker");
+        broker
+            .report_worker(ReportWorkerRequest {
+                operation_id: OperationId::new(),
+                workspace_id: workspace.clone(),
+                worker_identity: worker_identity.clone(),
+                worker_id: spawned.worker_id.clone(),
+                task_id: spawned.task_id.clone(),
+                body: "durable progress".into(),
+            })
+            .await
+            .expect("store report");
+        broker
+            .finish_task(FinishTaskRequest {
+                workspace_id: workspace.clone(),
+                worker_identity,
+                worker_id: spawned.worker_id,
+                task_id: spawned.task_id,
+                result: finished_result(),
+            })
+            .await
+            .expect("finish worker");
+
+        let operation_id = OperationId::new();
+        let first = broker
+            .collect_updates_for_operation(&workspace, &anchor_identity, &operation_id)
+            .await
+            .expect("first durable collection");
+        assert_eq!(first.reports.len(), 1);
+        assert_eq!(first.completed.len(), 1);
+
+        let replay = broker
+            .collect_updates_for_operation(&workspace, &anchor_identity, &operation_id)
+            .await
+            .expect("replay collection after response loss");
+        assert_eq!(replay, first);
+
+        let next = broker
+            .collect_updates_for_operation(&workspace, &anchor_identity, &OperationId::new())
+            .await
+            .expect("new collection after replay");
+        assert!(next.reports.is_empty());
+        assert!(next.completed.is_empty());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn claim_requires_confirmed_canonical_worker_conversation_and_rejects_core_identity() {
+        let root = temp_root("moondesk-worker-claim-conversation");
+        let path = root.join("worker-state-v1.json");
+        let broker = WorkerBroker::open(&path).expect("open worker broker");
+        let workspace = WorkspaceId::new();
+        let core = anchor("core-claim-conversation");
+        let worker_identity = anchor("worker-claim-conversation");
+        let spawned = broker
+            .spawn_worker(spawn_request(
+                OperationId::new(),
+                workspace.clone(),
+                core.clone(),
+                "claim exact conversation",
+            ))
+            .await
+            .expect("spawn worker");
+        let command_id = Uuid::new_v4().to_string();
+        broker
+            .link_launch_command(
+                &workspace,
+                &core,
+                &spawned.worker_id,
+                &spawned.task_id,
+                &command_id,
+            )
+            .await
+            .expect("link worker launch");
+
+        for invalid in [
+            None,
+            Some("https://chatgpt.com/".to_string()),
+            Some(format!(
+                "https://chatgpt.com/c/{}?temporary=1",
+                spawned.worker_id
+            )),
+            Some(format!("https://chatgpt.com/foo/c/{}", spawned.worker_id)),
+        ] {
+            let error = broker
+                .update_launch_by_command(
+                    &command_id,
+                    WorkerLaunchState::WaitingClaim,
+                    None,
+                    invalid,
+                )
+                .await
+                .expect_err("non-canonical success must not become claimable");
+            assert!(matches!(error, WorkerBrokerError::Invalid(_)));
+        }
+
+        broker
+            .update_launch_by_command(
+                &command_id,
+                WorkerLaunchState::WaitingClaim,
+                None,
+                Some(format!("https://chatgpt.com/c/{}", spawned.worker_id)),
+            )
+            .await
+            .expect("confirm canonical worker conversation");
+        assert_eq!(
+            broker
+                .expected_claim_conversation_id(&workspace, &spawned.worker_id, &spawned.task_id)
+                .await
+                .expect("expected claim conversation"),
+            spawned.worker_id.to_string()
+        );
+
+        let core_claim = broker
+            .claim_worker(
+                &workspace,
+                &spawned.worker_id,
+                &spawned.task_id,
+                &spawned.claim_token,
+                core,
+            )
+            .await
+            .expect_err("Core must not claim its own worker");
+        assert!(matches!(core_claim, WorkerBrokerError::Conflict(_)));
+
+        broker
+            .claim_worker(
+                &workspace,
+                &spawned.worker_id,
+                &spawned.task_id,
+                &spawned.claim_token,
+                worker_identity,
+            )
+            .await
+            .expect("worker conversation claims exact launch");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn completed_history_and_idempotency_receipts_stay_bounded_across_many_cycles() {
+        let root = temp_root("moondesk-worker-history-bounded");
+        let path = root.join("worker-state-v1.json");
+        let broker = WorkerBroker::open(&path).expect("open worker broker");
+        let workspace = WorkspaceId::new();
+        let anchor_identity = anchor("anchor-history-bounded");
+        let worker_identity = anchor("worker-history-bounded");
+        let spawned = broker
+            .spawn_worker(spawn_request(
+                OperationId::new(),
+                workspace.clone(),
+                anchor_identity.clone(),
+                "initial history task",
+            ))
+            .await
+            .expect("spawn worker");
+        make_claimable(&broker, &workspace, &anchor_identity, &spawned).await;
+        broker
+            .claim_worker(
+                &workspace,
+                &spawned.worker_id,
+                &spawned.task_id,
+                &spawned.claim_token,
+                worker_identity.clone(),
+            )
+            .await
+            .expect("claim worker");
+
+        let worker_id = spawned.worker_id.clone();
+        let mut task_id = spawned.task_id.clone();
+        for index in 0..80 {
+            let message = broker
+                .message_worker(MessageWorkerRequest {
+                    operation_id: OperationId::new(),
+                    workspace_id: workspace.clone(),
+                    anchor_identity: anchor_identity.clone(),
+                    worker_id: worker_id.clone(),
+                    body: format!("message-{index}"),
+                })
+                .await
+                .expect("store bounded message");
+            broker
+                .acknowledge_message(
+                    &workspace,
+                    &worker_identity,
+                    &worker_id,
+                    &message.message_id,
+                )
+                .await
+                .expect("ack bounded message");
+            broker
+                .report_worker(ReportWorkerRequest {
+                    operation_id: OperationId::new(),
+                    workspace_id: workspace.clone(),
+                    worker_identity: worker_identity.clone(),
+                    worker_id: worker_id.clone(),
+                    task_id: task_id.clone(),
+                    body: format!("report-{index}"),
+                })
+                .await
+                .expect("store bounded report");
+            broker
+                .finish_task(FinishTaskRequest {
+                    workspace_id: workspace.clone(),
+                    worker_identity: worker_identity.clone(),
+                    worker_id: worker_id.clone(),
+                    task_id: task_id.clone(),
+                    result: finished_result(),
+                })
+                .await
+                .expect("finish bounded task");
+            let updates = broker
+                .collect_updates_for_operation(&workspace, &anchor_identity, &OperationId::new())
+                .await
+                .expect("collect bounded updates");
+            assert_eq!(updates.reports.len(), 1);
+            assert_eq!(updates.completed.len(), 1);
+
+            if index == 79 {
+                break;
+            }
+            let reused = broker
+                .reuse_worker(ReuseWorkerRequest {
+                    operation_id: OperationId::new(),
+                    workspace_id: workspace.clone(),
+                    anchor_identity: anchor_identity.clone(),
+                    worker_id: worker_id.clone(),
+                    assignment: format!("history-task-{index}"),
+                })
+                .await
+                .expect("reuse bounded worker");
+            task_id = reused.task_id.clone();
+            broker
+                .start_task(&workspace, &worker_identity, &worker_id, &task_id)
+                .await
+                .expect("start bounded reuse task");
+        }
+
+        let snapshot = broker.snapshot().await;
+        let family = snapshot.families.values().next().expect("bounded family");
+        let worker = family.workers.get(&worker_id).expect("bounded worker");
+        assert!(worker.tasks.len() <= MAX_TASK_RECORDS_PER_WORKER);
+        assert!(family.reports.is_empty());
+        assert!(family.spawn_requests.len() <= MAX_IDEMPOTENCY_RECEIPTS_PER_FAMILY);
+        assert!(family.reuse_requests.len() <= MAX_IDEMPOTENCY_RECEIPTS_PER_FAMILY);
+        assert!(family.message_requests.len() <= MAX_IDEMPOTENCY_RECEIPTS_PER_FAMILY);
+        assert!(family.report_requests.len() <= MAX_IDEMPOTENCY_RECEIPTS_PER_FAMILY);
+        assert!(family.collect_requests.len() <= MAX_COLLECT_RECEIPTS_PER_FAMILY);
+        assert!(worker.messages.is_empty());
+        assert!(
+            std::fs::metadata(&path)
+                .expect("bounded worker store metadata")
+                .len()
+                < 4 * 1024 * 1024
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn receipt_compaction_prunes_old_unreferenced_idempotency_history() {
+        let root = temp_root("moondesk-worker-receipt-compaction");
+        let path = root.join("worker-state-v1.json");
+        let broker = WorkerBroker::open(&path).expect("open worker broker");
+        let workspace = WorkspaceId::new();
+        let anchor_identity = anchor("anchor-receipt-compaction");
+        let spawned = broker
+            .spawn_worker(spawn_request(
+                OperationId::new(),
+                workspace,
+                anchor_identity,
+                "receipt compaction seed",
+            ))
+            .await
+            .expect("spawn receipt compaction seed");
+        let mut family = broker
+            .snapshot()
+            .await
+            .families
+            .into_values()
+            .next()
+            .expect("seed family");
+
+        for _ in 0..(MAX_IDEMPOTENCY_RECEIPTS_PER_FAMILY + 32) {
+            let sequence =
+                allocate_receipt_sequence(&mut family).expect("allocate spawn receipt sequence");
+            family.spawn_requests.insert(
+                OperationId::new(),
+                SpawnReceipt {
+                    request_fingerprint: "a".repeat(64),
+                    sequence,
+                    family_id: family.id.clone(),
+                    worker_id: spawned.worker_id.clone(),
+                    task_id: TaskId::new(),
+                    display_id: "worker-history".into(),
+                    claim_token: "c".repeat(64),
+                },
+            );
+        }
+        for _ in 0..(MAX_IDEMPOTENCY_RECEIPTS_PER_FAMILY + 32) {
+            let sequence =
+                allocate_receipt_sequence(&mut family).expect("allocate reuse receipt sequence");
+            family.reuse_requests.insert(
+                OperationId::new(),
+                ReuseReceipt {
+                    request_fingerprint: "b".repeat(64),
+                    sequence,
+                    worker_id: spawned.worker_id.clone(),
+                    task_id: TaskId::new(),
+                    display_id: "worker-history".into(),
+                    execution_profile: profile(),
+                },
+            );
+        }
+        for _ in 0..(MAX_IDEMPOTENCY_RECEIPTS_PER_FAMILY + 32) {
+            let sequence =
+                allocate_receipt_sequence(&mut family).expect("allocate message receipt sequence");
+            family.message_requests.insert(
+                OperationId::new(),
+                MessageReceipt {
+                    request_fingerprint: "c".repeat(64),
+                    sequence,
+                    worker_id: spawned.worker_id.clone(),
+                    message_id: WorkerMessageId::new(),
+                },
+            );
+        }
+        for _ in 0..(MAX_IDEMPOTENCY_RECEIPTS_PER_FAMILY + 32) {
+            let sequence =
+                allocate_receipt_sequence(&mut family).expect("allocate report receipt sequence");
+            family.report_requests.insert(
+                OperationId::new(),
+                ReportReceipt {
+                    request_fingerprint: "d".repeat(64),
+                    sequence,
+                    worker_id: spawned.worker_id.clone(),
+                    report_id: WorkerReportId::new(),
+                },
+            );
+        }
+        for _ in 0..(MAX_COLLECT_RECEIPTS_PER_FAMILY + 8) {
+            let sequence =
+                allocate_receipt_sequence(&mut family).expect("allocate collect receipt sequence");
+            family.collect_requests.insert(
+                OperationId::new(),
+                CollectReceipt {
+                    request_fingerprint: "e".repeat(64),
+                    sequence,
+                    reports: Vec::new(),
+                    completed: Vec::new(),
+                },
+            );
+        }
+
+        compact_family_history(&mut family).expect("compact receipt history");
+        assert!(family.spawn_requests.len() <= MAX_IDEMPOTENCY_RECEIPTS_PER_FAMILY);
+        assert!(family.reuse_requests.len() <= MAX_IDEMPOTENCY_RECEIPTS_PER_FAMILY);
+        assert!(family.message_requests.len() <= MAX_IDEMPOTENCY_RECEIPTS_PER_FAMILY);
+        assert!(family.report_requests.len() <= MAX_IDEMPOTENCY_RECEIPTS_PER_FAMILY);
+        assert!(family.collect_requests.len() <= MAX_COLLECT_RECEIPTS_PER_FAMILY);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn large_delivered_payload_history_stays_within_worker_store_budget() {
+        let root = temp_root("moondesk-worker-large-history-budget");
+        let path = root.join("worker-state-v1.json");
+        let broker = WorkerBroker::open(&path).expect("open worker broker");
+        let workspace = WorkspaceId::new();
+        let anchor_identity = anchor("anchor-large-history-budget");
+        let worker_identity = anchor("worker-large-history-budget");
+        let large_assignment = "a".repeat(MAX_WORKER_ASSIGNMENT_BYTES);
+        let large_message = "m".repeat(MAX_WORKER_MESSAGE_BYTES);
+        let large_report = "r".repeat(MAX_WORKER_MESSAGE_BYTES);
+        let large_result = WorkerResult {
+            result: "z".repeat(96 * 1024),
+            changes: "large payload regression".into(),
+            validation: "persisted and collected".into(),
+            blockers: Vec::new(),
+        };
+        large_result
+            .validate()
+            .expect("large result stays within result budget");
+
+        let spawned = broker
+            .spawn_worker(spawn_request(
+                OperationId::new(),
+                workspace.clone(),
+                anchor_identity.clone(),
+                &large_assignment,
+            ))
+            .await
+            .expect("spawn large-payload worker");
+        make_claimable(&broker, &workspace, &anchor_identity, &spawned).await;
+        broker
+            .claim_worker(
+                &workspace,
+                &spawned.worker_id,
+                &spawned.task_id,
+                &spawned.claim_token,
+                worker_identity.clone(),
+            )
+            .await
+            .expect("claim large-payload worker");
+
+        let worker_id = spawned.worker_id.clone();
+        let mut task_id = spawned.task_id.clone();
+        for index in 0..20 {
+            let message = broker
+                .message_worker(MessageWorkerRequest {
+                    operation_id: OperationId::new(),
+                    workspace_id: workspace.clone(),
+                    anchor_identity: anchor_identity.clone(),
+                    worker_id: worker_id.clone(),
+                    body: large_message.clone(),
+                })
+                .await
+                .expect("store large message");
+            broker
+                .acknowledge_message(
+                    &workspace,
+                    &worker_identity,
+                    &worker_id,
+                    &message.message_id,
+                )
+                .await
+                .expect("ack large message");
+            broker
+                .report_worker(ReportWorkerRequest {
+                    operation_id: OperationId::new(),
+                    workspace_id: workspace.clone(),
+                    worker_identity: worker_identity.clone(),
+                    worker_id: worker_id.clone(),
+                    task_id: task_id.clone(),
+                    body: large_report.clone(),
+                })
+                .await
+                .expect("store large report");
+            broker
+                .finish_task(FinishTaskRequest {
+                    workspace_id: workspace.clone(),
+                    worker_identity: worker_identity.clone(),
+                    worker_id: worker_id.clone(),
+                    task_id: task_id.clone(),
+                    result: large_result.clone(),
+                })
+                .await
+                .expect("finish large result");
+            let updates = broker
+                .collect_updates_for_operation(&workspace, &anchor_identity, &OperationId::new())
+                .await
+                .expect("collect large payload batch");
+            assert_eq!(updates.reports.len(), 1);
+            assert_eq!(updates.completed.len(), 1);
+
+            if index == 19 {
+                break;
+            }
+            let reused = broker
+                .reuse_worker(ReuseWorkerRequest {
+                    operation_id: OperationId::new(),
+                    workspace_id: workspace.clone(),
+                    anchor_identity: anchor_identity.clone(),
+                    worker_id: worker_id.clone(),
+                    assignment: large_assignment.clone(),
+                })
+                .await
+                .expect("reuse large-payload worker");
+            task_id = reused.task_id.clone();
+            broker
+                .start_task(&workspace, &worker_identity, &worker_id, &task_id)
+                .await
+                .expect("start large-payload task");
+        }
+
+        let snapshot = broker.snapshot().await;
+        snapshot
+            .validate()
+            .expect("bounded large worker history validates");
+        let persisted_bytes = std::fs::metadata(&path)
+            .expect("large worker store metadata")
+            .len();
+        assert!(persisted_bytes < 4 * 1024 * 1024);
+        assert!(persisted_bytes <= crate::workers::MAX_WORKER_STORE_BYTES);
         let _ = std::fs::remove_dir_all(root);
     }
 

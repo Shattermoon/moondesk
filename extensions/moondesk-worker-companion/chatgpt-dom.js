@@ -254,19 +254,8 @@
   }
 
   function resolveWantedEffort(desiredEfforts, offeredEfforts) {
-    const offered = [...new Set(offeredEfforts.filter((effort) => PROVIDER_EFFORTS.has(effort)))];
-    const exact = desiredEfforts.find((effort) => offered.includes(effort));
-    if (exact) return exact;
-    const ladder = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
-    const target = ladder.indexOf(desiredEfforts[0]);
-    const candidates = offered.filter((effort) => ladder.includes(effort));
-    if (target < 0 || !candidates.length) return null;
-    candidates.sort((left, right) => {
-      const leftDistance = Math.abs(ladder.indexOf(left) - target);
-      const rightDistance = Math.abs(ladder.indexOf(right) - target);
-      return leftDistance - rightDistance || ladder.indexOf(right) - ladder.indexOf(left);
-    });
-    return candidates[0];
+    const offered = new Set(offeredEfforts.filter((effort) => PROVIDER_EFFORTS.has(effort)));
+    return desiredEfforts.find((effort) => offered.has(effort)) || null;
   }
 
 
@@ -853,23 +842,10 @@
 
         let wantedEffort = null;
         if (!failureCode) {
-          wantedEffort = desiredEfforts.find((effort) =>
-            offered.some((entry) => entry.choice.effort === effort)
-          ) || null;
-          if (!wantedEffort) {
-            const ladder = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
-            const target = ladder.indexOf(desiredEfforts[0]);
-            const efforts = [...new Set(offered.map((entry) => entry.choice.effort))]
-              .filter((effort) => ladder.includes(effort));
-            if (target >= 0 && efforts.length) {
-              efforts.sort((left, right) => {
-                const leftDistance = Math.abs(ladder.indexOf(left) - target);
-                const rightDistance = Math.abs(ladder.indexOf(right) - target);
-                return leftDistance - rightDistance || ladder.indexOf(right) - ladder.indexOf(left);
-              });
-              wantedEffort = efforts[0];
-            }
-          }
+          wantedEffort = resolveWantedEffort(
+            desiredEfforts,
+            offered.map((entry) => entry.choice.effort)
+          );
           if (!wantedEffort) fail('effort_unavailable');
         }
 

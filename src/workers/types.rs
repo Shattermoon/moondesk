@@ -168,6 +168,20 @@ pub struct WorkerResult {
     pub blockers: Vec<String>,
 }
 
+impl WorkerResult {
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        let bytes = serde_json::to_vec(self)
+            .map_err(|error| format!("failed to measure worker result: {error}"))?;
+        if bytes.len() > super::MAX_WORKER_RESULT_BYTES {
+            return Err(format!(
+                "worker result exceeds {} byte persisted-result limit",
+                super::MAX_WORKER_RESULT_BYTES
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkerTask {
@@ -239,6 +253,8 @@ pub struct WorkerRecord {
 #[serde(rename_all = "camelCase")]
 pub struct SpawnReceipt {
     pub request_fingerprint: String,
+    #[serde(default)]
+    pub sequence: u64,
     pub family_id: WorkerFamilyId,
     pub worker_id: WorkerId,
     pub task_id: TaskId,
@@ -250,6 +266,8 @@ pub struct SpawnReceipt {
 #[serde(rename_all = "camelCase")]
 pub struct ReuseReceipt {
     pub request_fingerprint: String,
+    #[serde(default)]
+    pub sequence: u64,
     pub worker_id: WorkerId,
     pub task_id: TaskId,
     pub display_id: String,
@@ -260,6 +278,8 @@ pub struct ReuseReceipt {
 #[serde(rename_all = "camelCase")]
 pub struct MessageReceipt {
     pub request_fingerprint: String,
+    #[serde(default)]
+    pub sequence: u64,
     pub worker_id: WorkerId,
     pub message_id: WorkerMessageId,
 }
@@ -268,8 +288,31 @@ pub struct MessageReceipt {
 #[serde(rename_all = "camelCase")]
 pub struct ReportReceipt {
     pub request_fingerprint: String,
+    #[serde(default)]
+    pub sequence: u64,
     pub worker_id: WorkerId,
     pub report_id: WorkerReportId,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CollectedTaskReceipt {
+    pub worker_id: WorkerId,
+    pub display_id: String,
+    pub task_id: TaskId,
+    pub result: WorkerResult,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CollectReceipt {
+    pub request_fingerprint: String,
+    #[serde(default)]
+    pub sequence: u64,
+    #[serde(default)]
+    pub reports: Vec<WorkerReport>,
+    #[serde(default)]
+    pub completed: Vec<CollectedTaskReceipt>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -278,6 +321,8 @@ pub struct WorkerFamily {
     pub id: WorkerFamilyId,
     pub workspace_id: WorkspaceId,
     pub anchor_identity: ChatIdentity,
+    #[serde(default)]
+    pub next_receipt_sequence: u64,
     #[serde(default)]
     pub workers: BTreeMap<WorkerId, WorkerRecord>,
     #[serde(default)]
@@ -290,6 +335,8 @@ pub struct WorkerFamily {
     pub message_requests: BTreeMap<OperationId, MessageReceipt>,
     #[serde(default)]
     pub report_requests: BTreeMap<OperationId, ReportReceipt>,
+    #[serde(default)]
+    pub collect_requests: BTreeMap<OperationId, CollectReceipt>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -323,6 +370,24 @@ impl WorkerStoreData {
                 return Err("worker family map key does not match family id".into());
             }
             family.anchor_identity.validate()?;
+            if family.reports.len() > super::MAX_REPORTS_PER_FAMILY {
+                return Err("worker family exceeds configured report limit".into());
+            }
+            for (label, len) in [
+                ("spawn", family.spawn_requests.len()),
+                ("reuse", family.reuse_requests.len()),
+                ("message", family.message_requests.len()),
+                ("report", family.report_requests.len()),
+            ] {
+                if len > super::MAX_IDEMPOTENCY_RECEIPTS_PER_FAMILY {
+                    return Err(format!(
+                        "worker {label} receipt history exceeds configured limit"
+                    ));
+                }
+            }
+            if family.collect_requests.len() > super::MAX_COLLECT_RECEIPTS_PER_FAMILY {
+                return Err("worker collect receipt history exceeds configured limit".into());
+            }
             if family.workers.len() > super::MAX_WORKER_RECORDS_PER_FAMILY {
                 return Err("worker family exceeds configured worker record limit".into());
             }
@@ -358,6 +423,9 @@ impl WorkerStoreData {
                 if worker.messages.len() > super::MAX_PENDING_MESSAGES_PER_WORKER {
                     return Err("worker message queue exceeds configured limit".into());
                 }
+                if worker.tasks.len() > super::MAX_TASK_RECORDS_PER_WORKER {
+                    return Err("worker task history exceeds configured limit".into());
+                }
                 if let Some(current_task_id) = &worker.current_task_id
                     && !worker.tasks.contains_key(current_task_id)
                 {
@@ -370,6 +438,9 @@ impl WorkerStoreData {
                     if task.assignment.len() > super::MAX_WORKER_ASSIGNMENT_BYTES {
                         return Err("worker assignment exceeds configured size limit".into());
                     }
+                    if let Some(result) = task.result.as_ref() {
+                        result.validate()?;
+                    }
                 }
                 for message in &worker.messages {
                     if message.body.len() > super::MAX_WORKER_MESSAGE_BYTES {
@@ -377,6 +448,14 @@ impl WorkerStoreData {
                     }
                 }
             }
+        }
+        let persisted = serde_json::to_vec_pretty(self)
+            .map_err(|error| format!("failed to measure worker store: {error}"))?;
+        if persisted.len() as u64 > super::MAX_WORKER_STORE_BYTES {
+            return Err(format!(
+                "worker state exceeds {} byte safety limit",
+                super::MAX_WORKER_STORE_BYTES
+            ));
         }
         Ok(())
     }

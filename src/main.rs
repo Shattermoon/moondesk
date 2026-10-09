@@ -4230,19 +4230,19 @@ async fn run_settings(
                             app.log("INFO", format!("Worker target count: {count}"));
                             app.mark_config_dirty();
                         } else if selected_row == settings_action_start + 3 {
-                            let existing_directory = app.companion_directory.clone();
+                            let installation_token =
+                                app.companion_auth.installation_token().to_string();
                             drop(app);
 
                             let config_path = app_config_path()?;
-                            // AppState synchronizes the embedded companion during startup and only
-                            // stores this directory on success. A missing directory is the retry path
-                            // for a startup materialization failure; an existing one is already
-                            // synchronized to the running MoonDesk binary.
-                            let result = match existing_directory {
-                                Some(directory) => Ok(directory),
-                                None => companion_install::materialize_for_config(&config_path)
-                                    .map(|install| install.directory),
-                            };
+                            // Startup already synchronizes this folder. Re-materialize here as a
+                            // repair path too, so opening Settings can recover a file damaged after
+                            // startup and refresh the private installation capability.
+                            let result = companion_install::materialize_for_config(
+                                &config_path,
+                                &installation_token,
+                            )
+                            .map(|install| install.directory);
                             match result {
                                 Ok(directory) => {
                                     {

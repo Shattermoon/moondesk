@@ -26,7 +26,7 @@ use crate::state::{
 };
 use crate::vision;
 use crate::workers::broker::WorkerBroker;
-use crate::workers::types::ChatIdentity;
+use crate::workers::types::{ChatIdentity, TaskId, WorkerId};
 use crate::workspace_tools;
 use crate::workspaces::{self, WorkspaceAvailability, WorkspaceId};
 
@@ -453,12 +453,12 @@ fn workers_tool_descriptor() -> Value {
     json!({
         "name": "workers",
         "title": "Coordinate workers",
-        "description": "Coordinate MoonDesk experimental workers for this exact workspace and ChatGPT conversation. The workspace is resolved from this connector; never pass or guess a workspace. Core actions are spawn, reuse, retire, status, send, collect. Worker actions are claim, start, inbox, ack, report, finish. Call status before creating a worker group: targetWorkerCount is the user's configured concurrency target, recommendedWorkerCount is the product recommendation, and maxWorkerCount is the hard ceiling. Respect an explicit user-requested count when it is within the maximum; otherwise use targetWorkerCount. Reuse creates a new durable task on an idle claimed worker and wakes its existing ChatGPT conversation. Retire frees an idle worker slot or safely abandons a launch only when MoonDesk can prove the assignment never crossed the Send boundary. collect can wait up to 60 seconds for a report/completion so the Core does not need polling loops. Worker coordination requires exact ChatGPT session metadata and fails closed when that identity is unavailable. operation_id must be a stable UUID reused when retrying the same spawn/reuse/send/report after an ambiguous response.",
+        "description": "Coordinate MoonDesk experimental workers for this exact workspace and ChatGPT conversation. The workspace is resolved from this connector; never pass or guess a workspace. Core actions are spawn, reuse, retire, status, send, collect. Worker actions are claim, start, inbox, ack, report, finish. Call status before creating a worker group: targetWorkerCount is the user's configured concurrency target, recommendedWorkerCount is the product recommendation, and maxWorkerCount is the hard ceiling. Respect an explicit user-requested count when it is within the maximum; otherwise use targetWorkerCount. Reuse creates a new durable task on an idle claimed worker and wakes its existing ChatGPT conversation. Retire frees an idle worker slot or safely abandons a launch only when MoonDesk can prove the assignment never crossed the Send boundary. collect can wait up to 60 seconds for a report/completion so the Core does not need polling loops. collect requires operation_id too so a dropped collect response can replay the same durable batch. Idempotency history is intentionally bounded (recent 256 mutation receipts per Core family and 16 collection batches), so retry an ambiguous response promptly with the same operation_id before issuing unrelated work. Worker coordination requires exact ChatGPT session metadata and fails closed when that identity is unavailable. operation_id must be a stable UUID reused when retrying the same spawn/reuse/send/report/collect after an ambiguous response.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "action": { "type": "string", "enum": ["spawn", "reuse", "retire", "status", "send", "collect", "claim", "start", "inbox", "ack", "report", "finish"] },
-                "operation_id": { "type": "string", "description": "Stable UUID for idempotent spawn/reuse/send/report operations" },
+                "operation_id": { "type": "string", "description": "Stable UUID for idempotent spawn/reuse/send/report/collect operations" },
                 "label": { "type": "string", "minLength": 1, "maxLength": 128, "description": "Short worker task label for spawn" },
                 "task": { "type": "string", "minLength": 1, "description": "Concrete assignment for spawn or reuse" },
                 "worker_id": { "type": "string", "description": "Worker UUID returned by spawn" },
@@ -1101,7 +1101,71 @@ async fn handle_tools_call_for_workspace(
             Err(error) => return tool_error_response_text_only(req, error),
         };
         let arguments = tool_arguments(req);
-        let anchor_route = if arguments.get("action").and_then(Value::as_str) == Some("spawn") {
+        let action = arguments.get("action").and_then(Value::as_str);
+        if action == Some("claim")
+            && let Some(auth) = companion_auth.as_ref()
+        {
+            let worker_id = match arguments
+                .get("worker_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "Missing or invalid required parameter: worker_id".to_string())
+                .and_then(WorkerId::parse)
+            {
+                Ok(value) => value,
+                Err(error) => return tool_error_response_text_only(req, error),
+            };
+            let task_id = match arguments
+                .get("task_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "Missing or invalid required parameter: task_id".to_string())
+                .and_then(TaskId::parse)
+            {
+                Ok(value) => value,
+                Err(error) => return tool_error_response_text_only(req, error),
+            };
+            let expected_conversation = match worker_broker
+                .expected_claim_conversation_id(workspace_id, &worker_id, &task_id)
+                .await
+            {
+                Ok(value) => value,
+                Err(error) => return tool_error_response_text_only(req, error.to_string()),
+            };
+            let Some(request_id) = inbound_request_id.as_deref() else {
+                return tool_error_response_text_only(
+                    req,
+                    "workers claim requires exact provider request correlation for the worker ChatGPT conversation".into(),
+                );
+            };
+            let mut route = match auth.correlation_for_any(&[request_id]).await {
+                Ok(route) => route,
+                Err(error) => return tool_error_response_text_only(req, error),
+            };
+            if route.is_none() {
+                route = match auth
+                    .wait_for_any_correlation(
+                        &[request_id],
+                        std::time::Duration::from_millis(5_000),
+                    )
+                    .await
+                {
+                    Ok(route) => route,
+                    Err(error) => return tool_error_response_text_only(req, error),
+                };
+            }
+            let Some(route) = route else {
+                return tool_error_response_text_only(
+                    req,
+                    "workers claim could not correlate this tool call to an exact ChatGPT conversation".into(),
+                );
+            };
+            if route.tab.conversation_id.to_ascii_lowercase() != expected_conversation {
+                return tool_error_response_text_only(
+                    req,
+                    "workers claim was issued from a different ChatGPT conversation than the confirmed worker launch".into(),
+                );
+            }
+        }
+        let anchor_route = if action == Some("spawn") {
             match companion_auth.as_ref() {
                 Some(auth) => {
                     if auth.paired_client_count().await == 0 {
@@ -3851,7 +3915,7 @@ fn handle_delete_path(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcResp
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::managed_chat::types::ManagedChatOpenMode;
+    use crate::managed_chat::types::{ManagedChatLaunch, ManagedChatOpenMode, ManagedChatPurpose};
     use uuid::Uuid;
 
     struct TestTempDir {
@@ -4847,6 +4911,197 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn workers_mcp_claim_requires_provider_correlation_to_the_confirmed_worker_conversation()
+    {
+        let root = TestTempDir::new("moondesk-workers-mcp-claim-correlation");
+        let workspace_root = root.path().join("workspace");
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        let workspace_id = WorkspaceId::new();
+        let broker = Arc::new(
+            WorkerBroker::open(root.path().join("worker-state-v1.json"))
+                .expect("open worker broker"),
+        );
+        let managed_chat_broker = Arc::new(
+            ManagedChatBroker::open(root.path().join("managed-chat-state-v1.json"))
+                .expect("open managed chat broker"),
+        );
+        let companion_auth = Arc::new(
+            CompanionAuth::open(root.path().join("companion-auth-v1.json"))
+                .expect("open companion auth"),
+        );
+        companion_auth
+            .auto_pair(
+                "chrome-install",
+                &"a".repeat(64),
+                Some("chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            )
+            .await
+            .expect("pair companion");
+
+        let core_identity =
+            ChatIdentity::from_openai_meta(Some("worker-test-subject"), "claim-correlation-core");
+        let spawned = broker
+            .spawn_worker(crate::workers::broker::SpawnWorkerRequest {
+                operation_id: crate::workers::types::OperationId::new(),
+                workspace_id: workspace_id.clone(),
+                anchor_identity: core_identity.clone(),
+                label: "claim correlation".into(),
+                assignment: "prove the exact worker conversation".into(),
+                execution_profile: ChatExecutionProfile::default(),
+            })
+            .await
+            .expect("spawn worker record");
+        let dedupe_key = format!("worker:{}:task:{}", spawned.worker_id, spawned.task_id);
+        let command = managed_chat_broker
+            .enqueue(crate::managed_chat::broker::EnqueueManagedChatRequest {
+                dedupe_key,
+                launch: ManagedChatLaunch {
+                    workspace_id: workspace_id.clone(),
+                    purpose: ManagedChatPurpose::Worker,
+                    execution_profile: ChatExecutionProfile::default(),
+                    opening_message: "claim correlation launch".into(),
+                    task_marker: format!("moondesk-worker-task:{}", spawned.task_id),
+                    thread_key: None,
+                    open_mode: ManagedChatOpenMode::NewThread,
+                    anchor_session_digest: Some(core_identity.session_digest.clone()),
+                },
+            })
+            .await
+            .expect("enqueue managed worker launch");
+        broker
+            .link_launch_command(
+                &workspace_id,
+                &core_identity,
+                &spawned.worker_id,
+                &spawned.task_id,
+                &command.id.to_string(),
+            )
+            .await
+            .expect("link managed command");
+        let worker_conversation = "8ccd9ad3-6d32-a500-b9df-f10d55aa86f0";
+        broker
+            .update_launch_by_command(
+                &command.id.to_string(),
+                crate::workers::types::WorkerLaunchState::WaitingClaim,
+                None,
+                Some(format!("https://chatgpt.com/c/{worker_conversation}")),
+            )
+            .await
+            .expect("confirm worker conversation");
+
+        let wrong_conversation = "9dde0be4-7e43-b611-caef-a21e66bb9701";
+        companion_auth
+            .observe_correlations(
+                "chrome-install",
+                crate::companion::CompanionCorrelationUpdate {
+                    conversation_id: wrong_conversation.into(),
+                    conversation_url: format!("https://chatgpt.com/c/{wrong_conversation}"),
+                    project_id: None,
+                    project_url: None,
+                    request_ids: vec!["claim-wrong-request".into()],
+                    operation_ids: Vec::new(),
+                },
+                crate::companion::unix_time_ms(),
+            )
+            .await
+            .expect("publish wrong claim correlation");
+
+        let claim_args = json!({
+            "action": "claim",
+            "worker_id": spawned.worker_id,
+            "task_id": spawned.task_id,
+            "claim_token": spawned.claim_token
+        });
+        let wrong_request = tool_call_request_with_session(
+            "workers",
+            claim_args.clone(),
+            "claim-correlation-worker-session",
+        );
+        let command_jobs = CommandJobManager::new();
+        let browser_runtime = None;
+        let wrong = handle_tools_call_for_workspace(
+            &wrong_request,
+            McpRequestContext {
+                workspace_id: &workspace_id,
+                workspace_name: "Claim Correlation",
+                workspace_root: &workspace_root.to_string_lossy(),
+                mode: Mode::Both,
+                tool_mode: ToolMode::MultiTools,
+                set_moondesk_as_co_author: false,
+                handoff_store_root: None,
+                command_jobs: &command_jobs,
+                browser_runtime: &browser_runtime,
+                worker_execution_profile: ChatExecutionProfile::default(),
+                worker_target_count: crate::workers::RECOMMENDED_WORKERS_PER_FAMILY,
+                worker_broker: broker.clone(),
+                managed_chat_broker: managed_chat_broker.clone(),
+                companion_auth: Some(companion_auth.clone()),
+                inbound_request_id: Some("claim-wrong-request".into()),
+            },
+        )
+        .await;
+        assert_eq!(
+            wrong
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(result_text(&wrong).contains("different ChatGPT conversation"));
+
+        companion_auth
+            .observe_correlations(
+                "chrome-install",
+                crate::companion::CompanionCorrelationUpdate {
+                    conversation_id: worker_conversation.into(),
+                    conversation_url: format!("https://chatgpt.com/c/{worker_conversation}"),
+                    project_id: None,
+                    project_url: None,
+                    request_ids: vec!["claim-correct-request".into()],
+                    operation_ids: Vec::new(),
+                },
+                crate::companion::unix_time_ms(),
+            )
+            .await
+            .expect("publish exact claim correlation");
+        let correct_request = tool_call_request_with_session(
+            "workers",
+            claim_args,
+            "claim-correlation-worker-session",
+        );
+        let correct = handle_tools_call_for_workspace(
+            &correct_request,
+            McpRequestContext {
+                workspace_id: &workspace_id,
+                workspace_name: "Claim Correlation",
+                workspace_root: &workspace_root.to_string_lossy(),
+                mode: Mode::Both,
+                tool_mode: ToolMode::MultiTools,
+                set_moondesk_as_co_author: false,
+                handoff_store_root: None,
+                command_jobs: &command_jobs,
+                browser_runtime: &browser_runtime,
+                worker_execution_profile: ChatExecutionProfile::default(),
+                worker_target_count: crate::workers::RECOMMENDED_WORKERS_PER_FAMILY,
+                worker_broker: broker.clone(),
+                managed_chat_broker,
+                companion_auth: Some(companion_auth),
+                inbound_request_id: Some("claim-correct-request".into()),
+            },
+        )
+        .await;
+        assert_eq!(
+            correct
+                .result
+                .as_ref()
+                .and_then(|result| result.pointer("/structuredContent/state"))
+                .and_then(Value::as_str),
+            Some("running")
+        );
+    }
+
+    #[tokio::test]
     async fn workers_mcp_binds_anchor_and_worker_to_exact_chat_sessions() {
         let root = TestTempDir::new("moondesk-workers-mcp-identity");
         let workspace_root = root.path().join("workspace");
@@ -4967,6 +5222,16 @@ mod tests {
             Some(true)
         );
 
+        broker
+            .update_launch_by_command(
+                &launch_command.id.to_string(),
+                crate::workers::types::WorkerLaunchState::WaitingClaim,
+                None,
+                Some(format!("https://chatgpt.com/c/{worker_id}")),
+            )
+            .await
+            .expect("confirm canonical worker conversation before claim");
+
         let claim = call_workers_for_test(
             &tool_call_request_with_session(
                 "workers",
@@ -5079,7 +5344,7 @@ mod tests {
         let collect = call_workers_for_test(
             &tool_call_request_with_session(
                 "workers",
-                json!({ "action": "collect" }),
+                json!({ "action": "collect", "operation_id": Uuid::new_v4().to_string() }),
                 "anchor-chat-a",
             ),
             &workspace_id,
@@ -5111,7 +5376,7 @@ mod tests {
         let second_collect = call_workers_for_test(
             &tool_call_request_with_session(
                 "workers",
-                json!({ "action": "collect" }),
+                json!({ "action": "collect", "operation_id": Uuid::new_v4().to_string() }),
                 "anchor-chat-a",
             ),
             &workspace_id,

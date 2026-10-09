@@ -4,9 +4,10 @@ const BRIDGE_PORTS = [47650, 47651, 47652, 47653, 47654];
 const REQUIRED_PROTOCOL_VERSION = 2;
 // Bump with any shipped companion runtime change that requires Chromium to load new bytes. Keep
 // this aligned with COMPANION_RUNTIME_REVISION in src/server.rs.
-const COMPANION_RUNTIME_REVISION = 3;
+const COMPANION_RUNTIME_REVISION = 4;
 const SOURCE_DEV_MANIFEST_VERSION = '0.1.0';
 const RUNTIME_RELOAD_STORAGE_KEY = 'moondeskWorkerCompanionReloadRevisionV1';
+const INSTALLATION_BOOTSTRAP_FILE = 'moondesk-bootstrap.json';
 const HELLO_PATH = '/__moondesk/companion/v1/hello';
 const PAIR_PATH = '/__moondesk/companion/v1/pair';
 const REPAIR_PATH = '/__moondesk/companion/v1/repair';
@@ -103,6 +104,32 @@ function randomCredential() {
   const bytes = new Uint8Array(32);
   crypto.getRandomValues(bytes);
   return [...bytes].map((byte) => byte.toString(16).padStart(2, '0')).join('');
+}
+
+async function installationBootstrapToken() {
+  let response;
+  try {
+    response = await fetch(chrome.runtime.getURL(INSTALLATION_BOOTSTRAP_FILE), { cache: 'no-store' });
+  } catch {
+    response = null;
+  }
+  if (!response?.ok) {
+    throw requestError(
+      'MoonDesk Worker Companion was not loaded from the folder prepared by MoonDesk. Open MoonDesk Settings -> Workers and load that folder unpacked.',
+      0,
+      'companion_installation_capability_missing'
+    );
+  }
+  const body = await response.json().catch(() => null);
+  const token = typeof body?.pairingToken === 'string' ? body.pairingToken.trim() : '';
+  if (!/^[0-9a-f]{64}$/i.test(token)) {
+    throw requestError(
+      'MoonDesk Worker Companion installation capability is invalid. Restart MoonDesk to refresh the companion folder.',
+      0,
+      'companion_installation_capability_invalid'
+    );
+  }
+  return token;
 }
 
 function requestError(message, status = 0, code = null) {
@@ -232,6 +259,7 @@ async function discoverBridge(state) {
     || legacyCompatible.find((probe) => probe.baseUrl === preferred)
     || legacyCompatible[0];
   if (match) {
+    await chrome.storage.local.remove(RUNTIME_RELOAD_STORAGE_KEY);
     if (state.baseUrl !== match.baseUrl) {
       state.baseUrl = match.baseUrl;
       await writeState(state);
@@ -285,10 +313,11 @@ async function ensureConnectedOnce() {
     await writeState(state);
   }
 
+  const bootstrapToken = await installationBootstrapToken();
   await api(state, PAIR_PATH, {
     method: 'POST',
     authenticated: false,
-    body: { clientId: state.clientId, credential: state.credential }
+    body: { clientId: state.clientId, credential: state.credential, bootstrapToken }
   });
   await api(state, STATUS_PATH);
   return state;
@@ -506,7 +535,7 @@ async function collectPresence(state) {
   const focusedTab = tabs.find(
     (tab) => tab.id && tab.active && focusedWindowId !== null && tab.windowId === focusedWindowId
   );
-  if (focusedTab?.id) {
+  if (Number.isInteger(focusedTab?.id)) {
     try {
       await ensureContent(focusedTab.id);
       const response = await sendToTab(
@@ -632,7 +661,7 @@ function rememberedLaunchMatchesRecord(record, rememberedLaunch) {
 }
 
 async function tabMatchesRecord(tab, record) {
-  if (!tab?.id || !tab.url?.startsWith('https://chatgpt.com/')) return false;
+  if (!Number.isInteger(tab?.id) || !tab.url?.startsWith('https://chatgpt.com/')) return false;
   if (tab.url.includes(`moondesk-launch=${encodeURIComponent(record.launchToken)}`)) return true;
   const tabUrl = canonicalChatUrl(tab.url);
   if (record.conversationUrl && tabUrl === canonicalChatUrl(record.conversationUrl)) return true;
@@ -833,7 +862,7 @@ async function observeWorkerAcceptance(
     if (!tab) {
       try { tab = await recoverTab(record); } catch {}
     }
-    if (tab?.id && tab.url?.startsWith('https://chatgpt.com/')) {
+    if (Number.isInteger(tab?.id) && tab.url?.startsWith('https://chatgpt.com/')) {
       try {
         await ensureContent(tab.id);
         const response = await sendToTab(tab.id, {
@@ -1000,7 +1029,7 @@ async function processCommand(state, offer) {
   }
 
   const { record, tab } = recordAndTab;
-  if (!tab.id) {
+  if (!Number.isInteger(tab?.id)) {
     throw new Error('Worker tab has no tab id');
   }
 

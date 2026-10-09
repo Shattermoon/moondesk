@@ -1602,7 +1602,10 @@ impl AppState {
         );
         let companion_auth = Arc::new(CompanionAuth::open_for_config(&config_path)?);
         let (companion_directory, companion_materialize_error) =
-            match companion_install::materialize_for_config(&config_path) {
+            match companion_install::materialize_for_config(
+                &config_path,
+                companion_auth.installation_token(),
+            ) {
                 Ok(install) => (Some(install.directory), None),
                 Err(error) => (None, Some(error.to_string())),
             };

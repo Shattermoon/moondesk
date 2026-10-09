@@ -279,6 +279,8 @@ pub struct ManagedChatCommand {
     pub terminal: Option<ManagedChatTerminalResult>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_client_id: Option<String>,
+    #[serde(default)]
+    pub target_client_pinned_by_request: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anchor_context: Option<ManagedChatAnchorContext>,
 }
@@ -441,6 +443,14 @@ impl ManagedChatStoreData {
             if &command.dedupe_key != dedupe_key {
                 return Err("managed chat dedupe entry does not match command".into());
             }
+        }
+        let persisted = serde_json::to_vec_pretty(self)
+            .map_err(|error| format!("failed to measure managed chat store: {error}"))?;
+        if persisted.len() as u64 > super::MAX_MANAGED_CHAT_STORE_BYTES {
+            return Err(format!(
+                "managed chat state exceeds {} byte safety limit",
+                super::MAX_MANAGED_CHAT_STORE_BYTES
+            ));
         }
         Ok(())
     }

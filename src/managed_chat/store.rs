@@ -1,15 +1,12 @@
-use super::types::ManagedChatStoreData;
+use super::{
+    MANAGED_CHAT_STORE_FILE_NAME, MAX_MANAGED_CHAT_STORE_BYTES, types::ManagedChatStoreData,
+};
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
-use std::path::Path;
-#[cfg(test)]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 #[cfg(windows)]
 use std::time::Duration;
 use uuid::Uuid;
-
-const MANAGED_CHAT_STORE_FILE_NAME: &str = "managed-chat-state-v1.json";
-const MAX_MANAGED_CHAT_STORE_BYTES: u64 = 4 * 1024 * 1024;
 
 #[cfg(windows)]
 const WINDOWS_STORE_RETRY_DELAYS: [Duration; 5] = [
@@ -59,7 +56,23 @@ pub(crate) fn load(path: &Path) -> std::io::Result<ManagedChatStoreData> {
     Ok(data)
 }
 
-pub(crate) fn save(path: &Path, data: &ManagedChatStoreData) -> std::io::Result<()> {
+pub(crate) struct PreparedManagedChatStoreWrite {
+    temp_path: PathBuf,
+    target_path: PathBuf,
+    #[cfg(unix)]
+    parent: PathBuf,
+}
+
+impl Drop for PreparedManagedChatStoreWrite {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.temp_path);
+    }
+}
+
+pub(crate) fn prepare_save(
+    path: &Path,
+    data: &ManagedChatStoreData,
+) -> std::io::Result<PreparedManagedChatStoreWrite> {
     data.validate().map_err(std::io::Error::other)?;
     let bytes = serde_json::to_vec_pretty(data).map_err(|error| {
         std::io::Error::other(format!("failed to serialize managed chat state: {error}"))
@@ -79,39 +92,55 @@ pub(crate) fn save(path: &Path, data: &ManagedChatStoreData) -> std::io::Result<
         ".{MANAGED_CHAT_STORE_FILE_NAME}.{}.tmp",
         Uuid::new_v4()
     ));
-
-    let result = (|| -> std::io::Result<()> {
-        let mut options = OpenOptions::new();
-        options.create_new(true).write(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            options.mode(0o600);
-        }
-
-        let mut file = options.open(&temp_path)?;
-        file.write_all(&bytes)?;
-        file.flush()?;
-        file.sync_all()?;
-        drop(file);
-
-        replace_store_file(&temp_path, path)?;
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
-            if let Ok(directory) = fs::File::open(parent) {
-                let _ = directory.sync_all();
-            }
-        }
-        Ok(())
-    })();
-
-    if result.is_err() {
-        let _ = fs::remove_file(&temp_path);
+    let mut options = OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
     }
-    result
+
+    let mut file = options.open(&temp_path)?;
+    if let Err(error) = file
+        .write_all(&bytes)
+        .and_then(|_| file.flush())
+        .and_then(|_| file.sync_all())
+    {
+        drop(file);
+        let _ = fs::remove_file(&temp_path);
+        return Err(error);
+    }
+    drop(file);
+
+    Ok(PreparedManagedChatStoreWrite {
+        temp_path,
+        target_path: path.to_path_buf(),
+        #[cfg(unix)]
+        parent: parent.to_path_buf(),
+    })
+}
+
+pub(crate) fn commit_prepared(mut prepared: PreparedManagedChatStoreWrite) -> std::io::Result<()> {
+    replace_store_file(&prepared.temp_path, &prepared.target_path)?;
+
+    #[cfg(unix)]
+    {
+        // The temp file is created with 0600, and rename preserves that mode. Directory sync is
+        // best-effort after the atomic replacement so no post-commit error can leave disk ahead
+        // of the broker's in-memory candidate.
+        if let Ok(directory) = fs::File::open(&prepared.parent) {
+            let _ = directory.sync_all();
+        }
+    }
+
+    prepared.temp_path = PathBuf::new();
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn save(path: &Path, data: &ManagedChatStoreData) -> std::io::Result<()> {
+    let prepared = prepare_save(path, data)?;
+    commit_prepared(prepared)
 }
 
 #[cfg(not(windows))]
@@ -186,6 +215,35 @@ mod tests {
             .expect("write unsupported store");
         let error = load(&path).expect_err("unsupported schema must fail closed");
         assert!(error.to_string().contains("managed chat store schema"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn prepared_write_does_not_publish_before_commit() {
+        let root = temp_root("moondesk-managed-chat-store-prepared");
+        fs::create_dir_all(&root).expect("create managed chat store test root");
+        let path = root.join(MANAGED_CHAT_STORE_FILE_NAME);
+        fs::write(&path, b"old canonical bytes").expect("write old canonical managed chat store");
+
+        let prepared = prepare_save(&path, &ManagedChatStoreData::default())
+            .expect("prepare managed chat store");
+        assert_eq!(
+            fs::read(&path).expect("read old canonical managed chat store"),
+            b"old canonical bytes"
+        );
+        drop(prepared);
+        assert_eq!(
+            fs::read(&path).expect("read preserved canonical managed chat store"),
+            b"old canonical bytes"
+        );
+
+        let prepared = prepare_save(&path, &ManagedChatStoreData::default())
+            .expect("prepare managed chat store");
+        commit_prepared(prepared).expect("commit managed chat store");
+        assert_eq!(
+            load(&path).expect("load committed managed chat store"),
+            ManagedChatStoreData::default()
+        );
         let _ = fs::remove_dir_all(root);
     }
 

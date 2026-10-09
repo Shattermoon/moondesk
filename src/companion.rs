@@ -304,6 +304,7 @@ pub struct CompanionAuth {
     correlations: Mutex<BTreeMap<String, (CompanionAnchorRoute, u64)>>,
     anchor_affinities: Mutex<BTreeMap<String, (CompanionAnchorRoute, u64)>>,
     pairing_token: RwLock<String>,
+    installation_token: String,
 }
 
 impl CompanionAuth {
@@ -324,6 +325,7 @@ impl CompanionAuth {
             correlations: Mutex::new(BTreeMap::new()),
             anchor_affinities: Mutex::new(BTreeMap::new()),
             pairing_token: RwLock::new(random_secret()),
+            installation_token: random_secret(),
         })
     }
 
@@ -332,6 +334,15 @@ impl CompanionAuth {
             .read()
             .map(|token| token.clone())
             .unwrap_or_default()
+    }
+
+    pub fn installation_token(&self) -> &str {
+        &self.installation_token
+    }
+
+    pub fn installation_token_matches(&self, supplied: &str) -> bool {
+        supplied.len() == self.installation_token.len()
+            && constant_time_equal(self.installation_token.as_bytes(), supplied.as_bytes())
     }
 
     pub async fn pair(

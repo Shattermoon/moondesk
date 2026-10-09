@@ -62,7 +62,7 @@ pub const COMPANION_CLEAR_WORKERS_ROUTE: &str = "/__moondesk/companion/v1/worker
 pub const COMPANION_TOKEN_HEADER: &str = "x-moondesk-companion-token";
 // Bump with any shipped companion runtime change that requires Chromium to load new bytes. Keep
 // this aligned with COMPANION_RUNTIME_REVISION in background.js.
-pub const COMPANION_RUNTIME_REVISION: u32 = 3;
+pub const COMPANION_RUNTIME_REVISION: u32 = 4;
 const MAX_COMPANION_BODY_BYTES: usize = 16 * 1024;
 
 #[derive(Clone)]
@@ -355,6 +355,7 @@ struct CompanionPairRequest {
 struct CompanionAutoPairRequest {
     client_id: String,
     credential: String,
+    bootstrap_token: String,
 }
 
 #[derive(Deserialize)]
@@ -415,6 +416,12 @@ async fn auto_pair_companion(
         return companion_origin_error();
     }
     let auth = { state.app.lock().await.companion_auth.clone() };
+    if !auth.installation_token_matches(&request.bootstrap_token) {
+        return json_response(
+            StatusCode::UNAUTHORIZED,
+            json!({ "error": "invalid Worker Companion installation capability" }),
+        );
+    }
     match auth
         .auto_pair(
             &request.client_id,
@@ -2641,6 +2648,7 @@ mod tests {
             config_path.clone(),
         )
         .expect("create app state");
+        let bootstrap_token = app.companion_auth.installation_token().to_string();
         let app_state = Arc::new(Mutex::new(app));
         let (ui_tx, _ui_rx) = ui_event_channel();
         let app = companion_bridge_router(
@@ -2692,9 +2700,27 @@ mod tests {
         let credential = "a".repeat(64);
         let pair_body = json!({
             "clientId": "extension-install-a",
-            "credential": credential
+            "credential": credential,
+            "bootstrapToken": bootstrap_token
         });
         let pair_url = format!("http://{address}{COMPANION_PAIR_ROUTE}");
+        let rejected = client
+            .post(&pair_url)
+            .header(
+                reqwest::header::ORIGIN,
+                "chrome-extension://other-extension",
+            )
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(reqwest_json_body(&json!({
+                "clientId": "other-extension",
+                "credential": "b".repeat(64),
+                "bootstrapToken": "c".repeat(64)
+            })))
+            .send()
+            .await
+            .expect("reject extension without installation capability");
+        assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+
         let pair = client
             .post(&pair_url)
             .header(reqwest::header::ORIGIN, "chrome-extension://moondesk-test")
@@ -2765,7 +2791,8 @@ mod tests {
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body(reqwest_json_body(&json!({
                 "clientId": "extension-install-b",
-                "credential": second_credential
+                "credential": second_credential,
+                "bootstrapToken": bootstrap_token
             })))
             .send()
             .await

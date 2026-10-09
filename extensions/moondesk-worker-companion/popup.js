@@ -44,7 +44,7 @@ async function bg(message) {
 // ── ChatGPT context detection ────────────────────────────────────
 async function activeChatTab() {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-  return tab?.id && tab.url?.startsWith('https://chatgpt.com/') ? tab : null;
+  return Number.isInteger(tab?.id) && tab.url?.startsWith('https://chatgpt.com/') ? tab : null;
 }
 
 async function ensureChatScripts(tabId) {

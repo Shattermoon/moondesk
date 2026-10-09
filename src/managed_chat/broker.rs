@@ -4,7 +4,10 @@ use super::types::{
     ManagedChatLaunch, ManagedChatLease, ManagedChatLeaseId, ManagedChatStoreData,
     ManagedChatTerminalResult,
 };
-use super::{DEFAULT_COMMAND_LEASE_MS, MAX_MANAGED_CHAT_COMMANDS, MAX_MANAGED_CHAT_DETAIL_BYTES};
+use super::{
+    DEFAULT_COMMAND_LEASE_MS, MAX_MANAGED_CHAT_COMMANDS, MAX_MANAGED_CHAT_DETAIL_BYTES,
+    MAX_MANAGED_CHAT_TERMINAL_HISTORY, MAX_MANAGED_CHAT_THREAD_AFFINITIES,
+};
 use crate::workspaces::WorkspaceId;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -78,8 +81,7 @@ impl ManagedChatBroker {
         })
     }
 
-    #[cfg(test)]
-    pub async fn snapshot(&self) -> ManagedChatStoreData {
+    pub(crate) async fn snapshot(&self) -> ManagedChatStoreData {
         self.data.lock().await.clone()
     }
 
@@ -235,6 +237,9 @@ impl ManagedChatBroker {
                     command.target_client_id = None;
                 }
             }
+            if command.target_client_id.is_none() {
+                command.target_client_pinned_by_request = false;
+            }
             changed.push(command.clone());
         }
         if changed.is_empty() {
@@ -376,13 +381,13 @@ impl ManagedChatBroker {
                 "managed chat dedupe key was reused with different launch input".into(),
             ));
         }
-        if guard.commands.len() >= MAX_MANAGED_CHAT_COMMANDS {
+        let mut candidate = guard.clone();
+        compact_terminal_history(&mut candidate);
+        if candidate.commands.len() >= MAX_MANAGED_CHAT_COMMANDS {
             return Err(ManagedChatError::Limit(format!(
-                "managed chat command store is limited to {MAX_MANAGED_CHAT_COMMANDS} commands"
+                "managed chat command store is limited to {MAX_MANAGED_CHAT_COMMANDS} active, paused, and retained commands"
             )));
         }
-
-        let mut candidate = guard.clone();
         let sequence = candidate.next_sequence;
         candidate.next_sequence = candidate.next_sequence.checked_add(1).ok_or_else(|| {
             ManagedChatError::Limit("managed chat command sequence is exhausted".into())
@@ -391,7 +396,7 @@ impl ManagedChatBroker {
         let prior_thread_command =
             if request.launch.open_mode == super::types::ManagedChatOpenMode::ExistingThread {
                 request.launch.thread_key.as_deref().and_then(|thread_key| {
-                    guard
+                    candidate
                         .commands
                         .values()
                         .filter(|command| {
@@ -403,9 +408,11 @@ impl ManagedChatBroker {
             } else {
                 None
             };
-        let target_client_id = prior_thread_command
-            .and_then(|command| command.target_client_id.clone())
-            .or(requested_client_id);
+        let prior_target_client_id =
+            prior_thread_command.and_then(|command| command.target_client_id.clone());
+        let target_client_pinned_by_request =
+            prior_target_client_id.is_some() || requested_client_id.is_some();
+        let target_client_id = prior_target_client_id.or(requested_client_id);
         let anchor_context = prior_thread_command
             .and_then(|command| command.anchor_context.clone())
             .or(requested_anchor_context);
@@ -421,6 +428,7 @@ impl ManagedChatBroker {
             lease: None,
             terminal: None,
             target_client_id,
+            target_client_pinned_by_request,
             anchor_context,
         };
         candidate
@@ -494,6 +502,9 @@ impl ManagedChatBroker {
                 .is_some_and(|lease| lease.expires_at_ms <= now_ms);
             if !expired {
                 continue;
+            }
+            if !command.target_client_pinned_by_request {
+                command.target_client_id = None;
             }
             match command.state {
                 ManagedChatCommandState::Leased => {
@@ -636,26 +647,35 @@ impl ManagedChatBroker {
                 "managed chat client id must contain 1..=128 bytes".into(),
             ));
         }
-        let (details, conversation_url) = match &outcome {
-            ManagedChatAckOutcome::Succeeded {
-                details,
-                conversation_url,
-            } => (details.as_deref(), conversation_url.as_deref()),
-            ManagedChatAckOutcome::Failed { details }
-            | ManagedChatAckOutcome::Paused { details } => (details.as_deref(), None),
-            ManagedChatAckOutcome::NeedsReconcile => (None, None),
+        let details = match &outcome {
+            ManagedChatAckOutcome::Succeeded { details, .. }
+            | ManagedChatAckOutcome::Failed { details }
+            | ManagedChatAckOutcome::Paused { details } => details.as_deref(),
+            ManagedChatAckOutcome::NeedsReconcile => None,
         };
         if details.is_some_and(|value| value.len() > MAX_MANAGED_CHAT_DETAIL_BYTES) {
             return Err(ManagedChatError::Invalid(format!(
                 "managed chat ack details exceed {MAX_MANAGED_CHAT_DETAIL_BYTES} bytes"
             )));
         }
-        if conversation_url.is_some_and(|value| {
-            value.is_empty() || value.len() > 2048 || !value.starts_with("https://chatgpt.com/")
-        }) {
-            return Err(ManagedChatError::Invalid(
-                "managed chat conversation URL is invalid".into(),
-            ));
+        if let ManagedChatAckOutcome::Succeeded {
+            conversation_url, ..
+        } = &outcome
+        {
+            let Some(conversation_url) = conversation_url.as_deref() else {
+                return Err(ManagedChatError::Invalid(
+                    "managed chat worker success requires a confirmed ChatGPT conversation URL"
+                        .into(),
+                ));
+            };
+            if conversation_url.len() > 2048
+                || canonical_chatgpt_conversation_id(conversation_url).is_none()
+            {
+                return Err(ManagedChatError::Invalid(
+                    "managed chat worker success requires a canonical ChatGPT /c/<id> conversation URL"
+                        .into(),
+                ));
+            }
         }
 
         let mut guard = self.data.lock().await;
@@ -774,12 +794,16 @@ impl ManagedChatBroker {
     ) -> Result<(), ManagedChatError> {
         let path = self.path.clone();
         let persisted = candidate.clone();
-        tokio::task::spawn_blocking(move || store::save(&path, &persisted))
+        let prepared = tokio::task::spawn_blocking(move || store::prepare_save(&path, &persisted))
             .await
             .map_err(|error| {
                 ManagedChatError::Storage(format!("managed chat persistence task failed: {error}"))
             })?
             .map_err(storage_error)?;
+        // Keep the cancellation point before the canonical store mutation. The prepared temp file
+        // can be abandoned safely; once this resumes, disk commit and in-memory publication happen
+        // back-to-back without another await.
+        store::commit_prepared(prepared).map_err(storage_error)?;
         **guard = candidate;
         Ok(())
     }
@@ -801,6 +825,98 @@ fn anchor_is_eligible(
         .is_none_or(|context| eligible.contains(&context.conversation_id))
 }
 
+fn compact_terminal_history(data: &mut ManagedChatStoreData) {
+    let mut newest_thread_success =
+        std::collections::BTreeMap::<String, (u64, ManagedChatCommandId)>::new();
+    for command in data.commands.values() {
+        if command.state != ManagedChatCommandState::Succeeded {
+            continue;
+        }
+        let Some(thread_key) = command.launch.thread_key.as_ref() else {
+            continue;
+        };
+        let replace = newest_thread_success
+            .get(thread_key)
+            .is_none_or(|(sequence, _)| command.sequence > *sequence);
+        if replace {
+            newest_thread_success
+                .insert(thread_key.clone(), (command.sequence, command.id.clone()));
+        }
+    }
+    let mut thread_affinities = newest_thread_success.into_values().collect::<Vec<_>>();
+    thread_affinities.sort_by_key(|(sequence, _)| std::cmp::Reverse(*sequence));
+    let protected = thread_affinities
+        .into_iter()
+        .take(MAX_MANAGED_CHAT_THREAD_AFFINITIES)
+        .map(|(_, command_id)| command_id)
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut terminal = data
+        .commands
+        .values()
+        .filter(|command| {
+            matches!(
+                command.state,
+                ManagedChatCommandState::Succeeded | ManagedChatCommandState::Failed
+            ) && !protected.contains(&command.id)
+        })
+        .map(|command| (command.sequence, command.id.clone()))
+        .collect::<Vec<_>>();
+    terminal.sort_by_key(|(sequence, _)| std::cmp::Reverse(*sequence));
+    let remove = terminal
+        .into_iter()
+        .skip(MAX_MANAGED_CHAT_TERMINAL_HISTORY)
+        .map(|(_, command_id)| command_id)
+        .collect::<std::collections::BTreeSet<_>>();
+    if remove.is_empty() {
+        return;
+    }
+    data.commands
+        .retain(|command_id, _| !remove.contains(command_id));
+    data.dedupe
+        .retain(|_, command_id| data.commands.contains_key(command_id));
+}
+
+fn canonical_chatgpt_conversation_id(value: &str) -> Option<String> {
+    let url = reqwest::Url::parse(value).ok()?;
+    if url.scheme() != "https"
+        || url.host_str() != Some("chatgpt.com")
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return None;
+    }
+    let segments = url
+        .path_segments()?
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    let valid_project_segment = |segment: &str| {
+        segment
+            .get(..36)
+            .and_then(|prefix| prefix.strip_prefix("g-p-"))
+            .is_some_and(|suffix| {
+                suffix.len() == 32 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+    };
+    let conversation_id = match segments.as_slice() {
+        ["c", conversation_id] => *conversation_id,
+        ["g", project, "c", conversation_id] if valid_project_segment(project) => *conversation_id,
+        ["g", project, "shared", "c", conversation_id] if valid_project_segment(project) => {
+            *conversation_id
+        }
+        _ => return None,
+    };
+    if !(16..=64).contains(&conversation_id.len())
+        || !conversation_id
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() || byte == b'-')
+    {
+        return None;
+    }
+    Some(conversation_id.to_ascii_lowercase())
+}
+
 fn terminal_matches(command: &ManagedChatCommand, outcome: &ManagedChatAckOutcome) -> bool {
     let Some(terminal) = &command.terminal else {
         return false;
@@ -814,8 +930,15 @@ fn terminal_matches(command: &ManagedChatCommand, outcome: &ManagedChatAckOutcom
                 && &terminal.details == details
                 && &terminal.conversation_url == conversation_url
         }
-        ManagedChatAckOutcome::Failed { details } | ManagedChatAckOutcome::Paused { details } => {
-            !terminal.succeeded && &terminal.details == details
+        ManagedChatAckOutcome::Failed { details } => {
+            command.state == ManagedChatCommandState::Failed
+                && !terminal.succeeded
+                && &terminal.details == details
+        }
+        ManagedChatAckOutcome::Paused { details } => {
+            command.state == ManagedChatCommandState::Paused
+                && !terminal.succeeded
+                && &terminal.details == details
         }
         ManagedChatAckOutcome::NeedsReconcile => false,
     }
@@ -1254,7 +1377,7 @@ mod tests {
 
         let reopened = ManagedChatBroker::open(&path).expect("reopen broker");
         let second = reopened
-            .redeem("extension-a", 1_000 + DEFAULT_COMMAND_LEASE_MS + 1)
+            .redeem("extension-b", 1_000 + DEFAULT_COMMAND_LEASE_MS + 1)
             .await
             .expect("redeem expired pre-send command")
             .expect("fresh command after safe expiry");
@@ -1270,14 +1393,14 @@ mod tests {
         assert_ne!(second_lease, first_lease);
 
         reopened
-            .mark_send_started(&command.id, &second_lease, "extension-a")
+            .mark_send_started(&command.id, &second_lease, "extension-b")
             .await
             .expect("cross durable send boundary");
         drop(reopened);
 
         let reopened = ManagedChatBroker::open(&path).expect("reopen after send started");
         let third = reopened
-            .redeem("extension-a", 1_000 + (DEFAULT_COMMAND_LEASE_MS * 2) + 2)
+            .redeem("extension-c", 1_000 + (DEFAULT_COMMAND_LEASE_MS * 2) + 2)
             .await
             .expect("redeem expired post-send command")
             .expect("reconciliation command");
@@ -1700,6 +1823,336 @@ mod tests {
         assert_eq!(queued.target_client_id, None);
         assert!(!queued.reconcile_history);
 
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn worker_success_requires_a_canonical_conversation_url() {
+        let root = temp_root("moondesk-managed-chat-success-url");
+        let broker = ManagedChatBroker::open(root.join("state.json")).expect("open broker");
+        let command = broker
+            .enqueue(EnqueueManagedChatRequest {
+                dedupe_key: "worker:success-url:task:one".into(),
+                launch: launch("success-url"),
+            })
+            .await
+            .expect("enqueue command");
+        let offer = broker
+            .redeem("extension-a", 10)
+            .await
+            .expect("redeem command")
+            .expect("lease command");
+        let lease_id = offer
+            .command
+            .lease
+            .as_ref()
+            .expect("lease")
+            .lease_id
+            .clone();
+        broker
+            .mark_send_started(&command.id, &lease_id, "extension-a")
+            .await
+            .expect("cross Send boundary");
+
+        for invalid in [
+            None,
+            Some("https://chatgpt.com/".to_string()),
+            Some(
+                "https://chatgpt.com/c/aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee?temporary=1"
+                    .to_string(),
+            ),
+            Some("https://chatgpt.com/foo/c/aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee".to_string()),
+        ] {
+            let error = broker
+                .acknowledge(
+                    &command.id,
+                    &lease_id,
+                    "extension-a",
+                    ManagedChatAckOutcome::Succeeded {
+                        details: Some("sent".into()),
+                        conversation_url: invalid,
+                    },
+                )
+                .await
+                .expect_err("non-canonical worker success must be rejected");
+            assert!(matches!(error, ManagedChatError::Invalid(_)));
+        }
+
+        let project = "g-p-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-moondesk";
+        let conversation = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+        let canonical = format!("https://chatgpt.com/g/{project}/c/{conversation}");
+        let succeeded = broker
+            .acknowledge(
+                &command.id,
+                &lease_id,
+                "extension-a",
+                ManagedChatAckOutcome::Succeeded {
+                    details: Some("sent".into()),
+                    conversation_url: Some(canonical.clone()),
+                },
+            )
+            .await
+            .expect("canonical Project conversation succeeds");
+        assert_eq!(succeeded.state, ManagedChatCommandState::Succeeded);
+        assert_eq!(
+            succeeded
+                .terminal
+                .as_ref()
+                .and_then(|terminal| terminal.conversation_url.as_deref()),
+            Some(canonical.as_str())
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn failed_and_paused_terminal_acks_are_not_interchangeable() {
+        let root = temp_root("moondesk-managed-chat-terminal-exact");
+        let broker = ManagedChatBroker::open(root.join("state.json")).expect("open broker");
+        let failed_command = broker
+            .enqueue(EnqueueManagedChatRequest {
+                dedupe_key: "worker:terminal:task:failed".into(),
+                launch: launch("terminal-failed"),
+            })
+            .await
+            .expect("enqueue failed command");
+        let failed_offer = broker
+            .redeem("extension-a", 10)
+            .await
+            .expect("redeem failed command")
+            .expect("lease failed command");
+        let failed_lease = failed_offer
+            .command
+            .lease
+            .as_ref()
+            .expect("failed lease")
+            .lease_id
+            .clone();
+        broker
+            .acknowledge(
+                &failed_command.id,
+                &failed_lease,
+                "extension-a",
+                ManagedChatAckOutcome::Failed {
+                    details: Some("same-details".into()),
+                },
+            )
+            .await
+            .expect("terminal failure");
+        let paused_as_failed = broker
+            .acknowledge(
+                &failed_command.id,
+                &failed_lease,
+                "extension-a",
+                ManagedChatAckOutcome::Paused {
+                    details: Some("same-details".into()),
+                },
+            )
+            .await
+            .expect_err("Paused must not replay as Failed");
+        assert!(matches!(paused_as_failed, ManagedChatError::Conflict(_)));
+
+        let paused_command = broker
+            .enqueue(EnqueueManagedChatRequest {
+                dedupe_key: "worker:terminal:task:paused".into(),
+                launch: launch("terminal-paused"),
+            })
+            .await
+            .expect("enqueue paused command");
+        let paused_offer = broker
+            .redeem("extension-a", 20)
+            .await
+            .expect("redeem paused command")
+            .expect("lease paused command");
+        let paused_lease = paused_offer
+            .command
+            .lease
+            .as_ref()
+            .expect("paused lease")
+            .lease_id
+            .clone();
+        broker
+            .mark_send_started(&paused_command.id, &paused_lease, "extension-a")
+            .await
+            .expect("cross Send boundary for pause");
+        broker
+            .acknowledge(
+                &paused_command.id,
+                &paused_lease,
+                "extension-a",
+                ManagedChatAckOutcome::Paused {
+                    details: Some("same-details".into()),
+                },
+            )
+            .await
+            .expect("terminal pause");
+        let failed_as_paused = broker
+            .acknowledge(
+                &paused_command.id,
+                &paused_lease,
+                "extension-a",
+                ManagedChatAckOutcome::Failed {
+                    details: Some("same-details".into()),
+                },
+            )
+            .await
+            .expect_err("Failed must not replay as Paused");
+        assert!(matches!(failed_as_paused, ManagedChatError::Conflict(_)));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn enqueue_compacts_old_terminal_history_before_global_capacity_is_exhausted() {
+        let root = temp_root("moondesk-managed-chat-terminal-compaction");
+        std::fs::create_dir_all(&root).expect("create managed chat compaction root");
+        let path = root.join("state.json");
+        let mut data = ManagedChatStoreData::default();
+        for sequence in 0..MAX_MANAGED_CHAT_COMMANDS as u64 {
+            let command_id = ManagedChatCommandId::new();
+            let dedupe_key = format!("terminal-history-{sequence}");
+            let mut historical_launch = launch(&format!("terminal-{sequence}"));
+            historical_launch.thread_key = None;
+            let command = ManagedChatCommand {
+                id: command_id.clone(),
+                sequence,
+                dedupe_key: dedupe_key.clone(),
+                request_fingerprint: "a".repeat(64),
+                launch: historical_launch,
+                state: ManagedChatCommandState::Failed,
+                dispatch_ready: true,
+                reconcile_history: false,
+                lease: None,
+                terminal: Some(ManagedChatTerminalResult {
+                    succeeded: false,
+                    details: Some("historical".into()),
+                    conversation_url: None,
+                }),
+                target_client_id: None,
+                target_client_pinned_by_request: false,
+                anchor_context: None,
+            };
+            data.dedupe.insert(dedupe_key, command_id.clone());
+            data.commands.insert(command_id, command);
+        }
+        data.next_sequence = MAX_MANAGED_CHAT_COMMANDS as u64;
+        store::save(&path, &data).expect("seed full terminal store");
+
+        let broker = ManagedChatBroker::open(&path).expect("open full terminal store");
+        let command = broker
+            .enqueue(EnqueueManagedChatRequest {
+                dedupe_key: "fresh-after-compaction".into(),
+                launch: launch("fresh-after-compaction"),
+            })
+            .await
+            .expect("terminal history must be compacted before capacity rejection");
+        let snapshot = broker.snapshot().await;
+        assert!(snapshot.commands.contains_key(&command.id));
+        assert!(snapshot.commands.len() <= MAX_MANAGED_CHAT_TERMINAL_HISTORY + 1);
+        assert_eq!(snapshot.commands.len(), snapshot.dedupe.len());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn terminal_compaction_bounds_per_thread_affinity_history() {
+        let root = temp_root("moondesk-managed-chat-thread-affinity-compaction");
+        std::fs::create_dir_all(&root).expect("create thread affinity compaction root");
+        let path = root.join("state.json");
+        let mut data = ManagedChatStoreData::default();
+        for sequence in 0..MAX_MANAGED_CHAT_COMMANDS as u64 {
+            let command_id = ManagedChatCommandId::new();
+            let dedupe_key = format!("thread-affinity-history-{sequence}");
+            let mut historical_launch = launch(&format!("thread-affinity-{sequence}"));
+            historical_launch.thread_key = Some(format!("worker:thread-{sequence}"));
+            let conversation_url = format!("https://chatgpt.com/c/{command_id}");
+            let command = ManagedChatCommand {
+                id: command_id.clone(),
+                sequence,
+                dedupe_key: dedupe_key.clone(),
+                request_fingerprint: "a".repeat(64),
+                launch: historical_launch,
+                state: ManagedChatCommandState::Succeeded,
+                dispatch_ready: true,
+                reconcile_history: true,
+                lease: None,
+                terminal: Some(ManagedChatTerminalResult {
+                    succeeded: true,
+                    details: Some("historical".into()),
+                    conversation_url: Some(conversation_url),
+                }),
+                target_client_id: Some(format!("browser-{sequence}")),
+                target_client_pinned_by_request: true,
+                anchor_context: None,
+            };
+            data.dedupe.insert(dedupe_key, command_id.clone());
+            data.commands.insert(command_id, command);
+        }
+        data.next_sequence = MAX_MANAGED_CHAT_COMMANDS as u64;
+        store::save(&path, &data).expect("seed full per-thread terminal store");
+
+        let broker = ManagedChatBroker::open(&path).expect("open per-thread terminal store");
+        broker
+            .enqueue(EnqueueManagedChatRequest {
+                dedupe_key: "fresh-after-thread-affinity-compaction".into(),
+                launch: launch("fresh-after-thread-affinity-compaction"),
+            })
+            .await
+            .expect("old per-thread affinity records must compact before capacity rejection");
+        let snapshot = broker.snapshot().await;
+        assert!(
+            snapshot.commands.len()
+                <= MAX_MANAGED_CHAT_THREAD_AFFINITIES + MAX_MANAGED_CHAT_TERMINAL_HISTORY + 1
+        );
+        assert_eq!(snapshot.commands.len(), snapshot.dedupe.len());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn maximum_large_command_count_fits_managed_chat_store_budget() {
+        let root = temp_root("moondesk-managed-chat-large-capacity");
+        std::fs::create_dir_all(&root).expect("create managed chat large-capacity root");
+        let path = root.join("state.json");
+        let large_opening = "x".repeat(crate::managed_chat::MAX_MANAGED_CHAT_OPENING_MESSAGE_BYTES);
+        let mut data = ManagedChatStoreData::default();
+
+        for sequence in 0..MAX_MANAGED_CHAT_COMMANDS as u64 {
+            let command_id = ManagedChatCommandId::new();
+            let dedupe_key = format!("large-capacity-{sequence}");
+            let mut large_launch = launch(&format!("large-capacity-{sequence}"));
+            large_launch.opening_message = large_opening.clone();
+            large_launch.thread_key = Some(format!("worker:large-capacity-{sequence}"));
+            let command = ManagedChatCommand {
+                id: command_id.clone(),
+                sequence,
+                dedupe_key: dedupe_key.clone(),
+                request_fingerprint: "a".repeat(64),
+                launch: large_launch,
+                state: ManagedChatCommandState::Queued,
+                dispatch_ready: true,
+                reconcile_history: false,
+                lease: None,
+                terminal: None,
+                target_client_id: None,
+                target_client_pinned_by_request: false,
+                anchor_context: None,
+            };
+            data.dedupe.insert(dedupe_key, command_id.clone());
+            data.commands.insert(command_id, command);
+        }
+        data.next_sequence = MAX_MANAGED_CHAT_COMMANDS as u64;
+        data.validate()
+            .expect("maximum configured command set must remain serializable");
+        let serialized = serde_json::to_vec_pretty(&data).expect("serialize maximum command set");
+        assert!(serialized.len() as u64 <= crate::managed_chat::MAX_MANAGED_CHAT_STORE_BYTES);
+        store::save(&path, &data).expect("persist maximum configured command set");
+
+        let broker = ManagedChatBroker::open(&path).expect("reopen maximum command set");
+        let overflow = broker
+            .enqueue(EnqueueManagedChatRequest {
+                dedupe_key: "large-capacity-overflow".into(),
+                launch: launch("large-capacity-overflow"),
+            })
+            .await
+            .expect_err("configured command count must reject overflow before persistence");
+        assert!(matches!(overflow, ManagedChatError::Limit(_)));
         let _ = std::fs::remove_dir_all(root);
     }
 

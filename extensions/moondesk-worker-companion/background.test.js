@@ -37,7 +37,10 @@ function loadBackground({ existingTabs = {}, contentByTab = {}, sendMessageImpl 
     storage: {
       local: {
         async get() { return stored; },
-        async set(value) { stored = { ...stored, ...value }; }
+        async set(value) { stored = { ...stored, ...value }; },
+        async remove(key) {
+          for (const entry of Array.isArray(key) ? key : [key]) delete stored[entry];
+        }
       }
     },
     tabs: {
@@ -86,6 +89,7 @@ function loadBackground({ existingTabs = {}, contentByTab = {}, sendMessageImpl 
     },
     runtime: {
       getManifest() { return runtimeManifest; },
+      getURL(path) { return `chrome-extension://test/${path}`; },
       reload() { runtimeReloads.push(true); },
       onMessage: { addListener(handler) { runtimeMessageHandler = handler; } },
       onInstalled: { addListener() {} },
@@ -100,7 +104,18 @@ function loadBackground({ existingTabs = {}, contentByTab = {}, sendMessageImpl 
     URL,
     AbortController,
     navigator: { userAgent: 'Mozilla/5.0 Chrome/153.0.0.0 Safari/537.36' },
-    fetch: fetchImpl,
+    fetch: async (url, options = {}) => {
+      if (String(url) === 'chrome-extension://test/moondesk-bootstrap.json') {
+        const body = { pairingToken: 'b'.repeat(64) };
+        return {
+          ok: true,
+          status: 200,
+          async json() { return body; },
+          async text() { return JSON.stringify(body); }
+        };
+      }
+      return fetchImpl(url, options);
+    },
     setTimeout: setTimeoutImpl || (() => 1),
     clearTimeout: () => {}
   });
@@ -258,7 +273,7 @@ test('bridge discovery prefers an exact runtime match over another MoonDesk vers
             app: 'moondesk-worker-companion',
             appVersion: '0.13.0',
             protocolVersion: 2,
-            companionRuntimeRevision: 4
+            companionRuntimeRevision: 5
           };
         }
       };
@@ -272,7 +287,7 @@ test('bridge discovery prefers an exact runtime match over another MoonDesk vers
             app: 'moondesk-worker-companion',
             appVersion: '0.12.0',
             protocolVersion: 2,
-            companionRuntimeRevision: 3
+            companionRuntimeRevision: 4
           };
         }
       };
@@ -286,7 +301,7 @@ test('bridge discovery prefers an exact runtime match over another MoonDesk vers
 
   const { evaluate, runtimeReloads } = loadBackground({ fetchImpl });
   const hello = await evaluate('discoverBridge(freshState())');
-  assert.equal(hello.companionRuntimeRevision, 3);
+  assert.equal(hello.companionRuntimeRevision, 4);
   assert.equal(runtimeReloads.length, 0);
 });
 
@@ -302,7 +317,7 @@ test('bridge runtime revision mismatch reloads the unpacked companion once', asy
             app: 'moondesk-worker-companion',
             appVersion: '0.13.0',
             protocolVersion: 2,
-            companionRuntimeRevision: 4
+            companionRuntimeRevision: 5
           };
         }
       };
@@ -328,6 +343,112 @@ test('bridge runtime revision mismatch reloads the unpacked companion once', asy
   assert.equal(runtimeReloads.length, 1, 'mismatch recovery must not enter a reload loop');
 });
 
+test('compatible bridge clears the one-shot runtime reload marker for a future mismatch', async () => {
+  const reloadKey = 'moondeskWorkerCompanionReloadRevisionV1';
+  const fetchImpl = async (url) => {
+    const port = new URL(url).port;
+    if (port === '47651') {
+      return {
+        ok: true,
+        status: 200,
+        async json() {
+          return {
+            app: 'moondesk-worker-companion',
+            appVersion: '0.12.0',
+            protocolVersion: 2,
+            companionRuntimeRevision: 4
+          };
+        }
+      };
+    }
+    return { ok: false, status: 404, async json() { return {}; } };
+  };
+  const { evaluate } = loadBackground({
+    fetchImpl,
+    initialStored: { [reloadKey]: '0.12.0:4' }
+  });
+
+  const hello = await evaluate('discoverBridge(freshState())');
+  assert.equal(hello.companionRuntimeRevision, 4);
+  const stored = await evaluate(`chrome.storage.local.get('${reloadKey}')`);
+  assert.equal(stored[reloadKey], undefined);
+});
+
+test('automatic pairing proves the extension was loaded from the MoonDesk-prepared folder', async () => {
+  const requests = [];
+  const fetchImpl = async (url, options = {}) => {
+    requests.push({ url: String(url), options });
+    if (String(url).endsWith('/__moondesk/companion/v1/hello')) {
+      return {
+        ok: true,
+        status: 200,
+        async json() {
+          return {
+            app: 'moondesk-worker-companion',
+            appVersion: '0.12.0',
+            protocolVersion: 2,
+            companionRuntimeRevision: 4
+          };
+        }
+      };
+    }
+    if (String(url).endsWith('/__moondesk/companion/v1/pair')) {
+      return { ok: true, status: 200, async text() { return '{}'; } };
+    }
+    if (String(url).endsWith('/__moondesk/companion/v1/status')) {
+      return {
+        ok: true,
+        status: 200,
+        async text() {
+          return JSON.stringify({ clientId: 'client-bootstrap', paired: true, protocolVersion: 2 });
+        }
+      };
+    }
+    return { ok: false, status: 404, async text() { return '{}'; }, async json() { return {}; } };
+  };
+  const { evaluate } = loadBackground({ fetchImpl });
+  const state = await evaluate(`writeState({
+    ...freshState(),
+    baseUrl: 'http://127.0.0.1:47651',
+    clientId: 'client-bootstrap',
+    credential: null
+  }).then(() => ensureConnectedOnce())`);
+  assert.equal(state.clientId, 'client-bootstrap');
+  const pair = requests.find((request) => request.url.endsWith('/__moondesk/companion/v1/pair'));
+  assert.ok(pair, 'automatic pairing must call the pair route');
+  const body = JSON.parse(pair.options.body);
+  assert.equal(body.clientId, 'client-bootstrap');
+  assert.match(body.credential, /^[0-9a-f]{64}$/);
+  assert.equal(body.bootstrapToken, 'b'.repeat(64));
+});
+
+test('worker tab recovery accepts Chromium tab id zero', async () => {
+  const launchToken = 'launch-zero';
+  const existingTabs = {
+    0: {
+      id: 0,
+      url: `https://chatgpt.com/?moondesk-launch=${launchToken}#moondesk-launch=${launchToken}`,
+      active: false
+    }
+  };
+  const { evaluate } = loadBackground({ existingTabs });
+  const recovered = await evaluate(`recoverTab({
+    commandId: 'command-zero',
+    workspaceId: 'workspace-zero',
+    taskMarker: 'marker-zero',
+    threadKey: 'thread-zero',
+    openMode: 'new_thread',
+    launchToken: '${launchToken}',
+    sourceUrl: 'https://chatgpt.com/',
+    tabId: 0,
+    conversationUrl: null,
+    phase: 'created',
+    reconcileAttempts: 0
+  })`);
+  assert.equal(recovered.id, 0);
+  assert.match(popupSource, /Number\.isInteger\(tab\?\.id\)/, 'popup must accept active ChatGPT tab id zero too');
+});
+
 test('release version mismatch reloads the unpacked companion even when protocol and runtime revision match', async () => {
   const fetchImpl = async (url) => {
     const port = new URL(url).port;
@@ -340,7 +461,7 @@ test('release version mismatch reloads the unpacked companion even when protocol
             app: 'moondesk-worker-companion',
             appVersion: '0.13.0',
             protocolVersion: 2,
-            companionRuntimeRevision: 3
+            companionRuntimeRevision: 4
           };
         }
       };
@@ -1542,6 +1663,59 @@ test('MAIN-world model reader uses the reported current-shell trigger as closed-
   assert.equal(trigger.attributes['data-moondesk-picker-route'], '/');
   assert.equal(trigger.attributes['data-moondesk-selected-model'], 'gpt-5.6-sol');
   assert.equal(trigger.attributes['data-moondesk-selected-effort'], 'max');
+});
+
+test('isolated model readback fails closed when only an adjacent reasoning effort is offered', async () => {
+  const picker = {
+    version: 'gpt-5.6',
+    currentBucket: 1,
+    versions: [{ id: 'gpt-5.6', label: 'GPT-5.6' }],
+    choices: [{
+      bucket: 1,
+      id: 'gpt-5.6-sol',
+      label: 'GPT-5.6 Sol',
+      familyId: 'gpt-5.6-sol',
+      familyLabel: 'GPT-5.6 Sol',
+      effort: 'medium',
+      available: true
+    }]
+  };
+  const listeners = new Set();
+  const pageWindow = {
+    addEventListener(type, handler) {
+      if (type === 'message') listeners.add(handler);
+    },
+    removeEventListener(type, handler) {
+      if (type === 'message') listeners.delete(handler);
+    },
+    postMessage(message) {
+      if (message?.source !== 'moondesk-picker-ask') return;
+      for (const handler of [...listeners]) {
+        handler({
+          source: pageWindow,
+          origin: 'https://chatgpt.com',
+          data: { source: 'moondesk-picker-reply', nonce: message.nonce, v: 1, picker }
+        });
+      }
+    }
+  };
+  const context = vm.createContext({
+    window: pageWindow,
+    document: { querySelector() { return null; }, querySelectorAll() { return []; } },
+    location: { origin: 'https://chatgpt.com', pathname: '/' },
+    crypto: webcrypto,
+    URL,
+    setTimeout,
+    clearTimeout
+  });
+
+  vm.runInContext(chatgptDomSource, context, { filename: chatgptDomPath });
+  const selection = await pageWindow.MOONDESK_CHATGPT_DOM.selectedModelAndEffort({
+    modelKey: 'gpt-5.6-sol',
+    modelLabel: 'GPT-5.6 Sol',
+    reasoningEffort: 'high'
+  });
+  assert.equal(selection, null, 'requested High must never be silently replaced by Medium');
 });
 
 test('isolated model readback accepts a legacy Extra High profile when the current shell offers Max', async () => {

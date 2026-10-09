@@ -48,6 +48,7 @@ mod tests {
     fn bootstrap_contains_claim_and_workspace_contract_without_secret_mcp_route() {
         let receipt = SpawnReceipt {
             request_fingerprint: "a".repeat(64),
+            sequence: 0,
             family_id: WorkerFamilyId::new(),
             worker_id: WorkerId::new(),
             task_id: TaskId::new(),

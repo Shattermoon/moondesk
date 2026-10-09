@@ -111,6 +111,13 @@ pub struct CollectedUpdates {
     pub completed: Vec<CollectedWorkerUpdate>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct InactiveWorkerCleanupSummary {
+    pub family_count: usize,
+    pub worker_count: usize,
+    pub replay_receipt_count: usize,
+}
+
 pub struct WorkerBroker {
     path: PathBuf,
     data: Mutex<WorkerStoreData>,
@@ -184,10 +191,10 @@ impl WorkerBroker {
                     .count();
                 let cleanup_guidance = if cleanup_candidates > 0 {
                     format!(
-                        "; {cleanup_candidates} retained Core families have no active workers. Open an older Core, collect any pending worker results, then retire its idle workers or use Clear Workers before creating workers from a new Core"
+                        "; {cleanup_candidates} retained Core families are safe to release. Use MoonDesk Settings -> Workers -> Release inactive Worker capacity for the affected workspace; ChatGPT conversations are preserved"
                     )
                 } else {
-                    "; no retained Core family is currently inactive enough to clean up safely; finish active worker tasks before freeing older Core history"
+                    "; no retained Core family is currently safe to release; finish active work and collect pending worker results before freeing older Core history"
                         .to_string()
                 };
                 return Err(WorkerBrokerError::Limit(format!(
@@ -1086,6 +1093,71 @@ impl WorkerBroker {
         Ok(removed)
     }
 
+    pub async fn inactive_cleanup_preview_for_workspace(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<InactiveWorkerCleanupSummary, WorkerBrokerError> {
+        workspace_id
+            .validate()
+            .map_err(WorkerBrokerError::Invalid)?;
+        let guard = self.data.lock().await;
+        Ok(inactive_cleanup_summary(&guard, workspace_id))
+    }
+
+    pub async fn inactive_cleanup_session_digests_for_workspace(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<Vec<String>, WorkerBrokerError> {
+        workspace_id
+            .validate()
+            .map_err(WorkerBrokerError::Invalid)?;
+        let guard = self.data.lock().await;
+        Ok(guard
+            .families
+            .values()
+            .filter(|family| {
+                &family.workspace_id == workspace_id
+                    && family_is_safe_for_explicit_host_cleanup(family)
+            })
+            .map(|family| family.anchor_identity.session_digest.clone())
+            .collect())
+    }
+
+    pub async fn cleanup_inactive_families_for_workspace(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<InactiveWorkerCleanupSummary, WorkerBrokerError> {
+        workspace_id
+            .validate()
+            .map_err(WorkerBrokerError::Invalid)?;
+        let mut guard = self.data.lock().await;
+        let removable = guard
+            .families
+            .iter()
+            .filter(|(_, family)| {
+                &family.workspace_id == workspace_id
+                    && family_is_safe_for_explicit_host_cleanup(family)
+            })
+            .map(|(family_id, _)| family_id.clone())
+            .collect::<Vec<_>>();
+        if removable.is_empty() {
+            return Ok(InactiveWorkerCleanupSummary::default());
+        }
+
+        let mut candidate = guard.clone();
+        let mut summary = InactiveWorkerCleanupSummary::default();
+        for family_id in removable {
+            if let Some(family) = candidate.families.remove(&family_id) {
+                summary.family_count += 1;
+                summary.worker_count += family.workers.len();
+                summary.replay_receipt_count += family.collect_requests.len();
+            }
+        }
+        self.commit_candidate(&mut guard, candidate).await?;
+        self.updates.notify_waiters();
+        Ok(summary)
+    }
+
     pub async fn ensure_clearable_session_digest(
         &self,
         session_digest: &str,
@@ -1732,24 +1804,65 @@ fn collected_updates_from_receipt(receipt: &CollectReceipt) -> CollectedUpdates 
     }
 }
 
-fn retired_family_is_reclaimable(family: &WorkerFamily) -> bool {
+fn task_is_settled_and_delivered(task: &WorkerTask) -> bool {
+    match task.state {
+        TaskState::Completed => task.result.is_some() && task.collected,
+        TaskState::Failed => task.result.as_ref().is_none_or(|_| task.collected),
+        TaskState::Pending | TaskState::Running | TaskState::Blocked => false,
+    }
+}
+
+fn collect_receipt_has_payload(receipt: &CollectReceipt) -> bool {
+    !receipt.reports.is_empty() || !receipt.completed.is_empty()
+}
+
+fn family_is_safe_for_explicit_host_cleanup(family: &WorkerFamily) -> bool {
     family.reports.is_empty()
         && family.workers.values().all(|worker| {
-            worker.state == WorkerState::Retired
-                && worker.messages.is_empty()
+            matches!(worker.state, WorkerState::Idle | WorkerState::Retired)
+                && matches!(
+                    worker.launch_state,
+                    WorkerLaunchState::Claimed | WorkerLaunchState::Failed
+                )
                 && worker.current_task_id.is_none()
-                && worker
-                    .tasks
-                    .values()
-                    .all(|task| task.result.is_none() || task.collected)
+                && worker.claim_token.is_none()
+                && worker.messages.is_empty()
+                && worker.tasks.values().all(task_is_settled_and_delivered)
         })
 }
 
+fn retired_family_is_reclaimable(family: &WorkerFamily) -> bool {
+    // Automatic capacity reclamation must honor the documented collect replay window. An explicit
+    // local Settings cleanup may discard those receipts only after showing their count and requiring
+    // typed confirmation, but unrelated Core activity must never evict a replayable payload early.
+    family_is_safe_for_explicit_host_cleanup(family)
+        && family
+            .workers
+            .values()
+            .all(|worker| worker.state == WorkerState::Retired)
+        && !family
+            .collect_requests
+            .values()
+            .any(collect_receipt_has_payload)
+}
+
 fn family_can_be_freed_by_user_cleanup(family: &WorkerFamily) -> bool {
-    family.workers.values().all(|worker| {
-        matches!(worker.state, WorkerState::Idle | WorkerState::Retired)
-            && worker.current_task_id.is_none()
-    })
+    family_is_safe_for_explicit_host_cleanup(family)
+}
+
+fn inactive_cleanup_summary(
+    data: &WorkerStoreData,
+    workspace_id: &WorkspaceId,
+) -> InactiveWorkerCleanupSummary {
+    let mut summary = InactiveWorkerCleanupSummary::default();
+    for family in data.families.values().filter(|family| {
+        &family.workspace_id == workspace_id && family_is_safe_for_explicit_host_cleanup(family)
+    }) {
+        summary.family_count += 1;
+        summary.worker_count += family.workers.len();
+        summary.replay_receipt_count += family.collect_requests.len();
+    }
+    summary
 }
 
 fn compact_inactive_families(data: &mut WorkerStoreData) {
@@ -4170,9 +4283,326 @@ mod tests {
             .expect_err("idle reusable workers must not be silently evicted");
         let message = error.to_string();
         assert!(message.contains("64 Core families"));
-        assert!(message.contains("no active workers"));
-        assert!(message.contains("retire its idle workers") || message.contains("Clear Workers"));
+        assert!(message.contains("safe to release"));
+        assert!(message.contains("Release inactive Worker capacity"));
         assert_eq!(broker.snapshot().await.families.len(), MAX_WORKER_FAMILIES);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn host_cleanup_reclaims_idle_families_without_touching_other_workspaces_or_uncollected_results()
+     {
+        let root = temp_root("moondesk-worker-host-cleanup-capacity");
+        std::fs::create_dir_all(&root).expect("create worker cleanup root");
+        let path = root.join("worker-state-v1.json");
+        let workspace = WorkspaceId::new();
+        let other_workspace = WorkspaceId::new();
+        let mut data = WorkerStoreData::default();
+
+        for index in 0..(MAX_WORKER_FAMILIES - 2) {
+            let mut family = inactive_family(
+                workspace.clone(),
+                anchor(&format!("stale-idle-family-{index}")),
+                WorkerState::Idle,
+                true,
+            );
+            if index == 0 {
+                let worker = family.workers.values().next().expect("cleanup worker");
+                let task = worker.tasks.values().next().expect("cleanup task");
+                family.collect_requests.insert(
+                    OperationId::new(),
+                    CollectReceipt {
+                        request_fingerprint: "a".repeat(64),
+                        sequence: 1,
+                        reports: Vec::new(),
+                        completed: vec![CollectedTaskReceipt {
+                            worker_id: worker.id.clone(),
+                            display_id: worker.display_id.clone(),
+                            task_id: task.id.clone(),
+                            result: task.result.clone().expect("cleanup task result"),
+                        }],
+                    },
+                );
+            }
+            data.families.insert(family.id.clone(), family);
+        }
+
+        let protected = inactive_family(
+            workspace.clone(),
+            anchor("uncollected-family"),
+            WorkerState::Retired,
+            false,
+        );
+        let protected_id = protected.id.clone();
+        data.families.insert(protected.id.clone(), protected);
+
+        let other = inactive_family(
+            other_workspace.clone(),
+            anchor("other-workspace-idle-family"),
+            WorkerState::Idle,
+            true,
+        );
+        let other_id = other.id.clone();
+        data.families.insert(other.id.clone(), other);
+        assert_eq!(data.families.len(), MAX_WORKER_FAMILIES);
+        store::save(&path, &data).expect("seed capacity-blocking worker families");
+
+        let broker = WorkerBroker::open(&path).expect("open worker broker");
+        let preview = broker
+            .inactive_cleanup_preview_for_workspace(&workspace)
+            .await
+            .expect("preview host cleanup");
+        assert_eq!(preview.family_count, MAX_WORKER_FAMILIES - 2);
+        assert_eq!(preview.replay_receipt_count, 1);
+
+        let removed = broker
+            .cleanup_inactive_families_for_workspace(&workspace)
+            .await
+            .expect("explicit host cleanup");
+        assert_eq!(removed, preview);
+        let snapshot = broker.snapshot().await;
+        assert!(snapshot.families.contains_key(&protected_id));
+        assert!(snapshot.families.contains_key(&other_id));
+        assert_eq!(snapshot.families.len(), 2);
+
+        broker
+            .spawn_worker(spawn_request(
+                OperationId::new(),
+                workspace,
+                anchor("new-core-after-host-cleanup"),
+                "capacity recovers without reopening old Core chats",
+            ))
+            .await
+            .expect("host cleanup frees capacity for a new Core");
+        let snapshot = broker.snapshot().await;
+        assert!(snapshot.families.contains_key(&other_id));
+        assert_eq!(
+            snapshot
+                .families
+                .values()
+                .filter(|family| family.workspace_id == other_workspace)
+                .count(),
+            1,
+            "host cleanup must stay scoped to the selected workspace"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn host_cleanup_recovers_capacity_from_sixty_four_unreachable_idle_cores() {
+        let root = temp_root("moondesk-worker-host-cleanup-sixty-four-idle");
+        std::fs::create_dir_all(&root).expect("create worker cleanup root");
+        let path = root.join("worker-state-v1.json");
+        let workspace = WorkspaceId::new();
+        let mut data = WorkerStoreData::default();
+        for index in 0..MAX_WORKER_FAMILIES {
+            let family = inactive_family(
+                workspace.clone(),
+                anchor(&format!("unreachable-idle-core-{index}")),
+                WorkerState::Idle,
+                true,
+            );
+            data.families.insert(family.id.clone(), family);
+        }
+        store::save(&path, &data).expect("seed sixty-four unreachable idle Cores");
+        let broker = WorkerBroker::open(&path).expect("open worker broker");
+
+        broker
+            .spawn_worker(spawn_request(
+                OperationId::new(),
+                workspace.clone(),
+                anchor("blocked-new-core"),
+                "prove the global family ceiling is reached first",
+            ))
+            .await
+            .expect_err("sixty-four retained idle Cores initially block a new Core");
+        let preview = broker
+            .inactive_cleanup_preview_for_workspace(&workspace)
+            .await
+            .expect("preview all unreachable idle Cores");
+        assert_eq!(preview.family_count, MAX_WORKER_FAMILIES);
+
+        let removed = broker
+            .cleanup_inactive_families_for_workspace(&workspace)
+            .await
+            .expect("host cleanup does not require any old Core conversation");
+        assert_eq!(removed.family_count, MAX_WORKER_FAMILIES);
+        assert!(broker.snapshot().await.families.is_empty());
+
+        broker
+            .spawn_worker(spawn_request(
+                OperationId::new(),
+                workspace,
+                anchor("new-core-after-sixty-four-cleanup"),
+                "capacity is available again",
+            ))
+            .await
+            .expect("supported host cleanup recovers global worker capacity");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn host_cleanup_refuses_active_or_ambiguous_worker_family() {
+        let root = temp_root("moondesk-worker-host-cleanup-active");
+        let path = root.join("worker-state-v1.json");
+        let broker = WorkerBroker::open(&path).expect("open worker broker");
+        let workspace = WorkspaceId::new();
+        let core = anchor("host-cleanup-active-core");
+        let spawned = broker
+            .spawn_worker(spawn_request(
+                OperationId::new(),
+                workspace.clone(),
+                core.clone(),
+                "keep this active launch protected",
+            ))
+            .await
+            .expect("spawn active worker");
+        let command_id = Uuid::new_v4().to_string();
+        broker
+            .link_launch_command(
+                &workspace,
+                &core,
+                &spawned.worker_id,
+                &spawned.task_id,
+                &command_id,
+            )
+            .await
+            .expect("link active launch");
+        broker
+            .update_launch_by_command(
+                &command_id,
+                WorkerLaunchState::Paused,
+                Some("ambiguous Send outcome".into()),
+                None,
+            )
+            .await
+            .expect("mark launch ambiguous");
+
+        let preview = broker
+            .inactive_cleanup_preview_for_workspace(&workspace)
+            .await
+            .expect("preview active family cleanup");
+        assert_eq!(preview.family_count, 0);
+        let removed = broker
+            .cleanup_inactive_families_for_workspace(&workspace)
+            .await
+            .expect("active cleanup attempt is safely a no-op");
+        assert_eq!(removed.family_count, 0);
+        assert_eq!(broker.snapshot().await.families.len(), 1);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn automatic_family_compaction_preserves_live_collect_replay_receipt() {
+        let root = temp_root("moondesk-worker-family-collect-replay-retention");
+        std::fs::create_dir_all(&root).expect("create worker replay root");
+        let path = root.join("worker-state-v1.json");
+        let workspace = WorkspaceId::new();
+        let original_anchor = anchor("replay-protected-family");
+        let worker_identity = anchor("replay-protected-worker");
+        let replay_operation = OperationId::new();
+        let broker = WorkerBroker::open(&path).expect("open replay source broker");
+
+        let spawned = broker
+            .spawn_worker(spawn_request(
+                OperationId::new(),
+                workspace.clone(),
+                original_anchor.clone(),
+                "produce one replayable collected result",
+            ))
+            .await
+            .expect("spawn replay worker");
+        make_claimable(&broker, &workspace, &original_anchor, &spawned).await;
+        broker
+            .claim_worker(
+                &workspace,
+                &spawned.worker_id,
+                &spawned.task_id,
+                &spawned.claim_token,
+                worker_identity.clone(),
+            )
+            .await
+            .expect("claim replay worker");
+        let replay_result = WorkerResult {
+            result: "replay-me".into(),
+            changes: "collect response is intentionally dropped".into(),
+            validation: "same operation id must replay after capacity pressure".into(),
+            blockers: Vec::new(),
+        };
+        broker
+            .finish_task(FinishTaskRequest {
+                workspace_id: workspace.clone(),
+                worker_identity,
+                worker_id: spawned.worker_id.clone(),
+                task_id: spawned.task_id.clone(),
+                result: replay_result.clone(),
+            })
+            .await
+            .expect("finish replay worker task");
+        let dropped_response = broker
+            .collect_updates_for_operation(&workspace, &original_anchor, &replay_operation)
+            .await
+            .expect("commit collect receipt before simulating a dropped response");
+        assert_eq!(dropped_response.completed.len(), 1);
+        broker
+            .retire_worker(&workspace, &original_anchor, &spawned.worker_id, None)
+            .await
+            .expect("retire replay worker after the collected result is durable");
+        let replay_family_id = broker
+            .family_for_anchor(&workspace, &original_anchor)
+            .await
+            .expect("inspect replay family")
+            .expect("replay family remains retained")
+            .id;
+        drop(broker);
+
+        let mut data = store::load(&path).expect("reload durable dropped-response receipt");
+        let replay_family = data
+            .families
+            .get(&replay_family_id)
+            .expect("replay family persisted before capacity pressure");
+        assert!(
+            replay_family
+                .collect_requests
+                .contains_key(&replay_operation)
+        );
+        for index in 0..(MAX_WORKER_FAMILIES - 1) {
+            let family = inactive_family(
+                workspace.clone(),
+                anchor(&format!("reclaimable-retired-family-{index}")),
+                WorkerState::Retired,
+                true,
+            );
+            data.families.insert(family.id.clone(), family);
+        }
+        assert_eq!(data.families.len(), MAX_WORKER_FAMILIES);
+        store::save(&path, &data).expect("persist capacity pressure around replay family");
+
+        let broker = WorkerBroker::open(&path).expect("reopen replay-protected broker");
+        broker
+            .spawn_worker(spawn_request(
+                OperationId::new(),
+                workspace.clone(),
+                anchor("new-core-for-replay-compaction"),
+                "force one automatic family compaction",
+            ))
+            .await
+            .expect("another reclaimable family should free capacity");
+        assert!(
+            broker
+                .snapshot()
+                .await
+                .families
+                .contains_key(&replay_family_id),
+            "unrelated Core activity must not evict a still-replayable collect payload"
+        );
+
+        let replayed = broker
+            .collect_updates_for_operation(&workspace, &original_anchor, &replay_operation)
+            .await
+            .expect("retry original dropped collect response");
+        assert_eq!(replayed.completed.len(), 1);
+        assert_eq!(replayed.completed[0].result, replay_result);
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -4203,11 +4633,7 @@ mod tests {
             ))
             .await
             .expect_err("uncollected results must block automatic family eviction");
-        assert!(
-            error
-                .to_string()
-                .contains("collect any pending worker results")
-        );
+        assert!(error.to_string().contains("collect pending worker results"));
         assert_eq!(broker.snapshot().await.families.len(), MAX_WORKER_FAMILIES);
         let _ = std::fs::remove_dir_all(root);
     }

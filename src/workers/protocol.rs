@@ -1,6 +1,6 @@
 use super::broker::{
-    FinishTaskRequest, MessageWorkerRequest, ReportWorkerRequest, ReuseWorkerRequest,
-    SpawnWorkerRequest, WorkerBroker, WorkerBrokerError,
+    FinishTaskRequest, InactiveWorkerCleanupSummary, MessageWorkerRequest, ReportWorkerRequest,
+    ReuseWorkerRequest, SpawnWorkerRequest, WorkerBroker, WorkerBrokerError,
 };
 use super::prompt;
 use super::types::{
@@ -75,6 +75,55 @@ fn blockers(arguments: &Value) -> Result<Vec<String>, String> {
 
 fn broker_error(error: WorkerBrokerError) -> String {
     error.to_string()
+}
+
+pub(crate) async fn cleanup_inactive_capacity_for_workspace(
+    workspace_id: &WorkspaceId,
+    worker_broker: &WorkerBroker,
+    managed_chat_broker: &ManagedChatBroker,
+) -> Result<InactiveWorkerCleanupSummary, String> {
+    let _lifecycle_guard = super::WORKER_LIFECYCLE_LOCK.lock().await;
+    let session_digests = worker_broker
+        .inactive_cleanup_session_digests_for_workspace(workspace_id)
+        .await
+        .map_err(broker_error)?;
+    if session_digests.is_empty() {
+        return Ok(InactiveWorkerCleanupSummary::default());
+    }
+
+    for session_digest in &session_digests {
+        managed_chat_broker
+            .ensure_clearable_anchor_session(session_digest)
+            .await
+            .map_err(|error| {
+                format!(
+                    "inactive Worker cleanup is blocked by active or ambiguous browser launch state: {error}"
+                )
+            })?;
+    }
+
+    // Purge only terminal managed-chat history first. If Worker persistence then fails, the idle
+    // family remains durable and the operation can be retried safely; reuse can create a fresh
+    // command from the worker's exact durable conversation binding.
+    for session_digest in &session_digests {
+        managed_chat_broker
+            .purge_terminal_for_anchor_session(session_digest)
+            .await
+            .map_err(|error| {
+                format!(
+                    "terminal browser launch cleanup did not complete; Worker families were left intact and retry is safe: {error}"
+                )
+            })?;
+    }
+
+    worker_broker
+        .cleanup_inactive_families_for_workspace(workspace_id)
+        .await
+        .map_err(|error| {
+            format!(
+                "terminal browser launch history was cleared but inactive Worker families were not removed; retry is safe: {error}"
+            )
+        })
 }
 
 pub struct WorkerLaunchContext<'a> {
@@ -952,6 +1001,167 @@ mod tests {
                 anchor_session_digest: None,
             },
         }
+    }
+
+    async fn make_idle_collected_worker(
+        worker: &WorkerBroker,
+        workspace: &WorkspaceId,
+        anchor: &ChatIdentity,
+    ) -> (WorkerId, TaskId) {
+        let receipt = worker
+            .spawn_worker(spawn_request(
+                OperationId::new(),
+                workspace.clone(),
+                anchor.clone(),
+            ))
+            .await
+            .expect("spawn cleanup worker");
+        let command_id = Uuid::new_v4().to_string();
+        worker
+            .link_launch_command(
+                workspace,
+                anchor,
+                &receipt.worker_id,
+                &receipt.task_id,
+                &command_id,
+            )
+            .await
+            .expect("link cleanup worker launch");
+        let conversation_id = Uuid::new_v4().to_string();
+        worker
+            .update_launch_by_command(
+                &command_id,
+                WorkerLaunchState::WaitingClaim,
+                None,
+                Some(format!("https://chatgpt.com/c/{conversation_id}")),
+            )
+            .await
+            .expect("make cleanup worker claimable");
+        let worker_identity = identity(&conversation_id);
+        worker
+            .claim_worker(
+                workspace,
+                &receipt.worker_id,
+                &receipt.task_id,
+                &receipt.claim_token,
+                worker_identity.clone(),
+            )
+            .await
+            .expect("claim cleanup worker");
+        worker
+            .finish_task(FinishTaskRequest {
+                workspace_id: workspace.clone(),
+                worker_identity,
+                worker_id: receipt.worker_id.clone(),
+                task_id: receipt.task_id.clone(),
+                result: WorkerResult {
+                    result: "done".into(),
+                    changes: "cleanup fixture".into(),
+                    validation: "cleanup fixture".into(),
+                    blockers: Vec::new(),
+                },
+            })
+            .await
+            .expect("finish cleanup worker");
+        let updates = worker
+            .collect_updates_wait(workspace, anchor, &OperationId::new(), 0)
+            .await
+            .expect("collect cleanup worker result");
+        assert_eq!(updates.completed.len(), 1);
+        (receipt.worker_id, receipt.task_id)
+    }
+
+    #[tokio::test]
+    async fn host_capacity_cleanup_fails_closed_on_active_managed_launch_state() {
+        let root = temp_root("moondesk-worker-host-cleanup-managed-active");
+        let worker_path = root.join("worker-state-v1.json");
+        let managed_path = root.join("managed-chat-state-v1.json");
+        let workspace = WorkspaceId::new();
+        let anchor = identity("cleanup-core");
+        let worker = WorkerBroker::open(&worker_path).expect("open worker broker");
+        let managed = ManagedChatBroker::open(&managed_path).expect("open managed broker");
+        let (worker_id, task_id) = make_idle_collected_worker(&worker, &workspace, &anchor).await;
+
+        let mut request = launch_for(workspace.clone(), &worker_id, &task_id);
+        request.dedupe_key = "cleanup-active-managed-command".into();
+        request.launch.anchor_session_digest = Some(anchor.session_digest.clone());
+        let command = managed
+            .enqueue_held_with_route(request, None, None)
+            .await
+            .expect("persist active held managed launch");
+
+        let error = cleanup_inactive_capacity_for_workspace(&workspace, &worker, &managed)
+            .await
+            .expect_err("active managed launch must block host cleanup");
+        assert!(error.contains("active or ambiguous browser launch state"));
+        assert!(
+            worker
+                .family_for_anchor(&workspace, &anchor)
+                .await
+                .expect("read cleanup family")
+                .is_some(),
+            "worker history must remain when managed state is not clearable"
+        );
+        assert!(managed.snapshot().await.commands.contains_key(&command.id));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn host_capacity_cleanup_purges_terminal_managed_history_with_worker_family() {
+        let root = temp_root("moondesk-worker-host-cleanup-managed-terminal");
+        let worker_path = root.join("worker-state-v1.json");
+        let managed_path = root.join("managed-chat-state-v1.json");
+        let workspace = WorkspaceId::new();
+        let anchor = identity("cleanup-terminal-core");
+        let worker = WorkerBroker::open(&worker_path).expect("open worker broker");
+        let managed = ManagedChatBroker::open(&managed_path).expect("open managed broker");
+        let (worker_id, task_id) = make_idle_collected_worker(&worker, &workspace, &anchor).await;
+
+        let mut request = launch_for(workspace.clone(), &worker_id, &task_id);
+        request.dedupe_key = "cleanup-terminal-managed-command".into();
+        request.launch.anchor_session_digest = Some(anchor.session_digest.clone());
+        let queued = managed
+            .enqueue(request)
+            .await
+            .expect("enqueue managed launch");
+        let offer = managed
+            .redeem("cleanup-browser", 1)
+            .await
+            .expect("redeem managed launch")
+            .expect("managed launch offer");
+        assert_eq!(offer.command.id, queued.id);
+        let lease_id = offer
+            .command
+            .lease
+            .as_ref()
+            .expect("managed launch lease")
+            .lease_id
+            .clone();
+        managed
+            .acknowledge(
+                &queued.id,
+                &lease_id,
+                "cleanup-browser",
+                ManagedChatAckOutcome::Failed {
+                    details: Some("proven pre-Send failure".into()),
+                },
+            )
+            .await
+            .expect("make managed launch safely terminal");
+
+        let removed = cleanup_inactive_capacity_for_workspace(&workspace, &worker, &managed)
+            .await
+            .expect("cleanup terminal managed history and worker family");
+        assert_eq!(removed.family_count, 1);
+        assert!(
+            worker
+                .family_for_anchor(&workspace, &anchor)
+                .await
+                .expect("read cleanup family")
+                .is_none()
+        );
+        assert!(managed.snapshot().await.commands.is_empty());
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]

@@ -1285,39 +1285,6 @@ impl WorkerBroker {
         Ok(workers)
     }
 
-    pub async fn expected_claim_conversation_id(
-        &self,
-        workspace_id: &WorkspaceId,
-        worker_id: &WorkerId,
-        task_id: &TaskId,
-    ) -> Result<String, WorkerBrokerError> {
-        let guard = self.data.lock().await;
-        let family_id = find_family_for_worker(&guard, workspace_id, worker_id)
-            .ok_or(WorkerBrokerError::NotFound)?;
-        let worker = guard
-            .families
-            .get(&family_id)
-            .and_then(|family| family.workers.get(worker_id))
-            .ok_or(WorkerBrokerError::NotFound)?;
-        if worker.current_task_id.as_ref() != Some(task_id) || !worker.tasks.contains_key(task_id) {
-            return Err(WorkerBrokerError::NotFound);
-        }
-        if worker.launch_state != WorkerLaunchState::WaitingClaim {
-            return Err(WorkerBrokerError::Conflict(
-                "worker cannot be claimed before MoonDesk confirms its launch".into(),
-            ));
-        }
-        worker
-            .conversation_url
-            .as_deref()
-            .and_then(canonical_conversation_id_from_url)
-            .ok_or_else(|| {
-                WorkerBrokerError::Conflict(
-                    "worker launch does not have a canonical ChatGPT conversation".into(),
-                )
-            })
-    }
-
     pub async fn claim_worker(
         &self,
         workspace_id: &WorkspaceId,
@@ -3934,14 +3901,6 @@ mod tests {
             )
             .await
             .expect("confirm canonical worker conversation");
-        assert_eq!(
-            broker
-                .expected_claim_conversation_id(&workspace, &spawned.worker_id, &spawned.task_id)
-                .await
-                .expect("expected claim conversation"),
-            spawned.worker_id.to_string()
-        );
-
         let core_claim = broker
             .claim_worker(
                 &workspace,

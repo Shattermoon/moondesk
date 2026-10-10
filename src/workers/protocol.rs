@@ -412,7 +412,15 @@ pub async fn handle(
                 .map_err(broker_error)?;
             maybe_pause_after_worker_persist(&operation_id).await;
 
-            let opening_message = prompt::bootstrap_message(workspace_name, &assignment, &receipt);
+            let claim_operation_id = receipt.claim_operation_id.as_ref().ok_or_else(|| {
+                "fresh worker claim is missing its browser-attested operation id; leave this stale worker untouched and create a new worker".to_string()
+            })?;
+            let opening_message = prompt::bootstrap_message(
+                workspace_name,
+                &assignment,
+                &receipt,
+                claim_operation_id,
+            );
             let (target_client_id, anchor_context) = launch_context
                 .anchor_route
                 .map(|route| {
@@ -537,7 +545,6 @@ pub async fn handle(
                 "workerId": receipt.worker_id,
                 "taskId": receipt.task_id,
                 "displayId": receipt.display_id,
-                "claimToken": receipt.claim_token,
                 "executionProfile": execution_profile,
                 "launchCommandId": launch.id,
                 "state": "provisioning",
@@ -849,12 +856,14 @@ pub async fn handle(
         }
         "claim" => {
             let _lifecycle_guard = super::WORKER_LIFECYCLE_LOCK.lock().await;
+            let claim_operation_id = parse_operation_id(arguments)?;
             let worker = broker
-                .claim_worker(
+                .claim_worker_attested(
                     workspace_id,
                     &parse_worker_id(arguments)?,
                     &parse_task_id(arguments)?,
                     required_string(arguments, "claim_token")?,
+                    &claim_operation_id,
                     caller_identity.clone(),
                 )
                 .await

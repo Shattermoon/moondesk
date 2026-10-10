@@ -133,6 +133,12 @@ pub(crate) struct InactiveWorkerCleanupPlan {
     pub families: Vec<InactiveWorkerCleanupFamily>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct WorkerClaimAttestationRequirement {
+    pub operation_id: OperationId,
+    pub conversation_id: String,
+}
+
 pub struct WorkerBroker {
     path: PathBuf,
     data: Mutex<WorkerStoreData>,
@@ -263,6 +269,7 @@ impl WorkerBroker {
         let worker_id = WorkerId::new();
         let task_id = TaskId::new();
         let claim_token = new_claim_token();
+        let claim_operation_id = OperationId::new();
         let task = WorkerTask {
             id: task_id.clone(),
             assignment: request.assignment,
@@ -283,6 +290,7 @@ impl WorkerBroker {
             conversation_url: None,
             chat_identity: None,
             claim_token: Some(claim_token.clone()),
+            claim_operation_id: Some(claim_operation_id.clone()),
             current_task_id: Some(task_id.clone()),
             tasks: [(task_id.clone(), task)].into_iter().collect(),
             messages: Vec::new(),
@@ -298,6 +306,7 @@ impl WorkerBroker {
             task_id,
             display_id,
             claim_token,
+            claim_operation_id: Some(claim_operation_id),
         };
         family
             .spawn_requests
@@ -594,6 +603,7 @@ impl WorkerBroker {
         worker.attachment_state = BrowserAttachmentState::Absent;
         if was_fresh {
             worker.claim_token = None;
+            worker.claim_operation_id = None;
             worker.state = WorkerState::Retired;
             worker.launch_state = WorkerLaunchState::Failed;
         } else {
@@ -1140,6 +1150,7 @@ impl WorkerBroker {
             worker.current_task_id = None;
         }
         worker.claim_token = None;
+        worker.claim_operation_id = None;
         worker.state = WorkerState::Retired;
         worker.attachment_state = BrowserAttachmentState::Absent;
         let retired = worker.clone();
@@ -1285,12 +1296,97 @@ impl WorkerBroker {
         Ok(workers)
     }
 
-    pub async fn claim_worker(
+    pub(crate) async fn claim_attestation_requirement(
         &self,
         workspace_id: &WorkspaceId,
         worker_id: &WorkerId,
         task_id: &TaskId,
         claim_token: &str,
+        claim_operation_id: &OperationId,
+        worker_identity: &ChatIdentity,
+    ) -> Result<Option<WorkerClaimAttestationRequirement>, WorkerBrokerError> {
+        worker_identity
+            .validate()
+            .map_err(WorkerBrokerError::Invalid)?;
+        let guard = self.data.lock().await;
+        let family_id = find_family_for_worker(&guard, workspace_id, worker_id)
+            .ok_or(WorkerBrokerError::NotFound)?;
+        let family = guard
+            .families
+            .get(&family_id)
+            .ok_or(WorkerBrokerError::NotFound)?;
+        if &family.anchor_identity == worker_identity {
+            return Err(WorkerBrokerError::Conflict(
+                "the Core conversation cannot claim one of its own workers".into(),
+            ));
+        }
+        let worker = family
+            .workers
+            .get(worker_id)
+            .ok_or(WorkerBrokerError::NotFound)?;
+        if worker.current_task_id.as_ref() != Some(task_id) || !worker.tasks.contains_key(task_id) {
+            return Err(WorkerBrokerError::NotFound);
+        }
+        if let Some(existing) = &worker.chat_identity {
+            if existing == worker_identity {
+                return Ok(None);
+            }
+            return Err(WorkerBrokerError::Conflict(
+                "worker has already been claimed by another ChatGPT conversation".into(),
+            ));
+        }
+        if worker.launch_state != WorkerLaunchState::WaitingClaim {
+            return Err(WorkerBrokerError::Conflict(
+                "worker cannot be claimed before MoonDesk confirms its canonical ChatGPT conversation"
+                    .into(),
+            ));
+        }
+        let conversation_id = worker
+            .conversation_url
+            .as_deref()
+            .and_then(canonical_conversation_id_from_url)
+            .ok_or_else(|| {
+                WorkerBrokerError::Conflict(
+                    "worker cannot be claimed before MoonDesk confirms its canonical ChatGPT conversation"
+                        .into(),
+                )
+            })?;
+        let Some(expected_operation_id) = worker.claim_operation_id.as_ref() else {
+            return Err(WorkerBrokerError::Conflict(
+                "worker claim predates browser-attested admission; leave this stale worker untouched and create a fresh worker"
+                    .into(),
+            ));
+        };
+        if expected_operation_id != claim_operation_id {
+            return Err(WorkerBrokerError::NotFound);
+        }
+        let Some(expected_claim_token) = worker.claim_token.as_deref() else {
+            return Err(WorkerBrokerError::Conflict(
+                "worker claim token has already been consumed".into(),
+            ));
+        };
+        if claim_token.len() != expected_claim_token.len()
+            || !bool::from(
+                claim_token
+                    .as_bytes()
+                    .ct_eq(expected_claim_token.as_bytes()),
+            )
+        {
+            return Err(WorkerBrokerError::NotFound);
+        }
+        Ok(Some(WorkerClaimAttestationRequirement {
+            operation_id: expected_operation_id.clone(),
+            conversation_id,
+        }))
+    }
+
+    pub async fn claim_worker_attested(
+        &self,
+        workspace_id: &WorkspaceId,
+        worker_id: &WorkerId,
+        task_id: &TaskId,
+        claim_token: &str,
+        claim_operation_id: &OperationId,
         worker_identity: ChatIdentity,
     ) -> Result<WorkerRecord, WorkerBrokerError> {
         worker_identity
@@ -1315,6 +1411,14 @@ impl WorkerBroker {
         if worker.current_task_id.as_ref() != Some(task_id) || !worker.tasks.contains_key(task_id) {
             return Err(WorkerBrokerError::NotFound);
         }
+        if let Some(existing) = &worker.chat_identity {
+            if existing == &worker_identity {
+                return Ok(worker.clone());
+            }
+            return Err(WorkerBrokerError::Conflict(
+                "worker has already been claimed by another ChatGPT conversation".into(),
+            ));
+        }
         if worker.launch_state != WorkerLaunchState::WaitingClaim
             || worker
                 .conversation_url
@@ -1327,13 +1431,14 @@ impl WorkerBroker {
                     .into(),
             ));
         }
-        if let Some(existing) = &worker.chat_identity {
-            if existing == &worker_identity {
-                return Ok(worker.clone());
-            }
+        let Some(expected_operation_id) = worker.claim_operation_id.as_ref() else {
             return Err(WorkerBrokerError::Conflict(
-                "worker has already been claimed by another ChatGPT conversation".into(),
+                "worker claim predates browser-attested admission; leave this stale worker untouched and create a fresh worker"
+                    .into(),
             ));
+        };
+        if expected_operation_id != claim_operation_id {
+            return Err(WorkerBrokerError::NotFound);
         }
         let Some(expected_claim_token) = worker.claim_token.as_deref() else {
             return Err(WorkerBrokerError::Conflict(
@@ -1358,6 +1463,7 @@ impl WorkerBroker {
             .ok_or(WorkerBrokerError::NotFound)?;
         worker.chat_identity = Some(worker_identity);
         worker.claim_token = None;
+        worker.claim_operation_id = None;
         worker.state = WorkerState::Running;
         worker.launch_state = WorkerLaunchState::Claimed;
         worker.launch_error = None;
@@ -1370,6 +1476,37 @@ impl WorkerBroker {
         let claimed = worker.clone();
         self.commit_candidate(&mut guard, candidate).await?;
         Ok(claimed)
+    }
+
+    #[cfg(test)]
+    pub async fn claim_worker(
+        &self,
+        workspace_id: &WorkspaceId,
+        worker_id: &WorkerId,
+        task_id: &TaskId,
+        claim_token: &str,
+        worker_identity: ChatIdentity,
+    ) -> Result<WorkerRecord, WorkerBrokerError> {
+        let claim_operation_id = {
+            let guard = self.data.lock().await;
+            let family_id = find_family_for_worker(&guard, workspace_id, worker_id)
+                .ok_or(WorkerBrokerError::NotFound)?;
+            guard
+                .families
+                .get(&family_id)
+                .and_then(|family| family.workers.get(worker_id))
+                .and_then(|worker| worker.claim_operation_id.clone())
+                .unwrap_or_else(OperationId::new)
+        };
+        self.claim_worker_attested(
+            workspace_id,
+            worker_id,
+            task_id,
+            claim_token,
+            &claim_operation_id,
+            worker_identity,
+        )
+        .await
     }
 
     pub async fn message_worker(
@@ -2223,6 +2360,7 @@ mod tests {
             conversation_url: Some(format!("https://chatgpt.com/c/{worker_id}")),
             chat_identity: Some(anchor(&format!("worker-{worker_id}"))),
             claim_token: None,
+            claim_operation_id: None,
             current_task_id: None,
             tasks: [(task_id, task)].into_iter().collect(),
             messages: Vec::new(),
@@ -4162,6 +4300,7 @@ mod tests {
                     task_id: TaskId::new(),
                     display_id: "worker-history".into(),
                     claim_token: "c".repeat(64),
+                    claim_operation_id: Some(OperationId::new()),
                 },
             );
         }

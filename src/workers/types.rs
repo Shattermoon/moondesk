@@ -242,6 +242,8 @@ pub struct WorkerRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claim_token: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim_operation_id: Option<OperationId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_task_id: Option<TaskId>,
     #[serde(default)]
     pub tasks: BTreeMap<TaskId, WorkerTask>,
@@ -260,6 +262,8 @@ pub struct SpawnReceipt {
     pub task_id: TaskId,
     pub display_id: String,
     pub claim_token: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim_operation_id: Option<OperationId>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

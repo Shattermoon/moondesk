@@ -997,7 +997,7 @@ test('bridge discovery prefers an exact runtime match over another MoonDesk vers
         async json() {
           return {
             app: 'moondesk-worker-companion',
-            appVersion: '0.13.0',
+            appVersion: manifest.version,
             protocolVersion: 2,
             companionRuntimeRevision: 9
           };
@@ -1041,7 +1041,7 @@ test('bridge runtime revision mismatch reloads the unpacked companion once', asy
         async json() {
           return {
             app: 'moondesk-worker-companion',
-            appVersion: '0.13.0',
+            appVersion: manifest.version,
             protocolVersion: 2,
             companionRuntimeRevision: 8
           };
@@ -1080,7 +1080,7 @@ test('compatible bridge clears the one-shot runtime reload marker for a future m
         async json() {
           return {
             app: 'moondesk-worker-companion',
-            appVersion: '0.12.0',
+            appVersion: manifest.version,
             protocolVersion: 2,
             companionRuntimeRevision: 9
           };
@@ -1111,7 +1111,7 @@ test('automatic pairing proves the extension was loaded from the MoonDesk-prepar
         async json() {
           return {
             app: 'moondesk-worker-companion',
-            appVersion: '0.12.0',
+            appVersion: manifest.version,
             protocolVersion: 2,
             companionRuntimeRevision: 9
           };
@@ -1153,7 +1153,7 @@ test('source and release-ZIP installs without a bootstrap capability expose Manu
     if (String(url).endsWith('/__moondesk/companion/v1/hello')) {
       const body = {
         app: 'moondesk-worker-companion',
-        appVersion: '0.12.0',
+        appVersion: manifest.version,
         protocolVersion: 2,
         companionRuntimeRevision: 9
       };

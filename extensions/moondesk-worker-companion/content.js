@@ -11,6 +11,7 @@
   const PROVIDER_CORRELATION_TTL_MS = 15000;
   const pendingProviderCorrelations = new Map();
   let providerCorrelationTimer = null;
+  let workerLaunchResetGeneration = 0;
 
   function validProviderCorrelation(value) {
     if (!value || typeof value !== 'object') return null;
@@ -277,6 +278,7 @@
     if (!commandId || !launchToken || !launch?.taskMarker || !launch?.openingMessage || !launch?.executionProfile) {
       return { state: 'failed', reason: 'invalid_commit_payload' };
     }
+    const resetGeneration = workerLaunchResetGeneration;
     const remembered = rememberedLaunch();
     if (
       !remembered ||
@@ -287,6 +289,7 @@
       return { state: 'failed', reason: 'prepared_launch_identity_mismatch' };
     }
     const stillOnPreparedTarget = () =>
+      workerLaunchResetGeneration === resetGeneration &&
       DOM.conversationIdFromPath() === (remembered.targetConversationId || null) &&
       (DOM.projectIdFromPath() || null) === (remembered.projectId || null);
     if (!stillOnPreparedTarget()) {
@@ -368,11 +371,12 @@
       return true;
     }
     if (message.type === 'MOONDESK_CLEAR_WORKER_LAUNCHES') {
+      workerLaunchResetGeneration += 1;
       try { sessionStorage.removeItem(LAUNCH_SESSION_KEY); } catch {}
       pendingProviderCorrelations.clear();
       if (providerCorrelationTimer) clearInterval(providerCorrelationTimer);
       providerCorrelationTimer = null;
-      sendResponse({ ok: true });
+      sendResponse({ ok: true, resetGeneration: workerLaunchResetGeneration });
       return false;
     }
     if (message.type === 'MOONDESK_PREPARE_WORKER') {

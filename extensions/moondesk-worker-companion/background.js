@@ -4,7 +4,7 @@ const BRIDGE_PORTS = [47650, 47651, 47652, 47653, 47654];
 const REQUIRED_PROTOCOL_VERSION = 2;
 // Bump with any shipped companion runtime change that requires Chromium to load new bytes. Keep
 // this aligned with COMPANION_RUNTIME_REVISION in src/server.rs.
-const COMPANION_RUNTIME_REVISION = 8;
+const COMPANION_RUNTIME_REVISION = 9;
 const SOURCE_DEV_MANIFEST_VERSION = '0.1.0';
 const RUNTIME_RELOAD_STORAGE_KEY = 'moondeskWorkerCompanionReloadRevisionV1';
 const INSTALLATION_BOOTSTRAP_FILE = 'moondesk-bootstrap.json';
@@ -93,19 +93,19 @@ async function applyHostWorkerResetEpoch(state, remote) {
   let changed = false;
   if (remoteEpoch > localEpoch) {
     // A reset from any paired browser invalidates this extension's already-running command work
-    // before any asynchronous cleanup runs. Stale command writers are generation-guarded, so they
-    // cannot repopulate launch/thread history after this point.
+    // immediately. Do not persist the new epoch until every still-open ChatGPT tab confirms that
+    // its content-side Send generation was cancelled; otherwise a background timeout could ACK
+    // while an older content task is still capable of clicking Send.
     workerClearGeneration += 1;
     sessionReconcileCommandIds.clear();
     state.launchRecords = {};
     state.threadRecords = {};
     state.blockedCommands = {};
+    await writeState(state);
+    await clearRememberedWorkerLaunchesInTabs();
     state.workerResetEpoch = remoteEpoch;
     await writeState(state);
     changed = true;
-  }
-  if (changed) {
-    await clearRememberedWorkerLaunchesInTabs();
   }
   if (
     remote?.workerResetAckRequired === true &&
@@ -1496,12 +1496,18 @@ async function setProfile({ profile: nextProfile }) {
 
 async function clearRememberedWorkerLaunchesInTabs() {
   const tabs = await chrome.tabs.query({ url: 'https://chatgpt.com/*' });
-  await Promise.allSettled(tabs.map(async (tab) => {
+  await Promise.all(tabs.map(async (tab) => {
     if (!Number.isInteger(tab?.id)) return;
     try {
       await ensureContent(tab.id);
-      await sendToTab(tab.id, { type: 'MOONDESK_CLEAR_WORKER_LAUNCHES' }, 1500);
-    } catch {}
+      const response = await sendToTab(tab.id, { type: 'MOONDESK_CLEAR_WORKER_LAUNCHES' }, 1500);
+      if (!response?.ok) throw new Error('ChatGPT tab did not confirm Worker Send cancellation');
+    } catch (error) {
+      // A tab that closed during reset cannot click Send anymore and is therefore safe. Any still-
+      // open tab must explicitly confirm its content-side cancellation generation before reset ACK.
+      try { await chrome.tabs.get(tab.id); } catch { return; }
+      throw error;
+    }
   }));
 }
 

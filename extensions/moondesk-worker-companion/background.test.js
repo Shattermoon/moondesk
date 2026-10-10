@@ -596,6 +596,214 @@ test('global Clear Workers waits for another browser DOM Send already in flight 
   assert.equal(browserBStatus.hasWorkerState, false, 'the other browser must not retain ghost worker history');
 });
 
+test('a timed-out background Send cannot ACK reset until content-side cancellation prevents a late click', async () => {
+  let statusCalls = 0;
+  let resetAckCalls = 0;
+  let contentCancelled = false;
+  let lateClickCalls = 0;
+  let releaseContentCommit;
+  const contentCommitGate = new Promise((resolve) => { releaseContentCommit = resolve; });
+  const commandId = '39111111-2222-4333-8444-555555555555';
+  const leaseId = '39666666-7777-4888-8999-aaaaaaaaaaaa';
+  const taskMarker = 'moondesk-worker-task:late-send-timeout-race';
+  const command = {
+    id: commandId,
+    state: 'leased',
+    lease: { leaseId, clientId: 'browser-b' },
+    anchorContext: {
+      conversationId: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee',
+      conversationUrl: 'https://chatgpt.com/c/aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee',
+      projectId: null,
+      projectUrl: null
+    },
+    launch: {
+      workspaceId: 'workspace-late-send-race',
+      purpose: 'worker',
+      taskMarker,
+      threadKey: 'worker:late-send-timeout-race',
+      openMode: 'new_thread',
+      openingMessage: `Do the task. Marker: ${taskMarker}`,
+      executionProfile: {
+        modelId: 'gpt-5.6-sol',
+        modelLabel: 'GPT-5.6 Sol',
+        reasoningEffort: 'high'
+      }
+    }
+  };
+  const hostResponse = (body) => ({
+    ok: true,
+    status: 200,
+    async text() { return JSON.stringify(body); }
+  });
+  const fetchImpl = async (url, options = {}) => {
+    const parsed = new URL(url);
+    const body = options.body ? JSON.parse(options.body) : {};
+    if (parsed.pathname === '/__moondesk/companion/v1/commands/send-started') {
+      assert.equal(body.commandId, commandId);
+      assert.equal(body.leaseId, leaseId);
+      return hostResponse({ command: { ...command, state: 'send_started', reconcileHistory: true } });
+    }
+    if (parsed.pathname === '/__moondesk/companion/v1/status') {
+      statusCalls += 1;
+      const resetPublished = statusCalls >= 2;
+      return hostResponse({
+        paired: true,
+        clientId: 'browser-b',
+        hasWorkerState: !resetPublished,
+        workerResetEpoch: resetPublished ? 1 : 0,
+        workerResetAckRequired: resetPublished
+      });
+    }
+    if (parsed.pathname === '/__moondesk/companion/v1/workers/reset-ack') {
+      assert.equal(body.workerResetEpoch, 1);
+      assert.equal(contentCancelled, true, 'reset ACK must follow confirmed content-side cancellation');
+      assert.equal(lateClickCalls, 0, 'no late content click may happen before reset ACK');
+      resetAckCalls += 1;
+      return hostResponse({ workerResetEpoch: 1, pendingClientCount: 0 });
+    }
+    throw new Error(`unexpected late-send request: ${parsed.pathname}`);
+  };
+
+  let rememberedLaunch = null;
+  const browserB = loadBackground({
+    fetchImpl,
+    sendMessageImpl: async (_tabId, message) => {
+      if (message.type === 'MOONDESK_CONTEXT') {
+        return {
+          ok: true,
+          context: {
+            projectId: null,
+            projectUrl: null,
+            conversationId: null,
+            sourceUrl: 'https://chatgpt.com/',
+            generating: false
+          },
+          rememberedLaunch
+        };
+      }
+      if (message.type === 'MOONDESK_PREPARE_WORKER') {
+        rememberedLaunch = {
+          commandId,
+          launchToken: message.launchToken,
+          taskMarker,
+          workspaceId: 'workspace-late-send-race',
+          threadKey: 'worker:late-send-timeout-race'
+        };
+        return {
+          ok: true,
+          result: {
+            state: 'ready',
+            evidence: {
+              conversationId: null,
+              markerPresent: false,
+              generating: false,
+              userTurnCount: 0,
+              composerEmpty: false
+            }
+          }
+        };
+      }
+      if (message.type === 'MOONDESK_COMMIT_WORKER_SEND') {
+        await contentCommitGate;
+        if (contentCancelled) {
+          return { ok: true, result: { state: 'failed', reason: 'prepared_launch_target_changed' } };
+        }
+        lateClickCalls += 1;
+        return { ok: true, result: { state: 'committed', baseline: {} } };
+      }
+      if (message.type === 'MOONDESK_CLEAR_WORKER_LAUNCHES') {
+        contentCancelled = true;
+        rememberedLaunch = null;
+        releaseContentCommit();
+        return { ok: true, resetGeneration: 1 };
+      }
+      throw new Error(`unexpected late-send tab message: ${message.type}`);
+    },
+    setTimeoutImpl(fn, delay) {
+      if (delay === 12000 || delay <= 250) queueMicrotask(fn);
+      return 1;
+    }
+  });
+
+  await browserB.evaluate(`(() => {
+    globalThis.__lateSendState = {
+      ...freshState(),
+      baseUrl: 'http://127.0.0.1:47650',
+      clientId: 'browser-b',
+      credential: '${'d'.repeat(64)}'
+    };
+    connecting = Promise.resolve(globalThis.__lateSendState);
+    globalThis.__lateSendCommand = ${JSON.stringify(command)};
+  })()`);
+
+  await assert.rejects(
+    browserB.evaluate(
+      'processCommand(globalThis.__lateSendState, { command: globalThis.__lateSendCommand, reconcileRequired: false })'
+    ),
+    /timed out/
+  );
+  await flushMicrotasks();
+
+  assert.equal(statusCalls >= 2, true, 'reset must publish only after the pre-Send status check');
+  assert.equal(contentCancelled, true, 'the still-open ChatGPT tab must confirm cancellation');
+  assert.equal(resetAckCalls, 1, 'the reset is acknowledged after content cancellation');
+  assert.equal(lateClickCalls, 0, 'the raced-out content operation must never click Send afterward');
+  assert.equal(browserB.evaluate('globalThis.__lateSendState.workerResetEpoch'), 1);
+});
+
+test('an open ChatGPT tab that cannot confirm content cancellation keeps reset unacknowledged', async () => {
+  let resetAckCalls = 0;
+  const browser = loadBackground({
+    existingTabs: { 7: { id: 7, url: 'https://chatgpt.com/' } },
+    fetchImpl: async (url) => {
+      if (new URL(url).pathname === '/__moondesk/companion/v1/workers/reset-ack') {
+        resetAckCalls += 1;
+        return { ok: true, status: 200, async text() { return JSON.stringify({ workerResetEpoch: 1, pendingClientCount: 0 }); } };
+      }
+      throw new Error(`unexpected reset-cancel request: ${new URL(url).pathname}`);
+    },
+    sendMessageImpl: async (_tabId, message) => {
+      if (message.type === 'MOONDESK_CONTEXT') {
+        return {
+          ok: true,
+          context: {
+            projectId: null,
+            projectUrl: null,
+            conversationId: null,
+            sourceUrl: 'https://chatgpt.com/',
+            generating: false
+          },
+          rememberedLaunch: null
+        };
+      }
+      if (message.type === 'MOONDESK_CLEAR_WORKER_LAUNCHES') {
+        throw new Error('content cancellation not confirmed');
+      }
+      throw new Error(`unexpected reset-cancel tab message: ${message.type}`);
+    }
+  });
+  await browser.evaluate(`(() => {
+    globalThis.__resetCancelState = {
+      ...freshState(),
+      baseUrl: 'http://127.0.0.1:47650',
+      clientId: 'browser-b',
+      credential: '${'e'.repeat(64)}'
+    };
+  })()`);
+
+  await assert.rejects(
+    browser.evaluate(
+      `applyHostWorkerResetEpoch(globalThis.__resetCancelState, {
+        workerResetEpoch: 1,
+        workerResetAckRequired: true
+      })`
+    ),
+    /content cancellation not confirmed/
+  );
+  assert.equal(resetAckCalls, 0, 'host reset must remain pending without confirmed content cancellation');
+  assert.equal(browser.evaluate('globalThis.__resetCancelState.workerResetEpoch'), 0);
+});
+
 test('a retried global reset uses a fresh epoch to fence worker authority created after an earlier timed-out reset', async () => {
   let commitCalls = 0;
   let resetAckCalls = 0;
@@ -791,7 +999,7 @@ test('bridge discovery prefers an exact runtime match over another MoonDesk vers
             app: 'moondesk-worker-companion',
             appVersion: '0.13.0',
             protocolVersion: 2,
-            companionRuntimeRevision: 8
+            companionRuntimeRevision: 9
           };
         }
       };
@@ -819,7 +1027,7 @@ test('bridge discovery prefers an exact runtime match over another MoonDesk vers
 
   const { evaluate, runtimeReloads } = loadBackground({ fetchImpl });
   const hello = await evaluate('discoverBridge(freshState())');
-  assert.equal(hello.companionRuntimeRevision, 8);
+  assert.equal(hello.companionRuntimeRevision, 9);
   assert.equal(runtimeReloads.length, 0);
 });
 
@@ -835,7 +1043,7 @@ test('bridge runtime revision mismatch reloads the unpacked companion once', asy
             app: 'moondesk-worker-companion',
             appVersion: '0.13.0',
             protocolVersion: 2,
-            companionRuntimeRevision: 7
+            companionRuntimeRevision: 8
           };
         }
       };
@@ -874,7 +1082,7 @@ test('compatible bridge clears the one-shot runtime reload marker for a future m
             app: 'moondesk-worker-companion',
             appVersion: '0.12.0',
             protocolVersion: 2,
-            companionRuntimeRevision: 8
+            companionRuntimeRevision: 9
           };
         }
       };
@@ -887,7 +1095,7 @@ test('compatible bridge clears the one-shot runtime reload marker for a future m
   });
 
   const hello = await evaluate('discoverBridge(freshState())');
-  assert.equal(hello.companionRuntimeRevision, 8);
+  assert.equal(hello.companionRuntimeRevision, 9);
   const stored = await evaluate(`chrome.storage.local.get('${reloadKey}')`);
   assert.equal(stored[reloadKey], undefined);
 });
@@ -905,7 +1113,7 @@ test('automatic pairing proves the extension was loaded from the MoonDesk-prepar
             app: 'moondesk-worker-companion',
             appVersion: '0.12.0',
             protocolVersion: 2,
-            companionRuntimeRevision: 8
+            companionRuntimeRevision: 9
           };
         }
       };
@@ -947,7 +1155,7 @@ test('source and release-ZIP installs without a bootstrap capability expose Manu
         app: 'moondesk-worker-companion',
         appVersion: '0.12.0',
         protocolVersion: 2,
-        companionRuntimeRevision: 8
+        companionRuntimeRevision: 9
       };
       return {
         ok: true,
@@ -1016,7 +1224,7 @@ test('release version mismatch reloads the unpacked companion even when protocol
             app: 'moondesk-worker-companion',
             appVersion: '0.13.0',
             protocolVersion: 2,
-            companionRuntimeRevision: 8
+            companionRuntimeRevision: 9
           };
         }
       };
@@ -3583,6 +3791,96 @@ test('worker commit refuses a route change that occurs after preparation but bef
     state: 'failed', reason: 'prepared_launch_target_changed'
   });
   assert.equal(commitCalls, 0, 'the native Send path must not run after the prepared target changes');
+});
+
+test('content reset generation cancels a delayed commit before its irreversible Send callback', async () => {
+  let messageHandler = null;
+  let sendCalls = 0;
+  let releaseSelection;
+  let reportSelectionStarted;
+  const selectionStarted = new Promise((resolve) => { reportSelectionStarted = resolve; });
+  const selectionGate = new Promise((resolve) => { releaseSelection = resolve; });
+  const storage = new Map();
+  const DOM = {
+    conversationIdFromPath() { return null; },
+    projectIdFromPath() { return null; },
+    composerReady() { return true; },
+    async waitForComposerReady(_timeoutMs, stillCurrent) { return stillCurrent(); },
+    async selectModelSettings(_profile, _failure, stillCurrent) { return stillCurrent(); },
+    visibleModelSelection() { return { model: 'gpt-5.6-sol', reasoningEffort: 'high' }; },
+    async selectedModelAndEffort() {
+      reportSelectionStarted();
+      await selectionGate;
+      return { model: 'gpt-5.6-sol', reasoningEffort: 'high' };
+    },
+    taskMarkerPresent() { return false; },
+    preparedPromptMatches() { return false; },
+    insertPrompt() { return true; },
+    workerEvidence() {
+      return { conversationId: null, projectId: null, markerPresent: false, generating: false, userTurnCount: 0, assistantTurnCount: 0, composerEmpty: false };
+    },
+    async commitSendOnce(_prompt, _marker, stillCurrent) {
+      if (!stillCurrent()) return { state: 'failed', reason: 'prepared_launch_target_changed' };
+      sendCalls += 1;
+      return { state: 'committed' };
+    }
+  };
+  const context = vm.createContext({
+    window: { MOONDESK_CHATGPT_DOM: DOM },
+    sessionStorage: {
+      setItem(key, value) { storage.set(key, value); },
+      getItem(key) { return storage.get(key) || null; },
+      removeItem(key) { storage.delete(key); }
+    },
+    location: { origin: 'https://chatgpt.com', hash: '', pathname: '/', search: '', href: 'https://chatgpt.com/' },
+    history: { state: null, replaceState() {} },
+    chrome: { runtime: { onMessage: { addListener(handler) { messageHandler = handler; } } } },
+    crypto: webcrypto,
+    setTimeout,
+    clearTimeout,
+    setInterval,
+    clearInterval,
+    console
+  });
+  vm.runInContext(contentSource, context, { filename: contentPath });
+  const launch = {
+    workspaceId: 'workspace-a',
+    taskMarker: 'moondesk-worker-task:content-reset-cancel',
+    openingMessage: 'content-reset-cancel',
+    threadKey: 'worker:content-reset-cancel',
+    openMode: 'new_thread',
+    executionProfile: { modelKey: 'gpt-5.6-sol', modelLabel: 'GPT-5.6 Sol', reasoningEffort: 'high' }
+  };
+  const prepare = await new Promise((resolve) => {
+    messageHandler({
+      type: 'MOONDESK_PREPARE_WORKER', commandId: 'content-reset-command', launchToken: 'content-reset-token',
+      placement: { projectId: null }, launch
+    }, null, resolve);
+  });
+  assert.equal(prepare.result.state, 'ready');
+
+  const commitPromise = new Promise((resolve) => {
+    const returned = messageHandler({
+      type: 'MOONDESK_COMMIT_WORKER_SEND', commandId: 'content-reset-command', launchToken: 'content-reset-token',
+      placement: { projectId: null }, launch
+    }, null, resolve);
+    assert.equal(returned, true);
+  });
+  await selectionStarted;
+
+  const reset = await new Promise((resolve) => {
+    const returned = messageHandler({ type: 'MOONDESK_CLEAR_WORKER_LAUNCHES' }, null, resolve);
+    assert.equal(returned, false);
+  });
+  assert.equal(reset.ok, true);
+  assert.equal(reset.resetGeneration, 1);
+
+  releaseSelection();
+  const committed = await commitPromise;
+  assert.deepEqual(JSON.parse(JSON.stringify(committed.result)), {
+    state: 'failed', reason: 'prepared_launch_target_changed'
+  });
+  assert.equal(sendCalls, 0, 'reset generation must prevent the delayed content task from reaching Send');
 });
 
 test('worker commit revalidates the exact model and effort immediately before Send', async () => {

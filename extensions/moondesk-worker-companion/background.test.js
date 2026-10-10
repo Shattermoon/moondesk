@@ -332,12 +332,23 @@ test('Clear Workers fences in-flight browser work before awaiting the host reset
       clientId: 'browser-clear-race',
       credential: '${'b'.repeat(64)}'
     };
+    globalThis.__staleWorkerState = {
+      ...globalThis.__raceClearState,
+      launchRecords: { stale: { commandId: 'stale-after-clear' } },
+      blockedCommands: { stale: { commandId: 'stale-after-clear' } }
+    };
+    globalThis.__staleWorkerGeneration = workerClearGeneration;
     connecting = Promise.resolve(globalThis.__raceClearState);
   })()`);
 
   const clearPromise = evaluate('clearWorkers()');
   assert.equal(evaluate('workerClearGeneration'), 1, 'generation must advance before the first await');
   assert.equal(evaluate('workerClearInProgress'), true);
+  assert.equal(
+    await evaluate('writeWorkerCommandState(globalThis.__staleWorkerState, globalThis.__staleWorkerGeneration)'),
+    false,
+    'a stale command generation must not republish launch history after Clear Workers begins'
+  );
   await flushMicrotasks();
   assert.equal(requestCount, 1);
   await evaluate('pump()');
@@ -345,6 +356,9 @@ test('Clear Workers fences in-flight browser work before awaiting the host reset
   releaseClear();
   await clearPromise;
   assert.equal(evaluate('workerClearInProgress'), false);
+  const persisted = JSON.parse(await evaluate(`chrome.storage.local.get(STORAGE_KEY).then((value) => JSON.stringify(value[STORAGE_KEY] || {}))`));
+  assert.deepEqual(persisted.launchRecords || {}, {});
+  assert.deepEqual(persisted.blockedCommands || {}, {});
 });
 
 test('closing a browser tab schedules immediate presence publication instead of ending a worker locally', () => {

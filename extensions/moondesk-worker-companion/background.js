@@ -73,6 +73,12 @@ async function writeState(state) {
   await stateWriteQueue;
 }
 
+async function writeWorkerCommandState(state, clearGeneration) {
+  if (clearGeneration !== workerClearGeneration) return false;
+  await writeState(state);
+  return clearGeneration === workerClearGeneration;
+}
+
 function blockCommand(state, blocked) {
   if (!blocked?.commandId) return;
   if (!state.blockedCommands || typeof state.blockedCommands !== 'object') {
@@ -706,7 +712,7 @@ async function recoverThreadRecord(state, threadKey, workspaceId) {
   return recovered;
 }
 
-async function recordForCommand(state, command, placement, reconcileRequired = false) {
+async function recordForCommand(state, command, placement, reconcileRequired = false, clearGeneration = workerClearGeneration) {
   const threadKey = command.launch.threadKey || `command:${command.id}`;
   const openMode = command.launch.openMode || 'new_thread';
   let thread = state.threadRecords?.[threadKey] || null;
@@ -770,7 +776,9 @@ async function recordForCommand(state, command, placement, reconcileRequired = f
       reconcileAttempts: 0
     };
     state.launchRecords[command.id] = record;
-    await writeState(state);
+    if (!(await writeWorkerCommandState(state, clearGeneration))) {
+      throw new Error('worker_clear_superseded');
+    }
   }
   let tab = await recoverTab(record);
   if (!tab) {
@@ -784,10 +792,14 @@ async function recordForCommand(state, command, placement, reconcileRequired = f
     });
     record.tabId = tab.id ?? null;
     record.phase = 'created';
-    await writeState(state);
+    if (!(await writeWorkerCommandState(state, clearGeneration))) {
+      throw new Error('worker_clear_superseded');
+    }
   } else if (record.tabId !== tab.id) {
     record.tabId = tab.id ?? null;
-    await writeState(state);
+    if (!(await writeWorkerCommandState(state, clearGeneration))) {
+      throw new Error('worker_clear_superseded');
+    }
   }
   return { record, tab };
 }
@@ -861,10 +873,12 @@ async function observeWorkerAcceptance(
   record,
   placement,
   baseline,
+  clearGeneration,
   timeoutMs = 45000
 ) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
+    if (clearGeneration !== workerClearGeneration) return null;
     let tab = null;
     if (Number.isInteger(record.tabId)) {
       try { tab = await chrome.tabs.get(record.tabId); } catch {}
@@ -894,7 +908,7 @@ async function observeWorkerAcceptance(
           record.tabId = tab.id;
           record.conversationUrl = conversationUrl;
           record.phase = 'succeeded';
-          await writeState(state);
+          if (!(await writeWorkerCommandState(state, clearGeneration))) return null;
           return {
             conversationUrl,
             evidence: response.evidence
@@ -907,10 +921,10 @@ async function observeWorkerAcceptance(
   return null;
 }
 
-async function reconcileOrBlock(state, command, record, workspaceId, reason) {
+async function reconcileOrBlock(state, command, record, workspaceId, reason, clearGeneration) {
   record.phase = 'uncertain';
   record.reconcileAttempts = (record.reconcileAttempts || 0) + 1;
-  await writeState(state);
+  if (!(await writeWorkerCommandState(state, clearGeneration))) return 'cleared';
   if (record.reconcileAttempts >= MAX_RECONCILE_ATTEMPTS) {
     sessionReconcileCommandIds.delete(command.id);
     const terminalReason = `reconciliation_exhausted:${reason}`;
@@ -921,7 +935,7 @@ async function reconcileOrBlock(state, command, record, workspaceId, reason) {
       reason,
       retryMode: 'reconcile'
     });
-    await writeState(state);
+    if (!(await writeWorkerCommandState(state, clearGeneration))) return 'cleared';
     return 'blocked';
   }
   sessionReconcileCommandIds.add(command.id);
@@ -980,24 +994,28 @@ async function prepareWorkerWithRetry(tabId, payload, deadlineMs = Date.now() + 
   return response;
 }
 
-async function processCommand(state, offer) {
-  const clearGeneration = workerClearGeneration;
+async function processCommand(state, offer, clearGeneration = workerClearGeneration) {
   const clearStillCurrent = () => clearGeneration === workerClearGeneration;
+  if (!clearStillCurrent()) return;
   let command = offer.command;
   const workspaceId = command?.launch?.workspaceId;
   const placement = placementForOffer(state, offer);
   const failBeforeSend = async (reason) => {
+    if (!clearStillCurrent()) return;
     await ack(state, command, 'failed', reason);
+    if (!clearStillCurrent()) return;
     blockCommand(state, {
       commandId: command.id,
       workspaceId,
       reason,
       retryMode: 'fresh'
     });
-    await writeState(state);
+    await writeWorkerCommandState(state, clearGeneration);
   };
   const pauseAfterSend = async (reason) => {
+    if (!clearStillCurrent()) return;
     await ack(state, command, 'paused', reason);
+    if (!clearStillCurrent()) return;
     sessionReconcileCommandIds.delete(command.id);
     blockCommand(state, {
       commandId: command.id,
@@ -1005,7 +1023,7 @@ async function processCommand(state, offer) {
       reason,
       retryMode: 'reconcile'
     });
-    await writeState(state);
+    await writeWorkerCommandState(state, clearGeneration);
   };
 
   if (!placement) {
@@ -1015,7 +1033,13 @@ async function processCommand(state, offer) {
   }
   let recordAndTab;
   try {
-    recordAndTab = await recordForCommand(state, command, placement, offer.reconcileRequired === true);
+    recordAndTab = await recordForCommand(
+      state,
+      command,
+      placement,
+      offer.reconcileRequired === true,
+      clearGeneration
+    );
   } catch (error) {
     if (!clearStillCurrent()) return;
     const message = String(error?.message || error);
@@ -1058,7 +1082,7 @@ async function processCommand(state, offer) {
     }, 10000);
     if (!clearStillCurrent()) return;
     if (!response?.ok) {
-      await reconcileOrBlock(state, command, record, workspaceId, 'reconciliation_tab_response_unconfirmed');
+      await reconcileOrBlock(state, command, record, workspaceId, 'reconciliation_tab_response_unconfirmed', clearGeneration);
       return;
     }
     const result = response.result || {};
@@ -1086,11 +1110,12 @@ async function processCommand(state, offer) {
             updatedAt: Date.now()
           };
         }
-        await writeState(state);
+        if (!(await writeWorkerCommandState(state, clearGeneration))) return;
         await ack(state, command, 'succeeded', 'worker execution acceptance confirmed', confirmedConversation);
+        if (!clearStillCurrent()) return;
         sessionReconcileCommandIds.delete(command.id);
         clearBlockedCommand(state, command.id);
-        await writeState(state);
+        if (!(await writeWorkerCommandState(state, clearGeneration))) return;
         return;
       }
     }
@@ -1103,7 +1128,8 @@ async function processCommand(state, offer) {
       command,
       record,
       workspaceId,
-      result.reason || 'reconciliation_unconfirmed'
+      result.reason || 'reconciliation_unconfirmed',
+      clearGeneration
     );
     return;
   }
@@ -1122,7 +1148,7 @@ async function processCommand(state, offer) {
   } catch (error) {
     if (!clearStillCurrent()) return;
     record.phase = 'failed';
-    await writeState(state);
+    if (!(await writeWorkerCommandState(state, clearGeneration))) return;
     const message = String(error?.message || error);
     const timedOut = message === 'worker_prepare_timeout' || /timed out/i.test(message);
     await failBeforeSend(timedOut ? 'worker_prepare_timeout' : 'worker_prepare_exception');
@@ -1136,7 +1162,7 @@ async function processCommand(state, offer) {
   const prepareResult = prepared.result || {};
   if (prepareResult.state === 'failed') {
     record.phase = 'failed';
-    await writeState(state);
+    if (!(await writeWorkerCommandState(state, clearGeneration))) return;
     await failBeforeSend(prepareResult.reason || 'worker_prepare_failed');
     return;
   }
@@ -1149,17 +1175,17 @@ async function processCommand(state, offer) {
     record.baseline = prepareResult.evidence || null;
   }
   record.phase = 'prepared';
-  await writeState(state);
+  if (!(await writeWorkerCommandState(state, clearGeneration))) return;
   if (!clearStillCurrent()) return;
   command = await markSendStarted(state, command);
   if (!clearStillCurrent()) return;
   record.phase = 'send_started';
-  await writeState(state);
+  if (!(await writeWorkerCommandState(state, clearGeneration))) return;
 
   if (prepareResult.state === 'already_sent') {
     const existingConversation = canonicalConversationUrl(prepareResult.conversationUrl || tab.url);
     if (!existingConversation) {
-      await reconcileOrBlock(state, command, record, workspaceId, 'preexisting_marker_conversation_unconfirmed');
+      await reconcileOrBlock(state, command, record, workspaceId, 'preexisting_marker_conversation_unconfirmed', clearGeneration);
       return;
     }
     const accepted = acceptanceMatches(
@@ -1171,16 +1197,17 @@ async function processCommand(state, offer) {
       prepared.rememberedLaunch
     );
     if (!accepted) {
-      await reconcileOrBlock(state, command, record, workspaceId, 'preexisting_marker_execution_unconfirmed');
+      await reconcileOrBlock(state, command, record, workspaceId, 'preexisting_marker_execution_unconfirmed', clearGeneration);
       return;
     }
     record.conversationUrl = existingConversation;
     record.phase = 'succeeded';
-    await writeState(state);
+    if (!(await writeWorkerCommandState(state, clearGeneration))) return;
     await ack(state, command, 'succeeded', 'worker execution acceptance confirmed', existingConversation);
+    if (!clearStillCurrent()) return;
     sessionReconcileCommandIds.delete(command.id);
     clearBlockedCommand(state, command.id);
-    await writeState(state);
+    if (!(await writeWorkerCommandState(state, clearGeneration))) return;
     return;
   }
 
@@ -1199,11 +1226,18 @@ async function processCommand(state, offer) {
 
   const baseline = committed.result.baseline || record.baseline || {};
   record.baseline = baseline;
-  await writeState(state);
-  const accepted = await observeWorkerAcceptance(state, command, record, placement, baseline);
+  if (!(await writeWorkerCommandState(state, clearGeneration))) return;
+  const accepted = await observeWorkerAcceptance(
+    state,
+    command,
+    record,
+    placement,
+    baseline,
+    clearGeneration
+  );
   if (!clearStillCurrent()) return;
   if (!accepted) {
-    await reconcileOrBlock(state, command, record, workspaceId, 'worker_send_acceptance_unconfirmed');
+    await reconcileOrBlock(state, command, record, workspaceId, 'worker_send_acceptance_unconfirmed', clearGeneration);
     return;
   }
 
@@ -1217,11 +1251,12 @@ async function processCommand(state, offer) {
     };
   }
   record.phase = 'succeeded';
-  await writeState(state);
+  if (!(await writeWorkerCommandState(state, clearGeneration))) return;
   await ack(state, command, 'succeeded', 'worker send acceptance confirmed', accepted.conversationUrl);
+  if (!clearStillCurrent()) return;
   sessionReconcileCommandIds.delete(command.id);
   clearBlockedCommand(state, command.id);
-  await writeState(state);
+  await writeWorkerCommandState(state, clearGeneration);
 }
 
 function schedulePump(delayMs = FAST_POLL_MS) {
@@ -1229,7 +1264,8 @@ function schedulePump(delayMs = FAST_POLL_MS) {
   pumpTimer = setTimeout(() => { void pump(); }, delayMs);
 }
 
-async function pauseInheritedReconciliation(state, offer) {
+async function pauseInheritedReconciliation(state, offer, clearGeneration) {
+  if (clearGeneration !== workerClearGeneration) return true;
   const command = offer?.command;
   if (
     !offer?.reconcileRequired ||
@@ -1240,43 +1276,55 @@ async function pauseInheritedReconciliation(state, offer) {
   }
   const previous = state.blockedCommands?.[command.id] || null;
   const reason = previous?.reason || 'reconciliation_paused_after_companion_restart';
+  if (clearGeneration !== workerClearGeneration) return true;
   await ack(state, command, 'paused', `reconciliation_paused:${reason}`);
+  if (clearGeneration !== workerClearGeneration) return true;
   blockCommand(state, {
     commandId: command.id,
     workspaceId: command?.launch?.workspaceId || previous?.workspaceId || null,
     reason,
     retryMode: 'reconcile'
   });
-  await writeState(state);
+  await writeWorkerCommandState(state, clearGeneration);
   return true;
 }
 
-async function redeemCommandBatch(state, limit = MAX_PARALLEL_COMMANDS) {
+async function redeemCommandBatch(state, limit = MAX_PARALLEL_COMMANDS, clearGeneration = workerClearGeneration) {
   const offers = [];
   for (let index = 0; index < limit; index += 1) {
+    if (workerClearInProgress || clearGeneration !== workerClearGeneration) break;
     const offer = await api(state, '/__moondesk/companion/v1/commands/redeem', { method: 'POST' });
+    if (workerClearInProgress || clearGeneration !== workerClearGeneration) break;
     if (!offer?.command) break;
-    if (await pauseInheritedReconciliation(state, offer)) continue;
+    if (await pauseInheritedReconciliation(state, offer, clearGeneration)) continue;
     offers.push(offer);
   }
   return offers;
 }
 
-async function processCommandBatch(state, offers, processor = processCommand) {
-  return Promise.allSettled(offers.map((offer) => processor(state, offer)));
+async function processCommandBatch(
+  state,
+  offers,
+  processor = processCommand,
+  clearGeneration = workerClearGeneration
+) {
+  return Promise.allSettled(offers.map((offer) => processor(state, offer, clearGeneration)));
 }
 
 async function pump() {
   if (pumpActive || workerClearInProgress) return;
+  const clearGeneration = workerClearGeneration;
   pumpActive = true;
   let redeemed = 0;
   try {
     const state = await ensureConnected();
+    if (workerClearInProgress || clearGeneration !== workerClearGeneration) return;
     await collectPresence(state);
-    const offers = await redeemCommandBatch(state);
+    if (workerClearInProgress || clearGeneration !== workerClearGeneration) return;
+    const offers = await redeemCommandBatch(state, MAX_PARALLEL_COMMANDS, clearGeneration);
     redeemed = offers.length;
-    if (offers.length) {
-      const outcomes = await processCommandBatch(state, offers);
+    if (offers.length && clearGeneration === workerClearGeneration) {
+      const outcomes = await processCommandBatch(state, offers, processCommand, clearGeneration);
       for (const outcome of outcomes) {
         if (outcome.status === 'rejected') {
           console.warn('MoonDesk worker command failed:', String(outcome.reason?.message || outcome.reason));

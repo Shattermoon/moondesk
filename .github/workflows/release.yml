@@ -301,6 +301,7 @@ jobs:
           node --check npm/install-binary.js
           node --check npm/update-manager.js
           node --check .github/scripts/verify-npm-package.mjs
+          node --check .github/scripts/verify-managed-browser-manifest.mjs
           node --check extensions/moondesk-worker-companion/background.js
           node --check extensions/moondesk-worker-companion/content.js
           node --check extensions/moondesk-worker-companion/chatgpt-dom.js
@@ -309,6 +310,7 @@ jobs:
           node --check extensions/moondesk-worker-companion/popup.js
           node --test npm/install-binary.test.js npm/update-manager.test.js npm/moondesk.test.js
           node --test extensions/moondesk-worker-companion/background.test.js
+          node .github/scripts/verify-managed-browser-manifest.mjs
           python3 -m py_compile .github/scripts/package-worker-companion.py
           python3 .github/scripts/package-worker-companion.py --output "$RUNNER_TEMP/companion-source.zip"
           test -s "$RUNNER_TEMP/companion-source.zip"
@@ -445,6 +447,26 @@ jobs:
           cp "${{ matrix.binary }}" "dist/${{ matrix.asset }}"
           chmod 755 "dist/${{ matrix.asset }}"
 
+      - name: Verify Linux glibc compatibility ceiling
+        if: startsWith(matrix.runner, 'ubuntu-')
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary="dist/${{ matrix.asset }}"
+          versions="$(objdump -T "$binary" | grep -oE 'GLIBC_[0-9]+(\.[0-9]+)+' || true)"
+          if [ -z "$versions" ]; then
+            echo "::error::Could not determine GLIBC symbol requirements for $binary."
+            exit 1
+          fi
+          max_glibc="$(printf '%s\n' "$versions" | sed 's/^GLIBC_//' | sort -Vu | tail -n 1)"
+          max_supported="2.34"
+          highest="$(printf '%s\n%s\n' "$max_supported" "$max_glibc" | sort -V | tail -n 1)"
+          if [ "$highest" != "$max_supported" ]; then
+            echo "::error::$binary now requires GLIBC $max_glibc, above MoonDesk's supported GLIBC $max_supported floor."
+            exit 1
+          fi
+          echo "$binary requires at most GLIBC $max_glibc (supported floor: $max_supported)."
+
       - name: Smoke-test binary and ClippyMoon export
         shell: bash
         run: |
@@ -513,7 +535,9 @@ jobs:
           }
 
       - name: Upload Windows release security record
+        id: upload_windows_security
         if: matrix.runner == 'windows-2022'
+        continue-on-error: true
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: windows-release-security
@@ -521,12 +545,45 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - name: Back off before retrying Windows release security upload
+        if: matrix.runner == 'windows-2022' && steps.upload_windows_security.outcome == 'failure'
+        shell: bash
+        run: sleep 5
+
+      - name: Retry Windows release security record upload
+        if: matrix.runner == 'windows-2022' && steps.upload_windows_security.outcome == 'failure'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: windows-release-security
+          path: windows-release-security.json
+          if-no-files-found: error
+          retention-days: 30
+          overwrite: true
+
+      - name: Upload release binary
+        id: upload_release_binary
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ matrix.asset }}
           path: dist/${{ matrix.asset }}
           if-no-files-found: error
           retention-days: 7
+
+      - name: Back off before retrying release binary upload
+        if: steps.upload_release_binary.outcome == 'failure'
+        shell: bash
+        run: sleep 5
+
+      - name: Retry release binary upload
+        if: steps.upload_release_binary.outcome == 'failure'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}
+          if-no-files-found: error
+          retention-days: 7
+          overwrite: true
 
   companion:
     name: Package Worker Companion
@@ -851,13 +908,13 @@ jobs:
             npm publish --access public --provenance
           fi
 
-          for attempt in $(seq 1 12); do
+          for attempt in $(seq 1 60); do
             published_version="$(npm view "${package_name}@${version}" version 2>/dev/null || true)"
             if [ "$published_version" = "$version" ]; then
               break
             fi
-            if [ "$attempt" -eq 12 ]; then
-              echo "::error::${package_name}@${version} was not visible after one minute."
+            if [ "$attempt" -eq 60 ]; then
+              echo "::error::${package_name}@${version} was not visible after five minutes."
               exit 1
             fi
             sleep 5
@@ -875,7 +932,7 @@ jobs:
           printf '%s\n' '{"name":"moondesk-release-verification","private":true}' > "$audit_dir/package.json"
           cd "$audit_dir"
           npm install --ignore-scripts --no-audit --no-fund "${package_name}@${version}"
-          for attempt in $(seq 1 24); do
+          for attempt in $(seq 1 60); do
             if audit_output="$(npm audit signatures 2>&1)"; then
               printf '%s\n' "$audit_output"
               break
@@ -889,12 +946,12 @@ jobs:
               exit "$audit_status"
             fi
 
-            if [ "$attempt" -eq 24 ]; then
-              echo "::error::npm provenance attestation for ${package_name}@${version} was not visible after two minutes."
+            if [ "$attempt" -eq 60 ]; then
+              echo "::error::npm provenance attestation for ${package_name}@${version} was not visible after five minutes."
               exit "$audit_status"
             fi
 
-            echo "npm provenance attestation is not visible yet; retrying signature audit in 5 seconds (${attempt}/24)."
+            echo "npm provenance attestation is not visible yet; retrying signature audit in 5 seconds (${attempt}/60)."
             sleep 5
           done
 
@@ -945,6 +1002,8 @@ jobs:
     if: >-
       always() &&
       needs.prepare.result == 'success' &&
+      needs.release.result == 'success' &&
+      needs.release.outputs.refs_published == 'true' &&
       needs.prepare.outputs.candidate_branch != ''
     needs:
       - prepare
@@ -960,8 +1019,27 @@ jobs:
         with:
           ref: main
 
-      - name: Delete candidate branch
+      - name: Delete successful release candidate branches
         shell: bash
         run: |
           set -euo pipefail
-          git push origin --delete "${{ needs.prepare.outputs.candidate_branch }}" || true
+          candidate_branch="${{ needs.prepare.outputs.candidate_branch }}"
+          candidate_prefix="${candidate_branch%-*}-"
+          deleted=0
+          while IFS=$'\t' read -r _ ref; do
+            [ -n "$ref" ] || continue
+            branch="${ref#refs/heads/}"
+            case "$branch" in
+              "${candidate_prefix}"*)
+                attempt="${branch#"$candidate_prefix"}"
+                case "$attempt" in
+                  ''|*[!0-9]*) continue ;;
+                esac
+                git push origin --delete "$branch"
+                deleted=$((deleted + 1))
+                ;;
+            esac
+          done < <(git ls-remote --heads origin 'refs/heads/release-candidate/*')
+          if [ "$deleted" -eq 0 ]; then
+            echo "No retained release-candidate branch remained for ${candidate_prefix}."
+          fi

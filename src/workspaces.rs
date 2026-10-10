@@ -4,7 +4,7 @@ use std::collections::HashSet;
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use subtle::ConstantTimeEq;
 use tokio::sync::Notify;
@@ -97,7 +97,7 @@ impl WorkspaceConfig {
         mcp_slug: impl AsRef<str>,
     ) -> Result<Self, String> {
         let name = normalize_workspace_name(name.as_ref())?;
-        let root = canonicalize_existing_workspace_root(root.as_ref())?;
+        let root = canonicalize_workspace_registration_root(root.as_ref())?;
         let mcp_slug = mcp_slug.as_ref().trim().to_string();
         validate_mcp_slug(&mcp_slug)?;
         Ok(Self {
@@ -112,6 +112,7 @@ impl WorkspaceConfig {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum WorkspaceAvailability {
     Available,
+    Protected,
     #[default]
     Unavailable,
 }
@@ -360,11 +361,116 @@ pub fn canonicalize_existing_workspace_root(path: &Path) -> Result<PathBuf, Stri
         .map_err(|error| format!("failed to canonicalize workspace root: {error}"))
 }
 
+fn canonical_protected_root(path: PathBuf) -> Option<PathBuf> {
+    canonicalize_existing_workspace_root(&path)
+        .ok()
+        .map(|root| comparable_root(&root))
+}
+
+#[cfg(windows)]
+fn protected_workspace_roots() -> &'static [PathBuf] {
+    static ROOTS: OnceLock<Vec<PathBuf>> = OnceLock::new();
+    ROOTS.get_or_init(|| {
+        let mut candidates = Vec::new();
+        for variable in [
+            "SystemRoot",
+            "WINDIR",
+            "ProgramFiles",
+            "ProgramFiles(x86)",
+            "ProgramData",
+        ] {
+            if let Some(value) = std::env::var_os(variable).filter(|value| !value.is_empty()) {
+                candidates.push(PathBuf::from(value));
+            }
+        }
+        if let Some(system_drive) =
+            std::env::var_os("SystemDrive").filter(|value| !value.is_empty())
+        {
+            let drive = PathBuf::from(system_drive);
+            candidates.extend([
+                drive.join("Recovery"),
+                drive.join("System Volume Information"),
+                drive.join("$Recycle.Bin"),
+            ]);
+        }
+        let mut roots = candidates
+            .into_iter()
+            .filter_map(canonical_protected_root)
+            .collect::<Vec<_>>();
+        roots.sort();
+        roots.dedup();
+        roots
+    })
+}
+
+#[cfg(unix)]
+fn protected_workspace_roots() -> &'static [PathBuf] {
+    static ROOTS: OnceLock<Vec<PathBuf>> = OnceLock::new();
+    ROOTS.get_or_init(|| {
+        let mut roots = [
+            "/bin",
+            "/sbin",
+            "/etc",
+            "/lib",
+            "/lib32",
+            "/lib64",
+            "/boot",
+            "/dev",
+            "/proc",
+            "/sys",
+            "/usr/bin",
+            "/usr/sbin",
+            "/usr/lib",
+            "/usr/lib32",
+            "/usr/lib64",
+            "/usr/share",
+            "/System",
+            "/Library",
+        ]
+        .into_iter()
+        .map(PathBuf::from)
+        .filter_map(canonical_protected_root)
+        .collect::<Vec<_>>();
+        roots.sort();
+        roots.dedup();
+        roots
+    })
+}
+
+#[cfg(all(not(unix), not(windows)))]
+fn protected_workspace_roots() -> &'static [PathBuf] {
+    &[]
+}
+
+fn canonical_workspace_root_is_protected(root: &Path) -> bool {
+    if root.parent().is_none() {
+        return true;
+    }
+    let root = comparable_root(root);
+    protected_workspace_roots()
+        .iter()
+        .any(|protected| root.starts_with(protected))
+}
+
+pub fn canonicalize_workspace_registration_root(path: &Path) -> Result<PathBuf, String> {
+    let root = canonicalize_existing_workspace_root(path)?;
+    if canonical_workspace_root_is_protected(&root) {
+        return Err(format!(
+            "workspace root is a protected operating-system directory and cannot be registered: {}",
+            root.display()
+        ));
+    }
+    Ok(root)
+}
+
 pub fn workspace_availability(root: &Path) -> WorkspaceAvailability {
     if !root.is_dir() {
         return WorkspaceAvailability::Unavailable;
     }
     match canonicalize_existing_workspace_root(root) {
+        Ok(canonical) if canonical_workspace_root_is_protected(&canonical) => {
+            WorkspaceAvailability::Protected
+        }
         Ok(canonical) if workspace_root_matches_canonical(root, &canonical) => {
             WorkspaceAvailability::Available
         }
@@ -781,6 +887,87 @@ mod tests {
 
         let _ = std::fs::remove_dir(&alias);
         let _ = std::fs::remove_dir_all(target);
+    }
+
+    #[test]
+    fn filesystem_root_is_protected_from_workspace_registration() {
+        let current = canonicalize_existing_workspace_root(
+            &std::env::current_dir().expect("resolve current directory"),
+        )
+        .expect("canonicalize current directory");
+        let filesystem_root = current
+            .ancestors()
+            .last()
+            .expect("current directory must have a filesystem root")
+            .to_path_buf();
+        assert_eq!(
+            workspace_availability(&filesystem_root),
+            WorkspaceAvailability::Protected
+        );
+        let error = canonicalize_workspace_registration_root(&filesystem_root)
+            .expect_err("filesystem root must never become a workspace");
+        assert!(error.contains("protected operating-system directory"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_system32_is_protected_from_workspace_registration() {
+        let system_root = std::env::var_os("SystemRoot")
+            .map(PathBuf::from)
+            .expect("Windows must provide SystemRoot");
+        let system32 = system_root.join("System32");
+        assert_eq!(
+            workspace_availability(&system32),
+            WorkspaceAvailability::Protected
+        );
+        let error = WorkspaceConfig::new("System32", &system32, "Ab3kL9xQ2pTm7VhC")
+            .expect_err("System32 must not become a workspace");
+        assert!(error.contains("protected operating-system directory"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_junction_alias_into_system_root_is_protected() {
+        let system_root = std::env::var_os("SystemRoot")
+            .map(PathBuf::from)
+            .expect("Windows must provide SystemRoot");
+        let alias = absolute_test_root("protected-system-root-junction");
+        let output = std::process::Command::new("cmd")
+            .args(["/D", "/C", "mklink", "/J"])
+            .arg(&alias)
+            .arg(&system_root)
+            .output()
+            .expect("create protected-root junction");
+        assert!(
+            output.status.success(),
+            "failed to create protected-root junction: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        assert_eq!(
+            workspace_availability(&alias),
+            WorkspaceAvailability::Protected,
+            "filesystem aliases into protected system directories must remain blocked"
+        );
+        assert!(canonicalize_workspace_registration_root(&alias).is_err());
+
+        let _ = std::fs::remove_dir(&alias);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_system_directories_are_protected_from_workspace_registration() {
+        for root in ["/etc", "/usr/bin"] {
+            let root = Path::new(root);
+            if !root.is_dir() {
+                continue;
+            }
+            assert_eq!(
+                workspace_availability(root),
+                WorkspaceAvailability::Protected
+            );
+            assert!(canonicalize_workspace_registration_root(root).is_err());
+        }
     }
 
     #[test]

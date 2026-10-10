@@ -1,5 +1,5 @@
 {
-  "version": "1.7.0",
+  "version": "native-cdp-1",
   "commands": {
     "click": [
       {
@@ -40,35 +40,11 @@
         "required": false
       }
     ],
-    "close_heapsnapshot": [
-      {
-        "name": "filePath",
-        "type": "string",
-        "required": true
-      }
-    ],
     "close_page": [
       {
         "name": "pageId",
         "type": "number",
         "required": true
-      }
-    ],
-    "compare_heapsnapshots": [
-      {
-        "name": "baseFilePath",
-        "type": "string",
-        "required": true
-      },
-      {
-        "name": "currentFilePath",
-        "type": "string",
-        "required": true
-      },
-      {
-        "name": "classIndex",
-        "type": "number",
-        "required": false
       }
     ],
     "drag": [
@@ -159,30 +135,6 @@
         "required": false
       }
     ],
-    "execute_3p_developer_tool": [
-      {
-        "name": "toolName",
-        "type": "string",
-        "required": true
-      },
-      {
-        "name": "params",
-        "type": "string",
-        "required": false
-      }
-    ],
-    "execute_webmcp_tool": [
-      {
-        "name": "toolName",
-        "type": "string",
-        "required": true
-      },
-      {
-        "name": "input",
-        "type": "string",
-        "required": false
-      }
-    ],
     "fill": [
       {
         "name": "uid",
@@ -204,202 +156,6 @@
       {
         "name": "msgid",
         "type": "number",
-        "required": true
-      }
-    ],
-    "get_heapsnapshot_class_nodes": [
-      {
-        "name": "filePath",
-        "type": "string",
-        "required": true
-      },
-      {
-        "name": "id",
-        "type": "number",
-        "required": true
-      },
-      {
-        "name": "filterName",
-        "type": "string",
-        "required": false,
-        "enum": [
-          "objectsRetainedByDetachedDomNodes",
-          "objectsRetainedByConsole",
-          "objectsRetainedByEventHandlers",
-          "objectsRetainedByContexts",
-          "sharedNativeContext",
-          "noNativeContext",
-          "attributedToSpecificNativeContext"
-        ]
-      },
-      {
-        "name": "objectId",
-        "type": "number",
-        "required": false
-      },
-      {
-        "name": "pageIdx",
-        "type": "number",
-        "required": false
-      },
-      {
-        "name": "pageSize",
-        "type": "number",
-        "required": false
-      }
-    ],
-    "get_heapsnapshot_details": [
-      {
-        "name": "filePath",
-        "type": "string",
-        "required": true
-      },
-      {
-        "name": "filterName",
-        "type": "string",
-        "required": false,
-        "enum": [
-          "objectsRetainedByDetachedDomNodes",
-          "objectsRetainedByConsole",
-          "objectsRetainedByEventHandlers",
-          "objectsRetainedByContexts",
-          "sharedNativeContext",
-          "noNativeContext",
-          "attributedToSpecificNativeContext"
-        ]
-      },
-      {
-        "name": "objectId",
-        "type": "number",
-        "required": false
-      },
-      {
-        "name": "pageIdx",
-        "type": "number",
-        "required": false
-      },
-      {
-        "name": "pageSize",
-        "type": "number",
-        "required": false
-      }
-    ],
-    "get_heapsnapshot_dominators": [
-      {
-        "name": "filePath",
-        "type": "string",
-        "required": true
-      },
-      {
-        "name": "nodeId",
-        "type": "number",
-        "required": true
-      }
-    ],
-    "get_heapsnapshot_duplicate_strings": [
-      {
-        "name": "filePath",
-        "type": "string",
-        "required": true
-      },
-      {
-        "name": "pageIdx",
-        "type": "number",
-        "required": false
-      },
-      {
-        "name": "pageSize",
-        "type": "number",
-        "required": false
-      }
-    ],
-    "get_heapsnapshot_edges": [
-      {
-        "name": "filePath",
-        "type": "string",
-        "required": true
-      },
-      {
-        "name": "nodeId",
-        "type": "number",
-        "required": true
-      },
-      {
-        "name": "pageIdx",
-        "type": "number",
-        "required": false
-      },
-      {
-        "name": "pageSize",
-        "type": "number",
-        "required": false
-      }
-    ],
-    "get_heapsnapshot_object_details": [
-      {
-        "name": "filePath",
-        "type": "string",
-        "required": true
-      },
-      {
-        "name": "nodeId",
-        "type": "number",
-        "required": true
-      }
-    ],
-    "get_heapsnapshot_retainers": [
-      {
-        "name": "filePath",
-        "type": "string",
-        "required": true
-      },
-      {
-        "name": "nodeId",
-        "type": "number",
-        "required": true
-      },
-      {
-        "name": "pageIdx",
-        "type": "number",
-        "required": false
-      },
-      {
-        "name": "pageSize",
-        "type": "number",
-        "required": false
-      }
-    ],
-    "get_heapsnapshot_retaining_paths": [
-      {
-        "name": "filePath",
-        "type": "string",
-        "required": true
-      },
-      {
-        "name": "nodeId",
-        "type": "number",
-        "required": true
-      },
-      {
-        "name": "maxDepth",
-        "type": "number",
-        "required": false
-      },
-      {
-        "name": "maxNodes",
-        "type": "number",
-        "required": false
-      },
-      {
-        "name": "maxSiblings",
-        "type": "number",
-        "required": false
-      }
-    ],
-    "get_heapsnapshot_summary": [
-      {
-        "name": "filePath",
-        "type": "string",
         "required": true
       }
     ],
@@ -448,41 +204,6 @@
         "required": false
       }
     ],
-    "install_extension": [
-      {
-        "name": "path",
-        "type": "string",
-        "required": true
-      }
-    ],
-    "lighthouse_audit": [
-      {
-        "name": "mode",
-        "type": "string",
-        "required": false,
-        "enum": [
-          "navigation",
-          "snapshot"
-        ],
-        "default": "navigation"
-      },
-      {
-        "name": "device",
-        "type": "string",
-        "required": false,
-        "enum": [
-          "desktop",
-          "mobile"
-        ],
-        "default": "desktop"
-      },
-      {
-        "name": "outputDirPath",
-        "type": "string",
-        "required": false
-      }
-    ],
-    "list_3p_developer_tools": [],
     "list_console_messages": [
       {
         "name": "pageSize",
@@ -502,16 +223,9 @@
       {
         "name": "includePreservedMessages",
         "type": "boolean",
-        "required": false,
-        "default": false
-      },
-      {
-        "name": "serviceWorkerId",
-        "type": "string",
         "required": false
       }
     ],
-    "list_extensions": [],
     "list_network_requests": [
       {
         "name": "pageSize",
@@ -531,12 +245,10 @@
       {
         "name": "includePreservedRequests",
         "type": "boolean",
-        "required": false,
-        "default": false
+        "required": false
       }
     ],
     "list_pages": [],
-    "list_webmcp_tools": [],
     "navigate_page": [
       {
         "name": "type",
@@ -560,6 +272,11 @@
         "required": false
       },
       {
+        "name": "initScript",
+        "type": "string",
+        "required": false
+      },
+      {
         "name": "handleBeforeUnload",
         "type": "string",
         "required": false,
@@ -567,16 +284,6 @@
           "accept",
           "dismiss"
         ]
-      },
-      {
-        "name": "initScript",
-        "type": "string",
-        "required": false
-      },
-      {
-        "name": "timeout",
-        "type": "integer",
-        "required": false
       }
     ],
     "new_page": [
@@ -589,28 +296,6 @@
         "name": "background",
         "type": "boolean",
         "required": false
-      },
-      {
-        "name": "isolatedContext",
-        "type": "string",
-        "required": false
-      },
-      {
-        "name": "timeout",
-        "type": "integer",
-        "required": false
-      }
-    ],
-    "performance_analyze_insight": [
-      {
-        "name": "insightSetId",
-        "type": "string",
-        "required": true
-      },
-      {
-        "name": "insightName",
-        "type": "string",
-        "required": true
       }
     ],
     "performance_start_trace": [
@@ -651,13 +336,6 @@
         "required": false
       }
     ],
-    "reload_extension": [
-      {
-        "name": "id",
-        "type": "string",
-        "required": true
-      }
-    ],
     "resize_page": [
       {
         "name": "width",
@@ -670,14 +348,18 @@
         "required": true
       }
     ],
-    "screencast_start": [
+    "scroll": [
       {
-        "name": "filePath",
-        "type": "string",
-        "required": false
+        "name": "deltaX",
+        "type": "number",
+        "required": true
+      },
+      {
+        "name": "deltaY",
+        "type": "number",
+        "required": true
       }
     ],
-    "screencast_stop": [],
     "select_page": [
       {
         "name": "pageId",
@@ -742,13 +424,6 @@
         "required": false
       }
     ],
-    "trigger_extension_action": [
-      {
-        "name": "id",
-        "type": "string",
-        "required": true
-      }
-    ],
     "type_text": [
       {
         "name": "text",
@@ -759,13 +434,6 @@
         "name": "submitKey",
         "type": "string",
         "required": false
-      }
-    ],
-    "uninstall_extension": [
-      {
-        "name": "id",
-        "type": "string",
-        "required": true
       }
     ],
     "upload_file": [

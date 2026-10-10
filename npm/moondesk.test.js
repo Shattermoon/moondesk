@@ -12,6 +12,7 @@ const {
   orchestrate,
   runNative,
 } = require("./moondesk");
+const { UNSUPPORTED_RUNTIME_ERROR_CODE } = require("./install-binary");
 const { UPDATE_EXIT_CODE, changelogNoticePath, currentVersion } = require("./update-manager");
 
 function tempDir() {
@@ -41,7 +42,7 @@ test("package exposes one MoonDesk CLI and keeps browser as a subcommand", () =>
   assert.equal(pkg.files.includes("skills/browser/SKILL.md"), true);
 });
 
-test("supported Node runtime matches the pinned browser dependency contract", () => {
+test("supported Node runtime matches the npm bootstrap contract", () => {
   const pkg = require("../package.json");
   assert.equal(SUPPORTED_NODE_RANGE, "^20.19.0 || ^22.12.0 || >=23");
   assert.equal(pkg.engines.node, SUPPORTED_NODE_RANGE);
@@ -69,6 +70,31 @@ test("unsupported Node exits before MoonDesk performs startup side effects", asy
   assert.equal(errors.length, 1);
   assert.match(errors[0], /\^20\.19\.0 \|\| \^22\.12\.0 \|\| >=23/);
   assert.match(errors[0], /22\.11\.0/);
+});
+
+test("unsupported native runtime reports compatibility without misleading network advice", async () => {
+  const dir = tempDir();
+  const errors = [];
+  try {
+    const result = await orchestrate({
+      logger: { log() {}, warn() {}, error(message) { errors.push(message); } },
+      updateStatePath: path.join(dir, "state.json"),
+      updateRequestPath: path.join(dir, "request.json"),
+      startUpdateMonitorImpl: () => () => {},
+      ensureBinaryImpl: async () => {
+        const error = new Error("MoonDesk prebuilt Linux binaries require glibc 2.34 or newer");
+        error.code = UNSUPPORTED_RUNTIME_ERROR_CODE;
+        throw error;
+      },
+    });
+
+    assert.deepEqual(result, { code: 1, signal: null });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /require glibc 2\.34 or newer/);
+    assert.doesNotMatch(errors[0], /network/i);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("browser subcommand arguments are forwarded unchanged to native MoonDesk", async () => {
@@ -126,12 +152,22 @@ test("managed update environment variables never leak into npm or the restarted 
   assert.deepEqual(
     cleanManagedUpdateEnv({
       PATH: "/bin",
+      HOME: "shell-home",
+      USERPROFILE: "user-profile",
+      HOMEDRIVE: "home-drive",
+      HOMEPATH: "home-path",
       MOONDESK_NPM_MANAGED: "stale",
       MOONDESK_UPDATE_REQUEST_PATH: "stale-request",
       MOONDESK_UPDATE_STATE_PATH: "stale-state",
       MOONDESK_CHANGELOG_NOTICE_PATH: "stale-changelog",
     }),
-    { PATH: "/bin" },
+    {
+      PATH: "/bin",
+      HOME: "shell-home",
+      USERPROFILE: "user-profile",
+      HOMEDRIVE: "home-drive",
+      HOMEPATH: "home-path",
+    },
   );
 });
 
@@ -235,6 +271,10 @@ test("validated update exit installs the exact version, verifies it, and restart
   const baseEnv = {
     PATH: "/bin",
     KEEP_ME: "yes",
+    HOME: "shell-home",
+    USERPROFILE: "user-profile",
+    HOMEDRIVE: "home-drive",
+    HOMEPATH: "home-path",
     MOONDESK_NPM_MANAGED: "stale",
     MOONDESK_UPDATE_REQUEST_PATH: "stale-request",
     MOONDESK_UPDATE_STATE_PATH: "stale-state",
@@ -264,6 +304,10 @@ test("validated update exit installs the exact version, verifies it, and restart
         assert.deepEqual(args, ["arg-one"]);
         assert.equal(options.cwd, dir);
         assert.equal(options.env.KEEP_ME, "yes");
+        assert.equal(options.env.HOME, "shell-home");
+        assert.equal(options.env.USERPROFILE, "user-profile");
+        assert.equal(options.env.HOMEDRIVE, "home-drive");
+        assert.equal(options.env.HOMEPATH, "home-path");
         assert.equal(options.env.MOONDESK_NPM_MANAGED, "1");
         assert.equal(options.env.MOONDESK_UPDATE_STATE_PATH, statePath);
         assert.equal(options.env.MOONDESK_UPDATE_REQUEST_PATH, requestPath);
@@ -285,6 +329,10 @@ test("validated update exit installs the exact version, verifies it, and restart
         assert.equal(version, targetVersion);
         assert.equal(options.cwd, dir);
         assert.equal(options.env.KEEP_ME, "yes");
+        assert.equal(options.env.HOME, "shell-home");
+        assert.equal(options.env.USERPROFILE, "user-profile");
+        assert.equal(options.env.HOMEDRIVE, "home-drive");
+        assert.equal(options.env.HOMEPATH, "home-path");
         assert.equal(options.env.MOONDESK_NPM_MANAGED, undefined);
         assert.equal(options.env.MOONDESK_UPDATE_REQUEST_PATH, undefined);
         assert.equal(options.env.MOONDESK_UPDATE_STATE_PATH, undefined);
@@ -305,6 +353,10 @@ test("validated update exit installs the exact version, verifies it, and restart
         assert.deepEqual(args, ["arg-one"]);
         assert.equal(options.cwd, dir);
         assert.equal(options.env.KEEP_ME, "yes");
+        assert.equal(options.env.HOME, "shell-home");
+        assert.equal(options.env.USERPROFILE, "user-profile");
+        assert.equal(options.env.HOMEDRIVE, "home-drive");
+        assert.equal(options.env.HOMEPATH, "home-path");
         assert.equal(options.env.MOONDESK_NPM_MANAGED, undefined);
         return { code: 0, signal: null };
       },

@@ -3,6 +3,7 @@
 const fs = require("node:fs");
 const { spawn } = require("node:child_process");
 const {
+  UNSUPPORTED_RUNTIME_ERROR_CODE,
   cleanupOldBinaryVersions,
   createDownloadProgressReporter,
   ensureBinary,
@@ -128,7 +129,7 @@ async function orchestrate(options = {}) {
   const nodeVersion = options.nodeVersion ?? process.versions.node;
   if (!isSupportedNodeVersion(nodeVersion)) {
     logger.error(
-      `MoonDesk requires Node.js ${SUPPORTED_NODE_RANGE} because the pinned browser runtime does not support Node.js ${nodeVersion}.`,
+      `MoonDesk requires Node.js ${SUPPORTED_NODE_RANGE} for its supported npm bootstrap and self-update runtime; detected Node.js ${nodeVersion}.`,
     );
     return { code: 1, signal: null };
   }
@@ -187,9 +188,11 @@ async function orchestrate(options = {}) {
     stopUpdateMonitor();
     cleanupEphemeralUpdateFiles(updateStatePath, updateRequestPath);
     logger.error(`MoonDesk could not prepare its native binary: ${error.message}`);
-    logger.error(
-      "Check your network connection and the matching GitHub Release, then run MoonDesk again.",
-    );
+    if (error?.code !== UNSUPPORTED_RUNTIME_ERROR_CODE) {
+      logger.error(
+        "Check your network connection and the matching GitHub Release, then run MoonDesk again.",
+      );
+    }
     return { code: 1, signal: null };
   }
 

@@ -4,7 +4,7 @@ use std::sync::OnceLock;
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
-const CONTRACT_JSON: &str = include_str!("browser_contract_v1_7.json");
+const CONTRACT_JSON: &str = include_str!("browser_contract.json");
 
 #[derive(Clone, Debug, Deserialize)]
 struct BrowserContractFile {
@@ -76,6 +76,40 @@ fn render_structured_scalar(spec: &BrowserArgSpec, value: &Value) -> Result<Stri
     }
 }
 
+pub fn browser_command_help(command: &str) -> Result<String, String> {
+    let contract = contract()?;
+    let Some(specs) = contract.commands.get(command) else {
+        return Err(format!("Unknown MoonDesk browser command '{command}'"));
+    };
+    let mut lines = vec![
+        format!("MoonDesk browser command: {command}"),
+        String::new(),
+        "Arguments:".to_string(),
+    ];
+    if specs.is_empty() {
+        lines.push("  (none)".to_string());
+    } else {
+        for spec in specs {
+            let required = if spec.required {
+                "required"
+            } else {
+                "optional"
+            };
+            let choices = if spec.choices.is_empty() {
+                String::new()
+            } else {
+                format!(" [{}]", spec.choices.join(" | "))
+            };
+            lines.push(format!(
+                "  --{} <{}> · {required}{choices}",
+                spec.name, spec.kind
+            ));
+        }
+    }
+    lines.push("  --output-format <md | json> · optional".to_string());
+    Ok(lines.join("\n"))
+}
+
 pub fn browser_structured_arguments_to_cli(
     command: &str,
     arguments: &Value,
@@ -83,7 +117,7 @@ pub fn browser_structured_arguments_to_cli(
     let contract = contract()?;
     let Some(specs) = contract.commands.get(command) else {
         return Err(format!(
-            "Unknown browser command '{command}' for pinned chrome-devtools-mcp@1.7.0"
+            "Unknown browser command '{command}' for MoonDesk's native browser contract"
         ));
     };
     let Some(object) = arguments.as_object() else {
@@ -160,9 +194,9 @@ fn contract() -> Result<&'static BrowserContractFile, String> {
         .get_or_init(|| {
             let parsed: BrowserContractFile = serde_json::from_str(CONTRACT_JSON)
                 .map_err(|error| format!("Embedded browser contract is invalid: {error}"))?;
-            if parsed.version != "1.7.0" {
+            if parsed.version != "native-cdp-1" {
                 return Err(format!(
-                    "Embedded browser contract version {} does not match pinned 1.7.0",
+                    "Embedded browser contract version {} does not match native-cdp-1",
                     parsed.version
                 ));
             }
@@ -352,7 +386,7 @@ pub fn parse_browser_cli_invocation(
     let contract = contract()?;
     let Some(specs) = contract.commands.get(command) else {
         return Err(format!(
-            "Unknown browser command '{command}' for pinned chrome-devtools-mcp@1.7.0"
+            "Unknown browser command '{command}' for MoonDesk's native browser contract"
         ));
     };
 
@@ -540,7 +574,7 @@ mod tests {
     }
 
     #[test]
-    fn pinned_contract_parses_required_and_optional_arguments() {
+    fn native_contract_parses_required_and_optional_arguments() {
         let parsed = parse_browser_cli_invocation(
             "click",
             &strings(&["1_23", "--dbl-click", "--includeSnapshot=false"]),
@@ -631,7 +665,7 @@ mod tests {
     }
 
     #[test]
-    fn pinned_contract_rejects_unknown_duplicate_and_missing_arguments() {
+    fn native_contract_rejects_unknown_duplicate_and_missing_arguments() {
         assert!(parse_browser_cli_invocation("click", &[]).is_err());
         assert!(parse_browser_cli_invocation("click", &strings(&["1_1", "--wat=1"])).is_err());
         assert!(

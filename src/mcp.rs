@@ -517,18 +517,18 @@ fn workers_tool_descriptor() -> Value {
     json!({
         "name": "workers",
         "title": "Coordinate workers",
-        "description": "Coordinate MoonDesk experimental workers for this exact workspace and ChatGPT conversation. The workspace is resolved from this connector; never pass or guess a workspace. Core actions are spawn, reuse, retire, status, send, collect. Worker actions are claim, start, inbox, ack, report, finish. Call status before creating a worker group: targetWorkerCount is the user's configured concurrency target, recommendedWorkerCount is the product recommendation, and maxWorkerCount is the hard ceiling. Respect an explicit user-requested count when it is within the maximum; otherwise use targetWorkerCount. For fresh spawn, pass `context` whenever the worker benefits from inherited Core knowledge: overall goal, user constraints, settled decisions, branch/PR/base state, work already completed, relevant validation, sibling-worker ownership, and what should count as a blocker. Keep `context` shared across fresh workers in the same run when appropriate, while `task` stays worker-specific. Do not copy credentials, claim capabilities, secret connector URLs, or unrelated private data into context. Reuse does not resend shared context because the durable worker already has that conversation history; put only newly relevant or changed facts directly in the reuse `task`. Reuse creates a new durable task on an idle claimed worker and wakes its existing ChatGPT conversation. Retire frees an idle worker slot or safely abandons a launch only when MoonDesk can prove the assignment never crossed the Send boundary. collect can wait up to 60 seconds for a report/completion so the Core does not need polling loops. collect requires operation_id too so a dropped collect response can replay the same durable batch. Idempotency history is intentionally bounded (recent 256 mutation receipts per Core family and 16 collection batches), so retry an ambiguous response promptly with the same operation_id before issuing unrelated work. Worker coordination requires exact ChatGPT session metadata and fails closed when that identity is unavailable. operation_id must be a stable UUID reused when retrying the same spawn/reuse/send/report/collect after an ambiguous response; fresh worker claim receives its one-time browser-attested operation_id only in the worker bootstrap.",
+        "description": "Coordinate MoonDesk worker conversations for the current workspace. Core actions are status, spawn, reuse, send, collect, and retire. Worker actions are claim, start, inbox, ack, report, and finish. Use status before spawning to read targetWorkerCount, recommendedWorkerCount, and maxWorkerCount; an explicit user-requested count within the maximum takes precedence. Fresh spawns may include shared `context` with the overall goal, constraints, settled decisions, relevant state, completed work, validation, and sibling ownership, while `task` stays worker-specific. Use the same shared context for sibling fresh spawns when applicable. Reuse continues the same durable worker conversation, so include only new or changed facts in the reuse `task`. collect may wait up to 60 seconds for reports or completions. If a response is uncertain, retry that request promptly with the same `operation_id`.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "action": { "type": "string", "enum": ["spawn", "reuse", "retire", "status", "send", "collect", "claim", "start", "inbox", "ack", "report", "finish"] },
-                "operation_id": { "type": "string", "description": "Stable UUID for idempotent spawn/reuse/send/report/collect operations; fresh worker claim must use the one-time browser-attested UUID embedded in that worker's bootstrap" },
+                "operation_id": { "type": "string", "description": "Stable UUID for spawn, reuse, send, report, or collect; reuse it when retrying the same uncertain request. Fresh worker claim uses the UUID supplied in its bootstrap" },
                 "label": { "type": "string", "minLength": 1, "maxLength": 128, "description": "Short worker task label for spawn" },
                 "task": { "type": "string", "minLength": 1, "description": "Concrete worker-specific assignment for spawn or reuse" },
-                "context": { "type": "string", "maxLength": 32768, "description": "Optional inherited Core context for fresh spawn only: overall goal, constraints, settled decisions, branch/PR/base state, completed work/validation, sibling ownership, and blocker criteria. Keep it concise and free of secrets; MoonDesk places it before the worker-specific assignment. Reuse relies on the durable worker conversation history; put only new or changed facts in task." },
+                "context": { "type": "string", "maxLength": 32768, "description": "Optional shared context for a fresh spawn: overall goal, constraints, settled decisions, relevant project state, completed work, validation, sibling ownership, and blocker criteria. Keep it task-relevant and exclude credentials, tokens, private keys, secret connector URLs, and unrelated private data. MoonDesk places it before the worker-specific assignment. Reuse relies on the existing worker conversation history." },
                 "worker_id": { "type": "string", "description": "Worker UUID returned by spawn" },
                 "task_id": { "type": "string", "description": "Task UUID returned by spawn" },
-                "claim_token": { "type": "string", "description": "Single-use worker claim capability embedded only in a fresh worker bootstrap" },
+                "claim_token": { "type": "string", "description": "One-time claim token supplied in a fresh worker bootstrap" },
                 "message_id": { "type": "string", "description": "Inbox message UUID to acknowledge" },
                 "message": { "type": "string", "minLength": 1, "description": "Message for send or progress report for report" },
                 "wait_ms": { "type": "integer", "minimum": 0, "maximum": 60000, "description": "For collect only: wait up to this many milliseconds for a new report or completed task instead of polling" },
@@ -5605,12 +5605,36 @@ mod tests {
             .and_then(|properties| properties.get("context"))
             .expect("workers context input");
         assert_eq!(context.get("maxLength"), Some(&json!(32768)));
+        let context_description = context
+            .get("description")
+            .and_then(Value::as_str)
+            .expect("workers context description");
+        assert!(context_description.contains("exclude credentials"));
+        assert!(context_description.contains("unrelated private data"));
         let description = workers
             .get("description")
             .and_then(Value::as_str)
             .expect("workers description");
-        assert!(description.contains("For fresh spawn, pass `context`"));
-        assert!(description.contains("Reuse does not resend shared context"));
+        assert!(description.contains("Fresh spawns may include shared `context`"));
+        assert!(description.contains("Use the same shared context for sibling fresh spawns"));
+        assert!(description.contains("Reuse continues the same durable worker conversation"));
+        assert!(description.contains("retry that request promptly with the same `operation_id`"));
+        assert!(
+            description.len() < 1_200,
+            "workers description should stay concise"
+        );
+        for policy_like in [
+            "fails closed",
+            "never pass or guess",
+            "Do not copy credentials",
+            "Send boundary",
+            "ambiguous response",
+        ] {
+            assert!(
+                !description.contains(policy_like),
+                "workers description should not narrate enforcement policy: {policy_like}"
+            );
+        }
     }
 
     #[tokio::test]

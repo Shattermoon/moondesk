@@ -1179,38 +1179,23 @@ async fn handle_tools_call_for_workspace(
                     );
                 }
                 let operation_id = requirement.operation_id.to_string();
-                let mut route = match auth.correlation_for_any(&[operation_id.as_str()]).await {
+                let route = match auth
+                    .wait_for_correlation_in_conversation(
+                        operation_id.as_str(),
+                        &requirement.conversation_id,
+                        std::time::Duration::from_millis(5_000),
+                    )
+                    .await
+                {
                     Ok(route) => route,
                     Err(error) => return tool_error_response_text_only(req, error),
                 };
-                if route.is_none() {
-                    route = match auth
-                        .wait_for_any_correlation(
-                            &[operation_id.as_str()],
-                            std::time::Duration::from_millis(5_000),
-                        )
-                        .await
-                    {
-                        Ok(route) => route,
-                        Err(error) => return tool_error_response_text_only(req, error),
-                    };
-                }
-                let Some(route) = route else {
+                let Some(_route) = route else {
                     return tool_error_response_text_only(
                         req,
-                        "worker claim could not verify the browser-attested claim operation in the exact worker conversation; the claim token was not consumed".into(),
+                        "worker claim could not verify the browser-attested claim operation in the exact worker conversation; any conflicting cached proof was discarded and the claim token was not consumed".into(),
                     );
                 };
-                if !route
-                    .tab
-                    .conversation_id
-                    .eq_ignore_ascii_case(&requirement.conversation_id)
-                {
-                    return tool_error_response_text_only(
-                        req,
-                        "worker claim was observed in a different ChatGPT conversation than the browser-confirmed worker; the claim token was not consumed".into(),
-                    );
-                }
             }
         }
 
@@ -5225,10 +5210,6 @@ mod tests {
             Some(&claim_operation_id)
         );
 
-        let companion_auth = Arc::new(
-            CompanionAuth::open(root.path().join("companion-auth-v1.json"))
-                .expect("reopen companion auth without ephemeral wrong claim proof"),
-        );
         companion_auth
             .observe_correlations(
                 "chrome-install",

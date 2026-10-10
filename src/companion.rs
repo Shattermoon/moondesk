@@ -810,6 +810,42 @@ impl CompanionAuth {
             tokio::time::sleep(std::time::Duration::from_millis(75)).await;
         }
     }
+
+    pub async fn wait_for_correlation_in_conversation(
+        &self,
+        correlation_id: &str,
+        expected_conversation_id: &str,
+        timeout: std::time::Duration,
+    ) -> Result<Option<CompanionAnchorRoute>, String> {
+        let key = normalize_request_id(correlation_id)
+            .ok_or_else(|| "exact companion correlation id is invalid".to_string())?;
+        validate_conversation_id(expected_conversation_id)?;
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            {
+                let mut guard = self.correlations.lock().await;
+                if let Some((route, _)) = guard.get(key) {
+                    if route
+                        .tab
+                        .conversation_id
+                        .eq_ignore_ascii_case(expected_conversation_id)
+                    {
+                        return Ok(Some(route.clone()));
+                    }
+                    // General Core routing is first-proof-wins. A fresh worker claim is
+                    // different: the durable launch already names the one conversation that
+                    // is allowed to prove this private claim UUID. A stale/wrong route must
+                    // not permanently poison that UUID, so discard only this mismatched proof
+                    // and keep waiting for evidence from the browser-confirmed conversation.
+                    guard.remove(key);
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Ok(None);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(75)).await;
+        }
+    }
 }
 
 pub(crate) fn unix_time_ms() -> u64 {
@@ -1452,6 +1488,84 @@ mod tests {
         let persisted = fs::read_to_string(&path).expect("read auth state");
         assert!(!persisted.contains(request_id));
         assert!(!persisted.contains(edge_conversation));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn claim_correlation_recovers_from_wrong_cached_conversation_in_same_auth() {
+        let root = temp_root("moondesk-companion-claim-correlation-recovery");
+        let path = root.join(COMPANION_AUTH_FILE_NAME);
+        let auth = std::sync::Arc::new(CompanionAuth::open(&path).expect("open companion auth"));
+        auth.auto_pair("edge-install", &"a".repeat(64), Some(ORIGIN_A))
+            .await
+            .expect("pair edge");
+        auth.auto_pair("chrome-install", &"b".repeat(64), Some(ORIGIN_B))
+            .await
+            .expect("pair chrome");
+
+        let operation_id = Uuid::new_v4().to_string();
+        let wrong_conversation = "6aad7eb1-4b10-83ee-97bd-d98b338864de";
+        let expected_conversation = "7bbd8fc2-5c21-94ff-a8ce-e09c449975ef";
+        auth.observe_correlations(
+            "edge-install",
+            CompanionCorrelationUpdate {
+                conversation_id: wrong_conversation.into(),
+                conversation_url: format!("https://chatgpt.com/c/{wrong_conversation}"),
+                project_id: None,
+                project_url: None,
+                request_ids: Vec::new(),
+                operation_ids: vec![operation_id.clone()],
+            },
+            100,
+        )
+        .await
+        .expect("store wrong claim correlation");
+
+        let waiter = auth.clone();
+        let operation_id_for_wait = operation_id.clone();
+        let expected_for_wait = expected_conversation.to_string();
+        let wait_task = tokio::spawn(async move {
+            waiter
+                .wait_for_correlation_in_conversation(
+                    &operation_id_for_wait,
+                    &expected_for_wait,
+                    std::time::Duration::from_secs(1),
+                )
+                .await
+                .expect("wait for exact claim correlation")
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        auth.observe_correlations(
+            "chrome-install",
+            CompanionCorrelationUpdate {
+                conversation_id: expected_conversation.into(),
+                conversation_url: format!("https://chatgpt.com/c/{expected_conversation}"),
+                project_id: None,
+                project_url: None,
+                request_ids: Vec::new(),
+                operation_ids: vec![operation_id.clone()],
+            },
+            200,
+        )
+        .await
+        .expect("store expected claim correlation after stale route is discarded");
+
+        let route = wait_task
+            .await
+            .expect("claim correlation waiter")
+            .expect("expected claim route");
+        assert_eq!(route.client_id, "chrome-install");
+        assert_eq!(route.tab.conversation_id, expected_conversation);
+        assert_eq!(
+            auth.correlation_for_any(&[operation_id.as_str()])
+                .await
+                .expect("lookup recovered claim route")
+                .expect("claim route retained")
+                .tab
+                .conversation_id,
+            expected_conversation
+        );
         let _ = fs::remove_dir_all(root);
     }
 

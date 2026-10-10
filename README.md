@@ -110,13 +110,57 @@ Authentication: None
 
 Allow write actions only when you trust the workspace and task.
 
-### 5. Add the recommended instruction
+### 5. Add this to ChatGPT Custom Instructions
+
+In ChatGPT, open **Settings → Personalization → Custom Instructions** and add the following instruction so ChatGPT routes project work to the correct MoonDesk connector:
 
 ```text
-MoonDesk is a coding tool and a custom connector. Always use MoonDesk if the user wants to do anything related to file operations. Always call `moondesk_instruction` after `list_resources`, and follow the instructions it contains.
+The user may have multiple MoonDesk custom connectors, with each connector bound to a different project/workspace.
+
+For any request involving local files, code, commands, or project operations, use the MoonDesk connector that matches the project/workspace being discussed. Never use a different project’s connector unless the user explicitly asks.
+
+Before using a MoonDesk connector for the first time in a conversation, call its moondesk_instruction tool and follow the instructions it returns. If the connector tools are unavailable or stale, refresh that connector with api_tool.list_resources first, then call moondesk_instruction.
+
+Workspace routing is determined by the connector itself. Do not ask for or invent a workspace argument.
 ```
 
 Select the connector and start working.
+
+## Experimental ChatGPT workers
+
+> [!WARNING]
+> The Worker Companion extension is **optional for MoonDesk itself** and is required only for the experimental **Workers/sub-agents** feature. Files, shell, browser automation, workspaces, handoffs, and normal MCP use continue to work without it. When Workers are used, the companion drives ChatGPT's web UI, so MoonDesk fails closed when it cannot positively confirm the requested model, reasoning effort, exact placement, or previous Send state.
+
+Workers let one ChatGPT conversation act as the **Core** and delegate independent tasks to durable worker conversations in the same MoonDesk workspace. The configurable target is **1-8 workers**, defaults to **4**, and has a hard maximum of **8 active workers per Core family**. **1-4 workers is the recommended operating range.** Using **5-8 workers** is supported but can trigger ChatGPT/provider rate limits, especially when the account already has other conversations generating at the same time, so higher counts are best treated as an advanced/high-load mode. MoonDesk launches up to four fresh worker conversations concurrently so the recommended group does not serialize behind one slow launch. Worker identity is bound to the route-resolved workspace plus ChatGPT's exact session metadata; a different conversation in the same workspace does not inherit Core or worker authority. ChatGPT Project names, connector names, MoonDesk workspace names, and folder names are display-only and are never used as routing or authorization keys.
+
+### Optional Worker Companion setup
+
+You do **not** need the extension for normal MoonDesk use. Install it only when you want Workers/sub-agents. MoonDesk embeds the exact companion files from its own build and synchronizes them into the stable `~/.moondesk/worker-companion` folder whenever MoonDesk starts; browser installation remains an explicit user opt-in, but later MoonDesk upgrades do not require a second companion-update step. An already-loaded companion can self-reload once when its MoonDesk release version or runtime revision no longer matches. The supported browser targets are **Google Chrome, Microsoft Edge, and Brave**. Current signed-in acceptance has been run in Chrome; Edge and Brave use the same Chromium Manifest V3 `chrome.*` extension APIs but have not been separately live-tested in this cycle. Other Chromium-based browsers may work but are not supported targets; Firefox and Safari are not currently supported. Each GitHub Release also carries the same checksummed `moondesk-worker-companion.zip` as a beta/recovery fallback. The full release/onboarding plan is in [`docs/WORKER_COMPANION_DISTRIBUTION.md`](docs/WORKER_COMPANION_DISTRIBUTION.md).
+
+To enable Workers:
+
+1. Start MoonDesk and open **Settings → Workers**.
+2. Choose **Open Worker Companion folder**. MoonDesk opens its stable Worker Companion folder.
+3. Open `chrome://extensions` (or `edge://extensions` / `brave://extensions`), enable **Developer mode**, choose **Load unpacked**, and select the folder MoonDesk opened.
+4. Open ChatGPT in that same browser. The extension discovers MoonDesk's loopback-only bridge and pairs automatically; there is no per-chat token step. Multiple browser installations may remain paired independently.
+5. Open the ChatGPT conversation you want to use as the Core. No Project/workspace binding step is required.
+6. The companion automatically discovers the signed-in account's available ChatGPT models and reasoning efforts. Open the popup, choose from the confirmed catalog, and save the worker profile. **Refresh models** is only a repair/revalidation fallback. The companion reads ChatGPT's provider-owned picker state instead of relying on translated labels, and supports the current provider effort lanes (`Instant`, `Minimal`, `Low`, `Medium`, `High`, `Extra High`, `Max`, `Ultra`, and `Pro`) when the account actually offers them. Existing `Extra High` profiles remain compatible with the provider's `xhigh`/`max` migration.
+
+Contributors running from source can still load `extensions/moondesk-worker-companion` directly. Source checkouts and the GitHub Release ZIP intentionally do **not** contain MoonDesk's private installation capability, so those fallback installs do not auto-pair. Open the companion popup → **Advanced → Manual Repair**, copy the current **Manual repair code** from **MoonDesk Settings → Workers**, paste it once, and pair that browser. The normal MoonDesk-prepared `~/.moondesk/worker-companion` folder remains the recommended path and auto-pairs without this step.
+
+Workers V1 always creates fresh workers as ordinary ChatGPT conversations, even when the Core is inside a ChatGPT Project. Project membership remains useful Core routing metadata, but it is not a worker placement target and MoonDesk never clones the Core conversation to create a worker. Fresh workers are routed to the paired browser that positively observes the exact Core. After the worker conversation is confirmed, reuse remains attached to that durable thread/browser affinity; legacy workers that were previously created inside a Project can still be reused by their exact confirmed conversation binding.
+
+The last confirmed model catalog is stored in extension-local storage, so reopening the popup does not require rediscovery. MoonDesk still re-verifies the actual model and effort in ChatGPT before sending every worker assignment. If MoonDesk has been upgraded but an existing ChatGPT conversation does not expose the `workers` tool, refresh/reconnect the Custom Connector and start a fresh conversation because ChatGPT may retain an older connector schema.
+
+MoonDesk keeps retained Worker state bounded to 64 Core families. Automatic compaction never discards an idle reusable worker, an uncollected result, or a still-replayable non-empty `collect` receipt merely because another Core needs capacity. If an old Core conversation is gone and its idle family can no longer be retired from that chat, use **MoonDesk Settings → Workers → Release inactive Worker capacity**, choose the workspace, and type `CLEANUP` to confirm. This host-local action is workspace-scoped and only removes idle/retired families when both Worker state and managed browser-launch history prove there is no active or ambiguous Send, pending worker message/report, or uncollected task result. ChatGPT conversations are preserved; terminal MoonDesk launch history for the removed families is cleared with them. Because this is an explicit destructive recovery action, the confirmation also reports when retained `collect` replay receipts for those inactive families will be discarded.
+
+### Worker lifecycle
+
+The MCP `workers` tool supports Core operations such as spawn, status, send, collect, reuse, and retire, plus worker-side claim, inbox, report, start, and finish operations. For a fresh spawn, Core can pass a compact `context` briefing containing the overall goal, user constraints and settled decisions, branch/PR state, completed validation, and sibling-worker ownership; MoonDesk places that shared context before the worker-specific assignment so a new worker does not need to rediscover conversation-only decisions. Reuse wakes the same durable ChatGPT conversation and does not resend that shared briefing; the worker keeps its existing conversation history, while any newly relevant or changed facts belong directly in the new `task`. A newly opened worker must claim its one-time capability before MoonDesk binds that ChatGPT session to the durable worker record. `collect` uses a stable `operation_id`: if its response is dropped, retrying promptly with the same ID replays the same durable batch. Workers V1 intentionally keeps only the most recent **16 collection batches per Core family**, so this is a bounded retry window rather than an indefinite delivery-ACK protocol; Core should retry an ambiguous collect before issuing enough unrelated collects to evict that receipt.
+
+Workers survive MoonDesk/browser tab restarts as durable records. Closing the tab of a **running** worker does not end its task: MoonDesk keeps the worker `running`, marks its browser attachment as `detached`/no-tab, preserves the exact conversation binding, and still accepts that worker's reports and `finish` call if its server-side ChatGPT turn continues. Opening that exact worker conversation again restores the attachment. MoonDesk deliberately does not infer completion or make the worker reusable from tab closure or a silence timer alone, because Workers V1 does not yet have CoS-style turn/request-level authority to distinguish a late old-turn call from a new assignment. Completing a task leaves the worker idle so a later task can reopen the same confirmed ChatGPT conversation. Retiring an idle worker frees its display slot; MoonDesk refuses retirement once a browser launch may have crossed the Send boundary.
+
+Browser commands use durable leases and acknowledgements. If MoonDesk cannot tell whether ChatGPT accepted a Send, the command moves to reconciliation and **never blindly sends the assignment again**. Failed worker launches are not exposed as delayed manual replays: a proven pre-Send failure automatically frees a fresh worker slot, while a failed pre-Send wake returns an existing durable worker to idle so Core can choose the next assignment. The companion's **Clear workers** action is a global Workers reset across the MoonDesk host: it discards retained Worker ownership and managed launch history while leaving the ChatGPT conversations themselves untouched. MoonDesk publishes a durable reset epoch so every paired browser drops stale local worker history on reconnect/status/pump and rechecks that epoch immediately before a browser Send after `send_started`. If another paired browser had already crossed `send_started`, Clear Workers does not report success until that browser acknowledges the new epoch after invalidating its local worker generation; a missing/stuck browser leaves Clear safely retryable instead of allowing a later post-clear Send. A Send that already reached ChatGPT cannot be unsent; Clear Workers reports commands that had already crossed MoonDesk's Send boundary so the popup can warn about that possibility.
 
 ## Browser control
 
@@ -171,6 +215,8 @@ Use read-only mode when mutation is unnecessary, and use a VM or container for u
 <summary><strong>Tools</strong></summary>
 
 **Guidance / handoffs:** `moondesk_instruction`, `create_handoff`, `resume_handoff`, `complete_handoff`
+
+**Experimental workers:** `workers`
 
 **Files:** `read`, `view_image`, `view_images`, `search`, `write`, `edit`, `delete`
 

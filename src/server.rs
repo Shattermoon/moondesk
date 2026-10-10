@@ -9,10 +9,11 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::collections::BTreeSet;
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use subtle::ConstantTimeEq;
 
 use crate::browser_runtime::{
@@ -20,6 +21,14 @@ use crate::browser_runtime::{
     MAX_BROWSER_CONTROL_BODY_BYTES, validate_browser_request_bounds,
 };
 use crate::command_jobs::CommandJobManager;
+use crate::companion::{
+    CompanionAutoPairError, CompanionCorrelationUpdate, CompanionPresenceUpdate,
+};
+use crate::managed_chat::broker::{ManagedChatAckOutcome, ManagedChatError};
+use crate::managed_chat::types::{
+    ChatExecutionProfile, ManagedChatCommand, ManagedChatCommandId, ManagedChatCommandState,
+    ManagedChatLeaseId, ManagedChatPurpose,
+};
 use crate::mcp::{self, JsonRpcRequest};
 use crate::state::{
     AddWorkspaceError, CommandActivityState, FlowDirection, ServerUiEvent, SharedState,
@@ -37,6 +46,26 @@ const MAX_HOST_CONTROL_BODY_BYTES: usize = 16 * 1024;
 pub const HOST_CONTROL_ROUTE: &str = "/__moondesk/workspaces";
 pub const HOST_BROWSER_CONTROL_ROUTE: &str = "/__moondesk/browser";
 pub const HOST_CONTROL_HEADER: &str = "x-moondesk-host-token";
+pub const COMPANION_HELLO_ROUTE: &str = "/__moondesk/companion/v1/hello";
+pub const COMPANION_PAIR_ROUTE: &str = "/__moondesk/companion/v1/pair";
+pub const COMPANION_REPAIR_ROUTE: &str = "/__moondesk/companion/v1/repair";
+pub const COMPANION_BRIDGE_PORTS: [u16; 5] = [47650, 47651, 47652, 47653, 47654];
+pub const COMPANION_STATUS_ROUTE: &str = "/__moondesk/companion/v1/status";
+pub const COMPANION_CLIENTS_ROUTE: &str = "/__moondesk/companion/v1/clients";
+pub const COMPANION_PRESENCE_ROUTE: &str = "/__moondesk/companion/v1/presence";
+pub const COMPANION_CORRELATIONS_ROUTE: &str = "/__moondesk/companion/v1/correlations";
+pub const COMPANION_WORKSPACES_ROUTE: &str = "/__moondesk/companion/v1/workspaces";
+pub const COMPANION_PROFILE_ROUTE: &str = "/__moondesk/companion/v1/profile";
+pub const COMPANION_REDEEM_ROUTE: &str = "/__moondesk/companion/v1/commands/redeem";
+pub const COMPANION_SEND_STARTED_ROUTE: &str = "/__moondesk/companion/v1/commands/send-started";
+pub const COMPANION_ACK_ROUTE: &str = "/__moondesk/companion/v1/commands/ack";
+pub const COMPANION_CLEAR_WORKERS_ROUTE: &str = "/__moondesk/companion/v1/workers/clear";
+pub const COMPANION_WORKER_RESET_ACK_ROUTE: &str = "/__moondesk/companion/v1/workers/reset-ack";
+pub const COMPANION_TOKEN_HEADER: &str = "x-moondesk-companion-token";
+// Bump with any shipped companion runtime change that requires Chromium to load new bytes. Keep
+// this aligned with COMPANION_RUNTIME_REVISION in background.js.
+pub const COMPANION_RUNTIME_REVISION: u32 = 9;
+const MAX_COMPANION_BODY_BYTES: usize = 16 * 1024;
 
 #[derive(Clone)]
 struct ServerState {
@@ -126,6 +155,78 @@ async fn validate_request_origin(
     next.run(request).await
 }
 /// Build the axum router.
+pub fn companion_bridge_router(
+    app_state: SharedState,
+    browser_runtime: Option<Arc<BrowserRuntime>>,
+    command_jobs: CommandJobManager,
+    ui_events: UiEventSender,
+    host_control_token: Arc<str>,
+) -> Router {
+    let state = ServerState {
+        app: app_state,
+        browser_runtime,
+        command_jobs,
+        ui_events,
+        host_control_token,
+    };
+
+    Router::new()
+        .route(COMPANION_HELLO_ROUTE, get(companion_hello))
+        .route(
+            COMPANION_PAIR_ROUTE,
+            post(auto_pair_companion).layer(DefaultBodyLimit::max(MAX_COMPANION_BODY_BYTES)),
+        )
+        .route(
+            COMPANION_REPAIR_ROUTE,
+            post(pair_companion).layer(DefaultBodyLimit::max(MAX_COMPANION_BODY_BYTES)),
+        )
+        .route(COMPANION_STATUS_ROUTE, get(companion_status))
+        .route(
+            COMPANION_CLIENTS_ROUTE,
+            get(companion_clients)
+                .post(revoke_companion_client)
+                .layer(DefaultBodyLimit::max(MAX_COMPANION_BODY_BYTES)),
+        )
+        .route(
+            COMPANION_PRESENCE_ROUTE,
+            post(update_companion_presence).layer(DefaultBodyLimit::max(MAX_COMPANION_BODY_BYTES)),
+        )
+        .route(
+            COMPANION_CORRELATIONS_ROUTE,
+            post(update_companion_correlations)
+                .layer(DefaultBodyLimit::max(MAX_COMPANION_BODY_BYTES)),
+        )
+        .route(COMPANION_WORKSPACES_ROUTE, get(companion_workspaces))
+        .route(
+            COMPANION_PROFILE_ROUTE,
+            get(companion_profile)
+                .post(update_companion_profile)
+                .layer(DefaultBodyLimit::max(MAX_COMPANION_BODY_BYTES)),
+        )
+        .route(
+            COMPANION_REDEEM_ROUTE,
+            post(redeem_companion_command).layer(DefaultBodyLimit::max(MAX_COMPANION_BODY_BYTES)),
+        )
+        .route(
+            COMPANION_SEND_STARTED_ROUTE,
+            post(mark_companion_send_started)
+                .layer(DefaultBodyLimit::max(MAX_COMPANION_BODY_BYTES)),
+        )
+        .route(
+            COMPANION_ACK_ROUTE,
+            post(ack_companion_command).layer(DefaultBodyLimit::max(MAX_COMPANION_BODY_BYTES)),
+        )
+        .route(
+            COMPANION_CLEAR_WORKERS_ROUTE,
+            post(clear_companion_workers).layer(DefaultBodyLimit::max(MAX_COMPANION_BODY_BYTES)),
+        )
+        .route(
+            COMPANION_WORKER_RESET_ACK_ROUTE,
+            post(ack_companion_worker_reset).layer(DefaultBodyLimit::max(MAX_COMPANION_BODY_BYTES)),
+        )
+        .with_state(state)
+}
+
 pub fn router(
     app_state: SharedState,
     browser_runtime: Option<Arc<BrowserRuntime>>,
@@ -141,7 +242,7 @@ pub fn router(
         host_control_token,
     };
     let mcp_routes = Router::new()
-        .route("/{slug}/mcp", post(post_mcp))
+        .route("/{slug}/mcp", post(post_mcp_http))
         .route("/{slug}/mcp", get(get_mcp))
         .route("/{slug}/mcp", delete(delete_mcp))
         .route_layer(middleware::from_fn_with_state(
@@ -176,6 +277,920 @@ fn response_with_body(
         .headers_mut()
         .insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
     response
+}
+
+fn json_response(status: StatusCode, value: Value) -> Response<Body> {
+    response_with_body(status, "application/json", Body::from(value.to_string()))
+}
+
+fn companion_origin_allowed(headers: &HeaderMap) -> bool {
+    let Some(origin) = headers.get(header::ORIGIN) else {
+        return true;
+    };
+    let Ok(origin) = origin.to_str() else {
+        return false;
+    };
+    let Ok(url) = reqwest::Url::parse(origin) else {
+        return false;
+    };
+    url.scheme() == "chrome-extension"
+        && url.host_str().is_some_and(|host| !host.is_empty())
+        && url.username().is_empty()
+        && url.password().is_none()
+        && matches!(url.path(), "" | "/")
+        && url.query().is_none()
+        && url.fragment().is_none()
+}
+
+fn companion_origin_error() -> Response<Body> {
+    json_response(
+        StatusCode::FORBIDDEN,
+        json!({ "error": "companion requests must come from the MoonDesk browser extension" }),
+    )
+}
+
+fn companion_unauthorized() -> Response<Body> {
+    json_response(
+        StatusCode::UNAUTHORIZED,
+        json!({ "error": "invalid or missing MoonDesk companion credential" }),
+    )
+}
+
+fn companion_request_origin(headers: &HeaderMap) -> Option<&str> {
+    headers.get(header::ORIGIN)?.to_str().ok()
+}
+
+async fn companion_client_id(state: &ServerState, headers: &HeaderMap) -> Option<String> {
+    let credential = headers.get(COMPANION_TOKEN_HEADER)?.to_str().ok()?.trim();
+    if credential.is_empty() || credential.len() > 256 {
+        return None;
+    }
+    let auth = { state.app.lock().await.companion_auth.clone() };
+    auth.authorize(credential, companion_request_origin(headers))
+        .await
+}
+
+fn unix_time_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64
+}
+
+fn managed_chat_error_response(error: ManagedChatError) -> Response<Body> {
+    let status = match error {
+        ManagedChatError::Invalid(_) => StatusCode::BAD_REQUEST,
+        ManagedChatError::NotFound => StatusCode::NOT_FOUND,
+        ManagedChatError::Conflict(_) => StatusCode::CONFLICT,
+        ManagedChatError::Limit(_) => StatusCode::TOO_MANY_REQUESTS,
+        ManagedChatError::Storage(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    json_response(status, json!({ "error": error.to_string() }))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CompanionPairRequest {
+    pairing_token: String,
+    client_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CompanionAutoPairRequest {
+    client_id: String,
+    credential: String,
+    bootstrap_token: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CompanionSendStartedRequest {
+    command_id: String,
+    lease_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CompanionAckRequest {
+    command_id: String,
+    lease_id: String,
+    outcome: String,
+    #[serde(default)]
+    details: Option<String>,
+    #[serde(default)]
+    conversation_url: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct CompanionClearWorkersRequest {}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CompanionWorkerResetAckRequest {
+    worker_reset_epoch: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CompanionRevokeClientRequest {
+    client_id: String,
+}
+
+async fn companion_hello(State(state): State<ServerState>, headers: HeaderMap) -> Response<Body> {
+    if !companion_origin_allowed(&headers) {
+        return companion_origin_error();
+    }
+    let auth = { state.app.lock().await.companion_auth.clone() };
+    json_response(
+        StatusCode::OK,
+        json!({
+            "app": "moondesk-worker-companion",
+            "appVersion": env!("CARGO_PKG_VERSION"),
+            "protocolVersion": 2,
+            "companionRuntimeRevision": COMPANION_RUNTIME_REVISION,
+            "paired": auth.paired_client_count().await > 0,
+            "pairedClientCount": auth.paired_client_count().await
+        }),
+    )
+}
+
+async fn auto_pair_companion(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(request): Json<CompanionAutoPairRequest>,
+) -> Response<Body> {
+    if !companion_origin_allowed(&headers) {
+        return companion_origin_error();
+    }
+    let auth = { state.app.lock().await.companion_auth.clone() };
+    if !auth.installation_token_matches(&request.bootstrap_token) {
+        return json_response(
+            StatusCode::UNAUTHORIZED,
+            json!({ "error": "invalid Worker Companion installation capability" }),
+        );
+    }
+    match auth
+        .auto_pair(
+            &request.client_id,
+            &request.credential,
+            companion_request_origin(&headers),
+        )
+        .await
+    {
+        Ok(receipt) => json_response(
+            StatusCode::OK,
+            json!({
+                "protocolVersion": 2,
+                "clientId": receipt.client_id
+            }),
+        ),
+        Err(CompanionAutoPairError::Invalid(error)) => {
+            json_response(StatusCode::BAD_REQUEST, json!({ "error": error }))
+        }
+        Err(CompanionAutoPairError::Conflict(error)) => {
+            json_response(StatusCode::CONFLICT, json!({ "error": error }))
+        }
+        Err(CompanionAutoPairError::Limit(error)) => {
+            json_response(StatusCode::TOO_MANY_REQUESTS, json!({ "error": error }))
+        }
+        Err(CompanionAutoPairError::Storage(error)) => {
+            json_response(StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": error }))
+        }
+    }
+}
+
+async fn pair_companion(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(request): Json<CompanionPairRequest>,
+) -> Response<Body> {
+    if !companion_origin_allowed(&headers) {
+        return companion_origin_error();
+    }
+    let auth = { state.app.lock().await.companion_auth.clone() };
+    match auth
+        .pair(
+            &request.pairing_token,
+            &request.client_id,
+            companion_request_origin(&headers),
+        )
+        .await
+    {
+        Ok(receipt) => json_response(
+            StatusCode::OK,
+            json!({
+                "protocolVersion": 2,
+                "clientId": receipt.client_id,
+                "credential": receipt.credential
+            }),
+        ),
+        Err(error) => json_response(StatusCode::UNAUTHORIZED, json!({ "error": error })),
+    }
+}
+
+async fn companion_status(State(state): State<ServerState>, headers: HeaderMap) -> Response<Body> {
+    if !companion_origin_allowed(&headers) {
+        return companion_origin_error();
+    }
+    let Some(client_id) = companion_client_id(&state, &headers).await else {
+        return companion_unauthorized();
+    };
+    let (auth, worker_broker, managed_chat_broker) = {
+        let app = state.app.lock().await;
+        (
+            app.companion_auth.clone(),
+            app.worker_broker.clone(),
+            app.managed_chat_broker.clone(),
+        )
+    };
+    let has_worker_state =
+        worker_broker.has_worker_state().await || managed_chat_broker.has_worker_commands().await;
+    json_response(
+        StatusCode::OK,
+        json!({
+            "appVersion": env!("CARGO_PKG_VERSION"),
+            "protocolVersion": 2,
+            "companionRuntimeRevision": COMPANION_RUNTIME_REVISION,
+            "paired": true,
+            "clientId": client_id,
+            "pairedClientCount": auth.paired_client_count().await,
+            "hasWorkerState": has_worker_state,
+            "workerResetEpoch": auth.worker_reset_epoch().await,
+            "workerResetAckRequired": auth.worker_reset_ack_required(&client_id).await
+        }),
+    )
+}
+
+async fn companion_clients(State(state): State<ServerState>, headers: HeaderMap) -> Response<Body> {
+    if !companion_origin_allowed(&headers) {
+        return companion_origin_error();
+    }
+    let Some(current_client_id) = companion_client_id(&state, &headers).await else {
+        return companion_unauthorized();
+    };
+    let auth = { state.app.lock().await.companion_auth.clone() };
+    let paired = auth.paired_client_ids().await;
+    let fresh = auth
+        .fresh_presence(unix_time_ms())
+        .await
+        .into_iter()
+        .map(|presence| (presence.client_id.clone(), presence))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let clients = paired
+        .into_iter()
+        .map(|client_id| {
+            let presence = fresh.get(&client_id);
+            json!({
+                "clientId": client_id,
+                "current": client_id == current_client_id,
+                "online": presence.is_some(),
+                "browserLabel": presence.and_then(|value| value.browser_label.clone()),
+                "lastSeenMs": presence.map(|value| value.last_seen_ms)
+            })
+        })
+        .collect::<Vec<_>>();
+    json_response(StatusCode::OK, json!({ "clients": clients }))
+}
+
+async fn revoke_companion_client(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(request): Json<CompanionRevokeClientRequest>,
+) -> Response<Body> {
+    if !companion_origin_allowed(&headers) {
+        return companion_origin_error();
+    }
+    let Some(current_client_id) = companion_client_id(&state, &headers).await else {
+        return companion_unauthorized();
+    };
+    if request.client_id == current_client_id {
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            json!({ "error": "revoke this browser from the browser you want to keep connected" }),
+        );
+    }
+    let _lifecycle_guard = crate::workers::WORKER_LIFECYCLE_LOCK.lock().await;
+    let (auth, managed_chat_broker) = {
+        let app = state.app.lock().await;
+        (app.companion_auth.clone(), app.managed_chat_broker.clone())
+    };
+
+    // Settle every durable command before revoking the credential. If any persistence/sync step
+    // fails, the browser remains paired so the exact same request can be retried safely. Once the
+    // credential removal succeeds there is no remaining cross-store work to strand.
+    let (retargeted_commands, paused_commands, _changed_commands) = match managed_chat_broker
+        .settle_revoked_client(&request.client_id)
+        .await
+    {
+        Ok(counts) => counts,
+        Err(error) => return managed_chat_error_response(error),
+    };
+    // Re-sync every retained worker command, not only commands changed by this invocation. That
+    // makes a retry repair the worker mirror even if a previous request durably settled the
+    // managed command and then failed before its worker record was updated.
+    let retained_worker_commands = managed_chat_broker
+        .snapshot()
+        .await
+        .commands
+        .into_values()
+        .filter(|command| {
+            command.launch.purpose == crate::managed_chat::types::ManagedChatPurpose::Worker
+        })
+        .collect::<Vec<_>>();
+    for command in &retained_worker_commands {
+        if let Err(error) = sync_worker_launch_from_command(&state, command).await {
+            return json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({
+                    "error": format!(
+                        "paired browser commands were settled but worker launch state sync did not complete; retry revoke to resume safely: {error}"
+                    )
+                }),
+            );
+        }
+    }
+
+    match auth.revoke_client(&request.client_id).await {
+        Ok(revoked) => json_response(
+            StatusCode::OK,
+            json!({
+                "revoked": revoked,
+                "alreadyRevoked": !revoked,
+                "retargetedCommands": retargeted_commands,
+                "pausedCommands": paused_commands
+            }),
+        ),
+        Err(error) => json_response(StatusCode::BAD_REQUEST, json!({ "error": error })),
+    }
+}
+
+async fn update_companion_presence(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(update): Json<CompanionPresenceUpdate>,
+) -> Response<Body> {
+    if !companion_origin_allowed(&headers) {
+        return companion_origin_error();
+    }
+    let Some(client_id) = companion_client_id(&state, &headers).await else {
+        return companion_unauthorized();
+    };
+    let (auth, worker_broker) = {
+        let app = state.app.lock().await;
+        (app.companion_auth.clone(), app.worker_broker.clone())
+    };
+    let now_ms = unix_time_ms();
+    match auth.update_presence(&client_id, update, now_ms).await {
+        Ok(presence) => {
+            let open_conversation_ids = auth
+                .fresh_presence(now_ms)
+                .await
+                .into_iter()
+                .flat_map(|client| client.tabs.into_iter().map(|tab| tab.conversation_id))
+                .collect::<BTreeSet<_>>();
+            if let Err(error) = worker_broker
+                .sync_browser_presence(&open_conversation_ids)
+                .await
+            {
+                return json_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    json!({ "error": format!("worker browser presence sync failed: {error}") }),
+                );
+            }
+            json_response(StatusCode::OK, json!({ "presence": presence }))
+        }
+        Err(error) => json_response(StatusCode::BAD_REQUEST, json!({ "error": error })),
+    }
+}
+
+async fn update_companion_correlations(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(update): Json<CompanionCorrelationUpdate>,
+) -> Response<Body> {
+    if !companion_origin_allowed(&headers) {
+        return companion_origin_error();
+    }
+    let Some(client_id) = companion_client_id(&state, &headers).await else {
+        return companion_unauthorized();
+    };
+    let auth = { state.app.lock().await.companion_auth.clone() };
+    match auth
+        .observe_correlations(&client_id, update, unix_time_ms())
+        .await
+    {
+        Ok(stored) => json_response(StatusCode::OK, json!({ "stored": stored })),
+        Err(error) => json_response(StatusCode::CONFLICT, json!({ "error": error })),
+    }
+}
+
+async fn companion_workspaces(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    if !companion_origin_allowed(&headers) {
+        return companion_origin_error();
+    }
+    if companion_client_id(&state, &headers).await.is_none() {
+        return companion_unauthorized();
+    }
+    let workspaces = {
+        let app = state.app.lock().await;
+        app.workspaces
+            .iter()
+            .map(|workspace| {
+                json!({
+                    "workspaceId": workspace.id,
+                    "name": workspace.name,
+                    "root": workspace.root.to_string_lossy()
+                })
+            })
+            .collect::<Vec<_>>()
+    };
+    json_response(StatusCode::OK, json!({ "workspaces": workspaces }))
+}
+
+async fn companion_profile(State(state): State<ServerState>, headers: HeaderMap) -> Response<Body> {
+    if !companion_origin_allowed(&headers) {
+        return companion_origin_error();
+    }
+    if companion_client_id(&state, &headers).await.is_none() {
+        return companion_unauthorized();
+    }
+    let profile = { state.app.lock().await.worker_execution_profile.clone() };
+    json_response(StatusCode::OK, json!({ "profile": profile }))
+}
+
+async fn update_companion_profile(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(profile): Json<ChatExecutionProfile>,
+) -> Response<Body> {
+    if !companion_origin_allowed(&headers) {
+        return companion_origin_error();
+    }
+    if companion_client_id(&state, &headers).await.is_none() {
+        return companion_unauthorized();
+    }
+    if let Err(error) = profile.validate() {
+        return json_response(StatusCode::BAD_REQUEST, json!({ "error": error }));
+    }
+    {
+        let mut app = state.app.lock().await;
+        app.worker_execution_profile = profile.clone();
+        app.mark_config_dirty();
+        app.log(
+            "INFO",
+            format!(
+                "Worker execution profile: {} / {}",
+                profile.model_label,
+                profile.reasoning_effort.label()
+            ),
+        );
+    }
+    json_response(StatusCode::OK, json!({ "profile": profile }))
+}
+
+async fn eligible_anchor_conversations_for_client(
+    state: &ServerState,
+    client_id: &str,
+    now_ms: u64,
+) -> std::collections::BTreeSet<String> {
+    let auth = { state.app.lock().await.companion_auth.clone() };
+    let presence = auth.fresh_presence(now_ms).await;
+    let mut winners: std::collections::BTreeMap<String, (u8, u64, String)> =
+        std::collections::BTreeMap::new();
+
+    for client in presence {
+        for tab in client.tabs {
+            let score = if tab.active && tab.window_focused {
+                2
+            } else if tab.active {
+                1
+            } else {
+                0
+            };
+            let candidate = (score, client.last_seen_ms, client.client_id.clone());
+            let replace = winners.get(&tab.conversation_id).is_none_or(|current| {
+                candidate.0 > current.0
+                    || (candidate.0 == current.0 && candidate.1 > current.1)
+                    || (candidate.0 == current.0
+                        && candidate.1 == current.1
+                        && candidate.2 < current.2)
+            });
+            if replace {
+                winners.insert(tab.conversation_id, candidate);
+            }
+        }
+    }
+
+    winners
+        .into_iter()
+        .filter_map(|(conversation_id, (_, _, winner))| {
+            (winner == client_id).then_some(conversation_id)
+        })
+        .collect()
+}
+
+async fn sync_worker_launch_from_command(
+    state: &ServerState,
+    command: &ManagedChatCommand,
+) -> Result<(), String> {
+    if command.launch.purpose != crate::managed_chat::types::ManagedChatPurpose::Worker {
+        return Ok(());
+    }
+    let worker_broker = { state.app.lock().await.worker_broker.clone() };
+    if command.state == ManagedChatCommandState::Failed && !command.reconcile_history {
+        worker_broker
+            .settle_pre_send_failure_by_command(
+                &command.id.to_string(),
+                command
+                    .terminal
+                    .as_ref()
+                    .and_then(|terminal| terminal.details.clone()),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        return Ok(());
+    }
+    let (launch_state, launch_error, conversation_url) = match command.state {
+        ManagedChatCommandState::Queued => {
+            (crate::workers::types::WorkerLaunchState::Queued, None, None)
+        }
+        ManagedChatCommandState::Leased => (
+            if command.reconcile_history {
+                crate::workers::types::WorkerLaunchState::Reconciling
+            } else {
+                crate::workers::types::WorkerLaunchState::Preparing
+            },
+            None,
+            None,
+        ),
+        ManagedChatCommandState::SendStarted => (
+            crate::workers::types::WorkerLaunchState::SendStarted,
+            None,
+            None,
+        ),
+        ManagedChatCommandState::NeedsReconcile => (
+            crate::workers::types::WorkerLaunchState::Reconciling,
+            None,
+            None,
+        ),
+        ManagedChatCommandState::Paused => (
+            crate::workers::types::WorkerLaunchState::Paused,
+            command
+                .terminal
+                .as_ref()
+                .and_then(|terminal| terminal.details.clone()),
+            command
+                .terminal
+                .as_ref()
+                .and_then(|terminal| terminal.conversation_url.clone()),
+        ),
+        ManagedChatCommandState::Succeeded => (
+            crate::workers::types::WorkerLaunchState::WaitingClaim,
+            None,
+            command
+                .terminal
+                .as_ref()
+                .and_then(|terminal| terminal.conversation_url.clone()),
+        ),
+        ManagedChatCommandState::Failed => (
+            crate::workers::types::WorkerLaunchState::Failed,
+            command
+                .terminal
+                .as_ref()
+                .and_then(|terminal| terminal.details.clone()),
+            command
+                .terminal
+                .as_ref()
+                .and_then(|terminal| terminal.conversation_url.clone()),
+        ),
+    };
+    worker_broker
+        .update_launch_by_command(
+            &command.id.to_string(),
+            launch_state,
+            launch_error,
+            conversation_url,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+async fn redeem_companion_command(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    if !companion_origin_allowed(&headers) {
+        return companion_origin_error();
+    }
+    let Some(client_id) = companion_client_id(&state, &headers).await else {
+        return companion_unauthorized();
+    };
+    let _lifecycle_guard = crate::workers::WORKER_LIFECYCLE_LOCK.lock().await;
+    let now_ms = unix_time_ms();
+    let eligible = eligible_anchor_conversations_for_client(&state, &client_id, now_ms).await;
+    let broker = { state.app.lock().await.managed_chat_broker.clone() };
+    match broker
+        .redeem_for_anchors(&client_id, now_ms, Some(&eligible))
+        .await
+    {
+        Ok(Some(offer)) => {
+            if let Err(error) = sync_worker_launch_from_command(&state, &offer.command).await {
+                return json_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    json!({ "error": format!("failed to sync worker launch state: {error}") }),
+                );
+            }
+            let anchor_context = offer.command.anchor_context.clone();
+            json_response(
+                StatusCode::OK,
+                json!({
+                    "command": offer.command,
+                    "reconcileRequired": offer.reconcile_required,
+                    "anchorContext": anchor_context
+                }),
+            )
+        }
+        Ok(None) => json_response(StatusCode::OK, json!({ "command": null })),
+        Err(error) => managed_chat_error_response(error),
+    }
+}
+
+async fn mark_companion_send_started(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(request): Json<CompanionSendStartedRequest>,
+) -> Response<Body> {
+    if !companion_origin_allowed(&headers) {
+        return companion_origin_error();
+    }
+    let Some(client_id) = companion_client_id(&state, &headers).await else {
+        return companion_unauthorized();
+    };
+    let command_id = match ManagedChatCommandId::parse(&request.command_id) {
+        Ok(value) => value,
+        Err(error) => return json_response(StatusCode::BAD_REQUEST, json!({ "error": error })),
+    };
+    let lease_id = match ManagedChatLeaseId::parse(&request.lease_id) {
+        Ok(value) => value,
+        Err(error) => return json_response(StatusCode::BAD_REQUEST, json!({ "error": error })),
+    };
+    let _lifecycle_guard = crate::workers::WORKER_LIFECYCLE_LOCK.lock().await;
+    let broker = { state.app.lock().await.managed_chat_broker.clone() };
+    match broker
+        .mark_send_started(&command_id, &lease_id, &client_id)
+        .await
+    {
+        Ok(command) => {
+            if let Err(error) = sync_worker_launch_from_command(&state, &command).await {
+                return json_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    json!({ "error": format!("failed to sync worker launch state: {error}") }),
+                );
+            }
+            json_response(StatusCode::OK, json!({ "command": command }))
+        }
+        Err(error) => managed_chat_error_response(error),
+    }
+}
+
+async fn ack_companion_command(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(request): Json<CompanionAckRequest>,
+) -> Response<Body> {
+    if !companion_origin_allowed(&headers) {
+        return companion_origin_error();
+    }
+    let Some(client_id) = companion_client_id(&state, &headers).await else {
+        return companion_unauthorized();
+    };
+    let command_id = match ManagedChatCommandId::parse(&request.command_id) {
+        Ok(value) => value,
+        Err(error) => return json_response(StatusCode::BAD_REQUEST, json!({ "error": error })),
+    };
+    let lease_id = match ManagedChatLeaseId::parse(&request.lease_id) {
+        Ok(value) => value,
+        Err(error) => return json_response(StatusCode::BAD_REQUEST, json!({ "error": error })),
+    };
+    let outcome = match request.outcome.as_str() {
+        "succeeded" => ManagedChatAckOutcome::Succeeded {
+            details: request.details,
+            conversation_url: request.conversation_url,
+        },
+        "failed" => {
+            if request.conversation_url.is_some() {
+                return json_response(
+                    StatusCode::BAD_REQUEST,
+                    json!({ "error": "failed does not accept conversationUrl" }),
+                );
+            }
+            ManagedChatAckOutcome::Failed {
+                details: request.details,
+            }
+        }
+        "needs_reconcile" => {
+            if request.details.is_some() || request.conversation_url.is_some() {
+                return json_response(
+                    StatusCode::BAD_REQUEST,
+                    json!({ "error": "needs_reconcile does not accept details or conversationUrl" }),
+                );
+            }
+            ManagedChatAckOutcome::NeedsReconcile
+        }
+        "paused" => {
+            if request.conversation_url.is_some() {
+                return json_response(
+                    StatusCode::BAD_REQUEST,
+                    json!({ "error": "paused does not accept conversationUrl" }),
+                );
+            }
+            ManagedChatAckOutcome::Paused {
+                details: request.details,
+            }
+        }
+        _ => {
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                json!({ "error": "outcome must be succeeded, failed, needs_reconcile, or paused" }),
+            );
+        }
+    };
+    let _lifecycle_guard = crate::workers::WORKER_LIFECYCLE_LOCK.lock().await;
+    let broker = { state.app.lock().await.managed_chat_broker.clone() };
+    match broker
+        .acknowledge(&command_id, &lease_id, &client_id, outcome)
+        .await
+    {
+        Ok(command) => {
+            if let Err(error) = sync_worker_launch_from_command(&state, &command).await {
+                return json_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    json!({ "error": format!("failed to sync worker launch state: {error}") }),
+                );
+            }
+            json_response(StatusCode::OK, json!({ "command": command }))
+        }
+        Err(error) => managed_chat_error_response(error),
+    }
+}
+
+async fn ack_companion_worker_reset(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(request): Json<CompanionWorkerResetAckRequest>,
+) -> Response<Body> {
+    if !companion_origin_allowed(&headers) {
+        return companion_origin_error();
+    }
+    let Some(client_id) = companion_client_id(&state, &headers).await else {
+        return companion_unauthorized();
+    };
+    let auth = { state.app.lock().await.companion_auth.clone() };
+    match auth
+        .acknowledge_worker_reset(&client_id, request.worker_reset_epoch)
+        .await
+    {
+        Ok((worker_reset_epoch, pending_count)) => json_response(
+            StatusCode::OK,
+            json!({
+                "workerResetEpoch": worker_reset_epoch,
+                "pendingClientCount": pending_count
+            }),
+        ),
+        Err(error) => json_response(StatusCode::CONFLICT, json!({ "error": error })),
+    }
+}
+
+async fn clear_companion_workers(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(_request): Json<CompanionClearWorkersRequest>,
+) -> Response<Body> {
+    if !companion_origin_allowed(&headers) {
+        return companion_origin_error();
+    }
+    let Some(requesting_client_id) = companion_client_id(&state, &headers).await else {
+        return companion_unauthorized();
+    };
+
+    // Mirror Chat on Steroids' explicit Clear Swarm semantics: this is a destructive global
+    // Workers reset, not a per-Core cleanup. Active/parked worker ownership and queued browser
+    // launches are discarded, ChatGPT conversations stay untouched, and already-bound worker
+    // conversation identities are retained as short-lived fences so an old worker tab cannot
+    // immediately return as a new Core.
+    let _lifecycle_guard = crate::workers::WORKER_LIFECYCLE_LOCK.lock().await;
+    let (auth, managed_chat_broker, worker_broker) = {
+        let app = state.app.lock().await;
+        (
+            app.companion_auth.clone(),
+            app.managed_chat_broker.clone(),
+            app.worker_broker.clone(),
+        )
+    };
+    let had_worker_state =
+        worker_broker.has_worker_state().await || managed_chat_broker.has_worker_commands().await;
+    let reset_required_clients = managed_chat_broker
+        .snapshot()
+        .await
+        .commands
+        .values()
+        .filter(|command| {
+            command.launch.purpose == ManagedChatPurpose::Worker
+                && command.state == ManagedChatCommandState::SendStarted
+        })
+        .filter_map(|command| command.lease.as_ref().map(|lease| lease.client_id.clone()))
+        .filter(|client_id| client_id != &requesting_client_id)
+        .collect::<BTreeSet<_>>();
+    // Commit the durable Worker reset before publishing the browser reset epoch. If this first
+    // persistence boundary fails, paired companions must keep their exact local bindings because
+    // the host still owns the old worker families. Once the Worker store is cleared, publishing a
+    // new epoch is safe: any later failure is a partial destructive clear that must be retried, but
+    // stale browser authority can no longer revive a deleted worker family.
+    let workers = match worker_broker.clear_all_workers().await {
+        Ok(value) => value,
+        Err(error) => {
+            return json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({ "error": format!("worker reset did not complete; no browser reset was published and retry is safe: {error}") }),
+            );
+        }
+    };
+    let (worker_reset_epoch, pending_reset_clients) = match auth
+        .begin_worker_reset(&reset_required_clients)
+        .await
+    {
+        Ok(value) => value,
+        Err(error) => {
+            return json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({ "error": format!("worker histories were cleared but browser reset publication did not complete; retry Clear Workers to resume safely: {error}") }),
+            );
+        }
+    };
+    let commands = match managed_chat_broker.clear_all_worker_commands().await {
+        Ok(value) => value,
+        Err(error) => {
+            return json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({
+                    "error": format!(
+                        "worker histories were cleared but browser-command cleanup did not complete; retry Clear Workers to resume safely: {error}"
+                    )
+                }),
+            );
+        }
+    };
+
+    let send_boundary_command_ids = commands
+        .iter()
+        .filter(|command| command.state == ManagedChatCommandState::SendStarted)
+        .map(|command| command.id.to_string())
+        .collect::<Vec<_>>();
+
+    if pending_reset_clients > 0
+        && !auth
+            .wait_for_worker_reset_acknowledgements(worker_reset_epoch, Duration::from_secs(5))
+            .await
+    {
+        let remaining_pending_clients = auth.worker_reset_pending_count().await;
+        let send_boundary_warning = if send_boundary_command_ids.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " {} worker send(s) had already crossed MoonDesk's Send boundary and may already have reached ChatGPT; those sends cannot be unsent.",
+                send_boundary_command_ids.len()
+            )
+        };
+        return json_response(
+            StatusCode::CONFLICT,
+            json!({
+                "error": format!(
+                    "worker state was cleared, but another paired browser has not yet acknowledged the global reset; let that browser reconnect or revoke it, then retry Clear Workers.{send_boundary_warning}"
+                ),
+                "workerResetEpoch": worker_reset_epoch,
+                "pendingBrowserCount": remaining_pending_clients,
+                "sendBoundaryCommandIds": send_boundary_command_ids
+            }),
+        );
+    }
+
+    json_response(
+        StatusCode::OK,
+        json!({
+            "cleared": true,
+            "alreadyCleared": !had_worker_state,
+            "workerResetEpoch": worker_reset_epoch,
+            "workerIds": workers.iter().map(|worker| worker.id.to_string()).collect::<Vec<_>>(),
+            "commandIds": commands.iter().map(|command| command.id.to_string()).collect::<Vec<_>>(),
+            "sendBoundaryCommandIds": send_boundary_command_ids
+        }),
+    )
 }
 
 fn jsonrpc_error_response(status: StatusCode, code: i64, msg: &str) -> Response<Body> {
@@ -793,10 +1808,48 @@ async fn health() -> Json<Value> {
 
 // ── POST /<slug>/mcp ────────────────────────────────────────
 
+fn normalized_openai_request_id(headers: &HeaderMap) -> Option<String> {
+    let mut values = headers.get_all("x-request-id").iter();
+    let raw = values.next()?.to_str().ok()?;
+    if values.next().is_some() {
+        return None;
+    }
+    let id = raw.split('/').next()?.trim();
+    if id.is_empty()
+        || id.len() > 100
+        || !id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+    {
+        return None;
+    }
+    Some(id.to_string())
+}
+
+async fn post_mcp_http(
+    AxumPath(slug): AxumPath<String>,
+    State(s): State<ServerState>,
+    headers: HeaderMap,
+    body_bytes: Bytes,
+) -> Response<Body> {
+    let inbound_request_id = normalized_openai_request_id(&headers);
+    post_mcp_with_request_id(AxumPath(slug), State(s), body_bytes, inbound_request_id).await
+}
+
+#[cfg(test)]
 async fn post_mcp(
     AxumPath(slug): AxumPath<String>,
     State(s): State<ServerState>,
     body_bytes: Bytes,
+) -> Response<Body> {
+    post_mcp_with_request_id(AxumPath(slug), State(s), body_bytes, None).await
+}
+
+async fn post_mcp_with_request_id(
+    AxumPath(slug): AxumPath<String>,
+    State(s): State<ServerState>,
+    body_bytes: Bytes,
+    inbound_request_id: Option<String>,
 ) -> Response<Body> {
     let Some((workspace, runtime, _request_lease)) = resolve_workspace(&s, &slug).await else {
         return not_found_response();
@@ -882,9 +1935,27 @@ async fn post_mcp(
     }
 
     let workspace_root = workspace.root.to_string_lossy().into_owned();
-    let (mode, tool_mode, set_moondesk_as_co_author) = {
+    let (
+        mode,
+        tool_mode,
+        set_moondesk_as_co_author,
+        worker_execution_profile,
+        worker_target_count,
+        worker_broker,
+        managed_chat_broker,
+        companion_auth,
+    ) = {
         let app = s.app.lock().await;
-        (app.mode, app.tool_mode, app.set_moondesk_as_co_author)
+        (
+            app.mode,
+            app.tool_mode,
+            app.set_moondesk_as_co_author,
+            app.worker_execution_profile.clone(),
+            app.worker_target_count,
+            app.worker_broker.clone(),
+            app.managed_chat_broker.clone(),
+            app.companion_auth.clone(),
+        )
     };
 
     let mut response_json: Option<Value> = None;
@@ -892,6 +1963,7 @@ async fn post_mcp(
         &req,
         mcp::McpRequestContext {
             workspace_id: &workspace.workspace_id,
+            workspace_name: &workspace.name,
             workspace_root: &workspace_root,
             mode,
             tool_mode,
@@ -899,6 +1971,12 @@ async fn post_mcp(
             handoff_store_root: None,
             command_jobs: &s.command_jobs,
             browser_runtime: &s.browser_runtime,
+            worker_execution_profile,
+            worker_target_count,
+            worker_broker,
+            managed_chat_broker,
+            companion_auth: Some(companion_auth),
+            inbound_request_id,
         },
     )
     .await
@@ -1037,6 +2115,12 @@ async fn delete_mcp(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::managed_chat::broker::EnqueueManagedChatRequest;
+    use crate::managed_chat::types::{
+        ChatExecutionProfile, ManagedChatCommand, ManagedChatCommandId, ManagedChatCommandState,
+        ManagedChatLaunch, ManagedChatOpenMode, ManagedChatPurpose, ManagedChatTerminalResult,
+        ReasoningEffort,
+    };
     use crate::state::{AppState, Mode, ToolMode, rotate_workspace_secret, ui_event_channel};
     use crate::workspaces::WorkspaceConfig;
     use axum::body::to_bytes;
@@ -1193,6 +2277,18 @@ mod tests {
             }))
             .expect("serialize tool call"),
         )
+    }
+
+    fn reqwest_json_body(value: &Value) -> Vec<u8> {
+        serde_json::to_vec(value).expect("serialize HTTP JSON body")
+    }
+
+    async fn reqwest_response_json(mut response: reqwest::Response) -> Value {
+        let mut body = Vec::new();
+        while let Some(chunk) = response.chunk().await.expect("read HTTP JSON chunk") {
+            body.extend_from_slice(&chunk);
+        }
+        serde_json::from_slice(&body).expect("parse HTTP JSON response")
     }
 
     #[cfg(windows)]
@@ -1354,6 +2450,1412 @@ mod tests {
         server.abort();
         let _ = server.await;
         let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_dir_all(config_root);
+        let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn public_mcp_router_does_not_expose_companion_control_routes() {
+        let workspace_root = unique_temp_path("moondesk-companion-public-router-workspace");
+        let config_root = unique_temp_path("moondesk-companion-public-router-config");
+        let config_path = config_root.join("config.toml");
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        std::fs::create_dir_all(&config_root).expect("create config dir");
+
+        let app = AppState::new_for_test(
+            8787,
+            workspace_root.to_string_lossy().into_owned(),
+            config_path.clone(),
+        )
+        .expect("create app state");
+        let app_state = Arc::new(Mutex::new(app));
+        let (ui_tx, _ui_rx) = ui_event_channel();
+        let app = router(
+            app_state,
+            None,
+            CommandJobManager::new(),
+            ui_tx,
+            Arc::from("test-host-control-token"),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind public router");
+        let address = listener.local_addr().expect("public router address");
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let client = reqwest::Client::new();
+
+        let hello = client
+            .get(format!("http://{address}{COMPANION_HELLO_ROUTE}"))
+            .send()
+            .await
+            .expect("probe companion hello on public router");
+        assert_eq!(hello.status(), StatusCode::NOT_FOUND);
+
+        let repair = client
+            .post(format!("http://{address}{COMPANION_REPAIR_ROUTE}"))
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(reqwest_json_body(&json!({
+                "pairingToken": "not-a-real-token",
+                "clientId": "extension-install-a"
+            })))
+            .send()
+            .await
+            .expect("probe companion repair on public router");
+        assert_eq!(repair.status(), StatusCode::NOT_FOUND);
+
+        server.abort();
+        let _ = server.await;
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_dir_all(config_root);
+        let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
+    #[test]
+    fn openai_request_id_normalization_is_exact_and_rejects_ambiguity() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-request-id",
+            HeaderValue::from_static("wfr_exact_request/attempt-7"),
+        );
+        assert_eq!(
+            normalized_openai_request_id(&headers).as_deref(),
+            Some("wfr_exact_request")
+        );
+
+        headers.append(
+            "x-request-id",
+            HeaderValue::from_static("wfr_conflict/attempt-8"),
+        );
+        assert_eq!(normalized_openai_request_id(&headers), None);
+
+        let mut invalid = HeaderMap::new();
+        invalid.insert(
+            "x-request-id",
+            HeaderValue::from_static("wfr invalid/attempt"),
+        );
+        assert_eq!(normalized_openai_request_id(&invalid), None);
+    }
+
+    #[tokio::test]
+    async fn legacy_claimed_success_sync_ignores_obsolete_placeholder_url() {
+        let workspace_root = unique_temp_path("moondesk-legacy-claimed-sync-workspace");
+        let config_root = unique_temp_path("moondesk-legacy-claimed-sync-config");
+        let config_path = config_root.join("config.toml");
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        std::fs::create_dir_all(&config_root).expect("create config dir");
+
+        let app = AppState::new_for_test(
+            8787,
+            workspace_root.to_string_lossy().into_owned(),
+            config_path.clone(),
+        )
+        .expect("create app state");
+        let workspace_id = app.workspaces[0].id.clone();
+        let broker = app.worker_broker.clone();
+        let core = crate::workers::types::ChatIdentity::from_openai_meta(
+            Some("test-subject"),
+            "core-legacy-claimed-sync",
+        );
+        let worker_identity = crate::workers::types::ChatIdentity::from_openai_meta(
+            Some("test-subject"),
+            "worker-legacy-claimed-sync",
+        );
+        let spawned = broker
+            .spawn_worker(crate::workers::broker::SpawnWorkerRequest {
+                operation_id: crate::workers::types::OperationId::new(),
+                workspace_id: workspace_id.clone(),
+                anchor_identity: core.clone(),
+                label: "legacy claimed sync".into(),
+                assignment: "preserve claimed durable binding".into(),
+                context: String::new(),
+                execution_profile: ChatExecutionProfile::default(),
+            })
+            .await
+            .expect("spawn worker");
+        let command_id = Uuid::new_v4().to_string();
+        broker
+            .link_launch_command(
+                &workspace_id,
+                &core,
+                &spawned.worker_id,
+                &spawned.task_id,
+                &command_id,
+            )
+            .await
+            .expect("link launch command");
+        let canonical_url = format!("https://chatgpt.com/c/{}", spawned.worker_id);
+        broker
+            .update_launch_by_command(
+                &command_id,
+                crate::workers::types::WorkerLaunchState::WaitingClaim,
+                None,
+                Some(canonical_url.clone()),
+            )
+            .await
+            .expect("bind canonical worker conversation");
+        broker
+            .claim_worker(
+                &workspace_id,
+                &spawned.worker_id,
+                &spawned.task_id,
+                &spawned.claim_token,
+                worker_identity,
+            )
+            .await
+            .expect("claim worker");
+
+        let app_state = Arc::new(Mutex::new(app));
+        let (ui_tx, _ui_rx) = ui_event_channel();
+        let server_state = ServerState {
+            app: app_state,
+            browser_runtime: None,
+            command_jobs: CommandJobManager::new(),
+            ui_events: ui_tx,
+            host_control_token: Arc::from("unused-host-token"),
+        };
+        let legacy_command = ManagedChatCommand {
+            id: ManagedChatCommandId::parse(&command_id).expect("command id"),
+            sequence: 0,
+            dedupe_key: format!("worker:{}:task:{}", spawned.worker_id, spawned.task_id),
+            request_fingerprint: "a".repeat(64),
+            launch: ManagedChatLaunch {
+                workspace_id: workspace_id.clone(),
+                purpose: ManagedChatPurpose::Worker,
+                execution_profile: ChatExecutionProfile::default(),
+                opening_message: "legacy worker launch".into(),
+                task_marker: "legacy-worker-launch".into(),
+                thread_key: Some(format!("worker:{}", spawned.worker_id)),
+                open_mode: ManagedChatOpenMode::NewThread,
+                existing_conversation_url: None,
+                anchor_session_digest: Some(core.session_digest.clone()),
+            },
+            state: ManagedChatCommandState::Succeeded,
+            dispatch_ready: true,
+            reconcile_history: true,
+            lease: None,
+            terminal: Some(ManagedChatTerminalResult {
+                succeeded: true,
+                details: Some("legacy placeholder accepted by an older build".into()),
+                conversation_url: Some(
+                    "https://chatgpt.com/c/local-chatgpt%3A422be40f-2871-4c05-9110-62ac6e7854cd"
+                        .into(),
+                ),
+            }),
+            target_client_id: None,
+            target_client_pinned_by_request: false,
+            anchor_context: None,
+        };
+
+        sync_worker_launch_from_command(&server_state, &legacy_command)
+            .await
+            .expect("already-claimed legacy history must not block revoke reconciliation");
+        let family = broker
+            .family_for_anchor(&workspace_id, &core)
+            .await
+            .expect("read family")
+            .expect("family exists");
+        let worker = family
+            .workers
+            .get(&spawned.worker_id)
+            .expect("worker exists");
+        assert_eq!(
+            worker.launch_state,
+            crate::workers::types::WorkerLaunchState::Claimed
+        );
+        assert_eq!(
+            worker.conversation_url.as_deref(),
+            Some(canonical_url.as_str())
+        );
+        let _ = std::fs::remove_dir_all(workspace_root);
+        let _ = std::fs::remove_dir_all(config_root);
+    }
+
+    #[tokio::test]
+    async fn companion_presence_detaches_a_running_worker_without_ending_its_task() {
+        let workspace_root = unique_temp_path("moondesk-companion-detached-workspace");
+        let config_root = unique_temp_path("moondesk-companion-detached-config");
+        let config_path = config_root.join("config.toml");
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        std::fs::create_dir_all(&config_root).expect("create config dir");
+
+        let app = AppState::new_for_test(
+            8787,
+            workspace_root.to_string_lossy().into_owned(),
+            config_path.clone(),
+        )
+        .expect("create app state");
+        let workspace_id = app.workspaces[0].id.clone();
+        let broker = app.worker_broker.clone();
+        let auth = app.companion_auth.clone();
+        let origin = "chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let credential = "a".repeat(64);
+        auth.auto_pair("chrome-install", &credential, Some(origin))
+            .await
+            .expect("pair companion browser");
+
+        let core = crate::workers::types::ChatIdentity::from_openai_meta(
+            Some("test-subject"),
+            "core-detached-presence",
+        );
+        let worker_identity = crate::workers::types::ChatIdentity::from_openai_meta(
+            Some("test-subject"),
+            "worker-detached-presence",
+        );
+        let spawned = broker
+            .spawn_worker(crate::workers::broker::SpawnWorkerRequest {
+                operation_id: crate::workers::types::OperationId::new(),
+                workspace_id: workspace_id.clone(),
+                anchor_identity: core.clone(),
+                label: "detached presence".into(),
+                assignment: "keep working if the browser tab closes".into(),
+                context: String::new(),
+                execution_profile: ChatExecutionProfile::default(),
+            })
+            .await
+            .expect("spawn worker");
+        let command_id = Uuid::new_v4().to_string();
+        broker
+            .link_launch_command(
+                &workspace_id,
+                &core,
+                &spawned.worker_id,
+                &spawned.task_id,
+                &command_id,
+            )
+            .await
+            .expect("link worker launch command");
+        let worker_conversation = "6aad7eb1-4b10-83ee-97bd-d98b338864de";
+        broker
+            .update_launch_by_command(
+                &command_id,
+                crate::workers::types::WorkerLaunchState::WaitingClaim,
+                None,
+                Some(format!("https://chatgpt.com/c/{worker_conversation}")),
+            )
+            .await
+            .expect("store durable worker conversation");
+        broker
+            .claim_worker(
+                &workspace_id,
+                &spawned.worker_id,
+                &spawned.task_id,
+                &spawned.claim_token,
+                worker_identity,
+            )
+            .await
+            .expect("claim worker");
+
+        let app_state = Arc::new(Mutex::new(app));
+        let (ui_tx, _ui_rx) = ui_event_channel();
+        let server_state = ServerState {
+            app: app_state,
+            browser_runtime: None,
+            command_jobs: CommandJobManager::new(),
+            ui_events: ui_tx,
+            host_control_token: Arc::from("unused-host-token"),
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            COMPANION_TOKEN_HEADER,
+            HeaderValue::from_str(&credential).expect("credential header"),
+        );
+        headers.insert(header::ORIGIN, HeaderValue::from_static(origin));
+
+        let attached = update_companion_presence(
+            State(server_state.clone()),
+            headers.clone(),
+            Json(CompanionPresenceUpdate {
+                browser_label: Some("Chrome".into()),
+                tabs: vec![crate::companion::CompanionTabPresence {
+                    conversation_id: worker_conversation.into(),
+                    conversation_url: format!("https://chatgpt.com/c/{worker_conversation}"),
+                    project_id: None,
+                    project_url: None,
+                    active: false,
+                    window_focused: false,
+                    generating: true,
+                }],
+            }),
+        )
+        .await;
+        assert_eq!(attached.status(), StatusCode::OK);
+
+        let closed = update_companion_presence(
+            State(server_state.clone()),
+            headers.clone(),
+            Json(CompanionPresenceUpdate {
+                browser_label: Some("Chrome".into()),
+                tabs: Vec::new(),
+            }),
+        )
+        .await;
+        assert_eq!(closed.status(), StatusCode::OK);
+        let family = broker
+            .family_for_anchor(&workspace_id, &core)
+            .await
+            .expect("read family")
+            .expect("worker family exists");
+        let detached = family
+            .workers
+            .get(&spawned.worker_id)
+            .expect("worker exists");
+        assert_eq!(detached.state, crate::workers::types::WorkerState::Running);
+        assert_eq!(
+            detached.attachment_state,
+            crate::workers::types::BrowserAttachmentState::Detached
+        );
+        assert_eq!(detached.current_task_id.as_ref(), Some(&spawned.task_id));
+
+        let returned = update_companion_presence(
+            State(server_state),
+            headers,
+            Json(CompanionPresenceUpdate {
+                browser_label: Some("Chrome".into()),
+                tabs: vec![crate::companion::CompanionTabPresence {
+                    conversation_id: worker_conversation.into(),
+                    conversation_url: format!("https://chatgpt.com/c/{worker_conversation}"),
+                    project_id: None,
+                    project_url: None,
+                    active: true,
+                    window_focused: true,
+                    generating: false,
+                }],
+            }),
+        )
+        .await;
+        assert_eq!(returned.status(), StatusCode::OK);
+        let family = broker
+            .family_for_anchor(&workspace_id, &core)
+            .await
+            .expect("read returned family")
+            .expect("worker family exists");
+        assert_eq!(
+            family
+                .workers
+                .get(&spawned.worker_id)
+                .map(|worker| worker.attachment_state),
+            Some(crate::workers::types::BrowserAttachmentState::Attached)
+        );
+
+        let _ = std::fs::remove_dir_all(config_root);
+        let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn companion_bridge_discovers_and_auto_pairs_without_manual_token() {
+        let workspace_root = unique_temp_path("moondesk-companion-bridge-workspace");
+        let config_root = unique_temp_path("moondesk-companion-bridge-config");
+        let config_path = config_root.join("config.toml");
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        std::fs::create_dir_all(&config_root).expect("create config dir");
+
+        let app = AppState::new_for_test(
+            8787,
+            workspace_root.to_string_lossy().into_owned(),
+            config_path.clone(),
+        )
+        .expect("create app state");
+        let bootstrap_token = app.companion_auth.installation_token().to_string();
+        let app_state = Arc::new(Mutex::new(app));
+        let (ui_tx, _ui_rx) = ui_event_channel();
+        let app = companion_bridge_router(
+            app_state,
+            None,
+            CommandJobManager::new(),
+            ui_tx,
+            Arc::from("unused-host-token"),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind companion bridge");
+        let address = listener.local_addr().expect("companion bridge address");
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let client = reqwest::Client::new();
+
+        let hello = client
+            .get(format!("http://{address}{COMPANION_HELLO_ROUTE}"))
+            .send()
+            .await
+            .expect("discover companion bridge");
+        assert_eq!(hello.status(), StatusCode::OK);
+        let hello_json = reqwest_response_json(hello).await;
+        assert_eq!(
+            hello_json.get("app").and_then(Value::as_str),
+            Some("moondesk-worker-companion")
+        );
+        assert_eq!(
+            hello_json.get("appVersion").and_then(Value::as_str),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
+        assert_eq!(
+            hello_json.get("paired").and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            hello_json.get("protocolVersion").and_then(Value::as_u64),
+            Some(2)
+        );
+        assert_eq!(
+            hello_json
+                .get("companionRuntimeRevision")
+                .and_then(Value::as_u64),
+            Some(u64::from(COMPANION_RUNTIME_REVISION))
+        );
+
+        let credential = "a".repeat(64);
+        let pair_body = json!({
+            "clientId": "extension-install-a",
+            "credential": credential,
+            "bootstrapToken": bootstrap_token
+        });
+        let pair_url = format!("http://{address}{COMPANION_PAIR_ROUTE}");
+        let rejected = client
+            .post(&pair_url)
+            .header(
+                reqwest::header::ORIGIN,
+                "chrome-extension://other-extension",
+            )
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(reqwest_json_body(&json!({
+                "clientId": "other-extension",
+                "credential": "b".repeat(64),
+                "bootstrapToken": "c".repeat(64)
+            })))
+            .send()
+            .await
+            .expect("reject extension without installation capability");
+        assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+
+        let pair = client
+            .post(&pair_url)
+            .header(reqwest::header::ORIGIN, "chrome-extension://moondesk-test")
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(reqwest_json_body(&pair_body))
+            .send()
+            .await
+            .expect("auto pair companion");
+        assert_eq!(pair.status(), StatusCode::OK);
+
+        let retry = client
+            .post(&pair_url)
+            .header(reqwest::header::ORIGIN, "chrome-extension://moondesk-test")
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(reqwest_json_body(&pair_body))
+            .send()
+            .await
+            .expect("retry auto pair companion");
+        assert_eq!(retry.status(), StatusCode::OK);
+
+        let status = client
+            .get(format!("http://{address}{COMPANION_STATUS_ROUTE}"))
+            .header(COMPANION_TOKEN_HEADER, &credential)
+            .send()
+            .await
+            .expect("authorize auto-paired companion");
+        assert_eq!(status.status(), StatusCode::OK);
+
+        let correlation_url = format!("http://{address}{COMPANION_CORRELATIONS_ROUTE}");
+        let correlation_body = json!({
+            "conversationId": "6aad7eb1-4b10-83ee-97bd-d98b338864de",
+            "conversationUrl": "https://chatgpt.com/c/6aad7eb1-4b10-83ee-97bd-d98b338864de",
+            "projectId": null,
+            "projectUrl": null,
+            "requestIds": ["wfr_http_exact_request"]
+        });
+        let unauthenticated_correlation = client
+            .post(&correlation_url)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(reqwest_json_body(&correlation_body))
+            .send()
+            .await
+            .expect("send unauthenticated correlation");
+        assert_eq!(
+            unauthenticated_correlation.status(),
+            StatusCode::UNAUTHORIZED
+        );
+
+        let correlation = client
+            .post(&correlation_url)
+            .header(COMPANION_TOKEN_HEADER, &credential)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(reqwest_json_body(&correlation_body))
+            .send()
+            .await
+            .expect("publish authenticated correlation");
+        assert_eq!(correlation.status(), StatusCode::OK);
+        let correlation_json = reqwest_response_json(correlation).await;
+        assert_eq!(
+            correlation_json.get("stored").and_then(Value::as_u64),
+            Some(1)
+        );
+
+        let second_credential = "b".repeat(64);
+        let second_pair = client
+            .post(&pair_url)
+            .header(reqwest::header::ORIGIN, "chrome-extension://other-install")
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(reqwest_json_body(&json!({
+                "clientId": "extension-install-b",
+                "credential": second_credential,
+                "bootstrapToken": bootstrap_token
+            })))
+            .send()
+            .await
+            .expect("pair second browser installation");
+        assert_eq!(second_pair.status(), StatusCode::OK);
+
+        let first_status = client
+            .get(format!("http://{address}{COMPANION_STATUS_ROUTE}"))
+            .header(COMPANION_TOKEN_HEADER, &credential)
+            .send()
+            .await
+            .expect("first browser remains authorized");
+        assert_eq!(first_status.status(), StatusCode::OK);
+        let first_status_json = reqwest_response_json(first_status).await;
+        assert_eq!(
+            first_status_json
+                .get("pairedClientCount")
+                .and_then(Value::as_u64),
+            Some(2)
+        );
+
+        let second_status = client
+            .get(format!("http://{address}{COMPANION_STATUS_ROUTE}"))
+            .header(COMPANION_TOKEN_HEADER, &second_credential)
+            .send()
+            .await
+            .expect("second browser is authorized");
+        assert_eq!(second_status.status(), StatusCode::OK);
+
+        let revoke_url = format!("http://{address}{COMPANION_CLIENTS_ROUTE}");
+        let revoke_body = json!({ "clientId": "extension-install-b" });
+        let revoked = client
+            .post(&revoke_url)
+            .header(COMPANION_TOKEN_HEADER, &credential)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(reqwest_json_body(&revoke_body))
+            .send()
+            .await
+            .expect("revoke second browser");
+        assert_eq!(revoked.status(), StatusCode::OK);
+        let revoked_json = reqwest_response_json(revoked).await;
+        assert_eq!(
+            revoked_json.get("revoked").and_then(Value::as_bool),
+            Some(true)
+        );
+
+        let revoked_retry = client
+            .post(&revoke_url)
+            .header(COMPANION_TOKEN_HEADER, &credential)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(reqwest_json_body(&revoke_body))
+            .send()
+            .await
+            .expect("retry revoke after response loss");
+        assert_eq!(revoked_retry.status(), StatusCode::OK);
+        let revoked_retry_json = reqwest_response_json(revoked_retry).await;
+        assert_eq!(
+            revoked_retry_json
+                .get("alreadyRevoked")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+
+        let web_origin = client
+            .post(&pair_url)
+            .header(reqwest::header::ORIGIN, "https://chatgpt.com")
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(reqwest_json_body(&pair_body))
+            .send()
+            .await
+            .expect("attempt web-origin auto pair");
+        assert_eq!(web_origin.status(), StatusCode::FORBIDDEN);
+
+        server.abort();
+        let _ = server.await;
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_dir_all(config_root);
+        let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn clear_worker_history_saga_resumes_after_restart_between_store_commits() {
+        let root = unique_temp_path("moondesk-clear-saga-restart");
+        std::fs::create_dir_all(&root).expect("create clear saga root");
+        let worker_path = root.join("worker-state-v1.json");
+        let managed_path = root.join("managed-chat-state-v1.json");
+        let workspace_id = crate::workspaces::WorkspaceId::new();
+        let conversation_id = "6ac62769-0c94-83e8-a8ef-95a21c7f3e7f";
+        let session_digest = "d".repeat(64);
+        let anchor_identity = crate::workers::types::ChatIdentity {
+            session_digest: session_digest.clone(),
+            subject_digest: None,
+        };
+        let worker_broker = crate::workers::broker::WorkerBroker::open(&worker_path)
+            .expect("open clear saga worker broker");
+        let managed_chat_broker =
+            crate::managed_chat::broker::ManagedChatBroker::open(&managed_path)
+                .expect("open clear saga managed broker");
+
+        let spawned = worker_broker
+            .spawn_worker(crate::workers::broker::SpawnWorkerRequest {
+                operation_id: crate::workers::types::OperationId::new(),
+                workspace_id: workspace_id.clone(),
+                anchor_identity: anchor_identity.clone(),
+                label: "clear saga".into(),
+                assignment: "prove restart-safe clear ordering".into(),
+                context: String::new(),
+                execution_profile: ChatExecutionProfile::default(),
+            })
+            .await
+            .expect("seed clear saga worker");
+        let command = managed_chat_broker
+            .enqueue_with_route(
+                EnqueueManagedChatRequest {
+                    dedupe_key: format!("worker:{}:task:{}", spawned.worker_id, spawned.task_id),
+                    launch: ManagedChatLaunch {
+                        workspace_id: workspace_id.clone(),
+                        purpose: ManagedChatPurpose::Worker,
+                        execution_profile: ChatExecutionProfile::default(),
+                        opening_message: "clear saga launch".into(),
+                        task_marker: format!("clear-saga:{}", spawned.task_id),
+                        thread_key: Some(format!("worker:{}", spawned.worker_id)),
+                        open_mode: ManagedChatOpenMode::NewThread,
+                        existing_conversation_url: None,
+                        anchor_session_digest: Some(session_digest.clone()),
+                    },
+                },
+                Some("clear-saga-browser".into()),
+                Some(crate::managed_chat::types::ManagedChatAnchorContext {
+                    conversation_id: conversation_id.into(),
+                    conversation_url: format!("https://chatgpt.com/c/{conversation_id}"),
+                    project_id: None,
+                    project_url: None,
+                }),
+            )
+            .await
+            .expect("seed clear saga command");
+        worker_broker
+            .link_launch_command(
+                &workspace_id,
+                &anchor_identity,
+                &spawned.worker_id,
+                &spawned.task_id,
+                &command.id.to_string(),
+            )
+            .await
+            .expect("link clear saga command");
+        let offer = managed_chat_broker
+            .redeem("clear-saga-browser", 1_000)
+            .await
+            .expect("redeem clear saga command")
+            .expect("clear saga lease");
+        let lease_id = offer
+            .command
+            .lease
+            .as_ref()
+            .expect("clear saga lease id")
+            .lease_id
+            .clone();
+        managed_chat_broker
+            .acknowledge(
+                &command.id,
+                &lease_id,
+                "clear-saga-browser",
+                ManagedChatAckOutcome::Failed {
+                    details: Some("proven pre-Send failure".into()),
+                },
+            )
+            .await
+            .expect("settle clear saga managed command");
+        worker_broker
+            .settle_pre_send_failure_by_command(
+                &command.id.to_string(),
+                Some("proven pre-Send failure".into()),
+            )
+            .await
+            .expect("settle clear saga worker")
+            .expect("clear saga worker exists");
+        worker_broker
+            .ensure_clearable_session_digest(&session_digest)
+            .await
+            .expect("worker side is clearable");
+        managed_chat_broker
+            .ensure_clearable_anchor_session(&session_digest)
+            .await
+            .expect("managed side is clearable");
+
+        worker_broker
+            .clear_session_digest(&session_digest)
+            .await
+            .expect("commit worker side of clear saga");
+        managed_chat_broker.fail_next_commit_for_test();
+        let interrupted = managed_chat_broker
+            .purge_terminal_for_anchor_session(&session_digest)
+            .await
+            .expect_err("inject managed-store failure after worker clear commit");
+        assert!(matches!(
+            interrupted,
+            crate::managed_chat::broker::ManagedChatError::Storage(_)
+        ));
+        drop(worker_broker);
+        drop(managed_chat_broker);
+
+        let worker_broker = crate::workers::broker::WorkerBroker::open(&worker_path)
+            .expect("reopen worker broker after simulated restart");
+        let managed_chat_broker =
+            crate::managed_chat::broker::ManagedChatBroker::open(&managed_path)
+                .expect("reopen managed broker after simulated restart");
+        assert!(
+            worker_broker
+                .family_for_anchor(&workspace_id, &anchor_identity)
+                .await
+                .expect("read cleared worker family after restart")
+                .is_none()
+        );
+        assert_eq!(
+            managed_chat_broker
+                .anchor_session_digest_for_conversation(conversation_id)
+                .await
+                .expect("recover Core digest from retained managed command"),
+            Some(session_digest.clone())
+        );
+        let removed = managed_chat_broker
+            .purge_terminal_for_anchor_session(&session_digest)
+            .await
+            .expect("resume clear saga after restart");
+        assert_eq!(removed.len(), 1);
+        assert!(managed_chat_broker.snapshot().await.commands.is_empty());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn revoke_saga_survives_restart_after_command_settlement_before_credential_removal() {
+        let root = unique_temp_path("moondesk-revoke-saga-restart");
+        std::fs::create_dir_all(&root).expect("create revoke saga root");
+        let auth_path = root.join("companion-auth.json");
+        let managed_path = root.join("managed-chat-state-v1.json");
+        let origin = "chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let client_id = "revoke-saga-browser";
+        let credential = "a".repeat(64);
+        let auth = crate::companion::CompanionAuth::open(&auth_path)
+            .expect("open revoke saga companion auth");
+        auth.auto_pair(client_id, &credential, Some(origin))
+            .await
+            .expect("pair revoke saga browser");
+        let managed_chat_broker =
+            crate::managed_chat::broker::ManagedChatBroker::open(&managed_path)
+                .expect("open revoke saga managed broker");
+        let command = managed_chat_broker
+            .enqueue_with_route(
+                EnqueueManagedChatRequest {
+                    dedupe_key: "revoke-saga-command".into(),
+                    launch: ManagedChatLaunch {
+                        workspace_id: crate::workspaces::WorkspaceId::new(),
+                        purpose: ManagedChatPurpose::Worker,
+                        execution_profile: ChatExecutionProfile::default(),
+                        opening_message: "revoke saga launch".into(),
+                        task_marker: "revoke-saga-task".into(),
+                        thread_key: Some("worker:revoke-saga".into()),
+                        open_mode: ManagedChatOpenMode::NewThread,
+                        existing_conversation_url: None,
+                        anchor_session_digest: Some("e".repeat(64)),
+                    },
+                },
+                Some(client_id.into()),
+                None,
+            )
+            .await
+            .expect("seed revoke saga command");
+        let offer = managed_chat_broker
+            .redeem(client_id, 1_000)
+            .await
+            .expect("redeem revoke saga command")
+            .expect("revoke saga lease");
+        let lease_id = offer
+            .command
+            .lease
+            .as_ref()
+            .expect("revoke saga lease id")
+            .lease_id
+            .clone();
+        managed_chat_broker
+            .mark_send_started(&command.id, &lease_id, client_id)
+            .await
+            .expect("cross Send boundary before revoke");
+        let (retargeted, paused, changed) = managed_chat_broker
+            .settle_revoked_client(client_id)
+            .await
+            .expect("settle revoke saga commands before credential removal");
+        assert_eq!((retargeted, paused), (0, 1));
+        assert_eq!(changed.len(), 1);
+        assert_eq!(changed[0].state, ManagedChatCommandState::Paused);
+        assert!(changed[0].target_client_id.is_none());
+        drop(managed_chat_broker);
+        drop(auth);
+
+        let auth = crate::companion::CompanionAuth::open(&auth_path)
+            .expect("reopen revoke saga auth after simulated restart");
+        let managed_chat_broker =
+            crate::managed_chat::broker::ManagedChatBroker::open(&managed_path)
+                .expect("reopen revoke saga managed broker after simulated restart");
+        assert_eq!(
+            auth.authorize(&credential, Some(origin)).await.as_deref(),
+            Some(client_id),
+            "credential removal had not happened before the simulated crash"
+        );
+        let restored = managed_chat_broker
+            .snapshot()
+            .await
+            .commands
+            .get(&command.id)
+            .cloned()
+            .expect("settled command survives restart");
+        assert_eq!(restored.state, ManagedChatCommandState::Paused);
+        assert!(restored.target_client_id.is_none());
+        assert!(
+            auth.revoke_client(client_id)
+                .await
+                .expect("resume credential removal after restart")
+        );
+        drop(auth);
+        let auth = crate::companion::CompanionAuth::open(&auth_path)
+            .expect("reopen auth after completed revoke saga");
+        assert!(auth.authorize(&credential, Some(origin)).await.is_none());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn companion_http_pair_redeem_reconcile_and_ack_flow_is_authenticated() {
+        let workspace_root = unique_temp_path("moondesk-companion-http-workspace");
+        let config_root = unique_temp_path("moondesk-companion-http-config");
+        let config_path = config_root.join("config.toml");
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        std::fs::create_dir_all(&config_root).expect("create config dir");
+
+        let app = AppState::new_for_test(
+            8787,
+            workspace_root.to_string_lossy().into_owned(),
+            config_path.clone(),
+        )
+        .expect("create app state");
+        let pairing_token = app.companion_auth.pairing_token();
+        let workspace_id = app
+            .workspaces
+            .first()
+            .expect("primary workspace")
+            .id
+            .clone();
+        let managed_chat_broker = app.managed_chat_broker.clone();
+        let worker_broker = app.worker_broker.clone();
+        let app_state = Arc::new(Mutex::new(app));
+        let (ui_tx, _ui_rx) = ui_event_channel();
+        let app = companion_bridge_router(
+            app_state,
+            None,
+            CommandJobManager::new(),
+            ui_tx,
+            Arc::from("unused-host-token"),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let address = listener.local_addr().expect("test server address");
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let client = reqwest::Client::new();
+        let pair_url = format!("http://{address}{COMPANION_REPAIR_ROUTE}");
+        let pair_body = json!({
+            "pairingToken": pairing_token,
+            "clientId": "extension-install-a"
+        });
+
+        let webpage_pair = client
+            .post(&pair_url)
+            .header(reqwest::header::ORIGIN, "https://chatgpt.com")
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(reqwest_json_body(&pair_body))
+            .send()
+            .await
+            .expect("send forbidden webpage pair request");
+        assert_eq!(webpage_pair.status(), StatusCode::FORBIDDEN);
+
+        let paired = client
+            .post(&pair_url)
+            .header(
+                reqwest::header::ORIGIN,
+                "chrome-extension://abcdefghijklmnop",
+            )
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(reqwest_json_body(&pair_body))
+            .send()
+            .await
+            .expect("pair companion");
+        assert_eq!(paired.status(), StatusCode::OK);
+        let paired_json = reqwest_response_json(paired).await;
+        let credential = paired_json
+            .get("credential")
+            .and_then(Value::as_str)
+            .expect("companion credential")
+            .to_string();
+        assert_eq!(
+            paired_json.get("clientId").and_then(Value::as_str),
+            Some("extension-install-a")
+        );
+
+        let unauthenticated_status = client
+            .get(format!("http://{address}{COMPANION_STATUS_ROUTE}"))
+            .send()
+            .await
+            .expect("send unauthenticated companion status");
+        assert_eq!(unauthenticated_status.status(), StatusCode::UNAUTHORIZED);
+
+        let status = client
+            .get(format!("http://{address}{COMPANION_STATUS_ROUTE}"))
+            .header(COMPANION_TOKEN_HEADER, &credential)
+            .send()
+            .await
+            .expect("send authenticated companion status");
+        assert_eq!(status.status(), StatusCode::OK);
+
+        let workspaces = client
+            .get(format!("http://{address}{COMPANION_WORKSPACES_ROUTE}"))
+            .header(COMPANION_TOKEN_HEADER, &credential)
+            .send()
+            .await
+            .expect("list companion workspaces");
+        assert_eq!(workspaces.status(), StatusCode::OK);
+        let workspaces_json = reqwest_response_json(workspaces).await;
+        assert!(
+            workspaces_json
+                .get("workspaces")
+                .and_then(Value::as_array)
+                .is_some_and(|items| items
+                    .iter()
+                    .any(|item| { item.get("workspaceId") == Some(&json!(workspace_id)) }))
+        );
+
+        let profile_url = format!("http://{address}{COMPANION_PROFILE_ROUTE}");
+        let initial_profile = client
+            .get(&profile_url)
+            .header(COMPANION_TOKEN_HEADER, &credential)
+            .send()
+            .await
+            .expect("read initial worker profile");
+        assert_eq!(initial_profile.status(), StatusCode::OK);
+        let initial_profile_json = reqwest_response_json(initial_profile).await;
+        assert_eq!(
+            initial_profile_json
+                .pointer("/profile/reasoningEffort")
+                .and_then(Value::as_str),
+            Some("high")
+        );
+
+        let replacement_profile = json!({
+            "modelKey": "gpt-5-6-thinking",
+            "modelLabel": "GPT-5.6 Sol",
+            "reasoningEffort": "extra_high"
+        });
+        let updated_profile = client
+            .post(&profile_url)
+            .header(COMPANION_TOKEN_HEADER, &credential)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(reqwest_json_body(&replacement_profile))
+            .send()
+            .await
+            .expect("update worker profile");
+        assert_eq!(updated_profile.status(), StatusCode::OK);
+        let updated_profile_json = reqwest_response_json(updated_profile).await;
+        assert_eq!(
+            updated_profile_json
+                .pointer("/profile/modelKey")
+                .and_then(Value::as_str),
+            Some("gpt-5-6-thinking")
+        );
+        assert_eq!(
+            updated_profile_json
+                .pointer("/profile/reasoningEffort")
+                .and_then(Value::as_str),
+            Some("extra_high")
+        );
+
+        let core_conversation_id = "6ac62769-0c94-83e8-a8ef-95a21c7f3e7f";
+        let core_session_digest = "c".repeat(64);
+        let core_identity = crate::workers::types::ChatIdentity {
+            session_digest: core_session_digest.clone(),
+            subject_digest: None,
+        };
+        let clear_worker = worker_broker
+            .spawn_worker(crate::workers::broker::SpawnWorkerRequest {
+                operation_id: crate::workers::types::OperationId::new(),
+                workspace_id: workspace_id.clone(),
+                anchor_identity: core_identity.clone(),
+                label: "clear saga worker".into(),
+                assignment: "seed clear retry coverage".into(),
+                context: String::new(),
+                execution_profile: ChatExecutionProfile::default(),
+            })
+            .await
+            .expect("seed clearable worker history");
+        let clear_worker_command = Uuid::new_v4().to_string();
+        worker_broker
+            .link_launch_command(
+                &workspace_id,
+                &core_identity,
+                &clear_worker.worker_id,
+                &clear_worker.task_id,
+                &clear_worker_command,
+            )
+            .await
+            .expect("link clearable worker command");
+        worker_broker
+            .settle_pre_send_failure_by_command(
+                &clear_worker_command,
+                Some("seeded pre-Send failure".into()),
+            )
+            .await
+            .expect("settle clearable worker")
+            .expect("worker exists");
+
+        let command = managed_chat_broker
+            .enqueue_with_route(
+                EnqueueManagedChatRequest {
+                    dedupe_key: "companion-http-command".into(),
+                    launch: ManagedChatLaunch {
+                        workspace_id: workspace_id.clone(),
+                        purpose: ManagedChatPurpose::Worker,
+                        execution_profile: ChatExecutionProfile {
+                            model_key: "gpt-5.6-sol".into(),
+                            model_label: "GPT-5.6 Sol".into(),
+                            reasoning_effort: ReasoningEffort::High,
+                        },
+                        opening_message: "worker bootstrap".into(),
+                        task_marker: "task-marker-http".into(),
+                        thread_key: Some("worker:test-http".into()),
+                        open_mode: ManagedChatOpenMode::NewThread,
+                        existing_conversation_url: None,
+                        anchor_session_digest: Some(core_session_digest.clone()),
+                    },
+                },
+                Some("extension-install-a".into()),
+                Some(crate::managed_chat::types::ManagedChatAnchorContext {
+                    conversation_id: core_conversation_id.into(),
+                    conversation_url: format!("https://chatgpt.com/c/{core_conversation_id}"),
+                    project_id: None,
+                    project_url: None,
+                }),
+            )
+            .await
+            .expect("enqueue companion command");
+
+        let command_id = command.id.to_string();
+        let redeem_url = format!("http://{address}{COMPANION_REDEEM_ROUTE}");
+        let redeemed = client
+            .post(&redeem_url)
+            .header(COMPANION_TOKEN_HEADER, &credential)
+            .send()
+            .await
+            .expect("redeem companion command");
+        assert_eq!(redeemed.status(), StatusCode::OK);
+        let redeemed_json = reqwest_response_json(redeemed).await;
+        assert_eq!(
+            redeemed_json.pointer("/command/id").and_then(Value::as_str),
+            Some(command_id.as_str())
+        );
+        assert_eq!(
+            redeemed_json
+                .get("reconcileRequired")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+        let lease_id = redeemed_json
+            .pointer("/command/lease/leaseId")
+            .and_then(Value::as_str)
+            .expect("lease id")
+            .to_string();
+
+        let unauthorized_ack_body = json!({
+            "commandId": command_id,
+            "leaseId": lease_id,
+            "outcome": "succeeded"
+        });
+        let unauthorized_ack = client
+            .post(format!("http://{address}{COMPANION_ACK_ROUTE}"))
+            .header(COMPANION_TOKEN_HEADER, "wrong-credential")
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(reqwest_json_body(&unauthorized_ack_body))
+            .send()
+            .await
+            .expect("send unauthorized ack");
+        assert_eq!(unauthorized_ack.status(), StatusCode::UNAUTHORIZED);
+
+        let send_started_body = json!({
+            "commandId": command.id.to_string(),
+            "leaseId": lease_id
+        });
+        let send_started = client
+            .post(format!("http://{address}{COMPANION_SEND_STARTED_ROUTE}"))
+            .header(COMPANION_TOKEN_HEADER, &credential)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(reqwest_json_body(&send_started_body))
+            .send()
+            .await
+            .expect("mark companion Send started");
+        assert_eq!(send_started.status(), StatusCode::OK);
+
+        let reconcile_ack_body = json!({
+            "commandId": command.id.to_string(),
+            "leaseId": lease_id,
+            "outcome": "needs_reconcile"
+        });
+        let reconcile_ack = client
+            .post(format!("http://{address}{COMPANION_ACK_ROUTE}"))
+            .header(COMPANION_TOKEN_HEADER, &credential)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(reqwest_json_body(&reconcile_ack_body))
+            .send()
+            .await
+            .expect("ack needs reconcile");
+        assert_eq!(reconcile_ack.status(), StatusCode::OK);
+
+        let reconciled = client
+            .post(&redeem_url)
+            .header(COMPANION_TOKEN_HEADER, &credential)
+            .send()
+            .await
+            .expect("redeem reconciliation command");
+        assert_eq!(reconciled.status(), StatusCode::OK);
+        let reconciled_body = reconciled
+            .bytes()
+            .await
+            .expect("read reconcile response body");
+        let reconciled_json: Value =
+            serde_json::from_slice(&reconciled_body).expect("reconcile response json");
+        assert_eq!(
+            reconciled_json
+                .get("reconcileRequired")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        let reconcile_lease = reconciled_json
+            .pointer("/command/lease/leaseId")
+            .and_then(Value::as_str)
+            .expect("reconciliation lease id")
+            .to_string();
+
+        let succeeded_body = json!({
+            "commandId": command.id.to_string(),
+            "leaseId": reconcile_lease,
+            "outcome": "succeeded",
+            "details": "existing task marker was confirmed",
+            "conversationUrl": "https://chatgpt.com/c/aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+        });
+        let succeeded = client
+            .post(format!("http://{address}{COMPANION_ACK_ROUTE}"))
+            .header(COMPANION_TOKEN_HEADER, &credential)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(reqwest_json_body(&succeeded_body))
+            .send()
+            .await
+            .expect("ack reconciled success");
+        assert_eq!(succeeded.status(), StatusCode::OK);
+
+        let empty = client
+            .post(&redeem_url)
+            .header(COMPANION_TOKEN_HEADER, &credential)
+            .send()
+            .await
+            .expect("redeem empty queue");
+        assert_eq!(empty.status(), StatusCode::OK);
+        let empty_body = empty
+            .bytes()
+            .await
+            .expect("read empty redeem response body");
+        let empty_json: Value =
+            serde_json::from_slice(&empty_body).expect("empty redeem response json");
+        assert!(empty_json.get("command").is_some_and(Value::is_null));
+
+        let worker_status = client
+            .get(format!("http://{address}{COMPANION_STATUS_ROUTE}"))
+            .header(COMPANION_TOKEN_HEADER, &credential)
+            .send()
+            .await
+            .expect("read worker-state status before clear");
+        assert_eq!(worker_status.status(), StatusCode::OK);
+        let worker_status_json = reqwest_response_json(worker_status).await;
+        assert_eq!(
+            worker_status_json
+                .get("hasWorkerState")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            worker_status_json
+                .get("workerResetEpoch")
+                .and_then(Value::as_u64),
+            Some(0)
+        );
+
+        worker_broker.fail_next_commit_for_test();
+        let worker_store_failed_clear = client
+            .post(format!("http://{address}{COMPANION_CLEAR_WORKERS_ROUTE}"))
+            .header(COMPANION_TOKEN_HEADER, &credential)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(reqwest_json_body(&json!({})))
+            .send()
+            .await
+            .expect("inject global clear failure before browser reset publication");
+        assert_eq!(
+            worker_store_failed_clear.status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert!(
+            worker_broker
+                .family_for_anchor(&workspace_id, &core_identity)
+                .await
+                .expect("read family after worker-store clear failure")
+                .is_some(),
+            "worker history must remain when its clear commit fails"
+        );
+        assert!(
+            managed_chat_broker
+                .snapshot()
+                .await
+                .commands
+                .contains_key(&command.id),
+            "managed command must remain untouched when worker-store clear fails"
+        );
+        let status_after_worker_store_failure = client
+            .get(format!("http://{address}{COMPANION_STATUS_ROUTE}"))
+            .header(COMPANION_TOKEN_HEADER, &credential)
+            .send()
+            .await
+            .expect("read reset epoch after worker-store clear failure");
+        let status_after_worker_store_failure =
+            reqwest_response_json(status_after_worker_store_failure).await;
+        assert_eq!(
+            status_after_worker_store_failure
+                .get("workerResetEpoch")
+                .and_then(Value::as_u64),
+            Some(0),
+            "a failed worker-store clear must not publish a reset that erases browser bindings"
+        );
+
+        managed_chat_broker.fail_next_commit_for_test();
+        let interrupted_clear = client
+            .post(format!("http://{address}{COMPANION_CLEAR_WORKERS_ROUTE}"))
+            .header(COMPANION_TOKEN_HEADER, &credential)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(reqwest_json_body(&json!({})))
+            .send()
+            .await
+            .expect("inject global clear failure after worker-store commit");
+        assert_eq!(
+            interrupted_clear.status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert!(
+            worker_broker
+                .family_for_anchor(&workspace_id, &core_identity)
+                .await
+                .expect("read family after interrupted clear")
+                .is_none(),
+            "worker store must commit first so a managed-store failure cannot strand live worker state"
+        );
+        assert!(
+            managed_chat_broker
+                .snapshot()
+                .await
+                .commands
+                .contains_key(&command.id),
+            "terminal managed command must remain retryable after injected persistence failure"
+        );
+        let status_after_interrupted_clear = client
+            .get(format!("http://{address}{COMPANION_STATUS_ROUTE}"))
+            .header(COMPANION_TOKEN_HEADER, &credential)
+            .send()
+            .await
+            .expect("read reset epoch after interrupted clear");
+        let status_after_interrupted_clear =
+            reqwest_response_json(status_after_interrupted_clear).await;
+        assert_eq!(
+            status_after_interrupted_clear
+                .get("workerResetEpoch")
+                .and_then(Value::as_u64),
+            Some(1),
+            "reset epoch must publish before later destructive store cleanup can fail"
+        );
+
+        let cleared = client
+            .post(format!("http://{address}{COMPANION_CLEAR_WORKERS_ROUTE}"))
+            .header(COMPANION_TOKEN_HEADER, &credential)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(reqwest_json_body(&json!({})))
+            .send()
+            .await
+            .expect("retry interrupted global worker clear");
+        assert_eq!(cleared.status(), StatusCode::OK);
+        let cleared_json = reqwest_response_json(cleared).await;
+        assert_eq!(
+            cleared_json.get("cleared").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            cleared_json.get("workerResetEpoch").and_then(Value::as_u64),
+            Some(2)
+        );
+        assert!(
+            cleared_json
+                .get("commandIds")
+                .and_then(Value::as_array)
+                .is_some_and(|ids| ids
+                    .iter()
+                    .any(|id| id.as_str() == Some(command_id.as_str())))
+        );
+
+        let cleared_retry = client
+            .post(format!("http://{address}{COMPANION_CLEAR_WORKERS_ROUTE}"))
+            .header(COMPANION_TOKEN_HEADER, &credential)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(reqwest_json_body(&json!({})))
+            .send()
+            .await
+            .expect("retry global clear after response loss");
+        assert_eq!(cleared_retry.status(), StatusCode::OK);
+        let cleared_retry_json = reqwest_response_json(cleared_retry).await;
+        assert_eq!(
+            cleared_retry_json
+                .get("alreadyCleared")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            cleared_retry_json
+                .get("workerResetEpoch")
+                .and_then(Value::as_u64),
+            Some(3)
+        );
+
+        let removed_retry_endpoint = client
+            .post(format!(
+                "http://{address}/__moondesk/companion/v1/commands/retry"
+            ))
+            .header(COMPANION_TOKEN_HEADER, &credential)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(reqwest_json_body(
+                &json!({ "commandId": command.id.to_string() }),
+            ))
+            .send()
+            .await
+            .expect("probe removed companion retry endpoint");
+        assert_eq!(removed_retry_endpoint.status(), StatusCode::NOT_FOUND);
+        server.abort();
+        let _ = server.await;
         let _ = std::fs::remove_dir_all(config_root);
         let _ = std::fs::remove_dir_all(workspace_root);
     }
@@ -3384,5 +5886,195 @@ document.getElementById('hidden-upload').addEventListener('change',event=>{docum
         let _ = std::fs::remove_dir_all(workspace_root);
         let _ = std::fs::remove_dir_all(workspace_b_root);
         let _ = std::fs::remove_dir_all(config_root);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "manual signed-in ChatGPT worker companion E2E host"]
+    async fn worker_companion_manual_e2e_host() {
+        use crate::managed_chat::types::ManagedChatCommandState;
+        use std::time::Duration;
+
+        let repo_root = std::env::current_dir().expect("resolve E2E repo root");
+        let runtime_root = repo_root.join("target").join("worker-companion-e2e");
+        std::fs::create_dir_all(&runtime_root).expect("create worker companion E2E runtime");
+        for control in ["enqueue", "reuse", "stop"] {
+            let _ = std::fs::remove_file(runtime_root.join(control));
+        }
+        let workspace_root = runtime_root.join("workspace");
+        let config_root = runtime_root.join("config");
+        let config_path = config_root.join("config.toml");
+        std::fs::create_dir_all(&workspace_root).expect("create E2E workspace");
+        std::fs::create_dir_all(&config_root).expect("create E2E config root");
+
+        let app = AppState::new_for_test(
+            3211,
+            workspace_root.to_string_lossy().into_owned(),
+            config_path,
+        )
+        .expect("create E2E app state");
+        let workspace_id = app.workspaces[0].id.clone();
+        let managed_chat_broker = app.managed_chat_broker.clone();
+        let companion_auth = app.companion_auth.clone();
+        let app_state = Arc::new(Mutex::new(app));
+        let (ui_tx, _ui_rx) = ui_event_channel();
+        let e2e_router = companion_bridge_router(
+            app_state.clone(),
+            None,
+            CommandJobManager::new(),
+            ui_tx,
+            Arc::from("unused-host-token"),
+        );
+        let mut bound = None;
+        for port in COMPANION_BRIDGE_PORTS {
+            if let Ok(listener) = tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
+                bound = Some((port, listener));
+                break;
+            }
+        }
+        let (bridge_port, listener) =
+            bound.expect("bind worker companion E2E bridge on a companion port");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, e2e_router)
+                .await
+                .expect("serve worker companion E2E host");
+        });
+
+        println!("MOONDESK_WORKER_E2E_READY=http://127.0.0.1:{bridge_port}");
+        println!("MOONDESK_WORKER_E2E_WORKSPACE_ID={workspace_id}");
+        println!(
+            "MOONDESK_WORKER_E2E_CONTROLS={}",
+            runtime_root.to_string_lossy()
+        );
+        println!(
+            "The companion should auto-connect. Focus the ChatGPT Core conversation in the browser being tested, then create enqueue; create reuse after launch #1 succeeds; create stop to exit."
+        );
+
+        let first_marker = "moondesk-worker-e2e-first-20260917";
+        let second_marker = "moondesk-worker-e2e-reuse-20260917";
+        let thread_key = "worker:e2e-browser-thread";
+        let mut first_command_id: Option<crate::managed_chat::types::ManagedChatCommandId> = None;
+        let mut second_command_id: Option<crate::managed_chat::types::ManagedChatCommandId> = None;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30 * 60);
+
+        loop {
+            let snapshot = managed_chat_broker.snapshot().await;
+            let presence = companion_auth.fresh_presence(unix_time_ms()).await;
+            let paired_clients = companion_auth.paired_client_ids().await;
+            let status = serde_json::json!({
+                "workspaceId": workspace_id,
+                "firstCommandId": first_command_id,
+                "secondCommandId": second_command_id,
+                "pairedClients": paired_clients,
+                "presence": presence,
+                "commands": snapshot.commands,
+            });
+            std::fs::write(
+                runtime_root.join("status.json"),
+                serde_json::to_vec_pretty(&status).expect("serialize E2E status"),
+            )
+            .expect("write E2E status");
+
+            if runtime_root.join("stop").exists() || tokio::time::Instant::now() >= deadline {
+                break;
+            }
+
+            if first_command_id.is_none() && runtime_root.join("enqueue").exists() {
+                let (profile, companion_auth) = {
+                    let app = app_state.lock().await;
+                    (
+                        app.worker_execution_profile.clone(),
+                        app.companion_auth.clone(),
+                    )
+                };
+                match companion_auth.focused_anchor_route().await {
+                    Ok(Some(route)) => {
+                        let anchor_context = crate::managed_chat::types::ManagedChatAnchorContext {
+                            conversation_id: route.tab.conversation_id.clone(),
+                            conversation_url: route.tab.conversation_url.clone(),
+                            project_id: route.tab.project_id.clone(),
+                            project_url: route.tab.project_url.clone(),
+                        };
+                        let command = managed_chat_broker
+                            .enqueue_with_route(
+                                EnqueueManagedChatRequest {
+                                    dedupe_key: "worker:e2e-browser-thread:task:first".into(),
+                                    launch: ManagedChatLaunch {
+                                        workspace_id: workspace_id.clone(),
+                                        purpose: ManagedChatPurpose::Worker,
+                                        execution_profile: profile,
+                                        opening_message: format!(
+                                            "MoonDesk Worker Companion signed-in browser E2E probe.\n\nMarker: {first_marker}\n\nDo not use tools and do not modify anything. Reply exactly: MoonDesk worker companion E2E first launch received."
+                                        ),
+                                        task_marker: first_marker.into(),
+                                        thread_key: Some(thread_key.into()),
+                                        open_mode: ManagedChatOpenMode::NewThread,
+                        existing_conversation_url: None,
+                                        anchor_session_digest: None,
+                                    },
+                                },
+                                Some(route.client_id.clone()),
+                                Some(anchor_context),
+                            )
+                            .await
+                            .expect("enqueue first E2E launch");
+                        println!(
+                            "MOONDESK_WORKER_E2E_FIRST_ROUTE=client:{} conversation:{} project:{}",
+                            route.client_id,
+                            route.tab.conversation_id,
+                            route.tab.project_id.as_deref().unwrap_or("normal-chat")
+                        );
+                        println!("MOONDESK_WORKER_E2E_FIRST_COMMAND={}", command.id);
+                        first_command_id = Some(command.id);
+                        let _ = std::fs::remove_file(runtime_root.join("enqueue"));
+                    }
+                    Ok(None) => {}
+                    Err(error) => println!("MOONDESK_WORKER_E2E_ROUTE_WAIT={error}"),
+                }
+            }
+
+            if second_command_id.is_none() && runtime_root.join("reuse").exists() {
+                let first_succeeded = first_command_id.as_ref().is_some_and(|command_id| {
+                    snapshot
+                        .commands
+                        .get(command_id)
+                        .is_some_and(|command| command.state == ManagedChatCommandState::Succeeded)
+                });
+                if first_succeeded {
+                    let profile = app_state.lock().await.worker_execution_profile.clone();
+                    let command = managed_chat_broker
+                        .enqueue(EnqueueManagedChatRequest {
+                            dedupe_key: "worker:e2e-browser-thread:task:reuse".into(),
+                            launch: ManagedChatLaunch {
+                                workspace_id: workspace_id.clone(),
+                                purpose: ManagedChatPurpose::Worker,
+                                execution_profile: profile,
+                                opening_message: format!(
+                                    "MoonDesk Worker Companion reuse E2E probe.\n\nMarker: {second_marker}\n\nThis must be sent in the same existing ChatGPT conversation as the first probe. Do not use tools. Reply exactly: MoonDesk worker companion E2E reused thread received."
+                                ),
+                                task_marker: second_marker.into(),
+                                thread_key: Some(thread_key.into()),
+                                open_mode: ManagedChatOpenMode::ExistingThread,
+                                existing_conversation_url: first_command_id
+                                    .as_ref()
+                                    .and_then(|command_id| snapshot.commands.get(command_id))
+                                    .and_then(|command| command.terminal.as_ref())
+                                    .and_then(|terminal| terminal.conversation_url.clone()),
+                                anchor_session_digest: None,
+                            },
+                        })
+                        .await
+                        .expect("enqueue reused-thread E2E launch");
+                    println!("MOONDESK_WORKER_E2E_REUSE_COMMAND={}", command.id);
+                    second_command_id = Some(command.id);
+                    let _ = std::fs::remove_file(runtime_root.join("reuse"));
+                }
+            }
+
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+
+        server.abort();
+        let _ = server.await;
+        println!("MOONDESK_WORKER_E2E_STOPPED");
     }
 }

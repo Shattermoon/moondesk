@@ -5,7 +5,10 @@ mod browser_runtime;
 mod clippymoon_gen;
 mod command;
 mod command_jobs;
+mod companion;
+mod companion_install;
 mod handoff;
+mod managed_chat;
 
 mod macos_terminal;
 mod mascot;
@@ -18,10 +21,12 @@ mod terminal_compat;
 mod theme;
 mod update;
 mod vision;
+mod workers;
 mod workspace_tools;
 mod workspaces;
 
 use browser_runtime::{BrowserPresentationChange, BrowserRuntime, DEFAULT_BROWSER_COMMAND_TIMEOUT};
+use command_jobs::CommandJobManager;
 use crossterm::{
     ExecutableCommand,
     event::{
@@ -30,6 +35,7 @@ use crossterm::{
     },
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
+use managed_chat::types::ChatExecutionProfile;
 use mascot::{TUI_MASCOT_BLOCK_HEIGHT, TUI_MASCOT_BLOCK_WIDTH, render_tui_lines};
 use ratatui::{
     prelude::*,
@@ -2237,12 +2243,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Cleanup after the TUI is gone so quit never appears frozen on screen.
     // Stop accepting new MCP work first, then terminate owned command trees and
     // shared host services before finally clearing local runtime status.
-    let (server_handle, command_jobs) = {
+    let (server_handle, companion_server_handle, command_jobs) = {
         let mut app = state.lock().await;
         app.server_running = false;
-        (app.server_handle.take(), app.command_jobs.clone())
+        app.companion_bridge_port = None;
+        (
+            app.server_handle.take(),
+            app.companion_server_handle.take(),
+            app.command_jobs.clone(),
+        )
     };
     if let Some(handle) = server_handle {
+        handle.abort();
+        let _ = handle.await;
+    }
+    if let Some(handle) = companion_server_handle {
         handle.abort();
         let _ = handle.await;
     }
@@ -4136,31 +4151,45 @@ async fn run_settings(
     let browser_presentations = BrowserPresentation::all();
     let config_path_text = app_config_path()?.to_string_lossy().into_owned();
     let mut confirm_reset_token_billing = false;
+    let mut companion_action_notice: Option<String> = None;
+    let mut worker_cleanup_notice: Option<String> = None;
     let mut selected_row = {
         let app = state.lock().await;
         themes.iter().position(|t| t.id == app.theme).unwrap_or(0)
     };
-    let total_rows = themes.len() + tool_modes.len() + browser_presentations.len() + 3;
+    let total_rows = themes.len() + tool_modes.len() + browser_presentations.len() + 8;
 
     loop {
         let (
             current_theme,
             current_tool_mode,
             current_browser_presentation,
+            worker_execution_profile,
+            worker_target_count,
             usage_totals,
             set_moondesk_as_co_author,
             ngrok_authtoken_configured,
             ngrok_domain,
+            companion_pairing_code,
+            companion_directory,
+            companion_materialize_error,
         ) = {
             let app = state.lock().await;
             (
                 app.current_theme(),
                 app.tool_mode,
                 app.browser_presentation,
+                app.worker_execution_profile.clone(),
+                app.worker_target_count,
                 app.all_time_usage_totals(),
                 app.set_moondesk_as_co_author,
                 app.ngrok_authtoken().is_some(),
                 app.ngrok_domain.clone(),
+                app.companion_auth.pairing_token(),
+                app.companion_directory
+                    .as_ref()
+                    .map(|path| path.to_string_lossy().into_owned()),
+                app.companion_materialize_error.clone(),
             )
         };
         terminal.draw(|f| {
@@ -4170,6 +4199,13 @@ async fn run_settings(
                     current_theme,
                     current_tool_mode,
                     current_browser_presentation,
+                    worker_execution_profile: &worker_execution_profile,
+                    worker_target_count,
+                    companion_pairing_code: &companion_pairing_code,
+                    companion_directory: companion_directory.as_deref(),
+                    companion_materialize_error: companion_materialize_error.as_deref(),
+                    companion_action_notice: companion_action_notice.as_deref(),
+                    worker_cleanup_notice: worker_cleanup_notice.as_deref(),
                     set_moondesk_as_co_author,
                     ngrok_authtoken_configured,
                     ngrok_domain: ngrok_domain.as_deref(),
@@ -4241,6 +4277,117 @@ async fn run_settings(
                                 app.mark_config_dirty();
                             }
                         } else if selected_row == settings_action_start {
+                            let current_model = app.worker_execution_profile.model_label.clone();
+                            drop(app);
+                            if let Some(model) = run_prompt(
+                                terminal,
+                                current_theme.palette,
+                                "Worker ChatGPT model (must exactly match an available model):",
+                                &current_model,
+                            )
+                            .await?
+                            {
+                                let model = model.trim();
+                                if model.is_empty() || model.len() > 128 {
+                                    state.lock().await.log(
+                                        "WARN",
+                                        "Worker model must contain 1..=128 characters".into(),
+                                    );
+                                    continue;
+                                }
+                                let mut app = state.lock().await;
+                                app.worker_execution_profile.model_key = model.to_string();
+                                app.worker_execution_profile.model_label = model.to_string();
+                                app.log("INFO", format!("Worker model: {model}"));
+                                app.mark_config_dirty();
+                            }
+                        } else if selected_row == settings_action_start + 1 {
+                            app.worker_execution_profile.reasoning_effort =
+                                app.worker_execution_profile.reasoning_effort.next();
+                            let effort = app.worker_execution_profile.reasoning_effort;
+                            app.log(
+                                "INFO",
+                                format!("Worker reasoning effort: {}", effort.label()),
+                            );
+                            app.mark_config_dirty();
+                        } else if selected_row == settings_action_start + 2 {
+                            app.worker_target_count =
+                                if app.worker_target_count >= workers::MAX_WORKERS_PER_FAMILY {
+                                    1
+                                } else {
+                                    app.worker_target_count + 1
+                                };
+                            let count = app.worker_target_count;
+                            app.log("INFO", format!("Worker target count: {count}"));
+                            app.mark_config_dirty();
+                        } else if selected_row == settings_action_start + 3 {
+                            let installation_token =
+                                app.companion_auth.installation_token().to_string();
+                            drop(app);
+
+                            let config_path = app_config_path()?;
+                            // Startup already synchronizes this folder. Re-materialize here as a
+                            // repair path too, so opening Settings can recover a file damaged after
+                            // startup and refresh the private installation capability.
+                            let result = companion_install::materialize_for_config(
+                                &config_path,
+                                &installation_token,
+                            )
+                            .map(|install| install.directory);
+                            match result {
+                                Ok(directory) => {
+                                    {
+                                        let mut app = state.lock().await;
+                                        app.companion_directory = Some(directory.clone());
+                                        app.companion_materialize_error = None;
+                                        app.log(
+                                            "INFO",
+                                            format!(
+                                                "Optional Worker Companion ready at {}",
+                                                directory.to_string_lossy()
+                                            ),
+                                        );
+                                    }
+                                    match companion_install::open_folder(&directory) {
+                                        Ok(()) => {
+                                            companion_action_notice = Some(
+                                                "Worker Companion folder opened. Use this folder with Developer mode -> Load unpacked."
+                                                    .into(),
+                                            );
+                                        }
+                                        Err(error) => {
+                                            companion_action_notice = Some(format!(
+                                                "Could not open Worker Companion folder: {error}"
+                                            ));
+                                            state.lock().await.log("WARN", error);
+                                        }
+                                    }
+                                }
+                                Err(error) => {
+                                    companion_action_notice = Some(format!(
+                                        "Could not prepare optional Worker Companion: {error}"
+                                    ));
+                                    let mut app = state.lock().await;
+                                    app.companion_materialize_error = Some(error.to_string());
+                                    app.log(
+                                        "WARN",
+                                        format!(
+                                            "Could not prepare optional Worker Companion: {error}"
+                                        ),
+                                    );
+                                }
+                            }
+                        } else if selected_row == settings_action_start + 4 {
+                            drop(app);
+                            worker_cleanup_notice = Some(
+                                run_inactive_worker_capacity_cleanup(
+                                    terminal,
+                                    state.clone(),
+                                    current_theme.palette,
+                                )
+                                .await?,
+                            );
+                        } else if selected_row == settings_action_start + 5 {
                             app.set_moondesk_as_co_author = !app.set_moondesk_as_co_author;
                             let enabled = app.set_moondesk_as_co_author;
                             app.log(
@@ -4251,11 +4398,11 @@ async fn run_settings(
                                 ),
                             );
                             app.mark_config_dirty();
-                        } else if selected_row == settings_action_start + 1 {
+                        } else if selected_row == settings_action_start + 6 {
                             drop(app);
                             let _ =
                                 run_ngrok_auth_setup(terminal, state.clone(), None, true).await?;
-                        } else if selected_row == settings_action_start + 2 {
+                        } else if selected_row == settings_action_start + 7 {
                             let previous_domain = app.ngrok_domain.clone();
                             let current_domain = previous_domain.clone().unwrap_or_default();
                             drop(app);
@@ -4332,10 +4479,147 @@ async fn run_settings(
     }
 }
 
+async fn run_inactive_worker_capacity_cleanup(
+    terminal: &mut Terminal<AppTerminalBackend>,
+    state: SharedState,
+    palette: theme::Palette,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let (workspaces, worker_broker, managed_chat_broker) = {
+        let app = state.lock().await;
+        (
+            app.workspaces.clone(),
+            app.worker_broker.clone(),
+            app.managed_chat_broker.clone(),
+        )
+    };
+    if workspaces.is_empty() {
+        return Ok("No registered workspace is available for Worker cleanup.".into());
+    }
+
+    let initial = if workspaces.len() == 1 {
+        workspaces[0].name.as_str()
+    } else {
+        ""
+    };
+    let Some(selection) = run_prompt(
+        terminal,
+        palette,
+        "Workspace name or UUID for inactive Worker cleanup (Esc cancels):",
+        initial,
+    )
+    .await?
+    else {
+        return Ok("Inactive Worker cleanup cancelled.".into());
+    };
+    let selection = selection.trim();
+    if selection.is_empty() {
+        return Ok("Inactive Worker cleanup cancelled.".into());
+    }
+
+    let workspace = if let Some(workspace) = workspaces
+        .iter()
+        .find(|workspace| workspace.id.as_str() == selection)
+    {
+        workspace.clone()
+    } else {
+        let matches = workspaces
+            .iter()
+            .filter(|workspace| workspace.name.eq_ignore_ascii_case(selection))
+            .cloned()
+            .collect::<Vec<_>>();
+        match matches.as_slice() {
+            [workspace] => workspace.clone(),
+            [] => {
+                return Ok(format!(
+                    "No registered workspace matches '{selection}'. Use the exact workspace name or UUID."
+                ));
+            }
+            _ => {
+                return Ok(format!(
+                    "Multiple workspaces match '{selection}'. Retry with the workspace UUID."
+                ));
+            }
+        }
+    };
+
+    let preview = match worker_broker
+        .inactive_cleanup_preview_for_workspace(&workspace.id)
+        .await
+    {
+        Ok(preview) => preview,
+        Err(error) => {
+            let message = format!("Could not inspect inactive Workers: {error}");
+            state.lock().await.log("WARN", message.clone());
+            return Ok(message);
+        }
+    };
+    if preview.summary.family_count == 0 {
+        return Ok(format!(
+            "No inactive Worker families in '{}' are safe to release. Active/ambiguous work and uncollected results remain protected.",
+            workspace.name
+        ));
+    }
+
+    let replay_warning = if preview.summary.replay_receipt_count == 0 {
+        String::new()
+    } else {
+        format!(
+            " This also discards {} retained collect replay receipt(s) for those inactive families.",
+            preview.summary.replay_receipt_count
+        )
+    };
+    let confirmation_prompt = format!(
+        "Type CLEANUP to release {} inactive Core family/families ({} worker record(s)) from '{}'. ChatGPT conversations are preserved; retained terminal MoonDesk launch history for those families is also removed.{}",
+        preview.summary.family_count, preview.summary.worker_count, workspace.name, replay_warning
+    );
+    let Some(confirmation) = run_prompt(terminal, palette, &confirmation_prompt, "").await? else {
+        return Ok("Inactive Worker cleanup cancelled.".into());
+    };
+    if confirmation.trim() != "CLEANUP" {
+        return Ok("Inactive Worker cleanup cancelled; type CLEANUP exactly to confirm.".into());
+    }
+
+    let removed = match workers::protocol::cleanup_inactive_capacity_for_workspace(
+        &workspace.id,
+        &preview,
+        worker_broker.as_ref(),
+        managed_chat_broker.as_ref(),
+    )
+    .await
+    {
+        Ok(removed) => removed,
+        Err(error) => {
+            let message = format!("Inactive Worker cleanup failed safely: {error}");
+            state.lock().await.log("WARN", message.clone());
+            return Ok(message);
+        }
+    };
+    let message = if removed.family_count == 0 {
+        format!(
+            "No inactive Worker families in '{}' remained eligible when cleanup committed.",
+            workspace.name
+        )
+    } else {
+        format!(
+            "Released {} inactive Core family/families and {} Worker record(s) from '{}'. ChatGPT conversations were not deleted.",
+            removed.family_count, removed.worker_count, workspace.name
+        )
+    };
+    state.lock().await.log("INFO", message.clone());
+    Ok(message)
+}
+
 struct SettingsView<'a> {
     current_theme: &'a theme::ThemeDef,
     current_tool_mode: ToolMode,
     current_browser_presentation: BrowserPresentation,
+    worker_execution_profile: &'a ChatExecutionProfile,
+    worker_target_count: usize,
+    companion_pairing_code: &'a str,
+    companion_directory: Option<&'a str>,
+    companion_materialize_error: Option<&'a str>,
+    companion_action_notice: Option<&'a str>,
+    worker_cleanup_notice: Option<&'a str>,
     set_moondesk_as_co_author: bool,
     ngrok_authtoken_configured: bool,
     ngrok_domain: Option<&'a str>,
@@ -4350,6 +4634,13 @@ fn draw_settings(f: &mut Frame, view: SettingsView<'_>) {
         current_theme,
         current_tool_mode,
         current_browser_presentation,
+        worker_execution_profile,
+        worker_target_count,
+        companion_pairing_code,
+        companion_directory,
+        companion_materialize_error,
+        companion_action_notice,
+        worker_cleanup_notice,
         set_moondesk_as_co_author,
         ngrok_authtoken_configured,
         ngrok_domain,
@@ -4512,7 +4803,187 @@ fn draw_settings(f: &mut Frame, view: SettingsView<'_>) {
         )]));
     }
 
-    let co_author_row = themes.len() + tool_modes.len() + browser_presentations.len();
+    let worker_model_row = themes.len() + tool_modes.len() + browser_presentations.len();
+    let worker_effort_row = worker_model_row + 1;
+    let worker_count_row = worker_effort_row + 1;
+    let worker_model_selected = worker_model_row == selected_row;
+    let worker_effort_selected = worker_effort_row == selected_row;
+    let worker_count_selected = worker_count_row == selected_row;
+    let worker_setup_row = worker_count_row + 1;
+    let worker_cleanup_row = worker_setup_row + 1;
+    let worker_setup_selected = worker_setup_row == selected_row;
+    let worker_cleanup_selected = worker_cleanup_row == selected_row;
+    let worker_model_style = if worker_model_selected {
+        Style::default()
+            .fg(palette.key_fg)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(palette.primary_fg)
+    };
+    let worker_effort_style = if worker_effort_selected {
+        Style::default()
+            .fg(palette.key_fg)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(palette.primary_fg)
+    };
+    let worker_count_style = if worker_count_selected {
+        Style::default()
+            .fg(palette.key_fg)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(palette.primary_fg)
+    };
+    let worker_setup_style = if worker_setup_selected {
+        Style::default()
+            .fg(palette.key_fg)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(palette.primary_fg)
+    };
+    let worker_cleanup_style = if worker_cleanup_selected {
+        Style::default()
+            .fg(palette.key_fg)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(palette.primary_fg)
+    };
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  Workers (experimental)",
+        Style::default()
+            .fg(palette.title_fg)
+            .add_modifier(Modifier::BOLD),
+    )));
+    if worker_model_selected {
+        selected_line_idx = lines.len();
+    }
+    lines.push(Line::from(Span::styled(
+        format!(
+            " {} [{}] Default model: {}",
+            if worker_model_selected { ">" } else { " " },
+            worker_model_row + 1,
+            worker_execution_profile.model_label
+        ),
+        worker_model_style,
+    )));
+    if worker_effort_selected {
+        selected_line_idx = lines.len();
+    }
+    lines.push(Line::from(Span::styled(
+        format!(
+            " {} [{}] Reasoning effort: {}",
+            if worker_effort_selected { ">" } else { " " },
+            worker_effort_row + 1,
+            worker_execution_profile.reasoning_effort.label()
+        ),
+        worker_effort_style,
+    )));
+    if worker_count_selected {
+        selected_line_idx = lines.len();
+    }
+    lines.push(Line::from(Span::styled(
+        format!(
+            " {} [{}] Worker count: {} (recommended 1-{}, max {})",
+            if worker_count_selected { ">" } else { " " },
+            worker_count_row + 1,
+            worker_target_count,
+            workers::RECOMMENDED_WORKERS_PER_FAMILY,
+            workers::MAX_WORKERS_PER_FAMILY
+        ),
+        worker_count_style,
+    )));
+    lines.push(Line::from(Span::styled(
+        "     5-8 workers can hit ChatGPT/provider rate limits, especially with other active chats.",
+        Style::default().fg(palette.muted_fg),
+    )));
+    lines.push(Line::from(Span::styled(
+        "     Worker Companion is optional. MoonDesk works normally without it; only Workers need it.",
+        Style::default().fg(palette.muted_fg),
+    )));
+    lines.push(Line::from(Span::styled(
+        "     Setup: chrome://extensions (or edge://extensions / brave://extensions) -> Developer mode -> Load unpacked.",
+        Style::default().fg(palette.muted_fg),
+    )));
+    lines.push(Line::from(Span::styled(
+        "     MoonDesk keeps the unpacked companion files synchronized automatically on startup.",
+        Style::default().fg(palette.muted_fg),
+    )));
+    if worker_setup_selected {
+        selected_line_idx = lines.len();
+    }
+    lines.push(Line::from(Span::styled(
+        format!(
+            " {} [{}] {}",
+            if worker_setup_selected { ">" } else { " " },
+            worker_setup_row + 1,
+            if companion_directory.is_some() {
+                "Open Worker Companion folder"
+            } else {
+                "Prepare Worker Companion folder"
+            }
+        ),
+        worker_setup_style,
+    )));
+    match (companion_directory, companion_materialize_error) {
+        (Some(directory), _) => {
+            lines.push(Line::from(Span::styled(
+                format!("     Developer mode -> Load unpacked -> {directory}"),
+                Style::default().fg(palette.muted_fg),
+            )));
+        }
+        (None, Some(error)) => lines.push(Line::from(Span::styled(
+            format!("     Companion folder unavailable: {error}"),
+            Style::default().fg(palette.danger_fg),
+        ))),
+        (None, None) => lines.push(Line::from(Span::styled(
+            "     Companion folder is not prepared yet.",
+            Style::default().fg(palette.muted_fg),
+        ))),
+    }
+    if let Some(notice) = companion_action_notice {
+        lines.push(Line::from(Span::styled(
+            format!("     {notice}"),
+            Style::default().fg(if notice.starts_with("Could not") {
+                palette.danger_fg
+            } else {
+                palette.success_fg
+            }),
+        )));
+    }
+    lines.push(Line::from(Span::styled(
+        format!("     Manual repair code: {companion_pairing_code}"),
+        Style::default().fg(palette.muted_fg),
+    )));
+    if worker_cleanup_selected {
+        selected_line_idx = lines.len();
+    }
+    lines.push(Line::from(Span::styled(
+        format!(
+            " {} [{}] Release inactive Worker capacity",
+            if worker_cleanup_selected { ">" } else { " " },
+            worker_cleanup_row + 1
+        ),
+        worker_cleanup_style,
+    )));
+    lines.push(Line::from(Span::styled(
+        "     Host-local cleanup for inaccessible old Cores. Only inactive families with no active/ambiguous work or uncollected results are eligible; ChatGPT chats are preserved.",
+        Style::default().fg(palette.muted_fg),
+    )));
+    if let Some(notice) = worker_cleanup_notice {
+        lines.push(Line::from(Span::styled(
+            format!("     {notice}"),
+            Style::default().fg(
+                if notice.contains("failed") || notice.starts_with("Could not") {
+                    palette.danger_fg
+                } else {
+                    palette.success_fg
+                },
+            ),
+        )));
+    }
+
+    let co_author_row = worker_cleanup_row + 1;
     let co_author_selected = co_author_row == selected_row;
     let co_author_marker = if co_author_selected { ">" } else { " " };
     let co_author_name_style = if co_author_selected {
@@ -4847,9 +5318,10 @@ async fn wait_for_local_server_ready(port: u16) -> bool {
 }
 
 async fn handle_mcp_server_exit(state: SharedState, result: Result<(), std::io::Error>) {
-    {
+    let companion_handle = {
         let mut app = state.lock().await;
         app.server_running = false;
+        app.companion_bridge_port = None;
         match result {
             Ok(()) => app.log("WARN", "MCP server exited".into()),
             Err(error) => app.log("ERROR", format!("MCP server failed: {error}")),
@@ -4860,17 +5332,82 @@ async fn handle_mcp_server_exit(state: SharedState, result: Result<(), std::io::
                 "Stopping ngrok because the local MCP server is unavailable".into(),
             );
         }
+        app.companion_server_handle.take()
+    };
+    if let Some(handle) = companion_handle {
+        handle.abort();
+        let _ = handle.await;
     }
     ngrok::stop(state).await;
+}
+
+async fn start_companion_bridge(
+    state: SharedState,
+    browser_runtime: Option<Arc<BrowserRuntime>>,
+    command_jobs: CommandJobManager,
+    ui_events: UiEventSender,
+    host_control_token: Arc<str>,
+) -> Result<u16, String> {
+    let mut last_error = None;
+    for port in server::COMPANION_BRIDGE_PORTS {
+        match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
+            Ok(listener) => {
+                let router = server::companion_bridge_router(
+                    state.clone(),
+                    browser_runtime,
+                    command_jobs,
+                    ui_events,
+                    host_control_token,
+                );
+                let bridge_state = state.clone();
+                let handle = tokio::spawn(async move {
+                    let result = axum::serve(listener, router).await;
+                    let mut app = bridge_state.lock().await;
+                    app.companion_bridge_port = None;
+                    match result {
+                        Ok(()) => app.log("WARN", "Worker companion bridge exited".into()),
+                        Err(error) => {
+                            app.log("ERROR", format!("Worker companion bridge failed: {error}"))
+                        }
+                    }
+                });
+                let mut app = state.lock().await;
+                app.companion_bridge_port = Some(port);
+                app.companion_server_handle = Some(handle);
+                app.log(
+                    "INFO",
+                    format!("Worker companion bridge started on 127.0.0.1:{port}"),
+                );
+                return Ok(port);
+            }
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(format!(
+        "could not bind any worker companion bridge port ({:?}): {}",
+        server::COMPANION_BRIDGE_PORTS,
+        last_error
+            .map(|error| error.to_string())
+            .unwrap_or_else(|| "no port candidates".into())
+    ))
 }
 
 async fn start_services(
     state: SharedState,
     ui_events: UiEventSender,
 ) -> Result<StartedServices, String> {
-    let (port, mode) = {
+    let (port, mode, workspace_ids, worker_broker, managed_chat_broker) = {
         let app = state.lock().await;
-        (app.port, app.mode)
+        (
+            app.port,
+            app.mode,
+            app.workspaces
+                .iter()
+                .map(|workspace| workspace.id.clone())
+                .collect::<Vec<_>>(),
+            app.worker_broker.clone(),
+            app.managed_chat_broker.clone(),
+        )
     };
 
     // Reserve the HTTP port before creating host services. A second MoonDesk instance should
@@ -4889,6 +5426,22 @@ async fn start_services(
             return Err(message);
         }
     };
+
+    // Only the instance that owns the local service port may reconcile durable Worker state. This
+    // keeps a second MoonDesk launch from mutating the shared stores before it discovers the
+    // already-running host.
+    if let Err(error) = workers::protocol::recover_registered_workspaces(
+        &workspace_ids,
+        &worker_broker,
+        &managed_chat_broker,
+    )
+    .await
+    {
+        state.lock().await.log(
+            "WARN",
+            format!("Worker launch recovery did not fully complete at startup: {error}"),
+        );
+    }
 
     if mode.browser_enabled() {
         state.lock().await.log(
@@ -4911,9 +5464,9 @@ async fn start_services(
     let router = server::router(
         state.clone(),
         browser_runtime.clone(),
-        command_jobs,
-        ui_events,
-        host_control_token,
+        command_jobs.clone(),
+        ui_events.clone(),
+        host_control_token.clone(),
     );
     let server_state = state.clone();
     let handle = tokio::spawn(async move {
@@ -4947,6 +5500,21 @@ async fn start_services(
         "INFO",
         format!("Local MCP health check passed on 127.0.0.1:{port}"),
     );
+
+    if let Err(error) = start_companion_bridge(
+        state.clone(),
+        browser_runtime.clone(),
+        command_jobs,
+        ui_events,
+        host_control_token,
+    )
+    .await
+    {
+        state.lock().await.log(
+            "WARN",
+            format!("Worker companion bridge unavailable: {error}"),
+        );
+    }
 
     // Start ngrok only after the local HTTP server has answered its health probe.
     let ngrok_start_error = match ngrok::start(state.clone()).await {
@@ -8380,6 +8948,9 @@ mod tests {
         let tunnel_task = tokio::spawn(async {
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
         });
+        let companion_task = tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        });
         {
             let mut app = state.lock().await;
             app.server_running = true;
@@ -8387,6 +8958,8 @@ mod tests {
             app.ngrok_url = Some("https://test.ngrok.app".into());
             app.remote_connected = true;
             app.ngrok_task = Some(tunnel_task);
+            app.companion_bridge_port = Some(crate::server::COMPANION_BRIDGE_PORTS[0]);
+            app.companion_server_handle = Some(companion_task);
         }
 
         handle_mcp_server_exit(state.clone(), Ok(())).await;
@@ -8398,6 +8971,8 @@ mod tests {
             assert!(app.ngrok_url.is_none());
             assert!(!app.remote_connected);
             assert!(app.ngrok_task.is_none());
+            assert!(app.companion_bridge_port.is_none());
+            assert!(app.companion_server_handle.is_none());
             assert!(app.logs.iter().any(|entry| {
                 entry
                     .message
@@ -10233,6 +10808,15 @@ mod tests {
                             current_theme: theme,
                             current_tool_mode: tool_mode,
                             current_browser_presentation: super::BrowserPresentation::Headless,
+                            worker_execution_profile: &super::ChatExecutionProfile::default(),
+                            worker_target_count: crate::workers::RECOMMENDED_WORKERS_PER_FAMILY,
+                            companion_pairing_code: "test-pairing-code",
+                            companion_directory: Some(
+                                r"C:\Users\tester\.moondesk\worker-companion",
+                            ),
+                            companion_action_notice: None,
+                            companion_materialize_error: None,
+                            worker_cleanup_notice: None,
                             set_moondesk_as_co_author: false,
                             ngrok_authtoken_configured: false,
                             ngrok_domain: None,
@@ -10264,6 +10848,13 @@ mod tests {
                         current_theme: theme,
                         current_tool_mode: tool_mode,
                         current_browser_presentation: super::BrowserPresentation::Visible,
+                        worker_execution_profile: &super::ChatExecutionProfile::default(),
+                        worker_target_count: crate::workers::RECOMMENDED_WORKERS_PER_FAMILY,
+                        companion_pairing_code: "test-pairing-code",
+                        companion_directory: Some(r"C:\Users\tester\.moondesk\worker-companion"),
+                        companion_action_notice: None,
+                        companion_materialize_error: None,
+                        worker_cleanup_notice: None,
                         set_moondesk_as_co_author: false,
                         ngrok_authtoken_configured: false,
                         ngrok_domain: None,
@@ -10292,6 +10883,77 @@ mod tests {
     }
 
     #[test]
+    fn settings_renders_worker_profile_and_companion_status() {
+        let usage = super::UsageTotals::default();
+        let theme = super::theme::resolve(super::theme::DEFAULT_THEME_ID);
+        let tool_mode = super::ToolMode::all()[0];
+        let worker_row = super::theme::all().len()
+            + super::ToolMode::all().len()
+            + super::BrowserPresentation::all().len();
+        let profile = super::ChatExecutionProfile {
+            model_key: "gpt-5-6-thinking".into(),
+            model_label: "GPT-5.6 Sol".into(),
+            reasoning_effort: super::managed_chat::types::ReasoningEffort::High,
+        };
+        let backend = TestBackend::new(110, 36);
+        let mut terminal = Terminal::new(backend).expect("create worker settings terminal");
+
+        terminal
+            .draw(|frame| {
+                super::draw_settings(
+                    frame,
+                    super::SettingsView {
+                        current_theme: theme,
+                        current_tool_mode: tool_mode,
+                        current_browser_presentation: super::BrowserPresentation::Headless,
+                        worker_execution_profile: &profile,
+                        worker_target_count: crate::workers::RECOMMENDED_WORKERS_PER_FAMILY,
+                        companion_pairing_code: "test-pairing-code",
+                        companion_directory: Some(r"C:\Users\tester\.moondesk\worker-companion"),
+                        companion_materialize_error: None,
+                        companion_action_notice: Some("Worker Companion folder opened. Use this folder with Developer mode -> Load unpacked."),
+                        worker_cleanup_notice: Some("Released 2 inactive Core families and 3 Worker records from 'Test Workspace'. ChatGPT conversations were not deleted."),
+                        set_moondesk_as_co_author: false,
+                        ngrok_authtoken_configured: false,
+                        ngrok_domain: None,
+                        config_path: r"C:\Users\tester\.moondesk\config.toml",
+                        usage_totals: &usage,
+                        selected_row: worker_row,
+                        confirm_reset_token_billing: false,
+                    },
+                )
+            })
+            .expect("render worker settings");
+
+        let buffer = terminal.backend().buffer();
+        let mut rendered = String::new();
+        for row in 0..buffer.area.height {
+            for column in 0..buffer.area.width {
+                rendered.push_str(buffer[(column, row)].symbol());
+            }
+            rendered.push('\n');
+        }
+
+        assert!(rendered.contains("Workers (experimental)"));
+        assert!(rendered.contains("Default model: GPT-5.6 Sol"));
+        assert!(rendered.contains("Reasoning effort: High"));
+        assert!(rendered.contains("Worker count: 4 (recommended 1-4, max 8)"));
+        assert!(rendered.contains("5-8 workers can hit ChatGPT/provider rate limits"));
+        assert!(rendered.contains("Worker Companion is optional"));
+        assert!(rendered.contains("MoonDesk works normally without it"));
+        assert!(rendered.contains("chrome://extensions"));
+        assert!(rendered.contains("synchronized automatically on startup"));
+        assert!(rendered.contains("Open Worker Companion folder"));
+        assert!(rendered.contains("Developer mode -> Load unpacked"));
+        assert!(rendered.contains("Worker Companion folder opened"));
+        assert!(!rendered.contains("unavailable"));
+        assert!(rendered.contains("Manual repair code: test-pairing-code"));
+        assert!(rendered.contains("Release inactive Worker capacity"));
+        assert!(rendered.contains("Host-local cleanup for inaccessible old Cores"));
+        assert!(rendered.contains("Released 2 inactive Core families"));
+    }
+
+    #[test]
     fn settings_exposes_masked_ngrok_authtoken_action() {
         let usage = super::UsageTotals::default();
         let theme = super::theme::resolve(super::theme::DEFAULT_THEME_ID);
@@ -10299,7 +10961,7 @@ mod tests {
         let auth_token_row = super::theme::all().len()
             + super::ToolMode::all().len()
             + super::BrowserPresentation::all().len()
-            + 1;
+            + 6;
         let backend = TestBackend::new(100, 32);
         let mut terminal = Terminal::new(backend).expect("create ngrok auth settings terminal");
 
@@ -10311,6 +10973,13 @@ mod tests {
                         current_theme: theme,
                         current_tool_mode: tool_mode,
                         current_browser_presentation: super::BrowserPresentation::Headless,
+                        worker_execution_profile: &super::ChatExecutionProfile::default(),
+                        worker_target_count: crate::workers::RECOMMENDED_WORKERS_PER_FAMILY,
+                        companion_pairing_code: "test-pairing-code",
+                        companion_directory: Some(r"C:\Users\tester\.moondesk\worker-companion"),
+                        companion_action_notice: None,
+                        companion_materialize_error: None,
+                        worker_cleanup_notice: None,
                         set_moondesk_as_co_author: false,
                         ngrok_authtoken_configured: true,
                         ngrok_domain: Some("example.ngrok-free.app"),
@@ -10385,6 +11054,13 @@ mod tests {
                         current_theme: theme,
                         current_tool_mode: tool_mode,
                         current_browser_presentation: super::BrowserPresentation::Headless,
+                        worker_execution_profile: &super::ChatExecutionProfile::default(),
+                        worker_target_count: crate::workers::RECOMMENDED_WORKERS_PER_FAMILY,
+                        companion_pairing_code: "test-pairing-code",
+                        companion_directory: Some(r"C:\Users\tester\.moondesk\worker-companion"),
+                        companion_action_notice: None,
+                        companion_materialize_error: None,
+                        worker_cleanup_notice: None,
                         set_moondesk_as_co_author: false,
                         ngrok_authtoken_configured: false,
                         ngrok_domain: None,

@@ -4,7 +4,7 @@ const BRIDGE_PORTS = [47650, 47651, 47652, 47653, 47654];
 const REQUIRED_PROTOCOL_VERSION = 2;
 // Bump with any shipped companion runtime change that requires Chromium to load new bytes. Keep
 // this aligned with COMPANION_RUNTIME_REVISION in src/server.rs.
-const COMPANION_RUNTIME_REVISION = 5;
+const COMPANION_RUNTIME_REVISION = 6;
 const SOURCE_DEV_MANIFEST_VERSION = '0.1.0';
 const RUNTIME_RELOAD_STORAGE_KEY = 'moondeskWorkerCompanionReloadRevisionV1';
 const INSTALLATION_BOOTSTRAP_FILE = 'moondesk-bootstrap.json';
@@ -31,6 +31,8 @@ let pumpActive = false;
 let connecting = null;
 let modelCatalogFlight = null;
 let stateWriteQueue = Promise.resolve();
+let workerClearGeneration = 0;
+let workerClearInProgress = false;
 const sessionReconcileCommandIds = new Set();
 
 function freshState() {
@@ -979,6 +981,8 @@ async function prepareWorkerWithRetry(tabId, payload, deadlineMs = Date.now() + 
 }
 
 async function processCommand(state, offer) {
+  const clearGeneration = workerClearGeneration;
+  const clearStillCurrent = () => clearGeneration === workerClearGeneration;
   let command = offer.command;
   const workspaceId = command?.launch?.workspaceId;
   const placement = placementForOffer(state, offer);
@@ -1013,6 +1017,7 @@ async function processCommand(state, offer) {
   try {
     recordAndTab = await recordForCommand(state, command, placement, offer.reconcileRequired === true);
   } catch (error) {
+    if (!clearStillCurrent()) return;
     const message = String(error?.message || error);
     if (offer.reconcileRequired) {
       const reason = message.includes('no durable browser launch record')
@@ -1035,6 +1040,7 @@ async function processCommand(state, offer) {
     }
     throw error;
   }
+  if (!clearStillCurrent()) return;
 
   const { record, tab } = recordAndTab;
   if (!Number.isInteger(tab?.id)) {
@@ -1050,6 +1056,7 @@ async function processCommand(state, offer) {
       placement,
       launch: command.launch
     }, 10000);
+    if (!clearStillCurrent()) return;
     if (!response?.ok) {
       await reconcileOrBlock(state, command, record, workspaceId, 'reconciliation_tab_response_unconfirmed');
       return;
@@ -1113,6 +1120,7 @@ async function processCommand(state, offer) {
       launch: command.launch
     }, prepareDeadlineMs);
   } catch (error) {
+    if (!clearStillCurrent()) return;
     record.phase = 'failed';
     await writeState(state);
     const message = String(error?.message || error);
@@ -1120,6 +1128,7 @@ async function processCommand(state, offer) {
     await failBeforeSend(timedOut ? 'worker_prepare_timeout' : 'worker_prepare_exception');
     return;
   }
+  if (!clearStillCurrent()) return;
   if (!prepared?.ok) {
     await failBeforeSend('worker_prepare_response_unconfirmed');
     return;
@@ -1141,7 +1150,9 @@ async function processCommand(state, offer) {
   }
   record.phase = 'prepared';
   await writeState(state);
+  if (!clearStillCurrent()) return;
   command = await markSendStarted(state, command);
+  if (!clearStillCurrent()) return;
   record.phase = 'send_started';
   await writeState(state);
 
@@ -1180,6 +1191,7 @@ async function processCommand(state, offer) {
     placement,
     launch: command.launch
   }, 12000);
+  if (!clearStillCurrent()) return;
   if (!committed?.ok || committed.result?.state !== 'committed') {
     await pauseAfterSend(committed?.result?.reason || 'worker_send_commit_unconfirmed');
     return;
@@ -1189,6 +1201,7 @@ async function processCommand(state, offer) {
   record.baseline = baseline;
   await writeState(state);
   const accepted = await observeWorkerAcceptance(state, command, record, placement, baseline);
+  if (!clearStillCurrent()) return;
   if (!accepted) {
     await reconcileOrBlock(state, command, record, workspaceId, 'worker_send_acceptance_unconfirmed');
     return;
@@ -1254,7 +1267,7 @@ async function processCommandBatch(state, offers, processor = processCommand) {
 }
 
 async function pump() {
-  if (pumpActive) return;
+  if (pumpActive || workerClearInProgress) return;
   pumpActive = true;
   let redeemed = 0;
   try {
@@ -1299,8 +1312,13 @@ async function status() {
   try {
     const state = await ensureConnected();
     const remote = await api(state, STATUS_PATH);
+    const hasLocalWorkerState =
+      Object.keys(state.launchRecords || {}).length > 0 ||
+      Object.keys(state.threadRecords || {}).length > 0 ||
+      Object.keys(state.blockedCommands || {}).length > 0;
     return {
       ...remote,
+      hasWorkerState: remote?.hasWorkerState === true || hasLocalWorkerState,
       paired: true,
       connected: true,
       baseUrl: state.baseUrl,
@@ -1363,34 +1381,45 @@ async function setProfile({ profile: nextProfile }) {
   return response.profile || null;
 }
 
-async function clearWorkers({ conversationId }) {
-  if (!conversationId) throw new Error('Open the Core conversation before clearing workers');
-  const state = await ensureConnected();
-  const response = await api(state, CLEAR_WORKERS_PATH, {
-    method: 'POST',
-    body: { conversationId }
-  });
-  const commandIds = new Set(Array.isArray(response.commandIds) ? response.commandIds : []);
-  const workerIds = new Set(Array.isArray(response.workerIds) ? response.workerIds : []);
-  const threadKeys = new Set([...workerIds].map((workerId) => `worker:${workerId}`));
+async function clearRememberedWorkerLaunchesInTabs() {
+  const tabs = await chrome.tabs.query({ url: 'https://chatgpt.com/*' });
+  await Promise.allSettled(tabs.map(async (tab) => {
+    if (!Number.isInteger(tab?.id)) return;
+    try {
+      await ensureContent(tab.id);
+      await sendToTab(tab.id, { type: 'MOONDESK_CLEAR_WORKER_LAUNCHES' }, 1500);
+    } catch {}
+  }));
+}
 
-  for (const commandId of commandIds) {
-    delete state.launchRecords?.[commandId];
-    clearBlockedCommand(state, commandId);
-    sessionReconcileCommandIds.delete(commandId);
+async function clearWorkers() {
+  if (workerClearInProgress) throw new Error('Clear Workers is already in progress');
+
+  // Cancel browser-side worker authority synchronously with the user's click. The generation fence
+  // makes every already-running processCommand coroutine stale before this function reaches its
+  // first await, and pump() refuses to redeem new commands until the durable host reset finishes.
+  workerClearInProgress = true;
+  workerClearGeneration += 1;
+  sessionReconcileCommandIds.clear();
+  try {
+    const state = await ensureConnected();
+    await clearRememberedWorkerLaunchesInTabs();
+    const response = await api(state, CLEAR_WORKERS_PATH, {
+      method: 'POST',
+      body: {}
+    });
+
+    // The host has now durably destroyed worker ownership. Only now erase the persisted companion
+    // records; if the host reset fails, those records remain available for diagnosis/retry.
+    state.launchRecords = {};
+    state.threadRecords = {};
+    state.blockedCommands = {};
+    await writeState(state);
+    return response;
+  } finally {
+    workerClearInProgress = false;
+    schedulePump(50);
   }
-  for (const [commandId, record] of Object.entries(state.launchRecords || {})) {
-    if (threadKeys.has(record?.threadKey)) {
-      delete state.launchRecords[commandId];
-      clearBlockedCommand(state, commandId);
-      sessionReconcileCommandIds.delete(commandId);
-    }
-  }
-  for (const threadKey of threadKeys) {
-    delete state.threadRecords?.[threadKey];
-  }
-  await writeState(state);
-  return response;
 }
 
 function modelCatalogHelperUrl(nonce) {

@@ -86,8 +86,9 @@
 
       <div id="clearBlock" class="adv-block adv-danger" hidden>
         <div class="adv-block-title danger-text">Clear Workers</div>
-        <p class="danger-desc">Removes all worker history and bindings for the current Core conversation. ChatGPT chats are preserved. Cannot clear while workers are active.</p>
-        <button id="clearWorkers" type="button" class="btn btn-danger" disabled aria-label="Clear workers for current Core conversation">Clear workers</button>
+        <p class="danger-desc">Stops running workers and removes all saved worker history and bindings. ChatGPT chats are preserved.</p>
+        <button id="clearWorkers" type="button" class="btn btn-danger" disabled aria-label="Clear all workers">Clear workers</button>
+        <span id="clearStatus" class="catalog-hint" aria-live="polite"></span>
       </div>
     </details>
 

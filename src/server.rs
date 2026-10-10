@@ -62,7 +62,7 @@ pub const COMPANION_CLEAR_WORKERS_ROUTE: &str = "/__moondesk/companion/v1/worker
 pub const COMPANION_TOKEN_HEADER: &str = "x-moondesk-companion-token";
 // Bump with any shipped companion runtime change that requires Chromium to load new bytes. Keep
 // this aligned with COMPANION_RUNTIME_REVISION in background.js.
-pub const COMPANION_RUNTIME_REVISION: u32 = 5;
+pub const COMPANION_RUNTIME_REVISION: u32 = 6;
 const MAX_COMPANION_BODY_BYTES: usize = 16 * 1024;
 
 #[derive(Clone)]
@@ -378,10 +378,7 @@ struct CompanionAckRequest {
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct CompanionClearWorkersRequest {
-    conversation_id: String,
-}
+struct CompanionClearWorkersRequest {}
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -488,7 +485,16 @@ async fn companion_status(State(state): State<ServerState>, headers: HeaderMap) 
     let Some(client_id) = companion_client_id(&state, &headers).await else {
         return companion_unauthorized();
     };
-    let auth = { state.app.lock().await.companion_auth.clone() };
+    let (auth, worker_broker, managed_chat_broker) = {
+        let app = state.app.lock().await;
+        (
+            app.companion_auth.clone(),
+            app.worker_broker.clone(),
+            app.managed_chat_broker.clone(),
+        )
+    };
+    let has_worker_state =
+        worker_broker.has_worker_state().await || managed_chat_broker.has_worker_commands().await;
     json_response(
         StatusCode::OK,
         json!({
@@ -497,7 +503,8 @@ async fn companion_status(State(state): State<ServerState>, headers: HeaderMap) 
             "companionRuntimeRevision": COMPANION_RUNTIME_REVISION,
             "paired": true,
             "clientId": client_id,
-            "pairedClientCount": auth.paired_client_count().await
+            "pairedClientCount": auth.paired_client_count().await,
+            "hasWorkerState": has_worker_state
         }),
     )
 }
@@ -1022,126 +1029,48 @@ async fn ack_companion_command(
 async fn clear_companion_workers(
     State(state): State<ServerState>,
     headers: HeaderMap,
-    Json(request): Json<CompanionClearWorkersRequest>,
+    Json(_request): Json<CompanionClearWorkersRequest>,
 ) -> Response<Body> {
     if !companion_origin_allowed(&headers) {
         return companion_origin_error();
     }
-    let Some(client_id) = companion_client_id(&state, &headers).await else {
+    if companion_client_id(&state, &headers).await.is_none() {
         return companion_unauthorized();
-    };
-    let conversation_id = request.conversation_id.trim();
-    if conversation_id.is_empty()
-        || conversation_id.len() > 128
-        || !conversation_id
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() || byte == b'-')
-    {
-        return json_response(
-            StatusCode::BAD_REQUEST,
-            json!({ "error": "Core conversation id is invalid" }),
-        );
     }
 
+    // Mirror Chat on Steroids' explicit Clear Swarm semantics: this is a destructive global
+    // Workers reset, not a per-Core cleanup. Active/parked worker ownership and queued browser
+    // launches are discarded, ChatGPT conversations stay untouched, and already-bound worker
+    // conversation identities are retained as short-lived fences so an old worker tab cannot
+    // immediately return as a new Core.
     let _lifecycle_guard = crate::workers::WORKER_LIFECYCLE_LOCK.lock().await;
-    let (auth, managed_chat_broker, worker_broker) = {
+    let (managed_chat_broker, worker_broker) = {
         let app = state.app.lock().await;
-        (
-            app.companion_auth.clone(),
-            app.managed_chat_broker.clone(),
-            app.worker_broker.clone(),
-        )
+        (app.managed_chat_broker.clone(), app.worker_broker.clone())
     };
-    let affinity_digest = match auth
-        .session_digest_for_route(&client_id, conversation_id)
-        .await
-    {
-        Ok(value) => value,
-        Err(error) => {
-            return json_response(StatusCode::CONFLICT, json!({ "error": error }));
-        }
-    };
-    let persisted_digest = match managed_chat_broker
-        .anchor_session_digest_for_conversation(conversation_id)
-        .await
-    {
-        Ok(value) => value,
-        Err(error) => return managed_chat_error_response(error),
-    };
-    let session_digest = match (affinity_digest, persisted_digest) {
-        (Some(left), Some(right)) if left != right => {
-            return json_response(
-                StatusCode::CONFLICT,
-                json!({ "error": "Core browser affinity disagrees with durable worker ownership" }),
-            );
-        }
-        (Some(value), _) | (_, Some(value)) => value,
-        (None, None) => {
-            // A repeated clear after the prior response was lost must be harmless. Once both
-            // durable stores are empty there is intentionally no ownership record left to resolve.
-            return json_response(
-                StatusCode::OK,
-                json!({
-                    "cleared": true,
-                    "alreadyCleared": true,
-                    "workerIds": [],
-                    "commandIds": []
-                }),
-            );
-        }
-    };
+    let had_worker_state =
+        worker_broker.has_worker_state().await || managed_chat_broker.has_worker_commands().await;
 
-    let preview_workers = match worker_broker
-        .ensure_clearable_session_digest(&session_digest)
-        .await
-    {
-        Ok(value) => value,
-        Err(error) => {
-            let status = match error {
-                crate::workers::broker::WorkerBrokerError::Conflict(_) => StatusCode::CONFLICT,
-                crate::workers::broker::WorkerBrokerError::Invalid(_) => StatusCode::BAD_REQUEST,
-                crate::workers::broker::WorkerBrokerError::NotFound => StatusCode::NOT_FOUND,
-                crate::workers::broker::WorkerBrokerError::Limit(_) => {
-                    StatusCode::TOO_MANY_REQUESTS
-                }
-                crate::workers::broker::WorkerBrokerError::Storage(_) => {
-                    StatusCode::INTERNAL_SERVER_ERROR
-                }
-            };
-            return json_response(status, json!({ "error": error.to_string() }));
-        }
-    };
-    let preview_commands = match managed_chat_broker
-        .ensure_clearable_anchor_session(&session_digest)
-        .await
-    {
-        Ok(value) => value,
-        Err(error) => return managed_chat_error_response(error),
-    };
-
-    // Clear the worker family first. If this durable write fails, managed-chat state is untouched.
-    // If the following terminal-command purge fails, those commands are non-dispatchable and still
-    // carry the session digest, so a retry can resolve ownership and finish the same clear safely.
-    let workers = match worker_broker.clear_session_digest(&session_digest).await {
+    // Commit the worker side first. If the managed-chat store then fails, the old worker
+    // conversations are already fenced and cannot keep acting; retrying this endpoint safely
+    // finishes command cleanup without reviving any worker family.
+    let workers = match worker_broker.clear_all_workers().await {
         Ok(value) => value,
         Err(error) => {
             return json_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                json!({ "error": format!("worker family cleanup did not complete; retry is safe: {error}") }),
+                json!({ "error": format!("worker reset did not complete; retry is safe: {error}") }),
             );
         }
     };
-    let commands = match managed_chat_broker
-        .purge_terminal_for_anchor_session(&session_digest)
-        .await
-    {
+    let commands = match managed_chat_broker.clear_all_worker_commands().await {
         Ok(value) => value,
         Err(error) => {
             return json_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 json!({
                     "error": format!(
-                        "worker family was cleared but terminal command cleanup did not complete; retry clear to resume safely: {error}"
+                        "worker histories were cleared but browser-command cleanup did not complete; retry Clear Workers to resume safely: {error}"
                     )
                 }),
             );
@@ -1152,7 +1081,7 @@ async fn clear_companion_workers(
         StatusCode::OK,
         json!({
             "cleared": true,
-            "alreadyCleared": preview_workers.is_empty() && preview_commands.is_empty(),
+            "alreadyCleared": !had_worker_state,
             "workerIds": workers.iter().map(|worker| worker.id.to_string()).collect::<Vec<_>>(),
             "commandIds": commands.iter().map(|command| command.id.to_string()).collect::<Vec<_>>()
         }),
@@ -3624,50 +3553,30 @@ mod tests {
             serde_json::from_slice(&empty_body).expect("empty redeem response json");
         assert!(empty_json.get("command").is_some_and(Value::is_null));
 
-        let clear_without_presence = client
-            .post(format!("http://{address}{COMPANION_CLEAR_WORKERS_ROUTE}"))
+        let worker_status = client
+            .get(format!("http://{address}{COMPANION_STATUS_ROUTE}"))
             .header(COMPANION_TOKEN_HEADER, &credential)
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .body(reqwest_json_body(
-                &json!({ "conversationId": core_conversation_id }),
-            ))
             .send()
             .await
-            .expect("clear without exact Core presence");
-        assert_eq!(clear_without_presence.status(), StatusCode::CONFLICT);
-
-        let presence = client
-            .post(format!("http://{address}{COMPANION_PRESENCE_ROUTE}"))
-            .header(COMPANION_TOKEN_HEADER, &credential)
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .body(reqwest_json_body(&json!({
-                "browserLabel": "Chrome",
-                "tabs": [{
-                    "conversationId": core_conversation_id,
-                    "conversationUrl": format!("https://chatgpt.com/c/{core_conversation_id}"),
-                    "projectId": null,
-                    "projectUrl": null,
-                    "active": true,
-                    "windowFocused": true,
-                    "generating": false
-                }]
-            })))
-            .send()
-            .await
-            .expect("publish Core presence");
-        assert_eq!(presence.status(), StatusCode::OK);
+            .expect("read worker-state status before clear");
+        assert_eq!(worker_status.status(), StatusCode::OK);
+        let worker_status_json = reqwest_response_json(worker_status).await;
+        assert_eq!(
+            worker_status_json
+                .get("hasWorkerState")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
 
         managed_chat_broker.fail_next_commit_for_test();
         let interrupted_clear = client
             .post(format!("http://{address}{COMPANION_CLEAR_WORKERS_ROUTE}"))
             .header(COMPANION_TOKEN_HEADER, &credential)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .body(reqwest_json_body(
-                &json!({ "conversationId": core_conversation_id }),
-            ))
+            .body(reqwest_json_body(&json!({})))
             .send()
             .await
-            .expect("inject clear failure after worker-store commit");
+            .expect("inject global clear failure after worker-store commit");
         assert_eq!(
             interrupted_clear.status(),
             StatusCode::INTERNAL_SERVER_ERROR
@@ -3693,12 +3602,10 @@ mod tests {
             .post(format!("http://{address}{COMPANION_CLEAR_WORKERS_ROUTE}"))
             .header(COMPANION_TOKEN_HEADER, &credential)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .body(reqwest_json_body(
-                &json!({ "conversationId": core_conversation_id }),
-            ))
+            .body(reqwest_json_body(&json!({})))
             .send()
             .await
-            .expect("retry interrupted Core worker clear");
+            .expect("retry interrupted global worker clear");
         assert_eq!(cleared.status(), StatusCode::OK);
         let cleared_json = reqwest_response_json(cleared).await;
         assert_eq!(
@@ -3718,12 +3625,10 @@ mod tests {
             .post(format!("http://{address}{COMPANION_CLEAR_WORKERS_ROUTE}"))
             .header(COMPANION_TOKEN_HEADER, &credential)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .body(reqwest_json_body(
-                &json!({ "conversationId": core_conversation_id }),
-            ))
+            .body(reqwest_json_body(&json!({})))
             .send()
             .await
-            .expect("retry clear after response loss");
+            .expect("retry global clear after response loss");
         assert_eq!(cleared_retry.status(), StatusCode::OK);
         let cleared_retry_json = reqwest_response_json(cleared_retry).await;
         assert_eq!(

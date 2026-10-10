@@ -323,6 +323,13 @@ pub struct CollectReceipt {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct RetiredWorkerFence {
+    pub identity: ChatIdentity,
+    pub retired_at_ms: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct WorkerFamily {
     pub id: WorkerFamilyId,
     pub workspace_id: WorkspaceId,
@@ -351,6 +358,8 @@ pub struct WorkerStoreData {
     pub schema_version: u32,
     #[serde(default)]
     pub families: BTreeMap<WorkerFamilyId, WorkerFamily>,
+    #[serde(default)]
+    pub retired_workers: BTreeMap<String, RetiredWorkerFence>,
 }
 
 impl Default for WorkerStoreData {
@@ -358,6 +367,7 @@ impl Default for WorkerStoreData {
         Self {
             schema_version: super::WORKER_STORE_SCHEMA_VERSION,
             families: BTreeMap::new(),
+            retired_workers: BTreeMap::new(),
         }
     }
 }
@@ -373,6 +383,12 @@ impl WorkerStoreData {
 
         if self.families.len() > super::MAX_WORKER_FAMILIES {
             return Err("worker store exceeds configured family limit".into());
+        }
+        for (session_digest, fence) in &self.retired_workers {
+            fence.identity.validate()?;
+            if session_digest != &fence.identity.session_digest {
+                return Err("retired worker fence key does not match its session identity".into());
+            }
         }
 
         for (family_id, family) in &self.families {

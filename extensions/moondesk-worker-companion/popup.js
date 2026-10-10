@@ -234,15 +234,11 @@ function renderBrowserClients(clients) {
 }
 
 // ── Render: clear workers button state ───────────────────────────
-function renderClearWorkers() {
-  const hasConversation = Boolean(currentContext?.conversationId);
+function renderClearWorkers(status) {
+  const hasWorkerState = status?.hasWorkerState === true;
   $('clearBlock').hidden = false;
-  $('clearWorkers').disabled = !hasConversation;
-  if (!hasConversation) {
-    $('clearWorkers').title = 'Open the Core conversation first';
-  } else {
-    $('clearWorkers').title = '';
-  }
+  $('clearWorkers').disabled = !hasWorkerState;
+  $('clearWorkers').title = hasWorkerState ? '' : 'No worker history to clear';
 }
 
 // ── Main render ──────────────────────────────────────────────────
@@ -331,8 +327,8 @@ async function render() {
     chatEl.classList.add('dim');
   }
 
-  // Advanced: clear workers
-  renderClearWorkers();
+  // Advanced: explicit global worker reset, matching Chat on Steroids Clear Swarm semantics.
+  renderClearWorkers(status);
 }
 
 // ── Event: repair pairing ────────────────────────────────────────
@@ -424,21 +420,25 @@ $('saveProfile').addEventListener('click', async () => {
 
 // ── Event: clear workers ─────────────────────────────────────────
 $('clearWorkers').addEventListener('click', async () => {
-  if (!currentContext?.conversationId) return;
-  if (!confirm('Clear all worker history and bindings for this Core conversation?\n\nChatGPT chats are preserved. Active/ambiguous work will be refused.')) return;
+  if (!confirm('Clear all workers? Running workers stop, and all saved worker histories and bindings are removed.\n\nTheir ChatGPT chats stay in ChatGPT.')) return;
   showError('');
+  $('clearStatus').textContent = '';
   $('clearWorkers').disabled = true;
   try {
-    const result = await bg({
-      type: 'MOONDESK_CLEAR_WORKERS',
-      conversationId: currentContext.conversationId
-    });
+    const result = await bg({ type: 'MOONDESK_CLEAR_WORKERS' });
     const count = (result.workerIds?.length || 0);
-    $('catalogStatus').textContent = `Cleared ${count} worker${count === 1 ? '' : 's'}.`;
-    await render();
+    const message = result.alreadyCleared
+      ? 'No worker history remained to clear.'
+      : `Cleared ${count} worker${count === 1 ? '' : 's'}.`;
+    try {
+      await render();
+    } catch (refreshError) {
+      showError(`Workers were cleared, but the popup could not refresh: ${String(refreshError?.message || refreshError)}`);
+    }
+    $('clearStatus').textContent = message;
   } catch (error) {
     showError(error);
-    $('clearWorkers').disabled = false;
+    try { await render(); } catch {}
   }
 });
 

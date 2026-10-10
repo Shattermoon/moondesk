@@ -30,6 +30,10 @@ pub const MAX_COLLECTED_TASK_HISTORY_PER_WORKER: usize = 2;
 pub const MAX_TASK_RECORDS_PER_WORKER: usize = 8;
 pub const MAX_REPORTS_PER_FAMILY: usize = 64;
 pub const MAX_UPDATES_PER_COLLECT: usize = 32;
+// Match Chat on Steroids' post-clear worker fence: a recently cleared worker conversation stays
+// recognizable long enough for any already-running turn/tab to fail closed instead of becoming a
+// new Core immediately after its retained history is destroyed.
+pub const RETIRED_WORKER_FENCE_TTL_MS: u64 = 30 * 60_000;
 
 pub(crate) fn store_path_for_config(config_path: &Path) -> std::io::Result<PathBuf> {
     let parent = config_path.parent().ok_or_else(|| {

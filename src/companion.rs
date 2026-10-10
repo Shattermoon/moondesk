@@ -648,6 +648,7 @@ impl CompanionAuth {
         None
     }
 
+    #[cfg(test)]
     pub async fn session_digest_for_route(
         &self,
         client_id: &str,

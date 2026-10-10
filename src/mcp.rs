@@ -941,23 +941,21 @@ fn browser_session_key(req: &JsonRpcRequest, workspace_id: &WorkspaceId) -> Brow
     }
 }
 
-fn worker_chat_identity(req: &JsonRpcRequest) -> Result<ChatIdentity, String> {
-    let meta = req
-        .params
-        .get("_meta")
-        .and_then(Value::as_object)
-        .ok_or_else(|| {
-            "workers requires exact ChatGPT conversation identity; openai/session metadata is missing"
-                .to_string()
-        })?;
-    let session = meta
-        .get("openai/session")
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty() && value.len() <= MAX_BROWSER_CALLER_META_BYTES)
-        .ok_or_else(|| {
-            "workers requires exact ChatGPT conversation identity; openai/session metadata is missing or invalid"
-                .to_string()
-        })?;
+fn optional_chat_identity(req: &JsonRpcRequest) -> Result<Option<ChatIdentity>, String> {
+    let Some(meta) = req.params.get("_meta").and_then(Value::as_object) else {
+        return Ok(None);
+    };
+    let session = match meta.get("openai/session") {
+        None => return Ok(None),
+        Some(Value::String(value))
+            if !value.trim().is_empty() && value.len() <= MAX_BROWSER_CALLER_META_BYTES =>
+        {
+            value.as_str()
+        }
+        Some(_) => {
+            return Err("invalid openai/session metadata for this ChatGPT conversation".into());
+        }
+    };
     let subject = match meta.get("openai/subject") {
         None => None,
         Some(Value::String(value))
@@ -967,13 +965,17 @@ fn worker_chat_identity(req: &JsonRpcRequest) -> Result<ChatIdentity, String> {
         }
         Some(Value::String(value)) if value.trim().is_empty() => None,
         Some(_) => {
-            return Err(
-                "workers rejected invalid openai/subject metadata for this ChatGPT conversation"
-                    .into(),
-            );
+            return Err("invalid openai/subject metadata for this ChatGPT conversation".into());
         }
     };
-    Ok(ChatIdentity::from_openai_meta(subject, session))
+    Ok(Some(ChatIdentity::from_openai_meta(subject, session)))
+}
+
+fn worker_chat_identity(req: &JsonRpcRequest) -> Result<ChatIdentity, String> {
+    optional_chat_identity(req)?.ok_or_else(|| {
+        "workers requires exact ChatGPT conversation identity; openai/session metadata is missing or invalid"
+            .to_string()
+    })
 }
 
 async fn handle_tools_call_for_workspace(
@@ -1003,6 +1005,20 @@ async fn handle_tools_call_for_workspace(
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
+
+    // Clear Workers mirrors Chat on Steroids' retired-worker fence: a recently cleared worker tab
+    // must not fall through and regain ordinary Core authority merely because its family history was
+    // destroyed. Only exact ChatGPT session metadata participates, so non-ChatGPT clients are
+    // unaffected.
+    if let Ok(Some(identity)) = optional_chat_identity(req)
+        && worker_broker.is_retired_worker_identity(&identity).await
+    {
+        return tool_error_response(
+            req,
+            "This ChatGPT conversation belonged to a worker that was cleared. Start a new Core conversation before using MoonDesk tools again."
+                .into(),
+        );
+    }
 
     let connector_browser_tool = connector_expanded_browser_tool(&tool_name);
     if matches!(
@@ -5316,6 +5332,90 @@ mod tests {
                 Some("worker-test-subject"),
                 "browser-bound-worker"
             ))
+        );
+    }
+
+    #[tokio::test]
+    async fn cleared_worker_chat_is_fenced_from_all_moondesk_tools() {
+        let root = TestTempDir::new("moondesk-cleared-worker-tool-fence");
+        let workspace_root = root.path().join("workspace");
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        let workspace_id = WorkspaceId::new();
+        let broker = Arc::new(
+            WorkerBroker::open(root.path().join("worker-state-v1.json"))
+                .expect("open worker broker"),
+        );
+        let managed_chat_broker = Arc::new(
+            ManagedChatBroker::open(root.path().join("managed-chat-state-v1.json"))
+                .expect("open managed chat broker"),
+        );
+        let core = ChatIdentity::from_openai_meta(Some("worker-test-subject"), "clear-core");
+        let worker_identity =
+            ChatIdentity::from_openai_meta(Some("worker-test-subject"), "cleared-worker-session");
+        let spawned = broker
+            .spawn_worker(crate::workers::broker::SpawnWorkerRequest {
+                operation_id: OperationId::new(),
+                workspace_id: workspace_id.clone(),
+                anchor_identity: core.clone(),
+                label: "clear fence".into(),
+                assignment: "be cleared and fenced".into(),
+                execution_profile: ChatExecutionProfile::default(),
+            })
+            .await
+            .expect("spawn worker");
+        let command_id = Uuid::new_v4().to_string();
+        broker
+            .link_launch_command(
+                &workspace_id,
+                &core,
+                &spawned.worker_id,
+                &spawned.task_id,
+                &command_id,
+            )
+            .await
+            .expect("link worker launch");
+        broker
+            .update_launch_by_command(
+                &command_id,
+                crate::workers::types::WorkerLaunchState::WaitingClaim,
+                None,
+                Some(format!("https://chatgpt.com/c/{}", spawned.worker_id)),
+            )
+            .await
+            .expect("make worker claimable");
+        broker
+            .claim_worker(
+                &workspace_id,
+                &spawned.worker_id,
+                &spawned.task_id,
+                &spawned.claim_token,
+                worker_identity,
+            )
+            .await
+            .expect("claim worker");
+        broker
+            .clear_all_workers()
+            .await
+            .expect("clear worker histories");
+
+        std::fs::write(workspace_root.join("probe.txt"), "must stay fenced")
+            .expect("write read probe");
+        let response = call_workers_for_test(
+            &tool_call_request_with_session(
+                "read",
+                json!({ "path": "probe.txt" }),
+                "cleared-worker-session",
+            ),
+            &workspace_id,
+            &workspace_root.to_string_lossy(),
+            broker,
+            managed_chat_broker,
+        )
+        .await;
+        assert!(
+            result_text(&response).contains("belonged to a worker that was cleared"),
+            "{}",
+            result_text(&response)
         );
     }
 

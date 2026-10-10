@@ -215,13 +215,136 @@ test('companion HTTP paths used by the extension match server route constants', 
   assert.doesNotMatch(source, /['"]\/__moondesk\/companion\/v1\/ack['"]/);
 });
 
-test('companion exposes destructive Core reset but no stale launch replay control', () => {
+test('Clear Workers mirrors Clear Swarm instead of requiring the current Core tab', () => {
   assert.match(source, /MOONDESK_CLEAR_WORKERS/);
   assert.match(source, /\/__moondesk\/companion\/v1\/workers\/clear/);
+  assert.match(source, /workerClearGeneration \+= 1/);
+  assert.match(source, /MOONDESK_CLEAR_WORKER_LAUNCHES/);
+  assert.match(contentSource, /MOONDESK_CLEAR_WORKER_LAUNCHES/);
+  assert.match(contentSource, /sessionStorage\.removeItem\(LAUNCH_SESSION_KEY\)/);
   assert.doesNotMatch(source, /MOONDESK_RETRY_BLOCKED/);
   assert.doesNotMatch(source, /\/__moondesk\/companion\/v1\/commands\/retry/);
-  assert.match(popupSource, /MOONDESK_CLEAR_WORKERS/);
+  assert.match(popupSource, /status\?\.hasWorkerState === true/);
+  assert.match(popupSource, /Clear all workers\?/);
+  assert.match(popupSource, /bg\(\{ type: 'MOONDESK_CLEAR_WORKERS' \}\)/);
+  assert.doesNotMatch(popupSource, /Open the Core conversation first/);
   assert.doesNotMatch(popupSource, /Retry safe launch|MOONDESK_RETRY_BLOCKED/);
+});
+
+test('clearWorkers destroys all companion-side worker history with an empty host request', async () => {
+  let clearBody = null;
+  const fetchImpl = async (url, options = {}) => {
+    const parsed = new URL(url);
+    if (parsed.pathname !== '/__moondesk/companion/v1/workers/clear') {
+      throw new Error(`unexpected request: ${parsed.pathname}`);
+    }
+    clearBody = JSON.parse(options.body || '{}');
+    return {
+      ok: true,
+      status: 200,
+      async text() {
+        return JSON.stringify({
+          cleared: true,
+          alreadyCleared: false,
+          workerIds: ['worker-record'],
+          commandIds: ['command-record']
+        });
+      }
+    };
+  };
+  const { evaluate } = loadBackground({ fetchImpl });
+  await evaluate(`(() => {
+    globalThis.__clearState = {
+      ...freshState(),
+      baseUrl: 'http://127.0.0.1:47650',
+      clientId: 'browser-clear-test',
+      credential: '${'a'.repeat(64)}',
+      launchRecords: { command: { threadKey: 'worker:worker-record' } },
+      threadRecords: { 'worker:worker-record': { conversationUrl: 'https://chatgpt.com/c/aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee' } },
+      blockedCommands: { command: { commandId: 'command' } }
+    };
+    connecting = Promise.resolve(globalThis.__clearState);
+  })()`);
+  const result = await evaluate('clearWorkers()');
+  assert.equal(result.cleared, true);
+  assert.deepEqual(clearBody, {});
+  const state = JSON.parse(evaluate('JSON.stringify(globalThis.__clearState)'));
+  assert.deepEqual(state.launchRecords, {});
+  assert.deepEqual(state.threadRecords, {});
+  assert.deepEqual(state.blockedCommands, {});
+  assert.equal(evaluate('workerClearGeneration'), 1);
+});
+
+test('popup status keeps Clear Workers available for stale companion-only history', async () => {
+  const fetchImpl = async (url) => {
+    const parsed = new URL(url);
+    if (parsed.pathname !== '/__moondesk/companion/v1/status') {
+      throw new Error(`unexpected request: ${parsed.pathname}`);
+    }
+    return {
+      ok: true,
+      status: 200,
+      async text() {
+        return JSON.stringify({ paired: true, clientId: 'browser-local-history', hasWorkerState: false });
+      }
+    };
+  };
+  const { evaluate } = loadBackground({ fetchImpl });
+  await evaluate(`(() => {
+    globalThis.__localHistoryState = {
+      ...freshState(),
+      baseUrl: 'http://127.0.0.1:47650',
+      clientId: 'browser-local-history',
+      credential: '${'c'.repeat(64)}',
+      launchRecords: { stale: { commandId: 'stale' } }
+    };
+    connecting = Promise.resolve(globalThis.__localHistoryState);
+  })()`);
+  const result = await evaluate('status()');
+  assert.equal(result.hasWorkerState, true);
+});
+
+test('Clear Workers fences in-flight browser work before awaiting the host reset', async () => {
+  let releaseClear = null;
+  let requestCount = 0;
+  const fetchImpl = async (url, options = {}) => {
+    const parsed = new URL(url);
+    if (parsed.pathname !== '/__moondesk/companion/v1/workers/clear') {
+      throw new Error(`unexpected request: ${parsed.pathname}`);
+    }
+    requestCount += 1;
+    assert.equal(options.method, 'POST');
+    return new Promise((resolve) => {
+      releaseClear = () => resolve({
+        ok: true,
+        status: 200,
+        async text() {
+          return JSON.stringify({ cleared: true, alreadyCleared: false, workerIds: [], commandIds: [] });
+        }
+      });
+    });
+  };
+  const { evaluate } = loadBackground({ fetchImpl });
+  await evaluate(`(() => {
+    globalThis.__raceClearState = {
+      ...freshState(),
+      baseUrl: 'http://127.0.0.1:47650',
+      clientId: 'browser-clear-race',
+      credential: '${'b'.repeat(64)}'
+    };
+    connecting = Promise.resolve(globalThis.__raceClearState);
+  })()`);
+
+  const clearPromise = evaluate('clearWorkers()');
+  assert.equal(evaluate('workerClearGeneration'), 1, 'generation must advance before the first await');
+  assert.equal(evaluate('workerClearInProgress'), true);
+  await flushMicrotasks();
+  assert.equal(requestCount, 1);
+  await evaluate('pump()');
+  assert.equal(requestCount, 1, 'pump must not redeem anything while Clear Workers is in flight');
+  releaseClear();
+  await clearPromise;
+  assert.equal(evaluate('workerClearInProgress'), false);
 });
 
 test('closing a browser tab schedules immediate presence publication instead of ending a worker locally', () => {
@@ -281,7 +404,7 @@ test('bridge discovery prefers an exact runtime match over another MoonDesk vers
             app: 'moondesk-worker-companion',
             appVersion: '0.13.0',
             protocolVersion: 2,
-            companionRuntimeRevision: 5
+            companionRuntimeRevision: 6
           };
         }
       };
@@ -309,7 +432,7 @@ test('bridge discovery prefers an exact runtime match over another MoonDesk vers
 
   const { evaluate, runtimeReloads } = loadBackground({ fetchImpl });
   const hello = await evaluate('discoverBridge(freshState())');
-  assert.equal(hello.companionRuntimeRevision, 5);
+  assert.equal(hello.companionRuntimeRevision, 6);
   assert.equal(runtimeReloads.length, 0);
 });
 
@@ -325,7 +448,7 @@ test('bridge runtime revision mismatch reloads the unpacked companion once', asy
             app: 'moondesk-worker-companion',
             appVersion: '0.13.0',
             protocolVersion: 2,
-            companionRuntimeRevision: 6
+            companionRuntimeRevision: 7
           };
         }
       };
@@ -364,7 +487,7 @@ test('compatible bridge clears the one-shot runtime reload marker for a future m
             app: 'moondesk-worker-companion',
             appVersion: '0.12.0',
             protocolVersion: 2,
-            companionRuntimeRevision: 5
+            companionRuntimeRevision: 6
           };
         }
       };
@@ -377,7 +500,7 @@ test('compatible bridge clears the one-shot runtime reload marker for a future m
   });
 
   const hello = await evaluate('discoverBridge(freshState())');
-  assert.equal(hello.companionRuntimeRevision, 5);
+  assert.equal(hello.companionRuntimeRevision, 6);
   const stored = await evaluate(`chrome.storage.local.get('${reloadKey}')`);
   assert.equal(stored[reloadKey], undefined);
 });
@@ -395,7 +518,7 @@ test('automatic pairing proves the extension was loaded from the MoonDesk-prepar
             app: 'moondesk-worker-companion',
             appVersion: '0.12.0',
             protocolVersion: 2,
-            companionRuntimeRevision: 5
+            companionRuntimeRevision: 6
           };
         }
       };
@@ -437,7 +560,7 @@ test('source and release-ZIP installs without a bootstrap capability expose Manu
         app: 'moondesk-worker-companion',
         appVersion: '0.12.0',
         protocolVersion: 2,
-        companionRuntimeRevision: 5
+        companionRuntimeRevision: 6
       };
       return {
         ok: true,
@@ -506,7 +629,7 @@ test('release version mismatch reloads the unpacked companion even when protocol
             app: 'moondesk-worker-companion',
             appVersion: '0.13.0',
             protocolVersion: 2,
-            companionRuntimeRevision: 5
+            companionRuntimeRevision: 6
           };
         }
       };

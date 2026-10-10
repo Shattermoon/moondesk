@@ -1,7 +1,7 @@
 use super::store;
 use super::types::{
     BrowserAttachmentState, ChatIdentity, CollectReceipt, CollectedTaskReceipt, MessageReceipt,
-    OperationId, ReportReceipt, ReuseReceipt, SpawnReceipt, TaskId, TaskState,
+    OperationId, ReportReceipt, RetiredWorkerFence, ReuseReceipt, SpawnReceipt, TaskId, TaskState,
     WorkerExecutionProfile, WorkerFamily, WorkerFamilyId, WorkerId, WorkerLaunchState,
     WorkerMessage, WorkerMessageId, WorkerMessageState, WorkerRecord, WorkerReport, WorkerReportId,
     WorkerResult, WorkerState, WorkerStoreData, WorkerTask,
@@ -11,7 +11,7 @@ use super::{
     MAX_IDEMPOTENCY_RECEIPTS_PER_FAMILY, MAX_PENDING_MESSAGES_PER_WORKER, MAX_REPORTS_PER_FAMILY,
     MAX_TASK_RECORDS_PER_WORKER, MAX_UPDATES_PER_COLLECT, MAX_WORKER_ASSIGNMENT_BYTES,
     MAX_WORKER_FAMILIES, MAX_WORKER_MESSAGE_BYTES, MAX_WORKER_RECORDS_PER_FAMILY,
-    MAX_WORKERS_PER_FAMILY,
+    MAX_WORKERS_PER_FAMILY, RETIRED_WORKER_FENCE_TTL_MS,
 };
 use crate::managed_chat::types::canonical_chatgpt_conversation_id;
 use crate::workspaces::WorkspaceId;
@@ -164,6 +164,52 @@ impl WorkerBroker {
         self.data.lock().await.clone()
     }
 
+    pub async fn has_worker_state(&self) -> bool {
+        !self.data.lock().await.families.is_empty()
+    }
+
+    pub async fn is_retired_worker_identity(&self, identity: &ChatIdentity) -> bool {
+        let now_ms = worker_unix_time_ms();
+        self.data
+            .lock()
+            .await
+            .retired_workers
+            .get(&identity.session_digest)
+            .is_some_and(|fence| retired_worker_fence_is_live(fence, now_ms))
+    }
+
+    pub async fn clear_all_workers(&self) -> Result<Vec<WorkerRecord>, WorkerBrokerError> {
+        let mut guard = self.data.lock().await;
+        let workers = guard
+            .families
+            .values()
+            .flat_map(|family| family.workers.values().cloned())
+            .collect::<Vec<_>>();
+        if workers.is_empty() && guard.families.is_empty() {
+            return Ok(workers);
+        }
+
+        let now_ms = worker_unix_time_ms();
+        let mut candidate = guard.clone();
+        prune_retired_worker_fences(&mut candidate, now_ms);
+        for worker in &workers {
+            let Some(identity) = worker.chat_identity.clone() else {
+                continue;
+            };
+            candidate.retired_workers.insert(
+                identity.session_digest.clone(),
+                RetiredWorkerFence {
+                    identity,
+                    retired_at_ms: now_ms,
+                },
+            );
+        }
+        candidate.families.clear();
+        self.commit_candidate(&mut guard, candidate).await?;
+        self.updates.notify_waiters();
+        Ok(workers)
+    }
+
     #[cfg(test)]
     pub(crate) fn fail_next_commit_for_test(&self) {
         self.fail_next_commit
@@ -177,6 +223,16 @@ impl WorkerBroker {
         validate_spawn_request(&request)?;
         let fingerprint = request_fingerprint(&request)?;
         let mut guard = self.data.lock().await;
+        if guard
+            .retired_workers
+            .get(&request.anchor_identity.session_digest)
+            .is_some_and(|fence| retired_worker_fence_is_live(fence, worker_unix_time_ms()))
+        {
+            return Err(WorkerBrokerError::Conflict(
+                "this ChatGPT conversation was retired by Clear Workers and cannot become a Core yet; start a new Core conversation"
+                    .into(),
+            ));
+        }
 
         if let Some(family) = guard.families.values().find(|family| {
             family.workspace_id == request.workspace_id
@@ -192,6 +248,7 @@ impl WorkerBroker {
         }
 
         let mut candidate = guard.clone();
+        prune_retired_worker_fences(&mut candidate, worker_unix_time_ms());
         let family_id = if let Some(existing) = candidate
             .families
             .values()
@@ -1244,6 +1301,7 @@ impl WorkerBroker {
         Ok(plan.summary.clone())
     }
 
+    #[cfg(test)]
     pub async fn ensure_clearable_session_digest(
         &self,
         session_digest: &str,
@@ -1278,6 +1336,7 @@ impl WorkerBroker {
         Ok(workers)
     }
 
+    #[cfg(test)]
     pub async fn clear_session_digest(
         &self,
         session_digest: &str,
@@ -1965,6 +2024,23 @@ impl WorkerBroker {
         **guard = candidate;
         Ok(())
     }
+}
+
+fn worker_unix_time_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64
+}
+
+fn retired_worker_fence_is_live(fence: &RetiredWorkerFence, now_ms: u64) -> bool {
+    now_ms.saturating_sub(fence.retired_at_ms) < RETIRED_WORKER_FENCE_TTL_MS
+}
+
+fn prune_retired_worker_fences(data: &mut WorkerStoreData, now_ms: u64) {
+    data.retired_workers
+        .retain(|_, fence| retired_worker_fence_is_live(fence, now_ms));
 }
 
 fn collected_updates_from_receipt(receipt: &CollectReceipt) -> CollectedUpdates {
@@ -3713,6 +3789,77 @@ mod tests {
             .await
             .expect("collect committed report");
         assert_eq!(updates.reports.len(), 1);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn clear_all_workers_destroys_live_families_and_fences_claimed_worker_chats() {
+        let root = temp_root("moondesk-worker-clear-all");
+        let path = root.join("worker-state-v1.json");
+        let broker = WorkerBroker::open(&path).expect("open worker broker");
+        let workspace_a = WorkspaceId::new();
+        let workspace_b = WorkspaceId::new();
+        let core_a = anchor("clear-all-core-a");
+        let core_b = anchor("clear-all-core-b");
+        let worker_identity = anchor("clear-all-running-worker");
+
+        let running = broker
+            .spawn_worker(spawn_request(
+                OperationId::new(),
+                workspace_a.clone(),
+                core_a.clone(),
+                "running worker cleared globally",
+            ))
+            .await
+            .expect("spawn running worker");
+        make_claimable(&broker, &workspace_a, &core_a, &running).await;
+        broker
+            .claim_worker(
+                &workspace_a,
+                &running.worker_id,
+                &running.task_id,
+                &running.claim_token,
+                worker_identity.clone(),
+            )
+            .await
+            .expect("claim running worker");
+
+        let pending = broker
+            .spawn_worker(spawn_request(
+                OperationId::new(),
+                workspace_b,
+                core_b,
+                "unclaimed worker cleared globally",
+            ))
+            .await
+            .expect("spawn pending worker");
+        assert!(broker.has_worker_state().await);
+
+        let cleared = broker
+            .clear_all_workers()
+            .await
+            .expect("clear every worker family");
+        assert_eq!(cleared.len(), 2);
+        assert!(cleared.iter().any(|worker| worker.id == running.worker_id));
+        assert!(cleared.iter().any(|worker| worker.id == pending.worker_id));
+        assert!(!broker.has_worker_state().await);
+        assert!(broker.snapshot().await.families.is_empty());
+        assert!(broker.is_retired_worker_identity(&worker_identity).await);
+
+        let retired_core_error = broker
+            .spawn_worker(spawn_request(
+                OperationId::new(),
+                workspace_a,
+                worker_identity.clone(),
+                "cleared worker chat must not become Core",
+            ))
+            .await
+            .expect_err("retired worker chat must stay fenced");
+        assert!(matches!(retired_core_error, WorkerBrokerError::Conflict(_)));
+
+        drop(broker);
+        let reopened = WorkerBroker::open(&path).expect("reopen worker broker");
+        assert!(reopened.is_retired_worker_identity(&worker_identity).await);
         let _ = std::fs::remove_dir_all(root);
     }
 

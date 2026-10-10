@@ -367,6 +367,14 @@
         .catch((error) => sendResponse({ ok: false, error: String(error?.message || error) }));
       return true;
     }
+    if (message.type === 'MOONDESK_CLEAR_WORKER_LAUNCHES') {
+      try { sessionStorage.removeItem(LAUNCH_SESSION_KEY); } catch {}
+      pendingProviderCorrelations.clear();
+      if (providerCorrelationTimer) clearInterval(providerCorrelationTimer);
+      providerCorrelationTimer = null;
+      sendResponse({ ok: true });
+      return false;
+    }
     if (message.type === 'MOONDESK_PREPARE_WORKER') {
       void prepareWorker(message)
         .then((result) => sendResponse({ ok: true, result, rememberedLaunch: rememberedLaunch() }))

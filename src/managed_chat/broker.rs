@@ -1,8 +1,8 @@
 use super::store;
 use super::types::{
     ManagedChatAnchorContext, ManagedChatCommand, ManagedChatCommandId, ManagedChatCommandState,
-    ManagedChatLaunch, ManagedChatLease, ManagedChatLeaseId, ManagedChatStoreData,
-    ManagedChatTerminalResult, canonical_chatgpt_conversation_id,
+    ManagedChatLaunch, ManagedChatLease, ManagedChatLeaseId, ManagedChatPurpose,
+    ManagedChatStoreData, ManagedChatTerminalResult, canonical_chatgpt_conversation_id,
 };
 use super::{
     DEFAULT_COMMAND_LEASE_MS, MAX_MANAGED_CHAT_COMMANDS, MAX_MANAGED_CHAT_DETAIL_BYTES,
@@ -95,6 +95,38 @@ impl ManagedChatBroker {
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
+    pub async fn has_worker_commands(&self) -> bool {
+        self.data
+            .lock()
+            .await
+            .commands
+            .values()
+            .any(|command| command.launch.purpose == ManagedChatPurpose::Worker)
+    }
+
+    pub async fn clear_all_worker_commands(
+        &self,
+    ) -> Result<Vec<ManagedChatCommand>, ManagedChatError> {
+        let mut guard = self.data.lock().await;
+        let removed = guard
+            .commands
+            .values()
+            .filter(|command| command.launch.purpose == ManagedChatPurpose::Worker)
+            .cloned()
+            .collect::<Vec<_>>();
+        if removed.is_empty() {
+            return Ok(removed);
+        }
+
+        let mut candidate = guard.clone();
+        for command in &removed {
+            candidate.commands.remove(&command.id);
+            candidate.dedupe.remove(&command.dedupe_key);
+        }
+        self.commit_candidate(&mut guard, candidate).await?;
+        Ok(removed)
+    }
+
     pub async fn purge_workspace(
         &self,
         workspace_id: &WorkspaceId,
@@ -120,6 +152,7 @@ impl ManagedChatBroker {
         Ok(removed_ids.len())
     }
 
+    #[cfg(test)]
     pub async fn anchor_session_digest_for_conversation(
         &self,
         conversation_id: &str,
@@ -155,6 +188,7 @@ impl ManagedChatBroker {
         Ok(digest)
     }
 
+    #[cfg(test)]
     pub async fn ensure_clearable_anchor_session(
         &self,
         session_digest: &str,
@@ -173,6 +207,7 @@ impl ManagedChatBroker {
         Ok(matching)
     }
 
+    #[cfg(test)]
     pub async fn purge_terminal_for_anchor_session(
         &self,
         session_digest: &str,

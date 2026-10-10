@@ -63,7 +63,7 @@ pub const COMPANION_WORKER_RESET_ACK_ROUTE: &str = "/__moondesk/companion/v1/wor
 pub const COMPANION_TOKEN_HEADER: &str = "x-moondesk-companion-token";
 // Bump with any shipped companion runtime change that requires Chromium to load new bytes. Keep
 // this aligned with COMPANION_RUNTIME_REVISION in background.js.
-pub const COMPANION_RUNTIME_REVISION: u32 = 7;
+pub const COMPANION_RUNTIME_REVISION: u32 = 8;
 const MAX_COMPANION_BODY_BYTES: usize = 16 * 1024;
 
 #[derive(Clone)]
@@ -1106,6 +1106,20 @@ async fn clear_companion_workers(
         .filter_map(|command| command.lease.as_ref().map(|lease| lease.client_id.clone()))
         .filter(|client_id| client_id != &requesting_client_id)
         .collect::<BTreeSet<_>>();
+    // Commit the durable Worker reset before publishing the browser reset epoch. If this first
+    // persistence boundary fails, paired companions must keep their exact local bindings because
+    // the host still owns the old worker families. Once the Worker store is cleared, publishing a
+    // new epoch is safe: any later failure is a partial destructive clear that must be retried, but
+    // stale browser authority can no longer revive a deleted worker family.
+    let workers = match worker_broker.clear_all_workers().await {
+        Ok(value) => value,
+        Err(error) => {
+            return json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({ "error": format!("worker reset did not complete; no browser reset was published and retry is safe: {error}") }),
+            );
+        }
+    };
     let (worker_reset_epoch, pending_reset_clients) = match auth
         .begin_worker_reset(&reset_required_clients)
         .await
@@ -1114,24 +1128,7 @@ async fn clear_companion_workers(
         Err(error) => {
             return json_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                json!({ "error": format!("worker reset epoch could not be published; no worker state was cleared: {error}") }),
-            );
-        }
-    };
-
-    // Publish the reset epoch before deleting durable Worker state so every paired companion can
-    // fence stale local offers/records as soon as it next reconnects, checks status, or reaches the
-    // final pre-Send barrier. If a later store commit fails, retrying Clear Workers safely advances
-    // the epoch again and resumes the destructive reset without reviving any old browser authority.
-    // Commit the worker side first. If the managed-chat store then fails, the old worker
-    // conversations are already fenced and cannot keep acting; retrying this endpoint safely
-    // finishes command cleanup without reviving any worker family.
-    let workers = match worker_broker.clear_all_workers().await {
-        Ok(value) => value,
-        Err(error) => {
-            return json_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                json!({ "error": format!("worker reset did not complete; retry is safe: {error}") }),
+                json!({ "error": format!("worker histories were cleared but browser reset publication did not complete; retry Clear Workers to resume safely: {error}") }),
             );
         }
     };
@@ -3683,6 +3680,51 @@ mod tests {
                 .get("workerResetEpoch")
                 .and_then(Value::as_u64),
             Some(0)
+        );
+
+        worker_broker.fail_next_commit_for_test();
+        let worker_store_failed_clear = client
+            .post(format!("http://{address}{COMPANION_CLEAR_WORKERS_ROUTE}"))
+            .header(COMPANION_TOKEN_HEADER, &credential)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(reqwest_json_body(&json!({})))
+            .send()
+            .await
+            .expect("inject global clear failure before browser reset publication");
+        assert_eq!(
+            worker_store_failed_clear.status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert!(
+            worker_broker
+                .family_for_anchor(&workspace_id, &core_identity)
+                .await
+                .expect("read family after worker-store clear failure")
+                .is_some(),
+            "worker history must remain when its clear commit fails"
+        );
+        assert!(
+            managed_chat_broker
+                .snapshot()
+                .await
+                .commands
+                .contains_key(&command.id),
+            "managed command must remain untouched when worker-store clear fails"
+        );
+        let status_after_worker_store_failure = client
+            .get(format!("http://{address}{COMPANION_STATUS_ROUTE}"))
+            .header(COMPANION_TOKEN_HEADER, &credential)
+            .send()
+            .await
+            .expect("read reset epoch after worker-store clear failure");
+        let status_after_worker_store_failure =
+            reqwest_response_json(status_after_worker_store_failure).await;
+        assert_eq!(
+            status_after_worker_store_failure
+                .get("workerResetEpoch")
+                .and_then(Value::as_u64),
+            Some(0),
+            "a failed worker-store clear must not publish a reset that erases browser bindings"
         );
 
         managed_chat_broker.fail_next_commit_for_test();

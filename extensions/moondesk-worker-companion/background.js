@@ -4,7 +4,7 @@ const BRIDGE_PORTS = [47650, 47651, 47652, 47653, 47654];
 const REQUIRED_PROTOCOL_VERSION = 2;
 // Bump with any shipped companion runtime change that requires Chromium to load new bytes. Keep
 // this aligned with COMPANION_RUNTIME_REVISION in src/server.rs.
-const COMPANION_RUNTIME_REVISION = 7;
+const COMPANION_RUNTIME_REVISION = 8;
 const SOURCE_DEV_MANIFEST_VERSION = '0.1.0';
 const RUNTIME_RELOAD_STORAGE_KEY = 'moondeskWorkerCompanionReloadRevisionV1';
 const INSTALLATION_BOOTSTRAP_FILE = 'moondesk-bootstrap.json';
@@ -34,6 +34,7 @@ let modelCatalogFlight = null;
 let stateWriteQueue = Promise.resolve();
 let workerClearGeneration = 0;
 let workerClearInProgress = false;
+let workerSendCommitInFlight = 0;
 const sessionReconcileCommandIds = new Set();
 
 function freshState() {
@@ -108,7 +109,8 @@ async function applyHostWorkerResetEpoch(state, remote) {
   }
   if (
     remote?.workerResetAckRequired === true &&
-    normalizedWorkerResetEpoch(state.workerResetEpoch) === remoteEpoch
+    normalizedWorkerResetEpoch(state.workerResetEpoch) === remoteEpoch &&
+    workerSendCommitInFlight === 0
   ) {
     await api(state, WORKER_RESET_ACK_PATH, {
       method: 'POST',
@@ -1264,13 +1266,22 @@ async function processCommand(state, offer, clearGeneration = workerClearGenerat
   await syncHostWorkerResetEpoch(state);
   if (!clearStillCurrent()) return;
 
-  const committed = await sendToTab(tab.id, {
-    type: 'MOONDESK_COMMIT_WORKER_SEND',
-    commandId: command.id,
-    launchToken: record.launchToken,
-    placement,
-    launch: command.launch
-  }, 12000);
+  let committed = null;
+  workerSendCommitInFlight += 1;
+  try {
+    committed = await sendToTab(tab.id, {
+      type: 'MOONDESK_COMMIT_WORKER_SEND',
+      commandId: command.id,
+      launchToken: record.launchToken,
+      placement,
+      launch: command.launch
+    }, 12000);
+  } finally {
+    workerSendCommitInFlight -= 1;
+    if (workerSendCommitInFlight === 0) {
+      try { await syncHostWorkerResetEpoch(state); } catch {}
+    }
+  }
   if (!clearStillCurrent()) return;
   if (!committed?.ok || committed.result?.state !== 'committed') {
     await pauseAfterSend(committed?.result?.reason || 'worker_send_commit_unconfirmed');

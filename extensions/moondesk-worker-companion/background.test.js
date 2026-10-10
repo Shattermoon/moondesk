@@ -596,6 +596,144 @@ test('global Clear Workers waits for another browser DOM Send already in flight 
   assert.equal(browserBStatus.hasWorkerState, false, 'the other browser must not retain ghost worker history');
 });
 
+test('a retried global reset uses a fresh epoch to fence worker authority created after an earlier timed-out reset', async () => {
+  let commitCalls = 0;
+  let resetAckCalls = 0;
+  let rememberedLaunch = null;
+  const commandId = '41111111-2222-4333-8444-555555555555';
+  const leaseId = '46666666-7777-4888-8999-aaaaaaaaaaaa';
+  const taskMarker = 'moondesk-worker-task:reset-retry-race';
+  const command = {
+    id: commandId,
+    state: 'leased',
+    lease: { leaseId, clientId: 'browser-c' },
+    anchorContext: {
+      conversationId: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee',
+      conversationUrl: 'https://chatgpt.com/c/aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee',
+      projectId: null,
+      projectUrl: null
+    },
+    launch: {
+      workspaceId: 'workspace-reset-retry',
+      purpose: 'worker',
+      taskMarker,
+      threadKey: 'worker:reset-retry-race',
+      openMode: 'new_thread',
+      openingMessage: `Do the task. Marker: ${taskMarker}`,
+      executionProfile: {
+        modelId: 'gpt-5.6-sol',
+        modelLabel: 'GPT-5.6 Sol',
+        reasoningEffort: 'high'
+      }
+    }
+  };
+  const hostResponse = (body) => ({
+    ok: true,
+    status: 200,
+    async text() { return JSON.stringify(body); }
+  });
+  const browserCFetch = async (url, options = {}) => {
+    const parsed = new URL(url);
+    const body = options.body ? JSON.parse(options.body) : {};
+    if (parsed.pathname === '/__moondesk/companion/v1/commands/send-started') {
+      assert.equal(body.commandId, commandId);
+      assert.equal(body.leaseId, leaseId);
+      return hostResponse({ command: { ...command, state: 'send_started', reconcileHistory: true } });
+    }
+    if (parsed.pathname === '/__moondesk/companion/v1/status') {
+      // Browser C already applied epoch 1 from the first Clear. Browser B is still pending, but
+      // Clear #2 has destructively cleared C's newly created command and therefore publishes 2.
+      return hostResponse({
+        paired: true,
+        clientId: 'browser-c',
+        hasWorkerState: false,
+        workerResetEpoch: 2,
+        workerResetAckRequired: true
+      });
+    }
+    if (parsed.pathname === '/__moondesk/companion/v1/workers/reset-ack') {
+      assert.equal(body.workerResetEpoch, 2);
+      resetAckCalls += 1;
+      // Browser B remains outstanding on the fresh epoch; C's ACK must not depend on B finishing.
+      return hostResponse({ workerResetEpoch: 2, pendingClientCount: 1 });
+    }
+    throw new Error(`unexpected browser C request: ${parsed.pathname}`);
+  };
+  const browserC = loadBackground({
+    fetchImpl: browserCFetch,
+    sendMessageImpl: async (tabId, message, { existingTabs }) => {
+      if (message.type === 'MOONDESK_CONTEXT') {
+        return {
+          ok: true,
+          context: {
+            projectId: null,
+            projectUrl: null,
+            conversationId: null,
+            sourceUrl: existingTabs[tabId].url,
+            generating: false
+          },
+          rememberedLaunch
+        };
+      }
+      if (message.type === 'MOONDESK_PREPARE_WORKER') {
+        rememberedLaunch = {
+          commandId,
+          launchToken: message.launchToken,
+          taskMarker,
+          workspaceId: 'workspace-reset-retry',
+          threadKey: 'worker:reset-retry-race'
+        };
+        return {
+          ok: true,
+          result: {
+            state: 'ready',
+            evidence: {
+              conversationId: null,
+              markerPresent: false,
+              generating: false,
+              userTurnCount: 0,
+              composerEmpty: false
+            }
+          }
+        };
+      }
+      if (message.type === 'MOONDESK_CLEAR_WORKER_LAUNCHES') {
+        rememberedLaunch = null;
+        return { ok: true };
+      }
+      if (message.type === 'MOONDESK_COMMIT_WORKER_SEND') {
+        commitCalls += 1;
+        return { ok: true, result: { state: 'committed', baseline: {} } };
+      }
+      throw new Error(`unexpected browser C tab message: ${message.type}`);
+    }
+  });
+
+  await browserC.evaluate(`(() => {
+    globalThis.__resetRetryState = {
+      ...freshState(),
+      baseUrl: 'http://127.0.0.1:47650',
+      clientId: 'browser-c',
+      credential: '${'c'.repeat(64)}',
+      workerResetEpoch: 1
+    };
+    connecting = Promise.resolve(globalThis.__resetRetryState);
+    globalThis.__resetRetryCommand = ${JSON.stringify(command)};
+  })()`);
+
+  await browserC.evaluate(
+    'processCommand(globalThis.__resetRetryState, { command: globalThis.__resetRetryCommand, reconcileRequired: false })'
+  );
+
+  const browserCState = JSON.parse(browserC.evaluate('JSON.stringify(globalThis.__resetRetryState)'));
+  assert.equal(browserCState.workerResetEpoch, 2, 'the retry must invalidate authority newer than epoch 1');
+  assert.deepEqual(browserCState.launchRecords, {});
+  assert.deepEqual(browserCState.threadRecords, {});
+  assert.deepEqual(browserCState.blockedCommands, {});
+  assert.equal(resetAckCalls, 1, 'browser C acknowledges only after applying the fresh epoch');
+  assert.equal(commitCalls, 0, 'the worker created after epoch 1 must never reach DOM Send after Clear #2');
+});
+
 test('closing a browser tab schedules immediate presence publication instead of ending a worker locally', () => {
   const delays = [];
   const { dispatchTabRemoved } = loadBackground({

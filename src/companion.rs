@@ -508,12 +508,14 @@ impl CompanionAuth {
     ) -> Result<(u64, usize), String> {
         let mut guard = self.state.lock().await;
         let mut candidate = guard.clone();
-        if candidate.worker_reset_pending_clients.is_empty() {
-            candidate.worker_reset_epoch = candidate
-                .worker_reset_epoch
-                .checked_add(1)
-                .ok_or_else(|| "companion worker reset epoch exhausted".to_string())?;
-        }
+        // Every destructive Clear Workers operation gets a fresh epoch, even when a previous
+        // reset still has browsers awaiting acknowledgement. New worker state may have been
+        // created after those browsers first observed the older epoch, so reusing it would let a
+        // browser acknowledge the new destructive reset without invalidating that newer authority.
+        candidate.worker_reset_epoch = candidate
+            .worker_reset_epoch
+            .checked_add(1)
+            .ok_or_else(|| "companion worker reset epoch exhausted".to_string())?;
         for client_id in required_clients {
             if candidate.clients.contains_key(client_id) {
                 candidate
@@ -1397,19 +1399,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn worker_reset_pending_browser_survives_restart_until_acknowledged() {
+    async fn worker_reset_retry_advances_epoch_while_preserving_pending_browsers() {
         let root = temp_root("moondesk-companion-worker-reset-pending");
         let path = root.join(COMPANION_AUTH_FILE_NAME);
         let auth = CompanionAuth::open(&path).expect("open companion auth");
-        let credential = "a".repeat(64);
-        auth.auto_pair("browser-b", &credential, Some(ORIGIN_A))
+        auth.auto_pair("browser-b", &"a".repeat(64), Some(ORIGIN_A))
             .await
             .expect("pair browser B");
-        let required = BTreeSet::from(["browser-b".to_string()]);
+        auth.auto_pair("browser-c", &"b".repeat(64), Some(ORIGIN_B))
+            .await
+            .expect("pair browser C");
+        let first_required = BTreeSet::from(["browser-b".to_string()]);
         assert_eq!(
-            auth.begin_worker_reset(&required)
+            auth.begin_worker_reset(&first_required)
                 .await
-                .expect("begin reset with pending browser"),
+                .expect("begin reset with stuck browser B"),
             (1, 1)
         );
         assert!(auth.worker_reset_ack_required("browser-b").await);
@@ -1418,14 +1422,44 @@ mod tests {
         let reopened = CompanionAuth::open(&path).expect("reopen companion auth");
         assert_eq!(reopened.worker_reset_epoch().await, 1);
         assert!(reopened.worker_reset_ack_required("browser-b").await);
+
+        // Browser C may have already applied epoch 1 and then acquired fresh worker authority
+        // while B remained pending. A retrying destructive clear must therefore publish epoch 2,
+        // preserve B's outstanding obligation, and add C to the new reset rather than reusing 1.
+        let second_required = BTreeSet::from(["browser-c".to_string()]);
         assert_eq!(
             reopened
-                .acknowledge_worker_reset("browser-b", 1)
+                .begin_worker_reset(&second_required)
                 .await
-                .expect("ack reset after restart"),
-            (1, 0)
+                .expect("retry reset with new browser C authority"),
+            (2, 2)
         );
-        assert!(!reopened.worker_reset_ack_required("browser-b").await);
+        assert!(reopened.worker_reset_ack_required("browser-b").await);
+        assert!(reopened.worker_reset_ack_required("browser-c").await);
+        assert!(
+            reopened
+                .acknowledge_worker_reset("browser-c", 1)
+                .await
+                .expect_err("old epoch acknowledgement must be rejected")
+                .contains("stale")
+        );
+        assert_eq!(
+            reopened
+                .acknowledge_worker_reset("browser-c", 2)
+                .await
+                .expect("ack fresh reset for browser C"),
+            (2, 1)
+        );
+        assert!(!reopened.worker_reset_ack_required("browser-c").await);
+        assert!(reopened.worker_reset_ack_required("browser-b").await);
+
+        assert!(
+            reopened
+                .revoke_client("browser-b")
+                .await
+                .expect("revoke stuck browser B")
+        );
+        assert_eq!(reopened.worker_reset_pending_count().await, 0);
         let _ = fs::remove_dir_all(root);
     }
 

@@ -21,6 +21,7 @@ pub const MAX_WORKER_RECORDS_PER_FAMILY: usize = 64;
 // these boundaries and is not held behind this lock.
 pub(crate) static WORKER_LIFECYCLE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 pub const MAX_WORKER_ASSIGNMENT_BYTES: usize = 64 * 1024;
+pub const MAX_WORKER_CONTEXT_BYTES: usize = 32 * 1024;
 pub const MAX_WORKER_MESSAGE_BYTES: usize = 32 * 1024;
 pub const MAX_WORKER_RESULT_BYTES: usize = 128 * 1024;
 pub const MAX_PENDING_MESSAGES_PER_WORKER: usize = 128;

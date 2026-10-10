@@ -483,6 +483,7 @@ mod tests {
                 anchor_identity: anchor.clone(),
                 label: "legacy worker binding".into(),
                 assignment: "preserve durable project conversation".into(),
+                context: String::new(),
                 execution_profile: ChatExecutionProfile::default(),
             })
             .await

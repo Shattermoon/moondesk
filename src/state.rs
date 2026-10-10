@@ -4574,6 +4574,7 @@ toolMode = "multiTools"
                 anchor_identity: primary_anchor.clone(),
                 label: "primary worker".into(),
                 assignment: "survive workspace removal".into(),
+                context: String::new(),
                 execution_profile: crate::managed_chat::types::ChatExecutionProfile::default(),
             })
             .await
@@ -4585,6 +4586,7 @@ toolMode = "multiTools"
                 anchor_identity: secondary_anchor.clone(),
                 label: "secondary worker".into(),
                 assignment: "purge with workspace".into(),
+                context: String::new(),
                 execution_profile: crate::managed_chat::types::ChatExecutionProfile::default(),
             })
             .await

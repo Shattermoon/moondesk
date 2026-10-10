@@ -2446,6 +2446,7 @@ mod tests {
                 anchor_identity: core.clone(),
                 label: "legacy claimed sync".into(),
                 assignment: "preserve claimed durable binding".into(),
+                context: String::new(),
                 execution_profile: ChatExecutionProfile::default(),
             })
             .await
@@ -2586,6 +2587,7 @@ mod tests {
                 anchor_identity: core.clone(),
                 label: "detached presence".into(),
                 assignment: "keep working if the browser tab closes".into(),
+                context: String::new(),
                 execution_profile: ChatExecutionProfile::default(),
             })
             .await
@@ -2983,6 +2985,7 @@ mod tests {
                 anchor_identity: anchor_identity.clone(),
                 label: "clear saga".into(),
                 assignment: "prove restart-safe clear ordering".into(),
+                context: String::new(),
                 execution_profile: ChatExecutionProfile::default(),
             })
             .await
@@ -3371,6 +3374,7 @@ mod tests {
                 anchor_identity: core_identity.clone(),
                 label: "clear saga worker".into(),
                 assignment: "seed clear retry coverage".into(),
+                context: String::new(),
                 execution_profile: ChatExecutionProfile::default(),
             })
             .await

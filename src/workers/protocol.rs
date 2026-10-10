@@ -27,6 +27,22 @@ fn required_string<'a>(arguments: &'a Value, name: &str) -> Result<&'a str, Stri
         .ok_or_else(|| format!("Missing or invalid required parameter: {name}"))
 }
 
+fn worker_context(arguments: &Value) -> Result<String, String> {
+    let Some(value) = arguments.get("context") else {
+        return Ok(String::new());
+    };
+    let value = value
+        .as_str()
+        .ok_or_else(|| "Parameter context must be a string".to_string())?;
+    if value.len() > super::MAX_WORKER_CONTEXT_BYTES {
+        return Err(format!(
+            "Parameter context exceeds {} bytes",
+            super::MAX_WORKER_CONTEXT_BYTES
+        ));
+    }
+    Ok(value.trim().to_string())
+}
+
 fn parse_operation_id(arguments: &Value) -> Result<OperationId, String> {
     OperationId::parse(required_string(arguments, "operation_id")?)
 }
@@ -397,6 +413,7 @@ pub async fn handle(
             )
             .await?;
             let assignment = required_string(arguments, "task")?.to_string();
+            let context = worker_context(arguments)?;
             let execution_profile = execution_profile.clone();
             let operation_id = parse_operation_id(arguments)?;
             let receipt = broker
@@ -406,6 +423,7 @@ pub async fn handle(
                     anchor_identity: caller_identity.clone(),
                     label: required_string(arguments, "label")?.to_string(),
                     assignment: assignment.clone(),
+                    context: context.clone(),
                     execution_profile: execution_profile.clone(),
                 })
                 .await
@@ -417,6 +435,7 @@ pub async fn handle(
             })?;
             let opening_message = prompt::bootstrap_message(
                 workspace_name,
+                &context,
                 &assignment,
                 &receipt,
                 claim_operation_id,
@@ -565,6 +584,7 @@ pub async fn handle(
                 "worker reuse requires a confirmed companion Core route".to_string()
             })?;
             let assignment = required_string(arguments, "task")?.to_string();
+            let context = worker_context(arguments)?;
             let operation_id = parse_operation_id(arguments)?;
             let receipt = broker
                 .reuse_worker(ReuseWorkerRequest {
@@ -573,6 +593,7 @@ pub async fn handle(
                     anchor_identity: caller_identity.clone(),
                     worker_id: parse_worker_id(arguments)?,
                     assignment: assignment.clone(),
+                    context: context.clone(),
                 })
                 .await
                 .map_err(broker_error)?;
@@ -588,6 +609,7 @@ pub async fn handle(
             maybe_pause_after_worker_persist(&operation_id).await;
             let opening_message = prompt::reuse_message(
                 workspace_name,
+                &context,
                 &assignment,
                 &receipt.display_id,
                 &receipt.worker_id,
@@ -1019,6 +1041,7 @@ mod tests {
             anchor_identity,
             label: "recovery".into(),
             assignment: "recover the same durable launch".into(),
+            context: String::new(),
             execution_profile: ChatExecutionProfile::default(),
         }
     }
@@ -1296,6 +1319,7 @@ mod tests {
                 anchor_identity: anchor.clone(),
                 worker_id: worker_id.clone(),
                 assignment: "reuse after cleanup partial commit restart".into(),
+                context: String::new(),
             })
             .await
             .expect("surviving worker reuses without managed-chat history");

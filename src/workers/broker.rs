@@ -10,8 +10,8 @@ use super::{
     MAX_COLLECT_RECEIPTS_PER_FAMILY, MAX_COLLECTED_TASK_HISTORY_PER_WORKER,
     MAX_IDEMPOTENCY_RECEIPTS_PER_FAMILY, MAX_PENDING_MESSAGES_PER_WORKER, MAX_REPORTS_PER_FAMILY,
     MAX_TASK_RECORDS_PER_WORKER, MAX_UPDATES_PER_COLLECT, MAX_WORKER_ASSIGNMENT_BYTES,
-    MAX_WORKER_FAMILIES, MAX_WORKER_MESSAGE_BYTES, MAX_WORKER_RECORDS_PER_FAMILY,
-    MAX_WORKERS_PER_FAMILY, RETIRED_WORKER_FENCE_TTL_MS,
+    MAX_WORKER_CONTEXT_BYTES, MAX_WORKER_FAMILIES, MAX_WORKER_MESSAGE_BYTES,
+    MAX_WORKER_RECORDS_PER_FAMILY, MAX_WORKERS_PER_FAMILY, RETIRED_WORKER_FENCE_TTL_MS,
 };
 use crate::managed_chat::types::canonical_chatgpt_conversation_id;
 use crate::workspaces::WorkspaceId;
@@ -55,6 +55,8 @@ pub struct SpawnWorkerRequest {
     pub anchor_identity: ChatIdentity,
     pub label: String,
     pub assignment: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub context: String,
     pub execution_profile: WorkerExecutionProfile,
 }
 
@@ -66,6 +68,8 @@ pub struct ReuseWorkerRequest {
     pub anchor_identity: ChatIdentity,
     pub worker_id: WorkerId,
     pub assignment: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub context: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -926,6 +930,11 @@ impl WorkerBroker {
         if request.assignment.is_empty() || request.assignment.len() > MAX_WORKER_ASSIGNMENT_BYTES {
             return Err(WorkerBrokerError::Invalid(format!(
                 "worker assignment must contain 1..={MAX_WORKER_ASSIGNMENT_BYTES} bytes"
+            )));
+        }
+        if request.context.len() > MAX_WORKER_CONTEXT_BYTES {
+            return Err(WorkerBrokerError::Invalid(format!(
+                "worker shared Core context must contain at most {MAX_WORKER_CONTEXT_BYTES} bytes"
             )));
         }
         let fingerprint = request_fingerprint(&request)?;
@@ -2321,6 +2330,11 @@ fn validate_spawn_request(request: &SpawnWorkerRequest) -> Result<(), WorkerBrok
             "worker assignment must contain 1..={MAX_WORKER_ASSIGNMENT_BYTES} bytes"
         )));
     }
+    if request.context.len() > MAX_WORKER_CONTEXT_BYTES {
+        return Err(WorkerBrokerError::Invalid(format!(
+            "worker shared Core context must contain at most {MAX_WORKER_CONTEXT_BYTES} bytes"
+        )));
+    }
     Ok(())
 }
 
@@ -2394,6 +2408,7 @@ mod tests {
             anchor_identity,
             label: "audit".into(),
             assignment: assignment.into(),
+            context: String::new(),
             execution_profile: profile(),
         }
     }
@@ -2606,6 +2621,26 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    #[test]
+    fn empty_worker_context_stays_out_of_request_fingerprints_for_upgrade_compatibility() {
+        let request = spawn_request(
+            OperationId::new(),
+            WorkspaceId::new(),
+            anchor("anchor-context-compat"),
+            "audit auth",
+        );
+        let serialized = serde_json::to_value(&request).expect("serialize worker request");
+        assert!(serialized.get("context").is_none());
+
+        let mut contextual = request;
+        contextual.context = "shared context".into();
+        let serialized = serde_json::to_value(&contextual).expect("serialize contextual request");
+        assert_eq!(
+            serialized.get("context"),
+            Some(&serde_json::json!("shared context"))
+        );
+    }
+
     #[tokio::test]
     async fn spawn_is_idempotent_and_rejects_changed_input_for_same_operation() {
         let root = temp_root("moondesk-worker-spawn-idempotent");
@@ -2615,22 +2650,19 @@ mod tests {
         let identity = anchor("anchor-a");
         let operation = OperationId::new();
 
+        let mut request = spawn_request(
+            operation.clone(),
+            workspace.clone(),
+            identity.clone(),
+            "audit auth",
+        );
+        request.context = "shared review context".into();
         let first = broker
-            .spawn_worker(spawn_request(
-                operation.clone(),
-                workspace.clone(),
-                identity.clone(),
-                "audit auth",
-            ))
+            .spawn_worker(request.clone())
             .await
             .expect("spawn worker");
         let retry = broker
-            .spawn_worker(spawn_request(
-                operation.clone(),
-                workspace.clone(),
-                identity.clone(),
-                "audit auth",
-            ))
+            .spawn_worker(request.clone())
             .await
             .expect("retry same spawn");
         assert_eq!(first, retry);
@@ -2647,6 +2679,14 @@ mod tests {
                 .len(),
             1
         );
+
+        let mut changed_context = request.clone();
+        changed_context.context = "different shared review context".into();
+        let changed = broker
+            .spawn_worker(changed_context)
+            .await
+            .expect_err("same operation id with changed context must fail");
+        assert!(matches!(changed, WorkerBrokerError::Conflict(_)));
 
         let changed = broker
             .spawn_worker(spawn_request(
@@ -2734,6 +2774,7 @@ mod tests {
                 anchor_identity: anchor_identity.clone(),
                 worker_id: live.worker_id.clone(),
                 assignment: "wake that never enqueues".into(),
+                context: String::new(),
             })
             .await
             .expect("create pending reuse");
@@ -2878,6 +2919,7 @@ mod tests {
             anchor_identity: anchor_identity.clone(),
             worker_id: spawned.worker_id.clone(),
             assignment: "second assignment".into(),
+            context: String::new(),
         };
         let reused = broker
             .reuse_worker(reuse_request.clone())
@@ -3189,6 +3231,7 @@ mod tests {
                 anchor_identity: core.clone(),
                 worker_id: durable.worker_id.clone(),
                 assignment: "reuse failure".into(),
+                context: String::new(),
             })
             .await
             .expect("reuse durable worker");
@@ -4380,6 +4423,7 @@ mod tests {
                     anchor_identity: anchor_identity.clone(),
                     worker_id: worker_id.clone(),
                     assignment: format!("history-task-{index}"),
+                    context: String::new(),
                 })
                 .await
                 .expect("reuse bounded worker");
@@ -4618,6 +4662,7 @@ mod tests {
                     anchor_identity: anchor_identity.clone(),
                     worker_id: worker_id.clone(),
                     assignment: large_assignment.clone(),
+                    context: String::new(),
                 })
                 .await
                 .expect("reuse large-payload worker");

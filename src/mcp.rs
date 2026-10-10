@@ -453,14 +453,15 @@ fn workers_tool_descriptor() -> Value {
     json!({
         "name": "workers",
         "title": "Coordinate workers",
-        "description": "Coordinate MoonDesk experimental workers for this exact workspace and ChatGPT conversation. The workspace is resolved from this connector; never pass or guess a workspace. Core actions are spawn, reuse, retire, status, send, collect. Worker actions are claim, start, inbox, ack, report, finish. Call status before creating a worker group: targetWorkerCount is the user's configured concurrency target, recommendedWorkerCount is the product recommendation, and maxWorkerCount is the hard ceiling. Respect an explicit user-requested count when it is within the maximum; otherwise use targetWorkerCount. Reuse creates a new durable task on an idle claimed worker and wakes its existing ChatGPT conversation. Retire frees an idle worker slot or safely abandons a launch only when MoonDesk can prove the assignment never crossed the Send boundary. collect can wait up to 60 seconds for a report/completion so the Core does not need polling loops. collect requires operation_id too so a dropped collect response can replay the same durable batch. Idempotency history is intentionally bounded (recent 256 mutation receipts per Core family and 16 collection batches), so retry an ambiguous response promptly with the same operation_id before issuing unrelated work. Worker coordination requires exact ChatGPT session metadata and fails closed when that identity is unavailable. operation_id must be a stable UUID reused when retrying the same spawn/reuse/send/report/collect after an ambiguous response; fresh worker claim receives its one-time browser-attested operation_id only in the worker bootstrap.",
+        "description": "Coordinate MoonDesk experimental workers for this exact workspace and ChatGPT conversation. The workspace is resolved from this connector; never pass or guess a workspace. Core actions are spawn, reuse, retire, status, send, collect. Worker actions are claim, start, inbox, ack, report, finish. Call status before creating a worker group: targetWorkerCount is the user's configured concurrency target, recommendedWorkerCount is the product recommendation, and maxWorkerCount is the hard ceiling. Respect an explicit user-requested count when it is within the maximum; otherwise use targetWorkerCount. For spawn/reuse, pass `context` whenever the worker benefits from inherited Core knowledge: overall goal, user constraints, settled decisions, branch/PR/base state, work already completed, relevant validation, sibling-worker ownership, and what should count as a blocker. Keep `context` shared across workers in the same run when appropriate, while `task` stays worker-specific. Do not copy credentials, claim capabilities, secret connector URLs, or unrelated private data into context. Reuse creates a new durable task on an idle claimed worker and wakes its existing ChatGPT conversation. Retire frees an idle worker slot or safely abandons a launch only when MoonDesk can prove the assignment never crossed the Send boundary. collect can wait up to 60 seconds for a report/completion so the Core does not need polling loops. collect requires operation_id too so a dropped collect response can replay the same durable batch. Idempotency history is intentionally bounded (recent 256 mutation receipts per Core family and 16 collection batches), so retry an ambiguous response promptly with the same operation_id before issuing unrelated work. Worker coordination requires exact ChatGPT session metadata and fails closed when that identity is unavailable. operation_id must be a stable UUID reused when retrying the same spawn/reuse/send/report/collect after an ambiguous response; fresh worker claim receives its one-time browser-attested operation_id only in the worker bootstrap.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "action": { "type": "string", "enum": ["spawn", "reuse", "retire", "status", "send", "collect", "claim", "start", "inbox", "ack", "report", "finish"] },
                 "operation_id": { "type": "string", "description": "Stable UUID for idempotent spawn/reuse/send/report/collect operations; fresh worker claim must use the one-time browser-attested UUID embedded in that worker's bootstrap" },
                 "label": { "type": "string", "minLength": 1, "maxLength": 128, "description": "Short worker task label for spawn" },
-                "task": { "type": "string", "minLength": 1, "description": "Concrete assignment for spawn or reuse" },
+                "task": { "type": "string", "minLength": 1, "description": "Concrete worker-specific assignment for spawn or reuse" },
+                "context": { "type": "string", "maxLength": 32768, "description": "Optional inherited Core context for spawn/reuse: overall goal, constraints, settled decisions, branch/PR/base state, completed work/validation, sibling ownership, and blocker criteria. Keep it concise and free of secrets; MoonDesk places it before the worker-specific assignment." },
                 "worker_id": { "type": "string", "description": "Worker UUID returned by spawn" },
                 "task_id": { "type": "string", "description": "Task UUID returned by spawn" },
                 "claim_token": { "type": "string", "description": "Single-use worker claim capability embedded only in a fresh worker bootstrap" },
@@ -4197,10 +4198,21 @@ mod tests {
             .and_then(|result| result.get("tools"))
             .and_then(Value::as_array)
             .expect("tools list");
+        let workers = tools
+            .iter()
+            .find(|tool| tool.get("name").and_then(Value::as_str) == Some("workers"))
+            .expect("workers tool");
+        let context = workers
+            .get("inputSchema")
+            .and_then(|schema| schema.get("properties"))
+            .and_then(|properties| properties.get("context"))
+            .expect("workers context input");
+        assert_eq!(context.get("maxLength"), Some(&json!(32768)));
         assert!(
-            tools
-                .iter()
-                .any(|tool| { tool.get("name").and_then(Value::as_str) == Some("workers") })
+            workers
+                .get("description")
+                .and_then(Value::as_str)
+                .is_some_and(|description| description.contains("inherited Core knowledge"))
         );
     }
 
@@ -5020,6 +5032,7 @@ mod tests {
                 anchor_identity: core_identity.clone(),
                 label: "browser bound claim".into(),
                 assignment: "prove browser-bound worker admission".into(),
+                context: String::new(),
                 execution_profile: ChatExecutionProfile::default(),
             })
             .await
@@ -5359,6 +5372,7 @@ mod tests {
                 anchor_identity: core.clone(),
                 label: "clear fence".into(),
                 assignment: "be cleared and fenced".into(),
+                context: String::new(),
                 execution_profile: ChatExecutionProfile::default(),
             })
             .await

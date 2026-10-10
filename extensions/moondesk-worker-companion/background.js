@@ -4,7 +4,7 @@ const BRIDGE_PORTS = [47650, 47651, 47652, 47653, 47654];
 const REQUIRED_PROTOCOL_VERSION = 2;
 // Bump with any shipped companion runtime change that requires Chromium to load new bytes. Keep
 // this aligned with COMPANION_RUNTIME_REVISION in src/server.rs.
-const COMPANION_RUNTIME_REVISION = 6;
+const COMPANION_RUNTIME_REVISION = 7;
 const SOURCE_DEV_MANIFEST_VERSION = '0.1.0';
 const RUNTIME_RELOAD_STORAGE_KEY = 'moondeskWorkerCompanionReloadRevisionV1';
 const INSTALLATION_BOOTSTRAP_FILE = 'moondesk-bootstrap.json';
@@ -17,6 +17,7 @@ const PRESENCE_PATH = '/__moondesk/companion/v1/presence';
 const CORRELATIONS_PATH = '/__moondesk/companion/v1/correlations';
 const SEND_STARTED_PATH = '/__moondesk/companion/v1/commands/send-started';
 const CLEAR_WORKERS_PATH = '/__moondesk/companion/v1/workers/clear';
+const WORKER_RESET_ACK_PATH = '/__moondesk/companion/v1/workers/reset-ack';
 const HELLO_TIMEOUT_MS = 1200;
 const FAST_POLL_MS = 1500;
 const MAX_RECONCILE_ATTEMPTS = 3;
@@ -43,7 +44,8 @@ function freshState() {
     bindings: {},
     launchRecords: {},
     threadRecords: {},
-    blockedCommands: {}
+    blockedCommands: {},
+    workerResetEpoch: 0
   };
 }
 
@@ -77,6 +79,49 @@ async function writeWorkerCommandState(state, clearGeneration) {
   if (clearGeneration !== workerClearGeneration) return false;
   await writeState(state);
   return clearGeneration === workerClearGeneration;
+}
+
+function normalizedWorkerResetEpoch(value) {
+  const epoch = Number(value);
+  return Number.isSafeInteger(epoch) && epoch >= 0 ? epoch : 0;
+}
+
+async function applyHostWorkerResetEpoch(state, remote) {
+  const remoteEpoch = normalizedWorkerResetEpoch(remote?.workerResetEpoch);
+  const localEpoch = normalizedWorkerResetEpoch(state.workerResetEpoch);
+  let changed = false;
+  if (remoteEpoch > localEpoch) {
+    // A reset from any paired browser invalidates this extension's already-running command work
+    // before any asynchronous cleanup runs. Stale command writers are generation-guarded, so they
+    // cannot repopulate launch/thread history after this point.
+    workerClearGeneration += 1;
+    sessionReconcileCommandIds.clear();
+    state.launchRecords = {};
+    state.threadRecords = {};
+    state.blockedCommands = {};
+    state.workerResetEpoch = remoteEpoch;
+    await writeState(state);
+    changed = true;
+  }
+  if (changed) {
+    await clearRememberedWorkerLaunchesInTabs();
+  }
+  if (
+    remote?.workerResetAckRequired === true &&
+    normalizedWorkerResetEpoch(state.workerResetEpoch) === remoteEpoch
+  ) {
+    await api(state, WORKER_RESET_ACK_PATH, {
+      method: 'POST',
+      body: { workerResetEpoch: remoteEpoch }
+    });
+  }
+  return changed;
+}
+
+async function syncHostWorkerResetEpoch(state) {
+  const remote = await api(state, STATUS_PATH);
+  await applyHostWorkerResetEpoch(state, remote);
+  return remote;
 }
 
 function blockCommand(state, blocked) {
@@ -308,6 +353,7 @@ async function ensureConnectedOnce() {
         state.clientId = remote.clientId;
         await writeState(state);
       }
+      await applyHostWorkerResetEpoch(state, remote);
       return state;
     } catch (error) {
       if (error?.status !== 401) throw error;
@@ -327,7 +373,8 @@ async function ensureConnectedOnce() {
     authenticated: false,
     body: { clientId: state.clientId, credential: state.credential, bootstrapToken }
   });
-  await api(state, STATUS_PATH);
+  const remote = await api(state, STATUS_PATH);
+  await applyHostWorkerResetEpoch(state, remote);
   return state;
 }
 
@@ -1211,6 +1258,12 @@ async function processCommand(state, offer, clearGeneration = workerClearGenerat
     return;
   }
 
+  // markSendStarted proves only that MoonDesk authorized the browser-side Send boundary. Another
+  // paired companion may clear all Workers after that response but before this tab is clicked, so
+  // re-read the durable host reset epoch at the last asynchronous boundary before DOM Send.
+  await syncHostWorkerResetEpoch(state);
+  if (!clearStillCurrent()) return;
+
   const committed = await sendToTab(tab.id, {
     type: 'MOONDESK_COMMIT_WORKER_SEND',
     commandId: command.id,
@@ -1360,6 +1413,7 @@ async function status() {
   try {
     const state = await ensureConnected();
     const remote = await api(state, STATUS_PATH);
+    await applyHostWorkerResetEpoch(state, remote);
     const hasLocalWorkerState =
       Object.keys(state.launchRecords || {}).length > 0 ||
       Object.keys(state.threadRecords || {}).length > 0 ||
@@ -1443,9 +1497,9 @@ async function clearRememberedWorkerLaunchesInTabs() {
 async function clearWorkers() {
   if (workerClearInProgress) throw new Error('Clear Workers is already in progress');
 
-  // Cancel browser-side worker authority synchronously with the user's click. The generation fence
-  // makes every already-running processCommand coroutine stale before this function reaches its
-  // first await, and pump() refuses to redeem new commands until the durable host reset finishes.
+  // Fence this browser synchronously with the user's click. The host publishes its own durable
+  // reset epoch so every other paired companion can independently discard stale worker authority.
+  // A Send that already reached ChatGPT cannot be unsent and is reported separately by the host.
   workerClearInProgress = true;
   workerClearGeneration += 1;
   sessionReconcileCommandIds.clear();
@@ -1462,6 +1516,10 @@ async function clearWorkers() {
     state.launchRecords = {};
     state.threadRecords = {};
     state.blockedCommands = {};
+    state.workerResetEpoch = Math.max(
+      normalizedWorkerResetEpoch(state.workerResetEpoch),
+      normalizedWorkerResetEpoch(response.workerResetEpoch)
+    );
     await writeState(state);
     return response;
   } finally {

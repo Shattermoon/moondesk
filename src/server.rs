@@ -27,7 +27,7 @@ use crate::companion::{
 use crate::managed_chat::broker::{ManagedChatAckOutcome, ManagedChatError};
 use crate::managed_chat::types::{
     ChatExecutionProfile, ManagedChatCommand, ManagedChatCommandId, ManagedChatCommandState,
-    ManagedChatLeaseId,
+    ManagedChatLeaseId, ManagedChatPurpose,
 };
 use crate::mcp::{self, JsonRpcRequest};
 use crate::state::{
@@ -59,10 +59,11 @@ pub const COMPANION_REDEEM_ROUTE: &str = "/__moondesk/companion/v1/commands/rede
 pub const COMPANION_SEND_STARTED_ROUTE: &str = "/__moondesk/companion/v1/commands/send-started";
 pub const COMPANION_ACK_ROUTE: &str = "/__moondesk/companion/v1/commands/ack";
 pub const COMPANION_CLEAR_WORKERS_ROUTE: &str = "/__moondesk/companion/v1/workers/clear";
+pub const COMPANION_WORKER_RESET_ACK_ROUTE: &str = "/__moondesk/companion/v1/workers/reset-ack";
 pub const COMPANION_TOKEN_HEADER: &str = "x-moondesk-companion-token";
 // Bump with any shipped companion runtime change that requires Chromium to load new bytes. Keep
 // this aligned with COMPANION_RUNTIME_REVISION in background.js.
-pub const COMPANION_RUNTIME_REVISION: u32 = 6;
+pub const COMPANION_RUNTIME_REVISION: u32 = 7;
 const MAX_COMPANION_BODY_BYTES: usize = 16 * 1024;
 
 #[derive(Clone)]
@@ -217,6 +218,10 @@ pub fn companion_bridge_router(
         .route(
             COMPANION_CLEAR_WORKERS_ROUTE,
             post(clear_companion_workers).layer(DefaultBodyLimit::max(MAX_COMPANION_BODY_BYTES)),
+        )
+        .route(
+            COMPANION_WORKER_RESET_ACK_ROUTE,
+            post(ack_companion_worker_reset).layer(DefaultBodyLimit::max(MAX_COMPANION_BODY_BYTES)),
         )
         .with_state(state)
 }
@@ -382,6 +387,12 @@ struct CompanionClearWorkersRequest {}
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct CompanionWorkerResetAckRequest {
+    worker_reset_epoch: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct CompanionRevokeClientRequest {
     client_id: String,
 }
@@ -504,7 +515,9 @@ async fn companion_status(State(state): State<ServerState>, headers: HeaderMap) 
             "paired": true,
             "clientId": client_id,
             "pairedClientCount": auth.paired_client_count().await,
-            "hasWorkerState": has_worker_state
+            "hasWorkerState": has_worker_state,
+            "workerResetEpoch": auth.worker_reset_epoch().await,
+            "workerResetAckRequired": auth.worker_reset_ack_required(&client_id).await
         }),
     )
 }
@@ -1026,6 +1039,33 @@ async fn ack_companion_command(
     }
 }
 
+async fn ack_companion_worker_reset(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(request): Json<CompanionWorkerResetAckRequest>,
+) -> Response<Body> {
+    if !companion_origin_allowed(&headers) {
+        return companion_origin_error();
+    }
+    let Some(client_id) = companion_client_id(&state, &headers).await else {
+        return companion_unauthorized();
+    };
+    let auth = { state.app.lock().await.companion_auth.clone() };
+    match auth
+        .acknowledge_worker_reset(&client_id, request.worker_reset_epoch)
+        .await
+    {
+        Ok((worker_reset_epoch, pending_count)) => json_response(
+            StatusCode::OK,
+            json!({
+                "workerResetEpoch": worker_reset_epoch,
+                "pendingClientCount": pending_count
+            }),
+        ),
+        Err(error) => json_response(StatusCode::CONFLICT, json!({ "error": error })),
+    }
+}
+
 async fn clear_companion_workers(
     State(state): State<ServerState>,
     headers: HeaderMap,
@@ -1034,9 +1074,9 @@ async fn clear_companion_workers(
     if !companion_origin_allowed(&headers) {
         return companion_origin_error();
     }
-    if companion_client_id(&state, &headers).await.is_none() {
+    let Some(requesting_client_id) = companion_client_id(&state, &headers).await else {
         return companion_unauthorized();
-    }
+    };
 
     // Mirror Chat on Steroids' explicit Clear Swarm semantics: this is a destructive global
     // Workers reset, not a per-Core cleanup. Active/parked worker ownership and queued browser
@@ -1044,13 +1084,45 @@ async fn clear_companion_workers(
     // conversation identities are retained as short-lived fences so an old worker tab cannot
     // immediately return as a new Core.
     let _lifecycle_guard = crate::workers::WORKER_LIFECYCLE_LOCK.lock().await;
-    let (managed_chat_broker, worker_broker) = {
+    let (auth, managed_chat_broker, worker_broker) = {
         let app = state.app.lock().await;
-        (app.managed_chat_broker.clone(), app.worker_broker.clone())
+        (
+            app.companion_auth.clone(),
+            app.managed_chat_broker.clone(),
+            app.worker_broker.clone(),
+        )
     };
     let had_worker_state =
         worker_broker.has_worker_state().await || managed_chat_broker.has_worker_commands().await;
+    let reset_required_clients = managed_chat_broker
+        .snapshot()
+        .await
+        .commands
+        .values()
+        .filter(|command| {
+            command.launch.purpose == ManagedChatPurpose::Worker
+                && command.state == ManagedChatCommandState::SendStarted
+        })
+        .filter_map(|command| command.lease.as_ref().map(|lease| lease.client_id.clone()))
+        .filter(|client_id| client_id != &requesting_client_id)
+        .collect::<BTreeSet<_>>();
+    let (worker_reset_epoch, pending_reset_clients) = match auth
+        .begin_worker_reset(&reset_required_clients)
+        .await
+    {
+        Ok(value) => value,
+        Err(error) => {
+            return json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({ "error": format!("worker reset epoch could not be published; no worker state was cleared: {error}") }),
+            );
+        }
+    };
 
+    // Publish the reset epoch before deleting durable Worker state so every paired companion can
+    // fence stale local offers/records as soon as it next reconnects, checks status, or reaches the
+    // final pre-Send barrier. If a later store commit fails, retrying Clear Workers safely advances
+    // the epoch again and resumes the destructive reset without reviving any old browser authority.
     // Commit the worker side first. If the managed-chat store then fails, the old worker
     // conversations are already fenced and cannot keep acting; retrying this endpoint safely
     // finishes command cleanup without reviving any worker family.
@@ -1077,13 +1149,48 @@ async fn clear_companion_workers(
         }
     };
 
+    let send_boundary_command_ids = commands
+        .iter()
+        .filter(|command| command.state == ManagedChatCommandState::SendStarted)
+        .map(|command| command.id.to_string())
+        .collect::<Vec<_>>();
+
+    if pending_reset_clients > 0
+        && !auth
+            .wait_for_worker_reset_acknowledgements(worker_reset_epoch, Duration::from_secs(5))
+            .await
+    {
+        let remaining_pending_clients = auth.worker_reset_pending_count().await;
+        let send_boundary_warning = if send_boundary_command_ids.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " {} worker send(s) had already crossed MoonDesk's Send boundary and may already have reached ChatGPT; those sends cannot be unsent.",
+                send_boundary_command_ids.len()
+            )
+        };
+        return json_response(
+            StatusCode::CONFLICT,
+            json!({
+                "error": format!(
+                    "worker state was cleared, but another paired browser has not yet acknowledged the global reset; let that browser reconnect or revoke it, then retry Clear Workers.{send_boundary_warning}"
+                ),
+                "workerResetEpoch": worker_reset_epoch,
+                "pendingBrowserCount": remaining_pending_clients,
+                "sendBoundaryCommandIds": send_boundary_command_ids
+            }),
+        );
+    }
+
     json_response(
         StatusCode::OK,
         json!({
             "cleared": true,
             "alreadyCleared": !had_worker_state,
+            "workerResetEpoch": worker_reset_epoch,
             "workerIds": workers.iter().map(|worker| worker.id.to_string()).collect::<Vec<_>>(),
-            "commandIds": commands.iter().map(|command| command.id.to_string()).collect::<Vec<_>>()
+            "commandIds": commands.iter().map(|command| command.id.to_string()).collect::<Vec<_>>(),
+            "sendBoundaryCommandIds": send_boundary_command_ids
         }),
     )
 }
@@ -3571,6 +3678,12 @@ mod tests {
                 .and_then(Value::as_bool),
             Some(true)
         );
+        assert_eq!(
+            worker_status_json
+                .get("workerResetEpoch")
+                .and_then(Value::as_u64),
+            Some(0)
+        );
 
         managed_chat_broker.fail_next_commit_for_test();
         let interrupted_clear = client
@@ -3601,6 +3714,21 @@ mod tests {
                 .contains_key(&command.id),
             "terminal managed command must remain retryable after injected persistence failure"
         );
+        let status_after_interrupted_clear = client
+            .get(format!("http://{address}{COMPANION_STATUS_ROUTE}"))
+            .header(COMPANION_TOKEN_HEADER, &credential)
+            .send()
+            .await
+            .expect("read reset epoch after interrupted clear");
+        let status_after_interrupted_clear =
+            reqwest_response_json(status_after_interrupted_clear).await;
+        assert_eq!(
+            status_after_interrupted_clear
+                .get("workerResetEpoch")
+                .and_then(Value::as_u64),
+            Some(1),
+            "reset epoch must publish before later destructive store cleanup can fail"
+        );
 
         let cleared = client
             .post(format!("http://{address}{COMPANION_CLEAR_WORKERS_ROUTE}"))
@@ -3615,6 +3743,10 @@ mod tests {
         assert_eq!(
             cleared_json.get("cleared").and_then(Value::as_bool),
             Some(true)
+        );
+        assert_eq!(
+            cleared_json.get("workerResetEpoch").and_then(Value::as_u64),
+            Some(2)
         );
         assert!(
             cleared_json
@@ -3640,6 +3772,12 @@ mod tests {
                 .get("alreadyCleared")
                 .and_then(Value::as_bool),
             Some(true)
+        );
+        assert_eq!(
+            cleared_retry_json
+                .get("workerResetEpoch")
+                .and_then(Value::as_u64),
+            Some(3)
         );
 
         let removed_retry_endpoint = client

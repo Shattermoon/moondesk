@@ -427,9 +427,13 @@ $('clearWorkers').addEventListener('click', async () => {
   try {
     const result = await bg({ type: 'MOONDESK_CLEAR_WORKERS' });
     const count = (result.workerIds?.length || 0);
+    const sendBoundaryCount = (result.sendBoundaryCommandIds?.length || 0);
+    const sendWarning = sendBoundaryCount
+      ? ` ${sendBoundaryCount} worker send${sendBoundaryCount === 1 ? '' : 's'} had already crossed MoonDesk's Send boundary and may already have reached ChatGPT.`
+      : '';
     const message = result.alreadyCleared
-      ? 'No worker history remained to clear.'
-      : `Cleared ${count} worker${count === 1 ? '' : 's'}.`;
+      ? `No worker history remained to clear.${sendWarning}`
+      : `Cleared ${count} worker${count === 1 ? '' : 's'}.${sendWarning}`;
     try {
       await render();
     } catch (refreshError) {

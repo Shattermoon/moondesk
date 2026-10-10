@@ -6,7 +6,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 use subtle::ConstantTimeEq;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 use uuid::Uuid;
 
 pub const COMPANION_AUTH_SCHEMA_VERSION: u32 = 2;
@@ -59,6 +59,10 @@ struct CompanionAuthState {
     schema_version: u32,
     #[serde(default)]
     clients: BTreeMap<String, CompanionClientCredential>,
+    #[serde(default)]
+    worker_reset_epoch: u64,
+    #[serde(default)]
+    worker_reset_pending_clients: BTreeSet<String>,
 }
 
 impl Default for CompanionAuthState {
@@ -66,6 +70,8 @@ impl Default for CompanionAuthState {
         Self {
             schema_version: COMPANION_AUTH_SCHEMA_VERSION,
             clients: BTreeMap::new(),
+            worker_reset_epoch: 0,
+            worker_reset_pending_clients: BTreeSet::new(),
         }
     }
 }
@@ -86,6 +92,12 @@ impl CompanionAuthState {
         for (client_id, client) in &self.clients {
             validate_client_id(client_id)?;
             client.validate()?;
+        }
+        for client_id in &self.worker_reset_pending_clients {
+            validate_client_id(client_id)?;
+            if !self.clients.contains_key(client_id) {
+                return Err("companion worker reset pending client is not paired".into());
+            }
         }
         Ok(())
     }
@@ -303,6 +315,7 @@ pub struct CompanionAuth {
     presence: Mutex<BTreeMap<String, CompanionClientPresence>>,
     correlations: Mutex<BTreeMap<String, (CompanionAnchorRoute, u64)>>,
     anchor_affinities: Mutex<BTreeMap<String, (CompanionAnchorRoute, u64)>>,
+    worker_reset_notify: Notify,
     pairing_token: RwLock<String>,
     installation_token: String,
 }
@@ -324,6 +337,7 @@ impl CompanionAuth {
             presence: Mutex::new(BTreeMap::new()),
             correlations: Mutex::new(BTreeMap::new()),
             anchor_affinities: Mutex::new(BTreeMap::new()),
+            worker_reset_notify: Notify::new(),
             pairing_token: RwLock::new(random_secret()),
             installation_token: random_secret(),
         })
@@ -484,6 +498,115 @@ impl CompanionAuth {
         self.state.lock().await.clients.len()
     }
 
+    pub async fn worker_reset_epoch(&self) -> u64 {
+        self.state.lock().await.worker_reset_epoch
+    }
+
+    pub async fn begin_worker_reset(
+        &self,
+        required_clients: &BTreeSet<String>,
+    ) -> Result<(u64, usize), String> {
+        let mut guard = self.state.lock().await;
+        let mut candidate = guard.clone();
+        if candidate.worker_reset_pending_clients.is_empty() {
+            candidate.worker_reset_epoch = candidate
+                .worker_reset_epoch
+                .checked_add(1)
+                .ok_or_else(|| "companion worker reset epoch exhausted".to_string())?;
+        }
+        for client_id in required_clients {
+            if candidate.clients.contains_key(client_id) {
+                candidate
+                    .worker_reset_pending_clients
+                    .insert(client_id.clone());
+            }
+        }
+        candidate.validate()?;
+        if candidate != *guard {
+            persist_state(&self.path, &candidate).await?;
+            *guard = candidate;
+        }
+        Ok((
+            guard.worker_reset_epoch,
+            guard.worker_reset_pending_clients.len(),
+        ))
+    }
+
+    pub async fn worker_reset_ack_required(&self, client_id: &str) -> bool {
+        self.state
+            .lock()
+            .await
+            .worker_reset_pending_clients
+            .contains(client_id)
+    }
+
+    pub async fn worker_reset_pending_count(&self) -> usize {
+        self.state.lock().await.worker_reset_pending_clients.len()
+    }
+
+    pub async fn acknowledge_worker_reset(
+        &self,
+        client_id: &str,
+        epoch: u64,
+    ) -> Result<(u64, usize), String> {
+        validate_client_id(client_id)?;
+        let mut guard = self.state.lock().await;
+        if !guard.clients.contains_key(client_id) {
+            return Err("companion browser is not paired".into());
+        }
+        if epoch != guard.worker_reset_epoch {
+            return Err(format!(
+                "companion worker reset acknowledgement is stale; current epoch is {}",
+                guard.worker_reset_epoch
+            ));
+        }
+        if !guard.worker_reset_pending_clients.contains(client_id) {
+            return Ok((
+                guard.worker_reset_epoch,
+                guard.worker_reset_pending_clients.len(),
+            ));
+        }
+        let mut candidate = guard.clone();
+        candidate.worker_reset_pending_clients.remove(client_id);
+        candidate.validate()?;
+        persist_state(&self.path, &candidate).await?;
+        let pending = candidate.worker_reset_pending_clients.len();
+        *guard = candidate;
+        drop(guard);
+        self.worker_reset_notify.notify_waiters();
+        Ok((epoch, pending))
+    }
+
+    pub async fn wait_for_worker_reset_acknowledgements(
+        &self,
+        epoch: u64,
+        timeout: std::time::Duration,
+    ) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let notified = self.worker_reset_notify.notified();
+            {
+                let guard = self.state.lock().await;
+                if guard.worker_reset_epoch != epoch {
+                    return false;
+                }
+                if guard.worker_reset_pending_clients.is_empty() {
+                    return true;
+                }
+            }
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            if tokio::time::timeout(deadline - now, notified)
+                .await
+                .is_err()
+            {
+                return false;
+            }
+        }
+    }
+
     pub async fn authorize(
         &self,
         credential: &str,
@@ -525,9 +648,14 @@ impl CompanionAuth {
         }
         let mut candidate = guard.clone();
         candidate.clients.remove(client_id);
+        let removed_pending = candidate.worker_reset_pending_clients.remove(client_id);
         candidate.validate()?;
         persist_state(&self.path, &candidate).await?;
         *guard = candidate;
+        drop(guard);
+        if removed_pending {
+            self.worker_reset_notify.notify_waiters();
+        }
         self.presence.lock().await.remove(client_id);
         self.correlations
             .lock()
@@ -1074,6 +1202,8 @@ fn load_state(path: &Path) -> std::io::Result<CompanionAuthState> {
             CompanionAuthState {
                 schema_version: COMPANION_AUTH_SCHEMA_VERSION,
                 clients,
+                worker_reset_epoch: 0,
+                worker_reset_pending_clients: BTreeSet::new(),
             },
             true,
         )
@@ -1227,6 +1357,75 @@ mod tests {
                 .as_deref(),
             Some("extension-install-a")
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn worker_reset_epoch_is_monotonic_and_survives_restart() {
+        let root = temp_root("moondesk-companion-worker-reset-epoch");
+        let path = root.join(COMPANION_AUTH_FILE_NAME);
+        fs::create_dir_all(&root).expect("create companion auth root");
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schemaVersion": COMPANION_AUTH_SCHEMA_VERSION,
+                "clients": {}
+            }))
+            .expect("serialize pre-epoch companion auth"),
+        )
+        .expect("write pre-epoch companion auth");
+        let auth = CompanionAuth::open(&path).expect("open companion auth");
+        assert_eq!(auth.worker_reset_epoch().await, 0);
+        assert_eq!(
+            auth.begin_worker_reset(&BTreeSet::new())
+                .await
+                .expect("begin reset epoch"),
+            (1, 0)
+        );
+        drop(auth);
+
+        let reopened = CompanionAuth::open(&path).expect("reopen companion auth");
+        assert_eq!(reopened.worker_reset_epoch().await, 1);
+        assert_eq!(
+            reopened
+                .begin_worker_reset(&BTreeSet::new())
+                .await
+                .expect("begin reset epoch after restart"),
+            (2, 0)
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn worker_reset_pending_browser_survives_restart_until_acknowledged() {
+        let root = temp_root("moondesk-companion-worker-reset-pending");
+        let path = root.join(COMPANION_AUTH_FILE_NAME);
+        let auth = CompanionAuth::open(&path).expect("open companion auth");
+        let credential = "a".repeat(64);
+        auth.auto_pair("browser-b", &credential, Some(ORIGIN_A))
+            .await
+            .expect("pair browser B");
+        let required = BTreeSet::from(["browser-b".to_string()]);
+        assert_eq!(
+            auth.begin_worker_reset(&required)
+                .await
+                .expect("begin reset with pending browser"),
+            (1, 1)
+        );
+        assert!(auth.worker_reset_ack_required("browser-b").await);
+        drop(auth);
+
+        let reopened = CompanionAuth::open(&path).expect("reopen companion auth");
+        assert_eq!(reopened.worker_reset_epoch().await, 1);
+        assert!(reopened.worker_reset_ack_required("browser-b").await);
+        assert_eq!(
+            reopened
+                .acknowledge_worker_reset("browser-b", 1)
+                .await
+                .expect("ack reset after restart"),
+            (1, 0)
+        );
+        assert!(!reopened.worker_reset_ack_required("browser-b").await);
         let _ = fs::remove_dir_all(root);
     }
 

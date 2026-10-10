@@ -205,10 +205,11 @@ test('companion HTTP paths used by the extension match server route constants', 
       'COMPANION_REDEEM_ROUTE',
       'COMPANION_SEND_STARTED_ROUTE',
       'COMPANION_ACK_ROUTE',
-      'COMPANION_CLEAR_WORKERS_ROUTE'
+      'COMPANION_CLEAR_WORKERS_ROUTE',
+      'COMPANION_WORKER_RESET_ACK_ROUTE'
     ].includes(name));
 
-  assert.equal(routes.length, 13, 'expected the complete companion route set from src/server.rs');
+  assert.equal(routes.length, 14, 'expected the complete companion route set from src/server.rs');
   for (const { name, route } of routes) {
     assert.ok(source.includes(route), `${name} must be used verbatim by background.js`);
   }
@@ -361,6 +362,218 @@ test('Clear Workers fences in-flight browser work before awaiting the host reset
   assert.deepEqual(persisted.blockedCommands || {}, {});
 });
 
+test('global Clear Workers epoch fences a second paired companion after send-started and clears its ghost history', async () => {
+  let hostEpoch = 0;
+  let sendStarted = false;
+  let commitCalls = 0;
+  let browserBAckRequired = false;
+  let resolveResetAck;
+  const resetAcked = new Promise((resolve) => { resolveResetAck = resolve; });
+  let releasePreSendStatus;
+  let reportPreSendStatus;
+  const preSendStatusReached = new Promise((resolve) => { reportPreSendStatus = resolve; });
+  const preSendStatusGate = new Promise((resolve) => { releasePreSendStatus = resolve; });
+  const commandId = '31111111-2222-4333-8444-555555555555';
+  const leaseId = '36666666-7777-4888-8999-aaaaaaaaaaaa';
+  const taskMarker = 'moondesk-worker-task:global-reset-race';
+  const conversationId = 'bbbbbbbb-cccc-4ddd-8eee-ffffffffffff';
+  const command = {
+    id: commandId,
+    state: 'leased',
+    lease: { leaseId, clientId: 'browser-b' },
+    anchorContext: {
+      conversationId: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee',
+      conversationUrl: 'https://chatgpt.com/c/aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee',
+      projectId: null,
+      projectUrl: null
+    },
+    launch: {
+      workspaceId: 'workspace-reset-race',
+      purpose: 'worker',
+      taskMarker,
+      threadKey: 'worker:global-reset-race',
+      openMode: 'new_thread',
+      openingMessage: `Do the task. Marker: ${taskMarker}`,
+      executionProfile: {
+        modelId: 'gpt-5.6-sol',
+        modelLabel: 'GPT-5.6 Sol',
+        reasoningEffort: 'high'
+      }
+    }
+  };
+
+  const hostResponse = (body) => ({
+    ok: true,
+    status: 200,
+    async text() { return JSON.stringify(body); }
+  });
+  const browserBFetch = async (url, options = {}) => {
+    const parsed = new URL(url);
+    const body = options.body ? JSON.parse(options.body) : {};
+    if (parsed.pathname === '/__moondesk/companion/v1/commands/send-started') {
+      assert.equal(body.commandId, commandId);
+      assert.equal(body.leaseId, leaseId);
+      sendStarted = true;
+      return hostResponse({ command: { ...command, state: 'send_started', reconcileHistory: true } });
+    }
+    if (parsed.pathname === '/__moondesk/companion/v1/status') {
+      if (sendStarted) {
+        reportPreSendStatus();
+        await preSendStatusGate;
+      }
+      return hostResponse({
+        paired: true,
+        clientId: 'browser-b',
+        hasWorkerState: hostEpoch === 0,
+        workerResetEpoch: hostEpoch,
+        workerResetAckRequired: browserBAckRequired
+      });
+    }
+    if (parsed.pathname === '/__moondesk/companion/v1/workers/reset-ack') {
+      assert.equal(body.workerResetEpoch, hostEpoch);
+      browserBAckRequired = false;
+      resolveResetAck();
+      return hostResponse({ workerResetEpoch: hostEpoch, pendingClientCount: 0 });
+    }
+    throw new Error(`unexpected browser B request: ${parsed.pathname}`);
+  };
+  const browserAFetch = async (url, options = {}) => {
+    const parsed = new URL(url);
+    if (parsed.pathname === '/__moondesk/companion/v1/workers/clear') {
+      assert.equal(options.method, 'POST');
+      hostEpoch += 1;
+      browserBAckRequired = true;
+      await resetAcked;
+      return hostResponse({
+        cleared: true,
+        alreadyCleared: false,
+        workerResetEpoch: hostEpoch,
+        workerIds: ['worker-global-reset'],
+        commandIds: [commandId],
+        sendBoundaryCommandIds: [commandId]
+      });
+    }
+    if (parsed.pathname === '/__moondesk/companion/v1/status') {
+      return hostResponse({
+        paired: true,
+        clientId: 'browser-a',
+        hasWorkerState: hostEpoch === 0,
+        workerResetEpoch: hostEpoch
+      });
+    }
+    throw new Error(`unexpected browser A request: ${parsed.pathname}`);
+  };
+
+  let rememberedLaunch = null;
+  const browserB = loadBackground({
+    fetchImpl: browserBFetch,
+    sendMessageImpl: async (tabId, message, { existingTabs }) => {
+      if (message.type === 'MOONDESK_CONTEXT') {
+        return {
+          ok: true,
+          context: {
+            projectId: null,
+            projectUrl: null,
+            conversationId: existingTabs[tabId].url.includes('/c/') ? conversationId : null,
+            sourceUrl: existingTabs[tabId].url,
+            generating: false
+          },
+          rememberedLaunch
+        };
+      }
+      if (message.type === 'MOONDESK_PREPARE_WORKER') {
+        rememberedLaunch = {
+          commandId,
+          launchToken: message.launchToken,
+          taskMarker,
+          workspaceId: 'workspace-reset-race',
+          threadKey: 'worker:global-reset-race'
+        };
+        return {
+          ok: true,
+          result: {
+            state: 'ready',
+            evidence: {
+              conversationId: null,
+              markerPresent: false,
+              generating: false,
+              userTurnCount: 0,
+              composerEmpty: false
+            }
+          }
+        };
+      }
+      if (message.type === 'MOONDESK_CLEAR_WORKER_LAUNCHES') {
+        rememberedLaunch = null;
+        return { ok: true };
+      }
+      if (message.type === 'MOONDESK_COMMIT_WORKER_SEND') {
+        commitCalls += 1;
+        existingTabs[tabId].url = `https://chatgpt.com/c/${conversationId}`;
+        return { ok: true, result: { state: 'committed', baseline: {} } };
+      }
+      throw new Error(`unexpected browser B tab message: ${message.type}`);
+    },
+    setTimeoutImpl(fn, delay) {
+      if (delay <= 250) queueMicrotask(fn);
+      return 1;
+    }
+  });
+  const browserA = loadBackground({ fetchImpl: browserAFetch });
+
+  await browserB.evaluate(`(() => {
+    globalThis.__resetRaceState = {
+      ...freshState(),
+      baseUrl: 'http://127.0.0.1:47650',
+      clientId: 'browser-b',
+      credential: '${'b'.repeat(64)}',
+      launchRecords: { ghost: { commandId: 'ghost-command' } },
+      threadRecords: { ghost: { conversationUrl: 'https://chatgpt.com/c/aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee' } }
+    };
+    connecting = Promise.resolve(globalThis.__resetRaceState);
+    globalThis.__resetRaceCommand = ${JSON.stringify(command)};
+  })()`);
+  await browserA.evaluate(`(() => {
+    globalThis.__resetRaceState = {
+      ...freshState(),
+      baseUrl: 'http://127.0.0.1:47650',
+      clientId: 'browser-a',
+      credential: '${'a'.repeat(64)}'
+    };
+    connecting = Promise.resolve(globalThis.__resetRaceState);
+  })()`);
+
+  const browserBWork = browserB.evaluate(
+    'processCommand(globalThis.__resetRaceState, { command: globalThis.__resetRaceCommand, reconcileRequired: false })'
+  );
+  await preSendStatusReached;
+  assert.equal(sendStarted, true, 'browser B must cross host send-start authorization first');
+  assert.equal(commitCalls, 0, 'browser B is paused before the actual ChatGPT Send');
+
+  let clearResolved = false;
+  const clearPromise = browserA.evaluate('clearWorkers()').then((value) => {
+    clearResolved = true;
+    return value;
+  });
+  await flushMicrotasks();
+  assert.equal(clearResolved, false, 'Clear must wait for the send-capable paired browser reset acknowledgement');
+  assert.equal(commitCalls, 0, 'browser B remains paused before the actual ChatGPT Send');
+
+  releasePreSendStatus();
+  await browserBWork;
+  const cleared = await clearPromise;
+  assert.equal(cleared.workerResetEpoch, 1);
+  assert.deepEqual(JSON.parse(JSON.stringify(cleared.sendBoundaryCommandIds)), [commandId]);
+  assert.equal(commitCalls, 0, 'the stale browser must not Send after confirmed global reset');
+  const browserBState = JSON.parse(browserB.evaluate('JSON.stringify(globalThis.__resetRaceState)'));
+  assert.equal(browserBState.workerResetEpoch, 1);
+  assert.deepEqual(browserBState.launchRecords, {});
+  assert.deepEqual(browserBState.threadRecords, {});
+  assert.deepEqual(browserBState.blockedCommands, {});
+  const browserBStatus = await browserB.evaluate('status()');
+  assert.equal(browserBStatus.hasWorkerState, false, 'the other browser must not retain ghost worker history');
+});
+
 test('closing a browser tab schedules immediate presence publication instead of ending a worker locally', () => {
   const delays = [];
   const { dispatchTabRemoved } = loadBackground({
@@ -418,7 +631,7 @@ test('bridge discovery prefers an exact runtime match over another MoonDesk vers
             app: 'moondesk-worker-companion',
             appVersion: '0.13.0',
             protocolVersion: 2,
-            companionRuntimeRevision: 6
+            companionRuntimeRevision: 7
           };
         }
       };
@@ -446,7 +659,7 @@ test('bridge discovery prefers an exact runtime match over another MoonDesk vers
 
   const { evaluate, runtimeReloads } = loadBackground({ fetchImpl });
   const hello = await evaluate('discoverBridge(freshState())');
-  assert.equal(hello.companionRuntimeRevision, 6);
+  assert.equal(hello.companionRuntimeRevision, 7);
   assert.equal(runtimeReloads.length, 0);
 });
 
@@ -462,7 +675,7 @@ test('bridge runtime revision mismatch reloads the unpacked companion once', asy
             app: 'moondesk-worker-companion',
             appVersion: '0.13.0',
             protocolVersion: 2,
-            companionRuntimeRevision: 7
+            companionRuntimeRevision: 8
           };
         }
       };
@@ -501,7 +714,7 @@ test('compatible bridge clears the one-shot runtime reload marker for a future m
             app: 'moondesk-worker-companion',
             appVersion: '0.12.0',
             protocolVersion: 2,
-            companionRuntimeRevision: 6
+            companionRuntimeRevision: 7
           };
         }
       };
@@ -514,7 +727,7 @@ test('compatible bridge clears the one-shot runtime reload marker for a future m
   });
 
   const hello = await evaluate('discoverBridge(freshState())');
-  assert.equal(hello.companionRuntimeRevision, 6);
+  assert.equal(hello.companionRuntimeRevision, 7);
   const stored = await evaluate(`chrome.storage.local.get('${reloadKey}')`);
   assert.equal(stored[reloadKey], undefined);
 });
@@ -532,7 +745,7 @@ test('automatic pairing proves the extension was loaded from the MoonDesk-prepar
             app: 'moondesk-worker-companion',
             appVersion: '0.12.0',
             protocolVersion: 2,
-            companionRuntimeRevision: 6
+            companionRuntimeRevision: 7
           };
         }
       };
@@ -574,7 +787,7 @@ test('source and release-ZIP installs without a bootstrap capability expose Manu
         app: 'moondesk-worker-companion',
         appVersion: '0.12.0',
         protocolVersion: 2,
-        companionRuntimeRevision: 6
+        companionRuntimeRevision: 7
       };
       return {
         ok: true,
@@ -643,7 +856,7 @@ test('release version mismatch reloads the unpacked companion even when protocol
             app: 'moondesk-worker-companion',
             appVersion: '0.13.0',
             protocolVersion: 2,
-            companionRuntimeRevision: 6
+            companionRuntimeRevision: 7
           };
         }
       };
@@ -3513,6 +3726,13 @@ test('worker launch transaction survives ChatGPT navigation and ACKs the confirm
         }
       };
     }
+    if (parsed.pathname === '/__moondesk/companion/v1/status') {
+      return {
+        ok: true,
+        status: 200,
+        async text() { return JSON.stringify({ workerResetEpoch: 0 }); }
+      };
+    }
     if (parsed.pathname === '/__moondesk/companion/v1/commands/ack') {
       events.push(`ack:${body.outcome}`);
       ackPayloads.push(body);
@@ -4043,6 +4263,13 @@ test('a hung fresh worker does not block three sibling normal-chat launches from
             command: { ...command, state: 'send_started', reconcileHistory: true }
           });
         }
+      };
+    }
+    if (parsed.pathname === '/__moondesk/companion/v1/status') {
+      return {
+        ok: true,
+        status: 200,
+        async text() { return JSON.stringify({ workerResetEpoch: 0 }); }
       };
     }
     if (parsed.pathname === '/__moondesk/companion/v1/commands/ack') {

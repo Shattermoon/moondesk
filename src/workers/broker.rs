@@ -68,8 +68,6 @@ pub struct ReuseWorkerRequest {
     pub anchor_identity: ChatIdentity,
     pub worker_id: WorkerId,
     pub assignment: String,
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub context: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -930,11 +928,6 @@ impl WorkerBroker {
         if request.assignment.is_empty() || request.assignment.len() > MAX_WORKER_ASSIGNMENT_BYTES {
             return Err(WorkerBrokerError::Invalid(format!(
                 "worker assignment must contain 1..={MAX_WORKER_ASSIGNMENT_BYTES} bytes"
-            )));
-        }
-        if request.context.len() > MAX_WORKER_CONTEXT_BYTES {
-            return Err(WorkerBrokerError::Invalid(format!(
-                "worker shared Core context must contain at most {MAX_WORKER_CONTEXT_BYTES} bytes"
             )));
         }
         let fingerprint = request_fingerprint(&request)?;
@@ -2774,7 +2767,6 @@ mod tests {
                 anchor_identity: anchor_identity.clone(),
                 worker_id: live.worker_id.clone(),
                 assignment: "wake that never enqueues".into(),
-                context: String::new(),
             })
             .await
             .expect("create pending reuse");
@@ -2919,7 +2911,6 @@ mod tests {
             anchor_identity: anchor_identity.clone(),
             worker_id: spawned.worker_id.clone(),
             assignment: "second assignment".into(),
-            context: String::new(),
         };
         let reused = broker
             .reuse_worker(reuse_request.clone())
@@ -3231,7 +3222,6 @@ mod tests {
                 anchor_identity: core.clone(),
                 worker_id: durable.worker_id.clone(),
                 assignment: "reuse failure".into(),
-                context: String::new(),
             })
             .await
             .expect("reuse durable worker");
@@ -4423,7 +4413,6 @@ mod tests {
                     anchor_identity: anchor_identity.clone(),
                     worker_id: worker_id.clone(),
                     assignment: format!("history-task-{index}"),
-                    context: String::new(),
                 })
                 .await
                 .expect("reuse bounded worker");
@@ -4662,7 +4651,6 @@ mod tests {
                     anchor_identity: anchor_identity.clone(),
                     worker_id: worker_id.clone(),
                     assignment: large_assignment.clone(),
-                    context: String::new(),
                 })
                 .await
                 .expect("reuse large-payload worker");

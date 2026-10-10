@@ -35,21 +35,19 @@ pub fn bootstrap_message(
 
 pub fn reuse_message(
     workspace_name: &str,
-    context: &str,
     assignment: &str,
     display_id: &str,
     worker_id: &super::types::WorkerId,
     task_id: &super::types::TaskId,
 ) -> String {
-    let briefing = task_briefing(context, assignment);
     format!(
-        r#"{briefing}
+        r#"{assignment}
 
-(MoonDesk worker contract: you are still {display_id}, the same durable worker for Core in workspace "{workspace_name}". The Shared Core context preserves prior goals, decisions, constraints, validation, and sibling ownership; use it to avoid rediscovering settled context, while Your assignment defines your owned scope. Core may later refine this assignment; follow the latest Core direction. Before starting, call `workers` action=`start` with worker_id=`{worker_id}` and task_id=`{task_id}`; if start fails, stop. For project work, use only this workspace's MoonDesk connector, call `moondesk_instruction` before local work, and obey current AGENTS.md and user instructions. Work independently until the assignment is complete, do not create workers, and do not change branches or unrelated files unless Core explicitly assigns it. Report meaningful discoveries or blockers to Core with `workers` action=`report`; do not spam routine progress. Call `workers` action=`finish` once with RESULT / CHANGES / VALIDATION / BLOCKERS when done.)
+(MoonDesk worker contract: you are still {display_id}, the same durable worker for Core in workspace "{workspace_name}". This is Core speaking to you again in the conversation you already know. Use your existing conversation history and prior work rather than starting over, and treat the assignment above as the newest direction. Before starting, call `workers` action=`start` with worker_id=`{worker_id}` and task_id=`{task_id}`; if start fails, stop. For project work, use only this workspace's MoonDesk connector, call `moondesk_instruction` before local work, and obey current AGENTS.md and user instructions. Work independently until the assignment is complete, do not create workers, and do not change branches or unrelated files unless Core explicitly assigns it. Report meaningful discoveries or blockers to Core with `workers` action=`report`; do not spam routine progress. Call `workers` action=`finish` once with RESULT / CHANGES / VALIDATION / BLOCKERS when done.)
 
 [moondesk-worker-task:{task_id}]
 "#,
-        briefing = briefing,
+        assignment = assignment,
         display_id = display_id,
         workspace_name = workspace_name,
         worker_id = worker_id,
@@ -115,14 +113,15 @@ mod tests {
         let task_id = TaskId::new();
         let text = reuse_message(
             "MoonDesk",
-            "The first review already established the baseline; focus only on the regression.",
             "Review the follow-up regression",
             "worker-1",
             &worker_id,
             &task_id,
         );
-        assert!(text.starts_with("Shared Core context:\nThe first review"));
-        assert!(text.contains("Your assignment:\nReview the follow-up regression"));
+        assert!(text.starts_with("Review the follow-up regression\n\n"));
+        assert!(!text.contains("Shared Core context:"));
+        assert!(text.contains("conversation you already know"));
+        assert!(text.contains("existing conversation history and prior work"));
         assert!(text.contains("worker for Core"));
         assert!(text.contains("action=`start`"));
         assert!(text.contains(&worker_id.to_string()));

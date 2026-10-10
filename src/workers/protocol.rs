@@ -584,7 +584,6 @@ pub async fn handle(
                 "worker reuse requires a confirmed companion Core route".to_string()
             })?;
             let assignment = required_string(arguments, "task")?.to_string();
-            let context = worker_context(arguments)?;
             let operation_id = parse_operation_id(arguments)?;
             let receipt = broker
                 .reuse_worker(ReuseWorkerRequest {
@@ -593,7 +592,6 @@ pub async fn handle(
                     anchor_identity: caller_identity.clone(),
                     worker_id: parse_worker_id(arguments)?,
                     assignment: assignment.clone(),
-                    context: context.clone(),
                 })
                 .await
                 .map_err(broker_error)?;
@@ -609,7 +607,6 @@ pub async fn handle(
             maybe_pause_after_worker_persist(&operation_id).await;
             let opening_message = prompt::reuse_message(
                 workspace_name,
-                &context,
                 &assignment,
                 &receipt.display_id,
                 &receipt.worker_id,
@@ -1319,7 +1316,6 @@ mod tests {
                 anchor_identity: anchor.clone(),
                 worker_id: worker_id.clone(),
                 assignment: "reuse after cleanup partial commit restart".into(),
-                context: String::new(),
             })
             .await
             .expect("surviving worker reuses without managed-chat history");

@@ -132,7 +132,11 @@ function createBrowserControl(chrome, transport, protectedTab = () => false) {
   async function authorize(command, writes = true) {
     if (command.epoch !== epoch || command.expiresAt <= Date.now()) error('BROWSER_EXPIRED: no further browser work was dispatched.');
     if (!(writes ? policy.write : policy.read)) error('BROWSER_PERMISSION_REVOKED');
-    const check = await transport('/browser-control',{method:'POST',body:JSON.stringify({action:'check',browserId,id:command.id,epoch:command.epoch})});
+    const check = await transport('/browser-control',{
+      method:'POST',
+      body:JSON.stringify({action:'check',browserId,id:command.id,epoch:command.epoch}),
+      timeoutMs:Math.max(1,Math.min(3000,command.expiresAt-Date.now()))
+    });
     if (command.epoch !== epoch || command.expiresAt <= Date.now()) error('BROWSER_EXPIRED: browser authority expired while permission was being checked.');
     if (!check.ok || check.data?.allowed !== true) error('BROWSER_PERMISSION_REVOKED: remaining input was not dispatched.');
   }

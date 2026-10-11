@@ -8,7 +8,7 @@ const BRIDGE_PORTS = [47650, 47651, 47652, 47653, 47654];
 const REQUIRED_PROTOCOL_VERSION = 2;
 // Bump with any shipped companion runtime change that requires Chromium to load new bytes. Keep
 // this aligned with COMPANION_RUNTIME_REVISION in src/server.rs.
-const COMPANION_RUNTIME_REVISION = 19;
+const COMPANION_RUNTIME_REVISION = 20;
 const SOURCE_DEV_MANIFEST_VERSION = '0.1.0';
 const RUNTIME_RELOAD_STORAGE_KEY = 'moondeskWorkerCompanionReloadRevisionV1';
 const INSTALLATION_BOOTSTRAP_FILE = 'moondesk-bootstrap.json';
@@ -24,6 +24,8 @@ const CLEAR_WORKERS_PATH = '/__moondesk/companion/v1/workers/clear';
 const WORKER_RESET_ACK_PATH = '/__moondesk/companion/v1/workers/reset-ack';
 const USER_BROWSER_PATH = '/__moondesk/companion/v1/browser-control';
 const HELLO_TIMEOUT_MS = 1200;
+const API_TIMEOUT_MS = 3000;
+const CLEAR_WORKERS_TIMEOUT_MS = 8000;
 const FAST_POLL_MS = 1500;
 const MAX_RECONCILE_ATTEMPTS = 3;
 const MAX_PARALLEL_COMMANDS = 4;
@@ -204,7 +206,11 @@ function requestError(message, status = 0, code = null) {
   return error;
 }
 
-async function api(state, path, { method = 'GET', body = null, authenticated = true } = {}) {
+async function api(
+  state,
+  path,
+  { method = 'GET', body = null, authenticated = true, timeoutMs = API_TIMEOUT_MS } = {}
+) {
   if (!state.baseUrl) throw requestError('MoonDesk companion bridge is not connected');
   const headers = {};
   if (authenticated) {
@@ -212,22 +218,37 @@ async function api(state, path, { method = 'GET', body = null, authenticated = t
     headers['x-moondesk-companion-token'] = state.credential;
   }
   if (body !== null) headers['content-type'] = 'application/json';
-  const response = await fetch(`${normalizeBaseUrl(state.baseUrl)}${path}`, {
-    method,
-    cache: 'no-store',
-    headers,
-    body: body === null ? undefined : JSON.stringify(body)
-  });
-  const text = await response.text();
-  let parsed = {};
-  if (text) {
-    try { parsed = JSON.parse(text); }
-    catch { throw requestError(`MoonDesk returned non-JSON response (${response.status})`, response.status); }
+  const boundedTimeout = Number.isFinite(Number(timeoutMs))
+    ? Math.max(1, Math.min(60_000, Math.trunc(Number(timeoutMs))))
+    : API_TIMEOUT_MS;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), boundedTimeout);
+  try {
+    const response = await fetch(`${normalizeBaseUrl(state.baseUrl)}${path}`, {
+      method,
+      cache: 'no-store',
+      headers,
+      body: body === null ? undefined : JSON.stringify(body),
+      signal: controller.signal
+    });
+    const text = await response.text();
+    let parsed = {};
+    if (text) {
+      try { parsed = JSON.parse(text); }
+      catch { throw requestError(`MoonDesk returned non-JSON response (${response.status})`, response.status); }
+    }
+    if (!response.ok) {
+      throw requestError(parsed.error || `MoonDesk request failed (${response.status})`, response.status, parsed.error || null);
+    }
+    return parsed;
+  } catch (error) {
+    if (controller.signal.aborted) {
+      throw requestError('MoonDesk companion request timed out', 0, 'companion_request_timeout');
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
   }
-  if (!response.ok) {
-    throw requestError(parsed.error || `MoonDesk request failed (${response.status})`, response.status, parsed.error || null);
-  }
-  return parsed;
 }
 
 function protectedUserBrowserTab(_tabId, url) {
@@ -250,7 +271,8 @@ async function userBrowserTransport(_path, options = {}) {
   try {
     const data = await api(state, USER_BROWSER_PATH, {
       method: options.method || 'POST',
-      body
+      body,
+      timeoutMs: options.timeoutMs ?? API_TIMEOUT_MS
     });
     return { ok: true, status: 200, data };
   } catch (error) {
@@ -1621,7 +1643,8 @@ async function clearWorkers() {
     await clearRememberedWorkerLaunchesInTabs();
     const response = await api(state, CLEAR_WORKERS_PATH, {
       method: 'POST',
-      body: {}
+      body: {},
+      timeoutMs: CLEAR_WORKERS_TIMEOUT_MS
     });
 
     // The host has now durably destroyed worker ownership. Only now erase the persisted companion

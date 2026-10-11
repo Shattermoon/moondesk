@@ -65,7 +65,7 @@ This deliberately favors a short recoverable interruption during an app upgrade 
 
 The extension discovers only MoonDesk's dedicated loopback bridge ports (`127.0.0.1:47650` through `47654`) and uses the companion protocol version to reject incompatible hosts.
 
-Pairing is installation-scoped. The recommended MoonDesk-prepared folder carries a private local bootstrap capability and pairs automatically. Direct source and release-ZIP fallback installs intentionally omit that secret and require the one-time **Manual Repair** code shown by the running MoonDesk instance. Multiple browser installations may remain paired independently. MoonDesk never uses the workspace MCP URL as a browser-extension credential.
+Pairing is installation-scoped. The recommended MoonDesk-prepared folder carries a private local bootstrap capability and pairs automatically. An installation that the user explicitly revokes stays revoked even if that bootstrap capability is still present; restoring that same installation requires **Manual Repair**. Direct source and release-ZIP fallback installs intentionally omit the bootstrap secret and require the one-time **Manual Repair** code shown by the running MoonDesk instance. Multiple browser installations may remain paired independently. MoonDesk never uses the workspace MCP URL as a browser-extension credential.
 
 A runtime/protocol mismatch should be explicit and actionable. Runtime-revision mismatches self-reload once after MoonDesk synchronizes the stable folder; protocol mismatches explain that MoonDesk should be restarted and the extension reloaded once only if Chromium does not recover automatically. Do not expose a generic connection failure when the real issue is incompatible bytes.
 

@@ -26,6 +26,7 @@ function loadControl({ initialTabs = {}, protectedTab = () => false, pendingComm
   const detachCalls = [];
   const debuggerCommands = [];
   const results = [];
+  const transportCalls = [];
   let pending = pendingCommand ? { ...pendingCommand } : null;
   let failPoll = false;
   const onUpdated = eventHook();
@@ -111,6 +112,7 @@ function loadControl({ initialTabs = {}, protectedTab = () => false, pendingComm
 
   const transport = async (_path, options = {}) => {
     const body = typeof options.body === 'string' ? JSON.parse(options.body) : (options.body || {});
+    transportCalls.push({ body, options: { ...options } });
     if (body.action === 'poll') {
       if (failPoll) return { ok: false, status: 0, data: { error: 'bridge offline' } };
       return { ok: true, status: 200, data: { epoch: 'epoch-1', requests: pending ? [pending.id] : [], policy: { read: true, write: true } } };
@@ -146,6 +148,7 @@ function loadControl({ initialTabs = {}, protectedTab = () => false, pendingComm
     detachCalls,
     debuggerCommands,
     results,
+    transportCalls,
     onDebuggerEvent,
     setPollFailure(value = true) { failPoll = value; }
   };
@@ -162,6 +165,21 @@ test('protected ChatGPT tabs refuse interactive attachment before debugger owner
     /BROWSER_EXECUTOR_TAB/
   );
   assert.deepEqual(env.attachCalls, []);
+});
+
+test('permission checks bound loopback transport by the remaining command lifetime', async () => {
+  const env = loadControl({
+    initialTabs: { 3: { url: 'https://example.com/', title: 'Example', active: false, pinned: false, status: 'complete' } }
+  });
+  await env.control.pump();
+  env.transportCalls.length = 0;
+  const command = env.command('browser_tabs', { action: 'list' });
+  command.expiresAt = Date.now() + 500;
+  await env.control.execute(command);
+  const check = env.transportCalls.find(call => call.body.action === 'check');
+  assert.ok(check, 'browser command must re-check host authority before dispatch');
+  assert.ok(check.options.timeoutMs > 0);
+  assert.ok(check.options.timeoutMs <= 500, 'permission check must not outlive the command deadline');
 });
 
 test('unattached DOM inspection path is not shipped around protected-tab ownership checks', () => {

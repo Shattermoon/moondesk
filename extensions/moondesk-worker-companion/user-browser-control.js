@@ -134,7 +134,8 @@ function createBrowserControl(chrome, transport, protectedTab = () => false) {
       await currentTab(state,command);
       return await send(state,method,params,undefined,command);
     } catch (cause) {
-      await release(state);
+      const protectedPage = /^BROWSER_EXECUTOR_TAB:/.test(String(cause?.message || cause));
+      await release(state,!protectedPage);
       throw cause;
     }
   }
@@ -218,11 +219,24 @@ function createBrowserControl(chrome, transport, protectedTab = () => false) {
     if (state.pageId !== pageId) error('BROWSER_PAGE_STALE: page changed while reading.');
     return result;
   }
-  async function release(state) {
+  async function release(state, removeOverlay = true) {
     if (tabs.get(state.tabId) !== state) return;
-    // Revoke first: no in-flight continuation can send more input while detach yields.
+    // Revoke admission first: no in-flight continuation can send more input while cleanup yields.
     tabs.delete(state.tabId);
-    await Promise.all([cleanup(removeIndicator(state)),cleanup(chrome.debugger.detach({tabId:state.tabId}))]);
+    let safeToTouchPage = removeOverlay;
+    if (safeToTouchPage) {
+      try {
+        const tab = await getTab(state.tabId);
+        pageURL(tab.url);
+        if (tab.pendingUrl && tab.pendingUrl !== tab.url) safeToTouchPage = false;
+        if (protectedTab(state.tabId,tab.url)) safeToTouchPage = false;
+      } catch { safeToTouchPage = false; }
+    }
+    const cleanupWork = [cleanup(chrome.debugger.detach({tabId:state.tabId}))];
+    // Never inject cleanup JavaScript after custody has crossed onto a protected,
+    // unsupported, or actively navigating page. The old document will disappear on navigation.
+    if (safeToTouchPage) cleanupWork.push(cleanup(removeIndicator(state)));
+    await Promise.all(cleanupWork);
     await save();
   }
   async function revoke() {
@@ -233,11 +247,15 @@ function createBrowserControl(chrome, transport, protectedTab = () => false) {
     if (!tabs.size || Date.now() - lastIndicatorRefreshAt < 2000) return;
     lastIndicatorRefreshAt = Date.now();
     await Promise.all([...tabs.values()].map(async state => {
+      let tab;
       try {
-        const tab = await getTab(state.tabId);
-        if (protectedTab(state.tabId, tab.url)) { await release(state); return; }
-        await page(state,'overlay');
-      } catch {}
+        tab = await getTab(state.tabId);
+        pageURL(tab.url);
+        if (tab.pendingUrl && tab.pendingUrl !== tab.url) pageURL(tab.pendingUrl);
+      } catch { await release(state,false); return; }
+      if (protectedTab(state.tabId, tab.url) || protectedTab(state.tabId, tab.pendingUrl)) { await release(state,false); return; }
+      try { await page(state,'overlay'); }
+      catch { await release(state); }
     }));
   }
   async function attach(tabId, command) {
@@ -372,6 +390,7 @@ function createBrowserControl(chrome, transport, protectedTab = () => false) {
   }
   async function action(state,args,command) {
     const a = args.action;
+    if (!['dialog','key','fill','type','select','scroll','click','drag','hover'].includes(a)) error('BROWSER_ACTION_UNKNOWN');
     if (a === 'dialog') {
       if (typeof args.accept !== 'boolean' || !state.dialog) error('BROWSER_DIALOG_REQUIRED: inspect pending dialog and specify accept.');
       await input(state,'Page.handleJavaScriptDialog',{ accept:args.accept,promptText:args.text || '' },command);
@@ -487,21 +506,23 @@ function createBrowserControl(chrome, transport, protectedTab = () => false) {
   async function execute(command) {
     if (command.epoch !== epoch || command.expiresAt <= Date.now()) error('BROWSER_EXPIRED: no operation dispatched.');
     const {tool,args} = command;
-    const writes = ['browser_action','browser_navigate','browser_evaluate'].includes(tool) || tool === 'browser_tabs' && ['attach','new','release','close'].includes(args.action);
+    const writes = ['browser_action','browser_navigate','browser_evaluate'].includes(tool) || tool === 'browser_tabs' && args.action !== 'list';
     if (!(writes ? policy.write : policy.read)) error('BROWSER_PERMISSION_REVOKED');
     await authorize(command,writes);
+    if (tool === 'browser_tabs' && !['list','attach','new','release','close'].includes(args.action)) error('BROWSER_TABS_ACTION_UNKNOWN');
+    if (tool === 'browser_navigate' && !['url','back','forward','reload'].includes(args.action)) error('BROWSER_NAVIGATION_ACTION_UNKNOWN');
     if (tool === 'browser_tabs') {
       if (args.action === 'list') {
         const list = await chrome.tabs.query({});
         const matched=list.filter(t=>(/^https?:/.test(t.url || t.pendingUrl || '') || t.url === 'about:blank')&&(!args.filter || `${t.title} ${t.url} ${t.pendingUrl || ''}`.toLowerCase().includes(args.filter.toLowerCase())));
         const values=[];let size=0;
         for(const tab of matched.slice(args.offset || 0,(args.offset || 0)+(args.limit || 100))) {
-          const attached=owns(tabs.get(tab.id),command),claimed=tabs.has(tab.id),protectedPage=protectedTab(tab.id,tab.url,command.conversationId);
+          const attached=owns(tabs.get(tab.id),command),claimed=tabs.has(tab.id),protectedPage=protectedTab(tab.id,tab.url,command.conversationId)||protectedTab(tab.id,tab.pendingUrl,command.conversationId);
           const navigating=!tab.url || !!tab.pendingUrl && tab.pendingUrl!==tab.url;
           const value={tabId:handle(tab.id),title:cut(tab.title,300),url:cut(tab.url,2000),urlTruncated:(tab.url?.length || 0)>2000,active:tab.active,pinned:tab.pinned,
             pendingUrl:tab.pendingUrl?cut(tab.pendingUrl,2000):undefined,pendingUrlTruncated:(tab.pendingUrl?.length || 0)>2000,status:tab.status || 'unknown',
             owned:attached,claimed,protected:protectedPage,access:{
-              snapshot:navigating?'loading':attached?'interactive':'attach-required',
+              snapshot:protectedPage?'protected':navigating?'loading':attached?'interactive':'attach-required',
               input:protectedPage?'protected':claimed&&!attached?'other-owner':!policy.write?'disabled':navigating?'loading':attached?'available':'attach-required'
             }};
           size+=JSON.stringify(value).length;if(size>24000)break;values.push(value);
@@ -513,6 +534,7 @@ function createBrowserControl(chrome, transport, protectedTab = () => false) {
       if (args.action === 'attach') return {value:await attach(args.tabId,command)};
       if (args.action === 'new') {
         const url = pageURL(args.url || 'about:blank');
+        if (protectedTab(null,url,command.conversationId)) error('BROWSER_EXECUTOR_TAB: ChatGPT pages cannot be opened through user-browser control. Open them yourself outside this control surface.');
         if (tabs.size >= 32) error('BROWSER_TAB_LIMIT: release an unused attachment before opening another tab.');
         await authorize(command);
         const tab = await chrome.tabs.create({url,active:false});
@@ -551,16 +573,18 @@ function createBrowserControl(chrome, transport, protectedTab = () => false) {
     if (tool === 'browser_navigate') {
       if (args.action === 'url') {
         const url = pageURL(args.url);
+        if (protectedTab(state.tabId,url,command.conversationId)) error('BROWSER_EXECUTOR_TAB: ChatGPT pages cannot be reached through user-browser navigation. Choose a different destination.');
         const result = await input(state,'Page.navigate',{url},command);
         if (result.errorText) error(`BROWSER_NAVIGATION_FAILED: ${cut(result.errorText)}`);
       } else if (args.action === 'reload') await input(state,'Page.reload',{},command);
-      else {
+      else if (args.action === 'back' || args.action === 'forward') {
         const history = await send(state,'Page.getNavigationHistory',{},undefined,command);
         const next = history.entries[history.currentIndex + (args.action === 'back' ? -1 : 1)];
         if (!next) error('BROWSER_HISTORY_EMPTY');
-        pageURL(next.url);
+        const url = pageURL(next.url);
+        if (protectedTab(state.tabId,url,command.conversationId)) error('BROWSER_EXECUTOR_TAB: history navigation into ChatGPT is blocked by user-browser protection.');
         await input(state,'Page.navigateToHistoryEntry',{entryId:next.id},command);
-      }
+      } else error('BROWSER_NAVIGATION_ACTION_UNKNOWN');
       invalidate(state);
       return {value:{tabId:handle(state.tabId),accepted:true,message:'Navigation requested. Snapshot again when the destination loads.'}};
     }
@@ -603,12 +627,14 @@ function createBrowserControl(chrome, transport, protectedTab = () => false) {
     } else if (method === 'Page.frameNavigated') {
       invalidate(state);
       if (params.frame?.id) state.frames.set(params.frame.id,{...params.frame,sessionId:source.sessionId});
-      if (!params.frame?.parentId && !source.sessionId && protectedTab(state.tabId, params.frame?.url)) {
-        void release(state);
-        return;
+      if (!params.frame?.parentId && !source.sessionId) {
+        try { pageURL(params.frame?.url); }
+        catch { void release(state,false); return; }
+        if (protectedTab(state.tabId, params.frame?.url)) { void release(state,false); return; }
+        // Reinstall the indicator after real document navigation. If the trust signal cannot
+        // be restored, retire debugger custody rather than leaving invisible control behind.
+        void page(state,'overlay').catch(() => release(state));
       }
-      // Reinstall the indicator after real document navigation, without a timer or page activation.
-      if (!params.frame?.parentId && !source.sessionId && /^https?:/.test(params.frame?.url)) void page(state,'overlay').catch(() => {});
     } else if (method === 'Page.navigatedWithinDocument') {
       invalidate(state);
     } else if (method === 'Page.javascriptDialogOpening') {

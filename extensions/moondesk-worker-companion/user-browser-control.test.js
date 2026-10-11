@@ -17,7 +17,7 @@ function eventHook() {
   };
 }
 
-function loadControl({ initialTabs = {}, protectedTab = () => false, pendingCommand = null, failCapture = false, delayFrameTreeMs = 0, onDebuggerCommand = null } = {}) {
+function loadControl({ initialTabs = {}, protectedTab = () => false, pendingCommand = null, failCapture = false, delayFrameTreeMs = 0, onDebuggerCommand = null, navigationHistory = null } = {}) {
   const tabs = new Map(Object.entries(initialTabs).map(([id, tab]) => [Number(id), { id: Number(id), ...tab }]));
   let nextTabId = Math.max(100, ...tabs.keys()) + 1;
   let sessionStore = {};
@@ -79,7 +79,7 @@ function loadControl({ initialTabs = {}, protectedTab = () => false, pendingComm
         }
         if (method === 'Page.createIsolatedWorld') return { executionContextId: 42 };
         if (method === 'Runtime.evaluate') return { result: { value: true } };
-        if (method === 'Page.getNavigationHistory') return { currentIndex: 0, entries: [{ id: 1, url: tabs.get(target.tabId)?.url || 'about:blank' }] };
+        if (method === 'Page.getNavigationHistory') return navigationHistory || { currentIndex: 0, entries: [{ id: 1, url: tabs.get(target.tabId)?.url || 'about:blank' }] };
         if (method === 'Page.getLayoutMetrics') return {
           cssVisualViewport: { pageX: 0, pageY: 0, clientWidth: 1200, clientHeight: 800, scale: 1 },
           cssContentSize: { x: 0, y: 0, width: 1200, height: 2400 }
@@ -177,13 +177,151 @@ test('controlled tab is retired when its main frame navigates into protected Cha
   });
   await env.control.pump();
   await env.control.execute(env.command('browser_tabs', { action: 'attach', tabId: 2 }));
+  const transitionStart = env.debuggerCommands.length;
   env.tabs.get(2).url = 'https://chatgpt.com/c/protected';
   await env.control.event({ tabId: 2 }, 'Page.frameNavigated', { frame: { id: 'frame-2', url: 'https://chatgpt.com/c/protected' } });
   await new Promise(resolve => setTimeout(resolve, 0));
   assert.deepEqual(env.detachCalls, [2]);
+  assert.equal(
+    env.debuggerCommands.slice(transitionStart).some(call => call.method === 'Runtime.evaluate'),
+    false,
+    'retiring a protected destination must not inject cleanup JavaScript into that page'
+  );
   await assert.rejects(
     env.control.execute(env.command('browser_snapshot', { tabId: 2 })),
     /BROWSER_TAB_NOT_OWNED/
+  );
+});
+
+test('pending protected navigation retires custody before commit instead of refreshing the glow', async () => {
+  const env = loadControl({
+    initialTabs: { 11: { url: 'https://example.com/', title: 'Example', active: false, pinned: false, status: 'complete' } },
+    protectedTab: (_id, url) => {
+      try { return new URL(url).hostname === 'chatgpt.com'; } catch { return false; }
+    }
+  });
+  await env.control.pump();
+  await env.control.execute(env.command('browser_tabs', { action: 'attach', tabId: 11 }));
+  const start = env.debuggerCommands.length;
+  env.tabs.get(11).pendingUrl = 'https://chatgpt.com/c/protected';
+  const listed = await env.control.execute(env.command('browser_tabs', { action: 'list' }));
+  assert.equal(listed.value.tabs.find(tab => tab.tabId === 11)?.access.snapshot, 'protected');
+  await env.control.heartbeat();
+  assert.deepEqual(env.detachCalls, [11]);
+  assert.equal(
+    env.debuggerCommands.slice(start).some(call => call.method === 'Runtime.evaluate'),
+    false,
+    'a pending protected destination must detach before page-script indicator refresh'
+  );
+});
+
+test('direct user-browser navigation cannot enter protected ChatGPT or fall through unknown actions', async () => {
+  const env = loadControl({
+    initialTabs: { 8: { url: 'https://example.com/', title: 'Example', active: false, pinned: false, status: 'complete' } },
+    protectedTab: (_id, url) => {
+      try { return new URL(url).hostname === 'chatgpt.com'; } catch { return false; }
+    },
+    navigationHistory: {
+      currentIndex: 0,
+      entries: [
+        { id: 1, url: 'https://example.com/' },
+        { id: 2, url: 'https://chatgpt.com/c/protected' }
+      ]
+    }
+  });
+  await env.control.pump();
+  const attached = await env.control.execute(env.command('browser_tabs', { action: 'attach', tabId: 8 }));
+  const start = env.debuggerCommands.length;
+  await assert.rejects(
+    env.control.execute(env.command('browser_navigate', {
+      tabId: 8,
+      pageId: attached.value.pageId,
+      action: 'url',
+      url: 'https://chatgpt.com/c/protected'
+    })),
+    /BROWSER_EXECUTOR_TAB/
+  );
+  await assert.rejects(
+    env.control.execute(env.command('browser_navigate', {
+      tabId: 8,
+      pageId: attached.value.pageId,
+      action: 'forward'
+    })),
+    /BROWSER_EXECUTOR_TAB/
+  );
+  await assert.rejects(
+    env.control.execute(env.command('browser_navigate', {
+      tabId: 8,
+      pageId: attached.value.pageId,
+      action: 'sideways'
+    })),
+    /BROWSER_NAVIGATION_ACTION_UNKNOWN/
+  );
+  assert.equal(
+    env.debuggerCommands.slice(start).some(call => ['Page.navigate','Page.navigateToHistoryEntry'].includes(call.method)),
+    false,
+    'blocked/unknown navigation must not dispatch a navigation command'
+  );
+  assert.equal(env.tabs.get(8).url, 'https://example.com/');
+});
+
+test('unknown user-browser action is rejected before any input dispatch', async () => {
+  const env = loadControl({
+    initialTabs: { 12: { url: 'https://example.com/', title: 'Example', active: false, pinned: false, status: 'complete' } }
+  });
+  await env.control.pump();
+  const attached = await env.control.execute(env.command('browser_tabs', { action: 'attach', tabId: 12 }));
+  const shot = await env.control.execute(env.command('browser_screenshot', { tabId: 12, fullPage: false }));
+  const start = env.debuggerCommands.length;
+  await assert.rejects(
+    env.control.execute(env.command('browser_action', {
+      tabId: 12,
+      pageId: attached.value.pageId,
+      action: 'sideways',
+      x: 100,
+      y: 100,
+      screenshotId: shot.value.screenshotId
+    })),
+    /BROWSER_ACTION_UNKNOWN/
+  );
+  assert.equal(
+    env.debuggerCommands.slice(start).some(call => call.method.startsWith('Input.')),
+    false,
+    'unknown actions must fail before dispatching input'
+  );
+});
+
+test('user-browser new refuses a protected ChatGPT destination before creating a tab', async () => {
+  const env = loadControl({
+    initialTabs: { 9: { url: 'https://example.com/', title: 'Example', active: false, pinned: false, status: 'complete' } },
+    protectedTab: (_id, url) => {
+      try { return new URL(url).hostname === 'chatgpt.com'; } catch { return false; }
+    }
+  });
+  await env.control.pump();
+  const before = env.tabs.size;
+  await assert.rejects(
+    env.control.execute(env.command('browser_tabs', { action: 'new', url: 'https://chatgpt.com/' })),
+    /BROWSER_EXECUTOR_TAB/
+  );
+  assert.equal(env.tabs.size, before);
+});
+
+test('unsupported top-level navigation retires debugger custody instead of leaving invisible control', async () => {
+  const env = loadControl({
+    initialTabs: { 10: { url: 'https://example.com/', title: 'Example', active: false, pinned: false, status: 'complete' } }
+  });
+  await env.control.pump();
+  await env.control.execute(env.command('browser_tabs', { action: 'attach', tabId: 10 }));
+  const transitionStart = env.debuggerCommands.length;
+  env.tabs.get(10).url = 'file:///tmp/local.html';
+  await env.control.event({ tabId: 10 }, 'Page.frameNavigated', { frame: { id: 'frame-10', url: 'file:///tmp/local.html' } });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.deepEqual(env.detachCalls, [10]);
+  assert.equal(
+    env.debuggerCommands.slice(transitionStart).some(call => call.method === 'Runtime.evaluate'),
+    false,
+    'unsupported destinations must be detached without page-script cleanup'
   );
 });
 

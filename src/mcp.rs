@@ -262,6 +262,16 @@ fn local_tool_output_schema(name: &str) -> Option<Value> {
             );
             properties.insert("tabId".to_string(), json!({ "type": "string" }));
             properties.insert("pageId".to_string(), json!({ "type": "string" }));
+            properties.insert(
+                "total".to_string(),
+                json!({ "type": "integer", "minimum": 0 }),
+            );
+            properties.insert("truncated".to_string(), json!({ "type": "boolean" }));
+            properties.insert(
+                "nextOffset".to_string(),
+                json!({ "type": ["integer", "null"], "minimum": 0 }),
+            );
+            properties.insert("guidance".to_string(), json!({ "type": "string" }));
             properties.insert("attached".to_string(), json!({ "type": "boolean" }));
             properties.insert("created".to_string(), json!({ "type": "boolean" }));
             properties.insert("released".to_string(), json!({ "type": "boolean" }));
@@ -648,7 +658,9 @@ fn push_user_browser_tools(tools: &mut Vec<Value>) {
                 "browser_id": { "type": "string", "description": "Browser UUID returned by list; optional when exactly one companion browser is online." },
                 "tab_id": { "type": "string", "description": "Exact tab handle returned by list/attach/new." },
                 "url": { "type": "string", "maxLength": 8192, "description": "HTTP(S) URL for action=new; defaults to about:blank." },
-                "filter": { "type": "string", "maxLength": 200, "description": "List: literal title/URL filter." }
+                "filter": { "type": "string", "maxLength": 200, "description": "List: literal title/URL filter." },
+                "offset": { "type": "integer", "minimum": 0, "maximum": 10000, "default": 0, "description": "List: zero-based result offset for pagination." },
+                "limit": { "type": "integer", "minimum": 1, "maximum": 100, "default": 100, "description": "List: maximum tabs returned in this page." }
             },
             "required": ["action"]
         },
@@ -1532,9 +1544,18 @@ async fn handle_user_browser_tool(
     let broker = companion_auth.user_browser_broker();
     let browsers = broker.browsers().await;
 
-    let explicit_browser = args
-        .remove("browser_id")
-        .and_then(|value| value.as_str().map(str::to_string));
+    let explicit_browser = match args.remove("browser_id") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value)),
+        Some(_) => Err(
+            "USER_BROWSER_REQUIRED: browser_id must be the string UUID returned by user_browser_tabs"
+                .to_string(),
+        ),
+    };
+    let explicit_browser = match explicit_browser {
+        Ok(value) => value,
+        Err(error) => return tool_error_response(req, error),
+    };
     let tab_handle = match args.get("tab_id") {
         None | Some(Value::Null) => Ok(None),
         Some(Value::String(value)) => parse_user_browser_tab_handle(value).map(Some),
@@ -6085,6 +6106,25 @@ mod tests {
         ] {
             assert!(both_names.iter().any(|name| name == tool), "missing {tool}");
         }
+        let tabs_tool = both
+            .result
+            .as_ref()
+            .and_then(|result| result.get("tools"))
+            .and_then(Value::as_array)
+            .and_then(|tools| {
+                tools.iter().find(|tool| {
+                    tool.get("name").and_then(Value::as_str) == Some("user_browser_tabs")
+                })
+            })
+            .expect("user_browser_tabs descriptor");
+        assert_eq!(
+            tabs_tool.pointer("/inputSchema/properties/offset/type"),
+            Some(&json!("integer"))
+        );
+        assert_eq!(
+            tabs_tool.pointer("/inputSchema/properties/limit/maximum"),
+            Some(&json!(100))
+        );
 
         let browser_only = handle_tools_list(&request, Mode::Browser, ToolMode::MultiTools).await;
         let browser_only_names = names(&browser_only);
@@ -6175,6 +6215,10 @@ mod tests {
         let page_id = "00000000-0000-4000-8000-000000000001";
         let expected = vec![
             (
+                "user_browser_tabs",
+                json!({ "action": "list", "offset": 100, "limit": 25 }),
+            ),
+            (
                 "user_browser_snapshot",
                 json!({
                     "tabId": 17,
@@ -6262,6 +6306,10 @@ mod tests {
 
         let tab_id = format!("{browser_id}:17");
         let calls = vec![
+            (
+                "user_browser_tabs",
+                json!({ "action": "list", "browser_id": browser_id.clone(), "offset": 100, "limit": 25 }),
+            ),
             (
                 "user_browser_snapshot",
                 json!({ "tab_id": tab_id, "frame_id": "frame-7", "filter": "button" }),
@@ -6389,6 +6437,39 @@ mod tests {
             Some(true)
         );
         assert!(result_text(&response).contains("tab_id must be a string"));
+    }
+
+    #[tokio::test]
+    async fn user_browser_browser_id_rejects_non_string_values_before_fallback() {
+        let root = TestTempDir::new("moondesk-user-browser-browser-type");
+        let workspace = WorkspaceId::new();
+        let companion_auth = Arc::new(
+            CompanionAuth::open(root.path().join("companion-auth.json"))
+                .expect("open test companion auth"),
+        );
+        let request = tool_call_request_with_session(
+            "user_browser_tabs",
+            json!({ "action": "list", "browser_id": 17 }),
+            "user-browser-browser-type-chat",
+        );
+        let response = call_workers_for_test_with_companion(
+            &request,
+            &workspace,
+            &root.path().to_string_lossy(),
+            test_worker_broker(),
+            test_managed_chat_broker(),
+            Some(companion_auth),
+        )
+        .await;
+        assert_eq!(
+            response
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(result_text(&response).contains("browser_id must be the string UUID"));
     }
 
     #[tokio::test]

@@ -20,6 +20,7 @@ mod state;
 mod terminal_compat;
 mod theme;
 mod update;
+mod user_browser;
 mod vision;
 mod workers;
 mod workspace_tools;

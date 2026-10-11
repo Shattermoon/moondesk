@@ -999,7 +999,7 @@ test('bridge discovery prefers an exact runtime match over another MoonDesk vers
             app: 'moondesk-worker-companion',
             appVersion: manifest.version,
             protocolVersion: 2,
-            companionRuntimeRevision: 9
+            companionRuntimeRevision: 10
           };
         }
       };
@@ -1027,7 +1027,7 @@ test('bridge discovery prefers an exact runtime match over another MoonDesk vers
 
   const { evaluate, runtimeReloads } = loadBackground({ fetchImpl });
   const hello = await evaluate('discoverBridge(freshState())');
-  assert.equal(hello.companionRuntimeRevision, 9);
+  assert.equal(hello.companionRuntimeRevision, 10);
   assert.equal(runtimeReloads.length, 0);
 });
 
@@ -1043,7 +1043,7 @@ test('bridge runtime revision mismatch reloads the unpacked companion once', asy
             app: 'moondesk-worker-companion',
             appVersion: manifest.version,
             protocolVersion: 2,
-            companionRuntimeRevision: 8
+            companionRuntimeRevision: 9
           };
         }
       };
@@ -1082,7 +1082,7 @@ test('compatible bridge clears the one-shot runtime reload marker for a future m
             app: 'moondesk-worker-companion',
             appVersion: manifest.version,
             protocolVersion: 2,
-            companionRuntimeRevision: 9
+            companionRuntimeRevision: 10
           };
         }
       };
@@ -1095,7 +1095,7 @@ test('compatible bridge clears the one-shot runtime reload marker for a future m
   });
 
   const hello = await evaluate('discoverBridge(freshState())');
-  assert.equal(hello.companionRuntimeRevision, 9);
+  assert.equal(hello.companionRuntimeRevision, 10);
   const stored = await evaluate(`chrome.storage.local.get('${reloadKey}')`);
   assert.equal(stored[reloadKey], undefined);
 });
@@ -1113,7 +1113,7 @@ test('automatic pairing proves the extension was loaded from the MoonDesk-prepar
             app: 'moondesk-worker-companion',
             appVersion: manifest.version,
             protocolVersion: 2,
-            companionRuntimeRevision: 9
+            companionRuntimeRevision: 10
           };
         }
       };
@@ -1155,7 +1155,7 @@ test('source and release-ZIP installs without a bootstrap capability expose Manu
         app: 'moondesk-worker-companion',
         appVersion: manifest.version,
         protocolVersion: 2,
-        companionRuntimeRevision: 9
+        companionRuntimeRevision: 10
       };
       return {
         ok: true,
@@ -1224,7 +1224,7 @@ test('release version mismatch reloads the unpacked companion even when protocol
             app: 'moondesk-worker-companion',
             appVersion: '0.13.0',
             protocolVersion: 2,
-            companionRuntimeRevision: 9
+            companionRuntimeRevision: 10
           };
         }
       };

@@ -61,11 +61,13 @@ pub const COMPANION_SEND_STARTED_ROUTE: &str = "/__moondesk/companion/v1/command
 pub const COMPANION_ACK_ROUTE: &str = "/__moondesk/companion/v1/commands/ack";
 pub const COMPANION_CLEAR_WORKERS_ROUTE: &str = "/__moondesk/companion/v1/workers/clear";
 pub const COMPANION_WORKER_RESET_ACK_ROUTE: &str = "/__moondesk/companion/v1/workers/reset-ack";
+pub const COMPANION_USER_BROWSER_ROUTE: &str = "/__moondesk/companion/v1/browser-control";
 pub const COMPANION_TOKEN_HEADER: &str = "x-moondesk-companion-token";
 // Bump with any shipped companion runtime change that requires Chromium to load new bytes. Keep
 // this aligned with COMPANION_RUNTIME_REVISION in background.js.
-pub const COMPANION_RUNTIME_REVISION: u32 = 9;
+pub const COMPANION_RUNTIME_REVISION: u32 = 10;
 const MAX_COMPANION_BODY_BYTES: usize = 16 * 1024;
+const MAX_COMPANION_USER_BROWSER_BODY_BYTES: usize = 2 * 1024 * 1024;
 
 #[derive(Clone)]
 struct ServerState {
@@ -223,6 +225,11 @@ pub fn companion_bridge_router(
         .route(
             COMPANION_WORKER_RESET_ACK_ROUTE,
             post(ack_companion_worker_reset).layer(DefaultBodyLimit::max(MAX_COMPANION_BODY_BYTES)),
+        )
+        .route(
+            COMPANION_USER_BROWSER_ROUTE,
+            post(companion_user_browser_control)
+                .layer(DefaultBodyLimit::max(MAX_COMPANION_USER_BROWSER_BODY_BYTES)),
         )
         .with_state(state)
 }
@@ -521,6 +528,161 @@ async fn companion_status(State(state): State<ServerState>, headers: HeaderMap) 
             "workerResetAckRequired": auth.worker_reset_ack_required(&client_id).await
         }),
     )
+}
+
+async fn companion_user_browser_control(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response<Body> {
+    if !companion_origin_allowed(&headers) {
+        return companion_origin_error();
+    }
+    let Some(companion_client_id) = companion_client_id(&state, &headers).await else {
+        return companion_unauthorized();
+    };
+    let Some(object) = body.as_object() else {
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            json!({ "error": "invalid browser request" }),
+        );
+    };
+    let Some(action) = object.get("action").and_then(Value::as_str) else {
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            json!({ "error": "missing browser action" }),
+        );
+    };
+    let Some(browser_id) = object.get("browserId").and_then(Value::as_str) else {
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            json!({ "error": "missing browser identity" }),
+        );
+    };
+    if Uuid::parse_str(browser_id).is_err() {
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            json!({ "error": "invalid browser identity" }),
+        );
+    }
+    let (broker, host_enabled) = {
+        let app = state.app.lock().await;
+        (
+            app.companion_auth.user_browser_broker(),
+            app.tool_mode.write_tools_enabled(),
+        )
+    };
+    match action {
+        "poll" => {
+            let Some(name) = object.get("name").and_then(Value::as_str) else {
+                return json_response(
+                    StatusCode::BAD_REQUEST,
+                    json!({ "error": "missing browser name" }),
+                );
+            };
+            let Some(enabled) = object.get("enabled").and_then(Value::as_bool) else {
+                return json_response(
+                    StatusCode::BAD_REQUEST,
+                    json!({ "error": "missing browser permission state" }),
+                );
+            };
+            match broker
+                .poll(
+                    browser_id,
+                    &companion_client_id,
+                    name,
+                    enabled && host_enabled,
+                )
+                .await
+            {
+                Ok(poll) => json_response(
+                    StatusCode::OK,
+                    json!({
+                        "epoch": poll.epoch,
+                        "requests": poll.requests,
+                        "policy": { "read": host_enabled, "write": host_enabled }
+                    }),
+                ),
+                Err(error) => json_response(StatusCode::BAD_REQUEST, json!({ "error": error })),
+            }
+        }
+        "claim" => {
+            let (Some(id), Some(epoch)) = (
+                object.get("id").and_then(Value::as_str),
+                object.get("epoch").and_then(Value::as_str),
+            ) else {
+                return json_response(
+                    StatusCode::BAD_REQUEST,
+                    json!({ "error": "missing browser claim identity" }),
+                );
+            };
+            let command = if host_enabled {
+                broker
+                    .claim(browser_id, &companion_client_id, id, epoch)
+                    .await
+            } else {
+                None
+            };
+            json_response(
+                if command.is_some() {
+                    StatusCode::OK
+                } else {
+                    StatusCode::CONFLICT
+                },
+                json!({ "command": command }),
+            )
+        }
+        "check" => {
+            let (Some(id), Some(epoch)) = (
+                object.get("id").and_then(Value::as_str),
+                object.get("epoch").and_then(Value::as_str),
+            ) else {
+                return json_response(
+                    StatusCode::BAD_REQUEST,
+                    json!({ "error": "missing browser check identity" }),
+                );
+            };
+            json_response(
+                StatusCode::OK,
+                json!({
+                    "allowed": host_enabled && broker.check(browser_id, &companion_client_id, id, epoch).await
+                }),
+            )
+        }
+        "result" => {
+            let (Some(id), Some(epoch), Some(result)) = (
+                object.get("id").and_then(Value::as_str),
+                object.get("epoch").and_then(Value::as_str),
+                object.get("result"),
+            ) else {
+                return json_response(
+                    StatusCode::BAD_REQUEST,
+                    json!({ "error": "missing browser result" }),
+                );
+            };
+            if !result.is_object() {
+                return json_response(
+                    StatusCode::BAD_REQUEST,
+                    json!({ "error": "browser result must be an object" }),
+                );
+            }
+            let accepted = broker
+                .result(browser_id, &companion_client_id, id, epoch, result.clone())
+                .await;
+            json_response(
+                if accepted {
+                    StatusCode::OK
+                } else {
+                    StatusCode::CONFLICT
+                },
+                json!({ "ok": accepted }),
+            )
+        }
+        _ => json_response(
+            StatusCode::BAD_REQUEST,
+            json!({ "error": "unknown browser action" }),
+        ),
+    }
 }
 
 async fn companion_clients(State(state): State<ServerState>, headers: HeaderMap) -> Response<Body> {
@@ -3355,7 +3517,7 @@ mod tests {
         let app_state = Arc::new(Mutex::new(app));
         let (ui_tx, _ui_rx) = ui_event_channel();
         let app = companion_bridge_router(
-            app_state,
+            app_state.clone(),
             None,
             CommandJobManager::new(),
             ui_tx,
@@ -3422,6 +3584,76 @@ mod tests {
             .await
             .expect("send authenticated companion status");
         assert_eq!(status.status(), StatusCode::OK);
+
+        let browser_url = format!("http://{address}{COMPANION_USER_BROWSER_ROUTE}");
+        let browser_id = Uuid::new_v4().to_string();
+        let browser_poll_body = json!({
+            "action": "poll",
+            "browserId": browser_id,
+            "name": "Chrome / Chromium",
+            "enabled": true
+        });
+        let unauthenticated_browser_poll = client
+            .post(&browser_url)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(reqwest_json_body(&browser_poll_body))
+            .send()
+            .await
+            .expect("send unauthenticated user-browser poll");
+        assert_eq!(
+            unauthenticated_browser_poll.status(),
+            StatusCode::UNAUTHORIZED
+        );
+
+        app_state.lock().await.mode = crate::state::Mode::Browser;
+        let browser_poll = client
+            .post(&browser_url)
+            .header(COMPANION_TOKEN_HEADER, &credential)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(reqwest_json_body(&browser_poll_body))
+            .send()
+            .await
+            .expect("poll authenticated user browser");
+        assert_eq!(browser_poll.status(), StatusCode::OK);
+        let browser_poll_json = reqwest_response_json(browser_poll).await;
+        assert!(
+            browser_poll_json
+                .get("epoch")
+                .and_then(Value::as_str)
+                .is_some_and(|value| Uuid::parse_str(value).is_ok())
+        );
+        assert_eq!(
+            browser_poll_json
+                .pointer("/policy/read")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            browser_poll_json
+                .pointer("/policy/write")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        app_state.lock().await.mode = crate::state::Mode::Both;
+
+        app_state.lock().await.tool_mode = crate::state::ToolMode::ReadOnly;
+        let revoked_poll = client
+            .post(&browser_url)
+            .header(COMPANION_TOKEN_HEADER, &credential)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(reqwest_json_body(&browser_poll_body))
+            .send()
+            .await
+            .expect("poll user browser after host revocation");
+        assert_eq!(revoked_poll.status(), StatusCode::OK);
+        let revoked_poll_json = reqwest_response_json(revoked_poll).await;
+        assert_eq!(
+            revoked_poll_json
+                .pointer("/policy/write")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+        app_state.lock().await.tool_mode = crate::state::ToolMode::MultiTools;
 
         let workspaces = client
             .get(format!("http://{address}{COMPANION_WORKSPACES_ROUTE}"))
@@ -5886,6 +6118,280 @@ document.getElementById('hidden-upload').addEventListener('change',event=>{docum
         let _ = std::fs::remove_dir_all(workspace_root);
         let _ = std::fs::remove_dir_all(workspace_b_root);
         let _ = std::fs::remove_dir_all(config_root);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "manual Chrome user-browser Companion E2E host"]
+    async fn user_browser_manual_e2e_host() {
+        use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+        use std::time::Duration;
+
+        let repo_root = std::env::current_dir().expect("resolve user-browser E2E repo root");
+        let runtime_root = repo_root.join("target").join("user-browser-e2e");
+        let config_root = runtime_root.join("config");
+        let controls = runtime_root.join("controls");
+        std::fs::create_dir_all(&config_root).expect("create user-browser E2E config root");
+        std::fs::create_dir_all(&controls).expect("create user-browser E2E controls");
+        for name in [
+            "continue",
+            "release",
+            "status.json",
+            "attached.jpg",
+            "after-click.jpg",
+        ] {
+            let _ = std::fs::remove_file(controls.join(name));
+        }
+        let config_path = config_root.join("config.toml");
+        let app = AppState::new_for_test(
+            3201,
+            repo_root.to_string_lossy().into_owned(),
+            config_path.clone(),
+        )
+        .expect("create user-browser E2E app state");
+        let installation_token = app.companion_auth.installation_token().to_string();
+        let install =
+            crate::companion_install::materialize_for_config(&config_path, &installation_token)
+                .expect("materialize user-browser E2E Companion");
+        let broker = app.companion_auth.user_browser_broker();
+        let app_state = Arc::new(Mutex::new(app));
+        let (ui_tx, _ui_rx) = ui_event_channel();
+        let e2e_router = companion_bridge_router(
+            app_state,
+            None,
+            CommandJobManager::new(),
+            ui_tx,
+            Arc::from("unused-host-token"),
+        );
+        let mut bound = None;
+        for port in COMPANION_BRIDGE_PORTS {
+            if let Ok(listener) = tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
+                bound = Some((port, listener));
+                break;
+            }
+        }
+        let (bridge_port, listener) = bound.expect("bind user-browser E2E bridge");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, e2e_router)
+                .await
+                .expect("serve user-browser E2E bridge");
+        });
+
+        println!("MOONDESK_USER_BROWSER_E2E_READY=http://127.0.0.1:{bridge_port}");
+        println!(
+            "MOONDESK_USER_BROWSER_E2E_EXTENSION={}",
+            install.directory.display()
+        );
+        println!("MOONDESK_USER_BROWSER_E2E_CONTROLS={}", controls.display());
+        println!(
+            "Load/reload that folder as an unpacked Chrome extension. It will auto-pair with this debug bridge."
+        );
+
+        let owner = "d".repeat(64);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15 * 60);
+        let browser = loop {
+            let browsers = broker.browsers().await;
+            if let Some(browser) = browsers.into_iter().find(|browser| browser.enabled) {
+                break browser;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for debug Companion browser"
+            );
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        };
+        println!("MOONDESK_USER_BROWSER_E2E_BROWSER={}", browser.browser_id);
+
+        let opened = broker
+            .execute(
+                &browser.browser_id,
+                &owner,
+                "user_browser_tabs",
+                json!({ "action": "new", "url": "https://example.com/" }),
+            )
+            .await
+            .expect("open controlled example tab");
+        let tab_id = opened
+            .pointer("/value/tabId")
+            .and_then(Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok())
+            .expect("created tab id");
+        let page_id = opened
+            .pointer("/value/pageId")
+            .and_then(Value::as_str)
+            .expect("created page id")
+            .to_string();
+
+        let snapshot = broker
+            .execute(
+                &browser.browser_id,
+                &owner,
+                "user_browser_snapshot",
+                json!({ "tabId": tab_id, "maxNodes": 300, "maxChars": 16000 }),
+            )
+            .await
+            .expect("snapshot controlled example tab");
+        let screenshot = broker
+            .execute(
+                &browser.browser_id,
+                &owner,
+                "user_browser_screenshot",
+                json!({ "tabId": tab_id, "fullPage": false }),
+            )
+            .await
+            .expect("screenshot controlled example tab");
+        let pixels = screenshot
+            .pointer("/image/data")
+            .and_then(Value::as_str)
+            .and_then(|data| BASE64_STANDARD.decode(data).ok())
+            .expect("decode controlled-tab screenshot");
+        std::fs::write(controls.join("attached.jpg"), pixels).expect("write attached screenshot");
+        let status = json!({
+            "phase": "attached",
+            "browser": browser,
+            "tabId": tab_id,
+            "pageId": page_id,
+            "opened": opened,
+            "snapshot": snapshot,
+            "screenshot": screenshot.get("value")
+        });
+        std::fs::write(
+            controls.join("status.json"),
+            serde_json::to_vec_pretty(&status).expect("serialize attached E2E status"),
+        )
+        .expect("write attached E2E status");
+        println!("MOONDESK_USER_BROWSER_E2E_ATTACHED_TAB={tab_id}");
+        println!(
+            "Blue-glow screenshot: {}",
+            controls.join("attached.jpg").display()
+        );
+        println!(
+            "Create `continue` in the controls folder after inspecting the attached tab/glow."
+        );
+
+        while !controls.join("continue").exists() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for E2E continue control"
+            );
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+
+        let current = broker
+            .execute(
+                &browser.browser_id,
+                &owner,
+                "user_browser_snapshot",
+                json!({ "tabId": tab_id, "maxNodes": 300, "maxChars": 16000 }),
+            )
+            .await
+            .expect("refresh example snapshot before click");
+        let current_page_id = current
+            .pointer("/value/pageId")
+            .and_then(Value::as_str)
+            .expect("current page id")
+            .to_string();
+        let text = current
+            .pointer("/value/text")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let link_ref = text
+            .lines()
+            .find(|line| line.contains("link "))
+            .and_then(|line| line.split_once('[').map(|(_, rest)| rest))
+            .and_then(|rest| {
+                rest.split_once(']')
+                    .map(|(reference, _)| reference.to_string())
+            })
+            .expect("example page exposes a link ref");
+        let clicked = broker
+            .execute(
+                &browser.browser_id,
+                &owner,
+                "user_browser_action",
+                json!({
+                    "tabId": tab_id,
+                    "pageId": current_page_id,
+                    "action": "click",
+                    "ref": link_ref,
+                    "button": "left",
+                    "clickCount": 1
+                }),
+            )
+            .await
+            .expect("click controlled example link");
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let after = broker
+            .execute(
+                &browser.browser_id,
+                &owner,
+                "user_browser_snapshot",
+                json!({ "tabId": tab_id, "maxNodes": 300, "maxChars": 16000 }),
+            )
+            .await
+            .expect("snapshot after controlled click");
+        let after_shot = broker
+            .execute(
+                &browser.browser_id,
+                &owner,
+                "user_browser_screenshot",
+                json!({ "tabId": tab_id, "fullPage": false }),
+            )
+            .await
+            .expect("screenshot after controlled click");
+        if let Some(pixels) = after_shot
+            .pointer("/image/data")
+            .and_then(Value::as_str)
+            .and_then(|data| BASE64_STANDARD.decode(data).ok())
+        {
+            std::fs::write(controls.join("after-click.jpg"), pixels)
+                .expect("write after-click screenshot");
+        }
+        let status = json!({
+            "phase": "clicked",
+            "browser": browser,
+            "tabId": tab_id,
+            "clicked": clicked,
+            "after": after,
+            "screenshot": after_shot.get("value")
+        });
+        std::fs::write(
+            controls.join("status.json"),
+            serde_json::to_vec_pretty(&status).expect("serialize clicked E2E status"),
+        )
+        .expect("write clicked E2E status");
+        println!("MOONDESK_USER_BROWSER_E2E_CLICKED=true");
+        println!("Create `release` in the controls folder to detach and remove the blue glow.");
+
+        while !controls.join("release").exists() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for E2E release control"
+            );
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        let released = broker
+            .execute(
+                &browser.browser_id,
+                &owner,
+                "user_browser_tabs",
+                json!({ "action": "release", "tabId": tab_id }),
+            )
+            .await
+            .expect("release controlled tab");
+        std::fs::write(
+            controls.join("status.json"),
+            serde_json::to_vec_pretty(&json!({
+                "phase": "released",
+                "browser": browser,
+                "tabId": tab_id,
+                "released": released
+            }))
+            .expect("serialize released E2E status"),
+        )
+        .expect("write released E2E status");
+        println!("MOONDESK_USER_BROWSER_E2E_RELEASED=true");
+        server.abort();
+        let _ = server.await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

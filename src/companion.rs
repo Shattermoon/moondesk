@@ -4,10 +4,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 use subtle::ConstantTimeEq;
 use tokio::sync::{Mutex, Notify};
 use uuid::Uuid;
+
+use crate::user_browser::UserBrowserBroker;
 
 pub const COMPANION_AUTH_SCHEMA_VERSION: u32 = 2;
 pub const COMPANION_AUTH_FILE_NAME: &str = "companion-auth-v1.json";
@@ -318,6 +320,7 @@ pub struct CompanionAuth {
     worker_reset_notify: Notify,
     pairing_token: RwLock<String>,
     installation_token: String,
+    user_browser_broker: Arc<UserBrowserBroker>,
 }
 
 impl CompanionAuth {
@@ -340,6 +343,7 @@ impl CompanionAuth {
             worker_reset_notify: Notify::new(),
             pairing_token: RwLock::new(random_secret()),
             installation_token: random_secret(),
+            user_browser_broker: Arc::new(UserBrowserBroker::new()),
         })
     }
 
@@ -352,6 +356,10 @@ impl CompanionAuth {
 
     pub fn installation_token(&self) -> &str {
         &self.installation_token
+    }
+
+    pub fn user_browser_broker(&self) -> Arc<UserBrowserBroker> {
+        self.user_browser_broker.clone()
     }
 
     pub fn installation_token_matches(&self, supplied: &str) -> bool {

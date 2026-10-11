@@ -1,3 +1,4 @@
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::collections::hash_map::DefaultHasher;
@@ -248,6 +249,53 @@ fn local_tool_output_schema(name: &str) -> Option<Value> {
                 "images".to_string(),
                 json!({ "type": "array", "items": { "type": "object" } }),
             );
+        }
+        "user_browser_tabs" => {
+            properties.insert("browserId".to_string(), json!({ "type": "string" }));
+            properties.insert(
+                "browsers".to_string(),
+                json!({ "type": "array", "items": { "type": "object" } }),
+            );
+            properties.insert(
+                "tabs".to_string(),
+                json!({ "type": "array", "items": { "type": "object" } }),
+            );
+            properties.insert("tabId".to_string(), json!({ "type": "string" }));
+            properties.insert("pageId".to_string(), json!({ "type": "string" }));
+            properties.insert("attached".to_string(), json!({ "type": "boolean" }));
+            properties.insert("created".to_string(), json!({ "type": "boolean" }));
+            properties.insert("released".to_string(), json!({ "type": "boolean" }));
+            properties.insert("closed".to_string(), json!({ "type": "boolean" }));
+        }
+        "user_browser_snapshot" => {
+            properties.insert("tabId".to_string(), json!({ "type": "string" }));
+            properties.insert("pageId".to_string(), json!({ "type": "string" }));
+            properties.insert("title".to_string(), json!({ "type": "string" }));
+            properties.insert("url".to_string(), json!({ "type": "string" }));
+            properties.insert("text".to_string(), json!({ "type": "string" }));
+            properties.insert("truncated".to_string(), json!({ "type": "boolean" }));
+            properties.insert(
+                "frames".to_string(),
+                json!({ "type": "array", "items": { "type": "object" } }),
+            );
+        }
+        "user_browser_screenshot" => {
+            properties.insert("tabId".to_string(), json!({ "type": "string" }));
+            properties.insert("pageId".to_string(), json!({ "type": "string" }));
+            properties.insert("screenshotId".to_string(), json!({ "type": "string" }));
+            for field in ["width", "height"] {
+                properties.insert(
+                    field.to_string(),
+                    json!({ "type": "integer", "minimum": 0 }),
+                );
+            }
+            properties.insert("scale".to_string(), json!({ "type": "number" }));
+            properties.insert("fullPage".to_string(), json!({ "type": "boolean" }));
+        }
+        "user_browser_navigate" | "user_browser_action" => {
+            properties.insert("tabId".to_string(), json!({ "type": "string" }));
+            properties.insert("pageId".to_string(), json!({ "type": "string" }));
+            properties.insert("accepted".to_string(), json!({ "type": "boolean" }));
         }
         "set_browser_presentation" => {
             properties.insert("status".to_string(), json!({ "type": "string" }));
@@ -567,6 +615,99 @@ fn workers_tool_descriptor() -> Value {
     })
 }
 
+fn push_user_browser_tools(tools: &mut Vec<Value>) {
+    tools.push(json!({
+        "name": "user_browser_tabs",
+        "title": "Control user browser tabs",
+        "description": "List, attach, open, release, or close tabs in the user's existing Chrome/Edge through the MoonDesk Companion extension. This is separate from MoonDesk's isolated browser_* runtime. Attach grants this exact ChatGPT conversation temporary control of one non-ChatGPT tab and shows a blue glow; release leaves the tab open. List first when you do not already have an exact tab_id.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "action": { "type": "string", "enum": ["list", "attach", "new", "release", "close"] },
+                "browser_id": { "type": "string", "description": "Browser UUID returned by list; optional when exactly one companion browser is online." },
+                "tab_id": { "type": "string", "description": "Exact tab handle returned by list/attach/new." },
+                "url": { "type": "string", "maxLength": 8192, "description": "HTTP(S) URL for action=new; defaults to about:blank." },
+                "filter": { "type": "string", "maxLength": 200, "description": "List: literal title/URL filter." }
+            },
+            "required": ["action"]
+        },
+        "annotations": { "readOnlyHint": false, "openWorldHint": true, "destructiveHint": true }
+    }));
+    tools.push(json!({
+        "name": "user_browser_snapshot",
+        "title": "Inspect controlled user browser tab",
+        "description": "Read a bounded DOM-oriented snapshot from a tab controlled through MoonDesk Companion. Returns page_id plus stable element refs for the current document. Navigation invalidates old refs. ChatGPT tabs are protected from interactive attachment in this first version.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "tab_id": { "type": "string" },
+                "max_nodes": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 300 },
+                "max_chars": { "type": "integer", "minimum": 100, "maximum": 24000, "default": 16000 },
+                "filter": { "type": "string", "maxLength": 200 }
+            },
+            "required": ["tab_id"]
+        },
+        "annotations": { "readOnlyHint": true, "openWorldHint": true, "destructiveHint": false }
+    }));
+    tools.push(json!({
+        "name": "user_browser_screenshot",
+        "title": "Capture controlled user browser tab",
+        "description": "Capture the currently controlled user-browser tab without activating it. Returns rendered image content plus page_id/screenshot_id. Take a fresh screenshot after navigation before coordinate input.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "tab_id": { "type": "string" },
+                "full_page": { "type": "boolean", "default": false }
+            },
+            "required": ["tab_id"]
+        },
+        "annotations": { "readOnlyHint": true, "openWorldHint": true, "destructiveHint": false }
+    }));
+    tools.push(json!({
+        "name": "user_browser_navigate",
+        "title": "Navigate controlled user browser tab",
+        "description": "Navigate a controlled user-browser tab to an HTTP(S) URL, back, forward, or reload. The action runs in the background and invalidates old page refs.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "tab_id": { "type": "string" },
+                "page_id": { "type": "string", "description": "Current page_id from attach/snapshot/screenshot." },
+                "action": { "type": "string", "enum": ["url", "back", "forward", "reload"] },
+                "url": { "type": "string", "maxLength": 8192 }
+            },
+            "required": ["tab_id", "page_id", "action"]
+        },
+        "annotations": { "readOnlyHint": false, "openWorldHint": true, "destructiveHint": true }
+    }));
+    tools.push(json!({
+        "name": "user_browser_action",
+        "title": "Interact with controlled user browser tab",
+        "description": "Interact with one controlled user-browser tab without OS-level PC control. Click/hover/scroll by DOM ref or screenshot coordinates; fill/type text; select; send a key; or handle a JavaScript dialog. Observe the page after input before deciding whether to repeat anything.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "tab_id": { "type": "string" },
+                "page_id": { "type": "string" },
+                "action": { "type": "string", "enum": ["click", "hover", "fill", "type", "select", "key", "scroll", "dialog"] },
+                "ref": { "type": "string", "maxLength": 120 },
+                "text": { "type": "string", "maxLength": 24000 },
+                "key": { "type": "string", "maxLength": 100 },
+                "values": { "type": "array", "maxItems": 50, "items": { "type": "string", "maxLength": 1000 } },
+                "x": { "type": "number", "minimum": 0, "maximum": 10000 },
+                "y": { "type": "number", "minimum": 0, "maximum": 10000 },
+                "screenshot_id": { "type": "string", "maxLength": 100 },
+                "delta_x": { "type": "number", "minimum": -10000, "maximum": 10000 },
+                "delta_y": { "type": "number", "minimum": -10000, "maximum": 10000 },
+                "button": { "type": "string", "enum": ["left", "middle", "right"], "default": "left" },
+                "click_count": { "type": "integer", "minimum": 1, "maximum": 3, "default": 1 },
+                "accept": { "type": "boolean" }
+            },
+            "required": ["tab_id", "page_id", "action"]
+        },
+        "annotations": { "readOnlyHint": false, "openWorldHint": true, "destructiveHint": true }
+    }));
+}
+
 fn push_handoff_tools(tools: &mut Vec<Value>) {
     tools.push(create_handoff_tool_descriptor());
     tools.push(resume_handoff_tool_descriptor());
@@ -842,6 +983,7 @@ async fn handle_tools_list(
 
         if tool_mode.write_tools_enabled() {
             tools.push(workers_tool_descriptor());
+            push_user_browser_tools(&mut tools);
         }
         tools.push(json!({
             "name": "moondesk_instruction",
@@ -979,6 +1121,9 @@ async fn handle_tools_list(
 
     if mode.browser_enabled() {
         if !mode.computer_enabled() {
+            if tool_mode.write_tools_enabled() {
+                push_user_browser_tools(&mut tools);
+            }
             tools.push(json!({
                 "name": "moondesk_instruction",
                 "title": "Get usage instructions",
@@ -1200,6 +1345,207 @@ fn optional_chat_identity(req: &JsonRpcRequest) -> Result<Option<ChatIdentity>, 
     Ok(Some(ChatIdentity::from_openai_meta(subject, session)))
 }
 
+fn user_browser_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "user_browser_tabs"
+            | "user_browser_snapshot"
+            | "user_browser_screenshot"
+            | "user_browser_navigate"
+            | "user_browser_action"
+    )
+}
+
+fn user_browser_chat_identity(req: &JsonRpcRequest) -> Result<ChatIdentity, String> {
+    optional_chat_identity(req)?.ok_or_else(|| {
+        "user browser control requires exact ChatGPT conversation identity; openai/session metadata is missing or invalid"
+            .to_string()
+    })
+}
+
+fn parse_user_browser_tab_handle(value: &str) -> Result<(String, u32), String> {
+    let Some((browser_id, tab_id)) = value.rsplit_once(':') else {
+        return Err("USER_BROWSER_TAB_INVALID: use a tab_id returned by user_browser_tabs".into());
+    };
+    uuid::Uuid::parse_str(browser_id)
+        .map_err(|_| "USER_BROWSER_TAB_INVALID: browser identity is malformed".to_string())?;
+    let tab_id = tab_id
+        .parse::<u32>()
+        .ok()
+        .filter(|value| *value > 0)
+        .ok_or_else(|| "USER_BROWSER_TAB_INVALID: tab identity is malformed".to_string())?;
+    Ok((browser_id.to_string(), tab_id))
+}
+
+fn rename_user_browser_arg(object: &mut Map<String, Value>, from: &str, to: &str) {
+    if let Some(value) = object.remove(from) {
+        object.insert(to.to_string(), value);
+    }
+}
+
+fn decorate_user_browser_tab_handles(value: &mut Value, browser_id: &str) {
+    match value {
+        Value::Object(object) => {
+            if object.contains_key("browserId") {
+                object.insert(
+                    "browserId".to_string(),
+                    Value::String(browser_id.to_string()),
+                );
+            }
+            if let Some(tab_id) = object.get("tabId").and_then(Value::as_u64) {
+                object.insert(
+                    "tabId".to_string(),
+                    Value::String(format!("{browser_id}:{tab_id}")),
+                );
+            }
+            for child in object.values_mut() {
+                decorate_user_browser_tab_handles(child, browser_id);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                decorate_user_browser_tab_handles(item, browser_id);
+            }
+        }
+        _ => {}
+    }
+}
+
+async fn handle_user_browser_tool(
+    req: &JsonRpcRequest,
+    tool_name: &str,
+    identity: &ChatIdentity,
+    companion_auth: &CompanionAuth,
+) -> JsonRpcResponse {
+    let arguments = tool_arguments(req);
+    let Some(input) = arguments.as_object() else {
+        return tool_error_response(req, "user browser arguments must be an object".into());
+    };
+    let mut args = input.clone();
+    let broker = companion_auth.user_browser_broker();
+    let browsers = broker.browsers().await;
+
+    let explicit_browser = args
+        .remove("browser_id")
+        .and_then(|value| value.as_str().map(str::to_string));
+    let tab_handle = args
+        .get("tab_id")
+        .and_then(Value::as_str)
+        .map(parse_user_browser_tab_handle)
+        .transpose();
+    let (handle_browser, numeric_tab) = match tab_handle {
+        Ok(Some((browser, tab))) => (Some(browser), Some(tab)),
+        Ok(None) => (None, None),
+        Err(error) => return tool_error_response(req, error),
+    };
+    if let (Some(explicit), Some(from_handle)) = (&explicit_browser, &handle_browser)
+        && explicit != from_handle
+    {
+        return tool_error_response(
+            req,
+            "USER_BROWSER_TAB_INVALID: browser_id does not match the tab handle".into(),
+        );
+    }
+
+    let browser_id = explicit_browser
+        .or(handle_browser)
+        .or_else(|| (browsers.len() == 1).then(|| browsers[0].browser_id.clone()));
+    let action = args.get("action").and_then(Value::as_str);
+    if browser_id.is_none() && tool_name == "user_browser_tabs" && action == Some("list") {
+        let value = json!({
+            "browsers": browsers,
+            "tabs": [],
+            "message": if browsers.is_empty() {
+                "No paired browser with the MoonDesk Companion is online."
+            } else {
+                "More than one companion browser is online; choose browser_id and list again."
+            }
+        });
+        return tool_success_response_with_structured(req, value.to_string(), value);
+    }
+    let Some(browser_id) = browser_id else {
+        return tool_error_response(
+            req,
+            "USER_BROWSER_REQUIRED: list user browsers first, then specify browser_id or an exact tab_id"
+                .into(),
+        );
+    };
+
+    args.remove("tab_id");
+    if let Some(tab_id) = numeric_tab {
+        args.insert("tabId".to_string(), json!(tab_id));
+    }
+    rename_user_browser_arg(&mut args, "page_id", "pageId");
+    rename_user_browser_arg(&mut args, "max_nodes", "maxNodes");
+    rename_user_browser_arg(&mut args, "max_chars", "maxChars");
+    rename_user_browser_arg(&mut args, "full_page", "fullPage");
+    rename_user_browser_arg(&mut args, "screenshot_id", "screenshotId");
+    rename_user_browser_arg(&mut args, "delta_x", "deltaX");
+    rename_user_browser_arg(&mut args, "delta_y", "deltaY");
+    rename_user_browser_arg(&mut args, "click_count", "clickCount");
+
+    let result = match broker
+        .execute(
+            &browser_id,
+            &identity.session_digest,
+            tool_name,
+            Value::Object(args),
+        )
+        .await
+    {
+        Ok(result) => result,
+        Err(error) => return tool_error_response(req, error),
+    };
+    if let Some(error) = result.get("error").and_then(Value::as_str) {
+        return tool_error_response(req, error.to_string());
+    }
+    let mut value = result.get("value").cloned().unwrap_or(Value::Null);
+    decorate_user_browser_tab_handles(&mut value, &browser_id);
+
+    if let Some(image) = result.get("image").and_then(Value::as_object) {
+        let Some(data) = image.get("data").and_then(Value::as_str) else {
+            return tool_error_response(
+                req,
+                "USER_BROWSER_IMAGE_INVALID: missing image data".into(),
+            );
+        };
+        let Some(mime_type) = image.get("mimeType").and_then(Value::as_str) else {
+            return tool_error_response(
+                req,
+                "USER_BROWSER_IMAGE_INVALID: missing image type".into(),
+            );
+        };
+        if !matches!(mime_type, "image/jpeg" | "image/png") || data.len() > 1_700_000 {
+            return tool_error_response(
+                req,
+                "USER_BROWSER_IMAGE_INVALID: unsupported or oversized image".into(),
+            );
+        }
+        let bytes = match BASE64_STANDARD.decode(data) {
+            Ok(bytes) if bytes.len() <= 1_300_000 => bytes,
+            _ => {
+                return tool_error_response(
+                    req,
+                    "USER_BROWSER_IMAGE_INVALID: invalid encoded image".into(),
+                );
+            }
+        };
+        if image::load_from_memory(&bytes).is_err() {
+            return tool_error_response(
+                req,
+                "USER_BROWSER_IMAGE_INVALID: Chrome returned unreadable pixels".into(),
+            );
+        }
+        return tool_success_response_with_content(
+            req,
+            vec![json!({ "type": "image", "data": data, "mimeType": mime_type })],
+            value,
+        );
+    }
+
+    tool_success_response_with_structured(req, value.to_string(), value)
+}
+
 fn worker_chat_identity(req: &JsonRpcRequest) -> Result<ChatIdentity, String> {
     optional_chat_identity(req)?.ok_or_else(|| {
         "workers requires exact ChatGPT conversation identity; openai/session metadata is missing or invalid"
@@ -1247,6 +1593,23 @@ async fn handle_tools_call_for_workspace(
             "This ChatGPT conversation belonged to a worker that was cleared. Start a new Core conversation before using MoonDesk tools again."
                 .into(),
         );
+    }
+
+    if user_browser_tool(&tool_name) {
+        if tool_mode.read_only() {
+            return read_only_blocked_response(req, &tool_name);
+        }
+        let identity = match user_browser_chat_identity(req) {
+            Ok(identity) => identity,
+            Err(error) => return tool_error_response(req, error),
+        };
+        let Some(auth) = companion_auth.as_ref() else {
+            return tool_error_response(
+                req,
+                "MoonDesk Companion is unavailable for user browser control".into(),
+            );
+        };
+        return handle_user_browser_tool(req, &tool_name, &identity, auth).await;
     }
 
     let connector_browser_tool = connector_expanded_browser_tool(&tool_name);
@@ -2706,6 +3069,10 @@ Always specify the branch explicitly when using `git push`."#
         .lines()
         .map(str::to_string)
         .collect();
+
+    if tool_mode.write_tools_enabled() {
+        lines.push("If the optional MoonDesk Companion is installed, user_browser_tabs/user_browser_snapshot/user_browser_screenshot/user_browser_navigate/user_browser_action control exact tabs in the user's existing Chromium browser. This is separate from the isolated browser_* runtime and is not PC control. List or open a tab first, attach deliberately, use fresh page IDs/refs after navigation, do not blindly replay uncertain input, and release the tab when done; a blue four-edge glow indicates active MoonDesk control. Active ChatGPT orchestration tabs are protected from interactive attachment.".to_string());
+    }
 
     if mode.computer_enabled() {
         lines.push("Use read to read files and search to search the workspace. Relative read paths resolve inside the selected workspace, while an explicitly addressed absolute file may be read in either tool mode when the MoonDesk user can read it. Keep search/write/edit/delete workspace-scoped; ReadOnly controls mutation and execution capabilities rather than changing read-path semantics.".to_string());
@@ -5578,6 +5945,174 @@ mod tests {
         request.params["_meta"]["openai/session"] = json!("");
         let empty = browser_session_key(&request, &workspace);
         assert!(empty == fallback);
+    }
+
+    #[tokio::test]
+    async fn user_browser_tools_are_advertised_in_every_multitool_mode() {
+        let request = JsonRpcRequest {
+            jsonrpc: "2.0".into(),
+            id: Some(json!("user-browser-list")),
+            method: "tools/list".into(),
+            params: json!({}),
+        };
+        let names = |response: &JsonRpcResponse| {
+            response
+                .result
+                .as_ref()
+                .and_then(|result| result.get("tools"))
+                .and_then(Value::as_array)
+                .expect("tools list")
+                .iter()
+                .filter_map(|tool| tool.get("name").and_then(Value::as_str))
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        };
+
+        let both = handle_tools_list(&request, Mode::Both, ToolMode::MultiTools).await;
+        let both_names = names(&both);
+        for tool in [
+            "user_browser_tabs",
+            "user_browser_snapshot",
+            "user_browser_screenshot",
+            "user_browser_navigate",
+            "user_browser_action",
+        ] {
+            assert!(both_names.iter().any(|name| name == tool), "missing {tool}");
+        }
+
+        let browser_only = handle_tools_list(&request, Mode::Browser, ToolMode::MultiTools).await;
+        let browser_only_names = names(&browser_only);
+        for tool in [
+            "user_browser_tabs",
+            "user_browser_snapshot",
+            "user_browser_screenshot",
+            "user_browser_navigate",
+            "user_browser_action",
+        ] {
+            assert!(
+                browser_only_names.iter().any(|name| name == tool),
+                "missing {tool} in Browser mode"
+            );
+        }
+
+        let read_only = handle_tools_list(&request, Mode::Both, ToolMode::ReadOnly).await;
+        assert!(
+            names(&read_only)
+                .iter()
+                .all(|name| !name.starts_with("user_browser_"))
+        );
+    }
+
+    #[tokio::test]
+    async fn user_browser_tool_requires_exact_chatgpt_identity_before_dispatch() {
+        let root = TestTempDir::new("moondesk-user-browser-identity");
+        let workspace = WorkspaceId::new();
+        let request = tool_call_request("user_browser_tabs", json!({ "action": "list" }));
+        let response = call_workers_for_test(
+            &request,
+            &workspace,
+            &root.path().to_string_lossy(),
+            test_worker_broker(),
+            test_managed_chat_broker(),
+        )
+        .await;
+        assert_eq!(
+            response
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(result_text(&response).contains("exact ChatGPT conversation identity"));
+    }
+
+    #[tokio::test]
+    async fn user_browser_tool_round_trip_decorates_exact_tab_handle() {
+        let root = TestTempDir::new("moondesk-user-browser-roundtrip");
+        let workspace = WorkspaceId::new();
+        let companion_auth = Arc::new(
+            CompanionAuth::open(root.path().join("companion-auth.json"))
+                .expect("open test companion auth"),
+        );
+        let broker = companion_auth.user_browser_broker();
+        let browser_id = Uuid::new_v4().to_string();
+        let companion_client_id = "user-browser-roundtrip-companion";
+        broker
+            .poll(&browser_id, companion_client_id, "Chrome", true)
+            .await
+            .expect("publish browser presence");
+
+        let responder = {
+            let broker = broker.clone();
+            let browser_id = browser_id.clone();
+            tokio::spawn(async move {
+                loop {
+                    let poll = broker
+                        .poll(&browser_id, companion_client_id, "Chrome", true)
+                        .await
+                        .expect("poll browser requests");
+                    if let Some(request_id) = poll.requests.first().cloned() {
+                        let command = broker
+                            .claim(&browser_id, companion_client_id, &request_id, &poll.epoch)
+                            .await
+                            .expect("claim browser request");
+                        assert_eq!(command.tool, "user_browser_tabs");
+                        assert_eq!(
+                            command.args.get("action").and_then(Value::as_str),
+                            Some("list")
+                        );
+                        assert!(
+                            broker
+                                .result(
+                                    &browser_id,
+                                    companion_client_id,
+                                    &request_id,
+                                    &poll.epoch,
+                                    json!({
+                                        "value": {
+                                            "tabs": [{ "tabId": 17, "title": "Example" }]
+                                        }
+                                    }),
+                                )
+                                .await
+                        );
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+        };
+
+        let request = tool_call_request_with_session(
+            "user_browser_tabs",
+            json!({ "action": "list", "browser_id": browser_id }),
+            "user-browser-roundtrip-chat",
+        );
+        let response = call_workers_for_test_with_companion(
+            &request,
+            &workspace,
+            &root.path().to_string_lossy(),
+            test_worker_broker(),
+            test_managed_chat_broker(),
+            Some(companion_auth),
+        )
+        .await;
+        responder.await.expect("join browser responder");
+
+        let structured = response
+            .result
+            .as_ref()
+            .and_then(|result| result.get("structuredContent"))
+            .expect("structured user-browser result");
+        assert_eq!(
+            structured.pointer("/tabs/0/tabId").and_then(Value::as_str),
+            Some(format!("{browser_id}:17").as_str())
+        );
+        assert_eq!(
+            structured.pointer("/tabs/0/title").and_then(Value::as_str),
+            Some("Example")
+        );
     }
 
     #[tokio::test]
@@ -8882,6 +9417,11 @@ mod tests {
                 "read_command_output",
                 "cancel_command",
                 "workers",
+                "user_browser_tabs",
+                "user_browser_snapshot",
+                "user_browser_screenshot",
+                "user_browser_navigate",
+                "user_browser_action",
                 "moondesk_instruction",
                 "create_handoff",
                 "resume_handoff",
@@ -8992,6 +9532,11 @@ mod tests {
             ("read_command_output", "text"),
             ("cancel_command", "state"),
             ("workers", "action"),
+            ("user_browser_tabs", "tabs"),
+            ("user_browser_snapshot", "text"),
+            ("user_browser_screenshot", "screenshotId"),
+            ("user_browser_navigate", "accepted"),
+            ("user_browser_action", "accepted"),
             ("moondesk_instruction", "instructionText"),
             ("create_handoff", "handoffId"),
             ("resume_handoff", "drift"),

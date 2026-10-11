@@ -1,6 +1,6 @@
 # MoonDesk Worker Companion distribution plan
 
-The Worker Companion is **optional for MoonDesk itself**. Normal MoonDesk features—files, shell commands, browser automation, workspaces, handoffs, and ordinary MCP use—do not require it. Only the experimental **Workers/sub-agents** feature depends on the Chromium companion for exact ChatGPT routing, model/effort confirmation, durable Send reconciliation, and worker-tab presence.
+The Worker Companion is **optional for MoonDesk itself**. Normal MoonDesk features—files, shell commands, workspaces, handoffs, ordinary MCP use, and the isolated managed `browser_*` runtime—do not require it. The experimental **Workers/sub-agents** feature depends on the Chromium companion for exact ChatGPT routing, model/effort confirmation, durable Send reconciliation, and worker-tab presence. The separate `user_browser_*` tools also require the companion because they deliberately attach CDP to exact tabs in the user's existing Chromium browser.
 
 MoonDesk should **not** depend on browser-store approval for this companion. The production path is the same class of installation used by Chat On Steroids: MoonDesk ships the extension files itself, the user enables browser Developer mode once, and loads MoonDesk's stable local extension folder with **Load unpacked**.
 
@@ -10,7 +10,7 @@ MoonDesk should **not** depend on browser-store approval for this companion. The
 
 The MoonDesk native binary embeds the exact Worker Companion runtime files from the same source revision. On startup MoonDesk materializes those bytes into the stable `~/.moondesk/worker-companion` directory. This works for npm-installed MoonDesk and direct native-binary installs without requiring a repository checkout.
 
-The browser installation remains optional and explicit: normal MoonDesk does not require the companion. Users who want Workers choose **Open Worker Companion folder** in MoonDesk Settings, then load that stable folder with **Load unpacked**.
+The browser installation remains optional and explicit: normal MoonDesk does not require the companion. Users who want Workers or `user_browser_*` control of their existing Chromium tabs choose **Open Worker Companion folder** in MoonDesk Settings, then load that stable folder with **Load unpacked**. Chromium will request the extension's `debugger` permission because exact-tab control is implemented through CDP; MoonDesk does not request blanket website host access for this feature. Chromium explicitly does not allow `debugger` to be declared as an optional extension permission, so an existing unpacked Companion upgraded from a pre-tab-control MoonDesk release may require a one-time permission approval/re-enable on the browser's Extensions page.
 
 The stable directory itself is kept in place across MoonDesk updates so Chromium can keep remembering the same unpacked-extension path. On every MoonDesk startup the native binary synchronizes that directory to the exact companion runtime embedded in the running MoonDesk build. There is no separate companion-update action and no worker-idle gate: updating MoonDesk is the update mechanism for the bundled companion files.
 
@@ -37,8 +37,8 @@ Repository contributors may load `extensions/moondesk-worker-companion` directly
 
 The production instructions should be short and shown inside MoonDesk rather than buried in documentation:
 
-1. Install/update MoonDesk and start it. No extension is required for normal MoonDesk use.
-2. Only if Workers are wanted, open **Settings → Workers** and choose **Open Worker Companion folder**.
+1. Install/update MoonDesk and start it. No extension is required for normal MoonDesk use or the isolated `browser_*` runtime.
+2. Only if Workers or `user_browser_*` control of existing browser tabs is wanted, open **Settings → Workers** and choose **Open Worker Companion folder**.
 3. MoonDesk opens its stable `~/.moondesk/worker-companion` folder.
 4. In the browser used for ChatGPT, open `chrome://extensions`, `edge://extensions`, or `brave://extensions`.
 5. Turn on **Developer mode** and click **Load unpacked**.
@@ -48,6 +48,8 @@ The production instructions should be short and shown inside MoonDesk rather tha
 9. Open the ChatGPT conversation that will act as the **Core**.
 10. Models and reasoning efforts are discovered automatically once signed-in ChatGPT is available. Open the companion popup, choose from the confirmed catalog, and save the worker profile. **Refresh models** is only a repair/revalidation fallback.
 11. Ask Core to create workers. MoonDesk recommends **1–4 simultaneous workers**; 8 remains the hard product ceiling, not the recommended everyday setting.
+
+When the same companion is used for `user_browser_*`, MoonDesk can list existing browser tabs, attach to one exact eligible tab, or open a new controlled tab. Control is leased to the exact ChatGPT conversation, active ChatGPT orchestration tabs are protected from interactive attachment, and a blue glow around all four page edges remains visible while CDP is attached. Releasing control removes the glow and leaves the user's tab open. This surface is tab-scoped browser control, not OS/desktop control, and remains separate from MoonDesk's isolated `browser_*` runtime.
 
 Fresh workers are ordinary ChatGPT conversations even when Core lives in a ChatGPT Project. Existing workers reuse their exact durable conversation.
 
@@ -96,4 +98,5 @@ Do not call Workers production-ready until all of these pass:
 - release/package installation from the stable local Worker Companion folder;
 - update from one companion version to the next without changing the browser's loaded folder;
 - explicit app/companion protocol mismatch guidance;
+- user-browser live acceptance covering open/attach, DOM snapshot, screenshot, real input/navigation, visible blue control glow, and release-without-close;
 - user instructions for Chrome, Edge, and Brave Developer mode + Load unpacked.

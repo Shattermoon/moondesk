@@ -1,10 +1,14 @@
+if (typeof importScripts === 'function') {
+  importScripts('user-browser-page.js', 'user-browser-control.js');
+}
+
 const STORAGE_KEY = 'moondeskWorkerCompanionV1';
 const POLL_ALARM = 'moondesk-worker-companion-poll';
 const BRIDGE_PORTS = [47650, 47651, 47652, 47653, 47654];
 const REQUIRED_PROTOCOL_VERSION = 2;
 // Bump with any shipped companion runtime change that requires Chromium to load new bytes. Keep
 // this aligned with COMPANION_RUNTIME_REVISION in src/server.rs.
-const COMPANION_RUNTIME_REVISION = 9;
+const COMPANION_RUNTIME_REVISION = 10;
 const SOURCE_DEV_MANIFEST_VERSION = '0.1.0';
 const RUNTIME_RELOAD_STORAGE_KEY = 'moondeskWorkerCompanionReloadRevisionV1';
 const INSTALLATION_BOOTSTRAP_FILE = 'moondesk-bootstrap.json';
@@ -18,6 +22,7 @@ const CORRELATIONS_PATH = '/__moondesk/companion/v1/correlations';
 const SEND_STARTED_PATH = '/__moondesk/companion/v1/commands/send-started';
 const CLEAR_WORKERS_PATH = '/__moondesk/companion/v1/workers/clear';
 const WORKER_RESET_ACK_PATH = '/__moondesk/companion/v1/workers/reset-ack';
+const USER_BROWSER_PATH = '/__moondesk/companion/v1/browser-control';
 const HELLO_TIMEOUT_MS = 1200;
 const FAST_POLL_MS = 1500;
 const MAX_RECONCILE_ATTEMPTS = 3;
@@ -35,6 +40,8 @@ let stateWriteQueue = Promise.resolve();
 let workerClearGeneration = 0;
 let workerClearInProgress = false;
 let workerSendCommitInFlight = 0;
+let userBrowserControl = null;
+let userBrowserTransportState = null;
 const sessionReconcileCommandIds = new Set();
 
 function freshState() {
@@ -218,6 +225,59 @@ async function api(state, path, { method = 'GET', body = null, authenticated = t
     throw requestError(parsed.error || `MoonDesk request failed (${response.status})`, response.status, parsed.error || null);
   }
   return parsed;
+}
+
+function protectedUserBrowserTab(_tabId, url) {
+  try {
+    const parsed = new URL(String(url || ''));
+    return parsed.protocol === 'https:' && ['chatgpt.com', 'chat.openai.com'].includes(parsed.hostname.toLowerCase());
+  } catch {
+    return false;
+  }
+}
+
+async function userBrowserTransport(_path, options = {}) {
+  const state = userBrowserTransportState;
+  if (!state) return { ok: false, status: 503, data: { error: 'MoonDesk Companion is not connected' } };
+  let body = null;
+  if (options.body !== undefined && options.body !== null) {
+    try { body = typeof options.body === 'string' ? JSON.parse(options.body) : options.body; }
+    catch { return { ok: false, status: 400, data: { error: 'invalid browser request body' } }; }
+  }
+  try {
+    const data = await api(state, USER_BROWSER_PATH, {
+      method: options.method || 'POST',
+      body
+    });
+    return { ok: true, status: 200, data };
+  } catch (error) {
+    return {
+      ok: false,
+      status: Number(error?.status) || 0,
+      data: { error: String(error?.message || error) }
+    };
+  }
+}
+
+function activeUserBrowserControl() {
+  if (userBrowserControl) return userBrowserControl;
+  const factory = globalThis.MoonDeskUserBrowserControl?.create;
+  if (
+    typeof factory !== 'function' ||
+    !chrome.debugger ||
+    !chrome.permissions ||
+    !chrome.storage?.session
+  ) return null;
+  userBrowserControl = factory(chrome, userBrowserTransport, protectedUserBrowserTab);
+  return userBrowserControl;
+}
+
+async function pumpUserBrowserControl(state) {
+  const control = activeUserBrowserControl();
+  if (!control) return false;
+  userBrowserTransportState = state;
+  await control.pump();
+  return true;
 }
 
 async function hello(baseUrl) {
@@ -1380,8 +1440,12 @@ async function pump() {
   const clearGeneration = workerClearGeneration;
   pumpActive = true;
   let redeemed = 0;
+  let userBrowserChecked = false;
   try {
     const state = await ensureConnected();
+    if (workerClearInProgress || clearGeneration !== workerClearGeneration) return;
+    await pumpUserBrowserControl(state);
+    userBrowserChecked = true;
     if (workerClearInProgress || clearGeneration !== workerClearGeneration) return;
     await collectPresence(state);
     if (workerClearInProgress || clearGeneration !== workerClearGeneration) return;
@@ -1396,6 +1460,13 @@ async function pump() {
       }
     }
   } catch (error) {
+    // Browser-tab authority is ephemeral. If the host failed before this cycle completed the
+    // browser-control policy check, release debugger leases rather than leaving invisible control.
+    // A later Worker-only error must not disturb a tab whose browser policy was already confirmed.
+    if (!userBrowserChecked) {
+      const control = activeUserBrowserControl();
+      if (control) await control.revoke().catch(() => {});
+    }
     // Keep the service worker quiet; popup/status surfaces the actionable connection state.
     console.warn('MoonDesk worker companion pump failed:', String(error?.message || error));
   } finally {
@@ -1694,6 +1765,19 @@ async function discoverModelCatalog({ force = false, requireExistingPage = false
   } finally {
     modelCatalogFlight = null;
   }
+}
+
+if (chrome.debugger?.onEvent) {
+  chrome.debugger.onEvent.addListener((source, method, params) => {
+    const control = activeUserBrowserControl();
+    if (control) void control.event(source, method, params).catch(() => {});
+  });
+}
+if (chrome.debugger?.onDetach) {
+  chrome.debugger.onDetach.addListener((source) => {
+    const control = activeUserBrowserControl();
+    if (control) void control.detached(source).catch(() => {});
+  });
 }
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {

@@ -956,6 +956,33 @@ test('closing a browser tab schedules immediate presence publication instead of 
   assert.match(source, /closed worker tab is not a finished worker/);
 });
 
+test('user browser heartbeat stays independent of both Worker and long browser command pumps', async () => {
+  const browser = loadBackground();
+  await browser.evaluate(`(async () => {
+    globalThis.__userBrowserHeartbeatCalls = 0;
+    globalThis.__userBrowserCommandCalls = 0;
+    globalThis.__releaseUserBrowserCommand = null;
+    userBrowserControl = {
+      async heartbeat() { globalThis.__userBrowserHeartbeatCalls += 1; },
+      async pump() {
+        globalThis.__userBrowserCommandCalls += 1;
+        await new Promise(resolve => { globalThis.__releaseUserBrowserCommand = resolve; });
+      },
+      async revoke() {}
+    };
+    pumpActive = true;
+    await pumpUserBrowserControl({});
+    await pumpUserBrowserControl({});
+  })()`);
+  assert.equal(browser.evaluate('globalThis.__userBrowserHeartbeatCalls'), 2, 'lease heartbeat must keep running while a browser command is busy');
+  assert.equal(browser.evaluate('globalThis.__userBrowserCommandCalls'), 1, 'only one browser command pump may be in flight');
+  assert.equal(browser.evaluate('pumpActive'), true, 'browser heartbeat must not wait for the Worker pump');
+  await browser.evaluate(`(async () => {
+    globalThis.__releaseUserBrowserCommand();
+    await userBrowserCommandFlight;
+  })()`);
+});
+
 test('companion runtime revision stays aligned with the MoonDesk bridge', () => {
   const javascriptRevision = Number(source.match(/const COMPANION_RUNTIME_REVISION = (\d+);/)?.[1]);
   const rustRevision = Number(serverSource.match(/pub const COMPANION_RUNTIME_REVISION: u32 = (\d+);/)?.[1]);
@@ -999,7 +1026,7 @@ test('bridge discovery prefers an exact runtime match over another MoonDesk vers
             app: 'moondesk-worker-companion',
             appVersion: manifest.version,
             protocolVersion: 2,
-            companionRuntimeRevision: 9
+            companionRuntimeRevision: 20
           };
         }
       };
@@ -1027,8 +1054,38 @@ test('bridge discovery prefers an exact runtime match over another MoonDesk vers
 
   const { evaluate, runtimeReloads } = loadBackground({ fetchImpl });
   const hello = await evaluate('discoverBridge(freshState())');
-  assert.equal(hello.companionRuntimeRevision, 9);
+  assert.equal(hello.companionRuntimeRevision, 20);
   assert.equal(runtimeReloads.length, 0);
+});
+
+test('companion API aborts a wedged loopback request at its configured deadline', async () => {
+  let fetchCalls = 0;
+  const fetchImpl = async (_url, options = {}) => {
+    fetchCalls += 1;
+    return new Promise((_, reject) => {
+      options.signal.addEventListener('abort', () => reject(new Error('aborted')), { once: true });
+    });
+  };
+  const { evaluate } = loadBackground({
+    fetchImpl,
+    setTimeoutImpl(callback, delayMs) {
+      if (delayMs === 25) {
+        queueMicrotask(callback);
+        return 25;
+      }
+      return 1;
+    }
+  });
+  await assert.rejects(
+    evaluate(`(async () => {
+      const state = freshState();
+      state.baseUrl = 'http://127.0.0.1:47651';
+      state.credential = '${'a'.repeat(64)}';
+      return api(state, STATUS_PATH, { timeoutMs: 25 });
+    })()`),
+    /request timed out/
+  );
+  assert.equal(fetchCalls, 1);
 });
 
 test('bridge runtime revision mismatch reloads the unpacked companion once', async () => {
@@ -1043,7 +1100,7 @@ test('bridge runtime revision mismatch reloads the unpacked companion once', asy
             app: 'moondesk-worker-companion',
             appVersion: manifest.version,
             protocolVersion: 2,
-            companionRuntimeRevision: 8
+            companionRuntimeRevision: 19
           };
         }
       };
@@ -1082,7 +1139,7 @@ test('compatible bridge clears the one-shot runtime reload marker for a future m
             app: 'moondesk-worker-companion',
             appVersion: manifest.version,
             protocolVersion: 2,
-            companionRuntimeRevision: 9
+            companionRuntimeRevision: 20
           };
         }
       };
@@ -1095,7 +1152,7 @@ test('compatible bridge clears the one-shot runtime reload marker for a future m
   });
 
   const hello = await evaluate('discoverBridge(freshState())');
-  assert.equal(hello.companionRuntimeRevision, 9);
+  assert.equal(hello.companionRuntimeRevision, 20);
   const stored = await evaluate(`chrome.storage.local.get('${reloadKey}')`);
   assert.equal(stored[reloadKey], undefined);
 });
@@ -1113,7 +1170,7 @@ test('automatic pairing proves the extension was loaded from the MoonDesk-prepar
             app: 'moondesk-worker-companion',
             appVersion: manifest.version,
             protocolVersion: 2,
-            companionRuntimeRevision: 9
+            companionRuntimeRevision: 20
           };
         }
       };
@@ -1155,7 +1212,7 @@ test('source and release-ZIP installs without a bootstrap capability expose Manu
         app: 'moondesk-worker-companion',
         appVersion: manifest.version,
         protocolVersion: 2,
-        companionRuntimeRevision: 9
+        companionRuntimeRevision: 20
       };
       return {
         ok: true,
@@ -1224,7 +1281,7 @@ test('release version mismatch reloads the unpacked companion even when protocol
             app: 'moondesk-worker-companion',
             appVersion: '0.13.0',
             protocolVersion: 2,
-            companionRuntimeRevision: 9
+            companionRuntimeRevision: 20
           };
         }
       };

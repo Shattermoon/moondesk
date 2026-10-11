@@ -1,10 +1,14 @@
+if (typeof importScripts === 'function') {
+  importScripts('user-browser-page.js', 'user-browser-control.js');
+}
+
 const STORAGE_KEY = 'moondeskWorkerCompanionV1';
 const POLL_ALARM = 'moondesk-worker-companion-poll';
 const BRIDGE_PORTS = [47650, 47651, 47652, 47653, 47654];
 const REQUIRED_PROTOCOL_VERSION = 2;
 // Bump with any shipped companion runtime change that requires Chromium to load new bytes. Keep
 // this aligned with COMPANION_RUNTIME_REVISION in src/server.rs.
-const COMPANION_RUNTIME_REVISION = 9;
+const COMPANION_RUNTIME_REVISION = 20;
 const SOURCE_DEV_MANIFEST_VERSION = '0.1.0';
 const RUNTIME_RELOAD_STORAGE_KEY = 'moondeskWorkerCompanionReloadRevisionV1';
 const INSTALLATION_BOOTSTRAP_FILE = 'moondesk-bootstrap.json';
@@ -18,7 +22,10 @@ const CORRELATIONS_PATH = '/__moondesk/companion/v1/correlations';
 const SEND_STARTED_PATH = '/__moondesk/companion/v1/commands/send-started';
 const CLEAR_WORKERS_PATH = '/__moondesk/companion/v1/workers/clear';
 const WORKER_RESET_ACK_PATH = '/__moondesk/companion/v1/workers/reset-ack';
+const USER_BROWSER_PATH = '/__moondesk/companion/v1/browser-control';
 const HELLO_TIMEOUT_MS = 1200;
+const API_TIMEOUT_MS = 3000;
+const CLEAR_WORKERS_TIMEOUT_MS = 8000;
 const FAST_POLL_MS = 1500;
 const MAX_RECONCILE_ATTEMPTS = 3;
 const MAX_PARALLEL_COMMANDS = 4;
@@ -29,12 +36,17 @@ const MODEL_CATALOG_RETRY_MS = 5 * 60 * 1000;
 
 let pumpTimer = null;
 let pumpActive = false;
+let userBrowserPumpTimer = null;
+let userBrowserPumpActive = false;
 let connecting = null;
 let modelCatalogFlight = null;
 let stateWriteQueue = Promise.resolve();
 let workerClearGeneration = 0;
 let workerClearInProgress = false;
 let workerSendCommitInFlight = 0;
+let userBrowserControl = null;
+let userBrowserTransportState = null;
+let userBrowserCommandFlight = null;
 const sessionReconcileCommandIds = new Set();
 
 function freshState() {
@@ -194,7 +206,11 @@ function requestError(message, status = 0, code = null) {
   return error;
 }
 
-async function api(state, path, { method = 'GET', body = null, authenticated = true } = {}) {
+async function api(
+  state,
+  path,
+  { method = 'GET', body = null, authenticated = true, timeoutMs = API_TIMEOUT_MS } = {}
+) {
   if (!state.baseUrl) throw requestError('MoonDesk companion bridge is not connected');
   const headers = {};
   if (authenticated) {
@@ -202,22 +218,102 @@ async function api(state, path, { method = 'GET', body = null, authenticated = t
     headers['x-moondesk-companion-token'] = state.credential;
   }
   if (body !== null) headers['content-type'] = 'application/json';
-  const response = await fetch(`${normalizeBaseUrl(state.baseUrl)}${path}`, {
-    method,
-    cache: 'no-store',
-    headers,
-    body: body === null ? undefined : JSON.stringify(body)
-  });
-  const text = await response.text();
-  let parsed = {};
-  if (text) {
-    try { parsed = JSON.parse(text); }
-    catch { throw requestError(`MoonDesk returned non-JSON response (${response.status})`, response.status); }
+  const boundedTimeout = Number.isFinite(Number(timeoutMs))
+    ? Math.max(1, Math.min(60_000, Math.trunc(Number(timeoutMs))))
+    : API_TIMEOUT_MS;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), boundedTimeout);
+  try {
+    const response = await fetch(`${normalizeBaseUrl(state.baseUrl)}${path}`, {
+      method,
+      cache: 'no-store',
+      headers,
+      body: body === null ? undefined : JSON.stringify(body),
+      signal: controller.signal
+    });
+    const text = await response.text();
+    let parsed = {};
+    if (text) {
+      try { parsed = JSON.parse(text); }
+      catch { throw requestError(`MoonDesk returned non-JSON response (${response.status})`, response.status); }
+    }
+    if (!response.ok) {
+      throw requestError(parsed.error || `MoonDesk request failed (${response.status})`, response.status, parsed.error || null);
+    }
+    return parsed;
+  } catch (error) {
+    if (controller.signal.aborted) {
+      throw requestError('MoonDesk companion request timed out', 0, 'companion_request_timeout');
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
   }
-  if (!response.ok) {
-    throw requestError(parsed.error || `MoonDesk request failed (${response.status})`, response.status, parsed.error || null);
+}
+
+function protectedUserBrowserTab(_tabId, url) {
+  try {
+    const parsed = new URL(String(url || ''));
+    return parsed.protocol === 'https:' && ['chatgpt.com', 'chat.openai.com'].includes(parsed.hostname.toLowerCase());
+  } catch {
+    return false;
   }
-  return parsed;
+}
+
+async function userBrowserTransport(_path, options = {}) {
+  const state = userBrowserTransportState;
+  if (!state) return { ok: false, status: 503, data: { error: 'MoonDesk Companion is not connected' } };
+  let body = null;
+  if (options.body !== undefined && options.body !== null) {
+    try { body = typeof options.body === 'string' ? JSON.parse(options.body) : options.body; }
+    catch { return { ok: false, status: 400, data: { error: 'invalid browser request body' } }; }
+  }
+  try {
+    const data = await api(state, USER_BROWSER_PATH, {
+      method: options.method || 'POST',
+      body,
+      timeoutMs: options.timeoutMs ?? API_TIMEOUT_MS
+    });
+    return { ok: true, status: 200, data };
+  } catch (error) {
+    return {
+      ok: false,
+      status: Number(error?.status) || 0,
+      data: { error: String(error?.message || error) }
+    };
+  }
+}
+
+function activeUserBrowserControl() {
+  if (userBrowserControl) return userBrowserControl;
+  const factory = globalThis.MoonDeskUserBrowserControl?.create;
+  if (
+    typeof factory !== 'function' ||
+    !chrome.debugger ||
+    !chrome.permissions ||
+    !chrome.storage?.session
+  ) return null;
+  userBrowserControl = factory(chrome, userBrowserTransport, protectedUserBrowserTab);
+  return userBrowserControl;
+}
+
+async function pumpUserBrowserControl(state) {
+  const control = activeUserBrowserControl();
+  if (!control) return false;
+  userBrowserTransportState = state;
+  await control.heartbeat();
+  if (!userBrowserCommandFlight) {
+    const flight = control.pump()
+      .catch(async (error) => {
+        await control.revoke().catch(() => {});
+        console.warn('MoonDesk user browser command pump failed:', String(error?.message || error));
+      })
+      .finally(() => {
+        if (userBrowserCommandFlight === flight) userBrowserCommandFlight = null;
+      });
+    userBrowserCommandFlight = flight;
+  }
+  return true;
 }
 
 async function hello(baseUrl) {
@@ -1328,6 +1424,27 @@ function schedulePump(delayMs = FAST_POLL_MS) {
   pumpTimer = setTimeout(() => { void pump(); }, delayMs);
 }
 
+function scheduleUserBrowserPump(delayMs = FAST_POLL_MS) {
+  if (userBrowserPumpTimer) clearTimeout(userBrowserPumpTimer);
+  userBrowserPumpTimer = setTimeout(() => { void userBrowserPump(); }, delayMs);
+}
+
+async function userBrowserPump() {
+  if (userBrowserPumpActive) return;
+  userBrowserPumpActive = true;
+  try {
+    const state = await ensureConnected();
+    await pumpUserBrowserControl(state);
+  } catch (error) {
+    const control = activeUserBrowserControl();
+    if (control) await control.revoke().catch(() => {});
+    console.warn('MoonDesk user browser pump failed:', String(error?.message || error));
+  } finally {
+    userBrowserPumpActive = false;
+    scheduleUserBrowserPump();
+  }
+}
+
 async function pauseInheritedReconciliation(state, offer, clearGeneration) {
   if (clearGeneration !== workerClearGeneration) return true;
   const command = offer?.command;
@@ -1417,6 +1534,7 @@ async function pair({ pairingToken }) {
   state.blockedCommands = {};
   await writeState(state);
   schedulePump(50);
+  scheduleUserBrowserPump(50);
   return { paired: true, connected: true, clientId: state.clientId, baseUrl: state.baseUrl };
 }
 
@@ -1525,7 +1643,8 @@ async function clearWorkers() {
     await clearRememberedWorkerLaunchesInTabs();
     const response = await api(state, CLEAR_WORKERS_PATH, {
       method: 'POST',
-      body: {}
+      body: {},
+      timeoutMs: CLEAR_WORKERS_TIMEOUT_MS
     });
 
     // The host has now durably destroyed worker ownership. Only now erase the persisted companion
@@ -1696,6 +1815,19 @@ async function discoverModelCatalog({ force = false, requireExistingPage = false
   }
 }
 
+if (chrome.debugger?.onEvent) {
+  chrome.debugger.onEvent.addListener((source, method, params) => {
+    const control = activeUserBrowserControl();
+    if (control) void control.event(source, method, params).catch(() => {});
+  });
+}
+if (chrome.debugger?.onDetach) {
+  chrome.debugger.onDetach.addListener((source) => {
+    const control = activeUserBrowserControl();
+    if (control) void control.detached(source).catch(() => {});
+  });
+}
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (!message || typeof message.type !== 'string') return false;
   const task = (() => {
@@ -1729,16 +1861,19 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 chrome.runtime.onInstalled.addListener(() => {
   void chrome.alarms.create(POLL_ALARM, { periodInMinutes: 0.5 });
   schedulePump(200);
+  scheduleUserBrowserPump(200);
   void discoverModelCatalog({ requireExistingPage: true }).catch(() => {});
 });
 chrome.runtime.onStartup.addListener(() => {
   void chrome.alarms.create(POLL_ALARM, { periodInMinutes: 0.5 });
   schedulePump(200);
+  scheduleUserBrowserPump(200);
   void discoverModelCatalog({ requireExistingPage: true }).catch(() => {});
 });
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === POLL_ALARM) {
     void pump();
+    void userBrowserPump();
     void discoverModelCatalog({ requireExistingPage: true }).catch(() => {});
   }
 });
@@ -1762,4 +1897,5 @@ chrome.windows.onFocusChanged.addListener(() => {
 
 void chrome.alarms.create(POLL_ALARM, { periodInMinutes: 0.5 });
 schedulePump(500);
+scheduleUserBrowserPump(500);
 void discoverModelCatalog({ requireExistingPage: true }).catch(() => {});

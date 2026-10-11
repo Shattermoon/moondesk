@@ -4,10 +4,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 use subtle::ConstantTimeEq;
 use tokio::sync::{Mutex, Notify};
 use uuid::Uuid;
+
+use crate::user_browser::UserBrowserBroker;
 
 pub const COMPANION_AUTH_SCHEMA_VERSION: u32 = 2;
 pub const COMPANION_AUTH_FILE_NAME: &str = "companion-auth-v1.json";
@@ -60,6 +62,8 @@ struct CompanionAuthState {
     #[serde(default)]
     clients: BTreeMap<String, CompanionClientCredential>,
     #[serde(default)]
+    revoked_clients: BTreeSet<String>,
+    #[serde(default)]
     worker_reset_epoch: u64,
     #[serde(default)]
     worker_reset_pending_clients: BTreeSet<String>,
@@ -70,6 +74,7 @@ impl Default for CompanionAuthState {
         Self {
             schema_version: COMPANION_AUTH_SCHEMA_VERSION,
             clients: BTreeMap::new(),
+            revoked_clients: BTreeSet::new(),
             worker_reset_epoch: 0,
             worker_reset_pending_clients: BTreeSet::new(),
         }
@@ -92,6 +97,12 @@ impl CompanionAuthState {
         for (client_id, client) in &self.clients {
             validate_client_id(client_id)?;
             client.validate()?;
+            if self.revoked_clients.contains(client_id) {
+                return Err("companion client cannot be both paired and revoked".into());
+            }
+        }
+        for client_id in &self.revoked_clients {
+            validate_client_id(client_id)?;
         }
         for client_id in &self.worker_reset_pending_clients {
             validate_client_id(client_id)?;
@@ -318,6 +329,7 @@ pub struct CompanionAuth {
     worker_reset_notify: Notify,
     pairing_token: RwLock<String>,
     installation_token: String,
+    user_browser_broker: Arc<UserBrowserBroker>,
 }
 
 impl CompanionAuth {
@@ -340,6 +352,7 @@ impl CompanionAuth {
             worker_reset_notify: Notify::new(),
             pairing_token: RwLock::new(random_secret()),
             installation_token: random_secret(),
+            user_browser_broker: Arc::new(UserBrowserBroker::new()),
         })
     }
 
@@ -352,6 +365,10 @@ impl CompanionAuth {
 
     pub fn installation_token(&self) -> &str {
         &self.installation_token
+    }
+
+    pub fn user_browser_broker(&self) -> Arc<UserBrowserBroker> {
+        self.user_browser_broker.clone()
     }
 
     pub fn installation_token_matches(&self, supplied: &str) -> bool {
@@ -389,6 +406,8 @@ impl CompanionAuth {
             ));
         }
         let mut candidate = guard.clone();
+        // Manual Repair is the explicit user action that restores a revoked installation.
+        candidate.revoked_clients.remove(client_id);
         candidate.clients.insert(
             client_id.to_string(),
             CompanionClientCredential {
@@ -426,6 +445,12 @@ impl CompanionAuth {
 
         let actual_hash = secret_hash(credential);
         let mut guard = self.state.lock().await;
+        if guard.revoked_clients.contains(client_id) {
+            return Err(CompanionAutoPairError::Conflict(
+                "MoonDesk companion browser was revoked; use Manual Repair to pair this installation again"
+                    .into(),
+            ));
+        }
         if let Some(existing) = guard.clients.get(client_id) {
             if !constant_time_equal(existing.credential_hash.as_bytes(), actual_hash.as_bytes()) {
                 return Err(CompanionAutoPairError::Conflict(
@@ -650,6 +675,9 @@ impl CompanionAuth {
         }
         let mut candidate = guard.clone();
         candidate.clients.remove(client_id);
+        // Keep revocation durable across a live extension's automatic installation pairing.
+        // Only explicit Manual Repair removes this tombstone.
+        candidate.revoked_clients.insert(client_id.to_string());
         let removed_pending = candidate.worker_reset_pending_clients.remove(client_id);
         candidate.validate()?;
         persist_state(&self.path, &candidate).await?;
@@ -667,6 +695,7 @@ impl CompanionAuth {
             .lock()
             .await
             .retain(|_, (route, _)| route.client_id != client_id);
+        self.user_browser_broker.remove_companion(client_id).await;
         Ok(true)
     }
 
@@ -1204,6 +1233,7 @@ fn load_state(path: &Path) -> std::io::Result<CompanionAuthState> {
             CompanionAuthState {
                 schema_version: COMPANION_AUTH_SCHEMA_VERSION,
                 clients,
+                revoked_clients: BTreeSet::new(),
                 worker_reset_epoch: 0,
                 worker_reset_pending_clients: BTreeSet::new(),
             },
@@ -1515,6 +1545,52 @@ mod tests {
         drop(auth);
         let reopened = CompanionAuth::open(&path).expect("reopen companion auth");
         assert_eq!(reopened.paired_client_count().await, 2);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn revoked_recommended_install_cannot_auto_pair_until_manual_repair() {
+        let root = temp_root("moondesk-companion-revocation-tombstone");
+        let path = root.join(COMPANION_AUTH_FILE_NAME);
+        let credential = "a".repeat(64);
+        let auth = CompanionAuth::open(&path).expect("open companion auth");
+        auth.auto_pair("extension-install-a", &credential, Some(ORIGIN_A))
+            .await
+            .expect("pair companion");
+        assert!(
+            auth.revoke_client("extension-install-a")
+                .await
+                .expect("revoke companion")
+        );
+        let blocked = auth
+            .auto_pair("extension-install-a", &credential, Some(ORIGIN_A))
+            .await
+            .expect_err("revoked install must not silently auto-pair again");
+        assert!(matches!(blocked, CompanionAutoPairError::Conflict(_)));
+
+        drop(auth);
+        let reopened = CompanionAuth::open(&path).expect("reopen companion auth");
+        let blocked_after_restart = reopened
+            .auto_pair("extension-install-a", &credential, Some(ORIGIN_A))
+            .await
+            .expect_err("revocation tombstone must survive restart");
+        assert!(matches!(
+            blocked_after_restart,
+            CompanionAutoPairError::Conflict(_)
+        ));
+
+        let repair_token = reopened.pairing_token();
+        let repaired = reopened
+            .pair(&repair_token, "extension-install-a", Some(ORIGIN_A))
+            .await
+            .expect("manual repair restores revoked install");
+        assert_eq!(
+            reopened
+                .authorize(&repaired.credential, Some(ORIGIN_A))
+                .await
+                .as_deref(),
+            Some("extension-install-a")
+        );
         let _ = fs::remove_dir_all(root);
     }
 

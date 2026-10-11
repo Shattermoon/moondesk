@@ -46,6 +46,18 @@ const RUNTIME_FILES: &[(&str, &[u8])] = &[
         "provider-correlation-main.js",
         include_bytes!("../extensions/moondesk-worker-companion/provider-correlation-main.js"),
     ),
+    (
+        "THIRD_PARTY_NOTICES.txt",
+        include_bytes!("../extensions/moondesk-worker-companion/THIRD_PARTY_NOTICES.txt"),
+    ),
+    (
+        "user-browser-control.js",
+        include_bytes!("../extensions/moondesk-worker-companion/user-browser-control.js"),
+    ),
+    (
+        "user-browser-page.js",
+        include_bytes!("../extensions/moondesk-worker-companion/user-browser-page.js"),
+    ),
 ];
 
 #[derive(Debug, Clone)]

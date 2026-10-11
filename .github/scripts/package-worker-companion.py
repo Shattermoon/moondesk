@@ -18,6 +18,9 @@ RUNTIME_FILES = [
     "popup.html",
     "popup.js",
     "provider-correlation-main.js",
+    "THIRD_PARTY_NOTICES.txt",
+    "user-browser-control.js",
+    "user-browser-page.js",
 ]
 
 

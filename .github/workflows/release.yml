@@ -307,9 +307,12 @@ jobs:
           node --check extensions/moondesk-worker-companion/chatgpt-dom.js
           node --check extensions/moondesk-worker-companion/model-state-main.js
           node --check extensions/moondesk-worker-companion/provider-correlation-main.js
+          node --check extensions/moondesk-worker-companion/user-browser-page.js
+          node --check extensions/moondesk-worker-companion/user-browser-control.js
           node --check extensions/moondesk-worker-companion/popup.js
           node --test npm/install-binary.test.js npm/update-manager.test.js npm/moondesk.test.js
           node --test extensions/moondesk-worker-companion/background.test.js
+          node --test extensions/moondesk-worker-companion/user-browser-control.test.js
           node .github/scripts/verify-managed-browser-manifest.mjs
           python3 -m py_compile .github/scripts/package-worker-companion.py
           python3 .github/scripts/package-worker-companion.py --output "$RUNNER_TEMP/companion-source.zip"
@@ -617,8 +620,11 @@ jobs:
           node --check extensions/moondesk-worker-companion/chatgpt-dom.js
           node --check extensions/moondesk-worker-companion/model-state-main.js
           node --check extensions/moondesk-worker-companion/provider-correlation-main.js
+          node --check extensions/moondesk-worker-companion/user-browser-page.js
+          node --check extensions/moondesk-worker-companion/user-browser-control.js
           node --check extensions/moondesk-worker-companion/popup.js
           node --test extensions/moondesk-worker-companion/background.test.js
+          node --test extensions/moondesk-worker-companion/user-browser-control.test.js
 
       - name: Create Worker Companion release ZIP
         shell: bash

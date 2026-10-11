@@ -7,7 +7,7 @@ It intentionally owns only a small surface:
 - automatically discover and pair with the local MoonDesk companion bridge on loopback ports 47650-47654;
 - keep multiple browser installations paired independently instead of making one browser take over another;
 - use Chromium's `debugger` permission only for explicit `user_browser_*` control of exact eligible tabs, with per-conversation ownership, non-replayed input, navigation-invalidated page references, and an animated multicolor four-edge/four-corner glow while control is attached; MoonDesk temporarily hides only that indicator while capturing a screenshot so model-visible pixels stay clean;
-- protect every HTTPS tab on `chatgpt.com` and `chat.openai.com` from interactive user-browser attachment, and release controlled tabs without closing them or turning the browser profile into MoonDesk's managed `browser_*` runtime;
+- protect every HTTPS tab on `chatgpt.com` and `chat.openai.com` from all user-browser observation and interaction; if an already-controlled tab reaches either protected host, MoonDesk retires the attachment without closing the tab or turning the browser profile into MoonDesk's managed `browser_*` runtime;
 - report only bounded routing presence for open ChatGPT conversations (exact conversation ID, optional exact Project ID, active/focused state);
 - redeem durable managed-chat launch commands for the browser that owns the exact Core or durable worker thread;
 - process up to four fresh worker launches concurrently while tracking failures independently; MoonDesk recommends 1-4 workers for normal use because higher totals can hit ChatGPT/provider rate limits, especially alongside other active conversations;

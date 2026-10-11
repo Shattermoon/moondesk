@@ -113,8 +113,7 @@ function createBrowserControl(chrome, transport, protectedTab = () => false) {
     alive(state,command);
     pageURL(tab.url);
     if (tab.pendingUrl && tab.pendingUrl !== tab.url) error('BROWSER_NAVIGATING: wait for the destination and snapshot again.');
-    const observes = ['browser_snapshot','browser_screenshot','browser_console','browser_network'].includes(command?.tool);
-    if (!observes && protectedTab(state.tabId, tab.url, command?.conversationId)) error('BROWSER_EXECUTOR_TAB: ChatGPT tabs are protected from interactive user-browser control. Choose a different tab.');
+    if (protectedTab(state.tabId, tab.url, command?.conversationId)) error('BROWSER_EXECUTOR_TAB: ChatGPT tabs are protected from user-browser control. Release the tab and choose a different tab.');
     return tab;
   }
   async function getTab(tabId) {
@@ -223,7 +222,13 @@ function createBrowserControl(chrome, transport, protectedTab = () => false) {
   async function refreshIndicators() {
     if (!tabs.size || Date.now() - lastIndicatorRefreshAt < 2000) return;
     lastIndicatorRefreshAt = Date.now();
-    await Promise.all([...tabs.values()].map(state => page(state,'overlay').catch(() => {})));
+    await Promise.all([...tabs.values()].map(async state => {
+      try {
+        const tab = await getTab(state.tabId);
+        if (protectedTab(state.tabId, tab.url)) { await release(state); return; }
+        await page(state,'overlay');
+      } catch {}
+    }));
   }
   async function attach(tabId, command) {
     if (tabs.size >= 32 && !tabs.has(tabId)) error('BROWSER_TAB_LIMIT: release an unused tab first.');
@@ -368,17 +373,16 @@ function createBrowserControl(chrome, transport, protectedTab = () => false) {
       }
       await input(state,'Input.dispatchKeyEvent',{ type:'keyDown',...key },command);
       const { text:_text,...up } = key;
-      // Releasing the key has the same exact tab custody even if keyDown navigated it.
       try {
         if (args.holdMs) await new Promise(resolve => setTimeout(resolve,Math.min(2000,Math.max(0,args.holdMs))));
-      } finally { await send(state,'Input.dispatchKeyEvent',{ type:'keyUp',...up }); }
+      } finally { await input(state,'Input.dispatchKeyEvent',{ type:'keyUp',...up },command); }
     } else if (a === 'fill' || a === 'type') {
       if (typeof args.text !== 'string' || !args.ref) error('BROWSER_TEXT_TARGET_REQUIRED: pass text and an editable ref.');
       await authorize(command);
       await page(state,'focus',{ref:args.ref,frameId:state.refFrames?.get(args.ref),replace:a === 'fill'},command);
       if (a === 'fill' && !args.text) {
         await input(state,'Input.dispatchKeyEvent',{type:'keyDown',key:'Backspace',code:'Backspace',windowsVirtualKeyCode:8},command);
-        await send(state,'Input.dispatchKeyEvent',{type:'keyUp',key:'Backspace',code:'Backspace',windowsVirtualKeyCode:8});
+        await input(state,'Input.dispatchKeyEvent',{type:'keyUp',key:'Backspace',code:'Backspace',windowsVirtualKeyCode:8},command);
       } else await input(state,'Input.insertText',{text:args.text},command);
     } else if (a === 'select') {
       if (!args.ref || !Array.isArray(args.values)) error('BROWSER_SELECT_REQUIRED: pass ref and values.');
@@ -394,7 +398,7 @@ function createBrowserControl(chrome, transport, protectedTab = () => false) {
           const button = args.button || 'left';
           for (let count = 1; count <= (args.clickCount || 1); count++) {
             await input(state,'Input.dispatchMouseEvent',{type:'mousePressed',...from,button,clickCount:count},command);
-            await send(state,'Input.dispatchMouseEvent',{type:'mouseReleased',...from,button,clickCount:count});
+            await input(state,'Input.dispatchMouseEvent',{type:'mouseReleased',...from,button,clickCount:count},command);
           }
         } else if (a === 'drag') {
           const to = await point(state,{ref:args.toRef,x:args.toX,y:args.toY,screenshotId:args.screenshotId},command);
@@ -405,7 +409,7 @@ function createBrowserControl(chrome, transport, protectedTab = () => false) {
           await input(state,'Input.dispatchMouseEvent',{type:'mousePressed',...from,button:'left',clickCount:1},command);
           try {
             for (let step = 1; step <= 12; step++) await input(state,'Input.dispatchMouseEvent',{type:'mouseMoved',...from,x:from.x+(to.x-from.x)*step/12,y:from.y+(to.y-from.y)*step/12,button:'left',buttons:1},command);
-          } finally { await send(state,'Input.dispatchMouseEvent',{type:'mouseReleased',...to,button:'left',clickCount:1}).catch(() => {}); }
+          } finally { await input(state,'Input.dispatchMouseEvent',{type:'mouseReleased',...to,button:'left',clickCount:1},command); }
         } else if (a !== 'hover') error('BROWSER_ACTION_UNKNOWN');
       }
     }
@@ -589,6 +593,10 @@ function createBrowserControl(chrome, transport, protectedTab = () => false) {
     } else if (method === 'Page.frameNavigated') {
       invalidate(state);
       if (params.frame?.id) state.frames.set(params.frame.id,{...params.frame,sessionId:source.sessionId});
+      if (!params.frame?.parentId && !source.sessionId && protectedTab(state.tabId, params.frame?.url)) {
+        void release(state);
+        return;
+      }
       // Reinstall the indicator after real document navigation, without a timer or page activation.
       if (!params.frame?.parentId && !source.sessionId && /^https?:/.test(params.frame?.url)) void page(state,'overlay').catch(() => {});
     } else if (method === 'Page.navigatedWithinDocument') {

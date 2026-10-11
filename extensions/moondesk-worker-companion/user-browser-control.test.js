@@ -167,6 +167,25 @@ test('protected ChatGPT tabs refuse interactive attachment before debugger owner
   assert.deepEqual(env.attachCalls, []);
 });
 
+test('controlled tab is retired when its main frame navigates into protected ChatGPT', async () => {
+  const env = loadControl({
+    initialTabs: { 2: { url: 'https://example.com/', title: 'Example', active: false, pinned: false, status: 'complete' } },
+    protectedTab: (_id, url) => {
+      try { return new URL(url).hostname === 'chatgpt.com'; } catch { return false; }
+    }
+  });
+  await env.control.pump();
+  await env.control.execute(env.command('browser_tabs', { action: 'attach', tabId: 2 }));
+  env.tabs.get(2).url = 'https://chatgpt.com/c/protected';
+  await env.control.event({ tabId: 2 }, 'Page.frameNavigated', { frame: { id: 'frame-2', url: 'https://chatgpt.com/c/protected' } });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.deepEqual(env.detachCalls, [2]);
+  await assert.rejects(
+    env.control.execute(env.command('browser_snapshot', { tabId: 2 })),
+    /BROWSER_TAB_NOT_OWNED/
+  );
+});
+
 test('permission checks bound loopback transport by the remaining command lifetime', async () => {
   const env = loadControl({
     initialTabs: { 3: { url: 'https://example.com/', title: 'Example', active: false, pinned: false, status: 'complete' } }
@@ -185,6 +204,10 @@ test('permission checks bound loopback transport by the remaining command lifeti
 test('unattached DOM inspection path is not shipped around protected-tab ownership checks', () => {
   assert.doesNotMatch(controlSource, /async function inspect\(/);
   assert.doesNotMatch(pageSource, /operation === ['"]inspect['"]/);
+});
+
+test('all compound input events retain command authority checks', () => {
+  assert.doesNotMatch(controlSource, /send\(state,['"]Input\.dispatch/);
 });
 
 test('network diagnostics retain request body size but never raw POST data', async () => {

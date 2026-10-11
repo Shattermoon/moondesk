@@ -363,7 +363,7 @@ test('release cleanup avoids another host round trip and retires custody if the 
   const attached = await env.control.execute(env.command('browser_tabs', { action: 'attach', tabId: 5 }));
   const checksBefore = env.transportCalls.filter(call => call.body.action === 'check').length;
   await assert.rejects(
-    env.control.execute(env.command('browser_action', { tabId: 5, pageId: attached.pageId, action: 'key', key: 'Enter' })),
+    env.control.execute(env.command('browser_action', { tabId: 5, pageId: attached.value.pageId, action: 'key', key: 'Enter' })),
     /BROWSER_EXECUTOR_TAB/
   );
   const checksAfter = env.transportCalls.filter(call => call.body.action === 'check').length;

@@ -17,7 +17,7 @@ function eventHook() {
   };
 }
 
-function loadControl({ initialTabs = {}, protectedTab = () => false, pendingCommand = null, failCapture = false, delayFrameTreeMs = 0 } = {}) {
+function loadControl({ initialTabs = {}, protectedTab = () => false, pendingCommand = null, failCapture = false, delayFrameTreeMs = 0, onDebuggerCommand = null } = {}) {
   const tabs = new Map(Object.entries(initialTabs).map(([id, tab]) => [Number(id), { id: Number(id), ...tab }]));
   let nextTabId = Math.max(100, ...tabs.keys()) + 1;
   let sessionStore = {};
@@ -71,6 +71,7 @@ function loadControl({ initialTabs = {}, protectedTab = () => false, pendingComm
       },
       async sendCommand(target, method, params = {}) {
         debuggerCommands.push({ target, method, params });
+        if (onDebuggerCommand) await onDebuggerCommand({ target, method, params, tabs });
         if (method === 'Page.getFrameTree') {
           if (delayFrameTreeMs > 0) await new Promise(resolve => setTimeout(resolve, delayFrameTreeMs));
           const tab = tabs.get(target.tabId);
@@ -208,6 +209,32 @@ test('unattached DOM inspection path is not shipped around protected-tab ownersh
 
 test('all compound input events retain command authority checks', () => {
   assert.doesNotMatch(controlSource, /send\(state,['"]Input\.dispatch/);
+});
+
+test('release cleanup avoids another host round trip and retires custody if the page becomes protected after press', async () => {
+  const env = loadControl({
+    initialTabs: { 5: { url: 'https://example.com/', title: 'Example', active: false, pinned: false, status: 'complete' } },
+    protectedTab: (_id, url) => new URL(url).hostname === 'chatgpt.com',
+    onDebuggerCommand: async ({ target, method, params, tabs }) => {
+      if (target.tabId === 5 && method === 'Input.dispatchKeyEvent' && params.type === 'keyDown') {
+        tabs.get(5).url = 'https://chatgpt.com/c/protected';
+      }
+    }
+  });
+  await env.control.pump();
+  const attached = await env.control.execute(env.command('browser_tabs', { action: 'attach', tabId: 5 }));
+  const checksBefore = env.transportCalls.filter(call => call.body.action === 'check').length;
+  await assert.rejects(
+    env.control.execute(env.command('browser_action', { tabId: 5, pageId: attached.pageId, action: 'key', key: 'Enter' })),
+    /BROWSER_EXECUTOR_TAB/
+  );
+  const checksAfter = env.transportCalls.filter(call => call.body.action === 'check').length;
+  assert.equal(checksAfter - checksBefore, 2, 'cleanup release must not add another host authorization round trip');
+  assert.deepEqual(
+    env.debuggerCommands.filter(call => call.method === 'Input.dispatchKeyEvent').map(call => call.params.type),
+    ['keyDown']
+  );
+  assert.deepEqual(env.detachCalls, [5]);
 });
 
 test('network diagnostics retain request body size but never raw POST data', async () => {

@@ -128,6 +128,16 @@ function createBrowserControl(chrome, transport, protectedTab = () => false) {
     await currentTab(state,command);
     return send(state,method,params,undefined,command);
   }
+  async function finishInput(state, method, params, command) {
+    try {
+      if (!policy.write) error('BROWSER_PERMISSION_REVOKED: remaining input was not dispatched.');
+      await currentTab(state,command);
+      return await send(state,method,params,undefined,command);
+    } catch (cause) {
+      await release(state);
+      throw cause;
+    }
+  }
   async function authorize(command, writes = true) {
     if (command.epoch !== epoch || command.expiresAt <= Date.now()) error('BROWSER_EXPIRED: no further browser work was dispatched.');
     if (!(writes ? policy.write : policy.read)) error('BROWSER_PERMISSION_REVOKED');
@@ -375,14 +385,14 @@ function createBrowserControl(chrome, transport, protectedTab = () => false) {
       const { text:_text,...up } = key;
       try {
         if (args.holdMs) await new Promise(resolve => setTimeout(resolve,Math.min(2000,Math.max(0,args.holdMs))));
-      } finally { await input(state,'Input.dispatchKeyEvent',{ type:'keyUp',...up },command); }
+      } finally { await finishInput(state,'Input.dispatchKeyEvent',{ type:'keyUp',...up },command); }
     } else if (a === 'fill' || a === 'type') {
       if (typeof args.text !== 'string' || !args.ref) error('BROWSER_TEXT_TARGET_REQUIRED: pass text and an editable ref.');
       await authorize(command);
       await page(state,'focus',{ref:args.ref,frameId:state.refFrames?.get(args.ref),replace:a === 'fill'},command);
       if (a === 'fill' && !args.text) {
         await input(state,'Input.dispatchKeyEvent',{type:'keyDown',key:'Backspace',code:'Backspace',windowsVirtualKeyCode:8},command);
-        await input(state,'Input.dispatchKeyEvent',{type:'keyUp',key:'Backspace',code:'Backspace',windowsVirtualKeyCode:8},command);
+        await finishInput(state,'Input.dispatchKeyEvent',{type:'keyUp',key:'Backspace',code:'Backspace',windowsVirtualKeyCode:8},command);
       } else await input(state,'Input.insertText',{text:args.text},command);
     } else if (a === 'select') {
       if (!args.ref || !Array.isArray(args.values)) error('BROWSER_SELECT_REQUIRED: pass ref and values.');
@@ -398,7 +408,7 @@ function createBrowserControl(chrome, transport, protectedTab = () => false) {
           const button = args.button || 'left';
           for (let count = 1; count <= (args.clickCount || 1); count++) {
             await input(state,'Input.dispatchMouseEvent',{type:'mousePressed',...from,button,clickCount:count},command);
-            await input(state,'Input.dispatchMouseEvent',{type:'mouseReleased',...from,button,clickCount:count},command);
+            await finishInput(state,'Input.dispatchMouseEvent',{type:'mouseReleased',...from,button,clickCount:count},command);
           }
         } else if (a === 'drag') {
           const to = await point(state,{ref:args.toRef,x:args.toX,y:args.toY,screenshotId:args.screenshotId},command);
@@ -409,7 +419,7 @@ function createBrowserControl(chrome, transport, protectedTab = () => false) {
           await input(state,'Input.dispatchMouseEvent',{type:'mousePressed',...from,button:'left',clickCount:1},command);
           try {
             for (let step = 1; step <= 12; step++) await input(state,'Input.dispatchMouseEvent',{type:'mouseMoved',...from,x:from.x+(to.x-from.x)*step/12,y:from.y+(to.y-from.y)*step/12,button:'left',buttons:1},command);
-          } finally { await input(state,'Input.dispatchMouseEvent',{type:'mouseReleased',...to,button:'left',clickCount:1},command); }
+          } finally { await finishInput(state,'Input.dispatchMouseEvent',{type:'mouseReleased',...to,button:'left',clickCount:1},command); }
         } else if (a !== 'hover') error('BROWSER_ACTION_UNKNOWN');
       }
     }

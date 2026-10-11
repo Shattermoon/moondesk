@@ -675,6 +675,7 @@ impl CompanionAuth {
             .lock()
             .await
             .retain(|_, (route, _)| route.client_id != client_id);
+        self.user_browser_broker.remove_companion(client_id).await;
         Ok(true)
     }
 

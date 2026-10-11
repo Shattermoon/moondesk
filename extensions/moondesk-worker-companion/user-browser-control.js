@@ -77,7 +77,7 @@ function createBrowserControl(chrome, transport, protectedTab = () => false) {
     let timer;
     try {
       return await Promise.race([
-        chrome.debugger.sendCommand({ tabId: state.tabId, ...(sessionId ? { sessionId } : {}) }, method, params).then(value => {alive(state);return value;}),
+        chrome.debugger.sendCommand({ tabId: state.tabId, ...(sessionId ? { sessionId } : {}) }, method, params).then(value => {alive(state,command);return value;}),
         new Promise((_,reject) => { timer = setTimeout(() => {
           // Retire admission before releasing a stuck debugger. A late result cannot
           // lend its target to another command; accepted effects are not replayed.
@@ -130,30 +130,33 @@ function createBrowserControl(chrome, transport, protectedTab = () => false) {
     return send(state,method,params,undefined,command);
   }
   async function authorize(command, writes = true) {
+    if (command.epoch !== epoch || command.expiresAt <= Date.now()) error('BROWSER_EXPIRED: no further browser work was dispatched.');
     if (!(writes ? policy.write : policy.read)) error('BROWSER_PERMISSION_REVOKED');
     const check = await transport('/browser-control',{method:'POST',body:JSON.stringify({action:'check',browserId,id:command.id,epoch:command.epoch})});
+    if (command.epoch !== epoch || command.expiresAt <= Date.now()) error('BROWSER_EXPIRED: browser authority expired while permission was being checked.');
     if (!check.ok || check.data?.allowed !== true) error('BROWSER_PERMISSION_REVOKED: remaining input was not dispatched.');
   }
-  async function initialize(state, sessionId) {
+  async function initialize(state, sessionId, command) {
     if (!sessionId && state.restored) {
       // Chrome may retain enabled domains while the MV3 JavaScript heap disappears.
       // Renew this lease's domain subscriptions so existing contexts/child sessions are emitted.
-      await send(state,'Target.setAutoAttach',{autoAttach:false,waitForDebuggerOnStart:false,flatten:true});
-      await send(state,'Runtime.disable');state.restored = false;
+      await send(state,'Target.setAutoAttach',{autoAttach:false,waitForDebuggerOnStart:false,flatten:true},undefined,command);
+      await send(state,'Runtime.disable',{},undefined,command);
+      state.restored = false;
     }
-    await send(state,'Page.enable',{},sessionId);
+    await send(state,'Page.enable',{},sessionId,command);
     // Hidden widgets otherwise wait ~5s for mouse ACKs and suspend animation/media.
     // This affects only the attached page, never Chrome's selected tab or OS focus.
     // Chrome drops the emulation when its debugger session is detached.
-    if (!sessionId) await send(state,'Emulation.setFocusEmulationEnabled',{enabled:true});
-    await send(state,'Runtime.enable',{},sessionId);
-    await send(state,'Network.enable',{ maxTotalBufferSize: 2_000_000, maxResourceBufferSize: 500_000, maxPostDataSize: 16000 },sessionId);
-    await send(state,'Log.enable',{},sessionId);
+    if (!sessionId) await send(state,'Emulation.setFocusEmulationEnabled',{enabled:true},undefined,command);
+    await send(state,'Runtime.enable',{},sessionId,command);
+    await send(state,'Network.enable',{ maxTotalBufferSize: 2_000_000, maxResourceBufferSize: 500_000, maxPostDataSize: 16000 },sessionId,command);
+    await send(state,'Log.enable',{},sessionId,command);
     // Chrome 125+ flat child sessions let the same tab own out-of-process frames.
-    await send(state,'Target.setAutoAttach',{ autoAttach:true, waitForDebuggerOnStart:false, flatten:true, filter:[{ type:'iframe', exclude:false }] },sessionId);
+    await send(state,'Target.setAutoAttach',{ autoAttach:true, waitForDebuggerOnStart:false, flatten:true, filter:[{ type:'iframe', exclude:false }] },sessionId,command);
     if (!sessionId) state.initialized = true;
   }
-  async function frameList(state) {
+  async function frameList(state, command) {
     const found = [], observed = new Map();
     const visit = (tree, sessionId) => {
       if (!tree || found.length >= 100) return;
@@ -165,23 +168,23 @@ function createBrowserControl(chrome, transport, protectedTab = () => false) {
       }
       for (const child of tree.childFrames || []) visit(child,sessionId);
     };
-    const root = await send(state,'Page.getFrameTree'); visit(root.frameTree);
+    const root = await send(state,'Page.getFrameTree',{},undefined,command); visit(root.frameTree);
     for (const sessionId of state.sessions) {
-      const tree = await send(state,'Page.getFrameTree',{},sessionId).catch(() => null);
+      const tree = await send(state,'Page.getFrameTree',{},sessionId,command).catch(() => null);
       if (tree) visit(tree.frameTree,sessionId);
     }
     state.frames = observed;
     return found.filter((f,i) => found.findIndex(other => other.frameId === f.frameId) === i);
   }
-  async function context(state, frameId, main = false) {
-    const frames = await frameList(state);
+  async function context(state, frameId, main = false, command) {
+    const frames = await frameList(state,command);
     const frame = state.frames.get(frameId || frames[0]?.frameId);
     if (!frame) error('BROWSER_FRAME_UNAVAILABLE: choose a frameId from a fresh snapshot.');
     pageURL(frame.url);
     const key = `${frame.id}:${main ? 'main' : 'isolated'}`;
     if (!main && !state.contexts.has(key)) {
       const pageId = state.pageId;
-      const created = await send(state,'Page.createIsolatedWorld',{ frameId:frame.id, worldName:`moondesk-browser-${state.lease}`, grantUniveralAccess:false },frame.sessionId);
+      const created = await send(state,'Page.createIsolatedWorld',{ frameId:frame.id, worldName:`moondesk-browser-${state.lease}`, grantUniveralAccess:false },frame.sessionId,command);
       if (state.pageId !== pageId) error('BROWSER_PAGE_STALE: frame changed while observing.');
       state.contexts.set(key,{ id:created.executionContextId, sessionId:frame.sessionId });
     }
@@ -196,7 +199,7 @@ function createBrowserControl(chrome, transport, protectedTab = () => false) {
   }
   async function page(state, operation, args = {}, command) {
     const pageId = state.pageId;
-    const ctx = await context(state,args.frameId);
+    const ctx = await context(state,args.frameId,false,command);
     if (state.pageId !== pageId) error('BROWSER_PAGE_STALE: snapshot again.');
     const result = await evaluate(state,`(${browserPage.toString()})(${JSON.stringify(operation)},${JSON.stringify({ ...args,pageId,lease:state.lease })})`,ctx,command);
     if (state.pageId !== pageId) error('BROWSER_PAGE_STALE: page changed while reading.');
@@ -231,9 +234,10 @@ function createBrowserControl(chrome, transport, protectedTab = () => false) {
         await save(); // Crash before/after attach never grants an automatic reattach.
         await chrome.debugger.attach({ tabId },'1.3');
         acquired = true;
+        alive(state,command);
       }
-      if (!state.initialized) await initialize(state);
-      await page(state,'overlay');
+      if (!state.initialized) await initialize(state,undefined,command);
+      await page(state,'overlay',{},command);
       const tab = await currentTab(state,command);
       return { tabId:handle(tabId), pageId:state.pageId, url:tab.url, title:cut(tab.title,500), attached:true };
     } catch (cause) {
@@ -279,7 +283,7 @@ function createBrowserControl(chrome, transport, protectedTab = () => false) {
     if (command.tool === 'browser_tabs' && command.args.action === 'release') { alive(state,command); return state; }
     await currentTab(state,command);
     if (!state.initialized) {
-      try { await initialize(state); } catch { await release(state); error('BROWSER_DETACHED: Chrome ended this debugger attachment. Attach again deliberately.'); }
+      try { await initialize(state,undefined,command); } catch { await release(state); error('BROWSER_DETACHED: Chrome ended this debugger attachment. Attach again deliberately.'); }
     }
     return state;
   }
@@ -289,13 +293,13 @@ function createBrowserControl(chrome, transport, protectedTab = () => false) {
       if (!args.ref.startsWith(`${state.pageId}:`)) error('BROWSER_REF_STALE');
       const frameId = state.refFrames?.get(args.ref);
       if (!frameId) error('BROWSER_REF_STALE: use a current snapshot ref.');
-      const frames = await frameList(state);
+      const frames = await frameList(state,command);
       const parents = [];
       let child = state.frames.get(frameId);
       while (child && child.id !== frames[0]?.frameId) {
         const parent = state.frames.get(child.parentId);
         if (!parent || parents.length >= 20) error('BROWSER_FRAME_UNAVAILABLE: snapshot again.');
-        const ctx = await context(state,parent.id);
+        const ctx = await context(state,parent.id,false,command);
         const owner = await send(state,'DOM.getFrameOwner',{frameId:child.id},parent.sessionId,command);
         const node = await send(state,'DOM.resolveNode',{backendNodeId:owner.backendNodeId,executionContextId:ctx.id},parent.sessionId,command);
         parents.push({objectId:node.object.objectId,sessionId:parent.sessionId}); child = parent;
@@ -406,7 +410,7 @@ function createBrowserControl(chrome, transport, protectedTab = () => false) {
   }
   async function screenshot(state,args,command) {
     const pageId = state.pageId;
-    const metrics = await send(state,'Page.getLayoutMetrics');
+    const metrics = await send(state,'Page.getLayoutMetrics',{},undefined,command);
     const viewport = metrics.cssVisualViewport;
     const rect = args.fullPage ? metrics.cssContentSize : {x:viewport.pageX,y:viewport.pageY,width:viewport.clientWidth,height:viewport.clientHeight};
     if (!(rect.width > 0 && rect.height > 0) || rect.width > 100000 || rect.height > 100000) error('BROWSER_CAPTURE_DIMENSIONS');
@@ -430,7 +434,7 @@ function createBrowserControl(chrome, transport, protectedTab = () => false) {
       if (restoreOverlay && tabs.get(state.tabId) === state) await page(state,'resumeOverlay').catch(() => {});
     }
   }
-  async function diagnostics(state,tool,args) {
+  async function diagnostics(state,tool,args,command) {
     const network = tool === 'browser_network';
     if (network && args.requestId) {
       const row = state.network.get(args.requestId);
@@ -439,7 +443,7 @@ function createBrowserControl(chrome, transport, protectedTab = () => false) {
       if (args.body) {
         if (row.encodedBytes > 500000) body = { unavailable:'Response exceeds the 500 KB capture limit.' };
         else try {
-          const data = await send(state,'Network.getResponseBody',{requestId:row.nativeId},row.sessionId);
+          const data = await send(state,'Network.getResponseBody',{requestId:row.nativeId},row.sessionId,command);
           body = { text:cut(data.body,20000),base64Encoded:data.base64Encoded === true,truncated:data.body.length > 20000 };
         } catch { body = { unavailable:'Chrome no longer retains this response body, or it has not completed.' }; }
       }
@@ -453,7 +457,7 @@ function createBrowserControl(chrome, transport, protectedTab = () => false) {
     const selected = matching.slice(0,args.limit || 50);
     const values = []; let size = 0;
     for (const row of selected) {
-      const { nativeId:_native,sessionId:_session,requestHeaders:_rq,responseHeaders:_rs,postData:_post,...brief } = row;
+      const { nativeId:_native,sessionId:_session,requestHeaders:_rq,responseHeaders:_rs,...brief } = row;
       const value = network ? brief : row;
       size += JSON.stringify(value).length;
       if (size > 24000) break;
@@ -462,44 +466,12 @@ function createBrowserControl(chrome, transport, protectedTab = () => false) {
     if (args.clear) { if (network) state.network.clear(); else state.console = []; }
     return { entries:values,nextCursor:values.at(-1)?.seq || args.after || 0,truncated:values.length < matching.length,dropped:network ? state.networkDropped : state.consoleDropped,capture:'Since debugger attachment; older events are unavailable.' };
   }
-  async function inspect(command) {
-    const args = command.args;
-    await authorize(command, false);
-    const tab = await getTab(args.tabId);
-    pageURL(tab.url);
-    const documentId = args.frameId?.startsWith('document:') ? args.frameId.slice('document:'.length) : undefined;
-    // Chrome's documentId is opaque, unlike our own page UUID. Preserve its bytes.
-    if (args.frameId && (!documentId || args.frameId.length > 100)) error('BROWSER_FRAME_UNAVAILABLE: unattached inspection uses document: frameIds. Omit frameId to read the current top document.');
-    // This fixed reader does not claim a debugger, retain references, change focus,
-    // touch an overlay or evaluate model-authored JavaScript. Chrome supplies document proof.
-    let result, timer;
-    try {
-      result = await Promise.race([
-        chrome.scripting.executeScript({
-          target: { tabId: args.tabId, ...(documentId ? { documentIds: [documentId] } : { frameIds: [0] }) },
-          world: 'ISOLATED', func: browserPage,
-          args: ['inspect', { selector: args.selector, format: args.format, filter: args.filter, maxNodes: args.maxNodes || 300, maxChars: args.maxChars || 16000 }]
-        }),
-        new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('BROWSER_INSPECTION_TIMEOUT: Chrome did not return the DOM observation. The tab and its debugger were left unchanged.')),
-          Math.max(1, Math.min(8000, command.expiresAt - Date.now()))); })
-      ]);
-    } finally { clearTimeout(timer); }
-    if (command.epoch !== epoch || command.expiresAt <= Date.now()) error('BROWSER_EXPIRED: the DOM inspection result expired. No input was dispatched.');
-    await authorize(command, false);
-    const captured = result[0];
-    if (documentId && captured?.documentId !== documentId) error('BROWSER_FRAME_UNAVAILABLE: the requested document is no longer available. Omit frameId to inspect the current top document.');
-    if (typeof captured?.result?.error === 'string') error(cut(captured.result.error, 1000));
-    if (!captured?.documentId || !captured.result || typeof captured.result.text !== 'string') error('BROWSER_INSPECTION_UNAVAILABLE: Chrome returned no DOM observation for that document.');
-    const { refs: _refs, ...value } = captured.result;
-    return { value: { ...value, tabId: handle(args.tabId), documentId: captured.documentId,
-      frameId: `document:${captured.documentId}`, inspectionOnly: true,
-      message: 'DOM inspection only; no action refs were created. Attach an eligible tab for browser input.' } };
-  }
   async function execute(command) {
     if (command.epoch !== epoch || command.expiresAt <= Date.now()) error('BROWSER_EXPIRED: no operation dispatched.');
     const {tool,args} = command;
     const writes = ['browser_action','browser_navigate','browser_evaluate'].includes(tool) || tool === 'browser_tabs' && ['attach','new','release','close'].includes(args.action);
     if (!(writes ? policy.write : policy.read)) error('BROWSER_PERMISSION_REVOKED');
+    await authorize(command,writes);
     if (tool === 'browser_tabs') {
       if (args.action === 'list') {
         const list = await chrome.tabs.query({});
@@ -548,8 +520,8 @@ function createBrowserControl(chrome, transport, protectedTab = () => false) {
     const state = await owned(command);
     if (tool === 'browser_snapshot') {
       if (state.dialog) return {value:{tabId:handle(state.tabId),pageId:state.pageId,dialog:state.dialog,text:'A JavaScript dialog is open. Use user_browser_action with action=dialog before inspecting the DOM.'}};
-      const frames = await frameList(state),frameId = args.frameId || frames[0]?.frameId;
-      const {refs,...value} = await page(state,'snapshot',{...args,frameId});
+      const frames = await frameList(state,command),frameId = args.frameId || frames[0]?.frameId;
+      const {refs,...value} = await page(state,'snapshot',{...args,frameId},command);
       // Each snapshot replaces refs only in its own frame; other inspected frames remain valid.
       state.refFrames ||= new Map();
       for (const [ref,frame] of state.refFrames) if (frame === frameId || !ref.startsWith(`${state.pageId}:`)) state.refFrames.delete(ref);
@@ -565,7 +537,7 @@ function createBrowserControl(chrome, transport, protectedTab = () => false) {
         if (result.errorText) error(`BROWSER_NAVIGATION_FAILED: ${cut(result.errorText)}`);
       } else if (args.action === 'reload') await input(state,'Page.reload',{},command);
       else {
-        const history = await send(state,'Page.getNavigationHistory');
+        const history = await send(state,'Page.getNavigationHistory',{},undefined,command);
         const next = history.entries[history.currentIndex + (args.action === 'back' ? -1 : 1)];
         if (!next) error('BROWSER_HISTORY_EMPTY');
         pageURL(next.url);
@@ -575,13 +547,14 @@ function createBrowserControl(chrome, transport, protectedTab = () => false) {
       return {value:{tabId:handle(state.tabId),accepted:true,message:'Navigation requested. Snapshot again when the destination loads.'}};
     }
     if (tool === 'browser_evaluate') {
-      const ctx = await context(state,args.frameId,true);
-      await authorize(command); await currentTab(state,command);
+      const ctx = await context(state,args.frameId,true,command);
+      await authorize(command);
+      await currentTab(state,command);
       const value = await evaluate(state,`(async()=>{const value=await (${args.expression});return (${boundedBrowserValue.toString()})(value);})()`,ctx,command);
       state.screenshot = null;
       return {value:{tabId:handle(state.tabId),pageId:state.pageId,...value}};
     }
-    if (tool === 'browser_console' || tool === 'browser_network') return {value:await diagnostics(state,tool,args)};
+    if (tool === 'browser_console' || tool === 'browser_network') return {value:await diagnostics(state,tool,args,command)};
     error('BROWSER_TOOL_UNKNOWN');
   }
   const headers = value => {
@@ -630,7 +603,10 @@ function createBrowserControl(chrome, transport, protectedTab = () => false) {
       const key = `${source.sessionId || 'main'}:${params.requestId}`;
       let row = state.network.get(key);
       if (method === 'Network.requestWillBeSent') {
-        row = {requestId:key,nativeId:params.requestId,sessionId:source.sessionId,pageId:state.pageId,url:cut(params.request?.url,2000),method:cut(params.request?.method,20),type:cut(params.type,30),requestHeaders:headers(params.request?.headers),postData:cut(params.request?.postData,4000),startedAt:params.timestamp,seq:++state.seq};
+        const postDataBytes = typeof params.request?.postData === 'string'
+          ? new TextEncoder().encode(params.request.postData).length
+          : 0;
+        row = {requestId:key,nativeId:params.requestId,sessionId:source.sessionId,pageId:state.pageId,url:cut(params.request?.url,2000),method:cut(params.request?.method,20),type:cut(params.type,30),requestHeaders:headers(params.request?.headers),postDataBytes,startedAt:params.timestamp,seq:++state.seq};
         state.network.set(key,row);
         if (state.network.size > 200) {state.network.delete(state.network.keys().next().value);state.networkDropped++;}
       } else if (row) {
@@ -646,21 +622,27 @@ function createBrowserControl(chrome, transport, protectedTab = () => false) {
     tabs.delete(source.tabId); await save();
     await cleanup(removeIndicator(state));
   }
-  async function pumpOnce() {
+  async function heartbeat() {
     await ready();
     const enabled = await chrome.permissions.contains({permissions:['debugger','tabs']});
+    const poll = await transport('/browser-control',{method:'POST',body:JSON.stringify({action:'poll',browserId,name:/Edg\//.test(navigator.userAgent) ? 'Edge' : 'Chrome / Chromium',enabled})});
+    if (!poll.ok) { await revoke(); return null; }
+    policy = poll.data.policy;
+    if (epoch !== poll.data.epoch) { await Promise.all([...tabs.values()].map(release)); epoch = poll.data.epoch; await save(); }
+    if (!enabled || !policy?.read) { await revoke(); return null; }
+    await refreshIndicators();
+    return poll.data;
+  }
+  async function pumpOnce() {
+    await ready();
     if (receipt) {
       const ack = await transport('/browser-control',{method:'POST',body:JSON.stringify({action:'result',browserId,...receipt})});
       if (!ack.ok && ack.status !== 409) { await revoke(); return; }
       receipt = null; await save();
     }
-    const poll = await transport('/browser-control',{method:'POST',body:JSON.stringify({action:'poll',browserId,name:/Edg\//.test(navigator.userAgent) ? 'Edge' : 'Chrome / Chromium',enabled})});
-    if (!poll.ok) { await revoke(); return; }
-    policy = poll.data.policy;
-    if (epoch !== poll.data.epoch) { await Promise.all([...tabs.values()].map(release)); epoch = poll.data.epoch; await save(); }
-    if (!enabled || !policy?.read) { await revoke(); return; }
-    await refreshIndicators();
-    for (const request of poll.data.requests || []) {
+    const poll = await heartbeat();
+    if (!poll) return;
+    for (const request of poll.requests || []) {
       const owners = [...new Set([...tabs.values()].map(state => state.owner).filter(owner => owner.startsWith('request:')))];
       const claim = await transport('/browser-control',{method:'POST',body:JSON.stringify({action:'claim',browserId,id:request,epoch,owners})});
       if (!claim.ok || !claim.data.command) continue;
@@ -681,7 +663,7 @@ function createBrowserControl(chrome, transport, protectedTab = () => false) {
     pumping = (async () => { do {again = false;await pumpOnce();} while (again); })().finally(() => {pumping = null;});
     return pumping;
   }
-  return {pump,event,detached,revoke,execute,ready};
+  return {pump,heartbeat,event,detached,revoke,execute,ready};
 }
 
 

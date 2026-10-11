@@ -92,6 +92,41 @@ impl UserBrowserBroker {
             .collect()
     }
 
+    pub async fn remove_companion(&self, companion_client_id: &str) {
+        let mut state = self.state.lock().await;
+        let browser_ids = state
+            .clients
+            .iter()
+            .filter(|(_, client)| client.companion_client_id == companion_client_id)
+            .map(|(browser_id, _)| browser_id.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        if browser_ids.is_empty() {
+            return;
+        }
+        state
+            .clients
+            .retain(|browser_id, _| !browser_ids.contains(browser_id));
+        let pending_ids = state
+            .pending
+            .iter()
+            .filter(|(_, pending)| browser_ids.contains(&pending.browser_id))
+            .map(|(request_id, _)| request_id.clone())
+            .collect::<Vec<_>>();
+        for request_id in pending_ids {
+            let Some(mut pending) = state.pending.remove(&request_id) else {
+                continue;
+            };
+            let error = if pending.claimed {
+                "USER_BROWSER_RESULT_UNCONFIRMED: the operation was dispatched before the paired Companion was revoked. Inspect the same tab before repeating input."
+            } else {
+                "USER_BROWSER_OFFLINE: the paired Companion was revoked before this operation was dispatched"
+            };
+            if let Some(sender) = pending.sender.take() {
+                let _ = sender.send(serde_json::json!({ "error": error }));
+            }
+        }
+    }
+
     pub async fn poll(
         &self,
         browser_id: &str,
@@ -375,6 +410,96 @@ mod tests {
         assert_eq!(
             runner.await.unwrap().unwrap(),
             serde_json::json!({"ok":true})
+        );
+    }
+
+    #[tokio::test]
+    async fn revoked_companion_removes_browser_and_fails_unclaimed_request() {
+        let broker = std::sync::Arc::new(UserBrowserBroker::new());
+        let browser_id = Uuid::new_v4().to_string();
+        broker
+            .poll(&browser_id, "companion-a", "Chrome", true)
+            .await
+            .unwrap();
+        let runner = {
+            let broker = broker.clone();
+            let browser_id = browser_id.clone();
+            tokio::spawn(async move {
+                broker
+                    .execute(
+                        &browser_id,
+                        &"b".repeat(64),
+                        "user_browser_tabs",
+                        serde_json::json!({"action":"list"}),
+                    )
+                    .await
+            })
+        };
+        tokio::task::yield_now().await;
+        broker.remove_companion("companion-a").await;
+        assert!(broker.browsers().await.is_empty());
+        let result = runner.await.unwrap().unwrap();
+        assert!(
+            result
+                .get("error")
+                .and_then(Value::as_str)
+                .is_some_and(|error| error.contains("USER_BROWSER_OFFLINE"))
+        );
+    }
+
+    #[tokio::test]
+    async fn revoked_companion_invalidates_claimed_request_as_unconfirmed() {
+        let broker = std::sync::Arc::new(UserBrowserBroker::new());
+        let browser_id = Uuid::new_v4().to_string();
+        broker
+            .poll(&browser_id, "companion-a", "Chrome", true)
+            .await
+            .unwrap();
+        let runner = {
+            let broker = broker.clone();
+            let browser_id = browser_id.clone();
+            tokio::spawn(async move {
+                broker
+                    .execute(
+                        &browser_id,
+                        &"c".repeat(64),
+                        "user_browser_action",
+                        serde_json::json!({"tabId":17,"action":"click"}),
+                    )
+                    .await
+            })
+        };
+        tokio::task::yield_now().await;
+        let poll = broker
+            .poll(&browser_id, "companion-a", "Chrome", true)
+            .await
+            .unwrap();
+        let request_id = poll.requests.first().expect("pending request").clone();
+        assert!(
+            broker
+                .claim(&browser_id, "companion-a", &request_id, &poll.epoch)
+                .await
+                .is_some()
+        );
+        broker.remove_companion("companion-a").await;
+        assert!(broker.browsers().await.is_empty());
+        let result = runner.await.unwrap().unwrap();
+        assert!(
+            result
+                .get("error")
+                .and_then(Value::as_str)
+                .is_some_and(|error| error.contains("USER_BROWSER_RESULT_UNCONFIRMED"))
+        );
+        assert!(
+            !broker
+                .result(
+                    &browser_id,
+                    "companion-a",
+                    &request_id,
+                    &poll.epoch,
+                    serde_json::json!({"value":{"accepted":true}}),
+                )
+                .await
         );
     }
 

@@ -65,7 +65,7 @@ pub const COMPANION_USER_BROWSER_ROUTE: &str = "/__moondesk/companion/v1/browser
 pub const COMPANION_TOKEN_HEADER: &str = "x-moondesk-companion-token";
 // Bump with any shipped companion runtime change that requires Chromium to load new bytes. Keep
 // this aligned with COMPANION_RUNTIME_REVISION in background.js.
-pub const COMPANION_RUNTIME_REVISION: u32 = 18;
+pub const COMPANION_RUNTIME_REVISION: u32 = 19;
 const MAX_COMPANION_BODY_BYTES: usize = 16 * 1024;
 const MAX_COMPANION_USER_BROWSER_BODY_BYTES: usize = 2 * 1024 * 1024;
 
@@ -6521,13 +6521,13 @@ document.getElementById('hidden-upload').addEventListener('change',event=>{docum
                 && let Ok(bytes) = BASE64_STANDARD.decode(data)
             {
                 let image_path = controls.join(format!("{request_id}.jpg"));
-                if std::fs::write(&image_path, bytes).is_ok() {
-                    if let Some(object) = response.as_object_mut() {
-                        object.insert(
-                            "debugImagePath".to_string(),
-                            Value::String(image_path.to_string_lossy().into_owned()),
-                        );
-                    }
+                if std::fs::write(&image_path, bytes).is_ok()
+                    && let Some(object) = response.as_object_mut()
+                {
+                    object.insert(
+                        "debugImagePath".to_string(),
+                        Value::String(image_path.to_string_lossy().into_owned()),
+                    );
                 }
             }
             let temporary = controls.join("response.json.tmp");

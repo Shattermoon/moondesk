@@ -619,7 +619,7 @@ fn push_user_browser_tools(tools: &mut Vec<Value>) {
     tools.push(json!({
         "name": "user_browser_tabs",
         "title": "Control user browser tabs",
-        "description": "List, attach, open, release, or close tabs in the user's existing Chrome/Edge through the MoonDesk Companion extension. This is separate from MoonDesk's isolated browser_* runtime. Attach grants this exact ChatGPT conversation temporary control of one non-ChatGPT tab and shows a blue glow; release leaves the tab open. List first when you do not already have an exact tab_id.",
+        "description": "List, attach, open, release, or close tabs in the user's existing Chrome/Edge through the MoonDesk Companion extension. This is separate from MoonDesk's isolated browser_* runtime. Attach grants this exact ChatGPT conversation temporary control of one eligible non-ChatGPT tab and shows an animated multicolor control glow; release leaves the tab open, while close is explicit and destructive. List first when you do not already have an exact tab_id.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -636,7 +636,7 @@ fn push_user_browser_tools(tools: &mut Vec<Value>) {
     tools.push(json!({
         "name": "user_browser_snapshot",
         "title": "Inspect controlled user browser tab",
-        "description": "Read a bounded DOM-oriented snapshot from a tab controlled through MoonDesk Companion. Returns page_id plus stable element refs for the current document. Navigation invalidates old refs. ChatGPT tabs are protected from interactive attachment in this first version.",
+        "description": "Read a bounded DOM-oriented snapshot from a tab controlled through MoonDesk Companion. Returns page_id plus stable element refs for the current document. Navigation invalidates old refs. Every HTTPS tab on chatgpt.com and chat.openai.com is protected from interactive attachment.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1428,11 +1428,14 @@ async fn handle_user_browser_tool(
     let explicit_browser = args
         .remove("browser_id")
         .and_then(|value| value.as_str().map(str::to_string));
-    let tab_handle = args
-        .get("tab_id")
-        .and_then(Value::as_str)
-        .map(parse_user_browser_tab_handle)
-        .transpose();
+    let tab_handle = match args.get("tab_id") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => parse_user_browser_tab_handle(value).map(Some),
+        Some(_) => Err(
+            "USER_BROWSER_TAB_INVALID: tab_id must be a string returned by user_browser_tabs"
+                .to_string(),
+        ),
+    };
     let (handle_browser, numeric_tab) = match tab_handle {
         Ok(Some((browser, tab))) => (Some(browser), Some(tab)),
         Ok(None) => (None, None),
@@ -3071,7 +3074,7 @@ Always specify the branch explicitly when using `git push`."#
         .collect();
 
     if tool_mode.write_tools_enabled() {
-        lines.push("If the optional MoonDesk Companion is installed, user_browser_tabs/user_browser_snapshot/user_browser_screenshot/user_browser_navigate/user_browser_action control exact tabs in the user's existing Chromium browser. This is separate from the isolated browser_* runtime and is not PC control. List or open a tab first, attach deliberately, use fresh page IDs/refs after navigation, do not blindly replay uncertain input, and release the tab when done; a blue four-edge glow indicates active MoonDesk control. Active ChatGPT orchestration tabs are protected from interactive attachment.".to_string());
+        lines.push("If the optional MoonDesk Companion is installed, user_browser_tabs/user_browser_snapshot/user_browser_screenshot/user_browser_navigate/user_browser_action control exact tabs in the user's existing Chromium browser. This is separate from the isolated browser_* runtime and is not PC control. List or open a tab first, attach deliberately, use fresh page IDs/refs after navigation, do not blindly replay uncertain input, and release the tab when done; an animated multicolor edge/corner glow indicates active MoonDesk control and is temporarily hidden only while MoonDesk captures model-facing screenshots. Every HTTPS tab on chatgpt.com and chat.openai.com is protected from interactive attachment.".to_string());
     }
 
     if mode.computer_enabled() {
@@ -6025,6 +6028,39 @@ mod tests {
             Some(true)
         );
         assert!(result_text(&response).contains("exact ChatGPT conversation identity"));
+    }
+
+    #[tokio::test]
+    async fn user_browser_tab_id_rejects_non_string_values_before_dispatch() {
+        let root = TestTempDir::new("moondesk-user-browser-tab-type");
+        let workspace = WorkspaceId::new();
+        let companion_auth = Arc::new(
+            CompanionAuth::open(root.path().join("companion-auth.json"))
+                .expect("open test companion auth"),
+        );
+        let request = tool_call_request_with_session(
+            "user_browser_snapshot",
+            json!({ "tab_id": 17 }),
+            "user-browser-tab-type-chat",
+        );
+        let response = call_workers_for_test_with_companion(
+            &request,
+            &workspace,
+            &root.path().to_string_lossy(),
+            test_worker_broker(),
+            test_managed_chat_broker(),
+            Some(companion_auth),
+        )
+        .await;
+        assert_eq!(
+            response
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(result_text(&response).contains("tab_id must be a string"));
     }
 
     #[tokio::test]

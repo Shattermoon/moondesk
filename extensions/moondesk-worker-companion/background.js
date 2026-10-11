@@ -8,7 +8,7 @@ const BRIDGE_PORTS = [47650, 47651, 47652, 47653, 47654];
 const REQUIRED_PROTOCOL_VERSION = 2;
 // Bump with any shipped companion runtime change that requires Chromium to load new bytes. Keep
 // this aligned with COMPANION_RUNTIME_REVISION in src/server.rs.
-const COMPANION_RUNTIME_REVISION = 18;
+const COMPANION_RUNTIME_REVISION = 19;
 const SOURCE_DEV_MANIFEST_VERSION = '0.1.0';
 const RUNTIME_RELOAD_STORAGE_KEY = 'moondeskWorkerCompanionReloadRevisionV1';
 const INSTALLATION_BOOTSTRAP_FILE = 'moondesk-bootstrap.json';
@@ -34,6 +34,8 @@ const MODEL_CATALOG_RETRY_MS = 5 * 60 * 1000;
 
 let pumpTimer = null;
 let pumpActive = false;
+let userBrowserPumpTimer = null;
+let userBrowserPumpActive = false;
 let connecting = null;
 let modelCatalogFlight = null;
 let stateWriteQueue = Promise.resolve();
@@ -42,6 +44,7 @@ let workerClearInProgress = false;
 let workerSendCommitInFlight = 0;
 let userBrowserControl = null;
 let userBrowserTransportState = null;
+let userBrowserCommandFlight = null;
 const sessionReconcileCommandIds = new Set();
 
 function freshState() {
@@ -276,7 +279,18 @@ async function pumpUserBrowserControl(state) {
   const control = activeUserBrowserControl();
   if (!control) return false;
   userBrowserTransportState = state;
-  await control.pump();
+  await control.heartbeat();
+  if (!userBrowserCommandFlight) {
+    const flight = control.pump()
+      .catch(async (error) => {
+        await control.revoke().catch(() => {});
+        console.warn('MoonDesk user browser command pump failed:', String(error?.message || error));
+      })
+      .finally(() => {
+        if (userBrowserCommandFlight === flight) userBrowserCommandFlight = null;
+      });
+    userBrowserCommandFlight = flight;
+  }
   return true;
 }
 
@@ -1388,6 +1402,27 @@ function schedulePump(delayMs = FAST_POLL_MS) {
   pumpTimer = setTimeout(() => { void pump(); }, delayMs);
 }
 
+function scheduleUserBrowserPump(delayMs = FAST_POLL_MS) {
+  if (userBrowserPumpTimer) clearTimeout(userBrowserPumpTimer);
+  userBrowserPumpTimer = setTimeout(() => { void userBrowserPump(); }, delayMs);
+}
+
+async function userBrowserPump() {
+  if (userBrowserPumpActive) return;
+  userBrowserPumpActive = true;
+  try {
+    const state = await ensureConnected();
+    await pumpUserBrowserControl(state);
+  } catch (error) {
+    const control = activeUserBrowserControl();
+    if (control) await control.revoke().catch(() => {});
+    console.warn('MoonDesk user browser pump failed:', String(error?.message || error));
+  } finally {
+    userBrowserPumpActive = false;
+    scheduleUserBrowserPump();
+  }
+}
+
 async function pauseInheritedReconciliation(state, offer, clearGeneration) {
   if (clearGeneration !== workerClearGeneration) return true;
   const command = offer?.command;
@@ -1440,12 +1475,8 @@ async function pump() {
   const clearGeneration = workerClearGeneration;
   pumpActive = true;
   let redeemed = 0;
-  let userBrowserChecked = false;
   try {
     const state = await ensureConnected();
-    if (workerClearInProgress || clearGeneration !== workerClearGeneration) return;
-    await pumpUserBrowserControl(state);
-    userBrowserChecked = true;
     if (workerClearInProgress || clearGeneration !== workerClearGeneration) return;
     await collectPresence(state);
     if (workerClearInProgress || clearGeneration !== workerClearGeneration) return;
@@ -1460,13 +1491,6 @@ async function pump() {
       }
     }
   } catch (error) {
-    // Browser-tab authority is ephemeral. If the host failed before this cycle completed the
-    // browser-control policy check, release debugger leases rather than leaving invisible control.
-    // A later Worker-only error must not disturb a tab whose browser policy was already confirmed.
-    if (!userBrowserChecked) {
-      const control = activeUserBrowserControl();
-      if (control) await control.revoke().catch(() => {});
-    }
     // Keep the service worker quiet; popup/status surfaces the actionable connection state.
     console.warn('MoonDesk worker companion pump failed:', String(error?.message || error));
   } finally {
@@ -1488,6 +1512,7 @@ async function pair({ pairingToken }) {
   state.blockedCommands = {};
   await writeState(state);
   schedulePump(50);
+  scheduleUserBrowserPump(50);
   return { paired: true, connected: true, clientId: state.clientId, baseUrl: state.baseUrl };
 }
 
@@ -1813,16 +1838,19 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 chrome.runtime.onInstalled.addListener(() => {
   void chrome.alarms.create(POLL_ALARM, { periodInMinutes: 0.5 });
   schedulePump(200);
+  scheduleUserBrowserPump(200);
   void discoverModelCatalog({ requireExistingPage: true }).catch(() => {});
 });
 chrome.runtime.onStartup.addListener(() => {
   void chrome.alarms.create(POLL_ALARM, { periodInMinutes: 0.5 });
   schedulePump(200);
+  scheduleUserBrowserPump(200);
   void discoverModelCatalog({ requireExistingPage: true }).catch(() => {});
 });
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === POLL_ALARM) {
     void pump();
+    void userBrowserPump();
     void discoverModelCatalog({ requireExistingPage: true }).catch(() => {});
   }
 });
@@ -1846,4 +1874,5 @@ chrome.windows.onFocusChanged.addListener(() => {
 
 void chrome.alarms.create(POLL_ALARM, { periodInMinutes: 0.5 });
 schedulePump(500);
+scheduleUserBrowserPump(500);
 void discoverModelCatalog({ requireExistingPage: true }).catch(() => {});

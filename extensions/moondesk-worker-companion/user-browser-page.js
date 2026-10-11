@@ -3,9 +3,7 @@
 /** Fixed DOM reader/target helper in an isolated world. No extension token enters the page. */
 function browserPage(operation, args) {
   const key = '__moondeskUserBrowserControl';
-  // Inspection must not overwrite another caller's interactive references or overlay.
-  const inspection = operation === 'inspect';
-  let state = inspection ? { refs: new Map(), next: 0, pageId: args.pageId } : globalThis[key];
+  let state = globalThis[key];
   if (!state || state.pageId !== args.pageId) {
     const previous = state;
     const overlay = previous?.overlay?.isConnected ? previous.overlay : null;
@@ -141,18 +139,14 @@ function browserPage(operation, args) {
     return true;
   }
 
-  if (operation === 'snapshot' || inspection) {
+  if (operation === 'snapshot') {
     let root = document.body || document.documentElement;
     if (args.selector) {
       let scopeError;
       try { root = document.querySelector(args.selector); }
       catch { scopeError = 'BROWSER_SELECTOR_INVALID: selector must be valid CSS.'; }
       if (!scopeError && !root) scopeError = 'BROWSER_SELECTOR_NOT_FOUND: the requested subtree is absent. Inspect the page or choose a current selector.';
-      if (scopeError) {
-        // scripting.executeScript does not serialize a thrown page exception as a result.
-        if (inspection) return { error: scopeError };
-        fail(scopeError);
-      }
+      if (scopeError) fail(scopeError);
     }
     // An explicit new snapshot replaces refs, preventing ref reuse after node replacement.
     state.refs.clear();
@@ -219,7 +213,7 @@ function browserPage(operation, args) {
         }
         const matches = !filter || `${role || ''} ${name} ${detail}`.toLocaleLowerCase().includes(filter);
         if (matches || options.some(option => option.toLocaleLowerCase().includes(filter))) {
-          const id = role && !inspection ? `${args.pageId}:${args.frameId}:e${++state.next}` : null;
+          const id = role ? `${args.pageId}:${args.frameId}:e${++state.next}` : null;
           const flags = [node.matches(':disabled,[aria-disabled="true"]') ? 'disabled' : '', node.checked ? 'checked' : '', node.getAttribute('aria-expanded') ? `expanded=${node.getAttribute('aria-expanded')}` : '', document.activeElement === node ? 'focused' : ''].filter(Boolean);
           const value = ['INPUT','TEXTAREA','SELECT'].includes(node.tagName) && node.type !== 'password' ? compact(node.value, 200) : '';
           const href = node.tagName === 'A' ? compact(node.getAttribute('href'), 300) : '';

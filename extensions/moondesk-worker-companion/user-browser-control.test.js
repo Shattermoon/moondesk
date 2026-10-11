@@ -17,7 +17,7 @@ function eventHook() {
   };
 }
 
-function loadControl({ initialTabs = {}, protectedTab = () => false, pendingCommand = null, failCapture = false } = {}) {
+function loadControl({ initialTabs = {}, protectedTab = () => false, pendingCommand = null, failCapture = false, delayFrameTreeMs = 0 } = {}) {
   const tabs = new Map(Object.entries(initialTabs).map(([id, tab]) => [Number(id), { id: Number(id), ...tab }]));
   let nextTabId = Math.max(100, ...tabs.keys()) + 1;
   let sessionStore = {};
@@ -71,6 +71,7 @@ function loadControl({ initialTabs = {}, protectedTab = () => false, pendingComm
       async sendCommand(target, method, params = {}) {
         debuggerCommands.push({ target, method, params });
         if (method === 'Page.getFrameTree') {
+          if (delayFrameTreeMs > 0) await new Promise(resolve => setTimeout(resolve, delayFrameTreeMs));
           const tab = tabs.get(target.tabId);
           return { frameTree: { frame: { id: `frame-${target.tabId}`, url: tab?.url || 'about:blank' }, childFrames: [] } };
         }
@@ -163,6 +164,59 @@ test('protected ChatGPT tabs refuse interactive attachment before debugger owner
   assert.deepEqual(env.attachCalls, []);
 });
 
+test('unattached DOM inspection path is not shipped around protected-tab ownership checks', () => {
+  assert.doesNotMatch(controlSource, /async function inspect\(/);
+  assert.doesNotMatch(pageSource, /operation === ['"]inspect['"]/);
+});
+
+test('network diagnostics retain request body size but never raw POST data', async () => {
+  const secretBody = 'username=alice&password=correct-horse-battery-staple';
+  const env = loadControl({
+    initialTabs: { 6: { url: 'https://example.com/login', title: 'Login', active: false, pinned: false, status: 'complete' } }
+  });
+  await env.control.pump();
+  await env.control.execute(env.command('browser_tabs', { action: 'attach', tabId: 6 }));
+  await env.control.event(
+    { tabId: 6 },
+    'Network.requestWillBeSent',
+    {
+      requestId: 'request-1',
+      request: {
+        url: 'https://example.com/session',
+        method: 'POST',
+        headers: { 'content-type': 'application/x-www-form-urlencoded' },
+        postData: secretBody
+      },
+      type: 'Fetch',
+      timestamp: 10
+    }
+  );
+  const result = await env.control.execute(
+    env.command('browser_network', { tabId: 6, requestId: 'main:request-1' })
+  );
+  assert.equal(result.value.postDataBytes, new TextEncoder().encode(secretBody).length);
+  assert.equal(Object.hasOwn(result.value, 'postData'), false);
+  assert.doesNotMatch(JSON.stringify(result), /correct-horse-battery-staple/);
+});
+
+test('snapshot CDP reads stop at the broker command deadline instead of continuing in the background', async () => {
+  const env = loadControl({
+    initialTabs: { 7: { url: 'https://example.com/', title: 'Example', active: false, pinned: false, status: 'complete' } },
+    delayFrameTreeMs: 20
+  });
+  await env.control.pump();
+  await env.control.execute(env.command('browser_tabs', { action: 'attach', tabId: 7 }));
+  const expiring = {
+    ...env.command('browser_snapshot', { tabId: 7 }),
+    expiresAt: Date.now() + 5
+  };
+  await assert.rejects(
+    env.control.execute(expiring),
+    /BROWSER_(?:CDP_TIMEOUT|EXPIRED)/
+  );
+  assert.ok(env.detachCalls.includes(7), 'an expired in-flight CDP read must retire debugger custody');
+});
+
 test('eligible tab attach injects the lightweight animated aurora glow, enforces one owner, and release detaches', async () => {
   const env = loadControl({
     initialTabs: { 2: { url: 'https://example.com/', title: 'Example', active: false, pinned: false, status: 'complete' } }
@@ -197,7 +251,7 @@ test('eligible tab attach injects the lightweight animated aurora glow, enforces
   const overlayCountBeforeHeartbeat = env.debuggerCommands.filter(entry =>
     entry.method === 'Runtime.evaluate' && entry.params.expression?.includes('#3984ff')
   ).length;
-  await env.control.pump();
+  await env.control.heartbeat();
   const overlayCountAfterHeartbeat = env.debuggerCommands.filter(entry =>
     entry.method === 'Runtime.evaluate' && entry.params.expression?.includes('#3984ff')
   ).length;

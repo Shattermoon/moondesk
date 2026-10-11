@@ -65,7 +65,7 @@ pub const COMPANION_USER_BROWSER_ROUTE: &str = "/__moondesk/companion/v1/browser
 pub const COMPANION_TOKEN_HEADER: &str = "x-moondesk-companion-token";
 // Bump with any shipped companion runtime change that requires Chromium to load new bytes. Keep
 // this aligned with COMPANION_RUNTIME_REVISION in background.js.
-pub const COMPANION_RUNTIME_REVISION: u32 = 10;
+pub const COMPANION_RUNTIME_REVISION: u32 = 18;
 const MAX_COMPANION_BODY_BYTES: usize = 16 * 1024;
 const MAX_COMPANION_USER_BROWSER_BODY_BYTES: usize = 2 * 1024 * 1024;
 
@@ -6188,8 +6188,15 @@ document.getElementById('hidden-upload').addEventListener('change',event=>{docum
 
         let owner = "d".repeat(64);
         let deadline = tokio::time::Instant::now() + Duration::from_secs(15 * 60);
+        let mut last_browser_snapshot = String::new();
         let browser = loop {
             let browsers = broker.browsers().await;
+            let snapshot =
+                serde_json::to_string(&browsers).expect("serialize user-browser E2E clients");
+            if snapshot != last_browser_snapshot {
+                println!("MOONDESK_USER_BROWSER_E2E_CLIENTS={snapshot}");
+                last_browser_snapshot = snapshot;
+            }
             if let Some(browser) = browsers.into_iter().find(|browser| browser.enabled) {
                 break browser;
             }
@@ -6390,6 +6397,155 @@ document.getElementById('hidden-upload').addEventListener('change',event=>{docum
         )
         .expect("write released E2E status");
         println!("MOONDESK_USER_BROWSER_E2E_RELEASED=true");
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "manual interactive user-browser Companion driver"]
+    async fn user_browser_manual_driver_host() {
+        use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+        use std::time::Duration;
+
+        let repo_root = std::env::current_dir().expect("resolve user-browser driver repo root");
+        let runtime_root = repo_root.join("target").join("user-browser-driver");
+        let config_root = runtime_root.join("config");
+        let controls = runtime_root.join("controls");
+        std::fs::create_dir_all(&config_root).expect("create user-browser driver config root");
+        std::fs::create_dir_all(&controls).expect("create user-browser driver controls");
+        for name in ["request.json", "response.json", "browser.json", "stop"] {
+            let _ = std::fs::remove_file(controls.join(name));
+        }
+
+        let config_path = config_root.join("config.toml");
+        let app = AppState::new_for_test(
+            3201,
+            repo_root.to_string_lossy().into_owned(),
+            config_path.clone(),
+        )
+        .expect("create user-browser driver app state");
+        let installation_token = app.companion_auth.installation_token().to_string();
+        let install =
+            crate::companion_install::materialize_for_config(&config_path, &installation_token)
+                .expect("materialize user-browser driver Companion");
+        let broker = app.companion_auth.user_browser_broker();
+        let app_state = Arc::new(Mutex::new(app));
+        let (ui_tx, _ui_rx) = ui_event_channel();
+        let driver_router = companion_bridge_router(
+            app_state,
+            None,
+            CommandJobManager::new(),
+            ui_tx,
+            Arc::from("unused-host-token"),
+        );
+        let mut bound = None;
+        for port in COMPANION_BRIDGE_PORTS {
+            if let Ok(listener) = tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
+                bound = Some((port, listener));
+                break;
+            }
+        }
+        let (bridge_port, listener) = bound.expect("bind user-browser driver bridge");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, driver_router)
+                .await
+                .expect("serve user-browser driver bridge");
+        });
+
+        println!("MOONDESK_USER_BROWSER_DRIVER_READY=http://127.0.0.1:{bridge_port}");
+        println!(
+            "MOONDESK_USER_BROWSER_DRIVER_EXTENSION={}",
+            install.directory.display()
+        );
+        println!(
+            "MOONDESK_USER_BROWSER_DRIVER_CONTROLS={}",
+            controls.display()
+        );
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30 * 60);
+        let browser = loop {
+            let browsers = broker.browsers().await;
+            if let Some(browser) = browsers.into_iter().find(|browser| browser.enabled) {
+                break browser;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for debug Companion browser"
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        };
+        std::fs::write(
+            controls.join("browser.json"),
+            serde_json::to_vec_pretty(&browser).expect("serialize driver browser"),
+        )
+        .expect("write driver browser state");
+        println!(
+            "MOONDESK_USER_BROWSER_DRIVER_BROWSER={}",
+            browser.browser_id
+        );
+
+        let mut last_request_id = String::new();
+        while tokio::time::Instant::now() < deadline && !controls.join("stop").exists() {
+            let request_path = controls.join("request.json");
+            let request = std::fs::read(&request_path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
+            let Some(request) = request else {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            };
+            let request_id = request
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            if request_id.is_empty() || request_id == last_request_id {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+            last_request_id = request_id.clone();
+            let owner = request
+                .get("owner")
+                .and_then(Value::as_str)
+                .unwrap_or("dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd");
+            let tool = request
+                .get("tool")
+                .and_then(Value::as_str)
+                .expect("driver request tool");
+            let args = request.get("args").cloned().unwrap_or_else(|| json!({}));
+            let mut response = match broker.execute(&browser.browser_id, owner, tool, args).await {
+                Ok(result) => result,
+                Err(error) => json!({ "error": error }),
+            };
+            if let Some(data) = response.pointer("/image/data").and_then(Value::as_str)
+                && let Ok(bytes) = BASE64_STANDARD.decode(data)
+            {
+                let image_path = controls.join(format!("{request_id}.jpg"));
+                if std::fs::write(&image_path, bytes).is_ok() {
+                    if let Some(object) = response.as_object_mut() {
+                        object.insert(
+                            "debugImagePath".to_string(),
+                            Value::String(image_path.to_string_lossy().into_owned()),
+                        );
+                    }
+                }
+            }
+            let temporary = controls.join("response.json.tmp");
+            std::fs::write(
+                &temporary,
+                serde_json::to_vec_pretty(&json!({
+                    "id": request_id,
+                    "browserId": browser.browser_id,
+                    "result": response
+                }))
+                .expect("serialize driver response"),
+            )
+            .expect("write driver response temp");
+            std::fs::rename(&temporary, controls.join("response.json"))
+                .expect("publish driver response");
+            println!("MOONDESK_USER_BROWSER_DRIVER_RESULT={last_request_id}");
+        }
+
         server.abort();
         let _ = server.await;
     }

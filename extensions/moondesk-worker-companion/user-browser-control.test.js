@@ -17,7 +17,7 @@ function eventHook() {
   };
 }
 
-function loadControl({ initialTabs = {}, protectedTab = () => false, pendingCommand = null } = {}) {
+function loadControl({ initialTabs = {}, protectedTab = () => false, pendingCommand = null, failCapture = false } = {}) {
   const tabs = new Map(Object.entries(initialTabs).map(([id, tab]) => [Number(id), { id: Number(id), ...tab }]));
   let nextTabId = Math.max(100, ...tabs.keys()) + 1;
   let sessionStore = {};
@@ -77,6 +77,14 @@ function loadControl({ initialTabs = {}, protectedTab = () => false, pendingComm
         if (method === 'Page.createIsolatedWorld') return { executionContextId: 42 };
         if (method === 'Runtime.evaluate') return { result: { value: true } };
         if (method === 'Page.getNavigationHistory') return { currentIndex: 0, entries: [{ id: 1, url: tabs.get(target.tabId)?.url || 'about:blank' }] };
+        if (method === 'Page.getLayoutMetrics') return {
+          cssVisualViewport: { pageX: 0, pageY: 0, clientWidth: 1200, clientHeight: 800, scale: 1 },
+          cssContentSize: { x: 0, y: 0, width: 1200, height: 2400 }
+        };
+        if (method === 'Page.captureScreenshot') {
+          if (failCapture) throw new Error('capture failed');
+          return { data: 'ZmFrZQ==' };
+        }
         return {};
       }
     }
@@ -155,7 +163,7 @@ test('protected ChatGPT tabs refuse interactive attachment before debugger owner
   assert.deepEqual(env.attachCalls, []);
 });
 
-test('eligible tab attach injects the blue glow, enforces one owner, and release detaches', async () => {
+test('eligible tab attach injects the lightweight animated aurora glow, enforces one owner, and release detaches', async () => {
   const env = loadControl({
     initialTabs: { 2: { url: 'https://example.com/', title: 'Example', active: false, pinned: false, status: 'complete' } }
   });
@@ -164,17 +172,34 @@ test('eligible tab attach injects the blue glow, enforces one owner, and release
   assert.equal(attached.value.tabId, 2);
   assert.equal(attached.value.attached, true);
   assert.deepEqual(env.attachCalls, [2]);
-  const overlayEval = env.debuggerCommands.find(entry => entry.method === 'Runtime.evaluate' && entry.params.expression?.includes('#3984ff99'));
+  const overlayEval = env.debuggerCommands.find(entry => entry.method === 'Runtime.evaluate' && entry.params.expression?.includes('#3984ff'));
   assert.ok(overlayEval, 'attach must inject the visible blue controlled-tab glow');
   assert.match(overlayEval.params.expression, /data-moondesk-browser-control/);
+  assert.match(overlayEval.params.expression, /#3984ff/);
+  assert.match(overlayEval.params.expression, /#7c3aed/);
+  assert.match(overlayEval.params.expression, /#ec4899/);
+  assert.match(overlayEval.params.expression, /#f59e0b/);
+  assert.match(overlayEval.params.expression, /md-flow-x/);
+  assert.match(overlayEval.params.expression, /md-flow-y/);
+  assert.match(overlayEval.params.expression, /md-breathe/);
+  assert.match(overlayEval.params.expression, /md-bloom/);
+  assert.match(overlayEval.params.expression, /md-corner-pulse/);
+  assert.match(overlayEval.params.expression, /height:14px/);
+  assert.match(overlayEval.params.expression, /width:14px/);
+  assert.match(overlayEval.params.expression, /top:-11px/);
+  assert.match(overlayEval.params.expression, /left:-11px/);
+  assert.match(overlayEval.params.expression, /filter:blur\(6px\)/);
+  assert.match(overlayEval.params.expression, /prefers-reduced-motion/);
+  const overlaySource = pageSource.match(/if \(operation === 'overlay'\) \{([\s\S]*?)if \(operation === 'removeOverlay'\)/)?.[1] || '';
+  assert.doesNotMatch(overlaySource, /requestAnimationFrame|canvas/i, 'glow must stay CSS-only and lightweight');
   assert.match(overlayEval.params.expression, /overlayTimer/);
   assert.match(overlayEval.params.expression, /6000/);
   const overlayCountBeforeHeartbeat = env.debuggerCommands.filter(entry =>
-    entry.method === 'Runtime.evaluate' && entry.params.expression?.includes('#3984ff99')
+    entry.method === 'Runtime.evaluate' && entry.params.expression?.includes('#3984ff')
   ).length;
   await env.control.pump();
   const overlayCountAfterHeartbeat = env.debuggerCommands.filter(entry =>
-    entry.method === 'Runtime.evaluate' && entry.params.expression?.includes('#3984ff99')
+    entry.method === 'Runtime.evaluate' && entry.params.expression?.includes('#3984ff')
   ).length;
   assert.ok(overlayCountAfterHeartbeat > overlayCountBeforeHeartbeat, 'active control must refresh the self-expiring glow lease');
 
@@ -186,6 +211,54 @@ test('eligible tab attach injects the blue glow, enforces one owner, and release
   assert.equal(released.value.released, true);
   assert.deepEqual(env.detachCalls, [2]);
   assert.ok(env.debuggerCommands.some(entry => entry.method === 'Runtime.evaluate' && entry.params.expression?.includes('node.remove')));
+});
+
+test('browser screenshot hides the human-only control glow before capture and restores it afterward', async () => {
+  const env = loadControl({
+    initialTabs: { 4: { url: 'https://example.com/', title: 'Example', active: false, pinned: false, status: 'complete' } }
+  });
+  await env.control.pump();
+  await env.control.execute(env.command('browser_tabs', { action: 'attach', tabId: 4 }));
+  const start = env.debuggerCommands.length;
+  const shot = await env.control.execute(env.command('browser_screenshot', { tabId: 4, fullPage: false }));
+  assert.equal(shot.value.width, 1200);
+  assert.equal(shot.value.height, 800);
+
+  const suspend = env.debuggerCommands.findIndex((entry, index) =>
+    index >= start && entry.method === 'Runtime.evaluate' && entry.params.expression?.includes('("suspendOverlay",')
+  );
+  const capture = env.debuggerCommands.findIndex((entry, index) => index >= start && entry.method === 'Page.captureScreenshot');
+  const resume = env.debuggerCommands.findIndex((entry, index) =>
+    index >= start && entry.method === 'Runtime.evaluate' && entry.params.expression?.includes('("resumeOverlay",')
+  );
+  assert.ok(suspend >= start, 'screenshot must suspend the human-only glow');
+  assert.ok(capture > suspend, 'capture must happen only after the glow is hidden');
+  assert.ok(resume > capture, 'glow must be restored after capture');
+  assert.match(pageSource, /overlayCaptureDepth/);
+  assert.match(pageSource, /visibility', 'hidden'/);
+  assert.match(pageSource, /getComputedStyle\(host\)\.visibility !== 'hidden'/);
+  assert.doesNotMatch(pageSource.match(/if \(operation === 'suspendOverlay'\) \{([\s\S]*?)if \(operation === 'resumeOverlay'\)/)?.[1] || '', /requestAnimationFrame|setTimeout/, 'screenshot suspension must not depend on throttled animation timers');
+});
+
+test('failed browser screenshot still restores the human-only control glow', async () => {
+  const env = loadControl({
+    initialTabs: { 5: { url: 'https://example.com/', title: 'Example', active: false, pinned: false, status: 'complete' } },
+    failCapture: true
+  });
+  await env.control.pump();
+  await env.control.execute(env.command('browser_tabs', { action: 'attach', tabId: 5 }));
+  const start = env.debuggerCommands.length;
+  await assert.rejects(
+    env.control.execute(env.command('browser_screenshot', { tabId: 5, fullPage: false })),
+    /capture failed/
+  );
+  const capture = env.debuggerCommands.findIndex((entry, index) => index >= start && entry.method === 'Page.captureScreenshot');
+  const resume = env.debuggerCommands.findIndex((entry, index) =>
+    index >= start && entry.method === 'Runtime.evaluate' && entry.params.expression?.includes('("resumeOverlay",')
+  );
+  assert.ok(capture >= start, 'capture should have been attempted');
+  assert.ok(resume > capture, 'finally must restore the glow after capture failure');
+  assert.deepEqual(env.detachCalls, []);
 });
 
 test('lost browser-control bridge revokes debugger custody instead of leaving invisible control', async () => {

@@ -412,11 +412,23 @@ function createBrowserControl(chrome, transport, protectedTab = () => false) {
     if (!(rect.width > 0 && rect.height > 0) || rect.width > 100000 || rect.height > 100000) error('BROWSER_CAPTURE_DIMENSIONS');
     const scale = Math.min(1,1600/Math.max(rect.width,rect.height));
     const width = Math.round(rect.width*scale),height = Math.round(rect.height*scale);
-    const result = await send(state,'Page.captureScreenshot',{format:'jpeg',quality:80,fromSurface:true,captureBeyondViewport:args.fullPage === true,clip:{...rect,scale}},undefined,command);
-    if (state.pageId !== pageId) error('BROWSER_PAGE_STALE: screenshot crossed navigation.');
-    if (!result.data || result.data.length > 1_600_000) error('BROWSER_SCREENSHOT_TOO_LARGE');
-    const shot = {id:id(),pageId,width,height,scale,viewport,fullPage:args.fullPage === true}; state.screenshot = shot;
-    return { value:{tabId:handle(state.tabId),pageId,screenshotId:shot.id,width,height,scale,fullPage:shot.fullPage},image:{mimeType:'image/jpeg',data:result.data} };
+    let restoreOverlay = false;
+    try {
+      // The ownership glow is a human trust signal, not page content. Hide only MoonDesk's
+      // isolated-world overlay for the frame captured by ChatGPT, force the hidden style to
+      // resolve synchronously, then restore it. This stays safe on throttled background tabs.
+      restoreOverlay = true;
+      await page(state,'suspendOverlay',{},command);
+      const result = await send(state,'Page.captureScreenshot',{format:'jpeg',quality:80,fromSurface:true,captureBeyondViewport:args.fullPage === true,clip:{...rect,scale}},undefined,command);
+      if (state.pageId !== pageId) error('BROWSER_PAGE_STALE: screenshot crossed navigation.');
+      if (!result.data || result.data.length > 1_600_000) error('BROWSER_SCREENSHOT_TOO_LARGE');
+      const shot = {id:id(),pageId,width,height,scale,viewport,fullPage:args.fullPage === true}; state.screenshot = shot;
+      return { value:{tabId:handle(state.tabId),pageId,screenshotId:shot.id,width,height,scale,fullPage:shot.fullPage},image:{mimeType:'image/jpeg',data:result.data} };
+    } finally {
+      // Cleanup is not tied to the request deadline. If custody was revoked while capture was
+      // in flight, release already removed the overlay and this guard prevents re-creating it.
+      if (restoreOverlay && tabs.get(state.tabId) === state) await page(state,'resumeOverlay').catch(() => {});
+    }
   }
   async function diagnostics(state,tool,args) {
     const network = tool === 'browser_network';

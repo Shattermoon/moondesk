@@ -7,8 +7,16 @@ function browserPage(operation, args) {
   const inspection = operation === 'inspect';
   let state = inspection ? { refs: new Map(), next: 0, pageId: args.pageId } : globalThis[key];
   if (!state || state.pageId !== args.pageId) {
-    const overlay = state?.overlay?.isConnected ? state.overlay : null;
-    state = globalThis[key] = { pageId: args.pageId, refs: new Map(), next: 0, overlay };
+    const previous = state;
+    const overlay = previous?.overlay?.isConnected ? previous.overlay : null;
+    state = globalThis[key] = {
+      pageId: args.pageId,
+      refs: new Map(),
+      next: 0,
+      overlay,
+      overlayTimer: overlay ? previous?.overlayTimer || null : null,
+      overlayCaptureDepth: overlay ? previous?.overlayCaptureDepth || 0 : 0
+    };
   }
   const compact = (value, max = 200) => String(value ?? '').slice(0, max * 4).replace(/\s+/g, ' ').trim().slice(0, max);
   const textOf = (element, excludeControls = false) => {
@@ -54,21 +62,83 @@ function browserPage(operation, args) {
       }, 6000);
     };
     if (state.overlay?.isConnected) {
-      expire(state.overlay);
+      if (!(state.overlayCaptureDepth > 0)) expire(state.overlay);
       return true;
     }
     const host = document.createElement('div');
     host.setAttribute('data-moondesk-browser-control', args.lease);
     host.style.cssText = 'all:initial!important;position:fixed!important;inset:0!important;pointer-events:none!important;z-index:2147483647!important;display:block!important;';
     const shadow = host.attachShadow({ mode: 'closed' });
-    const glow = document.createElement('div');
-    glow.style.cssText = 'position:fixed;inset:0;box-shadow:inset 0 0 20px #3984ff99,inset 0 0 52px #3984ff55;pointer-events:none;';
-    shadow.append(glow); document.documentElement.append(host); state.overlay = host; expire(host);
+    const style = document.createElement('style');
+    style.textContent = `
+      :host{all:initial}
+      .frame{position:fixed;inset:0;overflow:hidden;pointer-events:none;box-shadow:inset 0 0 28px 4px #3984ff61,inset 0 0 54px 6px rgba(124,58,237,.22),inset 0 0 80px 8px rgba(236,72,153,.12),inset 0 0 110px 10px rgba(139,92,246,.07);animation:md-breathe 5s ease-in-out infinite}
+      .frame::after{content:"";position:absolute;inset:0;background:radial-gradient(ellipse 45% 45% at 0% 0%,#3984ff38,rgba(124,58,237,.10) 40%,transparent 70%),radial-gradient(ellipse 45% 45% at 100% 0%,rgba(139,92,246,.20),rgba(217,70,239,.10) 40%,transparent 70%),radial-gradient(ellipse 45% 45% at 100% 100%,rgba(236,72,153,.18),rgba(245,158,11,.08) 40%,transparent 70%),radial-gradient(ellipse 45% 45% at 0% 100%,rgba(37,99,235,.18),rgba(251,191,36,.07) 40%,transparent 70%);animation:md-bloom 7s ease-in-out infinite alternate}
+      .edge{position:absolute;pointer-events:none;will-change:background-position;filter:blur(6px);opacity:.76}
+      .top,.bottom{left:-8px;right:-8px;height:14px;background:linear-gradient(90deg,#2563ebc7,#3984ffe0,#7c3aedc7,#8b5cf6c7,#d946efbd,#ec4899b8,#f59e0baa,#fbbf24a6,#3984ffe0,#2563ebc7);background-size:300% 100%;animation:md-flow-x 6s linear infinite}
+      .top{top:-11px;box-shadow:0 8px 20px 7px #3984ff66,0 13px 38px 11px rgba(124,58,237,.22),0 18px 58px 14px rgba(236,72,153,.10)}.bottom{bottom:-11px;animation-direction:reverse;box-shadow:0 -8px 20px 7px #3984ff66,0 -13px 38px 11px rgba(124,58,237,.22),0 -18px 58px 14px rgba(236,72,153,.10)}
+      .left,.right{top:-8px;bottom:-8px;width:14px;background:linear-gradient(180deg,#2563ebc7,#3984ffe0,#7c3aedc7,#8b5cf6c7,#d946efbd,#ec4899b8,#f59e0baa,#fbbf24a6,#3984ffe0,#2563ebc7);background-size:100% 300%;animation:md-flow-y 6.8s linear infinite}
+      .left{left:-11px;animation-direction:reverse;box-shadow:8px 0 20px 7px #3984ff66,13px 0 38px 11px rgba(124,58,237,.22),18px 0 58px 14px rgba(236,72,153,.10)}.right{right:-11px;box-shadow:-8px 0 20px 7px #3984ff66,-13px 0 38px 11px rgba(124,58,237,.22),-18px 0 58px 14px rgba(236,72,153,.10)}
+      .corner{position:absolute;width:80px;height:80px;border-radius:50%;pointer-events:none;animation:md-corner-pulse 5.5s ease-in-out infinite alternate}
+      .tl{top:-20px;left:-20px;background:radial-gradient(circle,#3984ff52,rgba(124,58,237,.16) 50%,transparent 75%)}
+      .tr{top:-20px;right:-20px;background:radial-gradient(circle,rgba(139,92,246,.30),rgba(217,70,239,.14) 50%,transparent 75%);animation-delay:-1.4s}
+      .br{bottom:-20px;right:-20px;background:radial-gradient(circle,rgba(236,72,153,.28),rgba(245,158,11,.10) 50%,transparent 75%);animation-delay:-2.8s}
+      .bl{bottom:-20px;left:-20px;background:radial-gradient(circle,rgba(37,99,235,.30),rgba(251,191,36,.10) 50%,transparent 75%);animation-delay:-4.2s}
+      @keyframes md-flow-x{to{background-position:300% 0}}
+      @keyframes md-flow-y{to{background-position:0 300%}}
+      @keyframes md-breathe{0%,100%{opacity:.75}50%{opacity:1}}
+      @keyframes md-bloom{0%{opacity:.55}50%{opacity:.90}100%{opacity:.65}}
+      @keyframes md-corner-pulse{0%{opacity:.5;transform:scale(.85)}50%{opacity:.95;transform:scale(1.1)}100%{opacity:.6;transform:scale(.9)}}
+      @media(prefers-reduced-motion:reduce){.frame,.frame::after,.edge,.corner{animation:none!important}}
+    `;
+    const frame = document.createElement('div');
+    frame.className = 'frame';
+    for (const side of ['top','right','bottom','left']) {
+      const edge = document.createElement('div');
+      edge.className = `edge ${side}`;
+      frame.append(edge);
+    }
+    for (const pos of ['tl','tr','br','bl']) {
+      const corner = document.createElement('div');
+      corner.className = `corner ${pos}`;
+      frame.append(corner);
+    }
+    shadow.append(style, frame); document.documentElement.append(host); state.overlay = host; expire(host);
     return true;
   }
   if (operation === 'removeOverlay') {
     if (state.overlayTimer) clearTimeout(state.overlayTimer);
-    state.overlayTimer = null; state.overlay?.remove(); state.overlay = null; return true;
+    state.overlayTimer = null;
+    state.overlayCaptureDepth = 0;
+    state.overlay?.remove();
+    state.overlay = null;
+    return true;
+  }
+  if (operation === 'suspendOverlay') {
+    const host = state.overlay?.isConnected ? state.overlay : null;
+    if (!host) return false;
+    state.overlayCaptureDepth = (state.overlayCaptureDepth || 0) + 1;
+    if (state.overlayCaptureDepth > 1) return true;
+    if (state.overlayTimer) clearTimeout(state.overlayTimer);
+    state.overlayTimer = null;
+    host.style.setProperty('visibility', 'hidden', 'important');
+    if (getComputedStyle(host).visibility !== 'hidden') fail('BROWSER_OVERLAY_SUSPEND_FAILED');
+    return true;
+  }
+  if (operation === 'resumeOverlay') {
+    state.overlayCaptureDepth = Math.max(0, (state.overlayCaptureDepth || 0) - 1);
+    const host = state.overlay?.isConnected ? state.overlay : null;
+    if (!host || state.overlayCaptureDepth > 0) return true;
+    host.style.removeProperty('visibility');
+    if (state.overlayTimer) clearTimeout(state.overlayTimer);
+    state.overlayTimer = setTimeout(() => {
+      if (state.overlay === host && !(state.overlayCaptureDepth > 0)) {
+        host.remove();
+        state.overlay = null;
+      }
+      state.overlayTimer = null;
+    }, 6000);
+    return true;
   }
 
   if (operation === 'snapshot' || inspection) {

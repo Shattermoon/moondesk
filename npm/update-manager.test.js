@@ -233,6 +233,22 @@ Context that belongs on the release page but not in the terminal changelog.
   ]);
 });
 
+test("wrapped structured bullets are joined without promoting nested bullets", () => {
+  const notes = normalizeReleaseNotes(`## Changelog
+
+- Fixed Windows updates when
+  the global npm prefix contains spaces.
+  - Nested technical detail.
+- Added recovery.
+
+## Pull requests
+- #1`);
+  assert.deepEqual(notes, [
+    "Fixed Windows updates when the global npm prefix contains spaces.",
+    "Added recovery.",
+  ]);
+});
+
 test("structured internal-only release notes stay out of the update changelog", () => {
   const notes = normalizeReleaseNotes(`## Changelog
 

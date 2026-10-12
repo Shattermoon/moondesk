@@ -123,6 +123,9 @@ export function validateChangelog(body) {
   if (changelog === NO_USER_VISIBLE_CHANGELOG) {
     return changelog;
   }
+  if (changelog.split("\n").some((line) => line.trim() === NO_USER_VISIBLE_CHANGELOG)) {
+    throw new Error("The internal-only changelog marker must be the entire changelog section.");
+  }
 
   const lines = changelog.split("\n");
   const records = markdownLineRecords(lines);
@@ -153,10 +156,17 @@ export function releaseMetadataFingerprint(pr) {
 }
 
 export function renderReleaseNotes(pr, options) {
+  return renderReleaseNotesBatch([pr], options);
+}
+
+export function renderReleaseNotesBatch(prs, options) {
+  if (!Array.isArray(prs) || prs.length === 0) throw new Error("At least one release PR is required.");
+  const pr = prs[0];
   if (!pr || typeof pr !== "object") {
     throw new Error("Pull request JSON is required.");
   }
-  const changelog = validateChangelog(pr.body ?? "");
+  const changelog = prs.map((item) => validateChangelog(item.body ?? ""))
+    .filter((part) => part !== NO_USER_VISIBLE_CHANGELOG).join("\n\n") || NO_USER_VISIBLE_CHANGELOG;
   const number = Number(pr.number);
   if (!Number.isInteger(number) || number <= 0) {
     throw new Error("Pull request number is missing or invalid.");
@@ -174,25 +184,19 @@ export function renderReleaseNotes(pr, options) {
     throw new Error("Release tag must use vX.Y.Z form.");
   }
 
-  const prUrl =
-    typeof pr.html_url === "string" && pr.html_url.startsWith("https://")
-      ? pr.html_url
-      : `https://github.com/${repository}/pull/${number}`;
-  const author =
-    typeof pr.user?.login === "string" && pr.user.login.trim()
-      ? ` by @${pr.user.login.trim()}`
-      : "";
-  const linkTitle = title.replace(/\\/g, "\\\\").replace(/\[/g, "\\[").replace(/\]/g, "\\]");
-
-  const lines = [
-    "## Changelog",
-    "",
-    changelog,
-    "",
-    "## Pull request",
-    "",
-    `- [#${number} ${linkTitle}](${prUrl})${author}`,
-  ];
+  const links = prs.map((item) => {
+    const itemNumber = Number(item.number);
+    if (!Number.isInteger(itemNumber) || itemNumber <= 0) throw new Error("Invalid release PR number.");
+    const itemTitle = String(item.title ?? "").trim();
+    if (!itemTitle) throw new Error("Pull request title is missing.");
+    const itemUrl = typeof item.html_url === "string" && item.html_url.startsWith("https://")
+      ? item.html_url : `https://github.com/${repository}/pull/${itemNumber}`;
+    const itemAuthor = typeof item.user?.login === "string" && item.user.login.trim()
+      ? ` by @${item.user.login.trim()}` : "";
+    const safeTitle = itemTitle.replaceAll("[", "\\[").replaceAll("]", "\\]");
+    return `- [#${itemNumber} ${safeTitle}](${itemUrl})${itemAuthor}`;
+  });
+  const lines = ["## Changelog", "", changelog, "", "## Pull requests", "", ...links];
 
   const previousTag = String(options.previousTag ?? "").trim();
   if (previousTag) {

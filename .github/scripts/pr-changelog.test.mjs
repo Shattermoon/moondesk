@@ -96,6 +96,13 @@ test("requires release-note bullets or the explicit internal-only sentence", () 
   );
 });
 
+test("rejects internal-only sentinel mixed with visible bullets", () => {
+  assert.throws(
+    () => validateChangelog("## Changelog\n\nNo user-visible changelog.\n- A user-visible fix"),
+    /internal-only changelog marker/,
+  );
+});
+
 test("renders release notes from the PR changelog with PR and comparison links", () => {
   const notes = renderReleaseNotes(
     {

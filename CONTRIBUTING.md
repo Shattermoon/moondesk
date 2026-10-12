@@ -31,7 +31,7 @@ Some optional integration tests require platform-specific software:
 - Windows tests may require PowerShell and standard developer tools.
 - Prebuilt Linux releases target x64/arm64 glibc systems with glibc 2.34 or newer. The npm bootstrap rejects musl/older-glibc hosts before download, and the release matrix rejects Linux binaries whose GLIBC symbol requirement rises above 2.34.
 - Browser tests can use MoonDesk's managed Chrome for Testing runtime. On first browser use MoonDesk downloads the pinned platform artifact, verifies its exact size and SHA-256, records a verified inventory of the installed browser files, installs it atomically into MoonDesk's browser cache, and then revalidates that inventory before reuse so missing or damaged support files trigger reprovisioning.
-- Browser control is native Rust CDP: MoonDesk owns Chromium directly, connects to its browser-level DevTools WebSocket, and starts the runtime lazily on the first browser operation rather than during host startup.
+- Managed `browser_*` control is native Rust CDP: MoonDesk owns Chromium directly, connects to its browser-level DevTools WebSocket, and starts the runtime lazily on the first browser operation rather than during host startup. The optional `user_browser_*` surface is deliberately separate: it uses the locally installed Companion extension plus Chromium's `debugger` API to lease exact tabs from the user's existing browser without turning that profile into MoonDesk's managed browser runtime.
 - Running MoonDesk end-to-end through a public MCP endpoint requires ngrok configuration.
 
 ## Getting the repository running
@@ -195,7 +195,7 @@ A single MoonDesk host can serve multiple workspace endpoints. A change in one w
 - connection/runtime state;
 - normal per-workspace quotas/history.
 
-Browser control is intentionally shared by the host and should remain clearly distinguished from workspace-local state. Keep its MCP surface stable: browser availability or runtime state must not dynamically add/remove raw DevTools tool schemas.
+The managed browser runtime is intentionally shared by the host and should remain clearly distinguished from workspace-local state. Keep its MCP surface stable: browser availability or runtime state must not dynamically add/remove raw DevTools tool schemas. `user_browser_*` is a different authority plane and must stay explicit, Companion-backed, exact-conversation-owned, and brokered through browser-incarnation-bound tab handles rather than reusing managed-browser page IDs or treating an extension-attached personal tab as part of a workspace BrowserContext.
 
 ### Process lifecycle
 

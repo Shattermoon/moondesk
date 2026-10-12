@@ -932,6 +932,15 @@ impl BrowserRuntime {
         upstream_page_id: u64,
     ) -> Result<(), String> {
         let runtime = self.runtime.lock().await;
+        if let Some(logical) = runtime.routing.sessions.get(session)
+            && logical.pages.len() <= 1
+            && logical
+                .pages
+                .values()
+                .any(|page| page.upstream_id == upstream_page_id)
+        {
+            return Err("The last open page cannot be closed".to_string());
+        }
         if runtime.routing.active_trace.as_ref().is_some_and(|active| {
             active.owner == *session && active.upstream_page_id == upstream_page_id
         }) {
@@ -2165,6 +2174,8 @@ impl PreparedBrowserInvocation {
 fn browser_path_flag_kind(command: &str, flag: &str) -> Option<BrowserPathKind> {
     match (command, flag) {
         ("evaluate_script", "filepath")
+        | ("get_network_request", "requestfilepath")
+        | ("get_network_request", "responsefilepath")
         | ("performance_start_trace", "filepath")
         | ("performance_stop_trace", "filepath")
         | ("take_screenshot", "filepath")
@@ -2952,6 +2963,51 @@ mod tests {
             102
         );
         assert!(runtime.owned_upstream_page_id(&chat_b, 2).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn close_page_refuses_the_last_logical_page() {
+        let runtime = BrowserRuntime::standalone();
+        let workspace = WorkspaceId::new();
+        let chat = BrowserSessionKey::openai(&workspace, Some("subject-a"), "chat-a");
+        let context = chat.workspace_context_name();
+
+        let first = UpstreamPageInfo {
+            id: 101,
+            url: "http://example.test/only".into(),
+            title: "Only".into(),
+            selected: true,
+            isolated_context: Some(context.clone()),
+        };
+        runtime
+            .reconcile_pages(
+                &chat,
+                std::slice::from_ref(&first),
+                Some(&HashSet::from([101])),
+            )
+            .await;
+        assert!(
+            runtime
+                .ensure_page_can_close(&chat, 101)
+                .await
+                .expect_err("the last logical page must not close")
+                .contains("last open page")
+        );
+
+        let second = UpstreamPageInfo {
+            id: 102,
+            url: "http://example.test/second".into(),
+            title: "Second".into(),
+            selected: false,
+            isolated_context: Some(context),
+        };
+        runtime
+            .reconcile_pages(&chat, &[first, second], Some(&HashSet::from([101, 102])))
+            .await;
+        runtime
+            .ensure_page_can_close(&chat, 101)
+            .await
+            .expect("one of multiple logical pages may close");
     }
 
     #[tokio::test]

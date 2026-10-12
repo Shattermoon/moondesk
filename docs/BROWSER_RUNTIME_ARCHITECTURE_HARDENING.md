@@ -211,7 +211,7 @@ extension/Lighthouse directory staging machinery is intentionally absent.
 
 ## Security properties
 
-The browser design preserves these invariants:
+The managed `browser_*` design preserves these invariants. They describe MoonDesk's isolated Chrome-for-Testing runtime; the optional Companion-backed `user_browser_*` surface is a separate authority that may deliberately lease exact tabs from the user's existing Chromium browser without merging that profile into this runtime.
 
 - no personal browser profile, cookies, or login state are inherited;
 - the DevTools endpoint is loopback-only and tied to MoonDesk's private temporary profile;

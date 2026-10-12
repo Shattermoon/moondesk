@@ -1,3 +1,4 @@
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::collections::hash_map::DefaultHasher;
@@ -19,11 +20,15 @@ use crate::command_jobs::{
     CommandJobManager, CommandJobSnapshot, DEFAULT_JOB_TIMEOUT_MS, DEFAULT_POLL_WAIT_MS,
     MAX_COMMAND_OUTPUT_READ_BYTES, MAX_JOB_TIMEOUT_MS, MAX_POLL_WAIT_MS,
 };
+use crate::companion::CompanionAuth;
 use crate::handoff;
+use crate::managed_chat::{broker::ManagedChatBroker, types::ChatExecutionProfile};
 use crate::state::{
     AgentsPathMode, BrowserPresentation, Mode, ToolMode, load_app_config, user_home_dir,
 };
 use crate::vision;
+use crate::workers::broker::WorkerBroker;
+use crate::workers::types::{ChatIdentity, OperationId, TaskId, WorkerId};
 use crate::workspace_tools;
 use crate::workspaces::{self, WorkspaceAvailability, WorkspaceId};
 
@@ -81,9 +86,10 @@ impl JsonRpcResponse {
 
 // ── Handler ─────────────────────────────────────────────────
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct McpRequestContext<'a> {
     pub workspace_id: &'a WorkspaceId,
+    pub workspace_name: &'a str,
     pub workspace_root: &'a str,
     pub mode: Mode,
     pub tool_mode: ToolMode,
@@ -91,6 +97,12 @@ pub struct McpRequestContext<'a> {
     pub handoff_store_root: Option<&'a Path>,
     pub command_jobs: &'a CommandJobManager,
     pub browser_runtime: &'a Option<Arc<BrowserRuntime>>,
+    pub worker_execution_profile: ChatExecutionProfile,
+    pub worker_target_count: usize,
+    pub worker_broker: Arc<WorkerBroker>,
+    pub managed_chat_broker: Arc<ManagedChatBroker>,
+    pub companion_auth: Option<Arc<CompanionAuth>>,
+    pub inbound_request_id: Option<String>,
 }
 
 pub async fn handle_request(
@@ -237,6 +249,84 @@ fn local_tool_output_schema(name: &str) -> Option<Value> {
                 "images".to_string(),
                 json!({ "type": "array", "items": { "type": "object" } }),
             );
+        }
+        "user_browser_tabs" => {
+            properties.insert("browserId".to_string(), json!({ "type": "string" }));
+            properties.insert(
+                "browsers".to_string(),
+                json!({ "type": "array", "items": { "type": "object" } }),
+            );
+            properties.insert(
+                "tabs".to_string(),
+                json!({ "type": "array", "items": { "type": "object" } }),
+            );
+            properties.insert("tabId".to_string(), json!({ "type": "string" }));
+            properties.insert("pageId".to_string(), json!({ "type": "string" }));
+            properties.insert(
+                "total".to_string(),
+                json!({ "type": "integer", "minimum": 0 }),
+            );
+            properties.insert("truncated".to_string(), json!({ "type": "boolean" }));
+            properties.insert(
+                "nextOffset".to_string(),
+                json!({ "type": ["integer", "null"], "minimum": 0 }),
+            );
+            properties.insert("guidance".to_string(), json!({ "type": "string" }));
+            properties.insert("attached".to_string(), json!({ "type": "boolean" }));
+            properties.insert("created".to_string(), json!({ "type": "boolean" }));
+            properties.insert("released".to_string(), json!({ "type": "boolean" }));
+            properties.insert("closed".to_string(), json!({ "type": "boolean" }));
+        }
+        "user_browser_snapshot" => {
+            properties.insert("tabId".to_string(), json!({ "type": "string" }));
+            properties.insert("pageId".to_string(), json!({ "type": "string" }));
+            properties.insert("frameId".to_string(), json!({ "type": "string" }));
+            properties.insert("title".to_string(), json!({ "type": "string" }));
+            properties.insert("url".to_string(), json!({ "type": "string" }));
+            properties.insert("text".to_string(), json!({ "type": "string" }));
+            properties.insert("truncated".to_string(), json!({ "type": "boolean" }));
+            properties.insert(
+                "frames".to_string(),
+                json!({ "type": "array", "items": { "type": "object" } }),
+            );
+        }
+        "user_browser_screenshot" => {
+            properties.insert("tabId".to_string(), json!({ "type": "string" }));
+            properties.insert("pageId".to_string(), json!({ "type": "string" }));
+            properties.insert("screenshotId".to_string(), json!({ "type": "string" }));
+            for field in ["width", "height"] {
+                properties.insert(
+                    field.to_string(),
+                    json!({ "type": "integer", "minimum": 0 }),
+                );
+            }
+            properties.insert("scale".to_string(), json!({ "type": "number" }));
+            properties.insert("fullPage".to_string(), json!({ "type": "boolean" }));
+        }
+        "user_browser_navigate" | "user_browser_action" => {
+            properties.insert("tabId".to_string(), json!({ "type": "string" }));
+            properties.insert("pageId".to_string(), json!({ "type": "string" }));
+            properties.insert("accepted".to_string(), json!({ "type": "boolean" }));
+        }
+        "user_browser_evaluate" => {
+            properties.insert("tabId".to_string(), json!({ "type": "string" }));
+            properties.insert("pageId".to_string(), json!({ "type": "string" }));
+            properties.insert("value".to_string(), json!({}));
+            properties.insert("truncated".to_string(), json!({ "type": "boolean" }));
+        }
+        "user_browser_console" | "user_browser_network" => {
+            properties.insert("entries".to_string(), json!({ "type": "array" }));
+            properties.insert(
+                "nextCursor".to_string(),
+                json!({ "type": "integer", "minimum": 0 }),
+            );
+            properties.insert("truncated".to_string(), json!({ "type": "boolean" }));
+            properties.insert(
+                "dropped".to_string(),
+                json!({ "type": "integer", "minimum": 0 }),
+            );
+            properties.insert("capture".to_string(), json!({ "type": "string" }));
+            properties.insert("requestId".to_string(), json!({ "type": "string" }));
         }
         "set_browser_presentation" => {
             properties.insert("status".to_string(), json!({ "type": "string" }));
@@ -500,6 +590,212 @@ fn complete_handoff_tool_descriptor() -> Value {
         },
         "annotations": { "readOnlyHint": false, "openWorldHint": false, "destructiveHint": false }
     })
+}
+
+fn workers_tool_descriptor() -> Value {
+    json!({
+        "name": "workers",
+        "title": "Coordinate workers",
+        "description": "Coordinate MoonDesk worker conversations for the current workspace. Core actions are status, spawn, reuse, send, collect, and retire. Worker actions are claim, start, inbox, ack, report, and finish. Use status before spawning to read targetWorkerCount, recommendedWorkerCount, and maxWorkerCount; an explicit user-requested count within the maximum takes precedence. Fresh spawns may include shared `context` with the overall goal, constraints, settled decisions, relevant state, completed work, validation, and sibling ownership, while `task` stays worker-specific. Use the same shared context for sibling fresh spawns when applicable. Reuse continues the same durable worker conversation, so include only new or changed facts in the reuse `task`. collect may wait up to 60 seconds for reports or completions. If a response is uncertain, retry that request promptly with the same `operation_id`.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "action": { "type": "string", "enum": ["spawn", "reuse", "retire", "status", "send", "collect", "claim", "start", "inbox", "ack", "report", "finish"] },
+                "operation_id": { "type": "string", "description": "Stable UUID for spawn, reuse, send, report, or collect; reuse it when retrying the same uncertain request. Fresh worker claim uses the UUID supplied in its bootstrap" },
+                "label": { "type": "string", "minLength": 1, "maxLength": 128, "description": "Short worker task label for spawn" },
+                "task": { "type": "string", "minLength": 1, "description": "Concrete worker-specific assignment for spawn or reuse" },
+                "context": { "type": "string", "maxLength": 32768, "description": "Optional shared context for a fresh spawn: overall goal, constraints, settled decisions, relevant project state, completed work, validation, sibling ownership, and blocker criteria. Keep it task-relevant and exclude credentials, tokens, private keys, secret connector URLs, and unrelated private data. MoonDesk places it before the worker-specific assignment. Reuse relies on the existing worker conversation history." },
+                "worker_id": { "type": "string", "description": "Worker UUID returned by spawn" },
+                "task_id": { "type": "string", "description": "Task UUID returned by spawn" },
+                "claim_token": { "type": "string", "description": "One-time claim token supplied in a fresh worker bootstrap" },
+                "message_id": { "type": "string", "description": "Inbox message UUID to acknowledge" },
+                "message": { "type": "string", "minLength": 1, "description": "Message for send or progress report for report" },
+                "wait_ms": { "type": "integer", "minimum": 0, "maximum": 60000, "description": "For collect only: wait up to this many milliseconds for a new report or completed task instead of polling" },
+                "result": { "type": "string", "description": "Final worker result for finish" },
+                "changes": { "type": "string", "description": "Changes made by the worker for finish" },
+                "validation": { "type": "string", "description": "Validation performed by the worker for finish" },
+                "blockers": { "type": "array", "maxItems": 100, "items": { "type": "string" }, "description": "Remaining blockers for finish" }
+            },
+            "required": ["action"]
+        },
+        "outputSchema": {
+            "type": "object",
+            "properties": {
+                "action": { "type": "string" },
+                "state": { "type": "string" },
+                "familyId": { "type": ["string", "null"] },
+                "workerId": { "type": "string" },
+                "taskId": { "type": ["string", "null"] },
+                "displayId": { "type": "string" },
+                "launchCommandId": { "type": "string" },
+                "executionProfile": { "type": "object" },
+                "family": { "type": ["object", "null"] },
+                "workers": { "type": "array" },
+                "targetWorkerCount": { "type": "integer" },
+                "recommendedWorkerCount": { "type": "integer" },
+                "maxWorkerCount": { "type": "integer" },
+                "messageId": { "type": "string" },
+                "reportId": { "type": "string" },
+                "messages": { "type": "array" },
+                "reports": { "type": "array" },
+                "completed": { "type": "array" },
+                "result": {}
+            }
+        },
+        "annotations": { "readOnlyHint": false, "openWorldHint": false, "destructiveHint": false }
+    })
+}
+
+fn push_user_browser_tools(tools: &mut Vec<Value>) {
+    tools.push(json!({
+        "name": "user_browser_tabs",
+        "title": "Control user browser tabs",
+        "description": "List, attach, open, release, or close tabs in the user's existing Chrome/Edge through the MoonDesk Companion extension. This is separate from MoonDesk's isolated browser_* runtime. Attach grants this exact ChatGPT conversation temporary control of one eligible non-ChatGPT tab and shows an animated multicolor control glow; release leaves the tab open, while close is explicit and destructive. List first when you do not already have an exact tab_id.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "action": { "type": "string", "enum": ["list", "attach", "new", "release", "close"] },
+                "browser_id": { "type": "string", "description": "Browser UUID returned by list; optional when exactly one companion browser is online." },
+                "tab_id": { "type": "string", "description": "Exact tab handle returned by list/attach/new." },
+                "url": { "type": "string", "maxLength": 8192, "description": "HTTP(S) URL for action=new; defaults to about:blank." },
+                "filter": { "type": "string", "maxLength": 200, "description": "List: literal title/URL filter." },
+                "offset": { "type": "integer", "minimum": 0, "maximum": 10000, "default": 0, "description": "List: zero-based result offset for pagination." },
+                "limit": { "type": "integer", "minimum": 1, "maximum": 100, "default": 100, "description": "List: maximum tabs returned in this page." }
+            },
+            "required": ["action"]
+        },
+        "annotations": { "readOnlyHint": false, "openWorldHint": true, "destructiveHint": true }
+    }));
+    tools.push(json!({
+        "name": "user_browser_snapshot",
+        "title": "Inspect controlled user browser tab",
+        "description": "Read a bounded DOM-oriented snapshot from a tab controlled through MoonDesk Companion. Returns page_id plus stable element refs for the current document. Navigation invalidates old refs. Every HTTPS tab on chatgpt.com and chat.openai.com is protected from all user-browser observation and interaction; if a controlled tab reaches one, MoonDesk retires the attachment.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "tab_id": { "type": "string" },
+                "frame_id": { "type": "string", "maxLength": 200, "description": "Optional frame_id from a previous snapshot; omit for the main frame." },
+                "max_nodes": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 300 },
+                "max_chars": { "type": "integer", "minimum": 100, "maximum": 24000, "default": 16000 },
+                "filter": { "type": "string", "maxLength": 200 }
+            },
+            "required": ["tab_id"]
+        },
+        "annotations": { "readOnlyHint": true, "openWorldHint": true, "destructiveHint": false }
+    }));
+    tools.push(json!({
+        "name": "user_browser_screenshot",
+        "title": "Capture controlled user browser tab",
+        "description": "Capture the currently controlled user-browser tab without activating it. Returns rendered image content plus page_id/screenshot_id. Take a fresh screenshot after navigation before coordinate input.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "tab_id": { "type": "string" },
+                "full_page": { "type": "boolean", "default": false }
+            },
+            "required": ["tab_id"]
+        },
+        "annotations": { "readOnlyHint": true, "openWorldHint": true, "destructiveHint": false }
+    }));
+    tools.push(json!({
+        "name": "user_browser_navigate",
+        "title": "Navigate controlled user browser tab",
+        "description": "Navigate a controlled user-browser tab to an HTTP(S) URL, back, forward, or reload. The action runs in the background and invalidates old page refs.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "tab_id": { "type": "string" },
+                "page_id": { "type": "string", "description": "Current page_id from attach/snapshot/screenshot." },
+                "action": { "type": "string", "enum": ["goto", "back", "forward", "reload"] },
+                "url": { "type": "string", "maxLength": 8192, "description": "Target URL for action=goto." }
+            },
+            "required": ["tab_id", "page_id", "action"]
+        },
+        "annotations": { "readOnlyHint": false, "openWorldHint": true, "destructiveHint": true }
+    }));
+    tools.push(json!({
+        "name": "user_browser_action",
+        "title": "Interact with controlled user browser tab",
+        "description": "Interact with one controlled user-browser tab without OS-level PC control. Click/hover/scroll/drag by DOM ref or screenshot coordinates; fill/type text; select; send a key; or handle a JavaScript dialog. Observe the page after input before deciding whether to repeat anything.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "tab_id": { "type": "string" },
+                "page_id": { "type": "string" },
+                "action": { "type": "string", "enum": ["click", "hover", "fill", "type", "select", "key", "scroll", "drag", "dialog"] },
+                "ref": { "type": "string", "maxLength": 120 },
+                "text": { "type": "string", "maxLength": 24000 },
+                "key": { "type": "string", "maxLength": 100 },
+                "values": { "type": "array", "maxItems": 50, "items": { "type": "string", "maxLength": 1000 } },
+                "x": { "type": "number", "minimum": 0, "maximum": 10000 },
+                "y": { "type": "number", "minimum": 0, "maximum": 10000 },
+                "screenshot_id": { "type": "string", "maxLength": 100 },
+                "to_ref": { "type": "string", "maxLength": 120, "description": "Drag destination ref; alternatively pass to_x/to_y with screenshot_id." },
+                "to_x": { "type": "number", "minimum": 0, "maximum": 10000 },
+                "to_y": { "type": "number", "minimum": 0, "maximum": 10000 },
+                "delta_x": { "type": "number", "minimum": -10000, "maximum": 10000 },
+                "delta_y": { "type": "number", "minimum": -10000, "maximum": 10000 },
+                "button": { "type": "string", "enum": ["left", "middle", "right"], "default": "left" },
+                "click_count": { "type": "integer", "minimum": 1, "maximum": 3, "default": 1 },
+                "accept": { "type": "boolean" }
+            },
+            "required": ["tab_id", "page_id", "action"]
+        },
+        "annotations": { "readOnlyHint": false, "openWorldHint": true, "destructiveHint": true }
+    }));
+    tools.push(json!({
+        "name": "user_browser_evaluate",
+        "title": "Evaluate JavaScript in controlled user browser tab",
+        "description": "Evaluate a bounded JavaScript expression in the controlled tab's main world. Requires the current page_id and is subject to the same ownership, expiry, and protected-page checks as input.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "tab_id": { "type": "string" },
+                "page_id": { "type": "string" },
+                "frame_id": { "type": "string", "maxLength": 200 },
+                "expression": { "type": "string", "minLength": 1, "maxLength": 24000 }
+            },
+            "required": ["tab_id", "page_id", "expression"]
+        },
+        "annotations": { "readOnlyHint": false, "openWorldHint": true, "destructiveHint": true }
+    }));
+    tools.push(json!({
+        "name": "user_browser_console",
+        "title": "Read controlled user browser console",
+        "description": "Read bounded console diagnostics captured since debugger attachment for the controlled tab.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "tab_id": { "type": "string" },
+                "after": { "type": "integer", "minimum": 0 },
+                "limit": { "type": "integer", "minimum": 1, "maximum": 100, "default": 50 },
+                "level": { "type": "string", "enum": ["all", "debug", "info", "warning", "error"] },
+                "filter": { "type": "string", "maxLength": 200 },
+                "clear": { "type": "boolean", "default": false }
+            },
+            "required": ["tab_id"]
+        },
+        "annotations": { "readOnlyHint": true, "openWorldHint": true, "destructiveHint": false }
+    }));
+    tools.push(json!({
+        "name": "user_browser_network",
+        "title": "Read controlled user browser network diagnostics",
+        "description": "Read bounded network diagnostics captured since debugger attachment. Request bodies are never retained; response bodies are optional and bounded.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "tab_id": { "type": "string" },
+                "request_id": { "type": "string", "maxLength": 300 },
+                "body": { "type": "boolean", "default": false },
+                "after": { "type": "integer", "minimum": 0 },
+                "limit": { "type": "integer", "minimum": 1, "maximum": 100, "default": 50 },
+                "filter": { "type": "string", "maxLength": 200 },
+                "clear": { "type": "boolean", "default": false }
+            },
+            "required": ["tab_id"]
+        },
+        "annotations": { "readOnlyHint": true, "openWorldHint": true, "destructiveHint": false }
+    }));
 }
 
 fn push_handoff_tools(tools: &mut Vec<Value>) {
@@ -775,6 +1071,10 @@ async fn handle_tools_list(
             }));
         }
 
+        if tool_mode.write_tools_enabled() {
+            tools.push(workers_tool_descriptor());
+            push_user_browser_tools(&mut tools);
+        }
         tools.push(json!({
             "name": "moondesk_instruction",
             "title": "Get usage instructions",
@@ -911,6 +1211,9 @@ async fn handle_tools_list(
 
     if mode.browser_enabled() {
         if !mode.computer_enabled() {
+            if tool_mode.write_tools_enabled() {
+                push_user_browser_tools(&mut tools);
+            }
             tools.push(json!({
                 "name": "moondesk_instruction",
                 "title": "Get usage instructions",
@@ -981,6 +1284,33 @@ async fn handle_tools_list(
 // ── tools/call ──────────────────────────────────────────────
 
 #[cfg(test)]
+fn test_worker_broker() -> Arc<WorkerBroker> {
+    Arc::new(
+        WorkerBroker::open(
+            std::env::temp_dir()
+                .join(format!("moondesk-mcp-worker-test-{}", uuid::Uuid::new_v4()))
+                .join(crate::workers::WORKER_STORE_FILE_NAME),
+        )
+        .expect("create test worker broker"),
+    )
+}
+
+#[cfg(test)]
+fn test_managed_chat_broker() -> Arc<ManagedChatBroker> {
+    Arc::new(
+        ManagedChatBroker::open(
+            std::env::temp_dir()
+                .join(format!(
+                    "moondesk-mcp-managed-chat-test-{}",
+                    uuid::Uuid::new_v4()
+                ))
+                .join(crate::managed_chat::MANAGED_CHAT_STORE_FILE_NAME),
+        )
+        .expect("create test managed chat broker"),
+    )
+}
+
+#[cfg(test)]
 async fn handle_tools_call(
     req: &JsonRpcRequest,
     workspace_root: &str,
@@ -1006,6 +1336,7 @@ async fn handle_tools_call(
         req,
         McpRequestContext {
             workspace_id: &workspace_id,
+            workspace_name: "Test Workspace",
             workspace_root,
             mode,
             tool_mode,
@@ -1013,6 +1344,12 @@ async fn handle_tools_call(
             handoff_store_root: None,
             command_jobs,
             browser_runtime,
+            worker_execution_profile: ChatExecutionProfile::default(),
+            worker_target_count: crate::workers::RECOMMENDED_WORKERS_PER_FAMILY,
+            worker_broker: test_worker_broker(),
+            managed_chat_broker: test_managed_chat_broker(),
+            companion_auth: None,
+            inbound_request_id: None,
         },
     )
     .await
@@ -1040,6 +1377,18 @@ fn read_call_requires_workspace(req: &JsonRpcRequest, tool_name: &str) -> bool {
 
 const MAX_BROWSER_CALLER_META_BYTES: usize = 512;
 
+fn workspace_access_error(workspace_root: &str) -> Option<String> {
+    match workspaces::workspace_availability(Path::new(workspace_root)) {
+        WorkspaceAvailability::Available => None,
+        WorkspaceAvailability::Protected => Some(format!(
+            "Workspace is blocked because it is a protected operating-system directory: {workspace_root}"
+        )),
+        WorkspaceAvailability::Unavailable => Some(format!(
+            "Workspace is currently unavailable: {workspace_root}"
+        )),
+    }
+}
+
 fn browser_session_key(req: &JsonRpcRequest, workspace_id: &WorkspaceId) -> BrowserSessionKey {
     let meta = req.params.get("_meta").and_then(Value::as_object);
     let session = meta
@@ -1056,12 +1405,285 @@ fn browser_session_key(req: &JsonRpcRequest, workspace_id: &WorkspaceId) -> Brow
     }
 }
 
+fn optional_chat_identity(req: &JsonRpcRequest) -> Result<Option<ChatIdentity>, String> {
+    let Some(meta) = req.params.get("_meta").and_then(Value::as_object) else {
+        return Ok(None);
+    };
+    let session = match meta.get("openai/session") {
+        None => return Ok(None),
+        Some(Value::String(value))
+            if !value.trim().is_empty() && value.len() <= MAX_BROWSER_CALLER_META_BYTES =>
+        {
+            value.as_str()
+        }
+        Some(_) => {
+            return Err("invalid openai/session metadata for this ChatGPT conversation".into());
+        }
+    };
+    let subject = match meta.get("openai/subject") {
+        None => None,
+        Some(Value::String(value))
+            if !value.trim().is_empty() && value.len() <= MAX_BROWSER_CALLER_META_BYTES =>
+        {
+            Some(value.as_str())
+        }
+        Some(Value::String(value)) if value.trim().is_empty() => None,
+        Some(_) => {
+            return Err("invalid openai/subject metadata for this ChatGPT conversation".into());
+        }
+    };
+    Ok(Some(ChatIdentity::from_openai_meta(subject, session)))
+}
+
+fn user_browser_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "user_browser_tabs"
+            | "user_browser_snapshot"
+            | "user_browser_screenshot"
+            | "user_browser_navigate"
+            | "user_browser_action"
+            | "user_browser_evaluate"
+            | "user_browser_console"
+            | "user_browser_network"
+    )
+}
+
+fn user_browser_chat_identity(req: &JsonRpcRequest) -> Result<ChatIdentity, String> {
+    optional_chat_identity(req)?.ok_or_else(|| {
+        "user browser control requires exact ChatGPT conversation identity; openai/session metadata is missing or invalid"
+            .to_string()
+    })
+}
+
+fn parse_user_browser_tab_handle(value: &str) -> Result<(String, u32), String> {
+    let Some((browser_id, tab_id)) = value.rsplit_once(':') else {
+        return Err("USER_BROWSER_TAB_INVALID: use a tab_id returned by user_browser_tabs".into());
+    };
+    uuid::Uuid::parse_str(browser_id)
+        .map_err(|_| "USER_BROWSER_TAB_INVALID: browser identity is malformed".to_string())?;
+    let tab_id = tab_id
+        .parse::<u32>()
+        .ok()
+        .filter(|value| *value > 0)
+        .ok_or_else(|| "USER_BROWSER_TAB_INVALID: tab identity is malformed".to_string())?;
+    Ok((browser_id.to_string(), tab_id))
+}
+
+fn rename_user_browser_arg(object: &mut Map<String, Value>, from: &str, to: &str) {
+    if let Some(value) = object.remove(from) {
+        object.insert(to.to_string(), value);
+    }
+}
+
+fn normalize_user_browser_args(tool_name: &str, args: &mut Map<String, Value>) {
+    rename_user_browser_arg(args, "page_id", "pageId");
+    rename_user_browser_arg(args, "frame_id", "frameId");
+    rename_user_browser_arg(args, "max_nodes", "maxNodes");
+    rename_user_browser_arg(args, "max_chars", "maxChars");
+    rename_user_browser_arg(args, "full_page", "fullPage");
+    rename_user_browser_arg(args, "screenshot_id", "screenshotId");
+    rename_user_browser_arg(args, "to_ref", "toRef");
+    rename_user_browser_arg(args, "to_x", "toX");
+    rename_user_browser_arg(args, "to_y", "toY");
+    rename_user_browser_arg(args, "request_id", "requestId");
+    rename_user_browser_arg(args, "delta_x", "deltaX");
+    rename_user_browser_arg(args, "delta_y", "deltaY");
+    rename_user_browser_arg(args, "click_count", "clickCount");
+
+    if tool_name == "user_browser_snapshot" {
+        args.entry("maxNodes".to_string()).or_insert(json!(300));
+        args.entry("maxChars".to_string()).or_insert(json!(16000));
+    }
+    if tool_name == "user_browser_navigate"
+        && args.get("action").and_then(Value::as_str) == Some("goto")
+    {
+        args.insert("action".to_string(), json!("url"));
+    }
+}
+
+fn decorate_user_browser_tab_handles(value: &mut Value, browser_id: &str) {
+    match value {
+        Value::Object(object) => {
+            if object.contains_key("browserId") {
+                object.insert(
+                    "browserId".to_string(),
+                    Value::String(browser_id.to_string()),
+                );
+            }
+            if let Some(tab_id) = object.get("tabId").and_then(Value::as_u64) {
+                object.insert(
+                    "tabId".to_string(),
+                    Value::String(format!("{browser_id}:{tab_id}")),
+                );
+            }
+            for child in object.values_mut() {
+                decorate_user_browser_tab_handles(child, browser_id);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                decorate_user_browser_tab_handles(item, browser_id);
+            }
+        }
+        _ => {}
+    }
+}
+
+async fn handle_user_browser_tool(
+    req: &JsonRpcRequest,
+    tool_name: &str,
+    identity: &ChatIdentity,
+    companion_auth: &CompanionAuth,
+) -> JsonRpcResponse {
+    let arguments = tool_arguments(req);
+    let Some(input) = arguments.as_object() else {
+        return tool_error_response(req, "user browser arguments must be an object".into());
+    };
+    let mut args = input.clone();
+    let broker = companion_auth.user_browser_broker();
+    let browsers = broker.browsers().await;
+
+    let explicit_browser = match args.remove("browser_id") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value)),
+        Some(_) => Err(
+            "USER_BROWSER_REQUIRED: browser_id must be the string UUID returned by user_browser_tabs"
+                .to_string(),
+        ),
+    };
+    let explicit_browser = match explicit_browser {
+        Ok(value) => value,
+        Err(error) => return tool_error_response(req, error),
+    };
+    let tab_handle = match args.get("tab_id") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => parse_user_browser_tab_handle(value).map(Some),
+        Some(_) => Err(
+            "USER_BROWSER_TAB_INVALID: tab_id must be a string returned by user_browser_tabs"
+                .to_string(),
+        ),
+    };
+    let (handle_browser, numeric_tab) = match tab_handle {
+        Ok(Some((browser, tab))) => (Some(browser), Some(tab)),
+        Ok(None) => (None, None),
+        Err(error) => return tool_error_response(req, error),
+    };
+    if let (Some(explicit), Some(from_handle)) = (&explicit_browser, &handle_browser)
+        && explicit != from_handle
+    {
+        return tool_error_response(
+            req,
+            "USER_BROWSER_TAB_INVALID: browser_id does not match the tab handle".into(),
+        );
+    }
+
+    let browser_id = explicit_browser
+        .or(handle_browser)
+        .or_else(|| (browsers.len() == 1).then(|| browsers[0].browser_id.clone()));
+    let action = args.get("action").and_then(Value::as_str);
+    if browser_id.is_none() && tool_name == "user_browser_tabs" && action == Some("list") {
+        let value = json!({
+            "browsers": browsers,
+            "tabs": [],
+            "message": if browsers.is_empty() {
+                "No paired browser with the MoonDesk Companion is online."
+            } else {
+                "More than one companion browser is online; choose browser_id and list again."
+            }
+        });
+        return tool_success_response_with_structured(req, value.to_string(), value);
+    }
+    let Some(browser_id) = browser_id else {
+        return tool_error_response(
+            req,
+            "USER_BROWSER_REQUIRED: list user browsers first, then specify browser_id or an exact tab_id"
+                .into(),
+        );
+    };
+
+    args.remove("tab_id");
+    if let Some(tab_id) = numeric_tab {
+        args.insert("tabId".to_string(), json!(tab_id));
+    }
+    normalize_user_browser_args(tool_name, &mut args);
+
+    let result = match broker
+        .execute(
+            &browser_id,
+            &identity.session_digest,
+            tool_name,
+            Value::Object(args),
+        )
+        .await
+    {
+        Ok(result) => result,
+        Err(error) => return tool_error_response(req, error),
+    };
+    if let Some(error) = result.get("error").and_then(Value::as_str) {
+        return tool_error_response(req, error.to_string());
+    }
+    let mut value = result.get("value").cloned().unwrap_or(Value::Null);
+    decorate_user_browser_tab_handles(&mut value, &browser_id);
+
+    if let Some(image) = result.get("image").and_then(Value::as_object) {
+        let Some(data) = image.get("data").and_then(Value::as_str) else {
+            return tool_error_response(
+                req,
+                "USER_BROWSER_IMAGE_INVALID: missing image data".into(),
+            );
+        };
+        let Some(mime_type) = image.get("mimeType").and_then(Value::as_str) else {
+            return tool_error_response(
+                req,
+                "USER_BROWSER_IMAGE_INVALID: missing image type".into(),
+            );
+        };
+        if !matches!(mime_type, "image/jpeg" | "image/png") || data.len() > 1_700_000 {
+            return tool_error_response(
+                req,
+                "USER_BROWSER_IMAGE_INVALID: unsupported or oversized image".into(),
+            );
+        }
+        let bytes = match BASE64_STANDARD.decode(data) {
+            Ok(bytes) if bytes.len() <= 1_300_000 => bytes,
+            _ => {
+                return tool_error_response(
+                    req,
+                    "USER_BROWSER_IMAGE_INVALID: invalid encoded image".into(),
+                );
+            }
+        };
+        if image::load_from_memory(&bytes).is_err() {
+            return tool_error_response(
+                req,
+                "USER_BROWSER_IMAGE_INVALID: Chrome returned unreadable pixels".into(),
+            );
+        }
+        return tool_success_response_with_content(
+            req,
+            vec![json!({ "type": "image", "data": data, "mimeType": mime_type })],
+            value,
+        );
+    }
+
+    tool_success_response_with_structured(req, value.to_string(), value)
+}
+
+fn worker_chat_identity(req: &JsonRpcRequest) -> Result<ChatIdentity, String> {
+    optional_chat_identity(req)?.ok_or_else(|| {
+        "workers requires exact ChatGPT conversation identity; openai/session metadata is missing or invalid"
+            .to_string()
+    })
+}
+
 async fn handle_tools_call_for_workspace(
     req: &JsonRpcRequest,
     context: McpRequestContext<'_>,
 ) -> JsonRpcResponse {
     let McpRequestContext {
         workspace_id,
+        workspace_name,
         workspace_root,
         mode,
         tool_mode,
@@ -1069,6 +1691,12 @@ async fn handle_tools_call_for_workspace(
         handoff_store_root,
         command_jobs,
         browser_runtime,
+        worker_execution_profile,
+        worker_target_count,
+        worker_broker,
+        managed_chat_broker,
+        companion_auth,
+        inbound_request_id,
     } = context;
     let params = &req.params;
     let tool_name = params
@@ -1076,6 +1704,37 @@ async fn handle_tools_call_for_workspace(
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
+
+    // Clear Workers mirrors Chat on Steroids' retired-worker fence: a recently cleared worker tab
+    // must not fall through and regain ordinary Core authority merely because its family history was
+    // destroyed. Only exact ChatGPT session metadata participates, so non-ChatGPT clients are
+    // unaffected.
+    if let Ok(Some(identity)) = optional_chat_identity(req)
+        && worker_broker.is_retired_worker_identity(&identity).await
+    {
+        return tool_error_response(
+            req,
+            "This ChatGPT conversation belonged to a worker that was cleared. Start a new Core conversation before using MoonDesk tools again."
+                .into(),
+        );
+    }
+
+    if user_browser_tool(&tool_name) {
+        if tool_mode.read_only() {
+            return read_only_blocked_response(req, &tool_name);
+        }
+        let identity = match user_browser_chat_identity(req) {
+            Ok(identity) => identity,
+            Err(error) => return tool_error_response(req, error),
+        };
+        let Some(auth) = companion_auth.as_ref() else {
+            return tool_error_response(
+                req,
+                "MoonDesk Companion is unavailable for user browser control".into(),
+            );
+        };
+        return handle_user_browser_tool(req, &tool_name, &identity, auth).await;
+    }
 
     let connector_browser_tool = connector_expanded_browser_tool(&tool_name);
     let facade_browser_tool = browser_facade_tool(&tool_name);
@@ -1085,13 +1744,8 @@ async fn handle_tools_call_for_workspace(
     ) || connector_browser_tool
         || facade_browser_tool
     {
-        if workspaces::workspace_availability(Path::new(workspace_root))
-            == WorkspaceAvailability::Unavailable
-        {
-            return tool_error_response(
-                req,
-                format!("Workspace is currently unavailable: {workspace_root}"),
-            );
+        if let Some(error) = workspace_access_error(workspace_root) {
+            return tool_error_response(req, error);
         }
         if !mode.browser_enabled() {
             return tool_error_response(
@@ -1160,6 +1814,224 @@ async fn handle_tools_call_for_workspace(
         .await;
     }
 
+    if tool_name == "workers" {
+        if !mode.computer_enabled() {
+            return tool_error_response_text_only(
+                req,
+                "Tool 'workers' requires Computer or Both mode".into(),
+            );
+        }
+        if tool_mode.read_only() {
+            return tool_error_response_text_only(
+                req,
+                format!("Tool '{tool_name}' is disabled in read-only mode"),
+            );
+        }
+        if workspaces::workspace_availability(Path::new(workspace_root))
+            == WorkspaceAvailability::Unavailable
+        {
+            return tool_error_response_text_only(
+                req,
+                format!("Workspace is currently unavailable: {workspace_root}"),
+            );
+        }
+        let caller_identity = match worker_chat_identity(req) {
+            Ok(identity) => identity,
+            Err(error) => return tool_error_response_text_only(req, error),
+        };
+        let arguments = tool_arguments(req);
+        let action = arguments.get("action").and_then(Value::as_str);
+
+        // Fresh worker admission has two host-controlled halves. The launch ACK first binds the
+        // durable worker slot to one canonical ChatGPT conversation. The bootstrap sent only into
+        // that conversation carries a random claim operation UUID. When the model calls `claim`,
+        // the companion passively attests that exact operation UUID from the page/provider stream.
+        // This deliberately does not require ChatGPT's x-request-id: request correlation proved
+        // unreliable in the signed-in flow, while our own operation UUID is stable and unique.
+        // The broker rechecks token + operation UUID atomically before consuming either capability.
+        if action == Some("claim") {
+            let worker_id = match arguments
+                .get("worker_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "workers claim requires worker_id".to_string())
+                .and_then(WorkerId::parse)
+            {
+                Ok(value) => value,
+                Err(error) => return tool_error_response_text_only(req, error),
+            };
+            let task_id = match arguments
+                .get("task_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "workers claim requires task_id".to_string())
+                .and_then(TaskId::parse)
+            {
+                Ok(value) => value,
+                Err(error) => return tool_error_response_text_only(req, error),
+            };
+            let claim_operation_id = match arguments
+                .get("operation_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "workers claim requires its browser-attested operation_id from the worker bootstrap".to_string())
+                .and_then(OperationId::parse)
+            {
+                Ok(value) => value,
+                Err(error) => return tool_error_response_text_only(req, error),
+            };
+            let claim_token = match arguments
+                .get("claim_token")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+            {
+                Some(value) => value,
+                None => {
+                    return tool_error_response_text_only(
+                        req,
+                        "workers claim requires the single-use claim_token from the worker bootstrap".into(),
+                    );
+                }
+            };
+            let requirement = match worker_broker
+                .claim_attestation_requirement(
+                    workspace_id,
+                    &worker_id,
+                    &task_id,
+                    claim_token,
+                    &claim_operation_id,
+                    &caller_identity,
+                )
+                .await
+            {
+                Ok(value) => value,
+                Err(error) => return tool_error_response_text_only(req, error.to_string()),
+            };
+            if let Some(requirement) = requirement {
+                let Some(auth) = companion_auth.as_ref() else {
+                    return tool_error_response_text_only(
+                        req,
+                        "fresh worker claim requires the MoonDesk Worker Companion browser attestation".into(),
+                    );
+                };
+                if auth.paired_client_count().await == 0 {
+                    return tool_error_response_text_only(
+                        req,
+                        "fresh worker claim requires a paired MoonDesk Worker Companion browser"
+                            .into(),
+                    );
+                }
+                let operation_id = requirement.operation_id.to_string();
+                let route = match auth
+                    .wait_for_correlation_in_conversation(
+                        operation_id.as_str(),
+                        &requirement.conversation_id,
+                        std::time::Duration::from_millis(5_000),
+                    )
+                    .await
+                {
+                    Ok(route) => route,
+                    Err(error) => return tool_error_response_text_only(req, error),
+                };
+                let Some(_route) = route else {
+                    return tool_error_response_text_only(
+                        req,
+                        "worker claim could not verify the browser-attested claim operation in the exact worker conversation; any conflicting cached proof was discarded and the claim token was not consumed".into(),
+                    );
+                };
+            }
+        }
+
+        let anchor_route = if matches!(action, Some("spawn") | Some("reuse")) {
+            match companion_auth.as_ref() {
+                Some(auth) => {
+                    if auth.paired_client_count().await == 0 {
+                        return tool_error_response_text_only(
+                            req,
+                            "Workers require the optional MoonDesk Worker Companion. MoonDesk works normally without it. Open MoonDesk Settings -> Workers, choose Set up Workers, then load the companion folder with Developer mode -> Load unpacked and retry.".into(),
+                        );
+                    }
+                    let launch_action = action.unwrap_or("worker launch");
+                    let request_id = inbound_request_id.as_deref();
+                    let operation_id = arguments
+                        .get("operation_id")
+                        .and_then(Value::as_str)
+                        .and_then(|value| uuid::Uuid::parse_str(value).ok())
+                        .map(|value| value.hyphenated().to_string());
+                    let correlation_ids = request_id
+                        .into_iter()
+                        .chain(operation_id.as_deref())
+                        .collect::<Vec<_>>();
+                    let mut route = match auth.correlation_for_any(&correlation_ids).await {
+                        Ok(route) => route,
+                        Err(error) => return tool_error_response_text_only(req, error),
+                    };
+
+                    if route.is_none() {
+                        route = auth
+                            .anchor_affinity_for(&caller_identity.session_digest)
+                            .await;
+                    }
+
+                    if route.is_none() {
+                        if correlation_ids.is_empty() {
+                            return tool_error_response_text_only(
+                                req,
+                                format!(
+                                    "workers {launch_action} could not identify the originating ChatGPT Core because neither a usable OpenAI x-request-id nor a valid operation_id was available, and no remembered Core affinity existed"
+                                ),
+                            );
+                        }
+                        route = match auth
+                            .wait_for_any_correlation(
+                                &correlation_ids,
+                                std::time::Duration::from_millis(5_000),
+                            )
+                            .await
+                        {
+                            Ok(route) => route,
+                            Err(error) => return tool_error_response_text_only(req, error),
+                        };
+                    }
+
+                    let Some(route) = route else {
+                        return tool_error_response_text_only(
+                            req,
+                            format!(
+                                "workers {launch_action} could not identify the originating ChatGPT Core; no exact provider-stream request/operation correlation or remembered Core affinity was available"
+                            ),
+                        );
+                    };
+                    if let Err(error) = auth
+                        .remember_anchor_affinity(&caller_identity.session_digest, &route)
+                        .await
+                    {
+                        return tool_error_response_text_only(req, error);
+                    }
+                    Some(route)
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
+        return match crate::workers::protocol::handle(
+            &arguments,
+            workspace_id,
+            workspace_name,
+            &caller_identity,
+            &worker_execution_profile,
+            worker_broker.as_ref(),
+            crate::workers::protocol::WorkerLaunchContext {
+                managed_chat_broker: managed_chat_broker.as_ref(),
+                anchor_route: anchor_route.as_ref(),
+                worker_target_count,
+            },
+        )
+        .await
+        {
+            Ok(structured) => tool_success_response_with_structured(req, String::new(), structured),
+            Err(error) => tool_error_response_text_only(req, error),
+        };
+    }
+
     let workspace_dependent = matches!(
         tool_name.as_str(),
         "moondesk_instruction"
@@ -1172,14 +2044,8 @@ async fn handle_tools_call_for_workspace(
             | "run_command"
             | "start_command"
     ) || read_call_requires_workspace(req, &tool_name);
-    if workspace_dependent
-        && workspaces::workspace_availability(Path::new(workspace_root))
-            == WorkspaceAvailability::Unavailable
-    {
-        return tool_error_response(
-            req,
-            format!("Workspace is currently unavailable: {workspace_root}"),
-        );
+    if workspace_dependent && let Some(error) = workspace_access_error(workspace_root) {
+        return tool_error_response(req, error);
     }
 
     if matches!(
@@ -2198,6 +3064,16 @@ fn tool_message_structured(message: String) -> Value {
     json!({ "message": message })
 }
 
+fn tool_error_response_text_only(req: &JsonRpcRequest, text: String) -> JsonRpcResponse {
+    JsonRpcResponse::success(
+        req.id.clone(),
+        json!({
+            "content": [{ "type": "text", "text": text }],
+            "isError": true
+        }),
+    )
+}
+
 fn tool_success_response_with_structured(
     req: &JsonRpcRequest,
     text: String,
@@ -2318,6 +3194,10 @@ Always specify the branch explicitly when using `git push`."#
         .map(str::to_string)
         .collect();
 
+    if tool_mode.write_tools_enabled() {
+        lines.push("If the optional MoonDesk Companion is installed, user_browser_tabs/user_browser_snapshot/user_browser_screenshot/user_browser_navigate/user_browser_action/user_browser_evaluate/user_browser_console/user_browser_network control exact tabs in the user's existing Chromium browser. This is separate from the isolated browser_* runtime and is not PC control. List or open a tab first, attach deliberately, use fresh page IDs/refs after navigation, do not blindly replay uncertain input, and release the tab when done; an animated multicolor edge/corner glow indicates active MoonDesk control and is temporarily hidden only while MoonDesk captures model-facing screenshots. Every HTTPS tab on chatgpt.com and chat.openai.com is protected from all user-browser observation and interaction; if a controlled tab reaches one, MoonDesk retires the attachment.".to_string());
+    }
+
     if mode.computer_enabled() {
         lines.push("Use read to read files and search to search the workspace. Relative read paths resolve inside the selected workspace, while an explicitly addressed absolute file may be read in either tool mode when the MoonDesk user can read it. Keep search/write/edit/delete workspace-scoped; ReadOnly controls mutation and execution capabilities rather than changing read-path semantics.".to_string());
         lines.push("When a task depends on what an image actually looks like, use view_image or view_images so the model receives the pixels through its vision input. Do not substitute filenames, dimensions, blur scores, OCR, or other image metadata for visual inspection. Relative image paths resolve inside the selected workspace, while explicitly addressed absolute images may be inspected in either tool mode when the MoonDesk user can read them.".to_string());
@@ -2378,6 +3258,10 @@ Always specify the branch explicitly when using `git push`."#
     }
 
     if tool_mode.write_tools_enabled() {
+        lines.push(
+            "Experimental Workers are exposed through the workers tool in multi-tools mode. If MoonDesk has been upgraded to a Workers-capable build but this ChatGPT conversation does not show a workers tool, the conversation may be holding an older cached connector schema: refresh/reconnect the MoonDesk Custom Connector and start a new conversation instead of simulating worker orchestration through browser or shell tools."
+                .to_string(),
+        );
         lines.push(
             "Session handoffs are manual and explicit. Call create_handoff only when the user asks for a handoff, says they are moving to another chat, or otherwise explicitly requests session continuation state; do not create handoffs silently or periodically in the background. MoonDesk stores the checkpoint outside the workspace and automatically captures Git and running command-job state. In the next session, use resume_handoff with the handoff ID shown below, verify any reported drift before editing, and call complete_handoff once that continuation is genuinely finished. Never put credentials, tokens, passwords, private keys, or other secrets in handoff text."
                 .to_string(),
@@ -4399,6 +5283,52 @@ async fn handle_set_browser_presentation(
     }
 }
 
+fn normalize_connector_browser_arguments(
+    command: &str,
+    mut arguments: Value,
+) -> Result<(Value, Option<u64>), String> {
+    let Some(object) = arguments.as_object_mut() else {
+        return Err("Browser tool arguments must be an object".to_string());
+    };
+
+    let timeout_ms = if matches!(command, "new_page" | "navigate_page") {
+        match object.remove("timeout") {
+            None => None,
+            Some(value) => match value.as_u64() {
+                Some(0) => None,
+                Some(value @ 1..=MAX_BROWSER_TIMEOUT_MS) => Some(value),
+                _ => {
+                    return Err(format!(
+                        "timeout must be an integer between 0 and {MAX_BROWSER_TIMEOUT_MS} ms"
+                    ));
+                }
+            },
+        }
+    } else {
+        None
+    };
+
+    if command == "new_page" && object.contains_key("isolatedContext") {
+        return Err(
+            "new_page isolatedContext is managed by MoonDesk and cannot be supplied by callers"
+                .to_string(),
+        );
+    }
+
+    if command == "list_console_messages" && object.contains_key("serviceWorkerId") {
+        return Err(
+            "list_console_messages serviceWorkerId filtering is unavailable in MoonDesk's shared browser because raw service-worker IDs are not scoped to the caller's logical browser session"
+                .to_string(),
+        );
+    }
+
+    if command == "take_screenshot" && !object.contains_key("format") {
+        object.insert("format".to_string(), Value::String("jpeg".to_string()));
+    }
+
+    Ok((arguments, timeout_ms))
+}
+
 async fn handle_connector_browser_command(
     req: &JsonRpcRequest,
     browser_session: &BrowserSessionKey,
@@ -4407,20 +5337,29 @@ async fn handle_connector_browser_command(
     browser_runtime: &Option<Arc<BrowserRuntime>>,
     command: &str,
 ) -> JsonRpcResponse {
-    let args = match browser_structured_arguments_to_cli(command, &tool_arguments(req)) {
+    let (arguments, timeout_ms) =
+        match normalize_connector_browser_arguments(command, tool_arguments(req)) {
+            Ok(arguments) => arguments,
+            Err(error) => return tool_error_response(req, error),
+        };
+    let args = match browser_structured_arguments_to_cli(command, &arguments) {
         Ok(args) => args,
         Err(error) => return tool_error_response(req, error),
     };
+    let mut browser_arguments = json!({
+        "command": command,
+        "args": args,
+    });
+    if let Some(timeout_ms) = timeout_ms {
+        browser_arguments["timeout_ms"] = json!(timeout_ms);
+    }
     let proxied = JsonRpcRequest {
         jsonrpc: req.jsonrpc.clone(),
         id: req.id.clone(),
         method: req.method.clone(),
         params: json!({
             "name": "browser_command",
-            "arguments": {
-                "command": command,
-                "args": args,
-            }
+            "arguments": browser_arguments
         }),
     };
     handle_browser_command(
@@ -4909,6 +5848,7 @@ fn handle_delete_path(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcResp
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::managed_chat::types::{ManagedChatLaunch, ManagedChatOpenMode, ManagedChatPurpose};
     use uuid::Uuid;
 
     struct TestTempDir {
@@ -4919,6 +5859,12 @@ mod tests {
         fn new(prefix: &str) -> Self {
             let path = std::env::temp_dir().join(format!("{prefix}-{}", Uuid::new_v4()));
             std::fs::create_dir_all(&path).expect("create test temp dir");
+            // Mirror production workspace registration. On macOS std::env::temp_dir() commonly
+            // returns a /var/... alias whose canonical spelling is /private/var/...; Workers
+            // deliberately reject non-canonical workspace roots, so MCP fixtures must register
+            // their temp root before passing child workspaces into the production dispatcher.
+            let path = workspaces::canonicalize_existing_workspace_root(&path)
+                .expect("canonicalize test temp dir like production registration");
             Self { path }
         }
 
@@ -4945,8 +5891,72 @@ mod tests {
         }
     }
 
+    fn tool_call_request_with_session(
+        name: &str,
+        arguments: Value,
+        session: &str,
+    ) -> JsonRpcRequest {
+        let mut request = tool_call_request(name, arguments);
+        request.params["_meta"] = json!({
+            "openai/subject": "worker-test-subject",
+            "openai/session": session
+        });
+        request
+    }
+
+    async fn call_workers_for_test(
+        request: &JsonRpcRequest,
+        workspace_id: &WorkspaceId,
+        workspace_root: &str,
+        worker_broker: Arc<WorkerBroker>,
+        managed_chat_broker: Arc<ManagedChatBroker>,
+    ) -> JsonRpcResponse {
+        call_workers_for_test_with_companion(
+            request,
+            workspace_id,
+            workspace_root,
+            worker_broker,
+            managed_chat_broker,
+            None,
+        )
+        .await
+    }
+
+    async fn call_workers_for_test_with_companion(
+        request: &JsonRpcRequest,
+        workspace_id: &WorkspaceId,
+        workspace_root: &str,
+        worker_broker: Arc<WorkerBroker>,
+        managed_chat_broker: Arc<ManagedChatBroker>,
+        companion_auth: Option<Arc<CompanionAuth>>,
+    ) -> JsonRpcResponse {
+        let command_jobs = CommandJobManager::new();
+        let browser_runtime = None;
+        handle_tools_call_for_workspace(
+            request,
+            McpRequestContext {
+                workspace_id,
+                workspace_name: "Test Workspace",
+                workspace_root,
+                mode: Mode::Both,
+                tool_mode: ToolMode::MultiTools,
+                set_moondesk_as_co_author: false,
+                handoff_store_root: None,
+                command_jobs: &command_jobs,
+                browser_runtime: &browser_runtime,
+                worker_execution_profile: ChatExecutionProfile::default(),
+                worker_target_count: crate::workers::RECOMMENDED_WORKERS_PER_FAMILY,
+                worker_broker,
+                managed_chat_broker,
+                companion_auth,
+                inbound_request_id: None,
+            },
+        )
+        .await
+    }
+
     fn result_text(response: &JsonRpcResponse) -> &str {
-        response
+        if let Some(text) = response
             .result
             .as_ref()
             .and_then(|result| result.get("structuredContent"))
@@ -4958,6 +5968,21 @@ mod tests {
                     .or_else(|| structured.get("instructionText"))
             })
             .and_then(Value::as_str)
+        {
+            return text;
+        }
+        response
+            .result
+            .as_ref()
+            .and_then(|result| result.get("content"))
+            .and_then(Value::as_array)
+            .and_then(|content| {
+                content.iter().find_map(|entry| {
+                    (entry.get("type").and_then(Value::as_str) == Some("text"))
+                        .then(|| entry.get("text").and_then(Value::as_str))
+                        .flatten()
+                })
+            })
             .expect("missing result text")
     }
 
@@ -5044,6 +6069,2429 @@ mod tests {
         request.params["_meta"]["openai/session"] = json!("");
         let empty = browser_session_key(&request, &workspace);
         assert!(empty == fallback);
+    }
+
+    #[tokio::test]
+    async fn user_browser_tools_are_advertised_in_every_multitool_mode() {
+        let request = JsonRpcRequest {
+            jsonrpc: "2.0".into(),
+            id: Some(json!("user-browser-list")),
+            method: "tools/list".into(),
+            params: json!({}),
+        };
+        let names = |response: &JsonRpcResponse| {
+            response
+                .result
+                .as_ref()
+                .and_then(|result| result.get("tools"))
+                .and_then(Value::as_array)
+                .expect("tools list")
+                .iter()
+                .filter_map(|tool| tool.get("name").and_then(Value::as_str))
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        };
+
+        let both = handle_tools_list(&request, Mode::Both, ToolMode::MultiTools).await;
+        let both_names = names(&both);
+        for tool in [
+            "user_browser_tabs",
+            "user_browser_snapshot",
+            "user_browser_screenshot",
+            "user_browser_navigate",
+            "user_browser_action",
+            "user_browser_evaluate",
+            "user_browser_console",
+            "user_browser_network",
+        ] {
+            assert!(both_names.iter().any(|name| name == tool), "missing {tool}");
+        }
+        let tabs_tool = both
+            .result
+            .as_ref()
+            .and_then(|result| result.get("tools"))
+            .and_then(Value::as_array)
+            .and_then(|tools| {
+                tools.iter().find(|tool| {
+                    tool.get("name").and_then(Value::as_str) == Some("user_browser_tabs")
+                })
+            })
+            .expect("user_browser_tabs descriptor");
+        assert_eq!(
+            tabs_tool.pointer("/inputSchema/properties/offset/type"),
+            Some(&json!("integer"))
+        );
+        assert_eq!(
+            tabs_tool.pointer("/inputSchema/properties/limit/maximum"),
+            Some(&json!(100))
+        );
+
+        let browser_only = handle_tools_list(&request, Mode::Browser, ToolMode::MultiTools).await;
+        let browser_only_names = names(&browser_only);
+        for tool in [
+            "user_browser_tabs",
+            "user_browser_snapshot",
+            "user_browser_screenshot",
+            "user_browser_navigate",
+            "user_browser_action",
+            "user_browser_evaluate",
+            "user_browser_console",
+            "user_browser_network",
+        ] {
+            assert!(
+                browser_only_names.iter().any(|name| name == tool),
+                "missing {tool} in Browser mode"
+            );
+        }
+
+        let read_only = handle_tools_list(&request, Mode::Both, ToolMode::ReadOnly).await;
+        assert!(
+            names(&read_only)
+                .iter()
+                .all(|name| !name.starts_with("user_browser_"))
+        );
+    }
+
+    #[test]
+    fn user_browser_public_arguments_map_to_executor_contract() {
+        let mut snapshot = json!({
+            "frame_id": "frame-7",
+            "filter": "button"
+        })
+        .as_object()
+        .expect("snapshot object")
+        .clone();
+        normalize_user_browser_args("user_browser_snapshot", &mut snapshot);
+        assert_eq!(snapshot.get("frameId"), Some(&json!("frame-7")));
+        assert_eq!(snapshot.get("maxNodes"), Some(&json!(300)));
+        assert_eq!(snapshot.get("maxChars"), Some(&json!(16000)));
+
+        let mut navigate = json!({ "action": "goto", "url": "https://example.com/" })
+            .as_object()
+            .expect("navigate object")
+            .clone();
+        normalize_user_browser_args("user_browser_navigate", &mut navigate);
+        assert_eq!(navigate.get("action"), Some(&json!("url")));
+
+        let mut drag = json!({
+            "to_ref": "ref-2",
+            "to_x": 320,
+            "to_y": 240,
+            "screenshot_id": "shot-1"
+        })
+        .as_object()
+        .expect("drag object")
+        .clone();
+        normalize_user_browser_args("user_browser_action", &mut drag);
+        assert_eq!(drag.get("toRef"), Some(&json!("ref-2")));
+        assert_eq!(drag.get("toX"), Some(&json!(320)));
+        assert_eq!(drag.get("toY"), Some(&json!(240)));
+        assert_eq!(drag.get("screenshotId"), Some(&json!("shot-1")));
+
+        let mut diagnostics = json!({ "request_id": "main:request-1" })
+            .as_object()
+            .expect("diagnostics object")
+            .clone();
+        normalize_user_browser_args("user_browser_network", &mut diagnostics);
+        assert_eq!(diagnostics.get("requestId"), Some(&json!("main:request-1")));
+    }
+
+    #[tokio::test]
+    async fn user_browser_public_arguments_round_trip_to_broker_contract() {
+        let root = TestTempDir::new("moondesk-user-browser-public-bindings");
+        let workspace = WorkspaceId::new();
+        let companion_auth = Arc::new(
+            CompanionAuth::open(root.path().join("companion-auth.json"))
+                .expect("open test companion auth"),
+        );
+        let broker = companion_auth.user_browser_broker();
+        let browser_id = Uuid::new_v4().to_string();
+        let companion_client_id = "user-browser-public-bindings-companion";
+        broker
+            .poll(&browser_id, companion_client_id, "Chrome", true)
+            .await
+            .expect("publish browser presence");
+
+        let page_id = "00000000-0000-4000-8000-000000000001";
+        let expected = vec![
+            (
+                "user_browser_tabs",
+                json!({ "action": "list", "offset": 100, "limit": 25 }),
+            ),
+            (
+                "user_browser_snapshot",
+                json!({
+                    "tabId": 17,
+                    "frameId": "frame-7",
+                    "filter": "button",
+                    "maxNodes": 300,
+                    "maxChars": 16000
+                }),
+            ),
+            (
+                "user_browser_navigate",
+                json!({
+                    "tabId": 17,
+                    "pageId": page_id,
+                    "action": "url",
+                    "url": "https://example.com/next"
+                }),
+            ),
+            (
+                "user_browser_action",
+                json!({
+                    "tabId": 17,
+                    "pageId": page_id,
+                    "action": "drag",
+                    "ref": "ref-1",
+                    "toRef": "ref-2",
+                    "screenshotId": "shot-1"
+                }),
+            ),
+            (
+                "user_browser_evaluate",
+                json!({
+                    "tabId": 17,
+                    "pageId": page_id,
+                    "frameId": "frame-7",
+                    "expression": "document.title"
+                }),
+            ),
+            (
+                "user_browser_console",
+                json!({ "tabId": 17, "after": 4, "limit": 10 }),
+            ),
+            (
+                "user_browser_network",
+                json!({ "tabId": 17, "requestId": "main:request-1", "body": true }),
+            ),
+        ];
+
+        let responder = {
+            let broker = broker.clone();
+            let browser_id = browser_id.clone();
+            tokio::spawn(async move {
+                for (tool, expected_args) in expected {
+                    loop {
+                        let poll = broker
+                            .poll(&browser_id, companion_client_id, "Chrome", true)
+                            .await
+                            .expect("poll browser requests");
+                        let Some(request_id) = poll.requests.first().cloned() else {
+                            tokio::task::yield_now().await;
+                            continue;
+                        };
+                        let command = broker
+                            .claim(&browser_id, companion_client_id, &request_id, &poll.epoch)
+                            .await
+                            .expect("claim browser request");
+                        assert_eq!(command.tool, tool);
+                        assert_eq!(command.args, expected_args);
+                        assert!(
+                            broker
+                                .result(
+                                    &browser_id,
+                                    companion_client_id,
+                                    &request_id,
+                                    &poll.epoch,
+                                    json!({ "value": { "accepted": true } }),
+                                )
+                                .await
+                        );
+                        break;
+                    }
+                }
+            })
+        };
+
+        let tab_id = format!("{browser_id}:17");
+        let calls = vec![
+            (
+                "user_browser_tabs",
+                json!({ "action": "list", "browser_id": browser_id.clone(), "offset": 100, "limit": 25 }),
+            ),
+            (
+                "user_browser_snapshot",
+                json!({ "tab_id": tab_id, "frame_id": "frame-7", "filter": "button" }),
+            ),
+            (
+                "user_browser_navigate",
+                json!({
+                    "tab_id": tab_id,
+                    "page_id": page_id,
+                    "action": "goto",
+                    "url": "https://example.com/next"
+                }),
+            ),
+            (
+                "user_browser_action",
+                json!({
+                    "tab_id": tab_id,
+                    "page_id": page_id,
+                    "action": "drag",
+                    "ref": "ref-1",
+                    "to_ref": "ref-2",
+                    "screenshot_id": "shot-1"
+                }),
+            ),
+            (
+                "user_browser_evaluate",
+                json!({
+                    "tab_id": tab_id,
+                    "page_id": page_id,
+                    "frame_id": "frame-7",
+                    "expression": "document.title"
+                }),
+            ),
+            (
+                "user_browser_console",
+                json!({ "tab_id": tab_id, "after": 4, "limit": 10 }),
+            ),
+            (
+                "user_browser_network",
+                json!({ "tab_id": tab_id, "request_id": "main:request-1", "body": true }),
+            ),
+        ];
+
+        for (tool, arguments) in calls {
+            let request = tool_call_request_with_session(
+                tool,
+                arguments,
+                "user-browser-public-bindings-chat",
+            );
+            let response = call_workers_for_test_with_companion(
+                &request,
+                &workspace,
+                &root.path().to_string_lossy(),
+                test_worker_broker(),
+                test_managed_chat_broker(),
+                Some(companion_auth.clone()),
+            )
+            .await;
+            assert_ne!(
+                response
+                    .result
+                    .as_ref()
+                    .and_then(|result| result.get("isError"))
+                    .and_then(Value::as_bool),
+                Some(true),
+                "{tool} should dispatch through the broker"
+            );
+        }
+
+        responder.await.expect("join browser responder");
+    }
+
+    #[tokio::test]
+    async fn user_browser_tool_requires_exact_chatgpt_identity_before_dispatch() {
+        let root = TestTempDir::new("moondesk-user-browser-identity");
+        let workspace = WorkspaceId::new();
+        let request = tool_call_request("user_browser_tabs", json!({ "action": "list" }));
+        let response = call_workers_for_test(
+            &request,
+            &workspace,
+            &root.path().to_string_lossy(),
+            test_worker_broker(),
+            test_managed_chat_broker(),
+        )
+        .await;
+        assert_eq!(
+            response
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(result_text(&response).contains("exact ChatGPT conversation identity"));
+    }
+
+    #[tokio::test]
+    async fn user_browser_tab_id_rejects_non_string_values_before_dispatch() {
+        let root = TestTempDir::new("moondesk-user-browser-tab-type");
+        let workspace = WorkspaceId::new();
+        let companion_auth = Arc::new(
+            CompanionAuth::open(root.path().join("companion-auth.json"))
+                .expect("open test companion auth"),
+        );
+        let request = tool_call_request_with_session(
+            "user_browser_snapshot",
+            json!({ "tab_id": 17 }),
+            "user-browser-tab-type-chat",
+        );
+        let response = call_workers_for_test_with_companion(
+            &request,
+            &workspace,
+            &root.path().to_string_lossy(),
+            test_worker_broker(),
+            test_managed_chat_broker(),
+            Some(companion_auth),
+        )
+        .await;
+        assert_eq!(
+            response
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(result_text(&response).contains("tab_id must be a string"));
+    }
+
+    #[tokio::test]
+    async fn user_browser_browser_id_rejects_non_string_values_before_fallback() {
+        let root = TestTempDir::new("moondesk-user-browser-browser-type");
+        let workspace = WorkspaceId::new();
+        let companion_auth = Arc::new(
+            CompanionAuth::open(root.path().join("companion-auth.json"))
+                .expect("open test companion auth"),
+        );
+        let request = tool_call_request_with_session(
+            "user_browser_tabs",
+            json!({ "action": "list", "browser_id": 17 }),
+            "user-browser-browser-type-chat",
+        );
+        let response = call_workers_for_test_with_companion(
+            &request,
+            &workspace,
+            &root.path().to_string_lossy(),
+            test_worker_broker(),
+            test_managed_chat_broker(),
+            Some(companion_auth),
+        )
+        .await;
+        assert_eq!(
+            response
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(result_text(&response).contains("browser_id must be the string UUID"));
+    }
+
+    #[tokio::test]
+    async fn user_browser_tool_round_trip_decorates_exact_tab_handle() {
+        let root = TestTempDir::new("moondesk-user-browser-roundtrip");
+        let workspace = WorkspaceId::new();
+        let companion_auth = Arc::new(
+            CompanionAuth::open(root.path().join("companion-auth.json"))
+                .expect("open test companion auth"),
+        );
+        let broker = companion_auth.user_browser_broker();
+        let browser_id = Uuid::new_v4().to_string();
+        let companion_client_id = "user-browser-roundtrip-companion";
+        broker
+            .poll(&browser_id, companion_client_id, "Chrome", true)
+            .await
+            .expect("publish browser presence");
+
+        let responder = {
+            let broker = broker.clone();
+            let browser_id = browser_id.clone();
+            tokio::spawn(async move {
+                loop {
+                    let poll = broker
+                        .poll(&browser_id, companion_client_id, "Chrome", true)
+                        .await
+                        .expect("poll browser requests");
+                    if let Some(request_id) = poll.requests.first().cloned() {
+                        let command = broker
+                            .claim(&browser_id, companion_client_id, &request_id, &poll.epoch)
+                            .await
+                            .expect("claim browser request");
+                        assert_eq!(command.tool, "user_browser_tabs");
+                        assert_eq!(
+                            command.args.get("action").and_then(Value::as_str),
+                            Some("list")
+                        );
+                        assert!(
+                            broker
+                                .result(
+                                    &browser_id,
+                                    companion_client_id,
+                                    &request_id,
+                                    &poll.epoch,
+                                    json!({
+                                        "value": {
+                                            "tabs": [{ "tabId": 17, "title": "Example" }]
+                                        }
+                                    }),
+                                )
+                                .await
+                        );
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+        };
+
+        let request = tool_call_request_with_session(
+            "user_browser_tabs",
+            json!({ "action": "list", "browser_id": browser_id }),
+            "user-browser-roundtrip-chat",
+        );
+        let response = call_workers_for_test_with_companion(
+            &request,
+            &workspace,
+            &root.path().to_string_lossy(),
+            test_worker_broker(),
+            test_managed_chat_broker(),
+            Some(companion_auth),
+        )
+        .await;
+        responder.await.expect("join browser responder");
+
+        let structured = response
+            .result
+            .as_ref()
+            .and_then(|result| result.get("structuredContent"))
+            .expect("structured user-browser result");
+        assert_eq!(
+            structured.pointer("/tabs/0/tabId").and_then(Value::as_str),
+            Some(format!("{browser_id}:17").as_str())
+        );
+        assert_eq!(
+            structured.pointer("/tabs/0/title").and_then(Value::as_str),
+            Some("Example")
+        );
+    }
+
+    #[tokio::test]
+    async fn workers_tool_is_advertised_for_computer_mode() {
+        let request = JsonRpcRequest {
+            jsonrpc: "2.0".into(),
+            id: Some(json!("workers-list")),
+            method: "tools/list".into(),
+            params: json!({}),
+        };
+        let response = handle_tools_list(&request, Mode::Both, ToolMode::MultiTools).await;
+        let tools = response
+            .result
+            .as_ref()
+            .and_then(|result| result.get("tools"))
+            .and_then(Value::as_array)
+            .expect("tools list");
+        let workers = tools
+            .iter()
+            .find(|tool| tool.get("name").and_then(Value::as_str) == Some("workers"))
+            .expect("workers tool");
+        let context = workers
+            .get("inputSchema")
+            .and_then(|schema| schema.get("properties"))
+            .and_then(|properties| properties.get("context"))
+            .expect("workers context input");
+        assert_eq!(context.get("maxLength"), Some(&json!(32768)));
+        let context_description = context
+            .get("description")
+            .and_then(Value::as_str)
+            .expect("workers context description");
+        assert!(context_description.contains("exclude credentials"));
+        assert!(context_description.contains("unrelated private data"));
+        let description = workers
+            .get("description")
+            .and_then(Value::as_str)
+            .expect("workers description");
+        assert!(description.contains("Fresh spawns may include shared `context`"));
+        assert!(description.contains("Use the same shared context for sibling fresh spawns"));
+        assert!(description.contains("Reuse continues the same durable worker conversation"));
+        assert!(description.contains("retry that request promptly with the same `operation_id`"));
+        assert!(
+            description.len() < 1_200,
+            "workers description should stay concise"
+        );
+        for policy_like in [
+            "fails closed",
+            "never pass or guess",
+            "Do not copy credentials",
+            "Send boundary",
+            "ambiguous response",
+        ] {
+            assert!(
+                !description.contains(policy_like),
+                "workers description should not narrate enforcement policy: {policy_like}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn workers_tool_is_hidden_and_blocked_in_read_only_mode() {
+        let list_request = JsonRpcRequest {
+            jsonrpc: "2.0".into(),
+            id: Some(json!("workers-read-only-list")),
+            method: "tools/list".into(),
+            params: json!({}),
+        };
+        let list_response = handle_tools_list(&list_request, Mode::Both, ToolMode::ReadOnly).await;
+        let tools = list_response
+            .result
+            .as_ref()
+            .and_then(|result| result.get("tools"))
+            .and_then(Value::as_array)
+            .expect("tools list");
+        assert!(
+            tools
+                .iter()
+                .all(|tool| tool.get("name").and_then(Value::as_str) != Some("workers"))
+        );
+
+        let root = TestTempDir::new("moondesk-workers-read-only");
+        let workspace_root = root.path().join("workspace");
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        let request = tool_call_request_with_session(
+            "workers",
+            json!({ "action": "status" }),
+            "read-only-anchor",
+        );
+        let command_jobs = CommandJobManager::new();
+        let browser_runtime = None;
+        let response = handle_tools_call(
+            &request,
+            &workspace_root.to_string_lossy(),
+            Mode::Both,
+            ToolMode::ReadOnly,
+            false,
+            &command_jobs,
+            &browser_runtime,
+        )
+        .await;
+        assert_eq!(
+            response
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(result_text(&response).contains("read-only"));
+    }
+
+    #[tokio::test]
+    async fn workers_status_exposes_configured_recommended_and_max_counts() {
+        let root = TestTempDir::new("moondesk-workers-mcp-counts");
+        let workspace_root = root.path().join("workspace");
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        let workspace_id = WorkspaceId::new();
+        let broker = Arc::new(
+            WorkerBroker::open(root.path().join("worker-state-v1.json"))
+                .expect("open worker broker"),
+        );
+        let managed_chat_broker = Arc::new(
+            ManagedChatBroker::open(root.path().join("managed-chat-state-v1.json"))
+                .expect("open managed chat broker"),
+        );
+        let response = call_workers_for_test(
+            &tool_call_request_with_session(
+                "workers",
+                json!({ "action": "status" }),
+                "anchor-counts",
+            ),
+            &workspace_id,
+            &workspace_root.to_string_lossy(),
+            broker,
+            managed_chat_broker,
+        )
+        .await;
+        let structured = response
+            .result
+            .as_ref()
+            .and_then(|result| result.get("structuredContent"))
+            .expect("workers status structured output");
+        assert_eq!(structured.get("targetWorkerCount"), Some(&json!(4)));
+        assert_eq!(structured.get("recommendedWorkerCount"), Some(&json!(4)));
+        assert_eq!(structured.get("maxWorkerCount"), Some(&json!(8)));
+    }
+
+    #[tokio::test]
+    async fn workers_mcp_fails_closed_without_exact_openai_session() {
+        let root = TestTempDir::new("moondesk-workers-mcp-no-session");
+        let workspace_root = root.path().join("workspace");
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        let workspace_id = WorkspaceId::new();
+        let broker = Arc::new(
+            WorkerBroker::open(root.path().join("worker-state-v1.json"))
+                .expect("open worker broker"),
+        );
+        let managed_chat_broker = Arc::new(
+            ManagedChatBroker::open(root.path().join("managed-chat-state-v1.json"))
+                .expect("open managed chat broker"),
+        );
+        let request = tool_call_request(
+            "workers",
+            json!({
+                "action": "spawn",
+                "operation_id": Uuid::new_v4().to_string(),
+                "label": "audit",
+                "task": "audit auth"
+            }),
+        );
+        let response = call_workers_for_test(
+            &request,
+            &workspace_id,
+            &workspace_root.to_string_lossy(),
+            broker.clone(),
+            managed_chat_broker,
+        )
+        .await;
+        assert_eq!(
+            response
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(result_text(&response).contains("openai/session"));
+        let result = response.result.as_ref().expect("workers error result");
+        assert!(
+            result.get("structuredContent").is_none(),
+            "tool errors must not emit structuredContent that violates a tool output schema"
+        );
+        assert_eq!(
+            result.pointer("/content/0/type").and_then(Value::as_str),
+            Some("text")
+        );
+        assert!(broker.snapshot().await.families.is_empty());
+    }
+
+    #[tokio::test]
+    async fn workers_mcp_spawn_explains_optional_companion_when_unpaired() {
+        let root = TestTempDir::new("moondesk-workers-mcp-unpaired-companion");
+        let workspace_root = root.path().join("workspace");
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        let workspace_root = workspaces::canonicalize_existing_workspace_root(&workspace_root)
+            .expect("canonicalize workspace like production registration");
+        let workspace_id = WorkspaceId::new();
+        let broker = Arc::new(
+            WorkerBroker::open(root.path().join("worker-state-v1.json"))
+                .expect("open worker broker"),
+        );
+        let managed_chat_broker = Arc::new(
+            ManagedChatBroker::open(root.path().join("managed-chat-state-v1.json"))
+                .expect("open managed chat broker"),
+        );
+        let companion_auth = Arc::new(
+            CompanionAuth::open(root.path().join("companion-auth-v1.json"))
+                .expect("open companion auth"),
+        );
+        let command_jobs = CommandJobManager::new();
+        let browser_runtime = None;
+        let response = handle_tools_call_for_workspace(
+            &tool_call_request_with_session(
+                "workers",
+                json!({
+                    "action": "spawn",
+                    "operation_id": Uuid::new_v4().to_string(),
+                    "label": "optional companion",
+                    "task": "Inspect without editing."
+                }),
+                "unpaired-companion-core",
+            ),
+            McpRequestContext {
+                workspace_id: &workspace_id,
+                workspace_name: "Test Workspace",
+                workspace_root: &workspace_root.to_string_lossy(),
+                mode: Mode::Both,
+                tool_mode: ToolMode::MultiTools,
+                set_moondesk_as_co_author: false,
+                handoff_store_root: None,
+                command_jobs: &command_jobs,
+                browser_runtime: &browser_runtime,
+                worker_execution_profile: ChatExecutionProfile::default(),
+                worker_target_count: crate::workers::RECOMMENDED_WORKERS_PER_FAMILY,
+                worker_broker: broker.clone(),
+                managed_chat_broker: managed_chat_broker.clone(),
+                companion_auth: Some(companion_auth),
+                inbound_request_id: None,
+            },
+        )
+        .await;
+
+        assert_eq!(
+            response
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        let text = result_text(&response);
+        assert!(text.contains("optional MoonDesk Worker Companion"));
+        assert!(text.contains("Set up Workers"));
+        assert!(broker.snapshot().await.families.is_empty());
+        assert!(managed_chat_broker.snapshot().await.commands.is_empty());
+    }
+
+    #[tokio::test]
+    async fn workers_mcp_spawn_waits_for_exact_provider_correlation() {
+        let root = TestTempDir::new("moondesk-workers-mcp-provider-correlation");
+        let workspace_root = root.path().join("workspace");
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        let workspace_id = WorkspaceId::new();
+        let broker = Arc::new(
+            WorkerBroker::open(root.path().join("worker-state-v1.json"))
+                .expect("open worker broker"),
+        );
+        let managed_chat_broker = Arc::new(
+            ManagedChatBroker::open(root.path().join("managed-chat-state-v1.json"))
+                .expect("open managed chat broker"),
+        );
+        let companion_auth = Arc::new(
+            CompanionAuth::open(root.path().join("companion-auth-v1.json"))
+                .expect("open companion auth"),
+        );
+        companion_auth
+            .auto_pair(
+                "chrome-install",
+                &"a".repeat(64),
+                Some("chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            )
+            .await
+            .expect("pair chrome");
+        companion_auth
+            .auto_pair(
+                "edge-install",
+                &"b".repeat(64),
+                Some("chrome-extension://bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+            )
+            .await
+            .expect("pair edge");
+
+        let request_id = "wfr_exact_worker_spawn";
+        let wrong_correlation_conversation = "6aad7eb1-4b10-83ee-97bd-d98b338864de";
+
+        companion_auth
+            .update_presence(
+                "chrome-install",
+                crate::companion::CompanionPresenceUpdate {
+                    browser_label: Some("Chrome".into()),
+                    tabs: vec![crate::companion::CompanionTabPresence {
+                        conversation_id: wrong_correlation_conversation.into(),
+                        conversation_url: format!(
+                            "https://chatgpt.com/c/{wrong_correlation_conversation}"
+                        ),
+                        project_id: None,
+                        project_url: None,
+                        active: true,
+                        window_focused: true,
+                        generating: false,
+                    }],
+                },
+                crate::companion::unix_time_ms().saturating_add(10_000),
+            )
+            .await
+            .expect("chrome presence");
+
+        let anchor_conversation = "7bbd8fc2-5c21-94ff-a8ce-e09c449975ef";
+        companion_auth
+            .update_presence(
+                "edge-install",
+                crate::companion::CompanionPresenceUpdate {
+                    browser_label: Some("Edge".into()),
+                    tabs: vec![crate::companion::CompanionTabPresence {
+                        conversation_id: anchor_conversation.into(),
+                        conversation_url: format!("https://chatgpt.com/c/{anchor_conversation}"),
+                        project_id: None,
+                        project_url: None,
+                        active: false,
+                        window_focused: false,
+                        generating: true,
+                    }],
+                },
+                crate::companion::unix_time_ms().saturating_add(10_000),
+            )
+            .await
+            .expect("edge generating presence");
+
+        let delayed_auth = companion_auth.clone();
+        let delayed_request_id = request_id.to_string();
+        let delayed_conversation = wrong_correlation_conversation.to_string();
+        let correlation_task = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+            delayed_auth
+                .observe_correlations(
+                    "chrome-install",
+                    crate::companion::CompanionCorrelationUpdate {
+                        conversation_id: delayed_conversation.clone(),
+                        conversation_url: format!("https://chatgpt.com/c/{delayed_conversation}"),
+                        project_id: None,
+                        project_url: None,
+                        request_ids: vec![delayed_request_id],
+                        operation_ids: Vec::new(),
+                    },
+                    crate::companion::unix_time_ms(),
+                )
+                .await
+                .expect("publish delayed exact correlation");
+        });
+
+        let opaque_openai_session = "opaque-openai-session-not-browser-url";
+        let request = tool_call_request_with_session(
+            "workers",
+            json!({
+                "action": "spawn",
+                "operation_id": Uuid::new_v4().to_string(),
+                "label": "correlation proof",
+                "task": "Inspect without editing."
+            }),
+            opaque_openai_session,
+        );
+        let command_jobs = CommandJobManager::new();
+        let browser_runtime = None;
+        let response = handle_tools_call_for_workspace(
+            &request,
+            McpRequestContext {
+                workspace_id: &workspace_id,
+                workspace_name: "Totally Different Workspace Label",
+                workspace_root: &workspace_root.to_string_lossy(),
+                mode: Mode::Both,
+                tool_mode: ToolMode::MultiTools,
+                set_moondesk_as_co_author: false,
+                handoff_store_root: None,
+                command_jobs: &command_jobs,
+                browser_runtime: &browser_runtime,
+                worker_execution_profile: ChatExecutionProfile::default(),
+                worker_target_count: crate::workers::RECOMMENDED_WORKERS_PER_FAMILY,
+                worker_broker: broker,
+                managed_chat_broker: managed_chat_broker.clone(),
+                companion_auth: Some(companion_auth),
+                inbound_request_id: Some(request_id.into()),
+            },
+        )
+        .await;
+        correlation_task.await.expect("delayed correlation task");
+        assert_ne!(
+            response
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+
+        let snapshot = managed_chat_broker.snapshot().await;
+        let command = snapshot
+            .commands
+            .values()
+            .next()
+            .expect("managed worker launch");
+        assert_eq!(command.target_client_id.as_deref(), Some("chrome-install"));
+        assert_eq!(
+            command
+                .anchor_context
+                .as_ref()
+                .map(|context| context.conversation_id.as_str()),
+            Some(wrong_correlation_conversation)
+        );
+        assert_eq!(
+            command.launch.anchor_session_digest.as_deref(),
+            Some(ChatIdentity::session_digest_for(opaque_openai_session).as_str())
+        );
+        assert_ne!(
+            command.launch.anchor_session_digest.as_deref(),
+            Some(ChatIdentity::session_digest_for(anchor_conversation).as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn workers_mcp_spawn_uses_exact_operation_correlation_without_request_header() {
+        let root = TestTempDir::new("moondesk-workers-mcp-operation-correlation");
+        let workspace_root = root.path().join("workspace");
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        let workspace_id = WorkspaceId::new();
+        let broker = Arc::new(
+            WorkerBroker::open(root.path().join("worker-state-v1.json"))
+                .expect("open worker broker"),
+        );
+        let managed_chat_broker = Arc::new(
+            ManagedChatBroker::open(root.path().join("managed-chat-state-v1.json"))
+                .expect("open managed chat broker"),
+        );
+        let companion_auth = Arc::new(
+            CompanionAuth::open(root.path().join("companion-auth-v1.json"))
+                .expect("open companion auth"),
+        );
+        companion_auth
+            .auto_pair(
+                "chrome-install",
+                &"a".repeat(64),
+                Some("chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            )
+            .await
+            .expect("pair chrome");
+
+        let operation_id = Uuid::new_v4().to_string();
+        let anchor_conversation = "5aad7eb1-4b10-83ee-97bd-d98b338864de";
+        let delayed_auth = companion_auth.clone();
+        let delayed_operation_id = operation_id.clone();
+        let delayed_conversation = anchor_conversation.to_string();
+        let correlation_task = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+            delayed_auth
+                .observe_correlations(
+                    "chrome-install",
+                    crate::companion::CompanionCorrelationUpdate {
+                        conversation_id: delayed_conversation.clone(),
+                        conversation_url: format!("https://chatgpt.com/c/{delayed_conversation}"),
+                        project_id: None,
+                        project_url: None,
+                        request_ids: Vec::new(),
+                        operation_ids: vec![delayed_operation_id],
+                    },
+                    crate::companion::unix_time_ms(),
+                )
+                .await
+                .expect("publish delayed operation correlation");
+        });
+
+        let request = tool_call_request_with_session(
+            "workers",
+            json!({
+                "action": "spawn",
+                "operation_id": operation_id,
+                "label": "operation correlation proof",
+                "task": "Inspect without editing."
+            }),
+            "opaque-openai-session-operation-correlation",
+        );
+        let command_jobs = CommandJobManager::new();
+        let browser_runtime = None;
+        let response = handle_tools_call_for_workspace(
+            &request,
+            McpRequestContext {
+                workspace_id: &workspace_id,
+                workspace_name: "MoonDesk Operation Correlation",
+                workspace_root: &workspace_root.to_string_lossy(),
+                mode: Mode::Both,
+                tool_mode: ToolMode::MultiTools,
+                set_moondesk_as_co_author: false,
+                handoff_store_root: None,
+                command_jobs: &command_jobs,
+                browser_runtime: &browser_runtime,
+                worker_execution_profile: ChatExecutionProfile::default(),
+                worker_target_count: crate::workers::RECOMMENDED_WORKERS_PER_FAMILY,
+                worker_broker: broker,
+                managed_chat_broker: managed_chat_broker.clone(),
+                companion_auth: Some(companion_auth),
+                inbound_request_id: None,
+            },
+        )
+        .await;
+        correlation_task.await.expect("operation correlation task");
+        assert_ne!(
+            response
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+
+        let snapshot = managed_chat_broker.snapshot().await;
+        let command = snapshot
+            .commands
+            .values()
+            .next()
+            .expect("managed worker launch");
+        assert_eq!(command.target_client_id.as_deref(), Some("chrome-install"));
+        assert_eq!(
+            command
+                .anchor_context
+                .as_ref()
+                .map(|context| context.conversation_id.as_str()),
+            Some(anchor_conversation)
+        );
+    }
+
+    #[tokio::test]
+    async fn workers_mcp_spawn_fails_closed_without_exact_provider_correlation() {
+        let root = TestTempDir::new("moondesk-workers-mcp-no-provider-correlation");
+        let workspace_root = root.path().join("workspace");
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        let workspace_id = WorkspaceId::new();
+        let broker = Arc::new(
+            WorkerBroker::open(root.path().join("worker-state-v1.json"))
+                .expect("open worker broker"),
+        );
+        let managed_chat_broker = Arc::new(
+            ManagedChatBroker::open(root.path().join("managed-chat-state-v1.json"))
+                .expect("open managed chat broker"),
+        );
+        let companion_auth = Arc::new(
+            CompanionAuth::open(root.path().join("companion-auth-v1.json"))
+                .expect("open companion auth"),
+        );
+        companion_auth
+            .auto_pair(
+                "chrome-install",
+                &"a".repeat(64),
+                Some("chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            )
+            .await
+            .expect("pair chrome");
+        companion_auth
+            .auto_pair(
+                "edge-install",
+                &"b".repeat(64),
+                Some("chrome-extension://bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+            )
+            .await
+            .expect("pair edge");
+
+        let chrome_conversation = "6aad7eb1-4b10-83ee-97bd-d98b338864de";
+        companion_auth
+            .update_presence(
+                "chrome-install",
+                crate::companion::CompanionPresenceUpdate {
+                    browser_label: Some("Chrome".into()),
+                    tabs: vec![crate::companion::CompanionTabPresence {
+                        conversation_id: chrome_conversation.into(),
+                        conversation_url: format!("https://chatgpt.com/c/{chrome_conversation}"),
+                        project_id: None,
+                        project_url: None,
+                        active: true,
+                        window_focused: false,
+                        generating: true,
+                    }],
+                },
+                crate::companion::unix_time_ms(),
+            )
+            .await
+            .expect("chrome generating presence");
+
+        let edge_conversation = "7bbd8fc2-5c21-94ff-a8ce-e09c449975ef";
+        companion_auth
+            .update_presence(
+                "edge-install",
+                crate::companion::CompanionPresenceUpdate {
+                    browser_label: Some("Edge".into()),
+                    tabs: vec![crate::companion::CompanionTabPresence {
+                        conversation_id: edge_conversation.into(),
+                        conversation_url: format!("https://chatgpt.com/c/{edge_conversation}"),
+                        project_id: None,
+                        project_url: None,
+                        active: true,
+                        window_focused: true,
+                        generating: true,
+                    }],
+                },
+                crate::companion::unix_time_ms().saturating_sub(5_000),
+            )
+            .await
+            .expect("unrelated edge generating presence");
+        companion_auth
+            .update_presence(
+                "edge-install",
+                crate::companion::CompanionPresenceUpdate {
+                    browser_label: Some("Edge".into()),
+                    tabs: vec![crate::companion::CompanionTabPresence {
+                        conversation_id: edge_conversation.into(),
+                        conversation_url: format!("https://chatgpt.com/c/{edge_conversation}"),
+                        project_id: None,
+                        project_url: None,
+                        active: true,
+                        window_focused: true,
+                        generating: true,
+                    }],
+                },
+                crate::companion::unix_time_ms().saturating_add(10_000),
+            )
+            .await
+            .expect("unrelated edge refreshed generating presence");
+
+        let request = tool_call_request_with_session(
+            "workers",
+            json!({
+                "action": "spawn",
+                "operation_id": Uuid::new_v4().to_string(),
+                "label": "focused fallback",
+                "task": "Report the workspace name without editing."
+            }),
+            "opaque-anchor-session",
+        );
+        let command_jobs = CommandJobManager::new();
+        let browser_runtime = None;
+        let response = handle_tools_call_for_workspace(
+            &request,
+            McpRequestContext {
+                workspace_id: &workspace_id,
+                workspace_name: "MoonDesk",
+                workspace_root: &workspace_root.to_string_lossy(),
+                mode: Mode::Both,
+                tool_mode: ToolMode::MultiTools,
+                set_moondesk_as_co_author: false,
+                handoff_store_root: None,
+                command_jobs: &command_jobs,
+                browser_runtime: &browser_runtime,
+                worker_execution_profile: ChatExecutionProfile::default(),
+                worker_target_count: crate::workers::RECOMMENDED_WORKERS_PER_FAMILY,
+                worker_broker: broker.clone(),
+                managed_chat_broker: managed_chat_broker.clone(),
+                companion_auth: Some(companion_auth),
+                inbound_request_id: Some("request_without_page_correlation".into()),
+            },
+        )
+        .await;
+        assert_eq!(
+            response
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(
+            result_text(&response)
+                .contains("no exact provider-stream request/operation correlation")
+        );
+        assert!(managed_chat_broker.snapshot().await.commands.is_empty());
+        assert!(broker.snapshot().await.families.is_empty());
+    }
+
+    #[tokio::test]
+    async fn workers_mcp_reuses_anchor_affinity_while_other_workers_are_generating() {
+        let root = TestTempDir::new("moondesk-workers-mcp-anchor-affinity");
+        let workspace_root = root.path().join("workspace");
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        let workspace_id = WorkspaceId::new();
+        let broker = Arc::new(
+            WorkerBroker::open(root.path().join("worker-state-v1.json"))
+                .expect("open worker broker"),
+        );
+        let managed_chat_broker = Arc::new(
+            ManagedChatBroker::open(root.path().join("managed-chat-state-v1.json"))
+                .expect("open managed chat broker"),
+        );
+        let companion_auth = Arc::new(
+            CompanionAuth::open(root.path().join("companion-auth-v1.json"))
+                .expect("open companion auth"),
+        );
+        companion_auth
+            .auto_pair(
+                "anchor-browser",
+                &"a".repeat(64),
+                Some("chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            )
+            .await
+            .expect("pair anchor browser");
+        companion_auth
+            .auto_pair(
+                "other-browser",
+                &"b".repeat(64),
+                Some("chrome-extension://bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+            )
+            .await
+            .expect("pair other browser");
+
+        let anchor_conversation = "6aad7eb1-4b10-83ee-97bd-d98b338864de";
+        let worker_conversation = "7bbd8fc2-5c21-94ff-a8ce-e09c449975ef";
+        let anchor_tab = crate::companion::CompanionTabPresence {
+            conversation_id: anchor_conversation.into(),
+            conversation_url: format!("https://chatgpt.com/c/{anchor_conversation}"),
+            project_id: None,
+            project_url: None,
+            active: true,
+            window_focused: false,
+            generating: true,
+        };
+        companion_auth
+            .update_presence(
+                "anchor-browser",
+                crate::companion::CompanionPresenceUpdate {
+                    browser_label: Some("Edge".into()),
+                    tabs: vec![anchor_tab.clone()],
+                },
+                crate::companion::unix_time_ms(),
+            )
+            .await
+            .expect("anchor presence");
+        companion_auth
+            .update_presence(
+                "other-browser",
+                crate::companion::CompanionPresenceUpdate {
+                    browser_label: Some("Chrome".into()),
+                    tabs: vec![crate::companion::CompanionTabPresence {
+                        conversation_id: worker_conversation.into(),
+                        conversation_url: format!("https://chatgpt.com/c/{worker_conversation}"),
+                        project_id: None,
+                        project_url: None,
+                        active: true,
+                        window_focused: true,
+                        generating: true,
+                    }],
+                },
+                crate::companion::unix_time_ms(),
+            )
+            .await
+            .expect("worker presence");
+
+        let anchor_session = "opaque-anchor-session-for-affinity";
+        companion_auth
+            .remember_anchor_affinity(
+                &ChatIdentity::session_digest_for(anchor_session),
+                &crate::companion::CompanionAnchorRoute {
+                    client_id: "anchor-browser".into(),
+                    tab: anchor_tab,
+                },
+            )
+            .await
+            .expect("remember Core affinity");
+
+        let request = tool_call_request_with_session(
+            "workers",
+            json!({
+                "action": "spawn",
+                "operation_id": Uuid::new_v4().to_string(),
+                "label": "second worker",
+                "task": "Report workspace identity without editing."
+            }),
+            anchor_session,
+        );
+        let command_jobs = CommandJobManager::new();
+        let browser_runtime = None;
+        let response = handle_tools_call_for_workspace(
+            &request,
+            McpRequestContext {
+                workspace_id: &workspace_id,
+                workspace_name: "MoonDesk",
+                workspace_root: &workspace_root.to_string_lossy(),
+                mode: Mode::Both,
+                tool_mode: ToolMode::MultiTools,
+                set_moondesk_as_co_author: false,
+                handoff_store_root: None,
+                command_jobs: &command_jobs,
+                browser_runtime: &browser_runtime,
+                worker_execution_profile: ChatExecutionProfile::default(),
+                worker_target_count: crate::workers::RECOMMENDED_WORKERS_PER_FAMILY,
+                worker_broker: broker,
+                managed_chat_broker: managed_chat_broker.clone(),
+                companion_auth: Some(companion_auth),
+                inbound_request_id: Some("uncorrelated-second-spawn".into()),
+            },
+        )
+        .await;
+        assert_ne!(
+            response
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        let snapshot = managed_chat_broker.snapshot().await;
+        let command = snapshot
+            .commands
+            .values()
+            .next()
+            .expect("managed worker launch");
+        assert_eq!(command.target_client_id.as_deref(), Some("anchor-browser"));
+        assert_eq!(
+            command
+                .anchor_context
+                .as_ref()
+                .map(|context| context.conversation_id.as_str()),
+            Some(anchor_conversation)
+        );
+    }
+
+    #[tokio::test]
+    async fn workers_mcp_claim_requires_private_browser_attested_operation() {
+        let root = TestTempDir::new("moondesk-workers-mcp-browser-bound-claim");
+        let workspace_root = root.path().join("workspace");
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        let workspace_id = WorkspaceId::new();
+        let broker = Arc::new(
+            WorkerBroker::open(root.path().join("worker-state-v1.json"))
+                .expect("open worker broker"),
+        );
+        let managed_chat_broker = Arc::new(
+            ManagedChatBroker::open(root.path().join("managed-chat-state-v1.json"))
+                .expect("open managed chat broker"),
+        );
+        let companion_auth = Arc::new(
+            CompanionAuth::open(root.path().join("companion-auth-v1.json"))
+                .expect("open companion auth"),
+        );
+        companion_auth
+            .auto_pair(
+                "chrome-install",
+                &"a".repeat(64),
+                Some("chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            )
+            .await
+            .expect("pair companion");
+
+        let core_identity =
+            ChatIdentity::from_openai_meta(Some("worker-test-subject"), "browser-bound-core");
+        let spawned = broker
+            .spawn_worker(crate::workers::broker::SpawnWorkerRequest {
+                operation_id: crate::workers::types::OperationId::new(),
+                workspace_id: workspace_id.clone(),
+                anchor_identity: core_identity.clone(),
+                label: "browser bound claim".into(),
+                assignment: "prove browser-bound worker admission".into(),
+                context: String::new(),
+                execution_profile: ChatExecutionProfile::default(),
+            })
+            .await
+            .expect("spawn worker record");
+        let claim_operation_id = spawned
+            .claim_operation_id
+            .clone()
+            .expect("fresh worker claim operation id");
+        let command = managed_chat_broker
+            .enqueue(crate::managed_chat::broker::EnqueueManagedChatRequest {
+                dedupe_key: format!("worker:{}:task:{}", spawned.worker_id, spawned.task_id),
+                launch: ManagedChatLaunch {
+                    workspace_id: workspace_id.clone(),
+                    purpose: ManagedChatPurpose::Worker,
+                    execution_profile: ChatExecutionProfile::default(),
+                    opening_message: "browser-bound claim launch".into(),
+                    task_marker: format!("moondesk-worker-task:{}", spawned.task_id),
+                    thread_key: None,
+                    open_mode: ManagedChatOpenMode::NewThread,
+                    existing_conversation_url: None,
+                    anchor_session_digest: Some(core_identity.session_digest.clone()),
+                },
+            })
+            .await
+            .expect("enqueue managed worker launch");
+        broker
+            .link_launch_command(
+                &workspace_id,
+                &core_identity,
+                &spawned.worker_id,
+                &spawned.task_id,
+                &command.id.to_string(),
+            )
+            .await
+            .expect("link managed command");
+        let worker_conversation = "8ccd9ad3-6d32-a500-b9df-f10d55aa86f0";
+        broker
+            .update_launch_by_command(
+                &command.id.to_string(),
+                crate::workers::types::WorkerLaunchState::WaitingClaim,
+                None,
+                Some(format!("https://chatgpt.com/c/{worker_conversation}")),
+            )
+            .await
+            .expect("persist browser-confirmed worker conversation");
+
+        let command_jobs = CommandJobManager::new();
+        let browser_runtime = None;
+        let workspace_root_text = workspace_root.to_string_lossy().to_string();
+
+        let bad_token_request = tool_call_request_with_session(
+            "workers",
+            json!({
+                "action": "claim",
+                "worker_id": spawned.worker_id,
+                "task_id": spawned.task_id,
+                "claim_token": "not-the-claim-token",
+                "operation_id": claim_operation_id.to_string()
+            }),
+            "browser-bound-worker",
+        );
+        let bad_token = handle_tools_call_for_workspace(
+            &bad_token_request,
+            McpRequestContext {
+                workspace_id: &workspace_id,
+                workspace_name: "Browser Bound Claim",
+                workspace_root: &workspace_root_text,
+                mode: Mode::Both,
+                tool_mode: ToolMode::MultiTools,
+                set_moondesk_as_co_author: false,
+                handoff_store_root: None,
+                command_jobs: &command_jobs,
+                browser_runtime: &browser_runtime,
+                worker_execution_profile: ChatExecutionProfile::default(),
+                worker_target_count: crate::workers::RECOMMENDED_WORKERS_PER_FAMILY,
+                worker_broker: broker.clone(),
+                managed_chat_broker: managed_chat_broker.clone(),
+                companion_auth: Some(companion_auth.clone()),
+                inbound_request_id: None,
+            },
+        )
+        .await;
+        assert_eq!(
+            bad_token
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+
+        let core_claim_request = tool_call_request_with_session(
+            "workers",
+            json!({
+                "action": "claim",
+                "worker_id": spawned.worker_id,
+                "task_id": spawned.task_id,
+                "claim_token": spawned.claim_token,
+                "operation_id": claim_operation_id.to_string()
+            }),
+            "browser-bound-core",
+        );
+        let core_claim = handle_tools_call_for_workspace(
+            &core_claim_request,
+            McpRequestContext {
+                workspace_id: &workspace_id,
+                workspace_name: "Browser Bound Claim",
+                workspace_root: &workspace_root_text,
+                mode: Mode::Both,
+                tool_mode: ToolMode::MultiTools,
+                set_moondesk_as_co_author: false,
+                handoff_store_root: None,
+                command_jobs: &command_jobs,
+                browser_runtime: &browser_runtime,
+                worker_execution_profile: ChatExecutionProfile::default(),
+                worker_target_count: crate::workers::RECOMMENDED_WORKERS_PER_FAMILY,
+                worker_broker: broker.clone(),
+                managed_chat_broker: managed_chat_broker.clone(),
+                companion_auth: Some(companion_auth.clone()),
+                inbound_request_id: None,
+            },
+        )
+        .await;
+        assert_eq!(
+            core_claim
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(result_text(&core_claim).contains("Core conversation cannot claim"));
+
+        let intruder_conversation = "9dde0be4-7e43-b611-cae0-a21e66bb9701";
+        companion_auth
+            .observe_correlations(
+                "chrome-install",
+                crate::companion::CompanionCorrelationUpdate {
+                    conversation_id: intruder_conversation.into(),
+                    conversation_url: format!("https://chatgpt.com/c/{intruder_conversation}"),
+                    project_id: None,
+                    project_url: None,
+                    request_ids: Vec::new(),
+                    operation_ids: vec![claim_operation_id.to_string()],
+                },
+                crate::companion::unix_time_ms(),
+            )
+            .await
+            .expect("publish wrong-conversation claim operation proof");
+        let wrong_session_claim = tool_call_request_with_session(
+            "workers",
+            json!({
+                "action": "claim",
+                "worker_id": spawned.worker_id,
+                "task_id": spawned.task_id,
+                "claim_token": spawned.claim_token,
+                "operation_id": claim_operation_id.to_string()
+            }),
+            "browser-bound-intruder",
+        );
+        let wrong_session = handle_tools_call_for_workspace(
+            &wrong_session_claim,
+            McpRequestContext {
+                workspace_id: &workspace_id,
+                workspace_name: "Browser Bound Claim",
+                workspace_root: &workspace_root_text,
+                mode: Mode::Both,
+                tool_mode: ToolMode::MultiTools,
+                set_moondesk_as_co_author: false,
+                handoff_store_root: None,
+                command_jobs: &command_jobs,
+                browser_runtime: &browser_runtime,
+                worker_execution_profile: ChatExecutionProfile::default(),
+                worker_target_count: crate::workers::RECOMMENDED_WORKERS_PER_FAMILY,
+                worker_broker: broker.clone(),
+                managed_chat_broker: managed_chat_broker.clone(),
+                companion_auth: Some(companion_auth.clone()),
+                inbound_request_id: None,
+            },
+        )
+        .await;
+        assert_eq!(
+            wrong_session
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        let pending = broker.snapshot().await;
+        let pending_worker = pending
+            .families
+            .values()
+            .flat_map(|family| family.workers.values())
+            .find(|worker| worker.id == spawned.worker_id)
+            .expect("pending worker after rejected intruder claim");
+        assert!(pending_worker.chat_identity.is_none());
+        assert_eq!(
+            pending_worker.claim_token.as_deref(),
+            Some(spawned.claim_token.as_str())
+        );
+        assert_eq!(
+            pending_worker.claim_operation_id.as_ref(),
+            Some(&claim_operation_id)
+        );
+
+        companion_auth
+            .observe_correlations(
+                "chrome-install",
+                crate::companion::CompanionCorrelationUpdate {
+                    conversation_id: worker_conversation.into(),
+                    conversation_url: format!("https://chatgpt.com/c/{worker_conversation}"),
+                    project_id: None,
+                    project_url: None,
+                    request_ids: Vec::new(),
+                    operation_ids: vec![claim_operation_id.to_string()],
+                },
+                crate::companion::unix_time_ms(),
+            )
+            .await
+            .expect("publish exact worker claim operation proof");
+
+        let claim_request = tool_call_request_with_session(
+            "workers",
+            json!({
+                "action": "claim",
+                "worker_id": spawned.worker_id,
+                "task_id": spawned.task_id,
+                "claim_token": spawned.claim_token,
+                "operation_id": claim_operation_id.to_string()
+            }),
+            "browser-bound-worker",
+        );
+        let claimed = handle_tools_call_for_workspace(
+            &claim_request,
+            McpRequestContext {
+                workspace_id: &workspace_id,
+                workspace_name: "Browser Bound Claim",
+                workspace_root: &workspace_root_text,
+                mode: Mode::Both,
+                tool_mode: ToolMode::MultiTools,
+                set_moondesk_as_co_author: false,
+                handoff_store_root: None,
+                command_jobs: &command_jobs,
+                browser_runtime: &browser_runtime,
+                worker_execution_profile: ChatExecutionProfile::default(),
+                worker_target_count: crate::workers::RECOMMENDED_WORKERS_PER_FAMILY,
+                worker_broker: broker.clone(),
+                managed_chat_broker: managed_chat_broker.clone(),
+                companion_auth: Some(companion_auth.clone()),
+                inbound_request_id: None,
+            },
+        )
+        .await;
+        assert_eq!(
+            claimed
+                .result
+                .as_ref()
+                .and_then(|result| result.pointer("/structuredContent/state"))
+                .and_then(Value::as_str),
+            Some("running"),
+            "{}",
+            result_text(&claimed)
+        );
+
+        let retry = handle_tools_call_for_workspace(
+            &claim_request,
+            McpRequestContext {
+                workspace_id: &workspace_id,
+                workspace_name: "Browser Bound Claim",
+                workspace_root: &workspace_root_text,
+                mode: Mode::Both,
+                tool_mode: ToolMode::MultiTools,
+                set_moondesk_as_co_author: false,
+                handoff_store_root: None,
+                command_jobs: &command_jobs,
+                browser_runtime: &browser_runtime,
+                worker_execution_profile: ChatExecutionProfile::default(),
+                worker_target_count: crate::workers::RECOMMENDED_WORKERS_PER_FAMILY,
+                worker_broker: broker.clone(),
+                managed_chat_broker: managed_chat_broker.clone(),
+                companion_auth: Some(companion_auth.clone()),
+                inbound_request_id: None,
+            },
+        )
+        .await;
+        assert_eq!(
+            retry
+                .result
+                .as_ref()
+                .and_then(|result| result.pointer("/structuredContent/state"))
+                .and_then(Value::as_str),
+            Some("running")
+        );
+
+        let snapshot = broker.snapshot().await;
+        let worker = snapshot
+            .families
+            .values()
+            .flat_map(|family| family.workers.values())
+            .find(|worker| worker.id == spawned.worker_id)
+            .expect("claimed worker");
+        assert_eq!(
+            worker.conversation_url.as_deref(),
+            Some(format!("https://chatgpt.com/c/{worker_conversation}").as_str())
+        );
+        assert_eq!(
+            worker.chat_identity.as_ref(),
+            Some(&ChatIdentity::from_openai_meta(
+                Some("worker-test-subject"),
+                "browser-bound-worker"
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn cleared_worker_chat_is_fenced_from_all_moondesk_tools() {
+        let root = TestTempDir::new("moondesk-cleared-worker-tool-fence");
+        let workspace_root = root.path().join("workspace");
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        let workspace_id = WorkspaceId::new();
+        let broker = Arc::new(
+            WorkerBroker::open(root.path().join("worker-state-v1.json"))
+                .expect("open worker broker"),
+        );
+        let managed_chat_broker = Arc::new(
+            ManagedChatBroker::open(root.path().join("managed-chat-state-v1.json"))
+                .expect("open managed chat broker"),
+        );
+        let core = ChatIdentity::from_openai_meta(Some("worker-test-subject"), "clear-core");
+        let worker_identity =
+            ChatIdentity::from_openai_meta(Some("worker-test-subject"), "cleared-worker-session");
+        let spawned = broker
+            .spawn_worker(crate::workers::broker::SpawnWorkerRequest {
+                operation_id: OperationId::new(),
+                workspace_id: workspace_id.clone(),
+                anchor_identity: core.clone(),
+                label: "clear fence".into(),
+                assignment: "be cleared and fenced".into(),
+                context: String::new(),
+                execution_profile: ChatExecutionProfile::default(),
+            })
+            .await
+            .expect("spawn worker");
+        let command_id = Uuid::new_v4().to_string();
+        broker
+            .link_launch_command(
+                &workspace_id,
+                &core,
+                &spawned.worker_id,
+                &spawned.task_id,
+                &command_id,
+            )
+            .await
+            .expect("link worker launch");
+        broker
+            .update_launch_by_command(
+                &command_id,
+                crate::workers::types::WorkerLaunchState::WaitingClaim,
+                None,
+                Some(format!("https://chatgpt.com/c/{}", spawned.worker_id)),
+            )
+            .await
+            .expect("make worker claimable");
+        broker
+            .claim_worker(
+                &workspace_id,
+                &spawned.worker_id,
+                &spawned.task_id,
+                &spawned.claim_token,
+                worker_identity,
+            )
+            .await
+            .expect("claim worker");
+        broker
+            .clear_all_workers()
+            .await
+            .expect("clear worker histories");
+
+        std::fs::write(workspace_root.join("probe.txt"), "must stay fenced")
+            .expect("write read probe");
+        let response = call_workers_for_test(
+            &tool_call_request_with_session(
+                "read",
+                json!({ "path": "probe.txt" }),
+                "cleared-worker-session",
+            ),
+            &workspace_id,
+            &workspace_root.to_string_lossy(),
+            broker,
+            managed_chat_broker,
+        )
+        .await;
+        assert!(
+            result_text(&response).contains("belonged to a worker that was cleared"),
+            "{}",
+            result_text(&response)
+        );
+    }
+
+    #[tokio::test]
+    async fn workers_mcp_binds_anchor_and_worker_to_exact_chat_sessions() {
+        let root = TestTempDir::new("moondesk-workers-mcp-identity");
+        let workspace_root = root.path().join("workspace");
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        let workspace_id = WorkspaceId::new();
+        let broker = Arc::new(
+            WorkerBroker::open(root.path().join("worker-state-v1.json"))
+                .expect("open worker broker"),
+        );
+        let managed_chat_broker = Arc::new(
+            ManagedChatBroker::open(root.path().join("managed-chat-state-v1.json"))
+                .expect("open managed chat broker"),
+        );
+        let operation_id = Uuid::new_v4().to_string();
+        let spawn_args = json!({
+            "action": "spawn",
+            "operation_id": operation_id,
+            "label": "auth audit",
+            "task": "Audit authentication changes without editing."
+        });
+        let spawn = call_workers_for_test(
+            &tool_call_request_with_session("workers", spawn_args.clone(), "anchor-chat-a"),
+            &workspace_id,
+            &workspace_root.to_string_lossy(),
+            broker.clone(),
+            managed_chat_broker.clone(),
+        )
+        .await;
+        let spawned = spawn
+            .result
+            .as_ref()
+            .and_then(|result| result.get("structuredContent"))
+            .expect("spawn structured content");
+        let worker_id = spawned
+            .get("workerId")
+            .and_then(Value::as_str)
+            .expect("worker id")
+            .to_string();
+        let task_id = spawned
+            .get("taskId")
+            .and_then(Value::as_str)
+            .expect("task id")
+            .to_string();
+        assert!(spawned.get("claimToken").is_none());
+        let pending_snapshot = broker.snapshot().await;
+        let pending_worker = pending_snapshot
+            .families
+            .values()
+            .flat_map(|family| family.workers.values())
+            .find(|worker| worker.id.to_string() == worker_id)
+            .expect("pending worker capability");
+        let claim_token = pending_worker
+            .claim_token
+            .clone()
+            .expect("claim token stays host-side");
+        let claim_operation_id = pending_worker
+            .claim_operation_id
+            .clone()
+            .expect("claim operation id stays host-side");
+        assert_eq!(
+            spawned
+                .pointer("/executionProfile/reasoningEffort")
+                .and_then(Value::as_str),
+            Some("high")
+        );
+        let launch_snapshot = managed_chat_broker.snapshot().await;
+        assert_eq!(launch_snapshot.commands.len(), 1);
+        let launch_command = launch_snapshot
+            .commands
+            .values()
+            .next()
+            .expect("worker launch command");
+        assert_eq!(launch_command.launch.workspace_id, workspace_id);
+        assert_eq!(
+            launch_command.launch.execution_profile.reasoning_effort,
+            crate::managed_chat::types::ReasoningEffort::High
+        );
+        assert!(
+            launch_command
+                .launch
+                .opening_message
+                .contains("Test Workspace")
+        );
+        assert!(launch_command.launch.opening_message.contains(&worker_id));
+        assert!(launch_command.launch.opening_message.contains(&task_id));
+        assert!(launch_command.launch.opening_message.contains(&claim_token));
+        assert!(
+            launch_command
+                .launch
+                .opening_message
+                .contains(&claim_operation_id.to_string())
+        );
+
+        let retry = call_workers_for_test(
+            &tool_call_request_with_session("workers", spawn_args, "anchor-chat-a"),
+            &workspace_id,
+            &workspace_root.to_string_lossy(),
+            broker.clone(),
+            managed_chat_broker.clone(),
+        )
+        .await;
+        let retried = retry
+            .result
+            .as_ref()
+            .and_then(|result| result.get("structuredContent"))
+            .expect("retry structured content");
+        assert_eq!(retried.get("workerId"), Some(&json!(worker_id)));
+        assert_eq!(retried.get("taskId"), Some(&json!(task_id)));
+        assert_eq!(broker.snapshot().await.families.len(), 1);
+        assert_eq!(managed_chat_broker.snapshot().await.commands.len(), 1);
+
+        let forged_send = call_workers_for_test(
+            &tool_call_request_with_session(
+                "workers",
+                json!({
+                    "action": "send",
+                    "operation_id": Uuid::new_v4().to_string(),
+                    "worker_id": worker_id,
+                    "message": "forged anchor message"
+                }),
+                "different-anchor-chat",
+            ),
+            &workspace_id,
+            &workspace_root.to_string_lossy(),
+            broker.clone(),
+            managed_chat_broker.clone(),
+        )
+        .await;
+        assert_eq!(
+            forged_send
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+
+        broker
+            .update_launch_by_command(
+                &launch_command.id.to_string(),
+                crate::workers::types::WorkerLaunchState::WaitingClaim,
+                None,
+                Some(format!("https://chatgpt.com/c/{worker_id}")),
+            )
+            .await
+            .expect("confirm canonical worker conversation before claim");
+        let companion_auth = Arc::new(
+            CompanionAuth::open(root.path().join("companion-auth-identity-v1.json"))
+                .expect("open claim companion auth"),
+        );
+        companion_auth
+            .auto_pair(
+                "chrome-install",
+                &"a".repeat(64),
+                Some("chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            )
+            .await
+            .expect("pair claim companion");
+        companion_auth
+            .observe_correlations(
+                "chrome-install",
+                crate::companion::CompanionCorrelationUpdate {
+                    conversation_id: worker_id.clone(),
+                    conversation_url: format!("https://chatgpt.com/c/{worker_id}"),
+                    project_id: None,
+                    project_url: None,
+                    request_ids: Vec::new(),
+                    operation_ids: vec![claim_operation_id.to_string()],
+                },
+                crate::companion::unix_time_ms(),
+            )
+            .await
+            .expect("publish claim operation correlation");
+
+        let claim = call_workers_for_test_with_companion(
+            &tool_call_request_with_session(
+                "workers",
+                json!({
+                    "action": "claim",
+                    "worker_id": worker_id,
+                    "task_id": task_id,
+                    "claim_token": claim_token,
+                    "operation_id": claim_operation_id.to_string()
+                }),
+                "worker-chat-a",
+            ),
+            &workspace_id,
+            &workspace_root.to_string_lossy(),
+            broker.clone(),
+            managed_chat_broker.clone(),
+            Some(companion_auth.clone()),
+        )
+        .await;
+        assert_eq!(
+            claim
+                .result
+                .as_ref()
+                .and_then(|result| result.pointer("/structuredContent/state"))
+                .and_then(Value::as_str),
+            Some("running")
+        );
+
+        let forged_report = call_workers_for_test(
+            &tool_call_request_with_session(
+                "workers",
+                json!({
+                    "action": "report",
+                    "operation_id": Uuid::new_v4().to_string(),
+                    "worker_id": worker_id,
+                    "task_id": task_id,
+                    "message": "forged worker report"
+                }),
+                "different-worker-chat",
+            ),
+            &workspace_id,
+            &workspace_root.to_string_lossy(),
+            broker.clone(),
+            managed_chat_broker.clone(),
+        )
+        .await;
+        assert_eq!(
+            forged_report
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+
+        let report = call_workers_for_test(
+            &tool_call_request_with_session(
+                "workers",
+                json!({
+                    "action": "report",
+                    "operation_id": Uuid::new_v4().to_string(),
+                    "worker_id": worker_id,
+                    "task_id": task_id,
+                    "message": "auth audit found no regression"
+                }),
+                "worker-chat-a",
+            ),
+            &workspace_id,
+            &workspace_root.to_string_lossy(),
+            broker.clone(),
+            managed_chat_broker.clone(),
+        )
+        .await;
+        assert_eq!(
+            report
+                .result
+                .as_ref()
+                .and_then(|result| result.pointer("/structuredContent/state"))
+                .and_then(Value::as_str),
+            Some("accepted")
+        );
+
+        let finish = call_workers_for_test(
+            &tool_call_request_with_session(
+                "workers",
+                json!({
+                    "action": "finish",
+                    "worker_id": worker_id,
+                    "task_id": task_id,
+                    "result": "clean",
+                    "changes": "none",
+                    "validation": "targeted tests passed",
+                    "blockers": []
+                }),
+                "worker-chat-a",
+            ),
+            &workspace_id,
+            &workspace_root.to_string_lossy(),
+            broker.clone(),
+            managed_chat_broker.clone(),
+        )
+        .await;
+        assert_eq!(
+            finish
+                .result
+                .as_ref()
+                .and_then(|result| result.pointer("/structuredContent/state"))
+                .and_then(Value::as_str),
+            Some("completed")
+        );
+
+        let collect = call_workers_for_test(
+            &tool_call_request_with_session(
+                "workers",
+                json!({ "action": "collect", "operation_id": Uuid::new_v4().to_string() }),
+                "anchor-chat-a",
+            ),
+            &workspace_id,
+            &workspace_root.to_string_lossy(),
+            broker.clone(),
+            managed_chat_broker.clone(),
+        )
+        .await;
+        let collected = collect
+            .result
+            .as_ref()
+            .and_then(|result| result.get("structuredContent"))
+            .expect("collect structured content");
+        assert_eq!(
+            collected
+                .get("reports")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(1)
+        );
+        assert_eq!(
+            collected
+                .get("completed")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(1)
+        );
+
+        let second_collect = call_workers_for_test(
+            &tool_call_request_with_session(
+                "workers",
+                json!({ "action": "collect", "operation_id": Uuid::new_v4().to_string() }),
+                "anchor-chat-a",
+            ),
+            &workspace_id,
+            &workspace_root.to_string_lossy(),
+            broker.clone(),
+            managed_chat_broker.clone(),
+        )
+        .await;
+        let second = second_collect
+            .result
+            .as_ref()
+            .and_then(|result| result.get("structuredContent"))
+            .expect("second collect structured content");
+        assert!(
+            second
+                .get("reports")
+                .and_then(Value::as_array)
+                .is_some_and(Vec::is_empty)
+        );
+        assert!(
+            second
+                .get("completed")
+                .and_then(Value::as_array)
+                .is_some_and(Vec::is_empty)
+        );
+
+        let companion_auth = Arc::new(
+            CompanionAuth::open(root.path().join("companion-auth-reuse-v1.json"))
+                .expect("open reuse companion auth"),
+        );
+        companion_auth
+            .auto_pair(
+                "chrome-install",
+                &"a".repeat(64),
+                Some("chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            )
+            .await
+            .expect("pair reuse browser");
+        let core_conversation = "6aad7eb1-4b10-83ee-97bd-d98b338864de";
+        let core_route = crate::companion::CompanionAnchorRoute {
+            client_id: "chrome-install".into(),
+            tab: crate::companion::CompanionTabPresence {
+                conversation_id: core_conversation.into(),
+                conversation_url: format!("https://chatgpt.com/c/{core_conversation}"),
+                project_id: None,
+                project_url: None,
+                active: true,
+                window_focused: true,
+                generating: false,
+            },
+        };
+        companion_auth
+            .update_presence(
+                "chrome-install",
+                crate::companion::CompanionPresenceUpdate {
+                    browser_label: Some("Chrome".into()),
+                    tabs: vec![core_route.tab.clone()],
+                },
+                crate::companion::unix_time_ms(),
+            )
+            .await
+            .expect("publish reuse Core presence");
+        let core_identity =
+            ChatIdentity::from_openai_meta(Some("worker-test-subject"), "anchor-chat-a");
+        companion_auth
+            .remember_anchor_affinity(&core_identity.session_digest, &core_route)
+            .await
+            .expect("remember reuse Core route");
+
+        let reuse_operation = Uuid::new_v4().to_string();
+        let reuse = call_workers_for_test_with_companion(
+            &tool_call_request_with_session(
+                "workers",
+                json!({
+                    "action": "reuse",
+                    "operation_id": reuse_operation,
+                    "worker_id": worker_id,
+                    "task": "Perform a second focused audit on the same worker thread."
+                }),
+                "anchor-chat-a",
+            ),
+            &workspace_id,
+            &workspace_root.to_string_lossy(),
+            broker.clone(),
+            managed_chat_broker.clone(),
+            Some(companion_auth),
+        )
+        .await;
+        let reused = reuse
+            .result
+            .as_ref()
+            .and_then(|result| result.get("structuredContent"))
+            .expect("reuse structured content");
+        assert_eq!(reused.get("workerId"), Some(&json!(worker_id)));
+        assert_eq!(reused.get("state").and_then(Value::as_str), Some("waking"));
+        let reused_task_id = reused
+            .get("taskId")
+            .and_then(Value::as_str)
+            .expect("reused task id")
+            .to_string();
+        assert_ne!(reused_task_id, task_id);
+
+        let managed = managed_chat_broker.snapshot().await;
+        assert_eq!(managed.commands.len(), 2);
+        let wake = managed
+            .commands
+            .values()
+            .find(|command| command.launch.task_marker.ends_with(&reused_task_id))
+            .expect("reuse managed chat command");
+        assert_eq!(wake.launch.open_mode, ManagedChatOpenMode::ExistingThread);
+        assert_eq!(
+            wake.launch.thread_key.as_deref(),
+            Some(format!("worker:{worker_id}").as_str())
+        );
+        assert_eq!(wake.target_client_id.as_deref(), Some("chrome-install"));
+        assert_eq!(
+            wake.anchor_context
+                .as_ref()
+                .map(|context| context.conversation_id.as_str()),
+            Some(core_conversation)
+        );
+
+        let forged_start = call_workers_for_test(
+            &tool_call_request_with_session(
+                "workers",
+                json!({
+                    "action": "start",
+                    "worker_id": worker_id,
+                    "task_id": reused_task_id
+                }),
+                "different-worker-chat",
+            ),
+            &workspace_id,
+            &workspace_root.to_string_lossy(),
+            broker.clone(),
+            managed_chat_broker.clone(),
+        )
+        .await;
+        assert_eq!(
+            forged_start
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+
+        let start = call_workers_for_test(
+            &tool_call_request_with_session(
+                "workers",
+                json!({
+                    "action": "start",
+                    "worker_id": worker_id,
+                    "task_id": reused_task_id
+                }),
+                "worker-chat-a",
+            ),
+            &workspace_id,
+            &workspace_root.to_string_lossy(),
+            broker,
+            managed_chat_broker,
+        )
+        .await;
+        assert_eq!(
+            start
+                .result
+                .as_ref()
+                .and_then(|result| result.pointer("/structuredContent/state"))
+                .and_then(Value::as_str),
+            Some("running")
+        );
+    }
+
+    #[tokio::test]
+    async fn workers_mcp_retire_cancels_only_pre_send_launch_and_reuses_slot() {
+        let root = TestTempDir::new("moondesk-workers-mcp-retire");
+        let workspace_root = root.path().join("workspace");
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        let workspace_id = WorkspaceId::new();
+        let broker = Arc::new(
+            WorkerBroker::open(root.path().join("worker-state-v1.json"))
+                .expect("open worker broker"),
+        );
+        let managed_chat_broker = Arc::new(
+            ManagedChatBroker::open(root.path().join("managed-chat-state-v1.json"))
+                .expect("open managed chat broker"),
+        );
+
+        let spawn = call_workers_for_test(
+            &tool_call_request_with_session(
+                "workers",
+                json!({
+                    "action": "spawn",
+                    "operation_id": Uuid::new_v4().to_string(),
+                    "label": "cancel me",
+                    "task": "This launch should be retired before Send."
+                }),
+                "anchor-retire",
+            ),
+            &workspace_id,
+            &workspace_root.to_string_lossy(),
+            broker.clone(),
+            managed_chat_broker.clone(),
+        )
+        .await;
+        let spawned = spawn
+            .result
+            .as_ref()
+            .and_then(|result| result.get("structuredContent"))
+            .expect("spawn structured content");
+        let worker_id = spawned
+            .get("workerId")
+            .and_then(Value::as_str)
+            .expect("worker id")
+            .to_string();
+        assert_eq!(
+            spawned.get("displayId").and_then(Value::as_str),
+            Some("worker-1")
+        );
+        assert_eq!(managed_chat_broker.snapshot().await.commands.len(), 1);
+
+        let retire = call_workers_for_test(
+            &tool_call_request_with_session(
+                "workers",
+                json!({ "action": "retire", "worker_id": worker_id }),
+                "anchor-retire",
+            ),
+            &workspace_id,
+            &workspace_root.to_string_lossy(),
+            broker.clone(),
+            managed_chat_broker.clone(),
+        )
+        .await;
+        assert_eq!(
+            retire
+                .result
+                .as_ref()
+                .and_then(|result| result.pointer("/structuredContent/state"))
+                .and_then(Value::as_str),
+            Some("retired")
+        );
+        assert!(managed_chat_broker.snapshot().await.commands.is_empty());
+
+        let replacement = call_workers_for_test(
+            &tool_call_request_with_session(
+                "workers",
+                json!({
+                    "action": "spawn",
+                    "operation_id": Uuid::new_v4().to_string(),
+                    "label": "replacement",
+                    "task": "Replacement task after safe retirement."
+                }),
+                "anchor-retire",
+            ),
+            &workspace_id,
+            &workspace_root.to_string_lossy(),
+            broker.clone(),
+            managed_chat_broker.clone(),
+        )
+        .await;
+        let replacement = replacement
+            .result
+            .as_ref()
+            .and_then(|result| result.get("structuredContent"))
+            .expect("replacement structured content");
+        assert_eq!(
+            replacement.get("displayId").and_then(Value::as_str),
+            Some("worker-1")
+        );
+        let replacement_worker_id = replacement
+            .get("workerId")
+            .and_then(Value::as_str)
+            .expect("replacement worker id");
+        assert_ne!(replacement_worker_id, worker_id);
+
+        let offer = managed_chat_broker
+            .redeem("extension-retire-test", 10)
+            .await
+            .expect("redeem replacement launch")
+            .expect("replacement launch offer");
+        assert!(!offer.reconcile_required);
+        let replacement_lease = offer
+            .command
+            .lease
+            .as_ref()
+            .expect("replacement launch lease")
+            .lease_id
+            .clone();
+        managed_chat_broker
+            .mark_send_started(
+                &offer.command.id,
+                &replacement_lease,
+                "extension-retire-test",
+            )
+            .await
+            .expect("cross replacement Send boundary");
+        let unsafe_retire = call_workers_for_test(
+            &tool_call_request_with_session(
+                "workers",
+                json!({ "action": "retire", "worker_id": replacement_worker_id }),
+                "anchor-retire",
+            ),
+            &workspace_id,
+            &workspace_root.to_string_lossy(),
+            broker.clone(),
+            managed_chat_broker.clone(),
+        )
+        .await;
+        assert_eq!(
+            unsafe_retire
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(result_text(&unsafe_retire).contains("Send boundary"));
+        let family = broker
+            .family_for_anchor(
+                &workspace_id,
+                &ChatIdentity::from_openai_meta(Some("worker-test-subject"), "anchor-retire"),
+            )
+            .await
+            .expect("read family")
+            .expect("family exists");
+        assert_eq!(
+            family
+                .workers
+                .get(
+                    &crate::workers::types::WorkerId::parse(replacement_worker_id)
+                        .expect("parse replacement worker")
+                )
+                .expect("replacement worker")
+                .state,
+            crate::workers::types::WorkerState::Provisioning
+        );
     }
 
     #[test]
@@ -5746,6 +9194,7 @@ mod tests {
             &tool_call_request("moondesk_instruction", json!({})),
             McpRequestContext {
                 workspace_id: &workspace_id,
+                workspace_name: "Test Workspace",
                 workspace_root: &workspace_root_str,
                 mode: Mode::Both,
                 tool_mode: ToolMode::MultiTools,
@@ -5753,6 +9202,12 @@ mod tests {
                 handoff_store_root: Some(&handoff_store_root),
                 command_jobs: &command_jobs,
                 browser_runtime: &None,
+                worker_execution_profile: ChatExecutionProfile::default(),
+                worker_target_count: crate::workers::RECOMMENDED_WORKERS_PER_FAMILY,
+                worker_broker: test_worker_broker(),
+                managed_chat_broker: test_managed_chat_broker(),
+                companion_auth: None,
+                inbound_request_id: None,
             },
         )
         .await;
@@ -5763,6 +9218,11 @@ mod tests {
             .and_then(|structured| structured.get("instructionText"))
             .and_then(Value::as_str)
             .expect("initial instruction text");
+        assert!(
+            initial_instruction_text
+                .contains("Experimental Workers are exposed through the workers tool")
+        );
+        assert!(initial_instruction_text.contains("older cached connector schema"));
         assert!(initial_instruction_text.contains("Session handoffs are manual and explicit"));
         assert!(
             initial_instruction_text.contains("do not create handoffs silently or periodically")
@@ -5789,6 +9249,7 @@ mod tests {
             ),
             McpRequestContext {
                 workspace_id: &workspace_id,
+                workspace_name: "Test Workspace",
                 workspace_root: &workspace_root_str,
                 mode: Mode::Both,
                 tool_mode: ToolMode::MultiTools,
@@ -5796,6 +9257,12 @@ mod tests {
                 handoff_store_root: Some(&handoff_store_root),
                 command_jobs: &command_jobs,
                 browser_runtime: &None,
+                worker_execution_profile: ChatExecutionProfile::default(),
+                worker_target_count: crate::workers::RECOMMENDED_WORKERS_PER_FAMILY,
+                worker_broker: test_worker_broker(),
+                managed_chat_broker: test_managed_chat_broker(),
+                companion_auth: None,
+                inbound_request_id: None,
             },
         )
         .await;
@@ -5820,6 +9287,7 @@ mod tests {
             &tool_call_request("moondesk_instruction", json!({})),
             McpRequestContext {
                 workspace_id: &workspace_id,
+                workspace_name: "Test Workspace",
                 workspace_root: &workspace_root_str,
                 mode: Mode::Both,
                 tool_mode: ToolMode::MultiTools,
@@ -5827,6 +9295,12 @@ mod tests {
                 handoff_store_root: Some(&handoff_store_root),
                 command_jobs: &command_jobs,
                 browser_runtime: &None,
+                worker_execution_profile: ChatExecutionProfile::default(),
+                worker_target_count: crate::workers::RECOMMENDED_WORKERS_PER_FAMILY,
+                worker_broker: test_worker_broker(),
+                managed_chat_broker: test_managed_chat_broker(),
+                companion_auth: None,
+                inbound_request_id: None,
             },
         )
         .await;
@@ -5848,6 +9322,7 @@ mod tests {
             &tool_call_request("resume_handoff", json!({ "handoff_id": handoff_id })),
             McpRequestContext {
                 workspace_id: &workspace_id,
+                workspace_name: "Test Workspace",
                 workspace_root: &workspace_root_str,
                 mode: Mode::Both,
                 tool_mode: ToolMode::MultiTools,
@@ -5855,6 +9330,12 @@ mod tests {
                 handoff_store_root: Some(&handoff_store_root),
                 command_jobs: &command_jobs,
                 browser_runtime: &None,
+                worker_execution_profile: ChatExecutionProfile::default(),
+                worker_target_count: crate::workers::RECOMMENDED_WORKERS_PER_FAMILY,
+                worker_broker: test_worker_broker(),
+                managed_chat_broker: test_managed_chat_broker(),
+                companion_auth: None,
+                inbound_request_id: None,
             },
         )
         .await;
@@ -5884,6 +9365,7 @@ mod tests {
             &tool_call_request("moondesk_instruction", json!({})),
             McpRequestContext {
                 workspace_id: &workspace_id,
+                workspace_name: "Test Workspace",
                 workspace_root: &workspace_root_str,
                 mode: Mode::Both,
                 tool_mode: ToolMode::MultiTools,
@@ -5891,6 +9373,12 @@ mod tests {
                 handoff_store_root: Some(&handoff_store_root),
                 command_jobs: &command_jobs,
                 browser_runtime: &None,
+                worker_execution_profile: ChatExecutionProfile::default(),
+                worker_target_count: crate::workers::RECOMMENDED_WORKERS_PER_FAMILY,
+                worker_broker: test_worker_broker(),
+                managed_chat_broker: test_managed_chat_broker(),
+                companion_auth: None,
+                inbound_request_id: None,
             },
         )
         .await;
@@ -5909,6 +9397,7 @@ mod tests {
             &tool_call_request("complete_handoff", json!({ "handoff_id": handoff_id })),
             McpRequestContext {
                 workspace_id: &workspace_id,
+                workspace_name: "Test Workspace",
                 workspace_root: &workspace_root_str,
                 mode: Mode::Both,
                 tool_mode: ToolMode::MultiTools,
@@ -5916,6 +9405,12 @@ mod tests {
                 handoff_store_root: Some(&handoff_store_root),
                 command_jobs: &command_jobs,
                 browser_runtime: &None,
+                worker_execution_profile: ChatExecutionProfile::default(),
+                worker_target_count: crate::workers::RECOMMENDED_WORKERS_PER_FAMILY,
+                worker_broker: test_worker_broker(),
+                managed_chat_broker: test_managed_chat_broker(),
+                companion_auth: None,
+                inbound_request_id: None,
             },
         )
         .await;
@@ -5933,6 +9428,7 @@ mod tests {
             &tool_call_request("moondesk_instruction", json!({})),
             McpRequestContext {
                 workspace_id: &workspace_id,
+                workspace_name: "Test Workspace",
                 workspace_root: &workspace_root_str,
                 mode: Mode::Both,
                 tool_mode: ToolMode::MultiTools,
@@ -5940,6 +9436,12 @@ mod tests {
                 handoff_store_root: Some(&handoff_store_root),
                 command_jobs: &command_jobs,
                 browser_runtime: &None,
+                worker_execution_profile: ChatExecutionProfile::default(),
+                worker_target_count: crate::workers::RECOMMENDED_WORKERS_PER_FAMILY,
+                worker_broker: test_worker_broker(),
+                managed_chat_broker: test_managed_chat_broker(),
+                companion_auth: None,
+                inbound_request_id: None,
             },
         )
         .await;
@@ -6359,6 +9861,15 @@ mod tests {
                 "poll_command",
                 "read_command_output",
                 "cancel_command",
+                "workers",
+                "user_browser_tabs",
+                "user_browser_snapshot",
+                "user_browser_screenshot",
+                "user_browser_navigate",
+                "user_browser_action",
+                "user_browser_evaluate",
+                "user_browser_console",
+                "user_browser_network",
                 "moondesk_instruction",
                 "create_handoff",
                 "resume_handoff",
@@ -6468,6 +9979,15 @@ mod tests {
             ("poll_command", "output"),
             ("read_command_output", "text"),
             ("cancel_command", "state"),
+            ("workers", "action"),
+            ("user_browser_tabs", "tabs"),
+            ("user_browser_snapshot", "text"),
+            ("user_browser_screenshot", "screenshotId"),
+            ("user_browser_navigate", "accepted"),
+            ("user_browser_action", "accepted"),
+            ("user_browser_evaluate", "value"),
+            ("user_browser_console", "entries"),
+            ("user_browser_network", "entries"),
             ("moondesk_instruction", "instructionText"),
             ("create_handoff", "handoffId"),
             ("resume_handoff", "drift"),
@@ -7459,6 +10979,70 @@ mod tests {
             "contract-only capabilities must not become hidden top-level tools"
         );
 
+        let (new_page_args, new_page_timeout) = normalize_connector_browser_arguments(
+            "new_page",
+            json!({ "url": "about:blank", "timeout": 750 }),
+        )
+        .expect("normalize connector new_page timeout");
+        assert_eq!(new_page_timeout, Some(750));
+        assert!(new_page_args.get("timeout").is_none());
+        assert!(
+            normalize_connector_browser_arguments(
+                "new_page",
+                json!({ "url": "about:blank", "isolatedContext": "caller-owned" })
+            )
+            .expect_err("caller-controlled context must stay rejected")
+            .contains("managed by MoonDesk")
+        );
+        assert!(
+            normalize_connector_browser_arguments(
+                "list_console_messages",
+                json!({ "serviceWorkerId": "worker-1" })
+            )
+            .expect_err("raw service worker filtering must stay session-safe")
+            .contains("not scoped")
+        );
+
+        let (navigate_args, navigate_timeout) = normalize_connector_browser_arguments(
+            "navigate_page",
+            json!({
+                "type": "url",
+                "url": "about:blank",
+                "timeout": 1_250,
+                "handleBeforeUnload": "accept"
+            }),
+        )
+        .expect("normalize connector navigation compatibility arguments");
+        assert_eq!(navigate_timeout, Some(1_250));
+        assert!(navigate_args.get("timeout").is_none());
+        assert_eq!(
+            navigate_args
+                .get("handleBeforeUnload")
+                .and_then(Value::as_str),
+            Some("accept")
+        );
+        let (dismiss_args, dismiss_timeout) = normalize_connector_browser_arguments(
+            "navigate_page",
+            json!({ "type": "reload", "handleBeforeUnload": "dismiss" }),
+        )
+        .expect("beforeunload dismissal should reach the native CDP handler");
+        assert_eq!(dismiss_timeout, None);
+        assert_eq!(
+            dismiss_args
+                .get("handleBeforeUnload")
+                .and_then(Value::as_str),
+            Some("dismiss")
+        );
+
+        let (screenshot_args, screenshot_timeout) =
+            normalize_connector_browser_arguments("take_screenshot", json!({}))
+                .expect("normalize connector screenshot defaults");
+        assert_eq!(screenshot_timeout, None);
+        assert_eq!(
+            screenshot_args.get("format").and_then(Value::as_str),
+            Some("jpeg")
+        );
+
         let workspace_root =
             std::env::temp_dir().join(format!("moondesk-browser-adapter-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&workspace_root).expect("create browser adapter workspace");
@@ -7856,7 +11440,9 @@ mod tests {
                 "navigate_page",
                 json!({
                     "type": "url",
-                    "url": "data:text/html,<input aria-label='first'><input aria-label='second'><div id='status'>waiting</div><script>setTimeout(()=>document.getElementById('status').textContent='ready-text',300)</script>"
+                    "url": "data:text/html,<input aria-label='first'><input aria-label='second'><select aria-label='choice'><option value='one'>One</option><option value='two'>Two label</option></select><input aria-label='check' type='checkbox'><input aria-label='radio' type='radio' name='choice-radio'><button aria-label='manual-dialog' onclick=\"window.manualDialogResult=prompt('manual-dialog','default')\">Dialog</button><button aria-label='hover-target' onmouseenter=\"window.hovered=true\">Hover</button><button aria-label='drag-source' onmousedown=\"window.dragStarted=true\">Drag source</button><button aria-label='drag-target' style='margin-left:120px' onmousemove=\"if(event.buttons===1)window.dragged=true\" onmouseup=\"window.dragEnded=true\">Drag target</button><input aria-label='keyboard-dialog' onkeydown=\"if(event.key==='Enter')window.keyboardDialogResult=prompt('keyboard-dialog','default')\"><input aria-label='type-dialog' oninput=\"if(this.value==='dialog')window.typeDialogResult=prompt('type-dialog','default')\"><div id='status'>waiting</div><script>setTimeout(()=>document.getElementById('status').textContent='ready-text',300)</script>",
+                    "timeout": 5_000,
+                    "handleBeforeUnload": "accept"
                 }),
             ),
             &workspace_root_str,
@@ -7897,7 +11483,7 @@ mod tests {
         let uid_for = |label: &str| {
             snapshot_stdout
                 .lines()
-                .find(|line| line.contains(&format!("textbox \"{label}\"")))
+                .find(|line| line.contains(&format!("\"{label}\"")))
                 .and_then(|line| line.trim().strip_prefix("uid="))
                 .and_then(|line| line.split_whitespace().next())
                 .map(str::to_string)
@@ -7905,6 +11491,493 @@ mod tests {
         };
         let first_uid = uid_for("first");
         let second_uid = uid_for("second");
+        let choice_uid = uid_for("choice");
+        let check_uid = uid_for("check");
+        let radio_uid = uid_for("radio");
+        let manual_dialog_uid = uid_for("manual-dialog");
+        let hover_uid = uid_for("hover-target");
+        let drag_source_uid = uid_for("drag-source");
+        let drag_target_uid = uid_for("drag-target");
+        let keyboard_dialog_uid = uid_for("keyboard-dialog");
+        let type_dialog_uid = uid_for("type-dialog");
+
+        let element_argument = handle_tools_call(
+            &tool_call_request(
+                "evaluate_script",
+                json!({
+                    "function": "(element) => ({ tag: element.tagName, label: element.getAttribute('aria-label') })",
+                    "args": [first_uid.clone()]
+                }),
+            ),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        let element_argument_stdout = browser_stdout(&element_argument);
+        assert!(
+            element_argument_stdout.contains("\"tag\":\"INPUT\"")
+                && element_argument_stdout.contains("\"label\":\"first\""),
+            "evaluate_script args must resolve snapshot UIDs to DOM elements: {element_argument_stdout}"
+        );
+
+        let dialog_click = handle_tools_call(
+            &tool_call_request("click", json!({ "uid": manual_dialog_uid })),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        assert_ne!(
+            dialog_click
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true),
+            "click that opens a dialog must return without invalidating the browser: {}",
+            result_text(&dialog_click)
+        );
+
+        let handled_dialog = handle_tools_call(
+            &tool_call_request(
+                "handle_dialog",
+                json!({ "action": "accept", "promptText": "manual-ok" }),
+            ),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        assert_ne!(
+            handled_dialog
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true),
+            "handle_dialog should accept the dialog opened by click: {}",
+            result_text(&handled_dialog)
+        );
+
+        let manual_dialog_result = handle_tools_call(
+            &tool_call_request(
+                "evaluate_script",
+                json!({ "function": "() => window.manualDialogResult" }),
+            ),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        assert!(
+            browser_stdout(&manual_dialog_result).contains("manual-ok"),
+            "prompt result should reflect handle_dialog input: {}",
+            browser_stdout(&manual_dialog_result)
+        );
+
+        let hovered = handle_tools_call(
+            &tool_call_request("hover", json!({ "uid": hover_uid })),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        assert_ne!(
+            hovered
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true),
+            "hover should complete in Chromium: {}",
+            result_text(&hovered)
+        );
+        let hover_state = handle_tools_call(
+            &tool_call_request(
+                "evaluate_script",
+                json!({ "function": "() => window.hovered === true" }),
+            ),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        assert!(
+            browser_stdout(&hover_state).contains("true"),
+            "hover must dispatch a real mouse-enter path: {}",
+            browser_stdout(&hover_state)
+        );
+
+        let dragged = handle_tools_call(
+            &tool_call_request(
+                "drag",
+                json!({
+                    "from_uid": drag_source_uid,
+                    "to_uid": drag_target_uid
+                }),
+            ),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        assert_ne!(
+            dragged
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true),
+            "drag should complete in Chromium: {}",
+            result_text(&dragged)
+        );
+        let drag_state = handle_tools_call(
+            &tool_call_request(
+                "evaluate_script",
+                json!({ "function": "() => ({ started: !!window.dragStarted, moved: !!window.dragged, ended: !!window.dragEnded })" }),
+            ),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        let drag_state_stdout = browser_stdout(&drag_state);
+        assert!(
+            drag_state_stdout.contains("\"started\":true")
+                && drag_state_stdout.contains("\"moved\":true")
+                && drag_state_stdout.contains("\"ended\":true"),
+            "drag must deliver pressed movement and release to the target: {drag_state_stdout}"
+        );
+
+        let keyboard_focus = handle_tools_call(
+            &tool_call_request("click", json!({ "uid": keyboard_dialog_uid })),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        assert_ne!(
+            keyboard_focus
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true),
+            "keyboard fixture focus click should succeed"
+        );
+        let keyboard_prompt = handle_tools_call(
+            &tool_call_request("press_key", json!({ "key": "ENTER" })),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        assert_ne!(
+            keyboard_prompt
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true),
+            "press_key that opens a dialog must return cleanly: {}",
+            result_text(&keyboard_prompt)
+        );
+        let handled_keyboard_prompt = handle_tools_call(
+            &tool_call_request(
+                "handle_dialog",
+                json!({ "action": "accept", "promptText": "keyboard-ok" }),
+            ),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        assert_ne!(
+            handled_keyboard_prompt
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true),
+            "keyboard dialog should be handleable: {}",
+            result_text(&handled_keyboard_prompt)
+        );
+
+        let type_focus = handle_tools_call(
+            &tool_call_request("click", json!({ "uid": type_dialog_uid })),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        assert_ne!(
+            type_focus
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true),
+            "type fixture focus click should succeed"
+        );
+        let type_prompt = handle_tools_call(
+            &tool_call_request("type_text", json!({ "text": "dialog" })),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        assert_ne!(
+            type_prompt
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true),
+            "type_text that opens a dialog must return cleanly: {}",
+            result_text(&type_prompt)
+        );
+        let handled_type_prompt = handle_tools_call(
+            &tool_call_request(
+                "handle_dialog",
+                json!({ "action": "accept", "promptText": "type-ok" }),
+            ),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        assert_ne!(
+            handled_type_prompt
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true),
+            "type_text dialog should be handleable: {}",
+            result_text(&handled_type_prompt)
+        );
+        let dialog_input_state = handle_tools_call(
+            &tool_call_request(
+                "evaluate_script",
+                json!({ "function": "() => ({ keyboard: window.keyboardDialogResult, typed: window.typeDialogResult })" }),
+            ),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        let dialog_input_stdout = browser_stdout(&dialog_input_state);
+        assert!(
+            dialog_input_stdout.contains("\"keyboard\":\"keyboard-ok\"")
+                && dialog_input_stdout.contains("\"typed\":\"type-ok\""),
+            "keyboard/text dialog results were not preserved: {dialog_input_stdout}"
+        );
+
+        let emitted_warning = handle_tools_call(
+            &tool_call_request(
+                "evaluate_script",
+                json!({
+                    "function": "() => { console.warn('native-warning-filter'); return 'warned'; }"
+                }),
+            ),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        assert!(
+            browser_stdout(&emitted_warning).contains("warned"),
+            "failed to emit native warning fixture: {}",
+            browser_stdout(&emitted_warning)
+        );
+        let warning_messages = handle_tools_call(
+            &tool_call_request("list_console_messages", json!({ "types": ["warn"] })),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::ReadOnly,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        let warning_stdout = browser_stdout(&warning_messages);
+        assert!(
+            warning_stdout.contains("[warn]") && warning_stdout.contains("native-warning-filter"),
+            "public warn filter should match Chrome warning events: {warning_stdout}"
+        );
+
+        let invalid_screenshot_quality = handle_tools_call(
+            &tool_call_request("take_screenshot", json!({ "quality": 101 })),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        assert!(
+            result_text(&invalid_screenshot_quality)
+                .contains("Screenshot quality must be between 0 and 100"),
+            "invalid screenshot quality should fail cleanly: {}",
+            result_text(&invalid_screenshot_quality)
+        );
+
+        let incompatible_screenshot = handle_tools_call(
+            &tool_call_request(
+                "take_screenshot",
+                json!({ "uid": first_uid.clone(), "fullPage": true }),
+            ),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        assert!(
+            result_text(&incompatible_screenshot)
+                .contains("fullPage=true is incompatible with uid"),
+            "element and full-page screenshot modes must remain mutually exclusive: {}",
+            result_text(&incompatible_screenshot)
+        );
+
+        let default_dialog = handle_tools_call(
+            &tool_call_request(
+                "evaluate_script",
+                json!({
+                    "function": "() => { alert('native-default-dialog'); return 'after-alert'; }"
+                }),
+            ),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        assert!(
+            browser_stdout(&default_dialog).contains("after-alert"),
+            "evaluate_script should accept dialogs by default: {}",
+            browser_stdout(&default_dialog)
+        );
+
+        let prompt_dialog = handle_tools_call(
+            &tool_call_request(
+                "evaluate_script",
+                json!({
+                    "function": "() => prompt('native-prompt', 'default')",
+                    "dialogAction": "typed-by-native"
+                }),
+            ),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        assert!(
+            browser_stdout(&prompt_dialog).contains("typed-by-native"),
+            "evaluate_script prompt text was not delivered: {}",
+            browser_stdout(&prompt_dialog)
+        );
+
+        let dismissed_dialog = handle_tools_call(
+            &tool_call_request(
+                "evaluate_script",
+                json!({
+                    "function": "() => confirm('native-dismiss')",
+                    "dialogAction": "dismiss"
+                }),
+            ),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        assert!(
+            browser_stdout(&dismissed_dialog).contains("false"),
+            "evaluate_script dialog dismissal was not observed: {}",
+            browser_stdout(&dismissed_dialog)
+        );
+
+        let accepted_dialog = handle_tools_call(
+            &tool_call_request(
+                "evaluate_script",
+                json!({
+                    "function": "() => confirm('native-accept')",
+                    "dialogAction": "accept"
+                }),
+            ),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        assert!(
+            browser_stdout(&accepted_dialog).contains("true"),
+            "evaluate_script dialog acceptance was not observed: {}",
+            browser_stdout(&accepted_dialog)
+        );
 
         let filled = handle_tools_call(
             &tool_call_request(
@@ -7912,7 +11985,10 @@ mod tests {
                 json!({
                     "elements": [
                         { "uid": first_uid, "value": "-1" },
-                        { "uid": second_uid, "value": "beta" }
+                        { "uid": second_uid, "value": "beta" },
+                        { "uid": choice_uid, "value": "Two label" },
+                        { "uid": check_uid, "value": "true" },
+                        { "uid": radio_uid, "value": "true" }
                     ],
                     "includeSnapshot": true
                 }),
@@ -7939,7 +12015,7 @@ mod tests {
             &tool_call_request(
                 "evaluate_script",
                 json!({
-                    "function": "() => ({first: document.querySelector('[aria-label=first]').value, second: document.querySelector('[aria-label=second]').value})"
+                    "function": "() => ({first: document.querySelector('[aria-label=first]').value, second: document.querySelector('[aria-label=second]').value, choice: document.querySelector('[aria-label=choice]').value, check: document.querySelector('[aria-label=check]').checked, radio: document.querySelector('[aria-label=radio]').checked})"
                 }),
             ),
             &workspace_root_str,
@@ -7959,6 +12035,34 @@ mod tests {
             .expect("connector-expanded evaluate_script stdout");
         assert!(evaluated_stdout.contains("-1"), "{evaluated_stdout}");
         assert!(evaluated_stdout.contains("beta"), "{evaluated_stdout}");
+        assert!(
+            evaluated_stdout.contains("\"choice\":\"two\""),
+            "{evaluated_stdout}"
+        );
+        assert!(
+            evaluated_stdout.contains("\"check\":true"),
+            "{evaluated_stdout}"
+        );
+        assert!(
+            evaluated_stdout.contains("\"radio\":true"),
+            "{evaluated_stdout}"
+        );
+
+        let verbose_snapshot = handle_tools_call(
+            &tool_call_request("take_snapshot", json!({ "verbose": true })),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::ReadOnly,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        let verbose_snapshot_stdout = browser_stdout(&verbose_snapshot);
+        assert!(
+            verbose_snapshot_stdout.contains("checked="),
+            "verbose accessibility snapshots should expose AX properties: {verbose_snapshot_stdout}"
+        );
 
         let refreshed_snapshot = handle_tools_call(
             &tool_call_request("take_snapshot", json!({})),
@@ -8057,6 +12161,100 @@ mod tests {
             .expect("connector wait_for stdout");
         assert!(waited_stdout.contains("ready-text"), "{waited_stdout}");
 
+        let waited_any = handle_tools_call(
+            &tool_call_request(
+                "wait_for",
+                json!({
+                    "text": ["definitely-missing-alternative", "ready-text"],
+                    "timeout": 3_000
+                }),
+            ),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::ReadOnly,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        assert_ne!(
+            waited_any
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true),
+            "wait_for must resolve when any requested text appears: {}",
+            result_text(&waited_any)
+        );
+        assert!(
+            browser_stdout(&waited_any).contains("ready-text"),
+            "wait_for any-text success should return a fresh page snapshot: {}",
+            browser_stdout(&waited_any)
+        );
+
+        let scheduled_block = handle_tools_call(
+            &tool_call_request(
+                "evaluate_script",
+                json!({
+                    "function": "() => { setTimeout(() => { const end = performance.now() + 1000; while (performance.now() < end) {} }, 0); return 'scheduled'; }"
+                }),
+            ),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        assert!(
+            browser_stdout(&scheduled_block).contains("scheduled"),
+            "failed to schedule browser main-thread block: {}",
+            browser_stdout(&scheduled_block)
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let blocked_wait = handle_tools_call(
+            &tool_call_request(
+                "wait_for",
+                json!({ "text": ["blocked-wait-never-appears"], "timeout": 50 }),
+            ),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::ReadOnly,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        assert!(
+            result_text(&blocked_wait).contains("Timed out after waiting 50ms"),
+            "explicit wait timeout during a slow CDP evaluation must stay a semantic timeout: {}",
+            result_text(&blocked_wait)
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(1_050)).await;
+        let after_blocked_wait = handle_tools_call(
+            &tool_call_request("list_pages", json!({})),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        assert_eq!(
+            after_blocked_wait
+                .result
+                .as_ref()
+                .and_then(|result| result.get("structuredContent"))
+                .and_then(|structured| structured.get("restarted"))
+                .and_then(Value::as_bool),
+            Some(false),
+            "semantic wait timeout must not invalidate the shared browser runtime"
+        );
+
         let metadata_only_wait = handle_tools_call(
             &tool_call_request("wait_for", json!({ "text": ["uid="], "timeout": 250 })),
             &workspace_root_str,
@@ -8110,6 +12308,142 @@ mod tests {
                 .and_then(Value::as_bool),
             Some(false),
             "ordinary wait timeout must not restart the shared browser runtime"
+        );
+
+        let beforeunload_page = handle_tools_call(
+            &tool_call_request(
+                "navigate_page",
+                json!({
+                    "type": "url",
+                    "url": "data:text/html,<button aria-label='arm' onclick=\"window.onbeforeunload=()=>'';document.title='armed'\">Arm</button>",
+                    "timeout": 5_000
+                }),
+            ),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        assert_ne!(
+            beforeunload_page
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true),
+            "beforeunload fixture navigation should succeed: {}",
+            result_text(&beforeunload_page)
+        );
+        let beforeunload_snapshot = handle_tools_call(
+            &tool_call_request("take_snapshot", json!({})),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        let arm_uid = browser_stdout(&beforeunload_snapshot)
+            .lines()
+            .find(|line| line.contains("button \"arm\""))
+            .and_then(|line| line.trim().strip_prefix("uid="))
+            .and_then(|line| line.split_whitespace().next())
+            .expect("beforeunload arm button uid")
+            .to_string();
+        let armed = handle_tools_call(
+            &tool_call_request("click", json!({ "uid": arm_uid })),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        assert_ne!(
+            armed
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true),
+            "arming beforeunload should succeed"
+        );
+
+        let dismissed_navigation = handle_tools_call(
+            &tool_call_request(
+                "navigate_page",
+                json!({
+                    "type": "url",
+                    "url": "data:text/html,<title>dismiss-target</title>dismiss-target",
+                    "handleBeforeUnload": "dismiss",
+                    "timeout": 5_000
+                }),
+            ),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        assert!(
+            result_text(&dismissed_navigation).contains("Navigation failed")
+                || result_text(&dismissed_navigation).contains("ERR_ABORTED"),
+            "dismissing beforeunload should abort navigation cleanly: {}",
+            result_text(&dismissed_navigation)
+        );
+        let after_dismiss = handle_tools_call(
+            &tool_call_request(
+                "evaluate_script",
+                json!({ "function": "() => document.title" }),
+            ),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        assert!(
+            browser_stdout(&after_dismiss).contains("armed"),
+            "dismissed beforeunload should keep the original page: {}",
+            browser_stdout(&after_dismiss)
+        );
+
+        let accepted_navigation = handle_tools_call(
+            &tool_call_request(
+                "navigate_page",
+                json!({
+                    "type": "url",
+                    "url": "data:text/html,<title>accepted-target</title>accepted-target",
+                    "handleBeforeUnload": "accept",
+                    "timeout": 5_000
+                }),
+            ),
+            &workspace_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &command_jobs,
+            &runtime_option,
+        )
+        .await;
+        assert_ne!(
+            accepted_navigation
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true),
+            "accepting beforeunload should allow navigation: {}",
+            result_text(&accepted_navigation)
         );
 
         let navigate = runtime
@@ -8621,6 +12955,47 @@ mod tests {
                 .and_then(Value::as_array)
                 .is_some_and(|events| !events.is_empty()),
             "native performance trace should contain trace events"
+        );
+
+        let compressed_trace = runtime
+            .run_for_session(
+                &browser_session,
+                &workspace_root_str,
+                "performance_start_trace",
+                &[
+                    "--reload=false".to_string(),
+                    "--autoStop=true".to_string(),
+                    "--filePath=reports/native-trace.json.gz".to_string(),
+                ],
+                DEFAULT_BROWSER_COMMAND_TIMEOUT,
+            )
+            .await
+            .expect("capture compressed native CDP performance trace");
+        assert!(
+            compressed_trace.success(),
+            "compressed native performance trace failed: stdout={} stderr={}",
+            compressed_trace.stdout,
+            compressed_trace.stderr
+        );
+        let compressed_trace_path = workspace_root.join("reports").join("native-trace.json.gz");
+        let compressed_bytes =
+            std::fs::read(&compressed_trace_path).expect("read compressed performance trace");
+        assert!(
+            compressed_bytes.starts_with(&[0x1f, 0x8b]),
+            "compressed trace must be a gzip stream"
+        );
+        let mut decoder = flate2::read::GzDecoder::new(compressed_bytes.as_slice());
+        let mut decompressed = Vec::new();
+        std::io::Read::read_to_end(&mut decoder, &mut decompressed)
+            .expect("decompress native performance trace");
+        let compressed_trace_json: Value = serde_json::from_slice(&decompressed)
+            .expect("decode compressed performance trace JSON");
+        assert!(
+            compressed_trace_json
+                .get("traceEvents")
+                .and_then(Value::as_array)
+                .is_some_and(|events| !events.is_empty()),
+            "compressed native performance trace should contain trace events"
         );
 
         let heap = runtime
@@ -9956,6 +14331,40 @@ mod tests {
         assert!(!sample.contains('\u{FFFD}'));
         assert!(writer.estimate_tokens() > 0);
     }
+    #[tokio::test]
+    async fn protected_workspace_blocks_workspace_tools() {
+        let current = workspaces::canonicalize_existing_workspace_root(
+            &std::env::current_dir().expect("resolve current directory"),
+        )
+        .expect("canonicalize current directory");
+        let protected_root = current
+            .ancestors()
+            .last()
+            .expect("current directory must have a filesystem root")
+            .to_path_buf();
+        let protected_root_str = protected_root.to_string_lossy().into_owned();
+        let manager = CommandJobManager::new();
+
+        let read = handle_tools_call(
+            &tool_call_request("read", json!({ "path": "README.md" })),
+            &protected_root_str,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &manager,
+            &None,
+        )
+        .await;
+        assert_eq!(
+            read.result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(result_text(&read).contains("protected operating-system directory"));
+    }
+
     #[tokio::test]
     async fn unavailable_workspace_blocks_filesystem_tools_without_disabling_job_management() {
         let missing_root =

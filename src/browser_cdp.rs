@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use base64::Engine as _;
+use flate2::{Compression, write::GzEncoder};
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Map, Value, json};
@@ -23,8 +24,7 @@ const DEVTOOLS_ACTIVE_PORT_FILE: &str = "DevToolsActivePort";
 const STARTUP_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const SHUTDOWN_WAIT: Duration = Duration::from_secs(5);
 const MAX_EVENT_HISTORY: usize = 5_000;
-const DEFAULT_EVENT_PAGE_SIZE: usize = 50;
-const MAX_EVENT_PAGE_SIZE: usize = 200;
+const MAX_EVENT_PAGE_SIZE: usize = MAX_EVENT_HISTORY;
 const MAX_TRACE_BYTES: usize = 256 * 1024 * 1024;
 const MAX_HEAP_SNAPSHOT_BYTES: usize = 512 * 1024 * 1024;
 const DEFAULT_VIEWPORT_WIDTH: u64 = 1_280;
@@ -192,7 +192,10 @@ impl CdpConnection {
                     "MoonDesk Chromium CDP response channel closed".to_string(),
                 ));
             }
-            Err(_) => return Err(BrowserTransportError::Timeout),
+            Err(_) => {
+                self.pending.lock().await.remove(&id);
+                return Err(BrowserTransportError::Timeout);
+            }
         };
 
         if let Some(error) = response.get("error") {
@@ -1180,6 +1183,94 @@ impl BrowserCdpTransport {
         Ok(page_id)
     }
 
+    async fn handle_active_javascript_dialog(
+        &self,
+        session_id: &str,
+        dialog_action: Option<&str>,
+        last_handled_dialog_id: &mut u64,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), BrowserTransportError> {
+        let events = self.connection.events_for_session(session_id).await;
+        let mut active_dialog_id = None;
+        for event in &events {
+            match event.method.as_str() {
+                "Page.javascriptDialogOpening" => active_dialog_id = Some(event.id),
+                "Page.javascriptDialogClosed" => active_dialog_id = None,
+                _ => {}
+            }
+        }
+        let Some(dialog_id) = active_dialog_id else {
+            return Ok(());
+        };
+        if dialog_id <= *last_handled_dialog_id {
+            return Ok(());
+        }
+
+        let action = dialog_action.unwrap_or("accept");
+        let mut response = json!({ "accept": action != "dismiss" });
+        if !matches!(action, "accept" | "dismiss") {
+            response["promptText"] = Value::String(action.to_string());
+        }
+        self.connection
+            .call(
+                "Page.handleJavaScriptDialog",
+                response,
+                Some(session_id),
+                deadline,
+            )
+            .await?;
+        *last_handled_dialog_id = dialog_id;
+        Ok(())
+    }
+
+    async fn call_with_dialog_handling(
+        &self,
+        method: &str,
+        params: Value,
+        session_id: &str,
+        dialog_action: Option<&str>,
+        deadline: tokio::time::Instant,
+    ) -> Result<Value, BrowserTransportError> {
+        let mut last_handled_dialog_id = 0;
+        self.handle_active_javascript_dialog(
+            session_id,
+            dialog_action,
+            &mut last_handled_dialog_id,
+            deadline,
+        )
+        .await?;
+
+        let call = self
+            .connection
+            .call(method, params, Some(session_id), deadline);
+        tokio::pin!(call);
+
+        loop {
+            tokio::select! {
+                result = &mut call => {
+                    let result = result?;
+                    self.handle_active_javascript_dialog(
+                        session_id,
+                        dialog_action,
+                        &mut last_handled_dialog_id,
+                        deadline,
+                    )
+                    .await?;
+                    return Ok(result);
+                }
+                _ = tokio::time::sleep(Duration::from_millis(10)) => {
+                    self.handle_active_javascript_dialog(
+                        session_id,
+                        dialog_action,
+                        &mut last_handled_dialog_id,
+                        deadline,
+                    )
+                    .await?;
+                }
+            }
+        }
+    }
+
     async fn navigate_page(
         &self,
         arguments: &Value,
@@ -1191,6 +1282,10 @@ impl BrowserCdpTransport {
             .get("type")
             .and_then(Value::as_str)
             .unwrap_or("url");
+        let beforeunload_action = arguments
+            .get("handleBeforeUnload")
+            .and_then(Value::as_str)
+            .unwrap_or("accept");
         if navigation_type != "url" && arguments.get("initScript").is_some() {
             return Ok(tool_error(
                 "initScript is only supported for URL navigation".to_string(),
@@ -1215,11 +1310,11 @@ impl BrowserCdpTransport {
             "url" => {
                 let url = required_str(arguments, "url")?;
                 let result = self
-                    .connection
-                    .call(
+                    .call_with_dialog_handling(
                         "Page.navigate",
                         json!({ "url": url }),
-                        Some(&session_id),
+                        &session_id,
+                        Some(beforeunload_action),
                         deadline,
                     )
                     .await?;
@@ -1239,19 +1334,19 @@ impl BrowserCdpTransport {
                 }
             }
             "reload" => {
-                self.connection
-                    .call(
-                        "Page.reload",
-                        json!({
-                            "ignoreCache": arguments
-                                .get("ignoreCache")
-                                .and_then(Value::as_bool)
-                                .unwrap_or(false)
-                        }),
-                        Some(&session_id),
-                        deadline,
-                    )
-                    .await?;
+                self.call_with_dialog_handling(
+                    "Page.reload",
+                    json!({
+                        "ignoreCache": arguments
+                            .get("ignoreCache")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false)
+                    }),
+                    &session_id,
+                    Some(beforeunload_action),
+                    deadline,
+                )
+                .await?;
             }
             "back" | "forward" => {
                 let history = self
@@ -1287,14 +1382,14 @@ impl BrowserCdpTransport {
                         "No navigation history entry is available".to_string(),
                     ));
                 };
-                self.connection
-                    .call(
-                        "Page.navigateToHistoryEntry",
-                        json!({ "entryId": entry_id }),
-                        Some(&session_id),
-                        deadline,
-                    )
-                    .await?;
+                self.call_with_dialog_handling(
+                    "Page.navigateToHistoryEntry",
+                    json!({ "entryId": entry_id }),
+                    &session_id,
+                    Some(beforeunload_action),
+                    deadline,
+                )
+                .await?;
             }
             other => {
                 return Ok(tool_error(format!(
@@ -1302,7 +1397,8 @@ impl BrowserCdpTransport {
                 )));
             }
         }
-        self.wait_document_ready(&session_id, deadline).await?;
+        self.wait_document_ready(&session_id, Some(beforeunload_action), deadline)
+            .await?;
         if let Some(identifier) = init_script_id.as_deref() {
             self.connection
                 .call(
@@ -1320,6 +1416,7 @@ impl BrowserCdpTransport {
     async fn wait_document_ready(
         &self,
         session_id: &str,
+        dialog_action: Option<&str>,
         deadline: tokio::time::Instant,
     ) -> Result<(), BrowserTransportError> {
         loop {
@@ -1327,14 +1424,14 @@ impl BrowserCdpTransport {
                 return Err(BrowserTransportError::Timeout);
             }
             let result = self
-                .connection
-                .call(
+                .call_with_dialog_handling(
                     "Runtime.evaluate",
                     json!({
                         "expression": "document.readyState",
                         "returnByValue": true,
                     }),
-                    Some(session_id),
+                    session_id,
+                    dialog_action,
                     deadline,
                 )
                 .await?;
@@ -1424,14 +1521,26 @@ impl BrowserCdpTransport {
             if let Some(value) = value.filter(|value| !value.is_empty()) {
                 line.push_str(&format!(" value=\"{}\"", escape_snapshot_text(value)));
             }
-            if verbose
-                && let Some(description) = ax_value_string(node.get("description"))
+            if verbose {
+                if let Some(description) = ax_value_string(node.get("description"))
                     .filter(|description| !description.is_empty())
-            {
-                line.push_str(&format!(
-                    " description=\"{}\"",
-                    escape_snapshot_text(description)
-                ));
+                {
+                    line.push_str(&format!(
+                        " description=\"{}\"",
+                        escape_snapshot_text(description)
+                    ));
+                }
+                if let Some(properties) = node.get("properties").and_then(Value::as_array) {
+                    for property in properties {
+                        let Some(name) = property.get("name").and_then(Value::as_str) else {
+                            continue;
+                        };
+                        let Some(value) = ax_property_value(property.get("value")) else {
+                            continue;
+                        };
+                        line.push_str(&format!(" {name}={value}"));
+                    }
+                }
             }
             if !line.is_empty() {
                 lines.push(line);
@@ -1469,6 +1578,35 @@ impl BrowserCdpTransport {
                     "Element uid {uid} was not found. Take a fresh browser snapshot and retry."
                 ))
             })
+    }
+
+    async fn resolve_element_object(
+        &self,
+        page_id: u64,
+        uid: &str,
+        deadline: tokio::time::Instant,
+    ) -> Result<(String, String), BrowserTransportError> {
+        let backend_node_id = self.element_backend_node(page_id, uid).await?;
+        let session_id = self.ensure_page_session(page_id, deadline).await?;
+        let resolved = self
+            .connection
+            .call(
+                "DOM.resolveNode",
+                json!({ "backendNodeId": backend_node_id }),
+                Some(&session_id),
+                deadline,
+            )
+            .await?;
+        let object_id = resolved
+            .pointer("/object/objectId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                BrowserTransportError::Protocol(format!(
+                    "Element uid {uid} could not be resolved in the page"
+                ))
+            })?
+            .to_string();
+        Ok((session_id, object_id))
     }
 
     async fn element_center(
@@ -1528,6 +1666,56 @@ impl BrowserCdpTransport {
         })
     }
 
+    async fn dispatch_input_sequence(
+        &self,
+        session_id: &str,
+        calls: Vec<(&'static str, Value)>,
+        deadline: tokio::time::Instant,
+    ) -> Result<bool, BrowserTransportError> {
+        let baseline_event_id = self
+            .connection
+            .events_for_session(session_id)
+            .await
+            .last()
+            .map(|event| event.id)
+            .unwrap_or(0);
+        let connection = self.connection.clone();
+        let owned_session_id = session_id.to_string();
+        let mut task = tokio::spawn(async move {
+            for (method, params) in calls {
+                connection
+                    .call(method, params, Some(&owned_session_id), deadline)
+                    .await?;
+            }
+            Ok::<(), BrowserTransportError>(())
+        });
+
+        loop {
+            tokio::select! {
+                result = &mut task => {
+                    return match result {
+                        Ok(result) => {
+                            result?;
+                            Ok(false)
+                        }
+                        Err(error) => Err(BrowserTransportError::Protocol(format!(
+                            "Browser input dispatch task failed: {error}"
+                        ))),
+                    };
+                }
+                _ = tokio::time::sleep(Duration::from_millis(10)) => {
+                    let events = self.connection.events_for_session(session_id).await;
+                    if events.iter().any(|event| {
+                        event.id > baseline_event_id
+                            && event.method == "Page.javascriptDialogOpening"
+                    }) {
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+    }
+
     async fn dispatch_click(
         &self,
         session_id: &str,
@@ -1535,46 +1723,40 @@ impl BrowserCdpTransport {
         y: f64,
         click_count: u64,
         deadline: tokio::time::Instant,
-    ) -> Result<(), BrowserTransportError> {
-        self.connection
-            .call(
-                "Input.dispatchMouseEvent",
-                json!({ "type": "mouseMoved", "x": x, "y": y }),
-                Some(session_id),
-                deadline,
-            )
-            .await?;
-        self.connection
-            .call(
-                "Input.dispatchMouseEvent",
-                json!({
-                    "type": "mousePressed",
-                    "x": x,
-                    "y": y,
-                    "button": "left",
-                    "buttons": 1,
-                    "clickCount": click_count,
-                }),
-                Some(session_id),
-                deadline,
-            )
-            .await?;
-        self.connection
-            .call(
-                "Input.dispatchMouseEvent",
-                json!({
-                    "type": "mouseReleased",
-                    "x": x,
-                    "y": y,
-                    "button": "left",
-                    "buttons": 0,
-                    "clickCount": click_count,
-                }),
-                Some(session_id),
-                deadline,
-            )
-            .await?;
-        Ok(())
+    ) -> Result<bool, BrowserTransportError> {
+        self.dispatch_input_sequence(
+            session_id,
+            vec![
+                (
+                    "Input.dispatchMouseEvent",
+                    json!({ "type": "mouseMoved", "x": x, "y": y }),
+                ),
+                (
+                    "Input.dispatchMouseEvent",
+                    json!({
+                        "type": "mousePressed",
+                        "x": x,
+                        "y": y,
+                        "button": "left",
+                        "buttons": 1,
+                        "clickCount": click_count,
+                    }),
+                ),
+                (
+                    "Input.dispatchMouseEvent",
+                    json!({
+                        "type": "mouseReleased",
+                        "x": x,
+                        "y": y,
+                        "button": "left",
+                        "buttons": 0,
+                        "clickCount": click_count,
+                    }),
+                ),
+            ],
+            deadline,
+        )
+        .await
     }
 
     async fn click_element(
@@ -1595,13 +1777,21 @@ impl BrowserCdpTransport {
         } else {
             1
         };
-        self.dispatch_click(&session_id, x, y, click_count, deadline)
+        let dialog_opened = self
+            .dispatch_click(&session_id, x, y, click_count, deadline)
             .await?;
-        let mut result = tool_success_text(format!("Clicked element {uid}."));
-        if arguments
-            .get("includeSnapshot")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
+        let mut result = if dialog_opened {
+            tool_success_text(format!(
+                "Clicked element {uid}. A browser dialog opened; use handle_dialog to continue."
+            ))
+        } else {
+            tool_success_text(format!("Clicked element {uid}."))
+        };
+        if !dialog_opened
+            && arguments
+                .get("includeSnapshot")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
         {
             let snapshot = self.take_snapshot(arguments, deadline).await?;
             append_tool_content(&mut result, &snapshot);
@@ -1627,13 +1817,21 @@ impl BrowserCdpTransport {
         } else {
             1
         };
-        self.dispatch_click(&session_id, x, y, click_count, deadline)
+        let dialog_opened = self
+            .dispatch_click(&session_id, x, y, click_count, deadline)
             .await?;
-        let mut result = tool_success_text(format!("Clicked at ({x}, {y})."));
-        if arguments
-            .get("includeSnapshot")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
+        let mut result = if dialog_opened {
+            tool_success_text(format!(
+                "Clicked at ({x}, {y}). A browser dialog opened; use handle_dialog to continue."
+            ))
+        } else {
+            tool_success_text(format!("Clicked at ({x}, {y})."))
+        };
+        if !dialog_opened
+            && arguments
+                .get("includeSnapshot")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
         {
             let snapshot = self.take_snapshot(arguments, deadline).await?;
             append_tool_content(&mut result, &snapshot);
@@ -1648,31 +1846,14 @@ impl BrowserCdpTransport {
         select: bool,
         deadline: tokio::time::Instant,
     ) -> Result<String, BrowserTransportError> {
-        let backend_node_id = self.element_backend_node(page_id, uid).await?;
-        let session_id = self.ensure_page_session(page_id, deadline).await?;
-        let resolved = self
-            .connection
-            .call(
-                "DOM.resolveNode",
-                json!({ "backendNodeId": backend_node_id }),
-                Some(&session_id),
-                deadline,
-            )
-            .await?;
-        let object_id = resolved
-            .pointer("/object/objectId")
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                BrowserTransportError::Protocol(format!(
-                    "Element uid {uid} could not be resolved in the page"
-                ))
-            })?;
+        let (session_id, object_id) = self.resolve_element_object(page_id, uid, deadline).await?;
         let function = if select {
             "function(){ this.focus(); if (typeof this.select === 'function') this.select(); }"
         } else {
             "function(){ this.focus(); }"
         };
-        self.connection
+        let result = self
+            .connection
             .call(
                 "Runtime.callFunctionOn",
                 json!({
@@ -1683,7 +1864,17 @@ impl BrowserCdpTransport {
                 Some(&session_id),
                 deadline,
             )
-            .await?;
+            .await;
+        let _ = self
+            .connection
+            .call(
+                "Runtime.releaseObject",
+                json!({ "objectId": object_id }),
+                Some(&session_id),
+                deadline,
+            )
+            .await;
+        result?;
         Ok(session_id)
     }
 
@@ -1695,16 +1886,159 @@ impl BrowserCdpTransport {
         let page_id = self.page_id_from_arguments(arguments).await?;
         let uid = required_str(arguments, "uid")?;
         let value = required_str(arguments, "value")?;
-        let session_id = self.focus_element(page_id, uid, true, deadline).await?;
-        self.connection
+        let (session_id, object_id) = self.resolve_element_object(page_id, uid, deadline).await?;
+        let metadata = self
+            .connection
             .call(
-                "Input.insertText",
-                json!({ "text": value }),
+                "Runtime.callFunctionOn",
+                json!({
+                    "objectId": object_id,
+                    "functionDeclaration": "function(){ return { tag: (this.tagName || '').toLowerCase(), type: (this.type || '').toLowerCase(), role: (this.getAttribute && this.getAttribute('role') || '').toLowerCase(), checked: !!this.checked, ariaChecked: this.getAttribute && this.getAttribute('aria-checked') }; }",
+                    "returnByValue": true,
+                }),
                 Some(&session_id),
                 deadline,
             )
             .await?;
-        let mut result = tool_success_text(format!("Filled element {uid}."));
+        let element = metadata
+            .pointer("/result/value")
+            .cloned()
+            .unwrap_or(Value::Null);
+        let tag = element
+            .get("tag")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let input_type = element
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let role = element
+            .get("role")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+
+        let operation = if tag == "select" {
+            let selected = self
+                .connection
+                .call(
+                    "Runtime.callFunctionOn",
+                    json!({
+                        "objectId": object_id,
+                        "functionDeclaration": "function(value){ const options = Array.from(this.options || []); const option = options.find((item) => item.value === value) || options.find((item) => (item.textContent || '').trim() === value); if (!option) return { ok: false, error: 'No matching option' }; const setter = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value')?.set; if (setter) setter.call(this, option.value); else this.value = option.value; this.dispatchEvent(new Event('input', { bubbles: true })); this.dispatchEvent(new Event('change', { bubbles: true })); return { ok: true, value: this.value }; }",
+                        "arguments": [{ "value": value }],
+                        "returnByValue": true,
+                        "userGesture": true,
+                    }),
+                    Some(&session_id),
+                    deadline,
+                )
+                .await?;
+            let selected = selected
+                .pointer("/result/value")
+                .cloned()
+                .unwrap_or(Value::Null);
+            if selected.get("ok").and_then(Value::as_bool) != Some(true) {
+                Ok(tool_error(format!(
+                    "Select element {uid} has no option matching '{value}'"
+                )))
+            } else {
+                Ok(tool_success_text(format!("Filled element {uid}.")))
+            }
+        } else if input_type == "checkbox"
+            || input_type == "radio"
+            || matches!(role, "checkbox" | "switch" | "radio")
+        {
+            let desired = match value.to_ascii_lowercase().as_str() {
+                "true" => true,
+                "false" if input_type != "radio" && role != "radio" => false,
+                "false" => {
+                    let _ = self
+                        .connection
+                        .call(
+                            "Runtime.releaseObject",
+                            json!({ "objectId": object_id }),
+                            Some(&session_id),
+                            deadline,
+                        )
+                        .await;
+                    return Ok(tool_error(format!(
+                        "Radio element {uid} only accepts the value 'true'"
+                    )));
+                }
+                _ => {
+                    let _ = self
+                        .connection
+                        .call(
+                            "Runtime.releaseObject",
+                            json!({ "objectId": object_id }),
+                            Some(&session_id),
+                            deadline,
+                        )
+                        .await;
+                    return Ok(tool_error(format!(
+                        "Boolean element {uid} requires value 'true' or 'false'"
+                    )));
+                }
+            };
+            let toggled = self
+                .connection
+                .call(
+                    "Runtime.callFunctionOn",
+                    json!({
+                        "objectId": object_id,
+                        "functionDeclaration": "function(desired){ const aria = this.getAttribute && this.getAttribute('aria-checked'); const before = typeof this.checked === 'boolean' ? this.checked : aria === 'true'; if (before !== desired && typeof this.click === 'function') this.click(); const afterAria = this.getAttribute && this.getAttribute('aria-checked'); const after = typeof this.checked === 'boolean' ? this.checked : afterAria === 'true'; return { ok: after === desired, checked: after }; }",
+                        "arguments": [{ "value": desired }],
+                        "returnByValue": true,
+                        "userGesture": true,
+                    }),
+                    Some(&session_id),
+                    deadline,
+                )
+                .await?;
+            let toggled = toggled
+                .pointer("/result/value")
+                .cloned()
+                .unwrap_or(Value::Null);
+            if toggled.get("ok").and_then(Value::as_bool) == Some(true) {
+                Ok(tool_success_text(format!("Filled element {uid}.")))
+            } else {
+                Ok(tool_error(format!(
+                    "Element {uid} could not be changed to {desired}"
+                )))
+            }
+        } else {
+            let _ = self
+                .connection
+                .call(
+                    "Runtime.releaseObject",
+                    json!({ "objectId": object_id.clone() }),
+                    Some(&session_id),
+                    deadline,
+                )
+                .await;
+            let session_id = self.focus_element(page_id, uid, true, deadline).await?;
+            self.connection
+                .call(
+                    "Input.insertText",
+                    json!({ "text": value }),
+                    Some(&session_id),
+                    deadline,
+                )
+                .await?;
+            Ok(tool_success_text(format!("Filled element {uid}.")))
+        };
+
+        let _ = self
+            .connection
+            .call(
+                "Runtime.releaseObject",
+                json!({ "objectId": object_id }),
+                Some(&session_id),
+                deadline,
+            )
+            .await;
+
+        let mut result = operation?;
         if arguments
             .get("includeSnapshot")
             .and_then(Value::as_bool)
@@ -1725,19 +2059,28 @@ impl BrowserCdpTransport {
         let uid = required_str(arguments, "uid")?;
         let (x, y) = self.element_center(page_id, uid, deadline).await?;
         let session_id = self.ensure_page_session(page_id, deadline).await?;
-        self.connection
-            .call(
-                "Input.dispatchMouseEvent",
-                json!({ "type": "mouseMoved", "x": x, "y": y }),
-                Some(&session_id),
+        let dialog_opened = self
+            .dispatch_input_sequence(
+                &session_id,
+                vec![(
+                    "Input.dispatchMouseEvent",
+                    json!({ "type": "mouseMoved", "x": x, "y": y }),
+                )],
                 deadline,
             )
             .await?;
-        let mut result = tool_success_text(format!("Hovered element {uid}."));
-        if arguments
-            .get("includeSnapshot")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
+        let mut result = if dialog_opened {
+            tool_success_text(format!(
+                "Hovered element {uid}. A browser dialog opened; use handle_dialog to continue."
+            ))
+        } else {
+            tool_success_text(format!("Hovered element {uid}."))
+        };
+        if !dialog_opened
+            && arguments
+                .get("includeSnapshot")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
         {
             let snapshot = self.take_snapshot(arguments, deadline).await?;
             append_tool_content(&mut result, &snapshot);
@@ -1756,16 +2099,12 @@ impl BrowserCdpTransport {
         let (from_x, from_y) = self.element_center(page_id, from_uid, deadline).await?;
         let (to_x, to_y) = self.element_center(page_id, to_uid, deadline).await?;
         let session_id = self.ensure_page_session(page_id, deadline).await?;
-        self.connection
-            .call(
+        let mut calls = vec![
+            (
                 "Input.dispatchMouseEvent",
                 json!({ "type": "mouseMoved", "x": from_x, "y": from_y }),
-                Some(&session_id),
-                deadline,
-            )
-            .await?;
-        self.connection
-            .call(
+            ),
+            (
                 "Input.dispatchMouseEvent",
                 json!({
                     "type": "mousePressed",
@@ -1774,48 +2113,48 @@ impl BrowserCdpTransport {
                     "button": "left",
                     "buttons": 1,
                 }),
-                Some(&session_id),
-                deadline,
-            )
-            .await?;
+            ),
+        ];
         for step in 1..=4 {
             let t = f64::from(step) / 4.0;
             let x = from_x + ((to_x - from_x) * t);
             let y = from_y + ((to_y - from_y) * t);
-            self.connection
-                .call(
-                    "Input.dispatchMouseEvent",
-                    json!({
-                        "type": "mouseMoved",
-                        "x": x,
-                        "y": y,
-                        "button": "left",
-                        "buttons": 1,
-                    }),
-                    Some(&session_id),
-                    deadline,
-                )
-                .await?;
-        }
-        self.connection
-            .call(
+            calls.push((
                 "Input.dispatchMouseEvent",
                 json!({
-                    "type": "mouseReleased",
-                    "x": to_x,
-                    "y": to_y,
+                    "type": "mouseMoved",
+                    "x": x,
+                    "y": y,
                     "button": "left",
-                    "buttons": 0,
+                    "buttons": 1,
                 }),
-                Some(&session_id),
-                deadline,
-            )
+            ));
+        }
+        calls.push((
+            "Input.dispatchMouseEvent",
+            json!({
+                "type": "mouseReleased",
+                "x": to_x,
+                "y": to_y,
+                "button": "left",
+                "buttons": 0,
+            }),
+        ));
+        let dialog_opened = self
+            .dispatch_input_sequence(&session_id, calls, deadline)
             .await?;
-        let mut result = tool_success_text(format!("Dragged {from_uid} to {to_uid}."));
-        if arguments
-            .get("includeSnapshot")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
+        let mut result = if dialog_opened {
+            tool_success_text(format!(
+                "Dragged {from_uid} toward {to_uid}. A browser dialog opened; use handle_dialog to continue."
+            ))
+        } else {
+            tool_success_text(format!("Dragged {from_uid} to {to_uid}."))
+        };
+        if !dialog_opened
+            && arguments
+                .get("includeSnapshot")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
         {
             let snapshot = self.take_snapshot(arguments, deadline).await?;
             append_tool_content(&mut result, &snapshot);
@@ -1864,22 +2203,125 @@ impl BrowserCdpTransport {
         let page_id = self.page_id_from_arguments(arguments).await?;
         let session_id = self.ensure_page_session(page_id, deadline).await?;
         let function = required_str(arguments, "function")?;
-        let encoded_args = arguments
+        let dialog_action = arguments.get("dialogAction").and_then(Value::as_str);
+        let element_uids = arguments
             .get("args")
             .and_then(Value::as_array)
-            .map(|args| {
-                args.iter()
-                    .map(|value| {
-                        serde_json::to_string(value).unwrap_or_else(|_| "null".to_string())
-                    })
-                    .collect::<Vec<_>>()
-                    .join(",")
-            })
+            .cloned()
             .unwrap_or_default();
-        let expression = format!("({function})({encoded_args})");
-        let value = self
-            .evaluate_value(&session_id, &expression, deadline)
-            .await?;
+
+        let value = if element_uids.is_empty() {
+            let expression = format!("({function})()");
+            let called = self
+                .call_with_dialog_handling(
+                    "Runtime.evaluate",
+                    json!({
+                        "expression": expression,
+                        "awaitPromise": true,
+                        "returnByValue": true,
+                        "userGesture": true,
+                    }),
+                    &session_id,
+                    dialog_action,
+                    deadline,
+                )
+                .await?;
+            if let Some(exception) = called.get("exceptionDetails") {
+                let message = exception
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .unwrap_or("JavaScript evaluation failed");
+                return Err(BrowserTransportError::Protocol(message.to_string()));
+            }
+            called
+                .pointer("/result/value")
+                .cloned()
+                .unwrap_or(Value::Null)
+        } else {
+            let mut object_ids = Vec::with_capacity(element_uids.len());
+            for (index, uid) in element_uids.iter().enumerate() {
+                let Some(uid) = uid.as_str() else {
+                    for object_id in &object_ids {
+                        let _ = self
+                            .connection
+                            .call(
+                                "Runtime.releaseObject",
+                                json!({ "objectId": object_id }),
+                                Some(&session_id),
+                                deadline,
+                            )
+                            .await;
+                    }
+                    return Err(BrowserTransportError::Protocol(format!(
+                        "evaluate_script args[{index}] must be an element uid"
+                    )));
+                };
+                match self.resolve_element_object(page_id, uid, deadline).await {
+                    Ok((_, object_id)) => object_ids.push(object_id),
+                    Err(error) => {
+                        for object_id in &object_ids {
+                            let _ = self
+                                .connection
+                                .call(
+                                    "Runtime.releaseObject",
+                                    json!({ "objectId": object_id }),
+                                    Some(&session_id),
+                                    deadline,
+                                )
+                                .await;
+                        }
+                        return Err(error);
+                    }
+                }
+            }
+
+            let call_arguments = object_ids
+                .iter()
+                .map(|object_id| json!({ "objectId": object_id }))
+                .collect::<Vec<_>>();
+            let function_declaration =
+                format!("function(...args){{ return ({function})(...args); }}");
+            let called = self
+                .call_with_dialog_handling(
+                    "Runtime.callFunctionOn",
+                    json!({
+                        "objectId": object_ids[0],
+                        "functionDeclaration": function_declaration,
+                        "arguments": call_arguments,
+                        "awaitPromise": true,
+                        "returnByValue": true,
+                        "userGesture": true,
+                    }),
+                    &session_id,
+                    dialog_action,
+                    deadline,
+                )
+                .await;
+            for object_id in &object_ids {
+                let _ = self
+                    .connection
+                    .call(
+                        "Runtime.releaseObject",
+                        json!({ "objectId": object_id }),
+                        Some(&session_id),
+                        deadline,
+                    )
+                    .await;
+            }
+            let called = called?;
+            if let Some(exception) = called.get("exceptionDetails") {
+                let message = exception
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .unwrap_or("JavaScript evaluation failed");
+                return Err(BrowserTransportError::Protocol(message.to_string()));
+            }
+            called
+                .pointer("/result/value")
+                .cloned()
+                .unwrap_or(Value::Null)
+        };
+
         let text = serde_json::to_string(&value).map_err(|error| {
             BrowserTransportError::Protocol(format!("Could not encode JavaScript result: {error}"))
         })?;
@@ -1908,18 +2350,129 @@ impl BrowserCdpTransport {
         let uid = required_str(arguments, "uid")?;
         let file_path = required_str(arguments, "filePath")?;
         let backend_node_id = self.element_backend_node(page_id, uid).await?;
-        let session_id = self.ensure_page_session(page_id, deadline).await?;
-        self.connection
+        let (session_id, object_id) = self.resolve_element_object(page_id, uid, deadline).await?;
+        let metadata = self
+            .connection
             .call(
-                "DOM.setFileInputFiles",
+                "Runtime.callFunctionOn",
                 json!({
-                    "files": [file_path],
-                    "backendNodeId": backend_node_id,
+                    "objectId": object_id,
+                    "functionDeclaration": "function(){ return { tag: (this.tagName || '').toLowerCase(), type: (this.type || '').toLowerCase() }; }",
+                    "returnByValue": true,
                 }),
                 Some(&session_id),
                 deadline,
             )
-            .await?;
+            .await;
+        let _ = self
+            .connection
+            .call(
+                "Runtime.releaseObject",
+                json!({ "objectId": object_id }),
+                Some(&session_id),
+                deadline,
+            )
+            .await;
+        let metadata = metadata?;
+        let element = metadata
+            .pointer("/result/value")
+            .cloned()
+            .unwrap_or(Value::Null);
+        let is_file_input = element.get("tag").and_then(Value::as_str) == Some("input")
+            && element.get("type").and_then(Value::as_str) == Some("file");
+
+        if is_file_input {
+            self.connection
+                .call(
+                    "DOM.setFileInputFiles",
+                    json!({
+                        "files": [file_path],
+                        "backendNodeId": backend_node_id,
+                    }),
+                    Some(&session_id),
+                    deadline,
+                )
+                .await?;
+        } else {
+            self.connection
+                .call(
+                    "Page.setInterceptFileChooserDialog",
+                    json!({ "enabled": true }),
+                    Some(&session_id),
+                    deadline,
+                )
+                .await?;
+            let baseline_event_id = self
+                .connection
+                .events_for_session(&session_id)
+                .await
+                .last()
+                .map(|event| event.id)
+                .unwrap_or(0);
+
+            let chooser_result: Result<Option<u64>, BrowserTransportError> = async {
+                let (x, y) = self.element_center(page_id, uid, deadline).await?;
+                self.dispatch_click(&session_id, x, y, 1, deadline).await?;
+                let chooser_deadline = std::cmp::min(
+                    deadline,
+                    tokio::time::Instant::now() + Duration::from_secs(2),
+                );
+                loop {
+                    let events = self.connection.events_for_session(&session_id).await;
+                    if let Some(backend_node_id) = events
+                        .iter()
+                        .filter(|event| {
+                            event.id > baseline_event_id && event.method == "Page.fileChooserOpened"
+                        })
+                        .find_map(|event| event.params.get("backendNodeId").and_then(Value::as_u64))
+                    {
+                        return Ok(Some(backend_node_id));
+                    }
+                    if tokio::time::Instant::now() >= chooser_deadline {
+                        return Ok(None);
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
+            .await;
+
+            let disable_result = self
+                .connection
+                .call(
+                    "Page.setInterceptFileChooserDialog",
+                    json!({ "enabled": false }),
+                    Some(&session_id),
+                    deadline,
+                )
+                .await;
+
+            let chooser_backend_node_id = match chooser_result {
+                Ok(Some(backend_node_id)) => backend_node_id,
+                Ok(None) => {
+                    disable_result?;
+                    return Ok(tool_error(format!(
+                        "Element {uid} did not open a file chooser"
+                    )));
+                }
+                Err(error) => {
+                    let _ = disable_result;
+                    return Err(error);
+                }
+            };
+            disable_result?;
+            self.connection
+                .call(
+                    "DOM.setFileInputFiles",
+                    json!({
+                        "files": [file_path],
+                        "backendNodeId": chooser_backend_node_id,
+                    }),
+                    Some(&session_id),
+                    deadline,
+                )
+                .await?;
+        }
+
         let mut result = tool_success_text(format!("Uploaded file to element {uid}."));
         if arguments
             .get("includeSnapshot")
@@ -1940,16 +2493,24 @@ impl BrowserCdpTransport {
         let page_id = self.page_id_from_arguments(arguments).await?;
         let session_id = self.ensure_page_session(page_id, deadline).await?;
         let text = required_str(arguments, "text")?;
-        self.connection
-            .call(
-                "Input.insertText",
-                json!({ "text": text }),
-                Some(&session_id),
+        let text_dialog_opened = self
+            .dispatch_input_sequence(
+                &session_id,
+                vec![("Input.insertText", json!({ "text": text }))],
                 deadline,
             )
             .await?;
-        if let Some(key) = arguments.get("submitKey").and_then(Value::as_str) {
-            self.dispatch_key(&session_id, key, deadline).await?;
+        if text_dialog_opened {
+            return Ok(tool_success_text(
+                "Typed text. A browser dialog opened; use handle_dialog to continue.".to_string(),
+            ));
+        }
+        if let Some(key) = arguments.get("submitKey").and_then(Value::as_str)
+            && self.dispatch_key(&session_id, key, deadline).await?
+        {
+            return Ok(tool_success_text(format!(
+                "Typed text and submitted {key}. A browser dialog opened; use handle_dialog to continue."
+            )));
         }
         Ok(tool_success_text("Typed text.".to_string()))
     }
@@ -1962,12 +2523,19 @@ impl BrowserCdpTransport {
         let page_id = self.page_id_from_arguments(arguments).await?;
         let session_id = self.ensure_page_session(page_id, deadline).await?;
         let key = required_str(arguments, "key")?;
-        self.dispatch_key(&session_id, key, deadline).await?;
-        let mut result = tool_success_text(format!("Pressed {key}."));
-        if arguments
-            .get("includeSnapshot")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
+        let dialog_opened = self.dispatch_key(&session_id, key, deadline).await?;
+        let mut result = if dialog_opened {
+            tool_success_text(format!(
+                "Pressed {key}. A browser dialog opened; use handle_dialog to continue."
+            ))
+        } else {
+            tool_success_text(format!("Pressed {key}."))
+        };
+        if !dialog_opened
+            && arguments
+                .get("includeSnapshot")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
         {
             let snapshot = self.take_snapshot(arguments, deadline).await?;
             append_tool_content(&mut result, &snapshot);
@@ -1980,7 +2548,7 @@ impl BrowserCdpTransport {
         session_id: &str,
         raw_key: &str,
         deadline: tokio::time::Instant,
-    ) -> Result<(), BrowserTransportError> {
+    ) -> Result<bool, BrowserTransportError> {
         let parsed = ParsedKey::parse(raw_key)?;
         let mut down = json!({
             "type": "rawKeyDown",
@@ -1996,25 +2564,25 @@ impl BrowserCdpTransport {
             down["text"] = Value::String(text.clone());
             down["unmodifiedText"] = Value::String(text);
         }
-        self.connection
-            .call("Input.dispatchKeyEvent", down, Some(session_id), deadline)
-            .await?;
-        self.connection
-            .call(
-                "Input.dispatchKeyEvent",
-                json!({
-                    "type": "keyUp",
-                    "key": parsed.key,
-                    "code": parsed.code,
-                    "modifiers": parsed.modifiers,
-                    "windowsVirtualKeyCode": parsed.windows_virtual_key_code.unwrap_or(0),
-                    "nativeVirtualKeyCode": parsed.windows_virtual_key_code.unwrap_or(0),
-                }),
-                Some(session_id),
-                deadline,
-            )
-            .await?;
-        Ok(())
+        self.dispatch_input_sequence(
+            session_id,
+            vec![
+                ("Input.dispatchKeyEvent", down),
+                (
+                    "Input.dispatchKeyEvent",
+                    json!({
+                        "type": "keyUp",
+                        "key": parsed.key,
+                        "code": parsed.code,
+                        "modifiers": parsed.modifiers,
+                        "windowsVirtualKeyCode": parsed.windows_virtual_key_code.unwrap_or(0),
+                        "nativeVirtualKeyCode": parsed.windows_virtual_key_code.unwrap_or(0),
+                    }),
+                ),
+            ],
+            deadline,
+        )
+        .await
     }
 
     async fn scroll(
@@ -2044,20 +2612,28 @@ impl BrowserCdpTransport {
             .and_then(Value::as_f64)
             .map(|height| height / 2.0)
             .unwrap_or(0.0);
-        self.connection
-            .call(
-                "Input.dispatchMouseEvent",
-                json!({
-                    "type": "mouseWheel",
-                    "x": x,
-                    "y": y,
-                    "deltaX": delta_x,
-                    "deltaY": delta_y,
-                }),
-                Some(&session_id),
+        let dialog_opened = self
+            .dispatch_input_sequence(
+                &session_id,
+                vec![(
+                    "Input.dispatchMouseEvent",
+                    json!({
+                        "type": "mouseWheel",
+                        "x": x,
+                        "y": y,
+                        "deltaX": delta_x,
+                        "deltaY": delta_y,
+                    }),
+                )],
                 deadline,
             )
             .await?;
+        if dialog_opened {
+            return Ok(tool_success_text(
+                "Scrolled the page. A browser dialog opened; use handle_dialog to continue."
+                    .to_string(),
+            ));
+        }
         let initial_x = metrics.get("x").and_then(Value::as_f64).unwrap_or(0.0);
         let initial_y = metrics.get("y").and_then(Value::as_f64).unwrap_or(0.0);
         let settle_deadline = std::cmp::min(
@@ -2188,7 +2764,9 @@ impl BrowserCdpTransport {
                 )
                 .await?;
         }
-        if let Some(geolocation) = arguments.get("geolocation").and_then(Value::as_str) {
+        if let Some(geolocation) = arguments.get("geolocation").and_then(Value::as_str)
+            && !geolocation.trim().is_empty()
+        {
             let mut parts = geolocation.split(',').map(str::trim);
             let latitude = parts.next().and_then(|value| value.parse::<f64>().ok());
             let longitude = parts.next().and_then(|value| value.parse::<f64>().ok());
@@ -2197,6 +2775,15 @@ impl BrowserCdpTransport {
                     "geolocation must be formatted as latitude,longitude".to_string(),
                 ));
             };
+            if parts.next().is_some()
+                || !(-90.0..=90.0).contains(&latitude)
+                || !(-180.0..=180.0).contains(&longitude)
+            {
+                return Ok(tool_error(
+                    "geolocation must contain latitude between -90 and 90 and longitude between -180 and 180"
+                        .to_string(),
+                ));
+            }
             self.connection
                 .call(
                     "Emulation.setGeolocationOverride",
@@ -2209,16 +2796,34 @@ impl BrowserCdpTransport {
                     deadline,
                 )
                 .await?;
+        } else {
+            self.connection
+                .call(
+                    "Emulation.clearGeolocationOverride",
+                    json!({}),
+                    Some(&session_id),
+                    deadline,
+                )
+                .await?;
         }
         if let Some(headers) = arguments.get("extraHttpHeaders").and_then(Value::as_str) {
-            let parsed: Value = serde_json::from_str(headers).map_err(|error| {
-                BrowserTransportError::Protocol(format!(
-                    "extraHttpHeaders must be a JSON object: {error}"
-                ))
-            })?;
-            if !parsed.is_object() {
+            let parsed = if headers.trim().is_empty() {
+                json!({})
+            } else {
+                serde_json::from_str::<Value>(headers).map_err(|error| {
+                    BrowserTransportError::Protocol(format!(
+                        "extraHttpHeaders must be a JSON object: {error}"
+                    ))
+                })?
+            };
+            let Some(parsed_headers) = parsed.as_object() else {
                 return Ok(tool_error(
                     "extraHttpHeaders must be a JSON object".to_string(),
+                ));
+            };
+            if parsed_headers.values().any(|value| !value.is_string()) {
+                return Ok(tool_error(
+                    "extraHttpHeaders values must all be strings".to_string(),
                 ));
             }
             self.connection
@@ -2230,32 +2835,42 @@ impl BrowserCdpTransport {
                 )
                 .await?;
         }
-        if let Some(network) = arguments.get("networkConditions").and_then(Value::as_str) {
-            let (offline, latency, down, up) = network_profile(network);
-            self.connection
-                .call(
-                    "Network.emulateNetworkConditions",
-                    json!({
-                        "offline": offline,
-                        "latency": latency,
-                        "downloadThroughput": down,
-                        "uploadThroughput": up,
-                    }),
-                    Some(&session_id),
-                    deadline,
-                )
-                .await?;
+        let network = arguments
+            .get("networkConditions")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let (offline, latency, down, up) = network_profile(network);
+        self.connection
+            .call(
+                "Network.emulateNetworkConditions",
+                json!({
+                    "offline": offline,
+                    "latency": latency,
+                    "downloadThroughput": down,
+                    "uploadThroughput": up,
+                }),
+                Some(&session_id),
+                deadline,
+            )
+            .await?;
+
+        let rate = arguments
+            .get("cpuThrottlingRate")
+            .and_then(Value::as_f64)
+            .unwrap_or(1.0);
+        if !rate.is_finite() || !(1.0..=20.0).contains(&rate) {
+            return Ok(tool_error(
+                "cpuThrottlingRate must be between 1 and 20".to_string(),
+            ));
         }
-        if let Some(rate) = arguments.get("cpuThrottlingRate").and_then(Value::as_f64) {
-            self.connection
-                .call(
-                    "Emulation.setCPUThrottlingRate",
-                    json!({ "rate": rate }),
-                    Some(&session_id),
-                    deadline,
-                )
-                .await?;
-        }
+        self.connection
+            .call(
+                "Emulation.setCPUThrottlingRate",
+                json!({ "rate": rate }),
+                Some(&session_id),
+                deadline,
+            )
+            .await?;
         Ok(tool_success_text("Browser emulation updated.".to_string()))
     }
 
@@ -2270,17 +2885,41 @@ impl BrowserCdpTransport {
             .get("format")
             .and_then(Value::as_str)
             .unwrap_or("png");
+        if !matches!(format, "png" | "jpeg" | "webp") {
+            return Ok(tool_error(format!(
+                "Unsupported screenshot format '{format}'"
+            )));
+        }
+        let full_page = arguments
+            .get("fullPage")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let uid = arguments.get("uid").and_then(Value::as_str);
+        if full_page && uid.is_some() {
+            return Ok(tool_error(
+                "take_screenshot fullPage=true is incompatible with uid".to_string(),
+            ));
+        }
+        let quality = arguments.get("quality").and_then(Value::as_f64);
+        if let Some(quality) = quality
+            && (!quality.is_finite() || !(0.0..=100.0).contains(&quality))
+        {
+            return Ok(tool_error(
+                "Screenshot quality must be between 0 and 100".to_string(),
+            ));
+        }
+
         let mut capture = Map::new();
         capture.insert("format".to_string(), Value::String(format.to_string()));
         capture.insert("fromSurface".to_string(), Value::Bool(true));
         capture.insert("captureBeyondViewport".to_string(), Value::Bool(false));
-        if let Some(quality) = arguments.get("quality").and_then(Value::as_f64)
+        if let Some(quality) = quality
             && matches!(format, "jpeg" | "webp")
         {
             capture.insert("quality".to_string(), Value::from(quality.round() as i64));
         }
 
-        if let Some(uid) = arguments.get("uid").and_then(Value::as_str) {
+        if let Some(uid) = uid {
             let backend_node_id = self.element_backend_node(page_id, uid).await?;
             let model = self
                 .connection
@@ -2308,11 +2947,7 @@ impl BrowserCdpTransport {
                 "clip".to_string(),
                 json!({ "x": x, "y": y, "width": width, "height": height, "scale": 1 }),
             );
-        } else if arguments
-            .get("fullPage")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-        {
+        } else if full_page {
             capture.insert("captureBeyondViewport".to_string(), Value::Bool(true));
             let metrics = self
                 .connection
@@ -2425,13 +3060,24 @@ impl BrowserCdpTransport {
                         serde_json::to_string(text).unwrap_or_else(|_| "\"\"".to_string())
                     ))
                     .collect::<Vec<_>>()
-                    .join(" && ")
+                    .join(" || ")
             );
-            let visible = self
+            let visible = match self
                 .evaluate_value(&session_id, &expression, wait_deadline)
-                .await?
-                .as_bool()
-                .unwrap_or(false);
+                .await
+            {
+                Ok(value) => value.as_bool().unwrap_or(false),
+                // An explicit wait timeout is a page-level outcome, not proof that the shared
+                // browser transport is unhealthy. Keep Chromium alive when the WebSocket still is.
+                Err(BrowserTransportError::Timeout)
+                    if requested_timeout_ms != 0 && self.connection.is_alive() =>
+                {
+                    return Ok(tool_error(format!(
+                        "Timed out after waiting {requested_timeout_ms}ms for requested text"
+                    )));
+                }
+                Err(error) => return Err(error),
+            };
             if visible {
                 return self.take_snapshot(arguments, deadline).await;
             }
@@ -2473,9 +3119,14 @@ impl BrowserCdpTransport {
         let page_id = self.page_id_from_arguments(arguments).await?;
         let session_id = self.ensure_page_session(page_id, deadline).await?;
         let type_filter = browser_string_filter(arguments, "types");
+        let include_preserved = arguments
+            .get("includePreservedMessages")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let events = self.connection.events_for_session(&session_id).await;
+        let cutoff = console_history_cutoff(&events, include_preserved);
         let mut messages = Vec::new();
-        for event in events {
+        for event in events.into_iter().filter(|event| event.id >= cutoff) {
             let entry = match event.method.as_str() {
                 "Runtime.consoleAPICalled" => {
                     let level = event
@@ -2521,7 +3172,8 @@ impl BrowserCdpTransport {
             let Some((level, text)) = entry else {
                 continue;
             };
-            if !type_filter.is_empty() && !type_filter.contains(&level.to_ascii_lowercase()) {
+            let level = browser_console_type(&level);
+            if !type_filter.is_empty() && !type_filter.contains(level) {
                 continue;
             }
             messages.push(json!({
@@ -2566,10 +3218,8 @@ impl BrowserCdpTransport {
     ) -> Result<Value, BrowserTransportError> {
         let page_id = self.page_id_from_arguments(arguments).await?;
         let session_id = self.ensure_page_session(page_id, deadline).await?;
-        let requested = arguments
-            .get("msgid")
-            .and_then(Value::as_u64)
-            .or_else(|| arguments.get("messageId").and_then(Value::as_u64))
+        let requested = optional_u64(arguments, "msgid")
+            .or_else(|| optional_u64(arguments, "messageId"))
             .ok_or_else(|| {
                 BrowserTransportError::Protocol(
                     "get_console_message requires a numeric message id".to_string(),
@@ -2603,9 +3253,14 @@ impl BrowserCdpTransport {
         let page_id = self.page_id_from_arguments(arguments).await?;
         let session_id = self.ensure_page_session(page_id, deadline).await?;
         let resource_filter = browser_string_filter(arguments, "resourceTypes");
+        let include_preserved = arguments
+            .get("includePreservedRequests")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let events = self.connection.events_for_session(&session_id).await;
+        let cutoff = network_history_cutoff(&events, include_preserved);
         let mut seen = HashMap::<String, Value>::new();
-        for event in events {
+        for event in events.iter().filter(|event| event.id >= cutoff) {
             if event.method != "Network.requestWillBeSent" {
                 continue;
             }
@@ -2642,9 +3297,62 @@ impl BrowserCdpTransport {
                     "method": method,
                     "url": url,
                     "resourceType": resource_type,
+                    "status": Value::Null,
+                    "statusText": Value::Null,
+                    "failureText": Value::Null,
                 }),
             );
         }
+
+        for event in events.iter().filter(|event| event.id >= cutoff) {
+            let Some(request_id) = event.params.get("requestId").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(request) = seen.get_mut(request_id).and_then(Value::as_object_mut) else {
+                continue;
+            };
+            match event.method.as_str() {
+                "Network.responseReceived" => {
+                    let response = event.params.get("response").unwrap_or(&Value::Null);
+                    if let Some(status) = response.get("status").cloned() {
+                        request.insert("status".to_string(), status);
+                    }
+                    if let Some(status_text) = response.get("statusText").cloned() {
+                        request.insert("statusText".to_string(), status_text);
+                    }
+                    if let Some(mime_type) = response.get("mimeType").cloned() {
+                        request.insert("mimeType".to_string(), mime_type);
+                    }
+                    if let Some(protocol) = response.get("protocol").cloned() {
+                        request.insert("protocol".to_string(), protocol);
+                    }
+                    if let Some(from_disk_cache) = response.get("fromDiskCache").cloned() {
+                        request.insert("fromDiskCache".to_string(), from_disk_cache);
+                    }
+                    if let Some(from_service_worker) = response.get("fromServiceWorker").cloned() {
+                        request.insert("fromServiceWorker".to_string(), from_service_worker);
+                    }
+                }
+                "Network.loadingFailed" => {
+                    if let Some(error_text) = event.params.get("errorText").cloned() {
+                        request.insert("failureText".to_string(), error_text);
+                    }
+                    if let Some(canceled) = event.params.get("canceled").cloned() {
+                        request.insert("canceled".to_string(), canceled);
+                    }
+                    if let Some(blocked_reason) = event.params.get("blockedReason").cloned() {
+                        request.insert("blockedReason".to_string(), blocked_reason);
+                    }
+                }
+                "Network.loadingFinished" => {
+                    if let Some(encoded_length) = event.params.get("encodedDataLength").cloned() {
+                        request.insert("encodedDataLength".to_string(), encoded_length);
+                    }
+                }
+                _ => {}
+            }
+        }
+
         let mut requests = seen.into_values().collect::<Vec<_>>();
         requests.sort_by_key(|request| request.get("id").and_then(Value::as_u64).unwrap_or(0));
 
@@ -2653,8 +3361,20 @@ impl BrowserCdpTransport {
         let text = page
             .iter()
             .map(|request| {
+                let status = request
+                    .get("failureText")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                    .map(|value| format!("failed: {value}"))
+                    .or_else(|| {
+                        request
+                            .get("status")
+                            .and_then(Value::as_f64)
+                            .map(|value| format!("{value:.0}"))
+                    })
+                    .unwrap_or_else(|| "pending".to_string());
                 format!(
-                    "{}: {} {} [{}] requestId={}",
+                    "{}: {} {} [{}] [{}] requestId={}",
                     request.get("id").and_then(Value::as_u64).unwrap_or(0),
                     request
                         .get("method")
@@ -2664,6 +3384,7 @@ impl BrowserCdpTransport {
                         .get("url")
                         .and_then(Value::as_str)
                         .unwrap_or_default(),
+                    status,
                     request
                         .get("resourceType")
                         .and_then(Value::as_str)
@@ -2694,27 +3415,234 @@ impl BrowserCdpTransport {
     ) -> Result<Value, BrowserTransportError> {
         let page_id = self.page_id_from_arguments(arguments).await?;
         let session_id = self.ensure_page_session(page_id, deadline).await?;
-        let requested = arguments
-            .get("reqid")
-            .and_then(Value::as_u64)
-            .or_else(|| arguments.get("requestId").and_then(Value::as_u64))
-            .ok_or_else(|| {
-                BrowserTransportError::Protocol(
-                    "get_network_request requires a numeric request id".to_string(),
-                )
-            })?;
-        let event = self
-            .connection
-            .events_for_session(&session_id)
-            .await
-            .into_iter()
+        let requested =
+            optional_u64(arguments, "reqid").or_else(|| optional_u64(arguments, "requestId"));
+        let Some(requested) = requested else {
+            return Ok(tool_success_text(
+                "Nothing is currently selected in the DevTools Network panel.".to_string(),
+            ));
+        };
+
+        let events = self.connection.events_for_session(&session_id).await;
+        let event = events
+            .iter()
             .find(|event| event.id == requested && event.method == "Network.requestWillBeSent");
         let Some(event) = event else {
             return Ok(tool_error(format!(
                 "Network request {requested} was not found"
             )));
         };
-        Ok(tool_success_text(value_to_compact_text(&event.params)))
+        let request_id = event
+            .params
+            .get("requestId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                BrowserTransportError::Protocol(format!(
+                    "Network request {requested} is missing its Chrome request id"
+                ))
+            })?;
+        let request = event.params.get("request").unwrap_or(&Value::Null);
+        let method = request
+            .get("method")
+            .and_then(Value::as_str)
+            .unwrap_or("GET");
+        let url = request
+            .get("url")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+
+        let response_event = events.iter().rev().find(|candidate| {
+            candidate.id >= event.id
+                && candidate.method == "Network.responseReceived"
+                && candidate.params.get("requestId").and_then(Value::as_str) == Some(request_id)
+        });
+        let failure_event = events.iter().rev().find(|candidate| {
+            candidate.id >= event.id
+                && candidate.method == "Network.loadingFailed"
+                && candidate.params.get("requestId").and_then(Value::as_str) == Some(request_id)
+        });
+        let response = response_event
+            .and_then(|candidate| candidate.params.get("response"))
+            .unwrap_or(&Value::Null);
+
+        let mut request_body = request
+            .get("postData")
+            .and_then(Value::as_str)
+            .map(|value| value.as_bytes().to_vec());
+        if request_body.is_none() && !matches!(method, "GET" | "HEAD") {
+            match self
+                .connection
+                .call(
+                    "Network.getRequestPostData",
+                    json!({ "requestId": request_id }),
+                    Some(&session_id),
+                    deadline,
+                )
+                .await
+            {
+                Ok(result) => {
+                    request_body = result
+                        .get("postData")
+                        .and_then(Value::as_str)
+                        .map(|value| value.as_bytes().to_vec());
+                }
+                Err(BrowserTransportError::Protocol(_)) => {}
+                Err(error) => return Err(error),
+            }
+        }
+
+        let mut response_body = None;
+        if response_event.is_some() {
+            match self
+                .connection
+                .call(
+                    "Network.getResponseBody",
+                    json!({ "requestId": request_id }),
+                    Some(&session_id),
+                    deadline,
+                )
+                .await
+            {
+                Ok(result) => {
+                    if let Some(body) = result.get("body").and_then(Value::as_str) {
+                        if result
+                            .get("base64Encoded")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false)
+                        {
+                            response_body = Some(
+                                base64::engine::general_purpose::STANDARD
+                                    .decode(body)
+                                    .map_err(|error| {
+                                        BrowserTransportError::Protocol(format!(
+                                            "Could not decode response body for request {requested}: {error}"
+                                        ))
+                                    })?,
+                            );
+                        } else {
+                            response_body = Some(body.as_bytes().to_vec());
+                        }
+                    }
+                }
+                Err(BrowserTransportError::Protocol(_)) => {}
+                Err(error) => return Err(error),
+            }
+        }
+
+        let request_file_path = arguments.get("requestFilePath").and_then(Value::as_str);
+        if let Some(path) = request_file_path {
+            std::fs::write(path, request_body.as_deref().unwrap_or_default()).map_err(|error| {
+                BrowserTransportError::Protocol(format!(
+                    "Could not write browser request body to {path}: {error}"
+                ))
+            })?;
+        }
+
+        let response_file_path = arguments.get("responseFilePath").and_then(Value::as_str);
+        if let Some(path) = response_file_path {
+            let unavailable = b"<not available anymore>".as_slice();
+            std::fs::write(path, response_body.as_deref().unwrap_or(unavailable)).map_err(
+                |error| {
+                    BrowserTransportError::Protocol(format!(
+                        "Could not write browser response body to {path}: {error}"
+                    ))
+                },
+            )?;
+        }
+
+        let request_headers =
+            browser_network_headers(request.get("headers").and_then(Value::as_object));
+        let response_headers =
+            browser_network_headers(response.get("headers").and_then(Value::as_object));
+
+        let mut lines = vec![format!("## Request {url}")];
+        if let Some(status) = response.get("status").and_then(Value::as_f64) {
+            lines.push(format!("Status: {status:.0}"));
+        } else if failure_event.is_some() {
+            lines.push("Status: failed".to_string());
+        } else {
+            lines.push("Status: pending".to_string());
+        }
+
+        lines.push("### Request Headers".to_string());
+        if request_headers.is_empty() {
+            lines.push("<none>".to_string());
+        } else {
+            lines.extend(
+                request_headers
+                    .iter()
+                    .map(|(name, value)| format!("- {name}:{value}")),
+            );
+        }
+
+        if request_body.is_some() || request_file_path.is_some() {
+            lines.push("### Request Body".to_string());
+            if let Some(path) = request_file_path {
+                lines.push(format!("Saved to {path}."));
+            } else if let Some(body) = request_body.as_deref() {
+                lines.push(browser_network_body_preview(body));
+            }
+        }
+
+        lines.push("### Response Headers".to_string());
+        if response_headers.is_empty() {
+            lines.push("<none>".to_string());
+        } else {
+            lines.extend(
+                response_headers
+                    .iter()
+                    .map(|(name, value)| format!("- {name}:{value}")),
+            );
+        }
+
+        lines.push("### Response Body".to_string());
+        if let Some(path) = response_file_path {
+            lines.push(format!("Saved to {path}."));
+        } else if let Some(body) = response_body.as_deref() {
+            lines.push(browser_network_body_preview(body));
+        } else {
+            lines.push("<not available anymore>".to_string());
+        }
+
+        if let Some(failure) = failure_event {
+            lines.push("### Request failed with".to_string());
+            lines.push(
+                failure
+                    .params
+                    .get("errorText")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown network error")
+                    .to_string(),
+            );
+        }
+
+        let status = response.get("status").cloned().unwrap_or(Value::Null);
+        let status_text = response.get("statusText").cloned().unwrap_or(Value::Null);
+        let mime_type = response.get("mimeType").cloned().unwrap_or(Value::Null);
+        let failure_text = failure_event
+            .and_then(|failure| failure.params.get("errorText"))
+            .cloned()
+            .unwrap_or(Value::Null);
+
+        Ok(tool_success_structured(
+            lines.join("\n"),
+            json!({
+                "request": {
+                    "id": requested,
+                    "requestId": request_id,
+                    "method": method,
+                    "url": url,
+                },
+                "response": {
+                    "status": status,
+                    "statusText": status_text,
+                    "mimeType": mime_type,
+                },
+                "failureText": failure_text,
+                "requestBodySavedTo": request_file_path,
+                "responseBodySavedTo": response_file_path,
+            }),
+        ))
     }
 
     async fn performance_start_trace(
@@ -2785,7 +3713,7 @@ impl BrowserCdpTransport {
                 *self.trace.lock().await = None;
                 return Err(error);
             }
-            if let Err(error) = self.wait_document_ready(&session_id, deadline).await {
+            if let Err(error) = self.wait_document_ready(&session_id, None, deadline).await {
                 let _ = self
                     .connection
                     .call("Tracing.end", json!({}), None, deadline)
@@ -2876,21 +3804,7 @@ impl BrowserCdpTransport {
                     "source": "MoonDesk native CDP",
                 }
             });
-            let mut file = std::fs::File::create(file_path).map_err(|error| {
-                BrowserTransportError::Protocol(format!(
-                    "Could not create performance trace at {file_path}: {error}"
-                ))
-            })?;
-            serde_json::to_writer(&mut file, &trace).map_err(|error| {
-                BrowserTransportError::Protocol(format!(
-                    "Could not encode performance trace: {error}"
-                ))
-            })?;
-            file.sync_all().map_err(|error| {
-                BrowserTransportError::Protocol(format!(
-                    "Could not sync performance trace at {file_path}: {error}"
-                ))
-            })?;
+            write_performance_trace_file(file_path, &trace)?;
             Ok(tool_success_text(format!("Saved to {file_path}.")))
         } else {
             Ok(tool_success_structured(
@@ -3195,22 +4109,21 @@ fn required_str<'a>(value: &'a Value, name: &str) -> Result<&'a str, BrowserTran
     })
 }
 
-fn required_u64(value: &Value, name: &str) -> Result<u64, BrowserTransportError> {
-    value
-        .get(name)
-        .and_then(Value::as_u64)
-        .or_else(|| {
+fn optional_u64(value: &Value, name: &str) -> Option<u64> {
+    value.get(name).and_then(|value| {
+        value.as_u64().or_else(|| {
             value
-                .get(name)
-                .and_then(Value::as_f64)
+                .as_f64()
                 .filter(|number| number.is_finite() && number.fract() == 0.0 && *number >= 0.0)
                 .map(|number| number as u64)
         })
-        .ok_or_else(|| {
-            BrowserTransportError::Protocol(format!(
-                "Missing or invalid browser parameter '{name}'"
-            ))
-        })
+    })
+}
+
+fn required_u64(value: &Value, name: &str) -> Result<u64, BrowserTransportError> {
+    optional_u64(value, name).ok_or_else(|| {
+        BrowserTransportError::Protocol(format!("Missing or invalid browser parameter '{name}'"))
+    })
 }
 
 fn required_f64(value: &Value, name: &str) -> Result<f64, BrowserTransportError> {
@@ -3223,6 +4136,17 @@ fn ax_value_string(value: Option<&Value>) -> Option<&str> {
     value
         .and_then(|value| value.get("value"))
         .and_then(Value::as_str)
+}
+
+fn ax_property_value(value: Option<&Value>) -> Option<String> {
+    let value = value?.get("value")?;
+    Some(match value {
+        Value::String(value) => format!("\"{}\"", escape_snapshot_text(value)),
+        Value::Bool(value) => value.to_string(),
+        Value::Number(value) => value.to_string(),
+        Value::Null => "null".to_string(),
+        other => value_to_compact_text(other),
+    })
 }
 
 fn escape_snapshot_text(value: &str) -> String {
@@ -3262,6 +4186,14 @@ fn quad_bounds(quad: &[Value]) -> Option<(f64, f64, f64, f64)> {
     (width > 0.0 && height > 0.0).then_some((min_x, min_y, width, height))
 }
 
+fn browser_console_type(level: &str) -> &str {
+    if level.eq_ignore_ascii_case("warning") {
+        "warn"
+    } else {
+        level
+    }
+}
+
 fn browser_string_filter(arguments: &Value, name: &str) -> HashSet<String> {
     arguments
         .get(name)
@@ -3273,20 +4205,74 @@ fn browser_string_filter(arguments: &Value, name: &str) -> HashSet<String> {
         .collect()
 }
 
+fn selected_main_frame_navigation(
+    events: &[CdpEvent],
+    include_preserved: bool,
+) -> Option<&CdpEvent> {
+    let navigations = events
+        .iter()
+        .filter(|event| {
+            event.method == "Page.frameNavigated"
+                && event
+                    .params
+                    .pointer("/frame/parentId")
+                    .and_then(Value::as_str)
+                    .is_none()
+        })
+        .collect::<Vec<_>>();
+    if navigations.is_empty() {
+        return None;
+    }
+    let index = if include_preserved {
+        navigations.len().saturating_sub(3)
+    } else {
+        navigations.len() - 1
+    };
+    navigations.get(index).copied()
+}
+
+fn console_history_cutoff(events: &[CdpEvent], include_preserved: bool) -> u64 {
+    selected_main_frame_navigation(events, include_preserved).map_or(0, |event| event.id)
+}
+
+fn network_history_cutoff(events: &[CdpEvent], include_preserved: bool) -> u64 {
+    let Some(navigation) = selected_main_frame_navigation(events, include_preserved) else {
+        return 0;
+    };
+    let Some(loader_id) = navigation
+        .params
+        .pointer("/frame/loaderId")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+    else {
+        return navigation.id;
+    };
+    events
+        .iter()
+        .filter(|event| {
+            event.method == "Network.requestWillBeSent"
+                && event.params.get("loaderId").and_then(Value::as_str) == Some(loader_id)
+        })
+        .map(|event| event.id)
+        .min()
+        .unwrap_or(navigation.id)
+}
+
 fn browser_pagination(
     arguments: &Value,
     total: usize,
 ) -> Result<(usize, usize, usize, usize), BrowserTransportError> {
-    let page_size = arguments
-        .get("pageSize")
-        .and_then(Value::as_u64)
-        .map(|value| usize::try_from(value).unwrap_or(usize::MAX))
-        .unwrap_or(DEFAULT_EVENT_PAGE_SIZE);
-    if page_size == 0 || page_size > MAX_EVENT_PAGE_SIZE {
-        return Err(BrowserTransportError::Protocol(format!(
-            "pageSize must be between 1 and {MAX_EVENT_PAGE_SIZE}"
-        )));
-    }
+    let page_size = if let Some(value) = arguments.get("pageSize").and_then(Value::as_u64) {
+        let page_size = usize::try_from(value).unwrap_or(usize::MAX);
+        if page_size == 0 || page_size > MAX_EVENT_PAGE_SIZE {
+            return Err(BrowserTransportError::Protocol(format!(
+                "pageSize must be between 1 and {MAX_EVENT_PAGE_SIZE}"
+            )));
+        }
+        page_size
+    } else {
+        total
+    };
     let page_idx = arguments
         .get("pageIdx")
         .and_then(Value::as_u64)
@@ -3299,6 +4285,101 @@ fn browser_pagination(
 
 fn value_to_compact_text(value: &Value) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| "<unserializable>".to_string())
+}
+
+fn browser_network_header_value(name: &str, value: &Value) -> String {
+    if matches!(
+        name.to_ascii_lowercase().as_str(),
+        "authorization"
+            | "proxy-authorization"
+            | "cookie"
+            | "set-cookie"
+            | "x-api-key"
+            | "x-auth-token"
+            | "sec-ch-ua"
+            | "sec-ch-ua-mobile"
+            | "sec-ch-ua-platform"
+            | "priority"
+    ) {
+        return "<redacted>".to_string();
+    }
+    value
+        .as_str()
+        .map(str::to_string)
+        .unwrap_or_else(|| value_to_compact_text(value))
+}
+
+fn browser_network_headers(headers: Option<&Map<String, Value>>) -> Vec<(String, String)> {
+    let mut ordered = BTreeMap::new();
+    if let Some(headers) = headers {
+        for (name, value) in headers {
+            ordered.insert(name.clone(), browser_network_header_value(name, value));
+        }
+    }
+    ordered.into_iter().collect()
+}
+
+fn browser_network_body_preview(bytes: &[u8]) -> String {
+    const MAX_PREVIEW_BYTES: usize = 64 * 1024;
+    if bytes.is_empty() {
+        return "<empty>".to_string();
+    }
+    let shown = &bytes[..bytes.len().min(MAX_PREVIEW_BYTES)];
+    match std::str::from_utf8(shown) {
+        Ok(text) => {
+            if bytes.len() > MAX_PREVIEW_BYTES {
+                format!("{text}\n<truncated; {} bytes total>", bytes.len())
+            } else {
+                text.to_string()
+            }
+        }
+        Err(_) => format!("<binary body: {} bytes>", bytes.len()),
+    }
+}
+
+fn write_performance_trace_file(
+    file_path: &str,
+    trace: &Value,
+) -> Result<(), BrowserTransportError> {
+    let file = std::fs::File::create(file_path).map_err(|error| {
+        BrowserTransportError::Protocol(format!(
+            "Could not create performance trace at {file_path}: {error}"
+        ))
+    })?;
+    let gzip = Path::new(file_path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("gz"));
+
+    if gzip {
+        let mut encoder = GzEncoder::new(file, Compression::default());
+        serde_json::to_writer(&mut encoder, trace).map_err(|error| {
+            BrowserTransportError::Protocol(format!(
+                "Could not encode compressed performance trace: {error}"
+            ))
+        })?;
+        let file = encoder.finish().map_err(|error| {
+            BrowserTransportError::Protocol(format!(
+                "Could not finish compressed performance trace at {file_path}: {error}"
+            ))
+        })?;
+        file.sync_all().map_err(|error| {
+            BrowserTransportError::Protocol(format!(
+                "Could not sync performance trace at {file_path}: {error}"
+            ))
+        })?;
+    } else {
+        let mut file = file;
+        serde_json::to_writer(&mut file, trace).map_err(|error| {
+            BrowserTransportError::Protocol(format!("Could not encode performance trace: {error}"))
+        })?;
+        file.sync_all().map_err(|error| {
+            BrowserTransportError::Protocol(format!(
+                "Could not sync performance trace at {file_path}: {error}"
+            ))
+        })?;
+    }
+    Ok(())
 }
 
 fn network_profile(name: &str) -> (bool, f64, f64, f64) {
@@ -3471,6 +4552,32 @@ mod tests {
         assert_eq!(key.key, "A");
         assert_eq!(key.code, "KeyA");
         assert_eq!(key.modifiers, 10);
+    }
+
+    #[test]
+    fn browser_console_warning_matches_public_warn_type() {
+        assert_eq!(browser_console_type("warning"), "warn");
+        assert_eq!(browser_console_type("WARN"), "WARN");
+        assert_eq!(browser_console_type("error"), "error");
+    }
+
+    #[test]
+    fn browser_pagination_returns_all_when_page_size_is_omitted() {
+        assert_eq!(
+            browser_pagination(&json!({}), 137).expect("default browser pagination"),
+            (0, 137, 0, 137)
+        );
+        assert_eq!(
+            browser_pagination(&json!({ "pageSize": 25, "pageIdx": 2 }), 137)
+                .expect("explicit browser pagination"),
+            (2, 25, 50, 75)
+        );
+        assert!(
+            browser_pagination(&json!({ "pageSize": MAX_EVENT_PAGE_SIZE + 1 }), 500)
+                .expect_err("explicit oversized page size must stay bounded")
+                .to_string()
+                .contains("pageSize")
+        );
     }
 
     #[test]

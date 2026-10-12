@@ -391,9 +391,16 @@ function normalizeReleaseNotes(body) {
   const notes = [];
   const seen = new Set();
   const lines = structured ?? body.split(/\r?\n/);
-  for (const line of lines) {
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
     if (structured && !/^[-*+][ \t]+\S/.test(line)) continue;
-    const note = normalizeChangelogLine(line);
+    let entry = line;
+    if (structured) {
+      while (index + 1 < lines.length && /^[ \t]{2,}(?![-*+][ \t])\S/.test(lines[index + 1])) {
+        entry += ` ${lines[++index].trim()}`;
+      }
+    }
+    const note = normalizeChangelogLine(entry);
     if (!note || seen.has(note)) continue;
     seen.add(note);
     notes.push(note);

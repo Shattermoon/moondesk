@@ -61,11 +61,12 @@ pub const COMPANION_SEND_STARTED_ROUTE: &str = "/__moondesk/companion/v1/command
 pub const COMPANION_ACK_ROUTE: &str = "/__moondesk/companion/v1/commands/ack";
 pub const COMPANION_CLEAR_WORKERS_ROUTE: &str = "/__moondesk/companion/v1/workers/clear";
 pub const COMPANION_WORKER_RESET_ACK_ROUTE: &str = "/__moondesk/companion/v1/workers/reset-ack";
+pub const COMPANION_WORKER_RECOVERY_ROUTE: &str = "/__moondesk/companion/v1/workers/recovery";
 pub const COMPANION_USER_BROWSER_ROUTE: &str = "/__moondesk/companion/v1/browser-control";
 pub const COMPANION_TOKEN_HEADER: &str = "x-moondesk-companion-token";
 // Bump with any shipped companion runtime change that requires Chromium to load new bytes. Keep
 // this aligned with COMPANION_RUNTIME_REVISION in background.js.
-pub const COMPANION_RUNTIME_REVISION: u32 = 20;
+pub const COMPANION_RUNTIME_REVISION: u32 = 22;
 const MAX_COMPANION_BODY_BYTES: usize = 16 * 1024;
 const MAX_COMPANION_USER_BROWSER_BODY_BYTES: usize = 2 * 1024 * 1024;
 
@@ -225,6 +226,10 @@ pub fn companion_bridge_router(
         .route(
             COMPANION_WORKER_RESET_ACK_ROUTE,
             post(ack_companion_worker_reset).layer(DefaultBodyLimit::max(MAX_COMPANION_BODY_BYTES)),
+        )
+        .route(
+            COMPANION_WORKER_RECOVERY_ROUTE,
+            post(companion_worker_recovery).layer(DefaultBodyLimit::max(MAX_COMPANION_BODY_BYTES)),
         )
         .route(
             COMPANION_USER_BROWSER_ROUTE,
@@ -528,6 +533,95 @@ async fn companion_status(State(state): State<ServerState>, headers: HeaderMap) 
             "workerResetAckRequired": auth.worker_reset_ack_required(&client_id).await
         }),
     )
+}
+
+async fn companion_worker_recovery(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response<Body> {
+    if !companion_origin_allowed(&headers) {
+        return companion_origin_error();
+    }
+    let Some(client_id) = companion_client_id(&state, &headers).await else {
+        return companion_unauthorized();
+    };
+    let Some(object) = body.as_object() else {
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            json!({ "error": "invalid worker recovery request" }),
+        );
+    };
+    let Some(action) = object.get("action").and_then(Value::as_str) else {
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            json!({ "error": "missing worker recovery action" }),
+        );
+    };
+    let broker = {
+        let app = state.app.lock().await;
+        app.companion_auth.worker_recovery_broker()
+    };
+    match action {
+        "poll" => match broker.poll(&client_id).await {
+            Ok(poll) => json_response(
+                StatusCode::OK,
+                json!({ "epoch": poll.epoch, "requests": poll.requests }),
+            ),
+            Err(error) => json_response(StatusCode::BAD_REQUEST, json!({ "error": error })),
+        },
+        "claim" => {
+            let (Some(id), Some(epoch)) = (
+                object.get("id").and_then(Value::as_str),
+                object.get("epoch").and_then(Value::as_str),
+            ) else {
+                return json_response(
+                    StatusCode::BAD_REQUEST,
+                    json!({ "error": "missing worker recovery claim identity" }),
+                );
+            };
+            let command = broker.claim(&client_id, id, epoch).await;
+            json_response(
+                if command.is_some() {
+                    StatusCode::OK
+                } else {
+                    StatusCode::CONFLICT
+                },
+                json!({ "command": command }),
+            )
+        }
+        "result" => {
+            let (Some(id), Some(epoch), Some(result)) = (
+                object.get("id").and_then(Value::as_str),
+                object.get("epoch").and_then(Value::as_str),
+                object.get("result"),
+            ) else {
+                return json_response(
+                    StatusCode::BAD_REQUEST,
+                    json!({ "error": "missing worker recovery result" }),
+                );
+            };
+            if !result.is_object() {
+                return json_response(
+                    StatusCode::BAD_REQUEST,
+                    json!({ "error": "worker recovery result must be an object" }),
+                );
+            }
+            let accepted = broker.result(&client_id, id, epoch, result.clone()).await;
+            json_response(
+                if accepted {
+                    StatusCode::OK
+                } else {
+                    StatusCode::CONFLICT
+                },
+                json!({ "ok": accepted }),
+            )
+        }
+        _ => json_response(
+            StatusCode::BAD_REQUEST,
+            json!({ "error": "unknown worker recovery action" }),
+        ),
+    }
 }
 
 async fn companion_user_browser_control(

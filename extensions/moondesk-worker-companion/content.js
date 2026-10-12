@@ -352,11 +352,129 @@
     return { ok: true, catalog };
   }
 
+  function recoveryEvidence(marker) {
+    const evidence = workerEvidence(marker);
+    return {
+      ...evidence,
+      composerReady: DOM.composerReady?.() === true
+    };
+  }
+
+  async function inspectWorkerRecovery(message) {
+    const marker = message?.taskMarker;
+    if (typeof marker !== 'string' || !marker) {
+      return { state: 'failed', reason: 'worker_recovery_task_marker_invalid' };
+    }
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    const evidence = recoveryEvidence(marker);
+    if (!evidence.conversationId || evidence.markerPresent !== true) {
+      return { state: 'failed', reason: 'worker_recovery_task_not_present', evidence };
+    }
+    return {
+      state: evidence.generating ? 'busy' : 'idle',
+      evidence
+    };
+  }
+
+  async function continueWorkerRecovery(message) {
+    const marker = message?.taskMarker;
+    const prompt = message?.prompt;
+    if (typeof marker !== 'string' || !marker || typeof prompt !== 'string' || !prompt.trim()) {
+      return { state: 'failed', reason: 'worker_recovery_continue_invalid' };
+    }
+    const conversationId = DOM.conversationIdFromPath();
+    const stillCurrent = () =>
+      Boolean(conversationId) &&
+      DOM.conversationIdFromPath() === conversationId &&
+      DOM.taskMarkerPresent(marker);
+    if (!stillCurrent()) {
+      return { state: 'failed', reason: 'worker_recovery_target_changed' };
+    }
+    const before = recoveryEvidence(marker);
+    const expected = message?.expected;
+    if (
+      expected &&
+      (Number(expected.userTurnCount) !== before.userTurnCount ||
+        Number(expected.assistantTurnCount) !== before.assistantTurnCount)
+    ) {
+      return { state: 'superseded', reason: 'worker_recovery_page_progressed', evidence: before };
+    }
+
+    let stopped = false;
+    if (before.generating) {
+      if (message?.stopIfBusy !== true) {
+        return { state: 'busy', reason: 'worker_recovery_still_generating', evidence: before };
+      }
+      if (!(await DOM.stopGeneration(10000, stillCurrent))) {
+        return { state: 'failed', reason: 'worker_recovery_stop_unconfirmed', evidence: recoveryEvidence(marker) };
+      }
+      stopped = true;
+    }
+    if (!stillCurrent()) {
+      return { state: 'superseded', reason: 'worker_recovery_target_changed_after_stop' };
+    }
+    if (!(await DOM.waitForComposerReady(12000, stillCurrent))) {
+      return { state: 'failed', reason: 'worker_recovery_composer_not_ready', evidence: recoveryEvidence(marker) };
+    }
+    const ready = recoveryEvidence(marker);
+    if (!ready.composerEmpty) {
+      return { state: 'superseded', reason: 'worker_recovery_existing_draft', evidence: ready };
+    }
+    if (!DOM.insertPrompt(prompt)) {
+      return { state: 'failed', reason: 'worker_recovery_prompt_insert_unconfirmed', evidence: ready };
+    }
+    const committed = await DOM.commitSendOnce(prompt, marker, stillCurrent);
+    if (committed?.state !== 'committed') {
+      return {
+        state: 'failed',
+        reason: committed?.reason || 'worker_recovery_send_unconfirmed',
+        evidence: recoveryEvidence(marker)
+      };
+    }
+    // A click is only the irreversible boundary, not proof that ChatGPT accepted the continuation.
+    // Require fresh page evidence before reporting success so an ignored/dropped click cannot make
+    // Core believe a stale worker resumed. A timeout remains explicitly unconfirmed and must be
+    // inspected before any retry.
+    const acceptanceDeadline = Date.now() + 12000;
+    while (Date.now() < acceptanceDeadline) {
+      if (!stillCurrent()) {
+        return { state: 'superseded', reason: 'worker_recovery_target_changed_after_send' };
+      }
+      const evidence = recoveryEvidence(marker);
+      if (
+        evidence.userTurnCount > ready.userTurnCount ||
+        evidence.assistantTurnCount > ready.assistantTurnCount ||
+        (evidence.generating && evidence.composerEmpty)
+      ) {
+        return { state: 'continued', stopped, evidence };
+      }
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    return {
+      state: 'unconfirmed',
+      stopped,
+      reason: 'worker_recovery_send_acceptance_unconfirmed',
+      evidence: recoveryEvidence(marker)
+    };
+  }
+
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     if (!message || typeof message.type !== 'string') return false;
     if (message.type === 'MOONDESK_CONTEXT') {
       sendResponse({ ok: true, context: DOM.context(), rememberedLaunch: rememberedLaunch() });
       return false;
+    }
+    if (message.type === 'MOONDESK_RECOVER_WORKER_INSPECT') {
+      void inspectWorkerRecovery(message)
+        .then((result) => sendResponse({ ok: true, result }))
+        .catch((error) => sendResponse({ ok: false, error: String(error?.message || error) }));
+      return true;
+    }
+    if (message.type === 'MOONDESK_RECOVER_WORKER_CONTINUE') {
+      void continueWorkerRecovery(message)
+        .then((result) => sendResponse({ ok: true, result }))
+        .catch((error) => sendResponse({ ok: false, error: String(error?.message || error) }));
+      return true;
     }
     if (message.type === 'MOONDESK_CORRELATION_EVIDENCE') {
       void DOM.correlationEvidence()

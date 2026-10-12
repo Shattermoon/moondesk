@@ -1026,7 +1026,7 @@ test('bridge discovery prefers an exact runtime match over another MoonDesk vers
             app: 'moondesk-worker-companion',
             appVersion: manifest.version,
             protocolVersion: 2,
-            companionRuntimeRevision: 20
+            companionRuntimeRevision: 22
           };
         }
       };
@@ -1054,7 +1054,7 @@ test('bridge discovery prefers an exact runtime match over another MoonDesk vers
 
   const { evaluate, runtimeReloads } = loadBackground({ fetchImpl });
   const hello = await evaluate('discoverBridge(freshState())');
-  assert.equal(hello.companionRuntimeRevision, 20);
+  assert.equal(hello.companionRuntimeRevision, 22);
   assert.equal(runtimeReloads.length, 0);
 });
 
@@ -1100,7 +1100,7 @@ test('bridge runtime revision mismatch reloads the unpacked companion once', asy
             app: 'moondesk-worker-companion',
             appVersion: manifest.version,
             protocolVersion: 2,
-            companionRuntimeRevision: 19
+            companionRuntimeRevision: 20
           };
         }
       };
@@ -1139,7 +1139,7 @@ test('compatible bridge clears the one-shot runtime reload marker for a future m
             app: 'moondesk-worker-companion',
             appVersion: manifest.version,
             protocolVersion: 2,
-            companionRuntimeRevision: 20
+            companionRuntimeRevision: 22
           };
         }
       };
@@ -1152,7 +1152,7 @@ test('compatible bridge clears the one-shot runtime reload marker for a future m
   });
 
   const hello = await evaluate('discoverBridge(freshState())');
-  assert.equal(hello.companionRuntimeRevision, 20);
+  assert.equal(hello.companionRuntimeRevision, 22);
   const stored = await evaluate(`chrome.storage.local.get('${reloadKey}')`);
   assert.equal(stored[reloadKey], undefined);
 });
@@ -1170,7 +1170,7 @@ test('automatic pairing proves the extension was loaded from the MoonDesk-prepar
             app: 'moondesk-worker-companion',
             appVersion: manifest.version,
             protocolVersion: 2,
-            companionRuntimeRevision: 20
+            companionRuntimeRevision: 22
           };
         }
       };
@@ -1212,7 +1212,7 @@ test('source and release-ZIP installs without a bootstrap capability expose Manu
         app: 'moondesk-worker-companion',
         appVersion: manifest.version,
         protocolVersion: 2,
-        companionRuntimeRevision: 20
+        companionRuntimeRevision: 22
       };
       return {
         ok: true,
@@ -1281,7 +1281,7 @@ test('release version mismatch reloads the unpacked companion even when protocol
             app: 'moondesk-worker-companion',
             appVersion: '0.13.0',
             protocolVersion: 2,
-            companionRuntimeRevision: 20
+            companionRuntimeRevision: 22
           };
         }
       };
@@ -3072,6 +3072,45 @@ test('existing worker placement survives without Core presence by using the host
   assert.equal(placement.projectUrl, null);
 });
 
+test('browserless fresh worker placement accepts only an explicitly request-pinned Companion', () => {
+  const { evaluate } = loadBackground();
+  const placementForOffer = evaluate('placementForOffer');
+  const state = { bindings: {}, launchRecords: {}, threadRecords: {} };
+  const pinnedOffer = {
+    anchorContext: null,
+    command: {
+      targetClientId: 'ide-worker-chrome',
+      targetClientPinnedByRequest: true,
+      launch: {
+        workspaceId: 'workspace-a',
+        threadKey: 'worker:browserless',
+        openMode: 'new_thread',
+        existingConversationUrl: null
+      }
+    }
+  };
+  const placement = placementForOffer(state, pinnedOffer);
+  assert.equal(placement.projectId, null);
+  assert.equal(placement.projectUrl, null);
+  assert.equal(placement.anchorConversationUrl, null);
+
+  const unpinnedOffer = {
+    ...pinnedOffer,
+    command: { ...pinnedOffer.command, targetClientPinnedByRequest: false }
+  };
+  assert.equal(
+    placementForOffer(state, unpinnedOffer),
+    null,
+    'an ordinary leased command without Core anchor authority must still fail closed'
+  );
+
+  const missingTargetOffer = {
+    ...pinnedOffer,
+    command: { ...pinnedOffer.command, targetClientId: null }
+  };
+  assert.equal(placementForOffer(state, missingTargetOffer), null);
+});
+
 test('fresh workers always start from normal ChatGPT home regardless of Core Project placement', () => {
   const { evaluate } = loadBackground();
   const sourceUrlForCommand = evaluate('sourceUrlForCommand');
@@ -3467,6 +3506,101 @@ test('existing-thread reuse accepts the exact durable thread owned by the same w
   assert.equal(record.sourceUrl, conversationUrl);
   assert.equal(tab.id, 77);
   assert.equal(createdTabs.length, 0);
+});
+
+test('worker recovery stop/continue waits for fresh accepted send evidence', async () => {
+  let messageHandler = null;
+  let generating = true;
+  let userTurnCount = 2;
+  let assistantTurnCount = 1;
+  let draftPresent = false;
+  let stopCalls = 0;
+  let commitCalls = 0;
+  const marker = 'moondesk-worker-task:recovery-confirmation';
+  const conversationId = '6aaef8db-ecf0-83ee-bfcc-d6f94853c540';
+  const storage = new Map();
+  const DOM = {
+    conversationIdFromPath() { return conversationId; },
+    taskMarkerPresent(value) { return value === marker; },
+    workerEvidence() {
+      return {
+        conversationId,
+        conversationUrl: `https://chatgpt.com/c/${conversationId}`,
+        projectId: null,
+        markerPresent: true,
+        generating,
+        userTurnCount,
+        assistantTurnCount,
+        composerEmpty: !draftPresent
+      };
+    },
+    composerReady() { return !generating; },
+    async stopGeneration(_timeoutMs, stillCurrent) {
+      stopCalls += 1;
+      assert.equal(stillCurrent(), true);
+      generating = false;
+      return true;
+    },
+    async waitForComposerReady(_timeoutMs, stillCurrent) {
+      return stillCurrent() && !generating;
+    },
+    insertPrompt(prompt) {
+      assert.match(prompt, /Continue the SAME assignment/);
+      draftPresent = true;
+      return true;
+    },
+    async commitSendOnce(_prompt, value, stillCurrent) {
+      commitCalls += 1;
+      assert.equal(value, marker);
+      assert.equal(stillCurrent(), true);
+      draftPresent = false;
+      userTurnCount += 1;
+      generating = true;
+      return { state: 'committed' };
+    }
+  };
+  const context = vm.createContext({
+    window: { MOONDESK_CHATGPT_DOM: DOM },
+    sessionStorage: {
+      setItem(key, value) { storage.set(key, value); },
+      getItem(key) { return storage.get(key) || null; },
+      removeItem(key) { storage.delete(key); }
+    },
+    location: {
+      origin: 'https://chatgpt.com',
+      hash: '',
+      pathname: `/c/${conversationId}`,
+      search: '',
+      href: `https://chatgpt.com/c/${conversationId}`
+    },
+    history: { state: null, replaceState() {} },
+    chrome: { runtime: { onMessage: { addListener(handler) { messageHandler = handler; } } } },
+    crypto: webcrypto,
+    setTimeout,
+    clearTimeout,
+    setInterval,
+    clearInterval,
+    console
+  });
+  vm.runInContext(contentSource, context, { filename: contentPath });
+
+  const response = await new Promise((resolve) => {
+    const returned = messageHandler({
+      type: 'MOONDESK_RECOVER_WORKER_CONTINUE',
+      taskMarker: marker,
+      prompt: `Continue the SAME assignment.\n\n[${marker}]`,
+      stopIfBusy: true,
+      expected: { userTurnCount: 2, assistantTurnCount: 1 }
+    }, null, resolve);
+    assert.equal(returned, true);
+  });
+
+  assert.equal(response.ok, true);
+  assert.equal(response.result.state, 'continued');
+  assert.equal(response.result.stopped, true);
+  assert.equal(response.result.evidence.userTurnCount, 3);
+  assert.equal(stopCalls, 1);
+  assert.equal(commitCalls, 1);
 });
 
 test('existing-thread preparation waits for the recovered conversation composer before continuing', async () => {

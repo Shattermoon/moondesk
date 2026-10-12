@@ -17,7 +17,7 @@ use crate::managed_chat::types::canonical_chatgpt_conversation_id;
 use crate::workspaces::WorkspaceId;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::PathBuf;
 use subtle::ConstantTimeEq;
@@ -114,6 +114,25 @@ pub struct CollectedUpdates {
     pub completed: Vec<CollectedWorkerUpdate>,
 }
 
+const MAX_RECENT_WORKER_TOOL_ACTIVITY: usize = 12;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkerToolActivity {
+    pub at_ms: u64,
+    pub tool: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<TaskId>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkerActivitySnapshot {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_activity_at_ms: Option<u64>,
+    pub recent_tool_calls: Vec<WorkerToolActivity>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct InactiveWorkerCleanupSummary {
     pub family_count: usize,
@@ -144,6 +163,7 @@ pub(crate) struct WorkerClaimAttestationRequirement {
 pub struct WorkerBroker {
     path: PathBuf,
     data: Mutex<WorkerStoreData>,
+    activity: Mutex<BTreeMap<WorkerId, WorkerActivitySnapshot>>,
     updates: Notify,
     #[cfg(test)]
     fail_next_commit: std::sync::atomic::AtomicBool,
@@ -156,6 +176,7 @@ impl WorkerBroker {
         Ok(Self {
             path,
             data: Mutex::new(data),
+            activity: Mutex::new(BTreeMap::new()),
             updates: Notify::new(),
             #[cfg(test)]
             fail_next_commit: std::sync::atomic::AtomicBool::new(false),
@@ -1141,6 +1162,93 @@ impl WorkerBroker {
             .cloned())
     }
 
+    pub async fn record_tool_activity(
+        &self,
+        workspace_id: &WorkspaceId,
+        worker_identity: &ChatIdentity,
+        tool: &str,
+    ) -> Result<Option<WorkerActivitySnapshot>, WorkerBrokerError> {
+        worker_identity
+            .validate()
+            .map_err(WorkerBrokerError::Invalid)?;
+        let tool = tool.trim();
+        if tool.is_empty() || tool.len() > 128 {
+            return Err(WorkerBrokerError::Invalid(
+                "worker activity tool name must contain 1..=128 bytes".into(),
+            ));
+        }
+        let owned = {
+            let guard = self.data.lock().await;
+            guard
+                .families
+                .values()
+                .filter(|family| &family.workspace_id == workspace_id)
+                .flat_map(|family| family.workers.values())
+                .find(|worker| worker.chat_identity.as_ref() == Some(worker_identity))
+                .map(|worker| (worker.id.clone(), worker.current_task_id.clone()))
+        };
+        let Some((worker_id, task_id)) = owned else {
+            return Ok(None);
+        };
+        Ok(Some(
+            self.record_worker_activity(&worker_id, task_id, tool).await,
+        ))
+    }
+
+    async fn record_worker_activity(
+        &self,
+        worker_id: &WorkerId,
+        task_id: Option<TaskId>,
+        tool: &str,
+    ) -> WorkerActivitySnapshot {
+        let now_ms = worker_unix_time_ms();
+        let mut activity = self.activity.lock().await;
+        let snapshot = activity.entry(worker_id.clone()).or_default();
+        snapshot.last_activity_at_ms = Some(now_ms);
+        snapshot.recent_tool_calls.push(WorkerToolActivity {
+            at_ms: now_ms,
+            tool: tool.to_string(),
+            task_id,
+        });
+        if snapshot.recent_tool_calls.len() > MAX_RECENT_WORKER_TOOL_ACTIVITY {
+            let remove = snapshot.recent_tool_calls.len() - MAX_RECENT_WORKER_TOOL_ACTIVITY;
+            snapshot.recent_tool_calls.drain(0..remove);
+        }
+        snapshot.clone()
+    }
+
+    pub async fn activity_for_family(
+        &self,
+        workspace_id: &WorkspaceId,
+        anchor_identity: &ChatIdentity,
+    ) -> Result<BTreeMap<WorkerId, WorkerActivitySnapshot>, WorkerBrokerError> {
+        anchor_identity
+            .validate()
+            .map_err(WorkerBrokerError::Invalid)?;
+        let worker_ids = {
+            let guard = self.data.lock().await;
+            guard
+                .families
+                .values()
+                .find(|family| {
+                    &family.workspace_id == workspace_id
+                        && &family.anchor_identity == anchor_identity
+                })
+                .map(|family| family.workers.keys().cloned().collect::<Vec<_>>())
+                .unwrap_or_default()
+        };
+        let activity = self.activity.lock().await;
+        Ok(worker_ids
+            .into_iter()
+            .filter_map(|worker_id| {
+                activity
+                    .get(&worker_id)
+                    .cloned()
+                    .map(|snapshot| (worker_id, snapshot))
+            })
+            .collect())
+    }
+
     pub async fn retire_worker(
         &self,
         workspace_id: &WorkspaceId,
@@ -1536,6 +1644,8 @@ impl WorkerBroker {
         task.state = TaskState::Running;
         let claimed = worker.clone();
         self.commit_candidate(&mut guard, candidate).await?;
+        self.record_worker_activity(worker_id, Some(task_id.clone()), "workers:claim")
+            .await;
         Ok(claimed)
     }
 
@@ -2490,6 +2600,80 @@ mod tests {
             )
             .await
             .expect("confirm canonical worker conversation before claim");
+    }
+
+    #[tokio::test]
+    async fn worker_tool_activity_is_ephemeral_and_scoped_to_exact_worker_identity() {
+        let root = temp_root("moondesk-worker-tool-activity");
+        let path = root.join("worker-state-v1.json");
+        let broker = WorkerBroker::open(&path).expect("open worker broker");
+        let workspace = WorkspaceId::new();
+        let core = anchor("core-tool-activity");
+        let worker_identity = anchor("worker-tool-activity");
+        let spawned = broker
+            .spawn_worker(spawn_request(
+                OperationId::new(),
+                workspace.clone(),
+                core.clone(),
+                "exercise activity telemetry",
+            ))
+            .await
+            .expect("spawn worker");
+        make_claimable(&broker, &workspace, &core, &spawned).await;
+        broker
+            .claim_worker(
+                &workspace,
+                &spawned.worker_id,
+                &spawned.task_id,
+                &spawned.claim_token,
+                worker_identity.clone(),
+            )
+            .await
+            .expect("claim worker");
+
+        assert!(
+            broker
+                .record_tool_activity(&workspace, &anchor("unrelated-chat"), "read")
+                .await
+                .expect("ignore unrelated caller")
+                .is_none()
+        );
+        broker
+            .record_tool_activity(&workspace, &worker_identity, "read")
+            .await
+            .expect("record read");
+        broker
+            .record_tool_activity(&workspace, &worker_identity, "run_command")
+            .await
+            .expect("record command");
+
+        let activity = broker
+            .activity_for_family(&workspace, &core)
+            .await
+            .expect("read Core activity");
+        let snapshot = activity.get(&spawned.worker_id).expect("worker activity");
+        assert!(snapshot.last_activity_at_ms.is_some());
+        assert_eq!(snapshot.recent_tool_calls.len(), 3);
+        assert_eq!(snapshot.recent_tool_calls[0].tool, "workers:claim");
+        assert_eq!(snapshot.recent_tool_calls[1].tool, "read");
+        assert_eq!(snapshot.recent_tool_calls[2].tool, "run_command");
+        assert!(
+            snapshot
+                .recent_tool_calls
+                .iter()
+                .all(|event| event.task_id.as_ref() == Some(&spawned.task_id))
+        );
+
+        drop(broker);
+        let reopened = WorkerBroker::open(&path).expect("reopen worker broker");
+        assert!(
+            reopened
+                .activity_for_family(&workspace, &core)
+                .await
+                .expect("ephemeral activity resets on restart")
+                .is_empty()
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]

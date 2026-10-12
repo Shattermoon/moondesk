@@ -28,7 +28,7 @@ use crate::state::{
 };
 use crate::vision;
 use crate::workers::broker::WorkerBroker;
-use crate::workers::types::{ChatIdentity, OperationId, TaskId, WorkerId};
+use crate::workers::types::{ChatIdentity, OperationId, TaskId, WorkerId, WorkerState};
 use crate::workspace_tools;
 use crate::workspaces::{self, WorkspaceAvailability, WorkspaceId};
 
@@ -596,15 +596,17 @@ fn workers_tool_descriptor() -> Value {
     json!({
         "name": "workers",
         "title": "Coordinate workers",
-        "description": "Coordinate MoonDesk worker conversations for the current workspace. Core actions are status, spawn, reuse, send, collect, and retire. Worker actions are claim, start, inbox, ack, report, and finish. Use status before spawning to read targetWorkerCount, recommendedWorkerCount, and maxWorkerCount; an explicit user-requested count within the maximum takes precedence. Fresh spawns may include shared `context` with the overall goal, constraints, settled decisions, relevant state, completed work, validation, and sibling ownership, while `task` stays worker-specific. Use the same shared context for sibling fresh spawns when applicable. Reuse continues the same durable worker conversation, so include only new or changed facts in the reuse `task`. collect may wait up to 60 seconds for reports or completions. If a response is uncertain, retry that request promptly with the same `operation_id`.",
+        "description": "Coordinate MoonDesk workers for this workspace. Core actions: status, spawn, reuse, recover, send, collect, retire. Worker actions: claim, start, inbox, ack, report, finish. ROLE-SCOPED RULE: only when the current caller is Core running in ChatGPT Work/Codex/IDE, use MoonDesk only for worker orchestration and use the IDE's native shell, browser, files, and computer tools for Core's own work. This restriction NEVER applies inside a MoonDesk Worker conversation: Workers should use this workspace's MoonDesk connector/tools normally for all assigned project work. If Core has no Companion-observed browser tab, set `browserless_core=true` on spawn/reuse; status lists online workerBrowsers and worker-count limits. Fresh spawn `context` may carry shared goals, constraints, settled decisions, validation, and sibling ownership while `task` stays worker-specific. Reuse keeps the same durable worker chat, so send only new direction. collect may wait up to 60 seconds. Retry an uncertain request promptly with the same `operation_id`.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "action": { "type": "string", "enum": ["spawn", "reuse", "retire", "status", "send", "collect", "claim", "start", "inbox", "ack", "report", "finish"] },
+                "action": { "type": "string", "enum": ["spawn", "reuse", "recover", "retire", "status", "send", "collect", "claim", "start", "inbox", "ack", "report", "finish"] },
                 "operation_id": { "type": "string", "description": "Stable UUID for spawn, reuse, send, report, or collect; reuse it when retrying the same uncertain request. Fresh worker claim uses the UUID supplied in its bootstrap" },
                 "label": { "type": "string", "minLength": 1, "maxLength": 128, "description": "Short worker task label for spawn" },
                 "task": { "type": "string", "minLength": 1, "description": "Concrete worker-specific assignment for spawn or reuse" },
                 "context": { "type": "string", "maxLength": 32768, "description": "Optional shared context for a fresh spawn: overall goal, constraints, settled decisions, relevant project state, completed work, validation, sibling ownership, and blocker criteria. Keep it task-relevant and exclude credentials, tokens, private keys, secret connector URLs, and unrelated private data. MoonDesk places it before the worker-specific assignment. Reuse relies on the existing worker conversation history." },
+                "browserless_core": { "type": "boolean", "description": "Set true only when Core is ChatGPT Work/Codex/IDE and has no Companion-observed browser tab. Existing browser-based Core routing remains unchanged when false or omitted." },
+                "worker_browser_id": { "type": "string", "maxLength": 128, "description": "Optional paired Companion client id from status.workerBrowsers. Use when browserless_core=true and more than one Companion browser is online." },
                 "worker_id": { "type": "string", "description": "Worker UUID returned by spawn" },
                 "task_id": { "type": "string", "description": "Task UUID returned by spawn" },
                 "claim_token": { "type": "string", "description": "One-time claim token supplied in a fresh worker bootstrap" },
@@ -634,6 +636,13 @@ fn workers_tool_descriptor() -> Value {
                 "targetWorkerCount": { "type": "integer" },
                 "recommendedWorkerCount": { "type": "integer" },
                 "maxWorkerCount": { "type": "integer" },
+                "workerBrowsers": { "type": "array" },
+                "browserlessCoreSupported": { "type": "boolean" },
+                "workerObservability": { "type": "array" },
+                "browserClientId": { "type": "string" },
+                "inspect": { "type": "object" },
+                "recovery": { "type": "object" },
+                "instruction": { "type": "string" },
                 "messageId": { "type": "string" },
                 "reportId": { "type": "string" },
                 "messages": { "type": "array" },
@@ -1677,6 +1686,357 @@ fn worker_chat_identity(req: &JsonRpcRequest) -> Result<ChatIdentity, String> {
     })
 }
 
+fn browserless_core_requested(arguments: &Value) -> Result<bool, String> {
+    match arguments.get("browserless_core") {
+        None | Some(Value::Null) => Ok(false),
+        Some(Value::Bool(value)) => Ok(*value),
+        Some(_) => Err("workers browserless_core must be a boolean".into()),
+    }
+}
+
+async fn worker_browser_choices(auth: &CompanionAuth) -> Vec<Value> {
+    let mut paired = auth.paired_client_ids().await;
+    paired.sort();
+    let fresh = auth.fresh_presence(crate::companion::unix_time_ms()).await;
+    paired
+        .into_iter()
+        .map(|client_id| {
+            let presence = fresh
+                .iter()
+                .find(|presence| presence.client_id == client_id);
+            json!({
+                "clientId": client_id,
+                "browserLabel": presence.and_then(|presence| presence.browser_label.clone()),
+                "online": presence.is_some(),
+                "lastSeenMs": presence.map(|presence| presence.last_seen_ms)
+            })
+        })
+        .collect()
+}
+
+async fn select_browserless_worker_client(
+    arguments: &Value,
+    auth: &CompanionAuth,
+) -> Result<String, String> {
+    let requested = match arguments.get("worker_browser_id") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(value)) if !value.trim().is_empty() && value.len() <= 128 => {
+            Some(value.as_str())
+        }
+        Some(_) => {
+            return Err(
+                "workers worker_browser_id must be a non-empty Companion client id from status.workerBrowsers"
+                    .into(),
+            );
+        }
+    };
+    let mut fresh = auth.fresh_presence(crate::companion::unix_time_ms()).await;
+    fresh.sort_by(|left, right| left.client_id.cmp(&right.client_id));
+    if let Some(requested) = requested {
+        return fresh
+            .into_iter()
+            .find(|presence| presence.client_id == requested)
+            .map(|presence| presence.client_id)
+            .ok_or_else(|| {
+                "workers browserless Core target is not currently online; call workers status and choose an online workerBrowsers clientId"
+                    .to_string()
+            });
+    }
+    match fresh.as_slice() {
+        [] => Err(
+            "workers browserless Core requires an online paired MoonDesk Companion browser; open the Companion browser and retry"
+                .into(),
+        ),
+        [only] => Ok(only.client_id.clone()),
+        _ => Err(
+            "workers browserless Core found multiple online Companion browsers; call workers status and retry with worker_browser_id"
+                .into(),
+        ),
+    }
+}
+
+const IDE_WORKER_SUSPECT_AFTER_MS: u64 = 3 * 60_000;
+
+async fn worker_observability(
+    workspace_id: &WorkspaceId,
+    anchor_identity: &ChatIdentity,
+    broker: &WorkerBroker,
+    companion_auth: Option<&CompanionAuth>,
+) -> Result<Vec<Value>, String> {
+    let Some(family) = broker
+        .family_for_anchor(workspace_id, anchor_identity)
+        .await
+        .map_err(|error| error.to_string())?
+    else {
+        return Ok(Vec::new());
+    };
+    let activity = broker
+        .activity_for_family(workspace_id, anchor_identity)
+        .await
+        .map_err(|error| error.to_string())?;
+    let now_ms = crate::companion::unix_time_ms();
+    let presence = match companion_auth {
+        Some(auth) => auth.fresh_presence(now_ms).await,
+        None => Vec::new(),
+    };
+
+    Ok(family
+        .workers
+        .values()
+        .map(|worker| {
+            let conversation_id = worker
+                .conversation_url
+                .as_deref()
+                .and_then(crate::managed_chat::types::canonical_chatgpt_conversation_id);
+            let browser = conversation_id.as_deref().and_then(|conversation_id| {
+                presence.iter().find_map(|client| {
+                    client
+                        .tabs
+                        .iter()
+                        .find(|tab| tab.conversation_id == conversation_id)
+                        .map(|tab| (client, tab))
+                })
+            });
+            let snapshot = activity.get(&worker.id);
+            let last_activity_at_ms = snapshot.and_then(|snapshot| snapshot.last_activity_at_ms);
+            let last_activity_age_ms = last_activity_at_ms.map(|at| now_ms.saturating_sub(at));
+            let browser_present = browser.is_some();
+            let browser_generating = browser.is_some_and(|(_, tab)| tab.generating);
+            let health = match worker.state {
+                WorkerState::Provisioning | WorkerState::Waking => "launching",
+                WorkerState::Idle => "idle",
+                WorkerState::Retired => "retired",
+                WorkerState::Running if !browser_present => "browser_missing",
+                WorkerState::Running if browser_generating => "thinking",
+                WorkerState::Running
+                    if last_activity_age_ms
+                        .is_some_and(|age| age >= IDE_WORKER_SUSPECT_AFTER_MS) =>
+                {
+                    "suspect"
+                }
+                WorkerState::Running if last_activity_at_ms.is_some() => "active",
+                WorkerState::Running => "running_unobserved",
+            };
+            let latest_report = family
+                .reports
+                .iter()
+                .rev()
+                .find(|report| report.worker_id == worker.id)
+                .map(|report| {
+                    json!({
+                        "reportId": report.id,
+                        "taskId": report.task_id,
+                        "message": report.body,
+                        "collected": report.collected
+                    })
+                });
+            json!({
+                "workerId": worker.id,
+                "displayId": worker.display_id,
+                "taskId": worker.current_task_id,
+                "state": worker.state,
+                "health": health,
+                "lastActivityAtMs": last_activity_at_ms,
+                "lastActivityAgeMs": last_activity_age_ms,
+                "recentToolCalls": snapshot
+                    .map(|snapshot| snapshot.recent_tool_calls.clone())
+                    .unwrap_or_default(),
+                "browser": {
+                    "present": browser_present,
+                    "generating": browser_generating,
+                    "clientId": browser.map(|(client, _)| client.client_id.clone()),
+                    "browserLabel": browser.and_then(|(client, _)| client.browser_label.clone()),
+                    "lastSeenMs": browser.map(|(client, _)| client.last_seen_ms)
+                },
+                "latestReport": latest_report
+            })
+        })
+        .collect())
+}
+
+async fn recover_worker_for_core(
+    workspace_id: &WorkspaceId,
+    caller_identity: &ChatIdentity,
+    worker_id: &WorkerId,
+    broker: &WorkerBroker,
+    managed_chat_broker: &ManagedChatBroker,
+    companion_auth: &CompanionAuth,
+) -> Result<Value, String> {
+    let family = broker
+        .family_for_anchor(workspace_id, caller_identity)
+        .await
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "worker family was not found for this Core".to_string())?;
+    let worker = family
+        .workers
+        .get(worker_id)
+        .ok_or_else(|| "worker was not found in this Core family".to_string())?;
+    if worker.state != WorkerState::Running {
+        return Err("worker recovery is only available while the worker task is running".into());
+    }
+    let task_id = worker
+        .current_task_id
+        .clone()
+        .ok_or_else(|| "running worker has no current task".to_string())?;
+    let conversation_url = worker
+        .conversation_url
+        .clone()
+        .ok_or_else(|| "worker recovery requires a durable ChatGPT conversation URL".to_string())?;
+    let conversation_id =
+        crate::managed_chat::types::canonical_chatgpt_conversation_id(&conversation_url)
+            .ok_or_else(|| "worker recovery conversation URL is invalid".to_string())?;
+
+    let activity_before = broker
+        .activity_for_family(workspace_id, caller_identity)
+        .await
+        .map_err(|error| error.to_string())?
+        .get(worker_id)
+        .cloned()
+        .unwrap_or_default();
+
+    let fresh = companion_auth
+        .fresh_presence(crate::companion::unix_time_ms())
+        .await;
+    let visible_client = fresh.iter().find_map(|client| {
+        client
+            .tabs
+            .iter()
+            .find(|tab| tab.conversation_id == conversation_id)
+            .map(|tab| (client.client_id.clone(), tab.generating))
+    });
+    if visible_client
+        .as_ref()
+        .is_some_and(|(_, generating)| *generating)
+    {
+        return Err(
+            "worker still reports an actively generating browser turn; wait for it to become quiet before forcing recovery"
+                .into(),
+        );
+    }
+
+    let thread_key = format!("worker:{worker_id}");
+    let remembered_client = managed_chat_broker
+        .snapshot()
+        .await
+        .commands
+        .values()
+        .filter(|command| command.launch.thread_key.as_deref() == Some(thread_key.as_str()))
+        .filter_map(|command| {
+            command
+                .target_client_id
+                .as_ref()
+                .map(|client_id| (command.sequence, client_id.clone()))
+        })
+        .max_by_key(|(sequence, _)| *sequence)
+        .map(|(_, client_id)| client_id);
+    let online = fresh
+        .iter()
+        .map(|client| client.client_id.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    let client_id = visible_client
+        .map(|(client_id, _)| client_id)
+        .or_else(|| remembered_client.filter(|client_id| online.contains(client_id)))
+        .or_else(|| {
+            (online.len() == 1)
+                .then(|| online.iter().next().cloned())
+                .flatten()
+        })
+        .ok_or_else(|| {
+            "worker recovery cannot identify an online Companion browser for this worker"
+                .to_string()
+        })?;
+
+    let recovery = companion_auth.worker_recovery_broker();
+    let marker = format!("moondesk-worker-task:{task_id}");
+    let inspected = recovery
+        .execute(
+            &client_id,
+            &conversation_url,
+            "inspect",
+            None,
+            &marker,
+            None,
+        )
+        .await?;
+    let inspect_state = inspected
+        .get("state")
+        .and_then(Value::as_str)
+        .unwrap_or("failed");
+    if !matches!(inspect_state, "idle" | "busy") {
+        return Ok(json!({
+            "action": "recover",
+            "workerId": worker_id,
+            "taskId": task_id,
+            "state": "recovery_failed",
+            "browserClientId": client_id,
+            "inspect": inspected,
+            "instruction": "The task is still running and was not marked complete. Inspect repository state with the IDE's native tools before deciding whether to retry recovery or continue the remaining work yourself."
+        }));
+    }
+
+    let activity_after_inspect = broker
+        .activity_for_family(workspace_id, caller_identity)
+        .await
+        .map_err(|error| error.to_string())?
+        .get(worker_id)
+        .cloned()
+        .unwrap_or_default();
+    if activity_after_inspect != activity_before {
+        return Ok(json!({
+            "action": "recover",
+            "workerId": worker_id,
+            "taskId": task_id,
+            "state": "worker_became_active",
+            "browserClientId": client_id,
+            "inspect": inspected,
+            "instruction": "New exact worker tool activity arrived during recovery inspection, so MoonDesk left the worker untouched. Collect/status again instead of sending a duplicate continuation."
+        }));
+    }
+
+    let prompt = format!(
+        "Recovery for your existing MoonDesk task {task_id}: your previous response appears to have stopped or become stale. Continue the SAME assignment from your existing conversation and repository state. Inspect what is already done before acting, do not repeat completed edits or commands, and do not start a new task. If the assignment is already complete, report any meaningful result and call workers action=finish now. Otherwise continue only the remaining work, report meaningful progress/blockers, and finish when done.\n\n[{marker}]"
+    );
+    let action = if inspect_state == "busy" {
+        "stop_continue"
+    } else {
+        "continue"
+    };
+    let expected = inspected.get("evidence").cloned();
+    let continued = recovery
+        .execute(
+            &client_id,
+            &conversation_url,
+            action,
+            Some(prompt),
+            &marker,
+            expected,
+        )
+        .await?;
+    let continued_state = continued
+        .get("state")
+        .and_then(Value::as_str)
+        .unwrap_or("failed");
+    let state = match continued_state {
+        "continued" => "recovery_sent",
+        "superseded" | "busy" => "worker_became_active",
+        _ => "recovery_failed",
+    };
+    Ok(json!({
+        "action": "recover",
+        "workerId": worker_id,
+        "taskId": task_id,
+        "state": state,
+        "browserClientId": client_id,
+        "inspect": inspected,
+        "recovery": continued,
+        "instruction": if state == "recovery_failed" {
+            "The task remains unfinished. Inspect git status/diff and other project state with the IDE's native tools, then decide whether to retry recovery or take over the remaining work."
+        } else {
+            "Recovery was handled without creating a new Worker task. Continue your own Core work and use workers collect/status to observe the worker."
+        }
+    }))
+}
+
 async fn handle_tools_call_for_workspace(
     req: &JsonRpcRequest,
     context: McpRequestContext<'_>,
@@ -1717,6 +2077,24 @@ async fn handle_tools_call_for_workspace(
             "This ChatGPT conversation belonged to a worker that was cleared. Start a new Core conversation before using MoonDesk tools again."
                 .into(),
         );
+    }
+
+    if let Ok(Some(identity)) = optional_chat_identity(req) {
+        let activity_tool = if tool_name == "workers" {
+            let activity_arguments = tool_arguments(req);
+            let action = activity_arguments
+                .get("action")
+                .and_then(Value::as_str)
+                .unwrap_or("call");
+            format!("workers:{action}")
+        } else {
+            tool_name.clone()
+        };
+        // Best-effort observability only. Worker authority and tool execution must never depend
+        // on this in-memory IDE/Work telemetry ledger.
+        let _ = worker_broker
+            .record_tool_activity(workspace_id, &identity, &activity_tool)
+            .await;
     }
 
     if user_browser_tool(&tool_name) {
@@ -1939,7 +2317,73 @@ async fn handle_tools_call_for_workspace(
             }
         }
 
-        let anchor_route = if matches!(action, Some("spawn") | Some("reuse")) {
+        if action == Some("recover") {
+            let worker_id = match arguments
+                .get("worker_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "workers recover requires worker_id".to_string())
+                .and_then(WorkerId::parse)
+            {
+                Ok(value) => value,
+                Err(error) => return tool_error_response_text_only(req, error),
+            };
+            let Some(auth) = companion_auth.as_ref() else {
+                return tool_error_response_text_only(
+                    req,
+                    "workers recover requires the MoonDesk Companion browser".into(),
+                );
+            };
+            return match recover_worker_for_core(
+                workspace_id,
+                &caller_identity,
+                &worker_id,
+                worker_broker.as_ref(),
+                managed_chat_broker.as_ref(),
+                auth.as_ref(),
+            )
+            .await
+            {
+                Ok(structured) => {
+                    tool_success_response_with_structured(req, String::new(), structured)
+                }
+                Err(error) => tool_error_response_text_only(req, error),
+            };
+        }
+
+        let browserless_core = match browserless_core_requested(&arguments) {
+            Ok(value) => value,
+            Err(error) => return tool_error_response_text_only(req, error),
+        };
+        if arguments.get("worker_browser_id").is_some() && !browserless_core {
+            return tool_error_response_text_only(
+                req,
+                "workers worker_browser_id is only valid with browserless_core=true".into(),
+            );
+        }
+        let browserless_client_id = if matches!(action, Some("spawn") | Some("reuse"))
+            && browserless_core
+        {
+            let Some(auth) = companion_auth.as_ref() else {
+                return tool_error_response_text_only(
+                    req,
+                    "Workers require the optional MoonDesk Worker Companion".into(),
+                );
+            };
+            if auth.paired_client_count().await == 0 {
+                return tool_error_response_text_only(
+                    req,
+                    "workers browserless Core requires a paired MoonDesk Companion browser".into(),
+                );
+            }
+            match select_browserless_worker_client(&arguments, auth).await {
+                Ok(client_id) => Some(client_id),
+                Err(error) => return tool_error_response_text_only(req, error),
+            }
+        } else {
+            None
+        };
+
+        let anchor_route = if matches!(action, Some("spawn") | Some("reuse")) && !browserless_core {
             match companion_auth.as_ref() {
                 Some(auth) => {
                     if auth.paired_client_count().await == 0 {
@@ -2012,7 +2456,27 @@ async fn handle_tools_call_for_workspace(
         } else {
             None
         };
-        return match crate::workers::protocol::handle(
+        let worker_browsers = if action == Some("status") {
+            match companion_auth.as_ref() {
+                Some(auth) => worker_browser_choices(auth).await,
+                None => Vec::new(),
+            }
+        } else {
+            Vec::new()
+        };
+        let worker_observability = if matches!(action, Some("status") | Some("collect")) {
+            worker_observability(
+                workspace_id,
+                &caller_identity,
+                worker_broker.as_ref(),
+                companion_auth.as_deref(),
+            )
+            .await
+            .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let result = crate::workers::protocol::handle(
             &arguments,
             workspace_id,
             workspace_name,
@@ -2022,12 +2486,27 @@ async fn handle_tools_call_for_workspace(
             crate::workers::protocol::WorkerLaunchContext {
                 managed_chat_broker: managed_chat_broker.as_ref(),
                 anchor_route: anchor_route.as_ref(),
+                browserless_client_id: browserless_client_id.as_deref(),
                 worker_target_count,
             },
         )
-        .await
-        {
-            Ok(structured) => tool_success_response_with_structured(req, String::new(), structured),
+        .await;
+        return match result {
+            Ok(mut structured) => {
+                if let Some(object) = structured.as_object_mut() {
+                    if action == Some("status") {
+                        object.insert("workerBrowsers".into(), Value::Array(worker_browsers));
+                        object.insert("browserlessCoreSupported".into(), Value::Bool(true));
+                    }
+                    if matches!(action, Some("status") | Some("collect")) {
+                        object.insert(
+                            "workerObservability".into(),
+                            Value::Array(worker_observability),
+                        );
+                    }
+                }
+                tool_success_response_with_structured(req, String::new(), structured)
+            }
             Err(error) => tool_error_response_text_only(req, error),
         };
     }
@@ -6595,10 +7074,20 @@ mod tests {
             .get("description")
             .and_then(Value::as_str)
             .expect("workers description");
-        assert!(description.contains("Fresh spawns may include shared `context`"));
-        assert!(description.contains("Use the same shared context for sibling fresh spawns"));
-        assert!(description.contains("Reuse continues the same durable worker conversation"));
-        assert!(description.contains("retry that request promptly with the same `operation_id`"));
+        assert!(description.contains("Fresh spawn `context` may carry shared goals"));
+        assert!(description.contains("ROLE-SCOPED RULE"));
+        assert!(description.contains("use MoonDesk only for worker orchestration"));
+        assert!(
+            description
+                .contains("This restriction NEVER applies inside a MoonDesk Worker conversation")
+        );
+        assert!(
+            description
+                .contains("Workers should use this workspace's MoonDesk connector/tools normally")
+        );
+        assert!(description.contains("browserless_core=true"));
+        assert!(description.contains("Reuse keeps the same durable worker chat"));
+        assert!(description.contains("same `operation_id`"));
         assert!(
             description.len() < 1_200,
             "workers description should stay concise"
@@ -6703,6 +7192,522 @@ mod tests {
         assert_eq!(structured.get("targetWorkerCount"), Some(&json!(4)));
         assert_eq!(structured.get("recommendedWorkerCount"), Some(&json!(4)));
         assert_eq!(structured.get("maxWorkerCount"), Some(&json!(8)));
+    }
+
+    #[tokio::test]
+    async fn workers_mcp_browserless_core_targets_online_companion_without_core_tab() {
+        let root = TestTempDir::new("moondesk-workers-browserless-core");
+        let workspace_root = root.path().join("workspace");
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        let workspace_id = WorkspaceId::new();
+        let broker = Arc::new(
+            WorkerBroker::open(root.path().join("worker-state-v1.json"))
+                .expect("open worker broker"),
+        );
+        let managed_chat_broker = Arc::new(
+            ManagedChatBroker::open(root.path().join("managed-chat-state-v1.json"))
+                .expect("open managed chat broker"),
+        );
+        let companion_auth = Arc::new(
+            CompanionAuth::open(root.path().join("companion-auth-v1.json"))
+                .expect("open companion auth"),
+        );
+        companion_auth
+            .auto_pair(
+                "ide-worker-chrome",
+                &"a".repeat(64),
+                Some("chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            )
+            .await
+            .expect("pair companion");
+        companion_auth
+            .update_presence(
+                "ide-worker-chrome",
+                crate::companion::CompanionPresenceUpdate {
+                    browser_label: Some("Chrome".into()),
+                    tabs: Vec::new(),
+                },
+                crate::companion::unix_time_ms(),
+            )
+            .await
+            .expect("publish browser presence without a Core tab");
+
+        let status = call_workers_for_test_with_companion(
+            &tool_call_request_with_session(
+                "workers",
+                json!({ "action": "status" }),
+                "ide-core-session",
+            ),
+            &workspace_id,
+            &workspace_root.to_string_lossy(),
+            broker.clone(),
+            managed_chat_broker.clone(),
+            Some(companion_auth.clone()),
+        )
+        .await;
+        let status = status
+            .result
+            .as_ref()
+            .and_then(|result| result.get("structuredContent"))
+            .expect("browserless status");
+        assert_eq!(status.get("browserlessCoreSupported"), Some(&json!(true)));
+        assert_eq!(
+            status
+                .pointer("/workerBrowsers/0/clientId")
+                .and_then(Value::as_str),
+            Some("ide-worker-chrome")
+        );
+        assert_eq!(
+            status
+                .pointer("/workerBrowsers/0/online")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+
+        let response = call_workers_for_test_with_companion(
+            &tool_call_request_with_session(
+                "workers",
+                json!({
+                    "action": "spawn",
+                    "operation_id": Uuid::new_v4().to_string(),
+                    "label": "ide parallel task",
+                    "task": "Inspect one isolated part of the task.",
+                    "browserless_core": true
+                }),
+                "ide-core-session",
+            ),
+            &workspace_id,
+            &workspace_root.to_string_lossy(),
+            broker,
+            managed_chat_broker.clone(),
+            Some(companion_auth),
+        )
+        .await;
+        assert_ne!(
+            response
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true),
+            "browserless Core spawn should not require a Core browser tab"
+        );
+        let managed = managed_chat_broker.snapshot().await;
+        let command = managed
+            .commands
+            .values()
+            .next()
+            .expect("worker launch command");
+        assert_eq!(
+            command.target_client_id.as_deref(),
+            Some("ide-worker-chrome")
+        );
+        assert!(command.target_client_pinned_by_request);
+        assert!(command.anchor_context.is_none());
+        assert_eq!(
+            command.launch.anchor_session_digest.as_deref(),
+            Some(ChatIdentity::session_digest_for("ide-core-session").as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn workers_recovery_refreshes_then_stops_busy_stale_turn_before_continuing() {
+        let root = TestTempDir::new("moondesk-workers-recovery-sequence");
+        let workspace_id = WorkspaceId::new();
+        let broker = Arc::new(
+            WorkerBroker::open(root.path().join("worker-state-v1.json"))
+                .expect("open worker broker"),
+        );
+        let managed = Arc::new(
+            ManagedChatBroker::open(root.path().join("managed-chat-state-v1.json"))
+                .expect("open managed broker"),
+        );
+        let companion = Arc::new(
+            CompanionAuth::open(root.path().join("companion-auth-v1.json"))
+                .expect("open companion auth"),
+        );
+        companion
+            .auto_pair("recovery-chrome", &"c".repeat(64), None)
+            .await
+            .expect("pair recovery browser");
+        let core = ChatIdentity::from_openai_meta(Some("worker-test-subject"), "recovery-core");
+        let worker_identity =
+            ChatIdentity::from_openai_meta(Some("worker-test-subject"), "recovery-worker");
+        let spawned = broker
+            .spawn_worker(crate::workers::broker::SpawnWorkerRequest {
+                operation_id: OperationId::new(),
+                workspace_id: workspace_id.clone(),
+                anchor_identity: core.clone(),
+                label: "recovery worker".into(),
+                assignment: "continue an existing task".into(),
+                context: String::new(),
+                execution_profile: ChatExecutionProfile::default(),
+            })
+            .await
+            .expect("spawn recovery worker");
+        let launch_id = Uuid::new_v4().to_string();
+        let conversation_id = "6aaef8db-ecf0-83ee-bfcc-d6f94853c540";
+        let conversation_url = format!("https://chatgpt.com/c/{conversation_id}");
+        broker
+            .link_launch_command(
+                &workspace_id,
+                &core,
+                &spawned.worker_id,
+                &spawned.task_id,
+                &launch_id,
+            )
+            .await
+            .expect("link recovery worker");
+        broker
+            .update_launch_by_command(
+                &launch_id,
+                crate::workers::types::WorkerLaunchState::WaitingClaim,
+                None,
+                Some(conversation_url.clone()),
+            )
+            .await
+            .expect("bind recovery worker conversation");
+        broker
+            .claim_worker(
+                &workspace_id,
+                &spawned.worker_id,
+                &spawned.task_id,
+                &spawned.claim_token,
+                worker_identity,
+            )
+            .await
+            .expect("claim recovery worker");
+        companion
+            .update_presence(
+                "recovery-chrome",
+                crate::companion::CompanionPresenceUpdate {
+                    browser_label: Some("Chrome".into()),
+                    tabs: vec![crate::companion::CompanionTabPresence {
+                        conversation_id: conversation_id.into(),
+                        conversation_url: conversation_url.clone(),
+                        project_id: None,
+                        project_url: None,
+                        active: false,
+                        window_focused: false,
+                        generating: false,
+                    }],
+                },
+                crate::companion::unix_time_ms(),
+            )
+            .await
+            .expect("publish recovery worker presence");
+
+        let recovery_broker = companion.worker_recovery_broker();
+        let responder = tokio::spawn(async move {
+            for expected_action in ["inspect", "stop_continue"] {
+                let (poll, request_id) = loop {
+                    let poll = recovery_broker.poll("recovery-chrome").await.unwrap();
+                    if let Some(id) = poll.requests.first().cloned() {
+                        break (poll, id);
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                };
+                let command = recovery_broker
+                    .claim("recovery-chrome", &request_id, &poll.epoch)
+                    .await
+                    .expect("claim recovery phase");
+                assert_eq!(command.action, expected_action);
+                let result =
+                    if expected_action == "inspect" {
+                        json!({
+                            "state": "busy",
+                            "evidence": {
+                                "userTurnCount": 2,
+                                "assistantTurnCount": 1,
+                                "generating": true,
+                                "markerPresent": true
+                            }
+                        })
+                    } else {
+                        assert_eq!(
+                            command
+                                .expected
+                                .as_ref()
+                                .and_then(|value| value.get("userTurnCount")),
+                            Some(&json!(2))
+                        );
+                        assert!(command.prompt.as_deref().is_some_and(|prompt| {
+                            prompt.contains("Continue the SAME assignment")
+                        }));
+                        json!({ "state": "continued", "stopped": true })
+                    };
+                assert!(
+                    recovery_broker
+                        .result("recovery-chrome", &request_id, &poll.epoch, result)
+                        .await
+                );
+            }
+        });
+
+        let result = recover_worker_for_core(
+            &workspace_id,
+            &core,
+            &spawned.worker_id,
+            broker.as_ref(),
+            managed.as_ref(),
+            companion.as_ref(),
+        )
+        .await
+        .expect("recover worker");
+        responder.await.expect("recovery responder");
+        assert_eq!(
+            result.get("state").and_then(Value::as_str),
+            Some("recovery_sent")
+        );
+        assert_eq!(
+            result.pointer("/recovery/stopped").and_then(Value::as_bool),
+            Some(true)
+        );
+        let family = broker
+            .family_for_anchor(&workspace_id, &core)
+            .await
+            .unwrap()
+            .expect("worker family remains");
+        let worker = family.workers.get(&spawned.worker_id).unwrap();
+        assert_eq!(worker.state, WorkerState::Running);
+        assert_eq!(worker.current_task_id.as_ref(), Some(&spawned.task_id));
+    }
+
+    #[tokio::test]
+    async fn workers_recovery_aborts_when_worker_activity_arrives_during_refresh() {
+        let root = TestTempDir::new("moondesk-workers-recovery-activity-race");
+        let workspace_id = WorkspaceId::new();
+        let broker = Arc::new(
+            WorkerBroker::open(root.path().join("worker-state-v1.json"))
+                .expect("open worker broker"),
+        );
+        let managed = Arc::new(
+            ManagedChatBroker::open(root.path().join("managed-chat-state-v1.json"))
+                .expect("open managed broker"),
+        );
+        let companion = Arc::new(
+            CompanionAuth::open(root.path().join("companion-auth-v1.json"))
+                .expect("open companion auth"),
+        );
+        companion
+            .auto_pair("recovery-race-chrome", &"d".repeat(64), None)
+            .await
+            .expect("pair recovery browser");
+        let core =
+            ChatIdentity::from_openai_meta(Some("worker-test-subject"), "recovery-race-core");
+        let worker_identity =
+            ChatIdentity::from_openai_meta(Some("worker-test-subject"), "recovery-race-worker");
+        let spawned = broker
+            .spawn_worker(crate::workers::broker::SpawnWorkerRequest {
+                operation_id: OperationId::new(),
+                workspace_id: workspace_id.clone(),
+                anchor_identity: core.clone(),
+                label: "recovery race worker".into(),
+                assignment: "continue an existing task".into(),
+                context: String::new(),
+                execution_profile: ChatExecutionProfile::default(),
+            })
+            .await
+            .expect("spawn recovery worker");
+        let launch_id = Uuid::new_v4().to_string();
+        let conversation_id = "7bbef8db-ecf0-83ee-bfcc-d6f94853c541";
+        let conversation_url = format!("https://chatgpt.com/c/{conversation_id}");
+        broker
+            .link_launch_command(
+                &workspace_id,
+                &core,
+                &spawned.worker_id,
+                &spawned.task_id,
+                &launch_id,
+            )
+            .await
+            .expect("link recovery worker");
+        broker
+            .update_launch_by_command(
+                &launch_id,
+                crate::workers::types::WorkerLaunchState::WaitingClaim,
+                None,
+                Some(conversation_url.clone()),
+            )
+            .await
+            .expect("bind recovery worker conversation");
+        broker
+            .claim_worker(
+                &workspace_id,
+                &spawned.worker_id,
+                &spawned.task_id,
+                &spawned.claim_token,
+                worker_identity.clone(),
+            )
+            .await
+            .expect("claim recovery worker");
+        companion
+            .update_presence(
+                "recovery-race-chrome",
+                crate::companion::CompanionPresenceUpdate {
+                    browser_label: Some("Chrome".into()),
+                    tabs: vec![crate::companion::CompanionTabPresence {
+                        conversation_id: conversation_id.into(),
+                        conversation_url: conversation_url.clone(),
+                        project_id: None,
+                        project_url: None,
+                        active: false,
+                        window_focused: false,
+                        generating: false,
+                    }],
+                },
+                crate::companion::unix_time_ms(),
+            )
+            .await
+            .expect("publish recovery worker presence");
+
+        let recovery_broker = companion.worker_recovery_broker();
+        let recovery_responder = recovery_broker.clone();
+        let activity_broker = broker.clone();
+        let activity_workspace = workspace_id.clone();
+        let activity_identity = worker_identity.clone();
+        let responder = tokio::spawn(async move {
+            let (poll, request_id) = loop {
+                let poll = recovery_responder
+                    .poll("recovery-race-chrome")
+                    .await
+                    .unwrap();
+                if let Some(id) = poll.requests.first().cloned() {
+                    break (poll, id);
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            };
+            let command = recovery_responder
+                .claim("recovery-race-chrome", &request_id, &poll.epoch)
+                .await
+                .expect("claim recovery inspect phase");
+            assert_eq!(command.action, "inspect");
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            activity_broker
+                .record_tool_activity(&activity_workspace, &activity_identity, "edit")
+                .await
+                .expect("record exact worker activity during refresh");
+            assert!(
+                recovery_responder
+                    .result(
+                        "recovery-race-chrome",
+                        &request_id,
+                        &poll.epoch,
+                        json!({
+                            "state": "idle",
+                            "evidence": {
+                                "userTurnCount": 2,
+                                "assistantTurnCount": 1,
+                                "generating": false,
+                                "markerPresent": true
+                            }
+                        }),
+                    )
+                    .await
+            );
+        });
+
+        let result = recover_worker_for_core(
+            &workspace_id,
+            &core,
+            &spawned.worker_id,
+            broker.as_ref(),
+            managed.as_ref(),
+            companion.as_ref(),
+        )
+        .await
+        .expect("recover worker should notice new activity");
+        responder.await.expect("recovery responder");
+        assert_eq!(
+            result.get("state").and_then(Value::as_str),
+            Some("worker_became_active")
+        );
+        let poll = recovery_broker
+            .poll("recovery-race-chrome")
+            .await
+            .expect("poll recovery queue after activity race");
+        assert!(
+            poll.requests.is_empty(),
+            "no Stop/Continue may be queued after fresh worker activity"
+        );
+        let family = broker
+            .family_for_anchor(&workspace_id, &core)
+            .await
+            .unwrap()
+            .expect("worker family remains");
+        let worker = family.workers.get(&spawned.worker_id).unwrap();
+        assert_eq!(worker.state, WorkerState::Running);
+        assert_eq!(worker.current_task_id.as_ref(), Some(&spawned.task_id));
+    }
+
+    #[tokio::test]
+    async fn workers_mcp_browserless_core_refuses_ambiguous_online_browsers() {
+        let root = TestTempDir::new("moondesk-workers-browserless-ambiguous");
+        let workspace_root = root.path().join("workspace");
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        let workspace_id = WorkspaceId::new();
+        let broker = Arc::new(
+            WorkerBroker::open(root.path().join("worker-state-v1.json"))
+                .expect("open worker broker"),
+        );
+        let managed_chat_broker = Arc::new(
+            ManagedChatBroker::open(root.path().join("managed-chat-state-v1.json"))
+                .expect("open managed chat broker"),
+        );
+        let companion_auth = Arc::new(
+            CompanionAuth::open(root.path().join("companion-auth-v1.json"))
+                .expect("open companion auth"),
+        );
+        for (client_id, credential, label) in [
+            ("ide-chrome", "a".repeat(64), "Chrome"),
+            ("ide-edge", "b".repeat(64), "Edge"),
+        ] {
+            companion_auth
+                .auto_pair(client_id, &credential, None)
+                .await
+                .expect("pair companion");
+            companion_auth
+                .update_presence(
+                    client_id,
+                    crate::companion::CompanionPresenceUpdate {
+                        browser_label: Some(label.into()),
+                        tabs: Vec::new(),
+                    },
+                    crate::companion::unix_time_ms(),
+                )
+                .await
+                .expect("publish companion presence");
+        }
+        let response = call_workers_for_test_with_companion(
+            &tool_call_request_with_session(
+                "workers",
+                json!({
+                    "action": "spawn",
+                    "operation_id": Uuid::new_v4().to_string(),
+                    "label": "ambiguous browser",
+                    "task": "Do not launch until browser is selected.",
+                    "browserless_core": true
+                }),
+                "ide-ambiguous-core",
+            ),
+            &workspace_id,
+            &workspace_root.to_string_lossy(),
+            broker.clone(),
+            managed_chat_broker.clone(),
+            Some(companion_auth),
+        )
+        .await;
+        assert_eq!(
+            response
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(result_text(&response).contains("multiple online Companion browsers"));
+        assert!(broker.snapshot().await.families.is_empty());
+        assert!(managed_chat_broker.snapshot().await.commands.is_empty());
     }
 
     #[tokio::test]

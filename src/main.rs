@@ -22,6 +22,7 @@ mod theme;
 mod update;
 mod user_browser;
 mod vision;
+mod worker_recovery;
 mod workers;
 mod workspace_tools;
 mod workspaces;

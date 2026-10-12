@@ -10,6 +10,7 @@ use tokio::sync::{Mutex, Notify};
 use uuid::Uuid;
 
 use crate::user_browser::UserBrowserBroker;
+use crate::worker_recovery::WorkerRecoveryBroker;
 
 pub const COMPANION_AUTH_SCHEMA_VERSION: u32 = 2;
 pub const COMPANION_AUTH_FILE_NAME: &str = "companion-auth-v1.json";
@@ -330,6 +331,7 @@ pub struct CompanionAuth {
     pairing_token: RwLock<String>,
     installation_token: String,
     user_browser_broker: Arc<UserBrowserBroker>,
+    worker_recovery_broker: Arc<WorkerRecoveryBroker>,
 }
 
 impl CompanionAuth {
@@ -353,6 +355,7 @@ impl CompanionAuth {
             pairing_token: RwLock::new(random_secret()),
             installation_token: random_secret(),
             user_browser_broker: Arc::new(UserBrowserBroker::new()),
+            worker_recovery_broker: Arc::new(WorkerRecoveryBroker::new()),
         })
     }
 
@@ -369,6 +372,10 @@ impl CompanionAuth {
 
     pub fn user_browser_broker(&self) -> Arc<UserBrowserBroker> {
         self.user_browser_broker.clone()
+    }
+
+    pub fn worker_recovery_broker(&self) -> Arc<WorkerRecoveryBroker> {
+        self.worker_recovery_broker.clone()
     }
 
     pub fn installation_token_matches(&self, supplied: &str) -> bool {
@@ -696,6 +703,9 @@ impl CompanionAuth {
             .await
             .retain(|_, (route, _)| route.client_id != client_id);
         self.user_browser_broker.remove_companion(client_id).await;
+        self.worker_recovery_broker
+            .remove_companion(client_id)
+            .await;
         Ok(true)
     }
 

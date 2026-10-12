@@ -90,6 +90,7 @@ mod tests {
         assert!(text.contains(&claim_operation_id.to_string()));
         assert!(text.contains("operation_id"));
         assert!(text.contains("moondesk_instruction"));
+        assert!(text.contains("use only this workspace's MoonDesk connector"));
         assert!(text.contains("do not create workers"));
         assert!(text.len() < 2_000, "worker bootstrap should stay compact");
         assert!(!text.contains("expected_model"));
@@ -127,6 +128,7 @@ mod tests {
         assert!(text.contains(&worker_id.to_string()));
         assert!(text.contains(&task_id.to_string()));
         assert!(text.contains("same durable worker"));
+        assert!(text.contains("use only this workspace's MoonDesk connector"));
         assert!(
             text.len() < 1_900,
             "worker continuation should stay compact"

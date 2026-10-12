@@ -119,6 +119,20 @@
     return false;
   }
 
+  async function stopGeneration(timeoutMs = 10000, stillCurrent = () => true) {
+    if (!stillCurrent()) return false;
+    if (!generating()) return true;
+    const controls = stopControls();
+    if (controls.length !== 1) return false;
+    const stop = controls[0];
+    if (stop.disabled || stop.getAttribute('aria-disabled') === 'true') return false;
+    stop.click();
+    return Boolean(await waitFor(() => {
+      if (!stillCurrent()) return null;
+      return !generating() ? true : null;
+    }, timeoutMs));
+  }
+
   function localeFreeSendControls() {
     const box = composer();
     const form = box?.closest('form');
@@ -1048,6 +1062,7 @@
     insertPrompt,
     workerEvidence,
     commitSendOnce,
+    stopGeneration,
     waitForComposerReady,
     composerReady: () => composerWritable() && !generating()
   };

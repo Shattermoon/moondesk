@@ -8,7 +8,7 @@ const BRIDGE_PORTS = [47650, 47651, 47652, 47653, 47654];
 const REQUIRED_PROTOCOL_VERSION = 2;
 // Bump with any shipped companion runtime change that requires Chromium to load new bytes. Keep
 // this aligned with COMPANION_RUNTIME_REVISION in src/server.rs.
-const COMPANION_RUNTIME_REVISION = 20;
+const COMPANION_RUNTIME_REVISION = 22;
 const SOURCE_DEV_MANIFEST_VERSION = '0.1.0';
 const RUNTIME_RELOAD_STORAGE_KEY = 'moondeskWorkerCompanionReloadRevisionV1';
 const INSTALLATION_BOOTSTRAP_FILE = 'moondesk-bootstrap.json';
@@ -22,6 +22,7 @@ const CORRELATIONS_PATH = '/__moondesk/companion/v1/correlations';
 const SEND_STARTED_PATH = '/__moondesk/companion/v1/commands/send-started';
 const CLEAR_WORKERS_PATH = '/__moondesk/companion/v1/workers/clear';
 const WORKER_RESET_ACK_PATH = '/__moondesk/companion/v1/workers/reset-ack';
+const WORKER_RECOVERY_PATH = '/__moondesk/companion/v1/workers/recovery';
 const USER_BROWSER_PATH = '/__moondesk/companion/v1/browser-control';
 const HELLO_TIMEOUT_MS = 1200;
 const API_TIMEOUT_MS = 3000;
@@ -744,6 +745,22 @@ function placementForOffer(state, offer) {
     return null;
   }
 
+  // Browserless IDE/Work Core has no Companion-observed anchor tab by design. The host must
+  // explicitly pin the fresh command to this Companion before the extension may treat that as
+  // sufficient placement authority. Merely acquiring an unpinned command lease is not enough.
+  if (
+    command?.launch?.openMode === 'new_thread' &&
+    command?.targetClientPinnedByRequest === true &&
+    typeof command?.targetClientId === 'string' &&
+    command.targetClientId.length > 0
+  ) {
+    return {
+      projectId: null,
+      projectUrl: null,
+      anchorConversationUrl: null
+    };
+  }
+
   // Compatibility only for commands created before automatic Core routing existed.
   const workspaceId = command?.launch?.workspaceId;
   const legacy = workspaceId ? state.bindings?.[workspaceId] : null;
@@ -1445,6 +1462,92 @@ async function userBrowserPump() {
   }
 }
 
+async function recoveryTabFor(command, reload = false) {
+  const expectedUrl = canonicalConversationUrl(command?.conversationUrl);
+  if (!expectedUrl) throw new Error('worker_recovery_conversation_invalid');
+  const tabs = await chrome.tabs.query({ url: 'https://chatgpt.com/*' });
+  let tab = tabs.find((candidate) =>
+    Number.isInteger(candidate?.id) && canonicalConversationUrl(candidate.url) === expectedUrl
+  ) || null;
+  if (!tab) {
+    tab = await chrome.tabs.create({ url: expectedUrl, active: false });
+  } else if (reload) {
+    await chrome.tabs.reload(tab.id);
+  }
+  if (!Number.isInteger(tab?.id)) throw new Error('worker_recovery_tab_unavailable');
+  await waitForContent(tab.id, 20000);
+  tab = await chrome.tabs.get(tab.id);
+  if (canonicalConversationUrl(tab?.url) !== expectedUrl) {
+    throw new Error('worker_recovery_tab_changed');
+  }
+  return tab;
+}
+
+async function executeWorkerRecoveryCommand(command) {
+  if (!command?.id || !command?.conversationUrl || !command?.taskMarker) {
+    return { state: 'failed', reason: 'worker_recovery_command_invalid' };
+  }
+  const action = command.action;
+  const tab = await recoveryTabFor(command, action === 'inspect');
+  if (action === 'inspect') {
+    const response = await sendToTab(tab.id, {
+      type: 'MOONDESK_RECOVER_WORKER_INSPECT',
+      taskMarker: command.taskMarker
+    }, 12000);
+    return response?.ok ? response.result : {
+      state: 'failed',
+      reason: response?.error || 'worker_recovery_inspect_unconfirmed'
+    };
+  }
+  if (action === 'continue' || action === 'stop_continue') {
+    const response = await sendToTab(tab.id, {
+      type: 'MOONDESK_RECOVER_WORKER_CONTINUE',
+      taskMarker: command.taskMarker,
+      prompt: command.prompt,
+      stopIfBusy: action === 'stop_continue',
+      expected: command.expected || null
+    }, 25000);
+    return response?.ok ? response.result : {
+      state: 'failed',
+      reason: response?.error || 'worker_recovery_continue_unconfirmed'
+    };
+  }
+  return { state: 'failed', reason: 'worker_recovery_action_invalid' };
+}
+
+async function pumpWorkerRecovery(state) {
+  let poll;
+  try {
+    poll = await api(state, WORKER_RECOVERY_PATH, {
+      method: 'POST',
+      body: { action: 'poll' }
+    });
+  } catch {
+    // Personal IDE/Work recovery is additive. A missing/older recovery endpoint must never stop
+    // the proven Worker launch/reuse pump from redeeming its ordinary commands.
+    return false;
+  }
+  const requestId = Array.isArray(poll?.requests) ? poll.requests[0] : null;
+  if (!requestId || !poll?.epoch) return false;
+  const claimed = await api(state, WORKER_RECOVERY_PATH, {
+    method: 'POST',
+    body: { action: 'claim', id: requestId, epoch: poll.epoch }
+  });
+  const command = claimed?.command;
+  if (!command) return false;
+  let result;
+  try {
+    result = await executeWorkerRecoveryCommand(command);
+  } catch (error) {
+    result = { state: 'failed', reason: String(error?.message || error) };
+  }
+  await api(state, WORKER_RECOVERY_PATH, {
+    method: 'POST',
+    body: { action: 'result', id: requestId, epoch: poll.epoch, result }
+  });
+  return true;
+}
+
 async function pauseInheritedReconciliation(state, offer, clearGeneration) {
   if (clearGeneration !== workerClearGeneration) return true;
   const command = offer?.command;
@@ -1502,8 +1605,11 @@ async function pump() {
     if (workerClearInProgress || clearGeneration !== workerClearGeneration) return;
     await collectPresence(state);
     if (workerClearInProgress || clearGeneration !== workerClearGeneration) return;
+    const recovered = await pumpWorkerRecovery(state);
+    if (recovered) redeemed += 1;
+    if (workerClearInProgress || clearGeneration !== workerClearGeneration) return;
     const offers = await redeemCommandBatch(state, MAX_PARALLEL_COMMANDS, clearGeneration);
-    redeemed = offers.length;
+    redeemed += offers.length;
     if (offers.length && clearGeneration === workerClearGeneration) {
       const outcomes = await processCommandBatch(state, offers, processCommand, clearGeneration);
       for (const outcome of outcomes) {

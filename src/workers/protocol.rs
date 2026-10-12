@@ -159,6 +159,9 @@ pub(crate) async fn cleanup_inactive_capacity_for_workspace(
 pub struct WorkerLaunchContext<'a> {
     pub managed_chat_broker: &'a ManagedChatBroker,
     pub anchor_route: Option<&'a CompanionAnchorRoute>,
+    /// Explicit Companion installation used when Core itself has no browser tab (Work/Codex/IDE).
+    /// Browser-based Core calls leave this unset and keep using the exact anchor route above.
+    pub browserless_client_id: Option<&'a str>,
     pub worker_target_count: usize,
 }
 
@@ -454,6 +457,8 @@ pub async fn handle(
                     )
                 })
                 .unwrap_or((None, None));
+            let target_client_id = target_client_id
+                .or_else(|| launch_context.browserless_client_id.map(str::to_owned));
             let dedupe_key = format!("worker:{}:task:{}", receipt.worker_id, receipt.task_id);
             let launch = match launch_context
                 .managed_chat_broker
@@ -580,9 +585,19 @@ pub async fn handle(
                 launch_context.managed_chat_broker,
             )
             .await?;
-            let route = launch_context.anchor_route.ok_or_else(|| {
-                "worker reuse requires a confirmed companion Core route".to_string()
-            })?;
+            let route = launch_context.anchor_route;
+            let target_client_id = route
+                .map(|route| route.client_id.clone())
+                .or_else(|| launch_context.browserless_client_id.map(str::to_owned))
+                .ok_or_else(|| {
+                    "worker reuse requires either a confirmed Companion Core route or an explicit browserless Core Companion target".to_string()
+                })?;
+            let anchor_context = route.map(|route| ManagedChatAnchorContext {
+                conversation_id: route.tab.conversation_id.clone(),
+                conversation_url: route.tab.conversation_url.clone(),
+                project_id: route.tab.project_id.clone(),
+                project_url: route.tab.project_url.clone(),
+            });
             let assignment = required_string(arguments, "task")?.to_string();
             let operation_id = parse_operation_id(arguments)?;
             let receipt = broker
@@ -630,13 +645,8 @@ pub async fn handle(
                             anchor_session_digest: Some(caller_identity.session_digest.clone()),
                         },
                     },
-                    Some(route.client_id.clone()),
-                    Some(ManagedChatAnchorContext {
-                        conversation_id: route.tab.conversation_id.clone(),
-                        conversation_url: route.tab.conversation_url.clone(),
-                        project_id: route.tab.project_id.clone(),
-                        project_url: route.tab.project_url.clone(),
-                    }),
+                    Some(target_client_id),
+                    anchor_context,
                 )
                 .await
             {
@@ -1723,6 +1733,7 @@ mod tests {
                     WorkerLaunchContext {
                         managed_chat_broker: managed.as_ref(),
                         anchor_route: None,
+                        browserless_client_id: None,
                         worker_target_count: super::super::RECOMMENDED_WORKERS_PER_FAMILY,
                     },
                 )
@@ -1741,6 +1752,7 @@ mod tests {
             WorkerLaunchContext {
                 managed_chat_broker: managed.as_ref(),
                 anchor_route: None,
+                browserless_client_id: None,
                 worker_target_count: super::super::RECOMMENDED_WORKERS_PER_FAMILY,
             },
         )
@@ -1769,6 +1781,7 @@ mod tests {
                     WorkerLaunchContext {
                         managed_chat_broker: managed.as_ref(),
                         anchor_route: None,
+                        browserless_client_id: None,
                         worker_target_count: super::super::RECOMMENDED_WORKERS_PER_FAMILY,
                     },
                 )
@@ -1900,6 +1913,7 @@ mod tests {
                     WorkerLaunchContext {
                         managed_chat_broker: managed.as_ref(),
                         anchor_route: Some(&route),
+                        browserless_client_id: None,
                         worker_target_count: super::super::RECOMMENDED_WORKERS_PER_FAMILY,
                     },
                 )
@@ -1939,6 +1953,7 @@ mod tests {
             WorkerLaunchContext {
                 managed_chat_broker: managed.as_ref(),
                 anchor_route: None,
+                browserless_client_id: None,
                 worker_target_count: super::super::RECOMMENDED_WORKERS_PER_FAMILY,
             },
         )
@@ -2006,6 +2021,7 @@ mod tests {
             WorkerLaunchContext {
                 managed_chat_broker: &managed,
                 anchor_route: None,
+                browserless_client_id: None,
                 worker_target_count: super::super::RECOMMENDED_WORKERS_PER_FAMILY,
             },
         )

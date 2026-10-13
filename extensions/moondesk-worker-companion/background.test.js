@@ -23,7 +23,7 @@ const popupSource = fs.readFileSync(popupPath, 'utf8');
 const serverSource = fs.readFileSync(serverPath, 'utf8');
 const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
 
-function loadBackground({ existingTabs = {}, contentByTab = {}, sendMessageImpl = null, scriptingExecuteImpl = null, fetchImpl = async () => { throw new Error('network not used'); }, setTimeoutImpl = null, runtimeManifest = manifest, initialStored = {}, createdTabIdStart = 101, bootstrapAvailable = true, bootstrapToken = 'b'.repeat(64) } = {}) {
+function loadBackground({ existingTabs = {}, contentByTab = {}, sendMessageImpl = null, scriptingExecuteImpl = null, accountFingerprint = 'a'.repeat(64), fetchImpl = async () => { throw new Error('network not used'); }, setTimeoutImpl = null, runtimeManifest = manifest, initialStored = {}, createdTabIdStart = 101, bootstrapAvailable = true, bootstrapToken = 'b'.repeat(64) } = {}) {
   const createdTabs = [];
   const removedTabs = [];
   const runtimeReloads = [];
@@ -85,7 +85,13 @@ function loadBackground({ existingTabs = {}, contentByTab = {}, sendMessageImpl 
       onFocusChanged: { addListener() {} }
     },
     scripting: {
-      async executeScript(options) { return scriptingExecuteImpl ? scriptingExecuteImpl(options) : []; }
+      async executeScript(options) {
+        if (scriptingExecuteImpl) return scriptingExecuteImpl(options);
+        if (typeof options?.func === 'function' && String(options.func).includes('moondesk-chatgpt-account-v1')) {
+          return [{ result: accountFingerprint }];
+        }
+        return [];
+      }
     },
     alarms: {
       async create() {},
@@ -3480,7 +3486,17 @@ test('existing-thread reuse treats the host durable URL as authority instead of 
     }
   };
   const state = {
-    launchRecords: {},
+    launchRecords: {
+      'prior-reuse': {
+        commandId: 'prior-reuse',
+        workspaceId: 'workspace-current',
+        threadKey: 'worker:reuse',
+        openMode: 'new_thread',
+        phase: 'succeeded',
+        conversationUrl: durableWorkerUrl,
+        accountFingerprint: 'a'.repeat(64)
+      }
+    },
     threadRecords: {
       'worker:reuse': {
         workspaceId: 'workspace-other',
@@ -3533,7 +3549,8 @@ test('existing-thread reuse never adopts a remembered local-chatgpt placeholder 
         workspaceId: 'workspace-current',
         projectId: null,
         conversationUrl: durableUrl,
-        tabId: 77
+        tabId: 77,
+        accountFingerprint: 'a'.repeat(64)
       }
     }
   };
@@ -3549,7 +3566,42 @@ test('existing-thread reuse never adopts a remembered local-chatgpt placeholder 
   assert.equal(new URL(createdTabs[0].url).pathname, '/c/aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeee5');
 });
 
-test('existing-thread reuse survives companion reinstall with empty local thread and launch records', async () => {
+test('existing-thread reuse refuses a different ChatGPT account before opening the durable conversation', async () => {
+  const durableUrl = 'https://chatgpt.com/c/aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeee7';
+  const otherUrl = 'https://chatgpt.com/c/aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeee8';
+  const { createdTabs, evaluate } = loadBackground({
+    accountFingerprint: 'b'.repeat(64),
+    existingTabs: { 77: { id: 77, url: otherUrl } }
+  });
+  const recordForCommand = evaluate('recordForCommand');
+  const command = {
+    id: 'command-account-mismatch',
+    launch: {
+      workspaceId: 'workspace-current',
+      taskMarker: 'marker-account-mismatch',
+      threadKey: 'worker:account-mismatch',
+      openMode: 'existing_thread',
+      existingConversationUrl: durableUrl
+    }
+  };
+  const state = {
+    launchRecords: {},
+    threadRecords: {
+      'worker:account-mismatch': {
+        workspaceId: 'workspace-current',
+        projectId: null,
+        conversationUrl: durableUrl,
+        tabId: null,
+        accountFingerprint: 'a'.repeat(64)
+      }
+    }
+  };
+
+  await assert.rejects(recordForCommand(state, command, null), /worker_account_changed/);
+  assert.equal(createdTabs.length, 0, 'different-account reuse must not navigate to the old Worker conversation');
+});
+
+test('existing-thread reuse fails closed after companion reinstall when account binding is unavailable', async () => {
   const workerUrl = 'https://chatgpt.com/c/aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeee2';
   const { createdTabs, evaluate } = loadBackground();
   const recordForCommand = evaluate('recordForCommand');
@@ -3570,14 +3622,8 @@ test('existing-thread reuse survives companion reinstall with empty local thread
     }
   };
 
-  const { record, tab } = await recordForCommand(state, command, null);
-  assert.equal(record.sourceUrl, workerUrl);
-  assert.equal(record.conversationUrl, workerUrl);
-  assert.equal(createdTabs.length, 1);
-  assert.equal(tab.id, createdTabs[0].id);
-  const opened = new URL(createdTabs[0].url);
-  assert.equal(opened.pathname, '/c/aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeee2');
-  assert.equal(opened.searchParams.get('moondesk-launch'), record.launchToken);
+  await assert.rejects(recordForCommand(state, command, null), /worker_account_binding_unconfirmed/);
+  assert.equal(createdTabs.length, 0, 'account-unbound durable conversation must never be opened');
 });
 
 test('existing-thread reuse accepts the exact durable thread owned by the same workspace', async () => {
@@ -3610,7 +3656,8 @@ test('existing-thread reuse accepts the exact durable thread owned by the same w
         workspaceId: command.launch.workspaceId,
         projectId: placement.projectId,
         conversationUrl,
-        tabId: 77
+        tabId: 77,
+        accountFingerprint: 'a'.repeat(64)
       }
     }
   };
@@ -3781,6 +3828,31 @@ test('worker recovery inspect classifies a zero-turn unhydrated shell as not-rea
   assert.equal(response.result.evidence.composerReady, false);
 });
 
+test('worker recovery refuses a different ChatGPT account before navigating to the Worker conversation', async () => {
+  const conversationUrl = 'https://chatgpt.com/c/aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeaa';
+  const otherUrl = 'https://chatgpt.com/c/aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeab';
+  const { createdTabs, evaluate } = loadBackground({
+    accountFingerprint: 'b'.repeat(64),
+    existingTabs: { 5: { id: 5, url: otherUrl, active: false } }
+  });
+  const state = {
+    launchRecords: { prior: { conversationUrl, accountFingerprint: 'a'.repeat(64) } },
+    threadRecords: {}
+  };
+  const command = {
+    id: 'recovery-account-mismatch',
+    action: 'inspect',
+    conversationUrl,
+    taskMarker: 'moondesk-worker-task:recovery-account-mismatch'
+  };
+
+  await assert.rejects(
+    evaluate(`executeWorkerRecoveryCommand(${JSON.stringify(state)}, ${JSON.stringify(command)})`),
+    /worker_account_changed/
+  );
+  assert.equal(createdTabs.length, 0, 'different-account recovery must not open the old Worker URL');
+});
+
 test('worker recovery inspect reacquires the content script after a remount closes the async response channel', async () => {
   const conversationId = '6aaef8db-ecf0-83ee-bfcc-d6f94853c540';
   const conversationUrl = `https://chatgpt.com/c/${conversationId}`;
@@ -3814,7 +3886,8 @@ test('worker recovery inspect reacquires the content script after a remount clos
     }
   });
 
-  const result = await evaluate(`executeWorkerRecoveryCommand(${JSON.stringify({
+  const recoveryState = { launchRecords: { prior: { conversationUrl, accountFingerprint: 'a'.repeat(64) } }, threadRecords: {} };
+  const result = await evaluate(`executeWorkerRecoveryCommand(${JSON.stringify(recoveryState)}, ${JSON.stringify({
     id: 'recovery-remount-command',
     action: 'inspect',
     conversationUrl,
@@ -3877,7 +3950,8 @@ test('worker recovery retries one blank unhydrated exact conversation before dec
     }
   });
 
-  const result = await evaluate(`executeWorkerRecoveryCommand(${JSON.stringify({
+  const recoveryState = { launchRecords: { prior: { conversationUrl, accountFingerprint: 'a'.repeat(64) } }, threadRecords: {} };
+  const result = await evaluate(`executeWorkerRecoveryCommand(${JSON.stringify(recoveryState)}, ${JSON.stringify({
     id: 'recovery-unhydrated-command',
     action: 'inspect',
     conversationUrl,
@@ -3908,7 +3982,8 @@ test('worker recovery continuation never replays an uncertain Send after its res
     }
   });
 
-  const result = await evaluate(`executeWorkerRecoveryCommand(${JSON.stringify({
+  const recoveryState = { launchRecords: { prior: { conversationUrl, accountFingerprint: 'a'.repeat(64) } }, threadRecords: {} };
+  const result = await evaluate(`executeWorkerRecoveryCommand(${JSON.stringify(recoveryState)}, ${JSON.stringify({
     id: 'recovery-continue-command',
     action: 'continue',
     conversationUrl,
@@ -5010,6 +5085,7 @@ test('reconciliation commits a newly observed marker user turn without waiting f
         sourceUrl: conversationUrl,
         conversationUrl,
         tabId: 77,
+        accountFingerprint: 'a'.repeat(64),
         phase: 'send_started',
         reconcileAttempts: 0,
         baseline: {

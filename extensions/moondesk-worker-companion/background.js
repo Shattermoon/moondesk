@@ -607,6 +607,83 @@ function browserLabel() {
   return 'Chromium';
 }
 
+async function chatGptAccountFingerprintForTab(tabId) {
+  if (!Number.isInteger(tabId)) return null;
+  try {
+    const [frame] = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: async () => {
+        try {
+          const response = await fetch('/api/auth/session', { credentials: 'include', cache: 'no-store' });
+          if (!response.ok) return null;
+          const session = await response.json();
+          const raw = session?.user?.id || session?.user?.account_id || session?.user?.accountId || session?.account?.id || null;
+          if (typeof raw !== 'string' || !raw.trim()) return null;
+          const bytes = new TextEncoder().encode(`moondesk-chatgpt-account-v1:${raw.trim()}`);
+          const digest = await crypto.subtle.digest('SHA-256', bytes);
+          return [...new Uint8Array(digest)].map((value) => value.toString(16).padStart(2, '0')).join('');
+        } catch {
+          return null;
+        }
+      }
+    });
+    const fingerprint = frame?.result;
+    return typeof fingerprint === 'string' && /^[0-9a-f]{64}$/i.test(fingerprint)
+      ? fingerprint.toLowerCase()
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+async function currentChatGptAccountFingerprint() {
+  let tabs = [];
+  try {
+    tabs = await chrome.tabs.query({ url: 'https://chatgpt.com/*' });
+  } catch {
+    return null;
+  }
+  const fingerprints = await Promise.all(tabs.slice(0, 32).map(async (tab) => {
+    if (!Number.isInteger(tab?.id) || tab.incognito || tab.discarded || tab.status === 'loading') return null;
+    return chatGptAccountFingerprintForTab(tab.id);
+  }));
+  const unique = [...new Set(fingerprints.filter(Boolean))];
+  return unique.length === 1 ? unique[0] : null;
+}
+
+function validAccountFingerprint(value) {
+  return typeof value === 'string' && /^[0-9a-f]{64}$/i.test(value);
+}
+
+async function waitForChatGptAccountFingerprint(tabId, timeoutMs = 15000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const fingerprint = await chatGptAccountFingerprintForTab(tabId);
+    if (fingerprint) return fingerprint;
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  return null;
+}
+
+function rememberedAccountFingerprintForConversation(state, conversationUrl) {
+  const expectedUrl = canonicalConversationUrl(conversationUrl);
+  if (!expectedUrl) return null;
+  const fingerprints = new Set();
+  for (const record of Object.values(state?.launchRecords || {})) {
+    if (canonicalConversationUrl(record?.conversationUrl) !== expectedUrl) continue;
+    if (validAccountFingerprint(record?.accountFingerprint)) {
+      fingerprints.add(record.accountFingerprint.toLowerCase());
+    }
+  }
+  for (const record of Object.values(state?.threadRecords || {})) {
+    if (canonicalConversationUrl(record?.conversationUrl) !== expectedUrl) continue;
+    if (validAccountFingerprint(record?.accountFingerprint)) {
+      fingerprints.add(record.accountFingerprint.toLowerCase());
+    }
+  }
+  return fingerprints.size === 1 ? [...fingerprints][0] : null;
+}
+
 function normalizedProviderCorrelation(value) {
   if (!value || typeof value !== 'object') return null;
   const conversationId = typeof value.conversationId === 'string'
@@ -898,6 +975,9 @@ async function recoverThreadRecord(state, threadKey, workspaceId) {
       projectId: projectIdFromChatUrl(conversationUrl),
       conversationUrl,
       tabId: tab.id ?? null,
+      accountFingerprint: validAccountFingerprint(candidate.accountFingerprint)
+        ? candidate.accountFingerprint.toLowerCase()
+        : null,
       updatedAt: Date.now()
     };
     if (recovered && recovered.conversationUrl !== next.conversationUrl) return null;
@@ -941,6 +1021,20 @@ async function recordForCommand(state, command, placement, reconcileRequired = f
   ) {
     throw new Error('Existing worker launch record conflicts with MoonDesk durable conversation binding');
   }
+  if (record && reconcileRequired && !record.conversationUrl) {
+    throw new Error('Reconciliation has no confirmed worker conversation URL and cannot create a fresh worker thread');
+  }
+  if (record) {
+    const expectedFingerprint = validAccountFingerprint(record.accountFingerprint)
+      ? record.accountFingerprint.toLowerCase()
+      : null;
+    if (!expectedFingerprint) throw new Error('worker_account_binding_unconfirmed');
+    const actualFingerprint = Number.isInteger(record.tabId)
+      ? await chatGptAccountFingerprintForTab(record.tabId)
+      : await currentChatGptAccountFingerprint();
+    if (!actualFingerprint) throw new Error('worker_account_unconfirmed');
+    if (actualFingerprint !== expectedFingerprint) throw new Error('worker_account_changed');
+  }
   if (!record && reconcileRequired) {
     throw new Error('Reconciliation has no durable browser launch record and cannot create a fresh worker thread');
   }
@@ -960,6 +1054,16 @@ async function recordForCommand(state, command, placement, reconcileRequired = f
     if (!sourceUrl) {
       throw new Error('Worker launch has no exact ChatGPT source URL for this placement');
     }
+    let accountFingerprint = null;
+    if (openMode === 'existing_thread') {
+      accountFingerprint = validAccountFingerprint(thread?.accountFingerprint)
+        ? thread.accountFingerprint.toLowerCase()
+        : rememberedAccountFingerprintForConversation(state, existingConversation);
+      if (!accountFingerprint) throw new Error('worker_account_binding_unconfirmed');
+      const currentFingerprint = await currentChatGptAccountFingerprint();
+      if (!currentFingerprint) throw new Error('worker_account_unconfirmed');
+      if (currentFingerprint !== accountFingerprint) throw new Error('worker_account_changed');
+    }
     record = {
       commandId: command.id,
       workspaceId: command.launch.workspaceId,
@@ -970,6 +1074,7 @@ async function recordForCommand(state, command, placement, reconcileRequired = f
       sourceUrl,
       tabId: null,
       conversationUrl: existingConversation,
+      accountFingerprint,
       phase: 'creating',
       reconcileAttempts: 0
     };
@@ -989,14 +1094,28 @@ async function recordForCommand(state, command, placement, reconcileRequired = f
       active: false
     });
     record.tabId = tab.id ?? null;
+    const actualFingerprint = Number.isInteger(tab?.id)
+      ? await waitForChatGptAccountFingerprint(tab.id)
+      : null;
+    if (!actualFingerprint) throw new Error('worker_account_unconfirmed');
+    if (record.accountFingerprint && actualFingerprint !== record.accountFingerprint) {
+      throw new Error('worker_account_changed');
+    }
+    record.accountFingerprint = actualFingerprint;
     record.phase = 'created';
     if (!(await writeWorkerCommandState(state, clearGeneration))) {
       throw new Error('worker_clear_superseded');
     }
-  } else if (record.tabId !== tab.id) {
-    record.tabId = tab.id ?? null;
-    if (!(await writeWorkerCommandState(state, clearGeneration))) {
-      throw new Error('worker_clear_superseded');
+  } else {
+    const actualFingerprint = await waitForChatGptAccountFingerprint(tab.id);
+    if (!actualFingerprint) throw new Error('worker_account_unconfirmed');
+    if (!record.accountFingerprint) throw new Error('worker_account_binding_unconfirmed');
+    if (actualFingerprint !== record.accountFingerprint) throw new Error('worker_account_changed');
+    if (record.tabId !== tab.id) {
+      record.tabId = tab.id ?? null;
+      if (!(await writeWorkerCommandState(state, clearGeneration))) {
+        throw new Error('worker_clear_superseded');
+      }
     }
   }
   return { record, tab };
@@ -1251,15 +1370,24 @@ async function processCommand(state, offer, clearGeneration = workerClearGenerat
   } catch (error) {
     if (!clearStillCurrent()) return;
     const message = String(error?.message || error);
+    const accountReason = [
+      'worker_account_binding_unconfirmed',
+      'worker_account_unconfirmed',
+      'worker_account_changed'
+    ].includes(message) ? message : null;
     if (offer.reconcileRequired) {
-      const reason = message.includes('no durable browser launch record')
+      const reason = accountReason || (message.includes('no durable browser launch record')
         ? 'reconciliation_launch_record_missing'
         : message.includes('no confirmed worker conversation URL')
           ? 'reconciliation_conversation_unconfirmed'
           : message.includes('no confirmed ChatGPT conversation binding')
             ? 'worker_thread_binding_missing'
-            : 'reconciliation_browser_context_unavailable';
+            : 'reconciliation_browser_context_unavailable');
       await pauseAfterSend(reason);
+      return;
+    }
+    if (accountReason) {
+      await failBeforeSend(accountReason);
       return;
     }
     if (message.includes('no confirmed ChatGPT conversation binding')) {
@@ -1334,6 +1462,7 @@ async function processCommand(state, offer, clearGeneration = workerClearGenerat
             projectId: projectIdFromChatUrl(confirmedConversation),
             conversationUrl: confirmedConversation,
             tabId: tab.id,
+            accountFingerprint: record.accountFingerprint,
             updatedAt: Date.now()
           };
         }
@@ -1508,6 +1637,7 @@ async function processCommand(state, offer, clearGeneration = workerClearGenerat
       projectId: projectIdFromChatUrl(accepted.conversationUrl),
       conversationUrl: accepted.conversationUrl,
       tabId: record.tabId,
+      accountFingerprint: record.accountFingerprint,
       updatedAt: Date.now()
     };
   }
@@ -1546,19 +1676,27 @@ async function userBrowserPump() {
   }
 }
 
-async function recoveryTabFor(command, reload = false) {
+async function recoveryTabFor(state, command, reload = false) {
   const expectedUrl = canonicalConversationUrl(command?.conversationUrl);
   if (!expectedUrl) throw new Error('worker_recovery_conversation_invalid');
+  const expectedFingerprint = rememberedAccountFingerprintForConversation(state, expectedUrl);
+  if (!expectedFingerprint) throw new Error('worker_account_binding_unconfirmed');
+  const currentFingerprint = await currentChatGptAccountFingerprint();
+  if (!currentFingerprint) throw new Error('worker_account_unconfirmed');
+  if (currentFingerprint !== expectedFingerprint) throw new Error('worker_account_changed');
+
   const tabs = await chrome.tabs.query({ url: 'https://chatgpt.com/*' });
   let tab = tabs.find((candidate) =>
     Number.isInteger(candidate?.id) && canonicalConversationUrl(candidate.url) === expectedUrl
   ) || null;
   if (!tab) {
     tab = await chrome.tabs.create({ url: expectedUrl, active: false });
-  } else if (reload) {
-    await chrome.tabs.reload(tab.id);
   }
   if (!Number.isInteger(tab?.id)) throw new Error('worker_recovery_tab_unavailable');
+  const targetFingerprint = await waitForChatGptAccountFingerprint(tab.id);
+  if (!targetFingerprint) throw new Error('worker_account_unconfirmed');
+  if (targetFingerprint !== expectedFingerprint) throw new Error('worker_account_changed');
+  if (reload) await chrome.tabs.reload(tab.id);
   await waitForContent(tab.id, 20000);
   tab = await chrome.tabs.get(tab.id);
   if (canonicalConversationUrl(tab?.url) !== expectedUrl) {
@@ -1567,12 +1705,12 @@ async function recoveryTabFor(command, reload = false) {
   return tab;
 }
 
-async function executeWorkerRecoveryCommand(command) {
+async function executeWorkerRecoveryCommand(state, command) {
   if (!command?.id || !command?.conversationUrl || !command?.taskMarker) {
     return { state: 'failed', reason: 'worker_recovery_command_invalid' };
   }
   const action = command.action;
-  const tab = await recoveryTabFor(command, action === 'inspect');
+  const tab = await recoveryTabFor(state, command, action === 'inspect');
   if (action === 'inspect') {
     const inspectTab = async (targetTab) => {
       const response = await sendReadOnlyToTabWithReacquire(targetTab.id, {
@@ -1589,7 +1727,7 @@ async function executeWorkerRecoveryCommand(command) {
       if (result?.state === 'not_ready') {
         // A blank/unhydrated ChatGPT shell is not proof that the task disappeared. One additional
         // exact-route reload is read-only and gives recovery a chance to escape a wedged page shell.
-        const retriedTab = await recoveryTabFor(command, true);
+        const retriedTab = await recoveryTabFor(state, command, true);
         result = await inspectTab(retriedTab);
       }
       return result;
@@ -1649,7 +1787,7 @@ async function pumpWorkerRecovery(state) {
   if (!command) return false;
   let result;
   try {
-    result = await executeWorkerRecoveryCommand(command);
+    result = await executeWorkerRecoveryCommand(state, command);
   } catch (error) {
     result = { state: 'failed', reason: String(error?.message || error) };
   }

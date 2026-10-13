@@ -115,6 +115,7 @@ pub struct CollectedUpdates {
 }
 
 const MAX_RECENT_WORKER_TOOL_ACTIVITY: usize = 12;
+const CLAIM_REGISTRATION_PENDING_MESSAGE: &str = "worker registration is still pending; MoonDesk has not yet confirmed the canonical ChatGPT conversation";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1504,21 +1505,35 @@ impl WorkerBroker {
                 "worker has already been claimed by another ChatGPT conversation".into(),
             ));
         }
-        if worker.launch_state != WorkerLaunchState::WaitingClaim {
-            return Err(WorkerBrokerError::Conflict(
-                "worker cannot be claimed before MoonDesk confirms its canonical ChatGPT conversation"
-                    .into(),
-            ));
+        match worker.launch_state {
+            WorkerLaunchState::WaitingClaim => {}
+            WorkerLaunchState::Unknown
+            | WorkerLaunchState::Queued
+            | WorkerLaunchState::Preparing
+            | WorkerLaunchState::SendStarted
+            | WorkerLaunchState::Reconciling => {
+                return Err(WorkerBrokerError::Conflict(
+                    CLAIM_REGISTRATION_PENDING_MESSAGE.into(),
+                ));
+            }
+            WorkerLaunchState::Paused | WorkerLaunchState::Failed => {
+                return Err(WorkerBrokerError::Conflict(format!(
+                    "worker launch cannot be claimed because registration ended in {:?}",
+                    worker.launch_state
+                )));
+            }
+            WorkerLaunchState::Claimed => {
+                return Err(WorkerBrokerError::Conflict(
+                    "worker launch is already claimed but has no bound worker identity".into(),
+                ));
+            }
         }
         let conversation_id = worker
             .conversation_url
             .as_deref()
             .and_then(canonical_conversation_id_from_url)
             .ok_or_else(|| {
-                WorkerBrokerError::Conflict(
-                    "worker cannot be claimed before MoonDesk confirms its canonical ChatGPT conversation"
-                        .into(),
-                )
+                WorkerBrokerError::Conflict(CLAIM_REGISTRATION_PENDING_MESSAGE.into())
             })?;
         let Some(expected_operation_id) = worker.claim_operation_id.as_ref() else {
             return Err(WorkerBrokerError::Conflict(
@@ -1547,6 +1562,56 @@ impl WorkerBroker {
             operation_id: expected_operation_id.clone(),
             conversation_id,
         }))
+    }
+
+    pub(crate) async fn wait_for_claim_attestation_requirement(
+        &self,
+        workspace_id: &WorkspaceId,
+        worker_id: &WorkerId,
+        task_id: &TaskId,
+        claim_token: &str,
+        claim_operation_id: &OperationId,
+        worker_identity: &ChatIdentity,
+        timeout: std::time::Duration,
+    ) -> Result<Option<WorkerClaimAttestationRequirement>, WorkerBrokerError> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            // Register the waiter before reading state so a registration ACK cannot race between the
+            // state check and sleeping. Notify::enable preserves a notification that arrives during
+            // the check below.
+            let mut notified = Box::pin(self.updates.notified());
+            notified.as_mut().enable();
+            match self
+                .claim_attestation_requirement(
+                    workspace_id,
+                    worker_id,
+                    task_id,
+                    claim_token,
+                    claim_operation_id,
+                    worker_identity,
+                )
+                .await
+            {
+                Ok(requirement) => return Ok(requirement),
+                Err(WorkerBrokerError::Conflict(message))
+                    if message == CLAIM_REGISTRATION_PENDING_MESSAGE => {}
+                Err(error) => return Err(error),
+            }
+
+            if tokio::time::Instant::now() >= deadline {
+                return Err(WorkerBrokerError::Conflict(format!(
+                    "{CLAIM_REGISTRATION_PENDING_MESSAGE}; retry the same claim with the same worker_id, task_id, claim_token, and operation_id after a short delay. The claim token was not consumed"
+                )));
+            }
+            tokio::select! {
+                _ = &mut notified => {},
+                _ = tokio::time::sleep_until(deadline) => {
+                    return Err(WorkerBrokerError::Conflict(format!(
+                        "{CLAIM_REGISTRATION_PENDING_MESSAGE}; retry the same claim with the same worker_id, task_id, claim_token, and operation_id after a short delay. The claim token was not consumed"
+                    )));
+                }
+            }
+        }
     }
 
     pub async fn claim_worker_attested(
@@ -1596,8 +1661,7 @@ impl WorkerBroker {
                 .is_none()
         {
             return Err(WorkerBrokerError::Conflict(
-                "worker cannot be claimed before MoonDesk confirms its canonical ChatGPT conversation"
-                    .into(),
+                CLAIM_REGISTRATION_PENDING_MESSAGE.into(),
             ));
         }
         let Some(expected_operation_id) = worker.claim_operation_id.as_ref() else {
@@ -2600,6 +2664,101 @@ mod tests {
             )
             .await
             .expect("confirm canonical worker conversation before claim");
+    }
+
+    #[tokio::test]
+    async fn fresh_claim_waits_for_canonical_conversation_registration_without_consuming_capability()
+     {
+        let root = temp_root("moondesk-worker-claim-registration-race");
+        let path = root.join("worker-state-v1.json");
+        let broker = std::sync::Arc::new(WorkerBroker::open(&path).expect("open worker broker"));
+        let workspace = WorkspaceId::new();
+        let core = anchor("core-claim-registration-race");
+        let worker_identity = anchor("worker-claim-registration-race");
+        let spawned = broker
+            .spawn_worker(spawn_request(
+                OperationId::new(),
+                workspace.clone(),
+                core.clone(),
+                "claim immediately when bootstrap arrives",
+            ))
+            .await
+            .expect("spawn worker");
+        let command_id = Uuid::new_v4().to_string();
+        broker
+            .link_launch_command(
+                &workspace,
+                &core,
+                &spawned.worker_id,
+                &spawned.task_id,
+                &command_id,
+            )
+            .await
+            .expect("link launch before registration");
+
+        let claim_operation_id = spawned
+            .claim_operation_id
+            .clone()
+            .expect("fresh spawn claim operation");
+        let waiter = {
+            let broker = broker.clone();
+            let workspace = workspace.clone();
+            let worker_id = spawned.worker_id.clone();
+            let task_id = spawned.task_id.clone();
+            let claim_token = spawned.claim_token.clone();
+            let claim_operation_id = claim_operation_id.clone();
+            let worker_identity = worker_identity.clone();
+            tokio::spawn(async move {
+                broker
+                    .wait_for_claim_attestation_requirement(
+                        &workspace,
+                        &worker_id,
+                        &task_id,
+                        &claim_token,
+                        &claim_operation_id,
+                        &worker_identity,
+                        std::time::Duration::from_secs(1),
+                    )
+                    .await
+            })
+        };
+
+        tokio::task::yield_now().await;
+        let conversation_id = spawned.worker_id.to_string();
+        broker
+            .update_launch_by_command(
+                &command_id,
+                WorkerLaunchState::WaitingClaim,
+                None,
+                Some(format!("https://chatgpt.com/c/{conversation_id}")),
+            )
+            .await
+            .expect("publish canonical conversation registration");
+
+        let requirement = waiter
+            .await
+            .expect("claim waiter task")
+            .expect("registration should wake pending claim")
+            .expect("fresh claim needs browser attestation");
+        assert_eq!(requirement.operation_id, claim_operation_id);
+        assert_eq!(requirement.conversation_id, conversation_id);
+
+        let snapshot = broker.snapshot().await;
+        let worker = snapshot
+            .families
+            .values()
+            .flat_map(|family| family.workers.values())
+            .find(|worker| worker.id == spawned.worker_id)
+            .expect("worker retained");
+        assert_eq!(
+            worker.claim_token.as_deref(),
+            Some(spawned.claim_token.as_str())
+        );
+        assert_eq!(
+            worker.claim_operation_id.as_ref(),
+            Some(&claim_operation_id)
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]

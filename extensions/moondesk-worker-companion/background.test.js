@@ -1073,7 +1073,7 @@ test('bridge discovery prefers an exact runtime match over another MoonDesk vers
             app: 'moondesk-worker-companion',
             appVersion: manifest.version,
             protocolVersion: 2,
-            companionRuntimeRevision: 23
+            companionRuntimeRevision: 24
           };
         }
       };
@@ -1101,7 +1101,7 @@ test('bridge discovery prefers an exact runtime match over another MoonDesk vers
 
   const { evaluate, runtimeReloads } = loadBackground({ fetchImpl });
   const hello = await evaluate('discoverBridge(freshState())');
-  assert.equal(hello.companionRuntimeRevision, 23);
+  assert.equal(hello.companionRuntimeRevision, 24);
   assert.equal(runtimeReloads.length, 0);
 });
 
@@ -1214,7 +1214,7 @@ test('compatible bridge clears the one-shot runtime reload marker for a future m
             app: 'moondesk-worker-companion',
             appVersion: manifest.version,
             protocolVersion: 2,
-            companionRuntimeRevision: 23
+            companionRuntimeRevision: 24
           };
         }
       };
@@ -1227,7 +1227,7 @@ test('compatible bridge clears the one-shot runtime reload marker for a future m
   });
 
   const hello = await evaluate('discoverBridge(freshState())');
-  assert.equal(hello.companionRuntimeRevision, 23);
+  assert.equal(hello.companionRuntimeRevision, 24);
   const stored = await evaluate(`chrome.storage.local.get('${reloadKey}')`);
   assert.equal(stored[reloadKey], undefined);
 });
@@ -1245,7 +1245,7 @@ test('automatic pairing proves the extension was loaded from the MoonDesk-prepar
             app: 'moondesk-worker-companion',
             appVersion: manifest.version,
             protocolVersion: 2,
-            companionRuntimeRevision: 23
+            companionRuntimeRevision: 24
           };
         }
       };
@@ -1287,7 +1287,7 @@ test('source and release-ZIP installs without a bootstrap capability expose Manu
         app: 'moondesk-worker-companion',
         appVersion: manifest.version,
         protocolVersion: 2,
-        companionRuntimeRevision: 23
+        companionRuntimeRevision: 24
       };
       return {
         ok: true,
@@ -1356,7 +1356,7 @@ test('release version mismatch reloads the unpacked companion even when protocol
             app: 'moondesk-worker-companion',
             appVersion: '0.13.0',
             protocolVersion: 2,
-            companionRuntimeRevision: 23
+            companionRuntimeRevision: 24
           };
         }
       };
@@ -3678,6 +3678,70 @@ test('worker recovery stop/continue waits for fresh accepted send evidence', asy
   assert.equal(commitCalls, 1);
 });
 
+test('worker recovery inspect classifies a zero-turn unhydrated shell as not-ready instead of task-absent', async () => {
+  let messageHandler = null;
+  let fakeNow = 0;
+  const conversationId = '5aaef8db-ecf0-83ee-bfcc-d6f94853c539';
+  const marker = 'moondesk-worker-task:recovery-blank-shell';
+  const DOM = {
+    conversationIdFromPath() { return conversationId; },
+    taskMarkerPresent() { return false; },
+    workerEvidence() {
+      return {
+        conversationId,
+        conversationUrl: `https://chatgpt.com/c/${conversationId}`,
+        projectId: null,
+        markerPresent: false,
+        generating: false,
+        userTurnCount: 0,
+        assistantTurnCount: 0,
+        composerEmpty: true
+      };
+    },
+    composerReady() { return false; }
+  };
+  class FakeDate extends Date {
+    static now() {
+      fakeNow += 1000;
+      return fakeNow;
+    }
+  }
+  const context = vm.createContext({
+    window: { MOONDESK_CHATGPT_DOM: DOM },
+    sessionStorage: { setItem() {}, getItem() { return null; }, removeItem() {} },
+    location: {
+      origin: 'https://chatgpt.com',
+      hash: '',
+      pathname: `/c/${conversationId}`,
+      search: '',
+      href: `https://chatgpt.com/c/${conversationId}`
+    },
+    history: { state: null, replaceState() {} },
+    chrome: { runtime: { onMessage: { addListener(handler) { messageHandler = handler; } } } },
+    crypto: webcrypto,
+    Date: FakeDate,
+    setTimeout(fn) { queueMicrotask(fn); return 1; },
+    clearTimeout() {},
+    setInterval,
+    clearInterval,
+    console
+  });
+  vm.runInContext(contentSource, context, { filename: contentPath });
+
+  const response = await new Promise((resolve) => {
+    const returned = messageHandler({
+      type: 'MOONDESK_RECOVER_WORKER_INSPECT',
+      taskMarker: marker
+    }, null, resolve);
+    assert.equal(returned, true);
+  });
+  assert.equal(response.ok, true);
+  assert.equal(response.result.state, 'not_ready');
+  assert.equal(response.result.reason, 'worker_recovery_page_not_ready');
+  assert.equal(response.result.evidence.userTurnCount, 0);
+  assert.equal(response.result.evidence.composerReady, false);
+});
+
 test('worker recovery inspect reacquires the content script after a remount closes the async response channel', async () => {
   const conversationId = '6aaef8db-ecf0-83ee-bfcc-d6f94853c540';
   const conversationUrl = `https://chatgpt.com/c/${conversationId}`;
@@ -3720,6 +3784,68 @@ test('worker recovery inspect reacquires the content script after a remount clos
   assert.equal(result.state, 'idle');
   assert.equal(inspectCalls, 2, 'read-only inspection may be retried after content-script reacquisition');
   assert.ok(contextCalls >= 2, 'recovery must reacquire and re-prove the ChatGPT content script');
+});
+
+test('worker recovery retries one blank unhydrated exact conversation before declaring not-ready', async () => {
+  const conversationId = '8ccff9ec-fdf1-84ff-cffd-e7f05964d652';
+  const conversationUrl = `https://chatgpt.com/c/${conversationId}`;
+  const marker = 'moondesk-worker-task:recovery-unhydrated';
+  let inspectCalls = 0;
+  const { evaluate } = loadBackground({
+    existingTabs: { 9: { id: 9, url: conversationUrl, active: false } },
+    sendMessageImpl: async (_tabId, message) => {
+      if (message.type === 'MOONDESK_CONTEXT') {
+        return {
+          ok: true,
+          context: { conversationId, sourceUrl: conversationUrl, projectId: null, generating: false }
+        };
+      }
+      if (message.type === 'MOONDESK_RECOVER_WORKER_INSPECT') {
+        inspectCalls += 1;
+        if (inspectCalls === 1) {
+          return {
+            ok: true,
+            result: {
+              state: 'not_ready',
+              reason: 'worker_recovery_page_not_ready',
+              evidence: {
+                conversationId,
+                markerPresent: false,
+                generating: false,
+                userTurnCount: 0,
+                assistantTurnCount: 0,
+                composerReady: false
+              }
+            }
+          };
+        }
+        return {
+          ok: true,
+          result: {
+            state: 'idle',
+            evidence: {
+              conversationId,
+              markerPresent: true,
+              generating: false,
+              userTurnCount: 1,
+              assistantTurnCount: 0,
+              composerReady: true
+            }
+          }
+        };
+      }
+      throw new Error(`unexpected recovery-unhydrated message: ${message.type}`);
+    }
+  });
+
+  const result = await evaluate(`executeWorkerRecoveryCommand(${JSON.stringify({
+    id: 'recovery-unhydrated-command',
+    action: 'inspect',
+    conversationUrl,
+    taskMarker: marker
+  })})`);
+  assert.equal(result.state, 'idle');
+  assert.equal(inspectCalls, 2, 'blank shell gets exactly one additional read-only inspection');
 });
 
 test('worker recovery continuation never replays an uncertain Send after its response channel closes', async () => {

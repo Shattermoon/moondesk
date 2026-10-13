@@ -8,7 +8,7 @@ const BRIDGE_PORTS = [47650, 47651, 47652, 47653, 47654];
 const REQUIRED_PROTOCOL_VERSION = 2;
 // Bump with any shipped companion runtime change that requires Chromium to load new bytes. Keep
 // this aligned with COMPANION_RUNTIME_REVISION in src/server.rs.
-const COMPANION_RUNTIME_REVISION = 23;
+const COMPANION_RUNTIME_REVISION = 24;
 const SOURCE_DEV_MANIFEST_VERSION = '0.1.0';
 const RUNTIME_RELOAD_STORAGE_KEY = 'moondeskWorkerCompanionReloadRevisionV1';
 const INSTALLATION_BOOTSTRAP_FILE = 'moondesk-bootstrap.json';
@@ -1562,15 +1562,25 @@ async function executeWorkerRecoveryCommand(command) {
   const action = command.action;
   const tab = await recoveryTabFor(command, action === 'inspect');
   if (action === 'inspect') {
-    try {
-      const response = await sendReadOnlyToTabWithReacquire(tab.id, {
+    const inspectTab = async (targetTab) => {
+      const response = await sendReadOnlyToTabWithReacquire(targetTab.id, {
         type: 'MOONDESK_RECOVER_WORKER_INSPECT',
         taskMarker: command.taskMarker
-      }, 12000);
+      }, 15000);
       return response?.ok ? response.result : {
         state: 'failed',
         reason: response?.error || 'worker_recovery_inspect_unconfirmed'
       };
+    };
+    try {
+      let result = await inspectTab(tab);
+      if (result?.state === 'not_ready') {
+        // A blank/unhydrated ChatGPT shell is not proof that the task disappeared. One additional
+        // exact-route reload is read-only and gives recovery a chance to escape a wedged page shell.
+        const retriedTab = await recoveryTabFor(command, true);
+        result = await inspectTab(retriedTab);
+      }
+      return result;
     } catch (error) {
       return {
         state: 'failed',

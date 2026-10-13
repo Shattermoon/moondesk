@@ -596,7 +596,7 @@ fn workers_tool_descriptor() -> Value {
     json!({
         "name": "workers",
         "title": "Coordinate workers",
-        "description": "Coordinate MoonDesk workers for this workspace. Core actions: status, spawn, reuse, recover, send, collect, retire. Worker actions: claim, start, inbox, ack, report, finish. ROLE-SCOPED RULE: only when the current caller is Core running in ChatGPT Work/Codex/IDE, use MoonDesk only for worker orchestration and use the IDE's native shell, browser, files, and computer tools for Core's own work. This restriction NEVER applies inside a MoonDesk Worker conversation: Workers should use this workspace's MoonDesk connector/tools normally for all assigned project work. If Core has no Companion-observed browser tab, set `browserless_core=true` on spawn/reuse; status lists online workerBrowsers and worker-count limits. Fresh spawn `context` may carry shared goals, constraints, settled decisions, validation, and sibling ownership while `task` stays worker-specific. Reuse keeps the same durable worker chat, so send only new direction. Provisioning/Waking means queued, not started; confirm Running/start activity before assuming a worker is working. collect may wait up to 60 seconds. Retry an uncertain request promptly with the same `operation_id`.",
+        "description": "Coordinate MoonDesk workers for this workspace. Core actions: status, spawn, reuse, recover, send, collect, retire. Worker actions: claim, start, inbox, ack, report, finish. ROLE-SCOPED RULE: only when the current caller is Core running in ChatGPT Work/Codex/IDE, use MoonDesk only for worker orchestration and use the IDE's native shell, browser, files, and computer tools for Core's own work. This restriction NEVER applies inside a MoonDesk Worker conversation: Workers should use this workspace's MoonDesk connector/tools normally for all assigned project work. If Core has no Companion-observed browser tab, set `browserless_core=true` on spawn/reuse; status lists online workerBrowsers and worker-count limits. Fresh spawn `context` may carry shared goals, constraints, settled decisions, validation, and sibling ownership while `task` stays worker-specific. Reuse keeps the same durable worker chat, so send only new direction. Provisioning/Waking means queued, not started; confirm Running/start activity before assuming a worker is working. A Running worker with health=suspect has been silent past MoonDesk's recovery threshold even if the browser still shows generating, so recover is appropriate before replacing it. collect may wait up to 60 seconds. Retry an uncertain request promptly with the same `operation_id`.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1807,6 +1807,13 @@ async fn worker_observability(
                 WorkerState::Idle => "idle",
                 WorkerState::Retired => "retired",
                 WorkerState::Running if !browser_present => "browser_missing",
+                WorkerState::Running
+                    if browser_generating
+                        && last_activity_age_ms
+                            .is_some_and(|age| age >= IDE_WORKER_SUSPECT_AFTER_MS) =>
+                {
+                    "suspect"
+                }
                 WorkerState::Running if browser_generating => "thinking",
                 WorkerState::Running
                     if last_activity_age_ms
@@ -1836,6 +1843,11 @@ async fn worker_observability(
                 "taskId": worker.current_task_id,
                 "state": worker.state,
                 "health": health,
+                "launchState": worker.launch_state,
+                "launchCommandId": worker.launch_command_id,
+                "attachmentState": worker.attachment_state,
+                "conversationId": conversation_id,
+                "canonicalConversationConfirmed": conversation_id.is_some(),
                 "lastActivityAtMs": last_activity_at_ms,
                 "lastActivityAgeMs": last_activity_age_ms,
                 "recentToolCalls": snapshot
@@ -1894,9 +1906,11 @@ async fn recover_worker_for_core(
         .cloned()
         .unwrap_or_default();
 
-    let fresh = companion_auth
-        .fresh_presence(crate::companion::unix_time_ms())
-        .await;
+    let recovery_now_ms = crate::companion::unix_time_ms();
+    let last_activity_age_ms = activity_before
+        .last_activity_at_ms
+        .map(|at| recovery_now_ms.saturating_sub(at));
+    let fresh = companion_auth.fresh_presence(recovery_now_ms).await;
     let visible_client = fresh.iter().find_map(|client| {
         client
             .tabs
@@ -1907,9 +1921,10 @@ async fn recover_worker_for_core(
     if visible_client
         .as_ref()
         .is_some_and(|(_, generating)| *generating)
+        && !last_activity_age_ms.is_some_and(|age| age >= IDE_WORKER_SUSPECT_AFTER_MS)
     {
         return Err(
-            "worker still reports an actively generating browser turn; wait for it to become quiet before forcing recovery"
+            "worker still reports an actively generating browser turn and MoonDesk does not have a stale exact-worker activity signal yet; wait for the worker to become quiet or reach the suspect threshold before forcing recovery"
                 .into(),
         );
     }
@@ -1962,6 +1977,18 @@ async fn recover_worker_for_core(
         .get("state")
         .and_then(Value::as_str)
         .unwrap_or("failed");
+    if inspect_state == "not_ready" {
+        return Ok(json!({
+            "action": "recover",
+            "workerId": worker_id,
+            "taskId": task_id,
+            "state": "recovery_not_ready",
+            "browserClientId": client_id,
+            "inspect": inspected,
+            "retrySafe": true,
+            "instruction": "The exact Worker conversation route was reached, but ChatGPT did not hydrate enough history/composer state to prove the task marker. This is not proof that the task disappeared. Wait briefly, call workers status/collect, then retry recover on the same Worker if it remains stalled."
+        }));
+    }
     if !matches!(inspect_state, "idle" | "busy") {
         return Ok(json!({
             "action": "recover",
@@ -1970,7 +1997,8 @@ async fn recover_worker_for_core(
             "state": "recovery_failed",
             "browserClientId": client_id,
             "inspect": inspected,
-            "instruction": "The task is still running and was not marked complete. Inspect repository state with the IDE's native tools before deciding whether to retry recovery or continue the remaining work yourself."
+            "retrySafe": true,
+            "instruction": "Recovery stopped during read-only inspection before any continuation Send. The task is still running and was not marked complete. Inspect workers status/collect and repository state; retrying recover on the same Worker later is safe, but do not create a duplicate editor merely from this inspection failure."
         }));
     }
 
@@ -2271,13 +2299,14 @@ async fn handle_tools_call_for_workspace(
                 }
             };
             let requirement = match worker_broker
-                .claim_attestation_requirement(
+                .wait_for_claim_attestation_requirement(
                     workspace_id,
                     &worker_id,
                     &task_id,
                     claim_token,
                     &claim_operation_id,
                     &caller_identity,
+                    std::time::Duration::from_secs(12),
                 )
                 .await
             {

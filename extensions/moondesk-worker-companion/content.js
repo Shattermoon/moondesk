@@ -365,13 +365,39 @@
     if (typeof marker !== 'string' || !marker) {
       return { state: 'failed', reason: 'worker_recovery_task_marker_invalid' };
     }
-    await new Promise((resolve) => setTimeout(resolve, 500));
-    const evidence = recoveryEvidence(marker);
-    if (!evidence.conversationId || evidence.markerPresent !== true) {
-      return { state: 'failed', reason: 'worker_recovery_task_not_present', evidence };
+
+    // A ChatGPT /c/<id> route can answer extension messages before its conversation history and
+    // composer have hydrated. Treating that transient blank shell as "task not present" made a
+    // recoverable stalled Worker look definitively corrupt. Wait for actual page evidence first.
+    const deadline = Date.now() + 12000;
+    let evidence = recoveryEvidence(marker);
+    while (Date.now() < deadline) {
+      evidence = recoveryEvidence(marker);
+      if (evidence.conversationId && evidence.markerPresent === true) {
+        return {
+          state: evidence.generating ? 'busy' : 'idle',
+          evidence
+        };
+      }
+      // Once real conversation turns are rendered, absence of the exact task marker is meaningful.
+      // Composer readiness alone is not enough: ChatGPT may paint the composer before history.
+      if (
+        evidence.conversationId &&
+        (Number(evidence.userTurnCount || 0) > 0 || Number(evidence.assistantTurnCount || 0) > 0)
+      ) {
+        return {
+          state: 'failed',
+          reason: 'worker_recovery_task_marker_absent_after_load',
+          evidence
+        };
+      }
+      await new Promise((resolve) => setTimeout(resolve, 250));
     }
+
+    evidence = recoveryEvidence(marker);
     return {
-      state: evidence.generating ? 'busy' : 'idle',
+      state: 'not_ready',
+      reason: 'worker_recovery_page_not_ready',
       evidence
     };
   }

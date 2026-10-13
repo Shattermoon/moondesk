@@ -234,6 +234,44 @@ impl WorkerBroker {
         Ok(workers)
     }
 
+    pub async fn clear_family_for_anchor(
+        &self,
+        workspace_id: &WorkspaceId,
+        anchor_identity: &ChatIdentity,
+    ) -> Result<Vec<WorkerRecord>, WorkerBrokerError> {
+        anchor_identity
+            .validate()
+            .map_err(WorkerBrokerError::Invalid)?;
+        let mut guard = self.data.lock().await;
+        let Some((family_id, family)) = guard.families.iter().find(|(_, family)| {
+            &family.workspace_id == workspace_id && &family.anchor_identity == anchor_identity
+        }) else {
+            return Ok(Vec::new());
+        };
+        let family_id = family_id.clone();
+        let workers = family.workers.values().cloned().collect::<Vec<_>>();
+
+        let now_ms = worker_unix_time_ms();
+        let mut candidate = guard.clone();
+        prune_retired_worker_fences(&mut candidate, now_ms);
+        for worker in &workers {
+            let Some(identity) = worker.chat_identity.clone() else {
+                continue;
+            };
+            candidate.retired_workers.insert(
+                identity.session_digest.clone(),
+                RetiredWorkerFence {
+                    identity,
+                    retired_at_ms: now_ms,
+                },
+            );
+        }
+        candidate.families.remove(&family_id);
+        self.commit_candidate(&mut guard, candidate).await?;
+        self.updates.notify_waiters();
+        Ok(workers)
+    }
+
     #[cfg(test)]
     pub(crate) fn fail_next_commit_for_test(&self) {
         self.fail_next_commit

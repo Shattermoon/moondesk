@@ -22,7 +22,10 @@ use crate::command_jobs::{
 };
 use crate::companion::CompanionAuth;
 use crate::handoff;
-use crate::managed_chat::{broker::ManagedChatBroker, types::ChatExecutionProfile};
+use crate::managed_chat::{
+    broker::ManagedChatBroker,
+    types::{ChatExecutionProfile, ManagedChatCommandState, ManagedChatPurpose},
+};
 use crate::state::{
     AgentsPathMode, BrowserPresentation, Mode, ToolMode, load_app_config, user_home_dir,
 };
@@ -648,6 +651,10 @@ fn workers_tool_descriptor() -> Value {
             "type": "object",
             "properties": {
                 "action": { "type": "string" },
+                "cleared": { "type": "boolean" },
+                "alreadyCleared": { "type": "boolean" },
+                "workerIds": { "type": "array", "items": { "type": "string" } },
+                "commandIds": { "type": "array", "items": { "type": "string" } },
                 "state": { "type": "string" },
                 "familyId": { "type": ["string", "null"] },
                 "workerId": { "type": "string" },
@@ -710,11 +717,11 @@ fn worker_gateway_workers_tool_descriptor() -> Value {
 fn local_ide_workers_tool_descriptor() -> Value {
     let mut descriptor = workers_tool_descriptor();
     descriptor["description"] = json!(
-        "Coordinate MoonDesk browser Workers from local Codex/IDE. Core actions: status, spawn, reuse, recover, send, collect, retire. Worker chats run in the paired Companion browser and use the one generalized MoonDesk Worker connector; MoonDesk resolves each Worker's workspace from claim and exact Worker chat identity. Local IDE Core is account-independent: switching the ChatGPT account used by Codex does not change Worker ownership or the Worker browser account. Treat one workspace as one logical Codex Core at a time; separate concurrent Codex sessions share the same Worker family. Fresh spawn `context` may carry shared goals/constraints while `task` stays worker-specific. Provisioning/Waking is queued, not started; wait for Running/start activity. Do not repeatedly long-poll collect while a Worker is still waiting_claim. If status shows claimStartupBlockedLikely=true, report the Worker startup/connector blocker immediately instead of waiting: the browser chat is idle but the Worker never claimed. If status.migrationBlocked is true, do not spawn: an older Core still owns an active Worker and must finish or be cleared first. health=suspect means the exact Worker is stale even if ChatGPT still shows generating; recover before replacing it. Continue independent Core work while Workers run and collect results when needed."
+        "Coordinate MoonDesk browser Workers from local Codex/IDE. Core actions: status, spawn, reuse, recover, send, collect, retire, clear. Worker chats run in the paired Companion browser and use the one generalized MoonDesk Worker connector; MoonDesk resolves each Worker's workspace from claim and exact Worker chat identity. Local IDE Core is account-independent: switching the ChatGPT account used by Codex does not change Worker ownership or the Worker browser account. Treat one workspace as one logical Codex Core at a time; separate concurrent Codex sessions share the same Worker family. `clear` is a destructive workspace-local recovery action for terminal browser launches: it removes only this local Core family's Worker ownership and managed launch history, preserves ChatGPT conversations and unrelated workspaces, and allows the next fresh spawn to choose an online Worker browser again. It fails closed while any matching browser launch is queued, leased, send-started, paused, or needs reconciliation; use the Companion's host-wide Clear Workers only when that stronger browser fence is actually required. Fresh spawn `context` may carry shared goals/constraints while `task` stays worker-specific. Provisioning/Waking is queued, not started; wait for Running/start activity. Do not repeatedly long-poll collect while a Worker is still waiting_claim. If status shows claimStartupBlockedLikely=true, report the Worker startup/connector blocker immediately instead of waiting: the browser chat is idle but the Worker never claimed. If status.migrationBlocked is true, do not spawn: an older Core still owns an active Worker and must finish or be cleared first. health=suspect means the exact Worker is stale even if ChatGPT still shows generating; recover before replacing it. Continue independent Core work while Workers run and collect results when needed."
     );
     if let Some(action_enum) = descriptor.pointer_mut("/inputSchema/properties/action/enum") {
         *action_enum = json!([
-            "spawn", "reuse", "recover", "retire", "status", "send", "collect"
+            "spawn", "reuse", "recover", "retire", "status", "send", "collect", "clear"
         ]);
     }
     if let Some(properties) = descriptor
@@ -1953,7 +1960,7 @@ async fn select_local_spawn_client(
     }
     if remembered.len() > 1 {
         return Err(
-            "this local Worker family has durable conversations in multiple Companion browsers from earlier history; Clear Workers before creating new Workers so the family can be pinned to one Worker account"
+            "this local Worker family has durable conversations in multiple Companion browsers from earlier history; call workers with action=clear before creating new Workers so this workspace-local family can be pinned to one Worker account"
                 .into(),
         );
     }
@@ -1963,7 +1970,7 @@ async fn select_local_spawn_client(
         .expect("one remembered browser");
     if requested.is_some_and(|requested| requested != preferred) {
         return Err(format!(
-            "this local Worker family is pinned to Companion browser '{preferred}'; Clear Workers before changing the Worker browser/account"
+            "this local Worker family is pinned to Companion browser '{preferred}'; call workers with action=clear before changing the Worker browser/account"
         ));
     }
     let fresh = auth.fresh_presence(crate::companion::unix_time_ms()).await;
@@ -1971,7 +1978,7 @@ async fn select_local_spawn_client(
         return Ok(preferred);
     }
     Err(format!(
-        "this local Worker family is pinned to Companion browser '{preferred}', which is currently offline; MoonDesk will not create Workers in a different browser/account. Bring the pinned Worker browser online and retry"
+        "this local Worker family is pinned to Companion browser '{preferred}', which is currently offline; MoonDesk will not create Workers in a different browser/account. Bring the pinned Worker browser online and retry, or call workers with action=clear to discard only this local workspace family and choose an online Worker browser again"
     ))
 }
 
@@ -2718,12 +2725,21 @@ async fn handle_tools_call_for_workspace(
         if local_ide_core
             && !matches!(
                 action,
-                Some("spawn" | "reuse" | "recover" | "retire" | "status" | "send" | "collect")
+                Some(
+                    "spawn"
+                        | "reuse"
+                        | "recover"
+                        | "retire"
+                        | "status"
+                        | "send"
+                        | "collect"
+                        | "clear"
+                )
             )
         {
             return tool_error_response_text_only(
                 req,
-                "Local Codex/IDE Core may use only workers status/spawn/reuse/recover/send/collect/retire; Worker-side lifecycle actions must come from the exact browser Worker conversation."
+                "Local Codex/IDE Core may use only workers status/spawn/reuse/recover/send/collect/retire/clear; Worker-side lifecycle actions must come from the exact browser Worker conversation."
                     .into(),
             );
         }
@@ -2869,6 +2885,86 @@ async fn handle_tools_call_for_workspace(
                 }
                 Err(error) => tool_error_response_text_only(req, error),
             };
+        }
+
+        if action == Some("clear") {
+            if !local_ide_core {
+                return tool_error_response_text_only(
+                    req,
+                    "workers clear is available only through the machine-local Codex/IDE MCP"
+                        .into(),
+                );
+            }
+            let _lifecycle_guard = crate::workers::WORKER_LIFECYCLE_LOCK.lock().await;
+            let anchor_session_digest = caller_identity.session_digest.as_str();
+            let managed_snapshot = managed_chat_broker.snapshot().await;
+            let matching_commands = managed_snapshot
+                .commands
+                .values()
+                .filter(|command| {
+                    command.launch.purpose == ManagedChatPurpose::Worker
+                        && &command.launch.workspace_id == workspace_id
+                        && command.launch.anchor_session_digest.as_deref()
+                            == Some(anchor_session_digest)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            if let Some(command) = matching_commands.iter().find(|command| {
+                !matches!(
+                    command.state,
+                    ManagedChatCommandState::Succeeded | ManagedChatCommandState::Failed
+                )
+            }) {
+                return tool_error_response_text_only(
+                    req,
+                    format!(
+                        "workers clear cannot safely remove this local family while browser command {} is {:?}; wait for that launch to become terminal or use the Companion's host-wide Clear Workers when an in-flight browser fence is required",
+                        command.id, command.state
+                    ),
+                );
+            }
+            let family_exists = match worker_broker
+                .family_for_anchor(workspace_id, &caller_identity)
+                .await
+            {
+                Ok(value) => value.is_some(),
+                Err(error) => return tool_error_response_text_only(req, error.to_string()),
+            };
+            let had_state = family_exists || !matching_commands.is_empty();
+
+            let workers = match worker_broker
+                .clear_family_for_anchor(workspace_id, &caller_identity)
+                .await
+            {
+                Ok(value) => value,
+                Err(error) => return tool_error_response_text_only(req, error.to_string()),
+            };
+            let commands = match managed_chat_broker
+                .clear_worker_commands_for_anchor(workspace_id, anchor_session_digest)
+                .await
+            {
+                Ok(value) => value,
+                Err(error) => {
+                    return tool_error_response_text_only(
+                        req,
+                        format!(
+                            "the local Worker family was cleared, but its terminal managed browser-command history could not be removed; retry workers clear before spawning again: {error}"
+                        ),
+                    );
+                }
+            };
+
+            return tool_success_response_with_structured(
+                req,
+                String::new(),
+                json!({
+                    "action": "clear",
+                    "cleared": true,
+                    "alreadyCleared": !had_state,
+                    "workerIds": workers.iter().map(|worker| worker.id.to_string()).collect::<Vec<_>>(),
+                    "commandIds": commands.iter().map(|command| command.id.to_string()).collect::<Vec<_>>()
+                }),
+            );
         }
 
         let browserless_core = if local_ide_core {
@@ -7738,7 +7834,7 @@ mod tests {
         assert_eq!(
             actions,
             vec![
-                "spawn", "reuse", "recover", "retire", "status", "send", "collect"
+                "spawn", "reuse", "recover", "retire", "status", "send", "collect", "clear"
             ]
         );
         assert!(
@@ -9138,6 +9234,221 @@ mod tests {
         .await
         .expect("select fixed family Worker browser");
         assert_eq!(selected, "fixed-edge");
+    }
+
+    #[tokio::test]
+    async fn local_ide_clear_drops_only_its_family_and_allows_browser_switch() {
+        let root = TestTempDir::new("moondesk-local-ide-clear-browser-affinity");
+        let workspace_root = root.path().join("workspace");
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        let workspace_id = WorkspaceId::new();
+        let other_workspace_id = WorkspaceId::new();
+        let core = ChatIdentity::local_core(&workspace_id);
+        let other_core = ChatIdentity::local_core(&other_workspace_id);
+        let broker = Arc::new(
+            WorkerBroker::open(root.path().join("worker-state-v1.json"))
+                .expect("open worker broker"),
+        );
+        let managed = Arc::new(
+            ManagedChatBroker::open(root.path().join("managed-chat-state-v1.json"))
+                .expect("open managed chat broker"),
+        );
+        let companion = Arc::new(
+            CompanionAuth::open(root.path().join("companion-auth-v1.json"))
+                .expect("open companion auth"),
+        );
+        for (client_id, credential) in [
+            ("offline-chrome", "a".repeat(64)),
+            ("online-edge", "b".repeat(64)),
+        ] {
+            companion
+                .auto_pair(client_id, &credential, None)
+                .await
+                .expect("pair companion");
+        }
+        companion
+            .update_presence(
+                "online-edge",
+                crate::companion::CompanionPresenceUpdate {
+                    browser_label: Some("Edge".into()),
+                    tabs: Vec::new(),
+                },
+                crate::companion::unix_time_ms(),
+            )
+            .await
+            .expect("publish online Edge presence");
+
+        let existing = broker
+            .spawn_worker(crate::workers::broker::SpawnWorkerRequest {
+                operation_id: OperationId::new(),
+                workspace_id: workspace_id.clone(),
+                anchor_identity: core.clone(),
+                label: "stuck worker".into(),
+                assignment: "This Worker is pinned to the offline browser.".into(),
+                context: String::new(),
+                execution_profile: ChatExecutionProfile::default(),
+            })
+            .await
+            .expect("spawn stuck Worker family");
+        managed
+            .enqueue_with_route(
+                crate::managed_chat::broker::EnqueueManagedChatRequest {
+                    dedupe_key: format!("worker:{}:task:stuck", existing.worker_id),
+                    launch: ManagedChatLaunch {
+                        workspace_id: workspace_id.clone(),
+                        purpose: ManagedChatPurpose::Worker,
+                        execution_profile: ChatExecutionProfile::default(),
+                        opening_message: "stuck worker".into(),
+                        task_marker: format!("moondesk-worker-task:{}", existing.task_id),
+                        thread_key: Some(format!("worker:{}", existing.worker_id)),
+                        open_mode: ManagedChatOpenMode::NewThread,
+                        existing_conversation_url: None,
+                        anchor_session_digest: Some(core.session_digest.clone()),
+                    },
+                },
+                Some("offline-chrome".into()),
+                None,
+            )
+            .await
+            .expect("persist offline browser affinity");
+        let offer = managed
+            .redeem("offline-chrome", crate::companion::unix_time_ms())
+            .await
+            .expect("redeem stuck launch")
+            .expect("stuck launch offer");
+        let lease_id = offer
+            .command
+            .lease
+            .as_ref()
+            .expect("stuck launch lease")
+            .lease_id
+            .clone();
+        managed
+            .mark_send_started(&offer.command.id, &lease_id, "offline-chrome")
+            .await
+            .expect("cross Send boundary for stuck launch");
+        managed
+            .acknowledge(
+                &offer.command.id,
+                &lease_id,
+                "offline-chrome",
+                crate::managed_chat::broker::ManagedChatAckOutcome::Succeeded {
+                    details: Some("worker chat opened but never claimed".into()),
+                    conversation_url: Some(
+                        "https://chatgpt.com/c/aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee".into(),
+                    ),
+                },
+            )
+            .await
+            .expect("terminalize stuck launch");
+
+        let preserved = broker
+            .spawn_worker(crate::workers::broker::SpawnWorkerRequest {
+                operation_id: OperationId::new(),
+                workspace_id: other_workspace_id.clone(),
+                anchor_identity: other_core.clone(),
+                label: "preserved worker".into(),
+                assignment: "Must survive another workspace's local clear.".into(),
+                context: String::new(),
+                execution_profile: ChatExecutionProfile::default(),
+            })
+            .await
+            .expect("spawn unrelated Worker family");
+        managed
+            .enqueue_with_route(
+                crate::managed_chat::broker::EnqueueManagedChatRequest {
+                    dedupe_key: format!("worker:{}:task:preserved", preserved.worker_id),
+                    launch: ManagedChatLaunch {
+                        workspace_id: other_workspace_id.clone(),
+                        purpose: ManagedChatPurpose::Worker,
+                        execution_profile: ChatExecutionProfile::default(),
+                        opening_message: "preserved worker".into(),
+                        task_marker: format!("moondesk-worker-task:{}", preserved.task_id),
+                        thread_key: Some(format!("worker:{}", preserved.worker_id)),
+                        open_mode: ManagedChatOpenMode::NewThread,
+                        existing_conversation_url: None,
+                        anchor_session_digest: Some(other_core.session_digest.clone()),
+                    },
+                },
+                Some("offline-chrome".into()),
+                None,
+            )
+            .await
+            .expect("persist unrelated command");
+
+        let blocked = select_local_spawn_client(
+            &json!({}),
+            companion.as_ref(),
+            managed.as_ref(),
+            broker.as_ref(),
+            &workspace_id,
+            &core,
+        )
+        .await
+        .expect_err("offline family affinity must block failover before clear");
+        assert!(blocked.contains("offline-chrome"));
+        assert!(blocked.contains("action=clear"));
+
+        let response = call_workers_for_test_with_companion(
+            &tool_call_request_local_ide("workers", json!({ "action": "clear" })),
+            &workspace_id,
+            &workspace_root.to_string_lossy(),
+            broker.clone(),
+            managed.clone(),
+            Some(companion.clone()),
+        )
+        .await;
+        assert_ne!(
+            response
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true),
+            "local clear should succeed without touching unrelated worker families"
+        );
+        let structured = response
+            .result
+            .as_ref()
+            .and_then(|result| result.get("structuredContent"))
+            .expect("local clear structured result");
+        assert_eq!(structured.get("action"), Some(&json!("clear")));
+        assert_eq!(structured.get("cleared"), Some(&json!(true)));
+
+        assert!(
+            broker
+                .family_for_anchor(&workspace_id, &core)
+                .await
+                .expect("read cleared family")
+                .is_none()
+        );
+        assert!(
+            broker
+                .family_for_anchor(&other_workspace_id, &other_core)
+                .await
+                .expect("read preserved family")
+                .is_some()
+        );
+        let snapshot = managed.snapshot().await;
+        assert!(snapshot.commands.values().all(|command| {
+            command.launch.anchor_session_digest.as_deref() != Some(core.session_digest.as_str())
+        }));
+        assert!(snapshot.commands.values().any(|command| {
+            command.launch.anchor_session_digest.as_deref()
+                == Some(other_core.session_digest.as_str())
+        }));
+
+        let selected = select_local_spawn_client(
+            &json!({}),
+            companion.as_ref(),
+            managed.as_ref(),
+            broker.as_ref(),
+            &workspace_id,
+            &core,
+        )
+        .await
+        .expect("fresh family may choose the only online browser after clear");
+        assert_eq!(selected, "online-edge");
     }
 
     #[tokio::test]

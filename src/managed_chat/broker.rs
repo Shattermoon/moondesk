@@ -127,6 +127,36 @@ impl ManagedChatBroker {
         Ok(removed)
     }
 
+    pub async fn clear_worker_commands_for_anchor(
+        &self,
+        workspace_id: &WorkspaceId,
+        anchor_session_digest: &str,
+    ) -> Result<Vec<ManagedChatCommand>, ManagedChatError> {
+        let mut guard = self.data.lock().await;
+        let removed = guard
+            .commands
+            .values()
+            .filter(|command| {
+                command.launch.purpose == ManagedChatPurpose::Worker
+                    && &command.launch.workspace_id == workspace_id
+                    && command.launch.anchor_session_digest.as_deref()
+                        == Some(anchor_session_digest)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if removed.is_empty() {
+            return Ok(removed);
+        }
+
+        let mut candidate = guard.clone();
+        for command in &removed {
+            candidate.commands.remove(&command.id);
+            candidate.dedupe.remove(&command.dedupe_key);
+        }
+        self.commit_candidate(&mut guard, candidate).await?;
+        Ok(removed)
+    }
+
     pub async fn purge_workspace(
         &self,
         workspace_id: &WorkspaceId,

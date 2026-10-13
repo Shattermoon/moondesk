@@ -19,7 +19,7 @@ pub fn bootstrap_message(
     format!(
         r#"{briefing}
 
-(MoonDesk worker contract: you are {display_id}, a worker for Core in workspace "{workspace_name}". The Shared Core context preserves prior goals, decisions, constraints, validation, and sibling ownership; use it to avoid rediscovering settled context, while Your assignment defines your owned scope. Core may later refine this assignment; follow the latest Core direction. Before starting, call `workers` action=`claim` with worker_id=`{worker_id}`, task_id=`{task_id}`, claim_token=`{claim_token}`, operation_id=`{claim_operation_id}`. If claim says registration is still pending, retry the exact same claim once after a short delay; for any other claim failure, stop. For project work, use only this workspace's MoonDesk connector, call `moondesk_instruction` before local work, and obey current AGENTS.md and user instructions. Work independently until the assignment is complete, do not create workers, and do not change branches or unrelated files unless Core explicitly assigns it. Report meaningful discoveries or blockers to Core with `workers` action=`report`; do not spam routine progress. Call `workers` action=`finish` once with RESULT / CHANGES / VALIDATION / BLOCKERS when done.)
+(MoonDesk worker contract: you are {display_id}, a worker for Core in workspace "{workspace_name}". The Shared Core context preserves prior goals, decisions, constraints, validation, and sibling ownership; use it to avoid rediscovering settled context, while Your assignment defines your owned scope. Core may later refine this assignment; follow the latest Core direction. Before doing or answering the assignment, call `workers` action=`claim` with worker_id=`{worker_id}`, task_id=`{task_id}`, claim_token=`{claim_token}`, operation_id=`{claim_operation_id}`. If claim says registration is still pending, retry the exact same claim once after a short delay; for any other claim failure, stop. If the `workers` tool is unavailable in this chat, do not answer the assignment in plain text: reply only that the MoonDesk Custom Connector for workspace "{workspace_name}" is unavailable in this Worker account, then stop. For project work, use only this workspace's MoonDesk connector, call `moondesk_instruction` before local work, and obey current AGENTS.md and user instructions. Work independently until the assignment is complete, do not create workers, and do not change branches or unrelated files unless Core explicitly assigns it. Report meaningful discoveries or blockers to Core with `workers` action=`report`; do not spam routine progress. Call `workers` action=`finish` once with RESULT / CHANGES / VALIDATION / BLOCKERS when done.)
 
 [moondesk-worker-task:{task_id}]
 "#,
@@ -91,6 +91,8 @@ mod tests {
         assert!(text.contains("operation_id"));
         assert!(text.contains("moondesk_instruction"));
         assert!(text.contains("use only this workspace's MoonDesk connector"));
+        assert!(text.contains("do not answer the assignment in plain text"));
+        assert!(text.contains("Custom Connector"));
         assert!(text.contains("do not create workers"));
         assert!(text.len() < 2_000, "worker bootstrap should stay compact");
         assert!(!text.contains("expected_model"));

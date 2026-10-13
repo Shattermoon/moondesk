@@ -668,7 +668,7 @@ fn workers_tool_descriptor() -> Value {
 fn local_ide_workers_tool_descriptor() -> Value {
     let mut descriptor = workers_tool_descriptor();
     descriptor["description"] = json!(
-        "Coordinate MoonDesk browser Workers from local Codex/IDE. Core actions: status, spawn, reuse, recover, send, collect, retire. Worker chats run in the paired Companion browser and keep using their normal MoonDesk ChatGPT connector. Local IDE Core is account-independent: switching the ChatGPT account used by Codex does not change Worker ownership or the Worker browser account. Treat one workspace as one logical Codex Core at a time; separate concurrent Codex sessions share the same Worker family. Fresh spawn `context` may carry shared goals/constraints while `task` stays worker-specific. Provisioning/Waking is queued, not started; wait for Running/start activity. If status.migrationBlocked is true, do not spawn: an older Core still owns an active Worker and must finish or be cleared first. health=suspect means the exact Worker is stale even if ChatGPT still shows generating; recover before replacing it. Continue independent Core work while Workers run and collect results when needed."
+        "Coordinate MoonDesk browser Workers from local Codex/IDE. Core actions: status, spawn, reuse, recover, send, collect, retire. Worker chats run in the paired Companion browser and keep using their normal MoonDesk ChatGPT connector. Local IDE Core is account-independent: switching the ChatGPT account used by Codex does not change Worker ownership or the Worker browser account. Treat one workspace as one logical Codex Core at a time; separate concurrent Codex sessions share the same Worker family. Fresh spawn `context` may carry shared goals/constraints while `task` stays worker-specific. Provisioning/Waking is queued, not started; wait for Running/start activity. Do not repeatedly long-poll collect while a Worker is still waiting_claim. If status shows claimStartupBlockedLikely=true, report the Worker startup/connector blocker immediately instead of waiting: the browser chat is idle but the Worker never claimed. If status.migrationBlocked is true, do not spawn: an older Core still owns an active Worker and must finish or be cleared first. health=suspect means the exact Worker is stale even if ChatGPT still shows generating; recover before replacing it. Continue independent Core work while Workers run and collect results when needed."
     );
     if let Some(action_enum) = descriptor.pointer_mut("/inputSchema/properties/action/enum") {
         *action_enum = json!([
@@ -2018,7 +2018,17 @@ async fn worker_observability(
             });
             let recovery_guard_age_ms =
                 recovery_guard_started_at_ms.map(|at| now_ms.saturating_sub(at));
+            let claim_startup_blocker_likely = worker.state == WorkerState::Provisioning
+                && worker.launch_state == crate::workers::types::WorkerLaunchState::WaitingClaim
+                && conversation_id.is_some()
+                && browser_present
+                && !browser_generating;
             let health = match worker.state {
+                WorkerState::Provisioning
+                    if worker.launch_state == crate::workers::types::WorkerLaunchState::WaitingClaim =>
+                {
+                    "waiting_claim"
+                }
                 WorkerState::Provisioning | WorkerState::Waking => "launching",
                 WorkerState::Idle => "idle",
                 WorkerState::Retired => "retired",
@@ -2068,6 +2078,10 @@ async fn worker_observability(
                 "lastActivityAgeMs": last_activity_age_ms,
                 "recoveryGuardStartedAtMs": recovery_guard_started_at_ms,
                 "recoveryGuardAgeMs": recovery_guard_age_ms,
+                "claimStartupBlockedLikely": claim_startup_blocker_likely,
+                "startupDiagnostic": claim_startup_blocker_likely.then_some(
+                    "The Worker conversation is confirmed and the browser is idle, but the Worker never completed workers claim. The most likely causes are that this Worker account does not have the MoonDesk Custom Connector for this workspace available in the chat, or the claim failed before registration. Do not keep long-polling collect while the Worker remains waiting_claim; fix the Worker connector/claim path and retry with a fresh Worker."
+                ),
                 "recentToolCalls": snapshot
                     .map(|snapshot| snapshot.recent_tool_calls.clone())
                     .unwrap_or_default(),
@@ -7671,6 +7685,91 @@ mod tests {
                 .get("description")
                 .and_then(Value::as_str)
                 .is_some_and(|description| description.contains("account-independent"))
+        );
+    }
+
+    #[tokio::test]
+    async fn waiting_claim_with_idle_confirmed_browser_surfaces_startup_blocker() {
+        let root = TestTempDir::new("moondesk-waiting-claim-startup-diagnostic");
+        let workspace_id = WorkspaceId::new();
+        let core = ChatIdentity::local_core(&workspace_id);
+        let broker = WorkerBroker::open(root.path().join("worker-state-v1.json"))
+            .expect("open worker broker");
+        let companion = CompanionAuth::open(root.path().join("companion-auth-v1.json"))
+            .expect("open companion auth");
+        companion
+            .auto_pair("worker-browser", &"a".repeat(64), None)
+            .await
+            .expect("pair worker browser");
+
+        let spawned = broker
+            .spawn_worker(crate::workers::broker::SpawnWorkerRequest {
+                operation_id: OperationId::new(),
+                workspace_id: workspace_id.clone(),
+                anchor_identity: core.clone(),
+                label: "claim diagnostic".into(),
+                assignment: "prove startup blocker observability".into(),
+                context: String::new(),
+                execution_profile: ChatExecutionProfile::default(),
+            })
+            .await
+            .expect("spawn worker fixture");
+        let launch_id = Uuid::new_v4().to_string();
+        let conversation_id = "6ace38b7-cf80-83ee-b41d-cc60e11d3d68";
+        let conversation_url = format!("https://chatgpt.com/c/{conversation_id}");
+        broker
+            .link_launch_command(
+                &workspace_id,
+                &core,
+                &spawned.worker_id,
+                &spawned.task_id,
+                &launch_id,
+            )
+            .await
+            .expect("link launch command");
+        broker
+            .update_launch_by_command(
+                &launch_id,
+                crate::workers::types::WorkerLaunchState::WaitingClaim,
+                None,
+                Some(conversation_url.clone()),
+            )
+            .await
+            .expect("confirm canonical worker conversation");
+        companion
+            .update_presence(
+                "worker-browser",
+                crate::companion::CompanionPresenceUpdate {
+                    browser_label: Some("Chrome".into()),
+                    tabs: vec![crate::companion::CompanionTabPresence {
+                        conversation_id: conversation_id.into(),
+                        conversation_url,
+                        project_id: None,
+                        project_url: None,
+                        active: true,
+                        window_focused: true,
+                        generating: false,
+                    }],
+                },
+                crate::companion::unix_time_ms(),
+            )
+            .await
+            .expect("publish idle confirmed worker tab");
+
+        let observed = worker_observability(&workspace_id, &core, &broker, Some(&companion))
+            .await
+            .expect("read worker observability");
+        assert_eq!(observed.len(), 1);
+        assert_eq!(observed[0].get("health"), Some(&json!("waiting_claim")));
+        assert_eq!(
+            observed[0].get("claimStartupBlockedLikely"),
+            Some(&json!(true))
+        );
+        assert!(
+            observed[0]
+                .get("startupDiagnostic")
+                .and_then(Value::as_str)
+                .is_some_and(|text| text.contains("Do not keep long-polling collect"))
         );
     }
 

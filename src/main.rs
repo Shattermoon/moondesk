@@ -4482,12 +4482,13 @@ async fn run_settings(
     let config_path_text = app_config_path()?.to_string_lossy().into_owned();
     let mut confirm_reset_token_billing = false;
     let mut companion_action_notice: Option<String> = None;
+    let mut worker_connector_notice: Option<String> = None;
     let mut worker_cleanup_notice: Option<String> = None;
     let mut selected_row = {
         let app = state.lock().await;
         themes.iter().position(|t| t.id == app.theme).unwrap_or(0)
     };
-    let total_rows = themes.len() + tool_modes.len() + browser_presentations.len() + 8;
+    let total_rows = themes.len() + tool_modes.len() + browser_presentations.len() + 9;
 
     loop {
         let (
@@ -4535,6 +4536,7 @@ async fn run_settings(
                     companion_directory: companion_directory.as_deref(),
                     companion_materialize_error: companion_materialize_error.as_deref(),
                     companion_action_notice: companion_action_notice.as_deref(),
+                    worker_connector_notice: worker_connector_notice.as_deref(),
                     worker_cleanup_notice: worker_cleanup_notice.as_deref(),
                     set_moondesk_as_co_author,
                     ngrok_authtoken_configured,
@@ -4708,6 +4710,18 @@ async fn run_settings(
                                 }
                             }
                         } else if selected_row == settings_action_start + 4 {
+                            let worker_url = app.worker_public_mcp_url();
+                            drop(app);
+                            worker_connector_notice = Some(match worker_url {
+                                Some(url) if clipboard_copy(&url) => {
+                                    "Generalized Worker connector URL copied. Configure it once in the fixed Worker ChatGPT account with Authentication: None."
+                                        .into()
+                                }
+                                Some(_) => "Could not copy generalized Worker connector URL".into(),
+                                None => "Could not copy generalized Worker connector URL: configure/start ngrok first"
+                                    .into(),
+                            });
+                        } else if selected_row == settings_action_start + 5 {
                             drop(app);
                             worker_cleanup_notice = Some(
                                 run_inactive_worker_capacity_cleanup(
@@ -4717,7 +4731,7 @@ async fn run_settings(
                                 )
                                 .await?,
                             );
-                        } else if selected_row == settings_action_start + 5 {
+                        } else if selected_row == settings_action_start + 6 {
                             app.set_moondesk_as_co_author = !app.set_moondesk_as_co_author;
                             let enabled = app.set_moondesk_as_co_author;
                             app.log(
@@ -4728,11 +4742,11 @@ async fn run_settings(
                                 ),
                             );
                             app.mark_config_dirty();
-                        } else if selected_row == settings_action_start + 6 {
+                        } else if selected_row == settings_action_start + 7 {
                             drop(app);
                             let _ =
                                 run_ngrok_auth_setup(terminal, state.clone(), None, true).await?;
-                        } else if selected_row == settings_action_start + 7 {
+                        } else if selected_row == settings_action_start + 8 {
                             let previous_domain = app.ngrok_domain.clone();
                             let current_domain = previous_domain.clone().unwrap_or_default();
                             drop(app);
@@ -4949,6 +4963,7 @@ struct SettingsView<'a> {
     companion_directory: Option<&'a str>,
     companion_materialize_error: Option<&'a str>,
     companion_action_notice: Option<&'a str>,
+    worker_connector_notice: Option<&'a str>,
     worker_cleanup_notice: Option<&'a str>,
     set_moondesk_as_co_author: bool,
     ngrok_authtoken_configured: bool,
@@ -4970,6 +4985,7 @@ fn draw_settings(f: &mut Frame, view: SettingsView<'_>) {
         companion_directory,
         companion_materialize_error,
         companion_action_notice,
+        worker_connector_notice,
         worker_cleanup_notice,
         set_moondesk_as_co_author,
         ngrok_authtoken_configured,
@@ -5140,8 +5156,10 @@ fn draw_settings(f: &mut Frame, view: SettingsView<'_>) {
     let worker_effort_selected = worker_effort_row == selected_row;
     let worker_count_selected = worker_count_row == selected_row;
     let worker_setup_row = worker_count_row + 1;
-    let worker_cleanup_row = worker_setup_row + 1;
+    let worker_connector_row = worker_setup_row + 1;
+    let worker_cleanup_row = worker_connector_row + 1;
     let worker_setup_selected = worker_setup_row == selected_row;
+    let worker_connector_selected = worker_connector_row == selected_row;
     let worker_cleanup_selected = worker_cleanup_row == selected_row;
     let worker_model_style = if worker_model_selected {
         Style::default()
@@ -5165,6 +5183,13 @@ fn draw_settings(f: &mut Frame, view: SettingsView<'_>) {
         Style::default().fg(palette.primary_fg)
     };
     let worker_setup_style = if worker_setup_selected {
+        Style::default()
+            .fg(palette.key_fg)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(palette.primary_fg)
+    };
+    let worker_connector_style = if worker_connector_selected {
         Style::default()
             .fg(palette.key_fg)
             .add_modifier(Modifier::BOLD)
@@ -5285,6 +5310,31 @@ fn draw_settings(f: &mut Frame, view: SettingsView<'_>) {
         format!("     Manual repair code: {companion_pairing_code}"),
         Style::default().fg(palette.muted_fg),
     )));
+    if worker_connector_selected {
+        selected_line_idx = lines.len();
+    }
+    lines.push(Line::from(Span::styled(
+        format!(
+            " {} [{}] Copy generalized Worker connector URL",
+            if worker_connector_selected { ">" } else { " " },
+            worker_connector_row + 1
+        ),
+        worker_connector_style,
+    )));
+    lines.push(Line::from(Span::styled(
+        "     Configure this once in the fixed Worker ChatGPT account. It is account-level and resolves each Worker's workspace from its claim; the secret URL is copied, never displayed.",
+        Style::default().fg(palette.muted_fg),
+    )));
+    if let Some(notice) = worker_connector_notice {
+        lines.push(Line::from(Span::styled(
+            format!("     {notice}"),
+            Style::default().fg(if notice.starts_with("Could not") {
+                palette.danger_fg
+            } else {
+                palette.success_fg
+            }),
+        )));
+    }
     if worker_cleanup_selected {
         selected_line_idx = lines.len();
     }
@@ -11177,6 +11227,7 @@ mod tests {
                             ),
                             companion_action_notice: None,
                             companion_materialize_error: None,
+                            worker_connector_notice: None,
                             worker_cleanup_notice: None,
                             set_moondesk_as_co_author: false,
                             ngrok_authtoken_configured: false,
@@ -11215,6 +11266,7 @@ mod tests {
                         companion_directory: Some(r"C:\Users\tester\.moondesk\worker-companion"),
                         companion_action_notice: None,
                         companion_materialize_error: None,
+                        worker_connector_notice: None,
                         worker_cleanup_notice: None,
                         set_moondesk_as_co_author: false,
                         ngrok_authtoken_configured: false,
@@ -11256,7 +11308,7 @@ mod tests {
             model_label: "GPT-5.6 Sol".into(),
             reasoning_effort: super::managed_chat::types::ReasoningEffort::High,
         };
-        let backend = TestBackend::new(110, 36);
+        let backend = TestBackend::new(110, 42);
         let mut terminal = Terminal::new(backend).expect("create worker settings terminal");
 
         terminal
@@ -11273,6 +11325,7 @@ mod tests {
                         companion_directory: Some(r"C:\Users\tester\.moondesk\worker-companion"),
                         companion_materialize_error: None,
                         companion_action_notice: Some("Worker Companion folder opened. Use this folder with Developer mode -> Load unpacked."),
+                        worker_connector_notice: None,
                         worker_cleanup_notice: Some("Released 2 inactive Core families and 3 Worker records from 'Test Workspace'. ChatGPT conversations were not deleted."),
                         set_moondesk_as_co_author: false,
                         ngrok_authtoken_configured: false,
@@ -11309,6 +11362,8 @@ mod tests {
         assert!(rendered.contains("Worker Companion folder opened"));
         assert!(!rendered.contains("unavailable"));
         assert!(rendered.contains("Manual repair code: test-pairing-code"));
+        assert!(rendered.contains("Copy generalized Worker connector URL"));
+        assert!(rendered.contains("Configure this once in the fixed Worker ChatGPT account"));
         assert!(rendered.contains("Release inactive Worker capacity"));
         assert!(rendered.contains("Host-local cleanup for inaccessible old Cores"));
         assert!(rendered.contains("Released 2 inactive Core families"));
@@ -11322,7 +11377,7 @@ mod tests {
         let auth_token_row = super::theme::all().len()
             + super::ToolMode::all().len()
             + super::BrowserPresentation::all().len()
-            + 6;
+            + 7;
         let backend = TestBackend::new(100, 32);
         let mut terminal = Terminal::new(backend).expect("create ngrok auth settings terminal");
 
@@ -11340,6 +11395,7 @@ mod tests {
                         companion_directory: Some(r"C:\Users\tester\.moondesk\worker-companion"),
                         companion_action_notice: None,
                         companion_materialize_error: None,
+                        worker_connector_notice: None,
                         worker_cleanup_notice: None,
                         set_moondesk_as_co_author: false,
                         ngrok_authtoken_configured: true,
@@ -11421,6 +11477,7 @@ mod tests {
                         companion_directory: Some(r"C:\Users\tester\.moondesk\worker-companion"),
                         companion_action_notice: None,
                         companion_materialize_error: None,
+                        worker_connector_notice: None,
                         worker_cleanup_notice: None,
                         set_moondesk_as_co_author: false,
                         ngrok_authtoken_configured: false,

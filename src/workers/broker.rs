@@ -1165,6 +1165,140 @@ impl WorkerBroker {
             .cloned())
     }
 
+    pub async fn gateway_workspace_for_worker_identity(
+        &self,
+        worker_identity: &ChatIdentity,
+    ) -> Result<Option<WorkspaceId>, WorkerBrokerError> {
+        worker_identity
+            .validate()
+            .map_err(WorkerBrokerError::Invalid)?;
+        let guard = self.data.lock().await;
+        let mut matched_workspace: Option<WorkspaceId> = None;
+        for family in guard.families.values().filter(|family| {
+            family
+                .workers
+                .values()
+                .any(|worker| worker.chat_identity.as_ref() == Some(worker_identity))
+        }) {
+            if matched_workspace
+                .as_ref()
+                .is_some_and(|workspace_id| workspace_id != &family.workspace_id)
+            {
+                return Err(WorkerBrokerError::Conflict(
+                    "this Worker conversation is bound to multiple MoonDesk workspaces; Clear Workers before using the generalized Worker connector again"
+                        .into(),
+                ));
+            }
+            matched_workspace = Some(family.workspace_id.clone());
+        }
+        Ok(matched_workspace)
+    }
+
+    pub async fn gateway_workspace_for_active_worker_identity(
+        &self,
+        worker_identity: &ChatIdentity,
+    ) -> Result<Option<WorkspaceId>, WorkerBrokerError> {
+        worker_identity
+            .validate()
+            .map_err(WorkerBrokerError::Invalid)?;
+        let guard = self.data.lock().await;
+        let mut matched: Option<(WorkspaceId, WorkerState)> = None;
+        for family in guard.families.values() {
+            for worker in family.workers.values() {
+                if worker.chat_identity.as_ref() != Some(worker_identity) {
+                    continue;
+                }
+                if matched.is_some() {
+                    return Err(WorkerBrokerError::Conflict(
+                        "this Worker conversation is bound more than once; Clear Workers before using the generalized Worker connector again"
+                            .into(),
+                    ));
+                }
+                matched = Some((family.workspace_id.clone(), worker.state));
+            }
+        }
+        let Some((workspace_id, state)) = matched else {
+            return Ok(None);
+        };
+        if state != WorkerState::Running {
+            return Err(WorkerBrokerError::Conflict(format!(
+                "this Worker conversation is bound to MoonDesk but has no active running task (state={state:?}); wait for Core reuse and complete workers start before using workspace tools"
+            )));
+        }
+        Ok(Some(workspace_id))
+    }
+
+    pub async fn gateway_workspace_for_claim(
+        &self,
+        worker_id: &WorkerId,
+        task_id: &TaskId,
+        claim_token: &str,
+        claim_operation_id: &OperationId,
+        worker_identity: &ChatIdentity,
+    ) -> Result<WorkspaceId, WorkerBrokerError> {
+        worker_identity
+            .validate()
+            .map_err(WorkerBrokerError::Invalid)?;
+        let guard = self.data.lock().await;
+
+        let mut existing_binding = None;
+        for family in guard.families.values() {
+            for worker in family.workers.values() {
+                if worker.chat_identity.as_ref() != Some(worker_identity) {
+                    continue;
+                }
+                if existing_binding.is_some() {
+                    return Err(WorkerBrokerError::Conflict(
+                        "this Worker conversation is already bound more than once; Clear Workers before retrying"
+                            .into(),
+                    ));
+                }
+                existing_binding = Some((
+                    family.workspace_id.clone(),
+                    worker.id.clone(),
+                    worker.current_task_id.clone(),
+                ));
+            }
+        }
+        if let Some((workspace_id, existing_worker_id, existing_task_id)) = existing_binding {
+            if &existing_worker_id == worker_id && existing_task_id.as_ref() == Some(task_id) {
+                return Ok(workspace_id);
+            }
+            return Err(WorkerBrokerError::Conflict(
+                "this ChatGPT conversation is already bound to another MoonDesk Worker; start a fresh Worker conversation"
+                    .into(),
+            ));
+        }
+
+        let mut matched_workspace = None;
+        for family in guard.families.values() {
+            let Some(worker) = family.workers.get(worker_id) else {
+                continue;
+            };
+            if worker.current_task_id.as_ref() != Some(task_id)
+                || worker.claim_operation_id.as_ref() != Some(claim_operation_id)
+            {
+                continue;
+            }
+            let Some(expected_token) = worker.claim_token.as_deref() else {
+                continue;
+            };
+            if claim_token.len() != expected_token.len()
+                || !bool::from(claim_token.as_bytes().ct_eq(expected_token.as_bytes()))
+            {
+                continue;
+            }
+            if matched_workspace.is_some() {
+                return Err(WorkerBrokerError::Conflict(
+                    "worker claim capability matched multiple workspaces; Clear Workers before retrying"
+                        .into(),
+                ));
+            }
+            matched_workspace = Some(family.workspace_id.clone());
+        }
+        matched_workspace.ok_or(WorkerBrokerError::NotFound)
+    }
+
     pub async fn record_tool_activity(
         &self,
         workspace_id: &WorkspaceId,
@@ -1590,6 +1724,7 @@ impl WorkerBroker {
                 "the Core conversation cannot claim one of its own workers".into(),
             ));
         }
+        ensure_worker_identity_unique_binding(&guard, &family_id, worker_id, worker_identity)?;
         let worker = family
             .workers
             .get(worker_id)
@@ -1739,6 +1874,7 @@ impl WorkerBroker {
                 "the Core conversation cannot claim one of its own workers".into(),
             ));
         }
+        ensure_worker_identity_unique_binding(&guard, &family_id, worker_id, &worker_identity)?;
         let worker = family
             .workers
             .get(worker_id)
@@ -2309,6 +2445,27 @@ impl WorkerBroker {
         **guard = candidate;
         Ok(())
     }
+}
+
+fn ensure_worker_identity_unique_binding(
+    data: &WorkerStoreData,
+    current_family_id: &WorkerFamilyId,
+    current_worker_id: &WorkerId,
+    worker_identity: &ChatIdentity,
+) -> Result<(), WorkerBrokerError> {
+    let bound_elsewhere = data.families.iter().any(|(family_id, family)| {
+        family.workers.iter().any(|(worker_id, worker)| {
+            worker.chat_identity.as_ref() == Some(worker_identity)
+                && (family_id != current_family_id || worker_id != current_worker_id)
+        })
+    });
+    if bound_elsewhere {
+        return Err(WorkerBrokerError::Conflict(
+            "this ChatGPT conversation is already bound to another MoonDesk Worker; start a fresh Worker conversation"
+                .into(),
+        ));
+    }
+    Ok(())
 }
 
 fn ensure_worker_family_account_affinity(
@@ -4255,6 +4412,128 @@ mod tests {
                 .subject_digest
                 .as_deref()
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn generalized_gateway_claim_capability_resolves_workspace_then_identity_stays_pinned() {
+        let root = temp_root("moondesk-generalized-worker-gateway-routing");
+        let path = root.join("worker-state-v1.json");
+        let broker = WorkerBroker::open(&path).expect("open worker broker");
+        let workspace_a = WorkspaceId::new();
+        let workspace_b = WorkspaceId::new();
+        let core_a = ChatIdentity::local_core(&workspace_a);
+        let core_b = ChatIdentity::local_core(&workspace_b);
+        broker
+            .spawn_worker(spawn_request(
+                OperationId::new(),
+                workspace_a.clone(),
+                core_a,
+                "unrelated workspace A worker",
+            ))
+            .await
+            .expect("spawn unrelated workspace A worker");
+        let target = broker
+            .spawn_worker(spawn_request(
+                OperationId::new(),
+                workspace_b.clone(),
+                core_b.clone(),
+                "gateway target in workspace B",
+            ))
+            .await
+            .expect("spawn gateway target");
+        let claim_operation_id = target
+            .claim_operation_id
+            .clone()
+            .expect("fresh claim operation id");
+        let worker_identity =
+            ChatIdentity::from_openai_meta(Some("fixed-worker-account"), "gateway-worker-chat");
+
+        let resolved = broker
+            .gateway_workspace_for_claim(
+                &target.worker_id,
+                &target.task_id,
+                &target.claim_token,
+                &claim_operation_id,
+                &worker_identity,
+            )
+            .await
+            .expect("claim capability resolves exact workspace");
+        assert_eq!(resolved, workspace_b);
+        assert_eq!(
+            broker
+                .gateway_workspace_for_worker_identity(&worker_identity)
+                .await
+                .expect("lookup before claim"),
+            None,
+            "ordinary tools must not route before claim binds the Worker chat"
+        );
+
+        make_claimable(&broker, &workspace_b, &core_b, &target).await;
+        broker
+            .claim_worker(
+                &workspace_b,
+                &target.worker_id,
+                &target.task_id,
+                &target.claim_token,
+                worker_identity.clone(),
+            )
+            .await
+            .expect("claim target Worker");
+        assert_eq!(
+            broker
+                .gateway_workspace_for_worker_identity(&worker_identity)
+                .await
+                .expect("lookup after claim"),
+            Some(workspace_b.clone())
+        );
+        assert_eq!(
+            broker
+                .gateway_workspace_for_active_worker_identity(&worker_identity)
+                .await
+                .expect("active lookup after claim"),
+            Some(workspace_b.clone())
+        );
+        broker
+            .finish_task(FinishTaskRequest {
+                workspace_id: workspace_b.clone(),
+                worker_identity: worker_identity.clone(),
+                worker_id: target.worker_id.clone(),
+                task_id: target.task_id.clone(),
+                result: finished_result(),
+            })
+            .await
+            .expect("finish gateway target");
+        let idle_tool_access = broker
+            .gateway_workspace_for_active_worker_identity(&worker_identity)
+            .await
+            .expect_err("idle Worker chat must not retain ordinary workspace-tool authority");
+        assert!(
+            idle_tool_access
+                .to_string()
+                .contains("no active running task")
+        );
+        assert_eq!(
+            broker
+                .gateway_workspace_for_worker_identity(&worker_identity)
+                .await
+                .expect("lifecycle routing remains available while idle"),
+            Some(workspace_b.clone())
+        );
+        let wrong_token = broker
+            .gateway_workspace_for_claim(
+                &target.worker_id,
+                &target.task_id,
+                "wrong-token",
+                &claim_operation_id,
+                &ChatIdentity::from_openai_meta(
+                    Some("fixed-worker-account"),
+                    "different-worker-chat",
+                ),
+            )
+            .await
+            .expect_err("claim capability must remain secret before identity binding");
+        assert_eq!(wrong_token, WorkerBrokerError::NotFound);
         let _ = std::fs::remove_dir_all(root);
     }
 

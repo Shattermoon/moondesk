@@ -254,6 +254,9 @@ pub fn router(
         host_control_token,
     };
     let mcp_routes = Router::new()
+        .route("/worker/{worker_slug}/mcp", post(post_worker_mcp_http))
+        .route("/worker/{worker_slug}/mcp", get(get_worker_mcp))
+        .route("/worker/{worker_slug}/mcp", delete(delete_worker_mcp))
         .route("/{slug}/mcp", post(post_mcp_http))
         .route("/{slug}/mcp", get(get_mcp))
         .route("/{slug}/mcp", delete(delete_mcp))
@@ -2111,6 +2114,7 @@ fn apply_local_ide_core_marker(body: &mut Value, local_ide_core: bool) {
     }
     let meta = meta.as_object_mut().expect("meta was normalized to object");
     meta.remove(mcp::LOCAL_IDE_CORE_META_KEY);
+    meta.remove(mcp::WORKER_GATEWAY_META_KEY);
     if local_ide_core {
         // Local IDE Core authority is intentionally account-independent. Even if Codex happens
         // to attach OpenAI account/session metadata, do not let it participate in Worker-family
@@ -2118,6 +2122,38 @@ fn apply_local_ide_core_marker(body: &mut Value, local_ide_core: bool) {
         meta.remove("openai/session");
         meta.remove("openai/subject");
         meta.insert(mcp::LOCAL_IDE_CORE_META_KEY.to_string(), Value::Bool(true));
+    }
+}
+
+fn apply_worker_gateway_marker(body: &mut Value, worker_gateway: bool) {
+    let Some(object) = body.as_object_mut() else {
+        return;
+    };
+    let params = object
+        .entry("params".to_string())
+        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    if !params.is_object() {
+        if !worker_gateway {
+            return;
+        }
+        *params = Value::Object(serde_json::Map::new());
+    }
+    let params = params
+        .as_object_mut()
+        .expect("params was normalized to object");
+    let meta = params
+        .entry("_meta".to_string())
+        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    if !meta.is_object() {
+        if !worker_gateway {
+            return;
+        }
+        *meta = Value::Object(serde_json::Map::new());
+    }
+    let meta = meta.as_object_mut().expect("meta was normalized to object");
+    meta.remove(mcp::WORKER_GATEWAY_META_KEY);
+    if worker_gateway {
+        meta.insert(mcp::WORKER_GATEWAY_META_KEY.to_string(), Value::Bool(true));
     }
 }
 
@@ -2137,6 +2173,170 @@ fn normalized_openai_request_id(headers: &HeaderMap) -> Option<String> {
         return None;
     }
     Some(id.to_string())
+}
+
+async fn worker_gateway_slug_matches(state: &ServerState, supplied: &str) -> bool {
+    let expected = state.app.lock().await.worker_mcp_slug.clone();
+    supplied.len() == expected.len() && bool::from(supplied.as_bytes().ct_eq(expected.as_bytes()))
+}
+
+async fn worker_gateway_workspace_slug(
+    state: &ServerState,
+    req: &mcp::JsonRpcRequest,
+) -> Result<String, String> {
+    let (broker, gateway_fallback_slug) = {
+        let app = state.app.lock().await;
+        let gateway_fallback_slug = app
+            .workspaces
+            .iter()
+            .find(|workspace| {
+                workspaces::workspace_availability(&workspace.root)
+                    != WorkspaceAvailability::Protected
+            })
+            .map(|workspace| workspace.mcp_slug.clone())
+            .ok_or_else(|| "MoonDesk has no routable registered workspace".to_string())?;
+        (app.worker_broker.clone(), gateway_fallback_slug)
+    };
+
+    if req.method != "tools/call" {
+        return Ok(gateway_fallback_slug);
+    }
+
+    let identity = mcp::exact_chat_identity(req)?;
+    let tool_name = req
+        .params
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "tools/call requires a tool name".to_string())?;
+    let arguments = req
+        .params
+        .get("arguments")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+
+    let worker_action = (tool_name == "workers")
+        .then(|| arguments.get("action").and_then(Value::as_str))
+        .flatten();
+    let workspace_id = if worker_action == Some("claim") {
+        let worker_id = arguments
+            .get("worker_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "workers claim requires worker_id".to_string())
+            .and_then(crate::workers::types::WorkerId::parse)?;
+        let task_id = arguments
+            .get("task_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "workers claim requires task_id".to_string())
+            .and_then(crate::workers::types::TaskId::parse)?;
+        let claim_operation_id = arguments
+            .get("operation_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "workers claim requires operation_id".to_string())
+            .and_then(crate::workers::types::OperationId::parse)?;
+        let claim_token = arguments
+            .get("claim_token")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "workers claim requires claim_token".to_string())?;
+        broker
+            .gateway_workspace_for_claim(
+                &worker_id,
+                &task_id,
+                claim_token,
+                &claim_operation_id,
+                &identity,
+            )
+            .await
+            .map_err(|error| error.to_string())?
+    } else if tool_name == "workers" {
+        broker
+            .gateway_workspace_for_worker_identity(&identity)
+            .await
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| {
+                "This Worker conversation has not claimed a MoonDesk task yet. Call workers action=claim with the exact bootstrap capability before using Worker lifecycle actions."
+                    .to_string()
+            })?
+    } else {
+        broker
+            .gateway_workspace_for_active_worker_identity(&identity)
+            .await
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| {
+                "This Worker conversation has not claimed a MoonDesk task yet. Call workers action=claim with the exact bootstrap capability before using project tools."
+                    .to_string()
+            })?
+    };
+
+    let app = state.app.lock().await;
+    app.workspaces
+        .iter()
+        .find(|workspace| workspace.id == workspace_id)
+        .map(|workspace| workspace.mcp_slug.clone())
+        .ok_or_else(|| {
+            "The claimed Worker workspace is no longer registered in MoonDesk".to_string()
+        })
+}
+
+async fn post_worker_mcp_http(
+    AxumPath(worker_slug): AxumPath<String>,
+    State(s): State<ServerState>,
+    headers: HeaderMap,
+    body_bytes: Bytes,
+) -> Response<Body> {
+    if headers.contains_key(HOST_CONTROL_HEADER)
+        || !worker_gateway_slug_matches(&s, &worker_slug).await
+    {
+        return not_found_response();
+    }
+    let req: mcp::JsonRpcRequest = match serde_json::from_slice(&body_bytes) {
+        Ok(req) => req,
+        Err(error) => {
+            return jsonrpc_error_response(
+                StatusCode::BAD_REQUEST,
+                -32700,
+                &format!("Parse error: {error}"),
+            );
+        }
+    };
+    let workspace_slug = match worker_gateway_workspace_slug(&s, &req).await {
+        Ok(slug) => slug,
+        Err(error) => return jsonrpc_error_response(StatusCode::OK, -32001, &error),
+    };
+    post_mcp_with_request_id(
+        AxumPath(workspace_slug),
+        State(s),
+        body_bytes,
+        normalized_openai_request_id(&headers),
+        false,
+        true,
+    )
+    .await
+}
+
+async fn get_worker_mcp(
+    AxumPath(worker_slug): AxumPath<String>,
+    State(s): State<ServerState>,
+) -> Response<Body> {
+    if !worker_gateway_slug_matches(&s, &worker_slug).await {
+        return not_found_response();
+    }
+    response_with_body(
+        StatusCode::METHOD_NOT_ALLOWED,
+        "application/json",
+        Body::from(
+            r#"{"jsonrpc":"2.0","error":{"code":-32601,"message":"GET SSE stream is disabled in pure HTTP mode"}}"#,
+        ),
+    )
+}
+
+async fn delete_worker_mcp(
+    AxumPath(worker_slug): AxumPath<String>,
+    State(s): State<ServerState>,
+) -> Response<Body> {
+    if !worker_gateway_slug_matches(&s, &worker_slug).await {
+        return not_found_response();
+    }
+    response_with_body(StatusCode::OK, "application/json", Body::from("{}"))
 }
 
 async fn post_mcp_http(
@@ -2160,6 +2360,7 @@ async fn post_mcp_http(
         body_bytes,
         inbound_request_id,
         local_ide_core,
+        false,
     )
     .await
 }
@@ -2170,7 +2371,7 @@ async fn post_mcp(
     State(s): State<ServerState>,
     body_bytes: Bytes,
 ) -> Response<Body> {
-    post_mcp_with_request_id(AxumPath(slug), State(s), body_bytes, None, false).await
+    post_mcp_with_request_id(AxumPath(slug), State(s), body_bytes, None, false, false).await
 }
 
 async fn post_mcp_with_request_id(
@@ -2179,6 +2380,7 @@ async fn post_mcp_with_request_id(
     body_bytes: Bytes,
     inbound_request_id: Option<String>,
     local_ide_core: bool,
+    worker_gateway: bool,
 ) -> Response<Body> {
     let Some((workspace, runtime, _request_lease)) = resolve_workspace(&s, &slug).await else {
         return not_found_response();
@@ -2202,6 +2404,7 @@ async fn post_mcp_with_request_id(
         );
     }
     apply_local_ide_core_marker(&mut body, local_ide_core);
+    apply_worker_gateway_marker(&mut body, worker_gateway);
 
     if body.get("method").and_then(Value::as_str) == Some("tools/call")
         && let Err(retry_after) = runtime.check_tool_invocation()
@@ -2517,6 +2720,170 @@ mod tests {
             public.pointer("/params/_meta/openai~1subject").is_none(),
             "trusted local Core must discard OpenAI account identity"
         );
+    }
+
+    #[test]
+    fn worker_gateway_marker_is_host_owned_and_preserves_worker_chat_identity() {
+        let mut public = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/list",
+            "params": {
+                "_meta": {
+                    mcp::WORKER_GATEWAY_META_KEY: true,
+                    "openai/session": "worker-session",
+                    "openai/subject": "worker-account"
+                }
+            }
+        });
+        apply_worker_gateway_marker(&mut public, false);
+        assert!(
+            public
+                .pointer("/params/_meta/moondesk~1worker-gateway")
+                .is_none(),
+            "ordinary workspace connectors must not be able to spoof generalized Worker authority"
+        );
+        apply_worker_gateway_marker(&mut public, true);
+        assert_eq!(
+            public
+                .pointer("/params/_meta/moondesk~1worker-gateway")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            public
+                .pointer("/params/_meta/openai~1session")
+                .and_then(Value::as_str),
+            Some("worker-session"),
+            "Worker gateway must preserve exact ChatGPT conversation identity"
+        );
+        assert_eq!(
+            public
+                .pointer("/params/_meta/openai~1subject")
+                .and_then(Value::as_str),
+            Some("worker-account")
+        );
+    }
+
+    #[tokio::test]
+    async fn generalized_worker_gateway_http_route_requires_secret_and_returns_gateway_schema() {
+        let workspace_root = unique_temp_path("moondesk-worker-gateway-http-workspace");
+        let config_root = unique_temp_path("moondesk-worker-gateway-http-config");
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        std::fs::create_dir_all(&config_root).expect("create config root");
+        let config_path = config_root.join("config.toml");
+        let mut app = AppState::new_for_test(
+            8787,
+            workspace_root.to_string_lossy().into_owned(),
+            config_path,
+        )
+        .expect("create app state");
+        app.mode = Mode::Both;
+        app.tool_mode = ToolMode::MultiTools;
+        let worker_slug = app.worker_mcp_slug.clone();
+        let shared = Arc::new(Mutex::new(app));
+        let (ui_tx, _ui_rx) = ui_event_channel();
+        let server_state = ServerState {
+            app: shared,
+            browser_runtime: None,
+            command_jobs: CommandJobManager::new(),
+            ui_events: ui_tx,
+            host_control_token: Arc::from("test-host-control-token"),
+        };
+
+        let initialize = post_worker_mcp_http(
+            AxumPath(worker_slug.clone()),
+            State(server_state.clone()),
+            HeaderMap::new(),
+            Bytes::from_static(
+                br#"{"jsonrpc":"2.0","id":"gateway-init","method":"initialize","params":{}}"#,
+            ),
+        )
+        .await;
+        assert_eq!(initialize.status(), StatusCode::OK);
+        let payload: Value = serde_json::from_slice(
+            &to_bytes(initialize.into_body(), usize::MAX)
+                .await
+                .expect("read initialize body"),
+        )
+        .expect("parse initialize body");
+        assert_eq!(
+            payload
+                .pointer("/result/serverInfo/name")
+                .and_then(Value::as_str),
+            Some("moondesk-worker-gateway")
+        );
+
+        let tools = post_worker_mcp_http(
+            AxumPath(worker_slug.clone()),
+            State(server_state.clone()),
+            HeaderMap::new(),
+            Bytes::from_static(
+                br#"{"jsonrpc":"2.0","id":"gateway-tools","method":"tools/list","params":{}}"#,
+            ),
+        )
+        .await;
+        assert_eq!(tools.status(), StatusCode::OK);
+        let payload: Value = serde_json::from_slice(
+            &to_bytes(tools.into_body(), usize::MAX)
+                .await
+                .expect("read tools body"),
+        )
+        .expect("parse tools body");
+        let worker_tool = payload
+            .pointer("/result/tools")
+            .and_then(Value::as_array)
+            .and_then(|tools| {
+                tools
+                    .iter()
+                    .find(|tool| tool.get("name").and_then(Value::as_str) == Some("workers"))
+            })
+            .expect("generalized workers tool");
+        assert_eq!(
+            worker_tool
+                .pointer("/inputSchema/properties/action/enum")
+                .and_then(Value::as_array)
+                .map(|actions| actions.iter().filter_map(Value::as_str).collect::<Vec<_>>()),
+            Some(vec!["claim", "start", "inbox", "ack", "report", "finish"])
+        );
+
+        let unclaimed_read = post_worker_mcp_http(
+            AxumPath(worker_slug.clone()),
+            State(server_state.clone()),
+            HeaderMap::new(),
+            Bytes::from_static(
+                br#"{"jsonrpc":"2.0","id":"gateway-unclaimed-read","method":"tools/call","params":{"name":"read","arguments":{"path":"README.md"},"_meta":{"openai/subject":"fixed-worker-account","openai/session":"unclaimed-worker-chat"}}}"#,
+            ),
+        )
+        .await;
+        assert_eq!(unclaimed_read.status(), StatusCode::OK);
+        let payload: Value = serde_json::from_slice(
+            &to_bytes(unclaimed_read.into_body(), usize::MAX)
+                .await
+                .expect("read unclaimed tool response"),
+        )
+        .expect("parse unclaimed tool response");
+        assert!(
+            payload
+                .pointer("/error/message")
+                .and_then(Value::as_str)
+                .is_some_and(|message| message.contains("has not claimed a MoonDesk task yet")),
+            "an unclaimed generic chat must not receive workspace authority"
+        );
+
+        let rejected = post_worker_mcp_http(
+            AxumPath("definitely-wrong-worker-secret".into()),
+            State(server_state),
+            HeaderMap::new(),
+            Bytes::from_static(
+                br#"{"jsonrpc":"2.0","id":"wrong-secret","method":"tools/list","params":{}}"#,
+            ),
+        )
+        .await;
+        assert_eq!(rejected.status(), StatusCode::NOT_FOUND);
+
+        let _ = std::fs::remove_dir_all(workspace_root);
+        let _ = std::fs::remove_dir_all(config_root);
     }
 
     #[test]
@@ -5886,6 +6253,102 @@ document.getElementById('hidden-upload').addEventListener('change',event=>{docum
         let _ = std::fs::remove_file(config_path);
         let _ = std::fs::remove_dir_all(config_root);
         let _ = std::fs::remove_dir_all(parent);
+    }
+
+    #[tokio::test]
+    async fn generalized_worker_gateway_claim_routes_to_non_primary_workspace() {
+        let workspace_a = unique_temp_path("moondesk-worker-gateway-primary");
+        let workspace_b = unique_temp_path("moondesk-worker-gateway-target");
+        let config_root = unique_temp_path("moondesk-worker-gateway-config");
+        std::fs::create_dir_all(&workspace_a).expect("create primary workspace");
+        std::fs::create_dir_all(&workspace_b).expect("create target workspace");
+        std::fs::create_dir_all(&config_root).expect("create config root");
+        let config_path = config_root.join("config.toml");
+        let app = AppState::new_for_test(
+            8787,
+            workspace_a.to_string_lossy().into_owned(),
+            config_path.clone(),
+        )
+        .expect("create app state");
+        let shared = Arc::new(Mutex::new(app));
+        let target_workspace =
+            crate::state::add_workspace(&shared, "Gateway target".into(), workspace_b.clone())
+                .await
+                .expect("add target workspace");
+        let (broker, target_slug) = {
+            let app = shared.lock().await;
+            (app.worker_broker.clone(), target_workspace.mcp_slug.clone())
+        };
+        let core = crate::workers::types::ChatIdentity::local_core(&target_workspace.id);
+        let spawned = broker
+            .spawn_worker(crate::workers::broker::SpawnWorkerRequest {
+                operation_id: crate::workers::types::OperationId::new(),
+                workspace_id: target_workspace.id.clone(),
+                anchor_identity: core,
+                label: "gateway routing".into(),
+                assignment: "prove generalized connector resolves the non-primary workspace".into(),
+                context: String::new(),
+                execution_profile: ChatExecutionProfile::default(),
+            })
+            .await
+            .expect("spawn target Worker");
+        let claim_operation_id = spawned
+            .claim_operation_id
+            .clone()
+            .expect("fresh Worker claim operation id");
+        let (ui_tx, _ui_rx) = ui_event_channel();
+        let server_state = ServerState {
+            app: shared,
+            browser_runtime: None,
+            command_jobs: CommandJobManager::new(),
+            ui_events: ui_tx,
+            host_control_token: Arc::from("test-host-control-token"),
+        };
+        let claim_request = mcp::JsonRpcRequest {
+            jsonrpc: "2.0".into(),
+            id: Some(json!("gateway-claim-route")),
+            method: "tools/call".into(),
+            params: json!({
+                "name": "workers",
+                "arguments": {
+                    "action": "claim",
+                    "worker_id": spawned.worker_id,
+                    "task_id": spawned.task_id,
+                    "claim_token": spawned.claim_token,
+                    "operation_id": claim_operation_id
+                },
+                "_meta": {
+                    "openai/subject": "fixed-worker-account",
+                    "openai/session": "gateway-worker-chat"
+                }
+            }),
+        };
+        let resolved = worker_gateway_workspace_slug(&server_state, &claim_request)
+            .await
+            .expect("claim capability must route gateway to target workspace");
+        assert_eq!(resolved, target_slug);
+
+        let preclaim_read = mcp::JsonRpcRequest {
+            jsonrpc: "2.0".into(),
+            id: Some(json!("gateway-preclaim-read")),
+            method: "tools/call".into(),
+            params: json!({
+                "name": "read",
+                "arguments": { "path": "README.md" },
+                "_meta": {
+                    "openai/subject": "fixed-worker-account",
+                    "openai/session": "gateway-worker-chat"
+                }
+            }),
+        };
+        let error = worker_gateway_workspace_slug(&server_state, &preclaim_read)
+            .await
+            .expect_err("ordinary workspace tools must fail before Worker claim");
+        assert!(error.contains("has not claimed a MoonDesk task yet"));
+
+        let _ = std::fs::remove_dir_all(workspace_a);
+        let _ = std::fs::remove_dir_all(workspace_b);
+        let _ = std::fs::remove_dir_all(config_root);
     }
 
     #[tokio::test]

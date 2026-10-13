@@ -20,7 +20,7 @@ It intentionally owns only a small surface:
 - never expose failed worker launches as delayed manual replay buttons; proven pre-Send fresh-launch failures automatically free their worker slot, while failed durable-worker wakes return that worker to idle;
 - provide an explicit **Clear workers** reset for the current Core that removes idle/retired and proven pre-Send-failed MoonDesk worker history/bindings without deleting ChatGPT conversations, while refusing active or ambiguous work.
 
-It does **not** match ChatGPT Projects, MoonDesk workspaces, connectors, or local folders by display name. Workspace authority remains the exact MoonDesk connector route / WorkspaceId. User-browser control is **not PC control**: it cannot operate arbitrary desktop applications or silently turn the user's personal browser profile into MoonDesk's managed browser session. It also does **not** record transcripts, spawn nested workers, mirror agent state, or use the workspace MCP URL as an authentication credential.
+It does **not** match ChatGPT Projects, MoonDesk workspaces, connectors, or local folders by display name. Browser-Core workspace authority remains the exact workspace connector route / WorkspaceId; local Codex Workers use the installation-wide generalized Worker connector, whose one-time claim resolves the exact WorkspaceId and binds that Worker conversation durably. User-browser control is **not PC control**: it cannot operate arbitrary desktop applications or silently turn the user's personal browser profile into MoonDesk's managed browser session. It also does **not** record transcripts, spawn nested workers, mirror agent state, or use any MCP URL as a browser-extension authentication credential.
 
 ## Distribution
 

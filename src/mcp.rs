@@ -36,6 +36,7 @@ const SERVER_NAME: &str = "moondesk";
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 const MCP_PROTOCOL_VERSION: &str = "2025-11-25";
 pub const LOCAL_IDE_CORE_META_KEY: &str = "moondesk/local-ide-core";
+pub const WORKER_GATEWAY_META_KEY: &str = "moondesk/worker-gateway";
 
 // ── JSON-RPC types ──────────────────────────────────────────
 
@@ -111,7 +112,11 @@ pub async fn handle_request(
     context: McpRequestContext<'_>,
 ) -> Option<JsonRpcResponse> {
     match req.method.as_str() {
-        "initialize" => Some(handle_initialize(req, local_ide_core_request(req))),
+        "initialize" => Some(handle_initialize(
+            req,
+            local_ide_core_request(req),
+            worker_gateway_request(req),
+        )),
         m if m.starts_with("notifications/") => None,
         "tools/list" => Some(handle_tools_list(req, context.mode, context.tool_mode).await),
         "tools/call" => Some(handle_tools_call_for_workspace(req, context).await),
@@ -124,9 +129,15 @@ pub async fn handle_request(
     }
 }
 
-fn handle_initialize(req: &JsonRpcRequest, local_ide_core: bool) -> JsonRpcResponse {
+fn handle_initialize(
+    req: &JsonRpcRequest,
+    local_ide_core: bool,
+    worker_gateway: bool,
+) -> JsonRpcResponse {
     let server_name = if local_ide_core {
         "moondesk-local-workers"
+    } else if worker_gateway {
+        "moondesk-worker-gateway"
     } else {
         SERVER_NAME
     };
@@ -139,7 +150,12 @@ fn handle_initialize(req: &JsonRpcRequest, local_ide_core: bool) -> JsonRpcRespo
     });
     if local_ide_core {
         result["instructions"] = Value::String(
-            "Machine-local MoonDesk Worker orchestrator for Codex/IDE. Use this server for Worker status/spawn/reuse/recover/send/collect/retire regardless of the ChatGPT account currently logged into Codex. Continue ordinary Core work with Codex native tools. Browser Worker chats keep using their normal MoonDesk ChatGPT connector."
+            "Machine-local MoonDesk Worker orchestrator for Codex/IDE. Use this server for Worker status/spawn/reuse/recover/send/collect/retire regardless of the ChatGPT account currently logged into Codex. Continue ordinary Core work with Codex native tools. Browser Worker chats use the generalized MoonDesk Worker connector."
+                .into(),
+        );
+    } else if worker_gateway {
+        result["instructions"] = Value::String(
+            "Generalized MoonDesk Worker connector. A fresh Worker must call workers claim before doing project work. MoonDesk resolves the owning workspace from the claim capability and then routes this exact Worker conversation to that workspace automatically. Do not guess or supply a workspace."
                 .into(),
         );
     }
@@ -606,7 +622,7 @@ fn workers_tool_descriptor() -> Value {
     json!({
         "name": "workers",
         "title": "Coordinate workers",
-        "description": "Coordinate MoonDesk workers. Core: status/spawn/reuse/recover/send/collect/retire; Worker: claim/start/inbox/ack/report/finish. ROLE-SCOPED RULE: browser ChatGPT Core may orchestrate Workers here; browserless Codex/IDE Core must use the machine-local `moondesk mcp` server instead of this account-bound connector. This restriction NEVER applies inside a MoonDesk Worker conversation: Workers should use this workspace's MoonDesk connector/tools normally. Fresh spawn `context` may carry shared goals, constraints, settled decisions, validation, and sibling ownership while `task` stays worker-specific. Reuse keeps the same durable worker chat; send only new direction. Provisioning/Waking is queued, not started. health=suspect means the exact Worker is stale even if the browser says generating; recover before replacing it. collect may wait up to 60 seconds. Retry uncertain requests with the same `operation_id`.",
+        "description": "Coordinate MoonDesk workers. Core: status/spawn/reuse/recover/send/collect/retire; Worker: claim/start/inbox/ack/report/finish. ROLE-SCOPED RULE: browser ChatGPT Core may orchestrate Workers here; browserless Codex/IDE Core must use the machine-local `moondesk mcp` server instead of this account-bound connector. Workers launched by local IDE use the generalized MoonDesk Worker connector, which resolves their workspace from claim and exact Worker chat identity. Fresh spawn `context` may carry shared goals, constraints, settled decisions, validation, and sibling ownership while `task` stays worker-specific. Reuse keeps the same durable worker chat; send only new direction. Provisioning/Waking is queued, not started. health=suspect means the exact Worker is stale even if the browser says generating; recover before replacing it. collect may wait up to 60 seconds. Retry uncertain requests with the same `operation_id`.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -665,10 +681,36 @@ fn workers_tool_descriptor() -> Value {
     })
 }
 
+fn worker_gateway_workers_tool_descriptor() -> Value {
+    let mut descriptor = workers_tool_descriptor();
+    descriptor["description"] = json!(
+        "Worker-side lifecycle for the generalized MoonDesk Worker connector. Fresh Workers must claim first; MoonDesk resolves the workspace from the claim capability and binds this exact ChatGPT conversation to it. Actions: claim, start, inbox, ack, report, finish. Never spawn or orchestrate sibling Workers from a Worker conversation."
+    );
+    if let Some(action_enum) = descriptor.pointer_mut("/inputSchema/properties/action/enum") {
+        *action_enum = json!(["claim", "start", "inbox", "ack", "report", "finish"]);
+    }
+    if let Some(properties) = descriptor
+        .pointer_mut("/inputSchema/properties")
+        .and_then(Value::as_object_mut)
+    {
+        for key in [
+            "label",
+            "task",
+            "context",
+            "wait_ms",
+            "worker_browser_id",
+            "browserless_core",
+        ] {
+            properties.remove(key);
+        }
+    }
+    descriptor
+}
+
 fn local_ide_workers_tool_descriptor() -> Value {
     let mut descriptor = workers_tool_descriptor();
     descriptor["description"] = json!(
-        "Coordinate MoonDesk browser Workers from local Codex/IDE. Core actions: status, spawn, reuse, recover, send, collect, retire. Worker chats run in the paired Companion browser and keep using their normal MoonDesk ChatGPT connector. Local IDE Core is account-independent: switching the ChatGPT account used by Codex does not change Worker ownership or the Worker browser account. Treat one workspace as one logical Codex Core at a time; separate concurrent Codex sessions share the same Worker family. Fresh spawn `context` may carry shared goals/constraints while `task` stays worker-specific. Provisioning/Waking is queued, not started; wait for Running/start activity. Do not repeatedly long-poll collect while a Worker is still waiting_claim. If status shows claimStartupBlockedLikely=true, report the Worker startup/connector blocker immediately instead of waiting: the browser chat is idle but the Worker never claimed. If status.migrationBlocked is true, do not spawn: an older Core still owns an active Worker and must finish or be cleared first. health=suspect means the exact Worker is stale even if ChatGPT still shows generating; recover before replacing it. Continue independent Core work while Workers run and collect results when needed."
+        "Coordinate MoonDesk browser Workers from local Codex/IDE. Core actions: status, spawn, reuse, recover, send, collect, retire. Worker chats run in the paired Companion browser and use the one generalized MoonDesk Worker connector; MoonDesk resolves each Worker's workspace from claim and exact Worker chat identity. Local IDE Core is account-independent: switching the ChatGPT account used by Codex does not change Worker ownership or the Worker browser account. Treat one workspace as one logical Codex Core at a time; separate concurrent Codex sessions share the same Worker family. Fresh spawn `context` may carry shared goals/constraints while `task` stays worker-specific. Provisioning/Waking is queued, not started; wait for Running/start activity. Do not repeatedly long-poll collect while a Worker is still waiting_claim. If status shows claimStartupBlockedLikely=true, report the Worker startup/connector blocker immediately instead of waiting: the browser chat is idle but the Worker never claimed. If status.migrationBlocked is true, do not spawn: an older Core still owns an active Worker and must finish or be cleared first. health=suspect means the exact Worker is stale even if ChatGPT still shows generating; recover before replacing it. Continue independent Core work while Workers run and collect results when needed."
     );
     if let Some(action_enum) = descriptor.pointer_mut("/inputSchema/properties/action/enum") {
         *action_enum = json!([
@@ -1140,8 +1182,14 @@ async fn handle_tools_list(
         }
 
         if tool_mode.write_tools_enabled() {
-            tools.push(workers_tool_descriptor());
-            push_user_browser_tools(&mut tools);
+            tools.push(if worker_gateway_request(req) {
+                worker_gateway_workers_tool_descriptor()
+            } else {
+                workers_tool_descriptor()
+            });
+            if !worker_gateway_request(req) {
+                push_user_browser_tools(&mut tools);
+            }
         }
         tools.push(json!({
             "name": "moondesk_instruction",
@@ -1510,6 +1558,22 @@ fn local_ide_core_request(req: &JsonRpcRequest) -> bool {
         .and_then(|meta| meta.get(LOCAL_IDE_CORE_META_KEY))
         .and_then(Value::as_bool)
         == Some(true)
+}
+
+fn worker_gateway_request(req: &JsonRpcRequest) -> bool {
+    req.params
+        .get("_meta")
+        .and_then(Value::as_object)
+        .and_then(|meta| meta.get(WORKER_GATEWAY_META_KEY))
+        .and_then(Value::as_bool)
+        == Some(true)
+}
+
+pub(crate) fn exact_chat_identity(req: &JsonRpcRequest) -> Result<ChatIdentity, String> {
+    optional_chat_identity(req)?.ok_or_else(|| {
+        "generalized MoonDesk Worker connector requires exact ChatGPT conversation identity; openai/session metadata is missing or invalid"
+            .to_string()
+    })
 }
 
 fn worker_caller_identity(
@@ -2080,7 +2144,7 @@ async fn worker_observability(
                 "recoveryGuardAgeMs": recovery_guard_age_ms,
                 "claimStartupBlockedLikely": claim_startup_blocker_likely,
                 "startupDiagnostic": claim_startup_blocker_likely.then_some(
-                    "The Worker conversation is confirmed and the browser is idle, but the Worker never completed workers claim. The most likely causes are that this Worker account does not have the MoonDesk Custom Connector for this workspace available in the chat, or the claim failed before registration. Do not keep long-polling collect while the Worker remains waiting_claim; fix the Worker connector/claim path and retry with a fresh Worker."
+                    "The Worker conversation is confirmed and the browser is idle, but the Worker never completed workers claim. The most likely causes are that the generalized MoonDesk Worker connector is unavailable in this Worker account/chat, or the claim failed before registration. Do not keep long-polling collect while the Worker remains waiting_claim; fix the generalized Worker connector/claim path and retry with a fresh Worker."
                 ),
                 "recentToolCalls": snapshot
                     .map(|snapshot| snapshot.recent_tool_calls.clone())
@@ -2489,6 +2553,13 @@ async fn handle_tools_call_for_workspace(
                 .into(),
         );
     }
+    if worker_gateway_request(req) && user_browser_tool(&tool_name) {
+        return tool_error_response_text_only(
+            req,
+            "The generalized MoonDesk Worker connector cannot control the user's personal browser; use workspace-scoped MoonDesk tools for the assigned Worker task."
+                .into(),
+        );
+    }
 
     // Clear Workers mirrors Chat on Steroids' retired-worker fence: a recently cleared worker tab
     // must not fall through and regain ordinary Core authority merely because its family history was
@@ -2653,6 +2724,18 @@ async fn handle_tools_call_for_workspace(
             return tool_error_response_text_only(
                 req,
                 "Local Codex/IDE Core may use only workers status/spawn/reuse/recover/send/collect/retire; Worker-side lifecycle actions must come from the exact browser Worker conversation."
+                    .into(),
+            );
+        }
+        if worker_gateway_request(req)
+            && !matches!(
+                action,
+                Some("claim" | "start" | "inbox" | "ack" | "report" | "finish")
+            )
+        {
+            return tool_error_response_text_only(
+                req,
+                "The generalized MoonDesk Worker connector is Worker-only and may use only workers claim/start/inbox/ack/report/finish. Core orchestration must use the machine-local Codex MCP."
                     .into(),
             );
         }
@@ -7603,14 +7686,8 @@ mod tests {
         assert!(description.contains("Fresh spawn `context` may carry shared goals"));
         assert!(description.contains("ROLE-SCOPED RULE"));
         assert!(description.contains("browserless Codex/IDE Core must use the machine-local"));
-        assert!(
-            description
-                .contains("This restriction NEVER applies inside a MoonDesk Worker conversation")
-        );
-        assert!(
-            description
-                .contains("Workers should use this workspace's MoonDesk connector/tools normally")
-        );
+        assert!(description.contains("generalized MoonDesk Worker connector"));
+        assert!(description.contains("resolves their workspace from claim"));
         assert!(description.contains("Reuse keeps the same durable worker chat"));
         assert!(description.contains("same `operation_id`"));
         assert!(
@@ -7685,6 +7762,80 @@ mod tests {
                 .get("description")
                 .and_then(Value::as_str)
                 .is_some_and(|description| description.contains("account-independent"))
+        );
+    }
+
+    #[tokio::test]
+    async fn generalized_worker_gateway_advertises_worker_side_lifecycle_and_workspace_tools() {
+        let initialize = JsonRpcRequest {
+            jsonrpc: "2.0".into(),
+            id: Some(json!("worker-gateway-init")),
+            method: "initialize".into(),
+            params: json!({
+                "_meta": { WORKER_GATEWAY_META_KEY: true }
+            }),
+        };
+        let initialized = handle_initialize(&initialize, false, true);
+        let init_result = initialized
+            .result
+            .as_ref()
+            .expect("gateway initialize result");
+        assert_eq!(
+            init_result
+                .pointer("/serverInfo/name")
+                .and_then(Value::as_str),
+            Some("moondesk-worker-gateway")
+        );
+        assert!(
+            init_result
+                .get("instructions")
+                .and_then(Value::as_str)
+                .is_some_and(|text| text.contains("resolves the owning workspace from the claim"))
+        );
+
+        let request = JsonRpcRequest {
+            jsonrpc: "2.0".into(),
+            id: Some(json!("worker-gateway-tools")),
+            method: "tools/list".into(),
+            params: json!({
+                "_meta": { WORKER_GATEWAY_META_KEY: true }
+            }),
+        };
+        let response = handle_tools_list(&request, Mode::Both, ToolMode::MultiTools).await;
+        let tools = response
+            .result
+            .as_ref()
+            .and_then(|result| result.get("tools"))
+            .and_then(Value::as_array)
+            .expect("gateway tools list");
+        let workers = tools
+            .iter()
+            .find(|tool| tool.get("name").and_then(Value::as_str) == Some("workers"))
+            .expect("gateway workers tool");
+        let actions = workers
+            .pointer("/inputSchema/properties/action/enum")
+            .and_then(Value::as_array)
+            .expect("gateway worker action enum")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actions,
+            vec!["claim", "start", "inbox", "ack", "report", "finish"]
+        );
+        assert!(
+            tools
+                .iter()
+                .any(|tool| tool.get("name").and_then(Value::as_str) == Some("read")),
+            "gateway must advertise normal workspace tools for use after claim"
+        );
+        assert!(
+            !tools.iter().any(|tool| {
+                tool.get("name")
+                    .and_then(Value::as_str)
+                    .is_some_and(|name| name.starts_with("user_browser_"))
+            }),
+            "Worker gateway must not expose Core/user-browser control"
         );
     }
 
@@ -11023,7 +11174,7 @@ mod tests {
             }),
         };
 
-        let response = handle_initialize(&req, false);
+        let response = handle_initialize(&req, false, false);
         assert_eq!(
             response
                 .result
@@ -11077,7 +11228,7 @@ mod tests {
             method: "initialize".into(),
             params: json!({}),
         };
-        let response = handle_initialize(&req, true);
+        let response = handle_initialize(&req, true, false);
         let result = response.result.as_ref().expect("local initialize result");
         assert_eq!(
             result.pointer("/serverInfo/name").and_then(Value::as_str),

@@ -178,6 +178,8 @@ pub struct AppConfig {
     pub mcp_slug: Option<String>,
     #[serde(default)]
     pub workspaces: Vec<WorkspaceConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_mcp_slug: Option<String>,
     pub ngrok_domain: Option<String>,
     #[serde(default)]
     pub agents_path_mode: AgentsPathMode,
@@ -203,6 +205,7 @@ impl Default for AppConfig {
             ngrok_authtoken: None,
             mcp_slug: None,
             workspaces: Vec::new(),
+            worker_mcp_slug: None,
             ngrok_domain: None,
             agents_path_mode: AgentsPathMode::Default,
             set_moondesk_as_co_author: false,
@@ -268,6 +271,10 @@ impl AppConfig {
                 }
                 workspaces::validate_workspace_registry(&self.workspaces)
                     .map_err(std::io::Error::other)?;
+                if let Some(worker_mcp_slug) = self.worker_mcp_slug.as_deref() {
+                    workspaces::validate_mcp_slug(worker_mcp_slug)
+                        .map_err(std::io::Error::other)?;
+                }
             }
             version => {
                 return Err(std::io::Error::other(format!(
@@ -290,6 +297,11 @@ impl AppConfig {
         };
 
         if config.config_version == CURRENT_CONFIG_VERSION {
+            if config.worker_mcp_slug.is_none() {
+                config.worker_mcp_slug = Some(workspaces::generate_mcp_slug());
+                config.validate_versioned()?;
+                config.save_to_path(path)?;
+            }
             return Ok((config, had_existing_workspace));
         }
 
@@ -309,6 +321,7 @@ impl AppConfig {
 
         config.config_version = CURRENT_CONFIG_VERSION;
         config.mcp_slug = None;
+        config.worker_mcp_slug = Some(workspaces::generate_mcp_slug());
         config.workspaces = vec![workspace];
         config.validate_versioned()?;
         config.save_to_path(path)?;
@@ -979,6 +992,7 @@ pub struct AppState {
     pub tool_mode: ToolMode,
     pub browser_presentation: BrowserPresentation,
     pub mcp_slug: String,
+    pub worker_mcp_slug: String,
     pub workspaces: Vec<WorkspaceConfig>,
     pub workspace_runtimes: HashMap<WorkspaceId, Arc<WorkspaceRuntime>>,
     workspace_mutation_lock: Arc<Mutex<()>>,
@@ -1591,6 +1605,9 @@ impl AppState {
             std::io::Error::other("config v2 did not provide a primary workspace")
         })?;
         let mcp_slug = primary_workspace.mcp_slug.clone();
+        let worker_mcp_slug = config.worker_mcp_slug.clone().ok_or_else(|| {
+            std::io::Error::other("config v2 did not provide a generalized Worker MCP slug")
+        })?;
         let workspace_root = primary_workspace.root.to_string_lossy().into_owned();
         let workspace_runtimes = config
             .workspaces
@@ -1620,6 +1637,7 @@ impl AppState {
             tool_mode: config.tool_mode,
             browser_presentation: config.browser_presentation,
             mcp_slug,
+            worker_mcp_slug,
             workspaces: config.workspaces,
             workspace_runtimes,
             workspace_mutation_lock: Arc::new(Mutex::new(())),
@@ -1711,6 +1729,23 @@ impl AppState {
                 .map(|domain| format!("https://{domain}"))
         })?;
         Some(format!("{}{}", base.trim_end_matches('/'), self.mcp_path()))
+    }
+
+    pub fn worker_mcp_path(&self) -> String {
+        format!("/worker/{}/mcp", self.worker_mcp_slug)
+    }
+
+    pub fn worker_public_mcp_url(&self) -> Option<String> {
+        let base = self.ngrok_url.clone().or_else(|| {
+            self.ngrok_domain
+                .as_ref()
+                .map(|domain| format!("https://{domain}"))
+        })?;
+        Some(format!(
+            "{}{}",
+            base.trim_end_matches('/'),
+            self.worker_mcp_path()
+        ))
     }
 
     fn recompute_remote_connection_state(&mut self) {
@@ -1881,6 +1916,7 @@ impl AppState {
             ngrok_authtoken: self.ngrok_authtoken.clone(),
             mcp_slug: None,
             workspaces: self.workspaces.clone(),
+            worker_mcp_slug: Some(self.worker_mcp_slug.clone()),
             ngrok_domain: self.ngrok_domain.clone(),
             agents_path_mode: self.agents_path_mode,
             set_moondesk_as_co_author: self.set_moondesk_as_co_author,
@@ -3601,6 +3637,60 @@ toolMode = "multiTools"
     }
 
     #[test]
+    fn existing_v2_config_gets_one_stable_generalized_worker_slug_on_upgrade() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let config_root =
+            std::env::temp_dir().join(format!("moondesk-v2-worker-gateway-upgrade-{unique}"));
+        let workspace_root = config_root.join("workspace");
+        std::fs::create_dir_all(&workspace_root).expect("create workspace root");
+        let config_path = config_root.join(APP_CONFIG_FILE_NAME);
+        let workspace = WorkspaceConfig::new(
+            "Workspace",
+            &workspace_root,
+            workspaces::generate_mcp_slug(),
+        )
+        .expect("create workspace config");
+        let config = AppConfig {
+            config_version: CURRENT_CONFIG_VERSION,
+            workspaces: vec![workspace],
+            worker_mcp_slug: None,
+            ..AppConfig::default()
+        };
+        std::fs::write(
+            &config_path,
+            toml::to_string_pretty(&config).expect("serialize pre-gateway v2 config"),
+        )
+        .expect("write pre-gateway v2 config");
+
+        let first = AppState::from_config_path(
+            8787,
+            workspace_root.to_string_lossy().into_owned(),
+            config_path.clone(),
+        )
+        .expect("upgrade current v2 config");
+        assert!(!first.worker_mcp_slug.is_empty());
+        let generated = first.worker_mcp_slug.clone();
+        let persisted = AppConfig::load_from_path(&config_path).expect("reload upgraded config");
+        assert_eq!(
+            persisted.worker_mcp_slug.as_deref(),
+            Some(generated.as_str())
+        );
+
+        let second = AppState::from_config_path(
+            8787,
+            workspace_root.to_string_lossy().into_owned(),
+            config_path.clone(),
+        )
+        .expect("reload upgraded config");
+        assert_eq!(second.worker_mcp_slug, generated);
+
+        let _ = std::fs::remove_dir_all(config_root);
+    }
+
+    #[test]
     fn config_rejects_unsupported_future_version() {
         let unique = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -4355,6 +4445,10 @@ toolMode = "multiTools"
         let primary_id = app.workspaces[0].id.clone();
         let primary_slug = app.workspaces[0].mcp_slug.clone();
         let primary_url = app.public_mcp_url().expect("primary connector URL");
+        let worker_slug = app.worker_mcp_slug.clone();
+        let worker_url = app
+            .worker_public_mcp_url()
+            .expect("generalized Worker connector URL");
         let state = Arc::new(Mutex::new(app));
 
         let secondary = add_workspace(&state, "Secondary".into(), secondary_root.clone())
@@ -4380,9 +4474,14 @@ toolMode = "multiTools"
         );
         assert_eq!(reloaded.workspaces[0].id, primary_id);
         assert_eq!(reloaded.workspaces[0].mcp_slug, primary_slug);
+        assert_eq!(reloaded.worker_mcp_slug, worker_slug);
         assert_eq!(
             reloaded.public_mcp_url().as_deref(),
             Some(primary_url.as_str())
+        );
+        assert_eq!(
+            reloaded.worker_public_mcp_url().as_deref(),
+            Some(worker_url.as_str())
         );
         let reloaded_secondary = reloaded
             .workspaces
@@ -4410,6 +4509,7 @@ toolMode = "multiTools"
     async fn workspace_lifecycle_mutations_persist_transactionally() {
         let (app, primary_root, config_path) = test_app("moondesk-workspace-lifecycle");
         let state = Arc::new(Mutex::new(app));
+        let worker_slug = state.lock().await.worker_mcp_slug.clone();
         let secondary_root =
             std::env::temp_dir().join(format!("moondesk-workspace-secondary-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&secondary_root).expect("create secondary workspace");
@@ -4427,6 +4527,7 @@ toolMode = "multiTools"
             .await
             .expect("rotate workspace secret");
         assert_ne!(old_slug, new_slug);
+        assert_eq!(state.lock().await.worker_mcp_slug, worker_slug);
 
         let saved = AppConfig::load_from_path(&config_path).expect("load persisted registry");
         let persisted = saved
@@ -4436,6 +4537,7 @@ toolMode = "multiTools"
             .expect("persisted workspace");
         assert_eq!(persisted.name, "Renamed");
         assert_eq!(persisted.mcp_slug, new_slug);
+        assert_eq!(saved.worker_mcp_slug.as_deref(), Some(worker_slug.as_str()));
         assert!(
             !saved
                 .workspaces

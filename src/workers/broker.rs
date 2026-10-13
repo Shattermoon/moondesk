@@ -3,8 +3,8 @@ use super::types::{
     BrowserAttachmentState, ChatIdentity, CollectReceipt, CollectedTaskReceipt, MessageReceipt,
     OperationId, ReportReceipt, RetiredWorkerFence, ReuseReceipt, SpawnReceipt, TaskId, TaskState,
     WorkerExecutionProfile, WorkerFamily, WorkerFamilyId, WorkerId, WorkerLaunchState,
-    WorkerMessage, WorkerMessageId, WorkerMessageState, WorkerRecord, WorkerReport, WorkerReportId,
-    WorkerResult, WorkerState, WorkerStoreData, WorkerTask,
+    WorkerMessage, WorkerMessageId, WorkerMessageState, WorkerRecord, WorkerRecoveryGuard,
+    WorkerReport, WorkerReportId, WorkerResult, WorkerState, WorkerStoreData, WorkerTask,
 };
 use super::{
     MAX_COLLECT_RECEIPTS_PER_FAMILY, MAX_COLLECTED_TASK_HISTORY_PER_WORKER,
@@ -373,6 +373,7 @@ impl WorkerBroker {
             claim_token: Some(claim_token.clone()),
             claim_operation_id: Some(claim_operation_id.clone()),
             current_task_id: Some(task_id.clone()),
+            recovery_guard: None,
             tasks: [(task_id.clone(), task)].into_iter().collect(),
             messages: Vec::new(),
         };
@@ -1026,6 +1027,7 @@ impl WorkerBroker {
                 },
             );
             worker.current_task_id = Some(task_id.clone());
+            worker.recovery_guard = None;
             worker.state = WorkerState::Waking;
             worker.launch_state = WorkerLaunchState::Queued;
             worker.launch_command_id = None;
@@ -1248,6 +1250,104 @@ impl WorkerBroker {
                     .map(|snapshot| (worker_id, snapshot))
             })
             .collect())
+    }
+
+    pub async fn begin_recovery_guard(
+        &self,
+        workspace_id: &WorkspaceId,
+        anchor_identity: &ChatIdentity,
+        worker_id: &WorkerId,
+        task_id: &TaskId,
+        guard_ms: u64,
+    ) -> Result<WorkerRecoveryGuard, WorkerBrokerError> {
+        anchor_identity
+            .validate()
+            .map_err(WorkerBrokerError::Invalid)?;
+        let mut guard = self.data.lock().await;
+        let family_id = find_family_for_worker(&guard, workspace_id, worker_id)
+            .ok_or(WorkerBrokerError::NotFound)?;
+        let family = guard
+            .families
+            .get(&family_id)
+            .ok_or(WorkerBrokerError::NotFound)?;
+        if &family.anchor_identity != anchor_identity {
+            return Err(WorkerBrokerError::NotFound);
+        }
+        let worker = family
+            .workers
+            .get(worker_id)
+            .ok_or(WorkerBrokerError::NotFound)?;
+        if worker.state != WorkerState::Running || worker.current_task_id.as_ref() != Some(task_id)
+        {
+            return Err(WorkerBrokerError::Conflict(
+                "worker recovery guard requires the exact currently running task".into(),
+            ));
+        }
+        let now = worker_unix_time_ms();
+        if worker.recovery_guard.as_ref().is_some_and(|existing| {
+            existing.task_id == *task_id && now.saturating_sub(existing.started_at_ms) < guard_ms
+        }) {
+            return Err(WorkerBrokerError::Conflict(
+                "worker recovery was already attempted recently for this exact task; observe status/collect before another recovery"
+                    .into(),
+            ));
+        }
+
+        let recovery_guard = WorkerRecoveryGuard {
+            task_id: task_id.clone(),
+            started_at_ms: now,
+        };
+        let mut candidate = guard.clone();
+        let worker = candidate
+            .families
+            .get_mut(&family_id)
+            .and_then(|family| family.workers.get_mut(worker_id))
+            .ok_or(WorkerBrokerError::NotFound)?;
+        worker.recovery_guard = Some(recovery_guard.clone());
+        self.commit_candidate(&mut guard, candidate).await?;
+        Ok(recovery_guard)
+    }
+
+    pub async fn clear_recovery_guard(
+        &self,
+        workspace_id: &WorkspaceId,
+        anchor_identity: &ChatIdentity,
+        worker_id: &WorkerId,
+        task_id: &TaskId,
+        started_at_ms: u64,
+    ) -> Result<(), WorkerBrokerError> {
+        anchor_identity
+            .validate()
+            .map_err(WorkerBrokerError::Invalid)?;
+        let mut guard = self.data.lock().await;
+        let family_id = find_family_for_worker(&guard, workspace_id, worker_id)
+            .ok_or(WorkerBrokerError::NotFound)?;
+        let family = guard
+            .families
+            .get(&family_id)
+            .ok_or(WorkerBrokerError::NotFound)?;
+        if &family.anchor_identity != anchor_identity {
+            return Err(WorkerBrokerError::NotFound);
+        }
+        let worker = family
+            .workers
+            .get(worker_id)
+            .ok_or(WorkerBrokerError::NotFound)?;
+        if !worker.recovery_guard.as_ref().is_some_and(|existing| {
+            existing.task_id == *task_id && existing.started_at_ms == started_at_ms
+        }) {
+            return Ok(());
+        }
+
+        let mut candidate = guard.clone();
+        let worker = candidate
+            .families
+            .get_mut(&family_id)
+            .and_then(|family| family.workers.get_mut(worker_id))
+            .ok_or(WorkerBrokerError::NotFound)?;
+        worker.recovery_guard = None;
+        self.commit_candidate(&mut guard, candidate).await?;
+        Ok(())
     }
 
     pub async fn retire_worker(
@@ -1505,6 +1605,7 @@ impl WorkerBroker {
                 "worker has already been claimed by another ChatGPT conversation".into(),
             ));
         }
+        ensure_worker_family_account_affinity(family, worker_id, worker_identity)?;
         match worker.launch_state {
             WorkerLaunchState::WaitingClaim => {}
             WorkerLaunchState::Unknown
@@ -1653,6 +1754,7 @@ impl WorkerBroker {
                 "worker has already been claimed by another ChatGPT conversation".into(),
             ));
         }
+        ensure_worker_family_account_affinity(family, worker_id, &worker_identity)?;
         if worker.launch_state != WorkerLaunchState::WaitingClaim
             || worker
                 .conversation_url
@@ -2160,6 +2262,13 @@ impl WorkerBroker {
         task.result = Some(request.result.clone());
         if worker.current_task_id.as_ref() == Some(&request.task_id) {
             worker.current_task_id = None;
+            if worker
+                .recovery_guard
+                .as_ref()
+                .is_some_and(|guard| guard.task_id == request.task_id)
+            {
+                worker.recovery_guard = None;
+            }
             worker.state = WorkerState::Idle;
             if worker.attachment_state == BrowserAttachmentState::Detached {
                 worker.attachment_state = BrowserAttachmentState::Absent;
@@ -2199,6 +2308,44 @@ impl WorkerBroker {
         store::commit_prepared(prepared).map_err(storage_error)?;
         **guard = candidate;
         Ok(())
+    }
+}
+
+fn ensure_worker_family_account_affinity(
+    family: &WorkerFamily,
+    claiming_worker_id: &WorkerId,
+    worker_identity: &ChatIdentity,
+) -> Result<(), WorkerBrokerError> {
+    let subjects = family
+        .workers
+        .iter()
+        .filter(|(worker_id, _)| *worker_id != claiming_worker_id)
+        .filter_map(|(_, worker)| {
+            worker
+                .chat_identity
+                .as_ref()
+                .and_then(|identity| identity.subject_digest.as_deref())
+        })
+        .collect::<BTreeSet<_>>();
+    if subjects.len() > 1 {
+        return Err(WorkerBrokerError::Conflict(
+            "this Worker family already contains claimed Workers from multiple ChatGPT accounts; Clear Workers before admitting another Worker"
+                .into(),
+        ));
+    }
+    let Some(expected_subject) = subjects.into_iter().next() else {
+        return Ok(());
+    };
+    match worker_identity.subject_digest.as_deref() {
+        Some(actual_subject) if actual_subject == expected_subject => Ok(()),
+        Some(_) => Err(WorkerBrokerError::Conflict(
+            "worker claim came from a different ChatGPT account than this Worker family. Restore the fixed Worker browser account or Clear Workers before changing Worker accounts"
+                .into(),
+        )),
+        None => Err(WorkerBrokerError::Conflict(
+            "worker claim could not verify the fixed Worker account because OpenAI subject metadata is missing; retry from the existing Worker account"
+                .into(),
+        )),
     }
 }
 
@@ -2620,6 +2767,7 @@ mod tests {
             claim_token: None,
             claim_operation_id: None,
             current_task_id: None,
+            recovery_guard: None,
             tasks: [(task_id, task)].into_iter().collect(),
             messages: Vec::new(),
         };
@@ -2831,6 +2979,112 @@ mod tests {
                 .await
                 .expect("ephemeral activity resets on restart")
                 .is_empty()
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn recovery_guard_is_durable_and_blocks_duplicate_same_task_recovery() {
+        let root = temp_root("moondesk-worker-recovery-guard");
+        let path = root.join("worker-state-v1.json");
+        let workspace = WorkspaceId::new();
+        let core = anchor("core-recovery-guard");
+        let worker_identity = anchor("worker-recovery-guard");
+        let broker = WorkerBroker::open(&path).expect("open worker broker");
+        let spawned = broker
+            .spawn_worker(spawn_request(
+                OperationId::new(),
+                workspace.clone(),
+                core.clone(),
+                "exercise durable recovery fence",
+            ))
+            .await
+            .expect("spawn worker");
+        make_claimable(&broker, &workspace, &core, &spawned).await;
+        broker
+            .claim_worker(
+                &workspace,
+                &spawned.worker_id,
+                &spawned.task_id,
+                &spawned.claim_token,
+                worker_identity,
+            )
+            .await
+            .expect("claim worker");
+
+        let first = broker
+            .begin_recovery_guard(
+                &workspace,
+                &core,
+                &spawned.worker_id,
+                &spawned.task_id,
+                180_000,
+            )
+            .await
+            .expect("begin recovery guard");
+        let duplicate = broker
+            .begin_recovery_guard(
+                &workspace,
+                &core,
+                &spawned.worker_id,
+                &spawned.task_id,
+                180_000,
+            )
+            .await
+            .expect_err("duplicate recovery must be fenced");
+        assert!(duplicate.to_string().contains("already attempted recently"));
+
+        drop(broker);
+        let reopened = WorkerBroker::open(&path).expect("reopen recovery-guard broker");
+        let family = reopened
+            .family_for_anchor(&workspace, &core)
+            .await
+            .expect("read family after restart")
+            .expect("family survives restart");
+        assert_eq!(
+            family
+                .workers
+                .get(&spawned.worker_id)
+                .and_then(|worker| worker.recovery_guard.as_ref()),
+            Some(&first),
+            "recovery fence must survive host restart"
+        );
+        let after_restart = reopened
+            .begin_recovery_guard(
+                &workspace,
+                &core,
+                &spawned.worker_id,
+                &spawned.task_id,
+                180_000,
+            )
+            .await
+            .expect_err("durable guard must fence a retry after restart");
+        assert!(
+            after_restart
+                .to_string()
+                .contains("already attempted recently")
+        );
+        reopened
+            .clear_recovery_guard(
+                &workspace,
+                &core,
+                &spawned.worker_id,
+                &spawned.task_id,
+                first.started_at_ms,
+            )
+            .await
+            .expect("clear exact recovery guard");
+        let family = reopened
+            .family_for_anchor(&workspace, &core)
+            .await
+            .expect("read family after guard clear")
+            .expect("family remains");
+        assert!(
+            family
+                .workers
+                .get(&spawned.worker_id)
+                .and_then(|worker| worker.recovery_guard.as_ref())
+                .is_none()
         );
         let _ = std::fs::remove_dir_all(root);
     }
@@ -3921,6 +4175,86 @@ mod tests {
             .await
             .expect_err("another chat in the same workspace must not collect this family");
         assert_eq!(collect_error, WorkerBrokerError::NotFound);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn worker_family_pins_claims_to_first_worker_chatgpt_account_not_core_account() {
+        let root = temp_root("moondesk-worker-account-affinity");
+        let path = root.join("worker-state-v1.json");
+        let broker = WorkerBroker::open(&path).expect("open worker broker");
+        let workspace = WorkspaceId::new();
+        let core = ChatIdentity::from_openai_meta(Some("codex-core-account"), "core-session");
+        let first = broker
+            .spawn_worker(spawn_request(
+                OperationId::new(),
+                workspace.clone(),
+                core.clone(),
+                "first fixed-account worker",
+            ))
+            .await
+            .expect("spawn first worker");
+        make_claimable(&broker, &workspace, &core, &first).await;
+        broker
+            .claim_worker(
+                &workspace,
+                &first.worker_id,
+                &first.task_id,
+                &first.claim_token,
+                ChatIdentity::from_openai_meta(Some("fixed-worker-account"), "worker-session-1"),
+            )
+            .await
+            .expect("first Worker account establishes family affinity");
+
+        let second = broker
+            .spawn_worker(spawn_request(
+                OperationId::new(),
+                workspace.clone(),
+                core.clone(),
+                "second fixed-account worker",
+            ))
+            .await
+            .expect("spawn second worker");
+        make_claimable(&broker, &workspace, &core, &second).await;
+        let wrong_account = broker
+            .claim_worker(
+                &workspace,
+                &second.worker_id,
+                &second.task_id,
+                &second.claim_token,
+                ChatIdentity::from_openai_meta(
+                    Some("different-worker-account"),
+                    "worker-session-2",
+                ),
+            )
+            .await
+            .expect_err("different Worker account must not join the family");
+        assert!(
+            wrong_account
+                .to_string()
+                .contains("different ChatGPT account")
+        );
+
+        let claimed = broker
+            .claim_worker(
+                &workspace,
+                &second.worker_id,
+                &second.task_id,
+                &second.claim_token,
+                ChatIdentity::from_openai_meta(Some("fixed-worker-account"), "worker-session-2"),
+            )
+            .await
+            .expect("different Worker chat on the same Worker account is valid");
+        assert_eq!(claimed.state, WorkerState::Running);
+        assert_eq!(
+            claimed
+                .chat_identity
+                .as_ref()
+                .and_then(|identity| identity.subject_digest.as_deref()),
+            ChatIdentity::from_openai_meta(Some("fixed-worker-account"), "worker-session-2")
+                .subject_digest
+                .as_deref()
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 

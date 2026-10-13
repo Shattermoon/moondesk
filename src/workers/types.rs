@@ -232,6 +232,13 @@ pub struct WorkerReport {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct WorkerRecoveryGuard {
+    pub task_id: TaskId,
+    pub started_at_ms: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct WorkerRecord {
     pub id: WorkerId,
     pub display_id: String,
@@ -255,6 +262,8 @@ pub struct WorkerRecord {
     pub claim_operation_id: Option<OperationId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_task_id: Option<TaskId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_guard: Option<WorkerRecoveryGuard>,
     #[serde(default)]
     pub tasks: BTreeMap<TaskId, WorkerTask>,
     #[serde(default)]
@@ -466,6 +475,11 @@ impl WorkerStoreData {
                     && !worker.tasks.contains_key(current_task_id)
                 {
                     return Err("worker current task is missing from task map".into());
+                }
+                if let Some(recovery_guard) = &worker.recovery_guard
+                    && !worker.tasks.contains_key(&recovery_guard.task_id)
+                {
+                    return Err("worker recovery guard references a missing task".into());
                 }
                 for (task_id, task) in &worker.tasks {
                     if task_id != &task.id {

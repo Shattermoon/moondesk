@@ -162,6 +162,9 @@ pub struct WorkerLaunchContext<'a> {
     /// Explicit Companion installation used when Core itself has no browser tab (Work/Codex/IDE).
     /// Browser-based Core calls leave this unset and keep using the exact anchor route above.
     pub browserless_client_id: Option<&'a str>,
+    /// Trusted host-injected local IDE Core. This mode must not silently create a second editor
+    /// alongside a still-active legacy/browser Core family in the same workspace.
+    pub local_ide_core: bool,
     pub worker_target_count: usize,
 }
 
@@ -395,6 +398,60 @@ pub(crate) async fn recover_registered_workspaces(
     }
 }
 
+async fn reject_parallel_editor_across_local_core_boundary(
+    workspace_id: &WorkspaceId,
+    caller_identity: &ChatIdentity,
+    broker: &WorkerBroker,
+    local_ide_core: bool,
+) -> Result<(), String> {
+    let snapshot = broker.snapshot().await;
+    let active_in_family = |family: &&crate::workers::types::WorkerFamily| {
+        family.workspace_id == *workspace_id
+            && family.workers.values().any(|worker| {
+                matches!(
+                    worker.state,
+                    WorkerState::Provisioning | WorkerState::Waking | WorkerState::Running
+                )
+            })
+    };
+
+    if local_ide_core {
+        let foreign_active = snapshot
+            .families
+            .values()
+            .filter(active_in_family)
+            .filter(|family| family.anchor_identity != *caller_identity)
+            .flat_map(|family| family.workers.values())
+            .filter(|worker| {
+                matches!(
+                    worker.state,
+                    WorkerState::Provisioning | WorkerState::Waking | WorkerState::Running
+                )
+            })
+            .count();
+        if foreign_active > 0 {
+            return Err(format!(
+                "local IDE Core found {foreign_active} active Worker(s) in this workspace owned by another/legacy Core. Finish or Clear Workers before starting another local Worker task so MoonDesk cannot create two concurrent editors for the same workspace"
+            ));
+        }
+        return Ok(());
+    }
+
+    let local_core = ChatIdentity::local_core(workspace_id);
+    let local_active = snapshot
+        .families
+        .values()
+        .filter(active_in_family)
+        .any(|family| family.anchor_identity == local_core);
+    if local_active {
+        return Err(
+            "this browser/plugin Core cannot start another Worker task while the workspace has an active local Codex/IDE Worker. Finish or Clear the local Worker first so MoonDesk cannot create two concurrent editors for the same workspace"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 pub async fn handle(
     arguments: &Value,
     workspace_id: &WorkspaceId,
@@ -413,6 +470,13 @@ pub async fn handle(
                 workspace_id,
                 broker,
                 launch_context.managed_chat_broker,
+            )
+            .await?;
+            reject_parallel_editor_across_local_core_boundary(
+                workspace_id,
+                caller_identity,
+                broker,
+                launch_context.local_ide_core,
             )
             .await?;
             let assignment = required_string(arguments, "task")?.to_string();
@@ -583,6 +647,13 @@ pub async fn handle(
                 workspace_id,
                 broker,
                 launch_context.managed_chat_broker,
+            )
+            .await?;
+            reject_parallel_editor_across_local_core_boundary(
+                workspace_id,
+                caller_identity,
+                broker,
+                launch_context.local_ide_core,
             )
             .await?;
             let route = launch_context.anchor_route;
@@ -1734,6 +1805,7 @@ mod tests {
                         managed_chat_broker: managed.as_ref(),
                         anchor_route: None,
                         browserless_client_id: None,
+                        local_ide_core: false,
                         worker_target_count: super::super::RECOMMENDED_WORKERS_PER_FAMILY,
                     },
                 )
@@ -1753,6 +1825,7 @@ mod tests {
                 managed_chat_broker: managed.as_ref(),
                 anchor_route: None,
                 browserless_client_id: None,
+                local_ide_core: false,
                 worker_target_count: super::super::RECOMMENDED_WORKERS_PER_FAMILY,
             },
         )
@@ -1782,6 +1855,7 @@ mod tests {
                         managed_chat_broker: managed.as_ref(),
                         anchor_route: None,
                         browserless_client_id: None,
+                        local_ide_core: false,
                         worker_target_count: super::super::RECOMMENDED_WORKERS_PER_FAMILY,
                     },
                 )
@@ -1914,6 +1988,7 @@ mod tests {
                         managed_chat_broker: managed.as_ref(),
                         anchor_route: Some(&route),
                         browserless_client_id: None,
+                        local_ide_core: false,
                         worker_target_count: super::super::RECOMMENDED_WORKERS_PER_FAMILY,
                     },
                 )
@@ -1954,6 +2029,7 @@ mod tests {
                 managed_chat_broker: managed.as_ref(),
                 anchor_route: None,
                 browserless_client_id: None,
+                local_ide_core: false,
                 worker_target_count: super::super::RECOMMENDED_WORKERS_PER_FAMILY,
             },
         )
@@ -2022,6 +2098,7 @@ mod tests {
                 managed_chat_broker: &managed,
                 anchor_route: None,
                 browserless_client_id: None,
+                local_ide_core: false,
                 worker_target_count: super::super::RECOMMENDED_WORKERS_PER_FAMILY,
             },
         )

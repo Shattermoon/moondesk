@@ -2017,7 +2017,10 @@ async fn register_workspace_from_local_host(
         let app = s.app.lock().await;
         app.workspaces
             .iter()
-            .find(|workspace| workspace.root == canonical_root)
+            .filter(|workspace| {
+                canonical_root == workspace.root || canonical_root.starts_with(&workspace.root)
+            })
+            .max_by_key(|workspace| workspace.root.components().count())
             .cloned()
     };
     if let Some(workspace) = existing {
@@ -2109,6 +2112,11 @@ fn apply_local_ide_core_marker(body: &mut Value, local_ide_core: bool) {
     let meta = meta.as_object_mut().expect("meta was normalized to object");
     meta.remove(mcp::LOCAL_IDE_CORE_META_KEY);
     if local_ide_core {
+        // Local IDE Core authority is intentionally account-independent. Even if Codex happens
+        // to attach OpenAI account/session metadata, do not let it participate in Worker-family
+        // ownership, retired-Worker fences, or Worker activity telemetry.
+        meta.remove("openai/session");
+        meta.remove("openai/subject");
         meta.insert(mcp::LOCAL_IDE_CORE_META_KEY.to_string(), Value::Bool(true));
     }
 }
@@ -2138,7 +2146,14 @@ async fn post_mcp_http(
     body_bytes: Bytes,
 ) -> Response<Body> {
     let inbound_request_id = normalized_openai_request_id(&headers);
+    let local_header_present = headers.contains_key(HOST_CONTROL_HEADER);
     let local_ide_core = host_control_authorized(&headers, &s.host_control_token);
+    if local_header_present && !local_ide_core {
+        // Never downgrade a stale/spoofed local-IDE request into the public ChatGPT connector path.
+        // A host restart rotates this capability, so the bridge must refresh it and retry only after
+        // a definitive pre-dispatch rejection rather than receiving a different tool/identity model.
+        return not_found_response();
+    }
     post_mcp_with_request_id(
         AxumPath(slug),
         State(s),
@@ -2493,6 +2508,14 @@ mod tests {
                 .pointer("/params/_meta/moondesk~1local-ide-core")
                 .and_then(Value::as_bool),
             Some(true)
+        );
+        assert!(
+            public.pointer("/params/_meta/openai~1session").is_none(),
+            "trusted local Core must be account/session independent"
+        );
+        assert!(
+            public.pointer("/params/_meta/openai~1subject").is_none(),
+            "trusted local Core must discard OpenAI account identity"
         );
     }
 
@@ -4351,6 +4374,28 @@ mod tests {
                 .is_none()
         );
 
+        let stale_local = client
+            .post(&endpoint)
+            .header(HOST_CONTROL_HEADER, "stale-local-ide-token")
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": "stale-local-tools",
+                    "method": "tools/list",
+                    "params": {}
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .expect("send stale local MCP request");
+        assert_eq!(
+            stale_local.status(),
+            StatusCode::NOT_FOUND,
+            "stale local capability must never downgrade into public connector mode"
+        );
+
         let public = client
             .post(&endpoint)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
@@ -4706,6 +4751,41 @@ mod tests {
         .await;
         assert_eq!(created.status(), StatusCode::CREATED);
         assert_eq!(app_state.lock().await.workspaces.len(), 2);
+
+        let workspace_b_child = workspace_b.join("src");
+        std::fs::create_dir_all(&workspace_b_child).expect("create workspace B child");
+        let nested_request = Bytes::from(
+            serde_json::to_vec(&json!({"root": workspace_b_child.to_string_lossy()}))
+                .expect("serialize nested registration request"),
+        );
+        let nested = register_workspace_from_local_host(
+            State(server_state.clone()),
+            headers.clone(),
+            nested_request,
+        )
+        .await;
+        assert_eq!(nested.status(), StatusCode::OK);
+        let nested_payload: Value = serde_json::from_slice(
+            &to_bytes(nested.into_body(), MAX_HOST_CONTROL_BODY_BYTES)
+                .await
+                .expect("read nested registration response"),
+        )
+        .expect("decode nested registration response");
+        let expected_workspace_b_slug = {
+            let app = app_state.lock().await;
+            assert_eq!(app.workspaces.len(), 2);
+            app.workspaces
+                .iter()
+                .find(|workspace| workspace.root.ends_with(workspace_b.file_name().unwrap()))
+                .expect("registered workspace B")
+                .mcp_slug
+                .clone()
+        };
+        assert_eq!(
+            nested_payload.get("mcpSlug").and_then(Value::as_str),
+            Some(expected_workspace_b_slug.as_str()),
+            "child cwd must resolve to its owning registered workspace instead of creating a nested workspace"
+        );
 
         let repeated =
             register_workspace_from_local_host(State(server_state), headers, request).await;

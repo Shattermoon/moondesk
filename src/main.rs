@@ -1996,7 +1996,7 @@ async fn local_mcp_workspace_target(
     port: u16,
     workspace_root: &std::path::Path,
 ) -> Result<HostAttachResult, String> {
-    if !port_hosts_moondesk(port).await {
+    if !wait_for_local_server_ready(port).await {
         return Err(format!(
             "`moondesk mcp` requires the MoonDesk host to be running on 127.0.0.1:{port}"
         ));
@@ -2029,7 +2029,48 @@ async fn send_local_mcp_request(
 }
 
 async fn run_local_mcp_stdio(args: LocalMcpCliArgs) -> Result<i32, String> {
-    use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+    use tokio::io::{AsyncBufReadExt as _, AsyncWrite, AsyncWriteExt as _};
+
+    async fn write_json_line<W: AsyncWrite + Unpin>(
+        writer: &mut W,
+        value: &serde_json::Value,
+    ) -> Result<(), String> {
+        let bytes = serde_json::to_vec(value)
+            .map_err(|error| format!("failed to encode local MCP response: {error}"))?;
+        writer
+            .write_all(&bytes)
+            .await
+            .map_err(|error| format!("failed to write MCP stdout: {error}"))?;
+        writer
+            .write_all(b"\n")
+            .await
+            .map_err(|error| format!("failed to delimit MCP stdout: {error}"))?;
+        writer
+            .flush()
+            .await
+            .map_err(|error| format!("failed to flush MCP stdout: {error}"))
+    }
+
+    async fn report_bridge_error<W: AsyncWrite + Unpin>(
+        writer: &mut W,
+        id: Option<serde_json::Value>,
+        message: String,
+    ) -> Result<(), String> {
+        if let Some(id) = id {
+            write_json_line(
+                writer,
+                &serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": { "code": -32000, "message": message }
+                }),
+            )
+            .await
+        } else {
+            eprintln!("MoonDesk local MCP notification transport error: {message}");
+            Ok(())
+        }
+    }
 
     if args.show_help {
         print!("{}", local_mcp_cli_usage());
@@ -2065,25 +2106,92 @@ async fn run_local_mcp_stdio(args: LocalMcpCliArgs) -> Result<i32, String> {
         if line.trim().is_empty() {
             continue;
         }
-        serde_json::from_str::<serde_json::Value>(&line)
-            .map_err(|error| format!("invalid JSON-RPC message on MCP stdin: {error}"))?;
-
-        let registration = read_host_runtime_registration(port).map_err(|error| {
-            format!("MoonDesk host registration is unavailable while local MCP is active: {error}")
-        })?;
-        let mut response =
-            send_local_mcp_request(&client, port, &registration.token, &target.mcp_slug, &line)
+        let parsed = match serde_json::from_str::<serde_json::Value>(&line) {
+            Ok(value) => value,
+            Err(error) => {
+                write_json_line(
+                    &mut stdout,
+                    &serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": serde_json::Value::Null,
+                        "error": { "code": -32700, "message": format!("Parse error: {error}") }
+                    }),
+                )
                 .await?;
+                continue;
+            }
+        };
+        let request_id = parsed.get("id").cloned();
+
+        let registration = match read_host_runtime_registration(port) {
+            Ok(value) => value,
+            Err(error) => {
+                report_bridge_error(
+                    &mut stdout,
+                    request_id,
+                    format!("MoonDesk host registration is unavailable: {error}"),
+                )
+                .await?;
+                continue;
+            }
+        };
+        let mut response = match send_local_mcp_request(
+            &client,
+            port,
+            &registration.token,
+            &target.mcp_slug,
+            &line,
+        )
+        .await
+        {
+            Ok(value) => value,
+            Err(error) => {
+                // Transport loss is ambiguous for mutating Worker calls. Never replay it blindly;
+                // keep the stdio server alive and tell Core how to reconcile safely.
+                report_bridge_error(
+                    &mut stdout,
+                    request_id,
+                    format!(
+                        "{error}. The Worker-call outcome may be ambiguous: do not blindly repeat a mutation. Call workers status/collect first; when the action uses operation_id, retry only with the same operation_id. For recover, inspect status/collect before deciding whether another recovery is needed."
+                    ),
+                )
+                .await?;
+                continue;
+            }
+        };
 
         if response.0 == reqwest::StatusCode::NOT_FOUND {
-            // A workspace may have been removed/re-added while Codex kept this stdio process alive.
-            // Refresh the durable workspace slug once; replaying a JSON-RPC request here is safe only
-            // because a 404 proves it never reached the MCP handler.
-            target = local_mcp_workspace_target(port, &workspace_root).await?;
-            let registration = read_host_runtime_registration(port)?;
-            response =
-                send_local_mcp_request(&client, port, &registration.token, &target.mcp_slug, &line)
-                    .await?;
+            // A stale host token or workspace slug is a definitive pre-dispatch rejection. Refresh
+            // both once; replay is safe because the MCP handler did not run.
+            target = match local_mcp_workspace_target(port, &workspace_root).await {
+                Ok(value) => value,
+                Err(error) => {
+                    report_bridge_error(&mut stdout, request_id, error).await?;
+                    continue;
+                }
+            };
+            let registration = match read_host_runtime_registration(port) {
+                Ok(value) => value,
+                Err(error) => {
+                    report_bridge_error(&mut stdout, request_id, error).await?;
+                    continue;
+                }
+            };
+            response = match send_local_mcp_request(
+                &client,
+                port,
+                &registration.token,
+                &target.mcp_slug,
+                &line,
+            )
+            .await
+            {
+                Ok(value) => value,
+                Err(error) => {
+                    report_bridge_error(&mut stdout, request_id, error).await?;
+                    continue;
+                }
+            };
         }
 
         let (status, bytes) = response;
@@ -2091,13 +2199,37 @@ async fn run_local_mcp_stdio(args: LocalMcpCliArgs) -> Result<i32, String> {
             if status.is_success() {
                 continue;
             }
-            return Err(format!(
-                "local MoonDesk MCP returned HTTP {status} with an empty body"
-            ));
+            report_bridge_error(
+                &mut stdout,
+                request_id,
+                format!("local MoonDesk MCP returned HTTP {status} with an empty body"),
+            )
+            .await?;
+            continue;
         }
-        serde_json::from_slice::<serde_json::Value>(&bytes).map_err(|error| {
-            format!("local MoonDesk MCP returned invalid JSON (HTTP {status}): {error}")
-        })?;
+        let decoded = match serde_json::from_slice::<serde_json::Value>(&bytes) {
+            Ok(value) => value,
+            Err(error) => {
+                report_bridge_error(
+                    &mut stdout,
+                    request_id,
+                    format!("local MoonDesk MCP returned invalid JSON (HTTP {status}): {error}"),
+                )
+                .await?;
+                continue;
+            }
+        };
+        if decoded.get("jsonrpc").and_then(serde_json::Value::as_str) != Some("2.0") {
+            report_bridge_error(
+                &mut stdout,
+                request_id,
+                format!(
+                    "local MoonDesk MCP returned a non-JSON-RPC HTTP response (HTTP {status}); the local bridge kept the session alive"
+                ),
+            )
+            .await?;
+            continue;
+        }
         stdout
             .write_all(&bytes)
             .await

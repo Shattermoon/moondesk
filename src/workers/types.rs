@@ -92,6 +92,16 @@ impl ChatIdentity {
         }
     }
 
+    pub fn local_core(workspace_id: &WorkspaceId) -> Self {
+        Self {
+            session_digest: digest_identity(
+                "session",
+                &format!("local-ide-core:{}", workspace_id.as_str()),
+            ),
+            subject_digest: Some(digest_identity("subject", "local-ide-core")),
+        }
+    }
+
     pub(crate) fn validate(&self) -> Result<(), String> {
         fn valid_digest(value: &str) -> bool {
             value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())

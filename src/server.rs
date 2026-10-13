@@ -2027,7 +2027,9 @@ async fn register_workspace_from_local_host(
             Body::from(
                 json!({
                     "status": "ok",
+                    "workspaceId": workspace.id,
                     "workspaceName": workspace.name,
+                    "mcpSlug": workspace.mcp_slug,
                     "alreadyRegistered": true
                 })
                 .to_string(),
@@ -2049,7 +2051,9 @@ async fn register_workspace_from_local_host(
             Body::from(
                 json!({
                     "status": "ok",
+                    "workspaceId": workspace.id,
                     "workspaceName": workspace.name,
+                    "mcpSlug": workspace.mcp_slug,
                     "alreadyRegistered": false
                 })
                 .to_string(),
@@ -2077,6 +2081,38 @@ async fn health() -> Json<Value> {
 
 // ── POST /<slug>/mcp ────────────────────────────────────────
 
+fn apply_local_ide_core_marker(body: &mut Value, local_ide_core: bool) {
+    let Some(object) = body.as_object_mut() else {
+        return;
+    };
+    let params = object
+        .entry("params".to_string())
+        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    if !params.is_object() {
+        if !local_ide_core {
+            return;
+        }
+        *params = Value::Object(serde_json::Map::new());
+    }
+    let params = params
+        .as_object_mut()
+        .expect("params was normalized to object");
+    let meta = params
+        .entry("_meta".to_string())
+        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    if !meta.is_object() {
+        if !local_ide_core {
+            return;
+        }
+        *meta = Value::Object(serde_json::Map::new());
+    }
+    let meta = meta.as_object_mut().expect("meta was normalized to object");
+    meta.remove(mcp::LOCAL_IDE_CORE_META_KEY);
+    if local_ide_core {
+        meta.insert(mcp::LOCAL_IDE_CORE_META_KEY.to_string(), Value::Bool(true));
+    }
+}
+
 fn normalized_openai_request_id(headers: &HeaderMap) -> Option<String> {
     let mut values = headers.get_all("x-request-id").iter();
     let raw = values.next()?.to_str().ok()?;
@@ -2102,7 +2138,15 @@ async fn post_mcp_http(
     body_bytes: Bytes,
 ) -> Response<Body> {
     let inbound_request_id = normalized_openai_request_id(&headers);
-    post_mcp_with_request_id(AxumPath(slug), State(s), body_bytes, inbound_request_id).await
+    let local_ide_core = host_control_authorized(&headers, &s.host_control_token);
+    post_mcp_with_request_id(
+        AxumPath(slug),
+        State(s),
+        body_bytes,
+        inbound_request_id,
+        local_ide_core,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -2111,7 +2155,7 @@ async fn post_mcp(
     State(s): State<ServerState>,
     body_bytes: Bytes,
 ) -> Response<Body> {
-    post_mcp_with_request_id(AxumPath(slug), State(s), body_bytes, None).await
+    post_mcp_with_request_id(AxumPath(slug), State(s), body_bytes, None, false).await
 }
 
 async fn post_mcp_with_request_id(
@@ -2119,12 +2163,13 @@ async fn post_mcp_with_request_id(
     State(s): State<ServerState>,
     body_bytes: Bytes,
     inbound_request_id: Option<String>,
+    local_ide_core: bool,
 ) -> Response<Body> {
     let Some((workspace, runtime, _request_lease)) = resolve_workspace(&s, &slug).await else {
         return not_found_response();
     };
 
-    let body: Value = match serde_json::from_slice(&body_bytes) {
+    let mut body: Value = match serde_json::from_slice(&body_bytes) {
         Ok(v) => v,
         Err(e) => {
             return jsonrpc_error_response(
@@ -2141,6 +2186,7 @@ async fn post_mcp_with_request_id(
             "Invalid request: expected a single JSON-RPC message object",
         );
     }
+    apply_local_ide_core_marker(&mut body, local_ide_core);
 
     if body.get("method").and_then(Value::as_str) == Some("tools/call")
         && let Err(retry_after) = runtime.check_tool_invocation()
@@ -2412,6 +2458,41 @@ mod tests {
         assert_eq!(
             summarize_response(&response),
             "id=1:result protocolVersion=2025-11-25"
+        );
+    }
+
+    #[test]
+    fn local_ide_core_marker_is_host_owned_and_cannot_be_spoofed_by_public_mcp_input() {
+        let mut public = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/list",
+            "params": {
+                "_meta": {
+                    mcp::LOCAL_IDE_CORE_META_KEY: true,
+                    "openai/session": "public-session"
+                }
+            }
+        });
+        apply_local_ide_core_marker(&mut public, false);
+        assert_eq!(
+            public
+                .pointer("/params/_meta/openai~1session")
+                .and_then(Value::as_str),
+            Some("public-session")
+        );
+        assert!(
+            public
+                .pointer("/params/_meta/moondesk~1local-ide-core")
+                .is_none()
+        );
+
+        apply_local_ide_core_marker(&mut public, true);
+        assert_eq!(
+            public
+                .pointer("/params/_meta/moondesk~1local-ide-core")
+                .and_then(Value::as_bool),
+            Some(true)
         );
     }
 
@@ -4195,6 +4276,114 @@ mod tests {
         assert_eq!(removed_retry_endpoint.status(), StatusCode::NOT_FOUND);
         server.abort();
         let _ = server.await;
+        let _ = std::fs::remove_dir_all(config_root);
+        let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn host_token_activates_local_ide_mcp_schema_while_public_spoof_is_stripped() {
+        let workspace_root = unique_temp_path("moondesk-local-ide-http-workspace");
+        let config_root = unique_temp_path("moondesk-local-ide-http-config");
+        let config_path = config_root.join("config.toml");
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        std::fs::create_dir_all(&config_root).expect("create config dir");
+
+        let mut app = AppState::new_for_test(
+            8787,
+            workspace_root.to_string_lossy().into_owned(),
+            config_path.clone(),
+        )
+        .expect("create app state");
+        app.mode = Mode::Both;
+        app.tool_mode = ToolMode::MultiTools;
+        let slug = app.mcp_slug.clone();
+        let app_state = Arc::new(Mutex::new(app));
+        let (ui_tx, _ui_rx) = ui_event_channel();
+        let app = router(
+            app_state,
+            None,
+            CommandJobManager::new(),
+            ui_tx,
+            Arc::from("trusted-local-ide-token"),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let address = listener.local_addr().expect("test server address");
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let endpoint = format!("http://{address}/{slug}/mcp");
+        let client = reqwest::Client::new();
+
+        let local = client
+            .post(&endpoint)
+            .header(HOST_CONTROL_HEADER, "trusted-local-ide-token")
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": "local-tools",
+                    "method": "tools/list",
+                    "params": {}
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .expect("send trusted local MCP request");
+        assert_eq!(local.status(), StatusCode::OK);
+        let local: Value =
+            serde_json::from_slice(&local.bytes().await.expect("read local tools response"))
+                .expect("decode local tools response");
+        let local_tools = local
+            .pointer("/result/tools")
+            .and_then(Value::as_array)
+            .expect("local tools");
+        assert_eq!(local_tools.len(), 1);
+        assert_eq!(
+            local_tools[0].get("name").and_then(Value::as_str),
+            Some("workers")
+        );
+        assert!(
+            local_tools[0]
+                .pointer("/inputSchema/properties/claim_token")
+                .is_none()
+        );
+
+        let public = client
+            .post(&endpoint)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": "public-spoof",
+                    "method": "tools/list",
+                    "params": {
+                        "_meta": { mcp::LOCAL_IDE_CORE_META_KEY: true }
+                    }
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .expect("send spoofed public MCP request");
+        assert_eq!(public.status(), StatusCode::OK);
+        let public: Value =
+            serde_json::from_slice(&public.bytes().await.expect("read public tools response"))
+                .expect("decode public tools response");
+        let public_tools = public
+            .pointer("/result/tools")
+            .and_then(Value::as_array)
+            .expect("public tools");
+        assert!(public_tools.len() > 1);
+        assert!(public_tools.iter().any(|tool| {
+            tool.get("name").and_then(Value::as_str) == Some("moondesk_instruction")
+        }));
+
+        server.abort();
+        let _ = server.await;
+        let _ = std::fs::remove_file(config_path);
         let _ = std::fs::remove_dir_all(config_root);
         let _ = std::fs::remove_dir_all(workspace_root);
     }

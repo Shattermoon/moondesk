@@ -35,6 +35,7 @@ use crate::workspaces::{self, WorkspaceAvailability, WorkspaceId};
 const SERVER_NAME: &str = "moondesk";
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 const MCP_PROTOCOL_VERSION: &str = "2025-11-25";
+pub const LOCAL_IDE_CORE_META_KEY: &str = "moondesk/local-ide-core";
 
 // ── JSON-RPC types ──────────────────────────────────────────
 
@@ -655,6 +656,41 @@ fn workers_tool_descriptor() -> Value {
     })
 }
 
+fn local_ide_workers_tool_descriptor() -> Value {
+    let mut descriptor = workers_tool_descriptor();
+    descriptor["description"] = json!(
+        "Coordinate MoonDesk browser Workers from local Codex/IDE. Core actions: status, spawn, reuse, recover, send, collect, retire. Worker chats run in the paired Companion browser and keep using their normal MoonDesk ChatGPT connector. Local IDE Core is account-independent: switching the ChatGPT account used by Codex does not change Worker ownership or the Worker browser account. Fresh spawn `context` may carry shared goals/constraints while `task` stays worker-specific. Provisioning/Waking is queued, not started; wait for Running/start activity. health=suspect means the exact Worker is stale even if ChatGPT still shows generating; recover before replacing it. Continue independent Core work while Workers run and collect results when needed."
+    );
+    if let Some(action_enum) = descriptor.pointer_mut("/inputSchema/properties/action/enum") {
+        *action_enum = json!([
+            "spawn", "reuse", "recover", "retire", "status", "send", "collect"
+        ]);
+    }
+    if let Some(properties) = descriptor
+        .pointer_mut("/inputSchema/properties")
+        .and_then(Value::as_object_mut)
+    {
+        for key in [
+            "browserless_core",
+            "claim_token",
+            "message_id",
+            "task_id",
+            "result",
+            "changes",
+            "validation",
+            "blockers",
+        ] {
+            properties.remove(key);
+        }
+        if let Some(worker_browser_id) = properties.get_mut("worker_browser_id") {
+            worker_browser_id["description"] = json!(
+                "Optional paired Companion client id from status.workerBrowsers. Omit when exactly one Worker browser is online."
+            );
+        }
+    }
+    descriptor
+}
+
 fn push_user_browser_tools(tools: &mut Vec<Value>) {
     tools.push(json!({
         "name": "user_browser_tabs",
@@ -969,6 +1005,17 @@ async fn handle_tools_list(
     mode: Mode,
     tool_mode: ToolMode,
 ) -> JsonRpcResponse {
+    if local_ide_core_request(req) {
+        let mut tools = Vec::new();
+        if mode.computer_enabled() && tool_mode.write_tools_enabled() {
+            tools.push(local_ide_workers_tool_descriptor());
+        }
+        for tool in &mut tools {
+            ensure_local_tool_output_schema(tool);
+        }
+        return JsonRpcResponse::success(req.id.clone(), json!({ "tools": tools }));
+    }
+
     let mut tools: Vec<Value> = Vec::new();
 
     // Computer tools
@@ -1444,6 +1491,28 @@ fn optional_chat_identity(req: &JsonRpcRequest) -> Result<Option<ChatIdentity>, 
     Ok(Some(ChatIdentity::from_openai_meta(subject, session)))
 }
 
+fn local_ide_core_request(req: &JsonRpcRequest) -> bool {
+    req.params
+        .get("_meta")
+        .and_then(Value::as_object)
+        .and_then(|meta| meta.get(LOCAL_IDE_CORE_META_KEY))
+        .and_then(Value::as_bool)
+        == Some(true)
+}
+
+fn worker_caller_identity(
+    req: &JsonRpcRequest,
+    workspace_id: &WorkspaceId,
+) -> Result<ChatIdentity, String> {
+    if local_ide_core_request(req) {
+        return Ok(ChatIdentity::local_core(workspace_id));
+    }
+    optional_chat_identity(req)?.ok_or_else(|| {
+        "workers requires exact ChatGPT conversation identity; openai/session metadata is missing or invalid"
+            .to_string()
+    })
+}
+
 fn user_browser_tool(name: &str) -> bool {
     matches!(
         name,
@@ -1677,13 +1746,6 @@ async fn handle_user_browser_tool(
     }
 
     tool_success_response_with_structured(req, value.to_string(), value)
-}
-
-fn worker_chat_identity(req: &JsonRpcRequest) -> Result<ChatIdentity, String> {
-    optional_chat_identity(req)?.ok_or_else(|| {
-        "workers requires exact ChatGPT conversation identity; openai/session metadata is missing or invalid"
-            .to_string()
-    })
 }
 
 fn browserless_core_requested(arguments: &Value) -> Result<bool, String> {
@@ -2094,6 +2156,14 @@ async fn handle_tools_call_for_workspace(
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
+    let local_ide_core = local_ide_core_request(req);
+    if local_ide_core && tool_name != "workers" {
+        return tool_error_response_text_only(
+            req,
+            "Local Codex/IDE MoonDesk MCP exposes only Worker orchestration; use the IDE's native tools for shell, files, browser, and computer work."
+                .into(),
+        );
+    }
 
     // Clear Workers mirrors Chat on Steroids' retired-worker fence: a recently cleared worker tab
     // must not fall through and regain ordinary Core authority merely because its family history was
@@ -2243,12 +2313,24 @@ async fn handle_tools_call_for_workspace(
                 format!("Workspace is currently unavailable: {workspace_root}"),
             );
         }
-        let caller_identity = match worker_chat_identity(req) {
+        let caller_identity = match worker_caller_identity(req, workspace_id) {
             Ok(identity) => identity,
             Err(error) => return tool_error_response_text_only(req, error),
         };
         let arguments = tool_arguments(req);
         let action = arguments.get("action").and_then(Value::as_str);
+        if local_ide_core
+            && !matches!(
+                action,
+                Some("spawn" | "reuse" | "recover" | "retire" | "status" | "send" | "collect")
+            )
+        {
+            return tool_error_response_text_only(
+                req,
+                "Local Codex/IDE Core may use only workers status/spawn/reuse/recover/send/collect/retire; Worker-side lifecycle actions must come from the exact browser Worker conversation."
+                    .into(),
+            );
+        }
 
         // Fresh worker admission has two host-controlled halves. The launch ACK first binds the
         // durable worker slot to one canonical ChatGPT conversation. The bootstrap sent only into
@@ -2381,9 +2463,13 @@ async fn handle_tools_call_for_workspace(
             };
         }
 
-        let browserless_core = match browserless_core_requested(&arguments) {
-            Ok(value) => value,
-            Err(error) => return tool_error_response_text_only(req, error),
+        let browserless_core = if local_ide_core {
+            true
+        } else {
+            match browserless_core_requested(&arguments) {
+                Ok(value) => value,
+                Err(error) => return tool_error_response_text_only(req, error),
+            }
         };
         if arguments.get("worker_browser_id").is_some() && !browserless_core {
             return tool_error_response_text_only(
@@ -6401,16 +6487,31 @@ mod tests {
         }
     }
 
+    fn tool_call_request_with_identity(
+        name: &str,
+        arguments: Value,
+        subject: &str,
+        session: &str,
+    ) -> JsonRpcRequest {
+        let mut request = tool_call_request(name, arguments);
+        request.params["_meta"] = json!({
+            "openai/subject": subject,
+            "openai/session": session
+        });
+        request
+    }
+
     fn tool_call_request_with_session(
         name: &str,
         arguments: Value,
         session: &str,
     ) -> JsonRpcRequest {
+        tool_call_request_with_identity(name, arguments, "worker-test-subject", session)
+    }
+
+    fn tool_call_request_local_ide(name: &str, arguments: Value) -> JsonRpcRequest {
         let mut request = tool_call_request(name, arguments);
-        request.params["_meta"] = json!({
-            "openai/subject": "worker-test-subject",
-            "openai/session": session
-        });
+        request.params["_meta"] = json!({ LOCAL_IDE_CORE_META_KEY: true });
         request
     }
 
@@ -7138,6 +7239,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn local_ide_core_advertises_only_core_worker_orchestration() {
+        let request = JsonRpcRequest {
+            jsonrpc: "2.0".into(),
+            id: Some(json!("local-ide-workers-list")),
+            method: "tools/list".into(),
+            params: json!({
+                "_meta": { LOCAL_IDE_CORE_META_KEY: true }
+            }),
+        };
+        let response = handle_tools_list(&request, Mode::Both, ToolMode::MultiTools).await;
+        let tools = response
+            .result
+            .as_ref()
+            .and_then(|result| result.get("tools"))
+            .and_then(Value::as_array)
+            .expect("local IDE tools list");
+        assert_eq!(tools.len(), 1);
+        let workers = &tools[0];
+        assert_eq!(workers.get("name").and_then(Value::as_str), Some("workers"));
+        let actions = workers
+            .pointer("/inputSchema/properties/action/enum")
+            .and_then(Value::as_array)
+            .expect("local IDE worker action enum")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actions,
+            vec![
+                "spawn", "reuse", "recover", "retire", "status", "send", "collect"
+            ]
+        );
+        assert!(
+            workers
+                .pointer("/inputSchema/properties/browserless_core")
+                .is_none()
+        );
+        assert!(
+            workers
+                .pointer("/inputSchema/properties/claim_token")
+                .is_none()
+        );
+        assert!(
+            workers
+                .get("description")
+                .and_then(Value::as_str)
+                .is_some_and(|description| description.contains("account-independent"))
+        );
+    }
+
+    #[tokio::test]
     async fn workers_tool_is_hidden_and_blocked_in_read_only_mode() {
         let list_request = JsonRpcRequest {
             jsonrpc: "2.0".into(),
@@ -7338,6 +7490,93 @@ mod tests {
         assert_eq!(
             command.launch.anchor_session_digest.as_deref(),
             Some(ChatIdentity::session_digest_for("ide-core-session").as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn local_ide_core_automatically_targets_paired_worker_browser() {
+        let root = TestTempDir::new("moondesk-local-ide-worker-routing");
+        let workspace_root = root.path().join("workspace");
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        let workspace_id = WorkspaceId::new();
+        let broker = Arc::new(
+            WorkerBroker::open(root.path().join("worker-state-v1.json"))
+                .expect("open worker broker"),
+        );
+        let managed_chat_broker = Arc::new(
+            ManagedChatBroker::open(root.path().join("managed-chat-state-v1.json"))
+                .expect("open managed chat broker"),
+        );
+        let companion_auth = Arc::new(
+            CompanionAuth::open(root.path().join("companion-auth-v1.json"))
+                .expect("open companion auth"),
+        );
+        companion_auth
+            .auto_pair(
+                "fixed-worker-browser",
+                &"a".repeat(64),
+                Some("chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            )
+            .await
+            .expect("pair worker browser");
+        companion_auth
+            .update_presence(
+                "fixed-worker-browser",
+                crate::companion::CompanionPresenceUpdate {
+                    browser_label: Some("Edge".into()),
+                    tabs: Vec::new(),
+                },
+                crate::companion::unix_time_ms(),
+            )
+            .await
+            .expect("publish worker browser presence");
+
+        let response = call_workers_for_test_with_companion(
+            &tool_call_request_local_ide(
+                "workers",
+                json!({
+                    "action": "spawn",
+                    "operation_id": Uuid::new_v4().to_string(),
+                    "label": "local IDE worker",
+                    "task": "Inspect one isolated part of the task."
+                }),
+            ),
+            &workspace_id,
+            &workspace_root.to_string_lossy(),
+            broker,
+            managed_chat_broker.clone(),
+            Some(companion_auth),
+        )
+        .await;
+        assert_ne!(
+            response
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true),
+            "local IDE Core should route through Companion automatically"
+        );
+
+        let snapshot = managed_chat_broker.snapshot().await;
+        let command = snapshot
+            .commands
+            .values()
+            .next()
+            .expect("managed Worker launch");
+        assert_eq!(
+            command.target_client_id.as_deref(),
+            Some("fixed-worker-browser")
+        );
+        assert!(command.target_client_pinned_by_request);
+        assert!(command.anchor_context.is_none());
+        assert_eq!(
+            command.launch.anchor_session_digest.as_deref(),
+            Some(
+                ChatIdentity::local_core(&workspace_id)
+                    .session_digest
+                    .as_str()
+            )
         );
     }
 
@@ -8430,6 +8669,153 @@ mod tests {
                 .as_ref()
                 .map(|context| context.conversation_id.as_str()),
             Some(anchor_conversation)
+        );
+    }
+
+    #[tokio::test]
+    async fn local_ide_core_allows_worker_claim_from_different_chatgpt_account() {
+        let root = TestTempDir::new("moondesk-local-ide-cross-account-worker");
+        let workspace_root = root.path().join("workspace");
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        let workspace_id = WorkspaceId::new();
+        let broker = Arc::new(
+            WorkerBroker::open(root.path().join("worker-state-v1.json"))
+                .expect("open worker broker"),
+        );
+        let managed_chat_broker = Arc::new(
+            ManagedChatBroker::open(root.path().join("managed-chat-state-v1.json"))
+                .expect("open managed chat broker"),
+        );
+        let companion_auth = Arc::new(
+            CompanionAuth::open(root.path().join("companion-auth-v1.json"))
+                .expect("open companion auth"),
+        );
+        companion_auth
+            .auto_pair(
+                "worker-account-browser",
+                &"b".repeat(64),
+                Some("chrome-extension://bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+            )
+            .await
+            .expect("pair Worker account browser");
+
+        let core_identity = ChatIdentity::local_core(&workspace_id);
+        let spawned = broker
+            .spawn_worker(crate::workers::broker::SpawnWorkerRequest {
+                operation_id: OperationId::new(),
+                workspace_id: workspace_id.clone(),
+                anchor_identity: core_identity.clone(),
+                label: "cross-account worker".into(),
+                assignment: "Prove Worker account is independent from local IDE Core.".into(),
+                context: String::new(),
+                execution_profile: ChatExecutionProfile::default(),
+            })
+            .await
+            .expect("spawn local-Core Worker record");
+        let claim_operation_id = spawned
+            .claim_operation_id
+            .clone()
+            .expect("fresh Worker claim operation id");
+        let command = managed_chat_broker
+            .enqueue(crate::managed_chat::broker::EnqueueManagedChatRequest {
+                dedupe_key: format!("worker:{}:task:{}", spawned.worker_id, spawned.task_id),
+                launch: ManagedChatLaunch {
+                    workspace_id: workspace_id.clone(),
+                    purpose: ManagedChatPurpose::Worker,
+                    execution_profile: ChatExecutionProfile::default(),
+                    opening_message: "cross-account Worker launch".into(),
+                    task_marker: format!("moondesk-worker-task:{}", spawned.task_id),
+                    thread_key: None,
+                    open_mode: ManagedChatOpenMode::NewThread,
+                    existing_conversation_url: None,
+                    anchor_session_digest: Some(core_identity.session_digest.clone()),
+                },
+            })
+            .await
+            .expect("enqueue local-Core managed launch");
+        broker
+            .link_launch_command(
+                &workspace_id,
+                &core_identity,
+                &spawned.worker_id,
+                &spawned.task_id,
+                &command.id.to_string(),
+            )
+            .await
+            .expect("link local-Core managed launch");
+        let worker_conversation = "8ccd9ad3-6d32-a500-b9df-f10d55aa86f1";
+        broker
+            .update_launch_by_command(
+                &command.id.to_string(),
+                crate::workers::types::WorkerLaunchState::WaitingClaim,
+                None,
+                Some(format!("https://chatgpt.com/c/{worker_conversation}")),
+            )
+            .await
+            .expect("confirm Worker browser conversation");
+        companion_auth
+            .observe_correlations(
+                "worker-account-browser",
+                crate::companion::CompanionCorrelationUpdate {
+                    conversation_id: worker_conversation.into(),
+                    conversation_url: format!("https://chatgpt.com/c/{worker_conversation}"),
+                    project_id: None,
+                    project_url: None,
+                    request_ids: Vec::new(),
+                    operation_ids: vec![claim_operation_id.to_string()],
+                },
+                crate::companion::unix_time_ms(),
+            )
+            .await
+            .expect("publish exact claim proof from Worker account browser");
+
+        let claim_request = tool_call_request_with_identity(
+            "workers",
+            json!({
+                "action": "claim",
+                "worker_id": spawned.worker_id,
+                "task_id": spawned.task_id,
+                "claim_token": spawned.claim_token,
+                "operation_id": claim_operation_id.to_string()
+            }),
+            "different-worker-chatgpt-account",
+            "different-worker-chat-session",
+        );
+        let claimed = call_workers_for_test_with_companion(
+            &claim_request,
+            &workspace_id,
+            &workspace_root.to_string_lossy(),
+            broker.clone(),
+            managed_chat_broker,
+            Some(companion_auth),
+        )
+        .await;
+        assert_eq!(
+            claimed
+                .result
+                .as_ref()
+                .and_then(|result| result.pointer("/structuredContent/state"))
+                .and_then(Value::as_str),
+            Some("running"),
+            "{}",
+            result_text(&claimed)
+        );
+
+        let family = broker
+            .family_for_anchor(&workspace_id, &core_identity)
+            .await
+            .expect("read local Core family")
+            .expect("local Core family exists");
+        let worker = family
+            .workers
+            .get(&spawned.worker_id)
+            .expect("claimed cross-account Worker");
+        assert_eq!(
+            worker.chat_identity.as_ref(),
+            Some(&ChatIdentity::from_openai_meta(
+                Some("different-worker-chatgpt-account"),
+                "different-worker-chat-session"
+            ))
         );
     }
 

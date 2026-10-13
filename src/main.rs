@@ -1775,6 +1775,7 @@ impl Drop for HostRuntimeGuard {
 #[derive(Debug)]
 struct HostAttachResult {
     workspace_name: String,
+    mcp_slug: String,
     already_registered: bool,
 }
 
@@ -1918,14 +1919,199 @@ async fn attach_workspace_to_running_host(
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| "running host response did not include a workspace name".to_string())?
         .to_string();
+    let mcp_slug = payload
+        .get("mcpSlug")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "running host response did not include an MCP slug".to_string())?
+        .to_string();
     let already_registered = payload
         .get("alreadyRegistered")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
     Ok(HostAttachResult {
         workspace_name,
+        mcp_slug,
         already_registered,
     })
+}
+
+const MCP_SUBCOMMAND: &str = "mcp";
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct LocalMcpCliArgs {
+    workspace: Option<PathBuf>,
+    show_help: bool,
+}
+
+fn local_mcp_cli_usage() -> &'static str {
+    "MoonDesk local MCP bridge for Codex/IDE\n\nUsage:\n  moondesk mcp [--workspace <project-path>]\n  moondesk mcp --help\n\nThe bridge uses stdio MCP and forwards only trusted local IDE requests to the already-running MoonDesk host. If --workspace is omitted, the bridge uses its current working directory.\n"
+}
+
+fn parse_local_mcp_cli_args(cli_args: &[String]) -> Option<Result<LocalMcpCliArgs, String>> {
+    if cli_args.first().map(String::as_str) != Some(MCP_SUBCOMMAND) {
+        return None;
+    }
+    let mut parsed = LocalMcpCliArgs::default();
+    let mut index = 1usize;
+    while index < cli_args.len() {
+        let argument = cli_args[index].trim();
+        match argument {
+            "-h" | "--help" => parsed.show_help = true,
+            "--workspace" => {
+                index += 1;
+                let Some(value) = cli_args.get(index).map(String::as_str).map(str::trim) else {
+                    return Some(Err("moondesk mcp --workspace requires a path".into()));
+                };
+                if value.is_empty() {
+                    return Some(Err(
+                        "moondesk mcp --workspace requires a non-empty path".into()
+                    ));
+                }
+                if parsed.workspace.is_some() {
+                    return Some(Err("moondesk mcp accepts --workspace only once".into()));
+                }
+                parsed.workspace = Some(PathBuf::from(value));
+            }
+            value if value.starts_with("--workspace=") => {
+                let value = value.trim_start_matches("--workspace=").trim();
+                if value.is_empty() {
+                    return Some(Err(
+                        "moondesk mcp --workspace requires a non-empty path".into()
+                    ));
+                }
+                if parsed.workspace.is_some() {
+                    return Some(Err("moondesk mcp accepts --workspace only once".into()));
+                }
+                parsed.workspace = Some(PathBuf::from(value));
+            }
+            "" => {}
+            other => return Some(Err(format!("unknown moondesk mcp argument: {other}"))),
+        }
+        index += 1;
+    }
+    Some(Ok(parsed))
+}
+
+async fn local_mcp_workspace_target(
+    port: u16,
+    workspace_root: &std::path::Path,
+) -> Result<HostAttachResult, String> {
+    if !port_hosts_moondesk(port).await {
+        return Err(format!(
+            "`moondesk mcp` requires the MoonDesk host to be running on 127.0.0.1:{port}"
+        ));
+    }
+    attach_workspace_to_running_host(port, workspace_root).await
+}
+
+async fn send_local_mcp_request(
+    client: &reqwest::Client,
+    port: u16,
+    token: &str,
+    mcp_slug: &str,
+    body: &str,
+) -> Result<(reqwest::StatusCode, Vec<u8>), String> {
+    let endpoint = format!("http://127.0.0.1:{port}/{mcp_slug}/mcp");
+    let response = client
+        .post(endpoint)
+        .header(server::HOST_CONTROL_HEADER, token)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(body.to_owned())
+        .send()
+        .await
+        .map_err(|error| format!("local MoonDesk MCP request failed: {error}"))?;
+    let status = response.status();
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|error| format!("failed to read local MoonDesk MCP response: {error}"))?;
+    Ok((status, bytes.to_vec()))
+}
+
+async fn run_local_mcp_stdio(args: LocalMcpCliArgs) -> Result<i32, String> {
+    use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+
+    if args.show_help {
+        print!("{}", local_mcp_cli_usage());
+        let _ = std::io::stdout().flush();
+        return Ok(0);
+    }
+
+    let port_value = std::env::var("PORT")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    let port = parse_port_value(port_value.as_deref())?;
+    let requested_root = match args.workspace {
+        Some(path) => path,
+        None => std::env::current_dir()
+            .map_err(|error| format!("could not resolve local MCP working directory: {error}"))?,
+    };
+    let workspace_root = workspaces::canonicalize_workspace_registration_root(&requested_root)?;
+    let mut target = local_mcp_workspace_target(port, &workspace_root).await?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(180))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|error| format!("could not create local MCP client: {error}"))?;
+
+    let stdin = tokio::io::BufReader::new(tokio::io::stdin());
+    let mut lines = stdin.lines();
+    let mut stdout = tokio::io::BufWriter::new(tokio::io::stdout());
+    while let Some(line) = lines
+        .next_line()
+        .await
+        .map_err(|error| format!("failed to read MCP stdin: {error}"))?
+    {
+        if line.trim().is_empty() {
+            continue;
+        }
+        serde_json::from_str::<serde_json::Value>(&line)
+            .map_err(|error| format!("invalid JSON-RPC message on MCP stdin: {error}"))?;
+
+        let registration = read_host_runtime_registration(port).map_err(|error| {
+            format!("MoonDesk host registration is unavailable while local MCP is active: {error}")
+        })?;
+        let mut response =
+            send_local_mcp_request(&client, port, &registration.token, &target.mcp_slug, &line)
+                .await?;
+
+        if response.0 == reqwest::StatusCode::NOT_FOUND {
+            // A workspace may have been removed/re-added while Codex kept this stdio process alive.
+            // Refresh the durable workspace slug once; replaying a JSON-RPC request here is safe only
+            // because a 404 proves it never reached the MCP handler.
+            target = local_mcp_workspace_target(port, &workspace_root).await?;
+            let registration = read_host_runtime_registration(port)?;
+            response =
+                send_local_mcp_request(&client, port, &registration.token, &target.mcp_slug, &line)
+                    .await?;
+        }
+
+        let (status, bytes) = response;
+        if bytes.is_empty() {
+            if status.is_success() {
+                continue;
+            }
+            return Err(format!(
+                "local MoonDesk MCP returned HTTP {status} with an empty body"
+            ));
+        }
+        serde_json::from_slice::<serde_json::Value>(&bytes).map_err(|error| {
+            format!("local MoonDesk MCP returned invalid JSON (HTTP {status}): {error}")
+        })?;
+        stdout
+            .write_all(&bytes)
+            .await
+            .map_err(|error| format!("failed to write MCP stdout: {error}"))?;
+        stdout
+            .write_all(b"\n")
+            .await
+            .map_err(|error| format!("failed to delimit MCP stdout: {error}"))?;
+        stdout
+            .flush()
+            .await
+            .map_err(|error| format!("failed to flush MCP stdout: {error}"))?;
+    }
+    Ok(0)
 }
 
 const BROWSER_SUBCOMMAND: &str = "browser";
@@ -2102,6 +2288,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli_args = std::env::args().skip(1).collect::<Vec<_>>();
     if cli_version_requested(&cli_args) {
         println!("{}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+    if let Some(parsed) = parse_local_mcp_cli_args(&cli_args) {
+        let args = parsed.map_err(std::io::Error::other)?;
+        let exit_code = run_local_mcp_stdio(args)
+            .await
+            .map_err(std::io::Error::other)?;
+        if exit_code != 0 {
+            std::process::exit(exit_code);
+        }
         return Ok(());
     }
     if let Some(parsed) = parse_browser_cli_args(&cli_args) {
@@ -9017,6 +9213,34 @@ mod tests {
     }
 
     #[test]
+    fn local_mcp_subcommand_parses_workspace_without_account_configuration() {
+        assert!(super::parse_local_mcp_cli_args(&[]).is_none());
+        assert!(super::parse_local_mcp_cli_args(&["something-else".to_string()]).is_none());
+
+        let parsed = super::parse_local_mcp_cli_args(&[
+            super::MCP_SUBCOMMAND.to_string(),
+            "--workspace".to_string(),
+            r"D:\projects\moon desk".to_string(),
+        ])
+        .expect("mcp subcommand should intercept")
+        .expect("valid local MCP arguments");
+        assert_eq!(
+            parsed.workspace,
+            Some(PathBuf::from(r"D:\projects\moon desk"))
+        );
+        assert!(!parsed.show_help);
+
+        let help = super::parse_local_mcp_cli_args(&[
+            super::MCP_SUBCOMMAND.to_string(),
+            "--help".to_string(),
+        ])
+        .expect("mcp help should intercept")
+        .expect("mcp help should parse");
+        assert!(help.show_help);
+        assert!(super::local_mcp_cli_usage().contains("stdio MCP"));
+    }
+
+    #[test]
     fn browser_subcommand_preserves_argument_boundaries_and_defaults_to_help() {
         assert!(super::parse_browser_cli_args(&[]).is_none());
         assert!(super::parse_browser_cli_args(&["something-else".to_string()]).is_none());
@@ -9295,7 +9519,9 @@ mod tests {
                         *seen.lock().await = Some((received_token, received_root));
                         axum::Json(serde_json::json!({
                             "status": "ok",
+                            "workspaceId": "11111111-1111-4111-8111-111111111111",
                             "workspaceName": "Attached Project",
+                            "mcpSlug": "AttachedProjectSlug123",
                             "alreadyRegistered": false,
                         }))
                     }
@@ -9310,6 +9536,7 @@ mod tests {
             .await
             .expect("attach workspace through client path");
         assert_eq!(result.workspace_name, "Attached Project");
+        assert_eq!(result.mcp_slug, "AttachedProjectSlug123");
         assert!(!result.already_registered);
         assert_eq!(
             seen.lock().await.as_ref(),

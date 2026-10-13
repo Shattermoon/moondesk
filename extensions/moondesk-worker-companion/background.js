@@ -843,11 +843,17 @@ function rememberedLaunchMatchesRecord(record, rememberedLaunch) {
   );
 }
 
-async function tabMatchesRecord(tab, record) {
+async function tabMatchesRecord(tab, record, allowRememberedLaunch = true) {
   if (!Number.isInteger(tab?.id) || !tab.url?.startsWith('https://chatgpt.com/')) return false;
   if (tab.url.includes(`moondesk-launch=${encodeURIComponent(record.launchToken)}`)) return true;
   const tabUrl = canonicalChatUrl(tab.url);
   if (record.conversationUrl && tabUrl === canonicalChatUrl(record.conversationUrl)) return true;
+  // A brand-new launch record has no durable tab/conversation to recover yet. Probing every
+  // existing ChatGPT tab through the content script can take seconds per tab and can exhaust the
+  // command lease before chrome.tabs.create() is ever reached. For that first create, only the
+  // launch-token URL is authoritative. Remembered-launch probing remains available once a tab id
+  // or durable conversation has existed, where it is actually needed for crash/reload recovery.
+  if (!allowRememberedLaunch) return false;
   // Once reuse has a confirmed durable conversation URL, never adopt a different tab merely
   // because it remembers the same thread key. ChatGPT can leave hidden tabs on a shared
   // local-chatgpt placeholder route; reuse must reopen/target the durable /c/<id> instead.
@@ -867,9 +873,10 @@ async function recoverTab(record) {
       if (await tabMatchesRecord(tab, record)) return tab;
     } catch {}
   }
+  const allowRememberedLaunchScan = Boolean(record.conversationUrl) || record.phase !== 'creating';
   const tabs = await chrome.tabs.query({ url: 'https://chatgpt.com/*' });
   for (const tab of tabs) {
-    if (await tabMatchesRecord(tab, record)) return tab;
+    if (await tabMatchesRecord(tab, record, allowRememberedLaunchScan)) return tab;
   }
   return null;
 }
@@ -1263,7 +1270,12 @@ async function processCommand(state, offer, clearGeneration = workerClearGenerat
       await failBeforeSend('worker_source_url_unconfirmed');
       return;
     }
-    throw error;
+    if (message === 'worker_clear_superseded') return;
+    const launchRecord = state.launchRecords?.[command.id];
+    if (launchRecord) launchRecord.phase = 'failed';
+    console.warn('MoonDesk worker pre-send browser launch failed:', message);
+    await failBeforeSend('worker_browser_launch_exception');
+    return;
   }
   if (!clearStillCurrent()) return;
 

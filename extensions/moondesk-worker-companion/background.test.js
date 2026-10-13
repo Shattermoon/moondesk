@@ -1317,6 +1317,45 @@ test('source and release-ZIP installs without a bootstrap capability expose Manu
   );
 });
 
+test('fresh worker creation does not probe unrelated ChatGPT tabs before opening its own tab', async () => {
+  let contentProbeCalls = 0;
+  const existingTabs = {
+    21: { id: 21, url: 'https://chatgpt.com/c/unrelated-worker-one', active: false },
+    22: { id: 22, url: 'https://chatgpt.com/c/unrelated-worker-two', active: false }
+  };
+  const { createdTabs, evaluate } = loadBackground({
+    existingTabs,
+    sendMessageImpl: async (_id, message) => {
+      if (message?.type === 'MOONDESK_CONTEXT') contentProbeCalls += 1;
+      throw new Error('unrelated tab has no MoonDesk content context');
+    }
+  });
+  const recordForCommand = evaluate('recordForCommand');
+  const state = { launchRecords: {}, threadRecords: {} };
+  const command = {
+    id: 'command-fresh-no-scan',
+    launch: {
+      workspaceId: 'workspace-fresh-no-scan',
+      taskMarker: 'marker-fresh-no-scan',
+      threadKey: 'worker:fresh-no-scan',
+      openMode: 'new_thread',
+      executionProfile: null
+    }
+  };
+
+  const { record, tab } = await recordForCommand(state, command, {
+    projectId: null,
+    projectUrl: null,
+    anchorConversationUrl: null
+  });
+
+  assert.equal(contentProbeCalls, 0, 'fresh creation must not content-probe unrelated ChatGPT tabs');
+  assert.equal(createdTabs.length, 1);
+  assert.equal(tab.id, createdTabs[0].id);
+  assert.equal(record.phase, 'created');
+  assert.match(createdTabs[0].url, /moondesk-launch=/);
+});
+
 test('worker tab recovery accepts Chromium tab id zero', async () => {
   const launchToken = 'launch-zero';
   const existingTabs = {

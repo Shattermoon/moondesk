@@ -596,7 +596,7 @@ fn workers_tool_descriptor() -> Value {
     json!({
         "name": "workers",
         "title": "Coordinate workers",
-        "description": "Coordinate MoonDesk workers for this workspace. Core actions: status, spawn, reuse, recover, send, collect, retire. Worker actions: claim, start, inbox, ack, report, finish. ROLE-SCOPED RULE: only when the current caller is Core running in ChatGPT Work/Codex/IDE, use MoonDesk only for worker orchestration and use the IDE's native shell, browser, files, and computer tools for Core's own work. This restriction NEVER applies inside a MoonDesk Worker conversation: Workers should use this workspace's MoonDesk connector/tools normally for all assigned project work. If Core has no Companion-observed browser tab, set `browserless_core=true` on spawn/reuse; status lists online workerBrowsers and worker-count limits. Fresh spawn `context` may carry shared goals, constraints, settled decisions, validation, and sibling ownership while `task` stays worker-specific. Reuse keeps the same durable worker chat, so send only new direction. collect may wait up to 60 seconds. Retry an uncertain request promptly with the same `operation_id`.",
+        "description": "Coordinate MoonDesk workers for this workspace. Core actions: status, spawn, reuse, recover, send, collect, retire. Worker actions: claim, start, inbox, ack, report, finish. ROLE-SCOPED RULE: only when the current caller is Core running in ChatGPT Work/Codex/IDE, use MoonDesk only for worker orchestration and use the IDE's native shell, browser, files, and computer tools for Core's own work. This restriction NEVER applies inside a MoonDesk Worker conversation: Workers should use this workspace's MoonDesk connector/tools normally for all assigned project work. If Core has no Companion-observed browser tab, set `browserless_core=true` on spawn/reuse; status lists online workerBrowsers and worker-count limits. Fresh spawn `context` may carry shared goals, constraints, settled decisions, validation, and sibling ownership while `task` stays worker-specific. Reuse keeps the same durable worker chat, so send only new direction. Provisioning/Waking means queued, not started; confirm Running/start activity before assuming a worker is working. collect may wait up to 60 seconds. Retry an uncertain request promptly with the same `operation_id`.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -2019,6 +2019,7 @@ async fn recover_worker_for_core(
     let state = match continued_state {
         "continued" => "recovery_sent",
         "superseded" | "busy" => "worker_became_active",
+        "unconfirmed" => "recovery_unconfirmed",
         _ => "recovery_failed",
     };
     Ok(json!({
@@ -2029,10 +2030,11 @@ async fn recover_worker_for_core(
         "browserClientId": client_id,
         "inspect": inspected,
         "recovery": continued,
-        "instruction": if state == "recovery_failed" {
-            "The task remains unfinished. Inspect git status/diff and other project state with the IDE's native tools, then decide whether to retry recovery or take over the remaining work."
-        } else {
-            "Recovery was handled without creating a new Worker task. Continue your own Core work and use workers collect/status to observe the worker."
+        "retrySafe": state == "recovery_failed",
+        "instruction": match state {
+            "recovery_failed" => "The task remains unfinished. Inspect git status/diff and other project state with the IDE's native tools, then decide whether to retry recovery or take over the remaining work.",
+            "recovery_unconfirmed" => "The recovery continuation reached the Companion but its response channel was lost, so MoonDesk will not resend it blindly. Inspect workers status/collect and project state before deciding whether any further recovery is needed.",
+            _ => "Recovery was handled without creating a new Worker task. Continue your own Core work and use workers collect/status to observe the worker."
         }
     }))
 }

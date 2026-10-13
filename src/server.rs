@@ -66,7 +66,7 @@ pub const COMPANION_USER_BROWSER_ROUTE: &str = "/__moondesk/companion/v1/browser
 pub const COMPANION_TOKEN_HEADER: &str = "x-moondesk-companion-token";
 // Bump with any shipped companion runtime change that requires Chromium to load new bytes. Keep
 // this aligned with COMPANION_RUNTIME_REVISION in background.js.
-pub const COMPANION_RUNTIME_REVISION: u32 = 22;
+pub const COMPANION_RUNTIME_REVISION: u32 = 23;
 const MAX_COMPANION_BODY_BYTES: usize = 16 * 1024;
 const MAX_COMPANION_USER_BROWSER_BODY_BYTES: usize = 2 * 1024 * 1024;
 
@@ -1351,6 +1351,17 @@ async fn clear_companion_workers(
     };
     let had_worker_state =
         worker_broker.has_worker_state().await || managed_chat_broker.has_worker_commands().await;
+    // Only a recently-online Companion can still have a live browser-side Send commit in flight.
+    // A stale/offline installation is fenced by the durable reset epoch before its next pump because
+    // ensureConnected reads status/applyHostWorkerResetEpoch before it can redeem or click Send.
+    // Waiting synchronously for stale clients made Clear Workers impossible whenever another browser
+    // was closed or its Manifest V3 service worker had been suspended.
+    let reset_capable_clients = auth
+        .fresh_presence(unix_time_ms())
+        .await
+        .into_iter()
+        .map(|presence| presence.client_id)
+        .collect::<BTreeSet<_>>();
     let reset_required_clients = managed_chat_broker
         .snapshot()
         .await
@@ -1361,7 +1372,9 @@ async fn clear_companion_workers(
                 && command.state == ManagedChatCommandState::SendStarted
         })
         .filter_map(|command| command.lease.as_ref().map(|lease| lease.client_id.clone()))
-        .filter(|client_id| client_id != &requesting_client_id)
+        .filter(|client_id| {
+            client_id != &requesting_client_id && reset_capable_clients.contains(client_id)
+        })
         .collect::<BTreeSet<_>>();
     // Commit the durable Worker reset before publishing the browser reset epoch. If this first
     // persistence boundary fails, paired companions must keep their exact local bindings because

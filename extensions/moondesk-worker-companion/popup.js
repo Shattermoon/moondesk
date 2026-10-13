@@ -342,7 +342,12 @@ $('pair').addEventListener('click', async () => {
     $('pairingToken').value = '';
     await render();
   } catch (error) {
-    showError(error);
+    const message = String(error?.message || error || '');
+    if (/invalid companion pairing token/i.test(message)) {
+      showError('Repair code rejected. Open MoonDesk → Settings → Workers and copy the current Manual repair code. Old codes stop working after MoonDesk restarts or after another successful repair.');
+    } else {
+      showError(error);
+    }
   }
 });
 

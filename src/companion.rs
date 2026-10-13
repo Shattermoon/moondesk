@@ -15,7 +15,11 @@ use crate::worker_recovery::WorkerRecoveryBroker;
 pub const COMPANION_AUTH_SCHEMA_VERSION: u32 = 2;
 pub const COMPANION_AUTH_FILE_NAME: &str = "companion-auth-v1.json";
 pub const MAX_PAIRED_COMPANION_CLIENTS: usize = 8;
-pub const COMPANION_PRESENCE_MAX_AGE_MS: u64 = 15_000;
+// Manifest V3 may suspend the Companion service worker between its 30-second fallback alarm wakes.
+// Keep presence alive across at least two wake intervals so a healthy browser is not falsely marked
+// offline merely because Chromium paused background timers. Commands remain durably queued if a
+// browser really is gone, and status still exposes the exact last-seen age.
+pub const COMPANION_PRESENCE_MAX_AGE_MS: u64 = 75_000;
 const MAX_COMPANION_AUTH_BYTES: u64 = 32 * 1024;
 const MAX_COMPANION_CLIENT_ID_BYTES: usize = 128;
 const MAX_COMPANION_ORIGIN_BYTES: usize = 512;
@@ -1712,6 +1716,16 @@ mod tests {
             .await
             .expect("fresh presence");
         assert_eq!(presence.tabs[0].project_id.as_deref(), Some(project_id));
+        assert!(
+            COMPANION_PRESENCE_MAX_AGE_MS >= 60_000,
+            "presence must survive at least two 30-second Manifest V3 alarm intervals"
+        );
+        assert!(
+            auth.presence_for("extension-install-a", 100 + 60_000)
+                .await
+                .is_some(),
+            "a healthy suspended Companion must not flap offline between alarm wakes"
+        );
         assert!(
             auth.presence_for(
                 "extension-install-a",

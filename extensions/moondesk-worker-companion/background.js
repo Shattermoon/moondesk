@@ -8,7 +8,7 @@ const BRIDGE_PORTS = [47650, 47651, 47652, 47653, 47654];
 const REQUIRED_PROTOCOL_VERSION = 2;
 // Bump with any shipped companion runtime change that requires Chromium to load new bytes. Keep
 // this aligned with COMPANION_RUNTIME_REVISION in src/server.rs.
-const COMPANION_RUNTIME_REVISION = 22;
+const COMPANION_RUNTIME_REVISION = 23;
 const SOURCE_DEV_MANIFEST_VERSION = '0.1.0';
 const RUNTIME_RELOAD_STORAGE_KEY = 'moondeskWorkerCompanionReloadRevisionV1';
 const INSTALLATION_BOOTSTRAP_FILE = 'moondesk-bootstrap.json';
@@ -111,11 +111,14 @@ async function applyHostWorkerResetEpoch(state, remote) {
     // while an older content task is still capable of clicking Send.
     workerClearGeneration += 1;
     sessionReconcileCommandIds.clear();
+    // Snapshot/clear exact Worker-authority tabs before erasing the local records used to identify
+    // them. Unrelated ChatGPT tabs are deliberately ignored so one remounting normal chat cannot
+    // block a global Worker reset.
+    await clearRememberedWorkerLaunchesInTabs(state);
     state.launchRecords = {};
     state.threadRecords = {};
     state.blockedCommands = {};
     await writeState(state);
-    await clearRememberedWorkerLaunchesInTabs();
     state.workerResetEpoch = remoteEpoch;
     await writeState(state);
     changed = true;
@@ -496,6 +499,32 @@ async function sendToTab(tabId, message, timeoutMs = 35000) {
     ]);
   } finally {
     if (timer) clearTimeout(timer);
+  }
+}
+
+function tabMessageTransportReason(error) {
+  const message = String(error?.message || error || '');
+  if (/asynchronous response.*channel closed|message channel closed|port closed|receiving end does not exist|could not establish connection/i.test(message)) {
+    return 'message_channel_closed';
+  }
+  if (/timed out/i.test(message)) return 'message_timeout';
+  return 'message_transport_error';
+}
+
+function transientTabMessageTransport(error) {
+  return tabMessageTransportReason(error) !== 'message_transport_error';
+}
+
+// Use only for idempotent/read-only content operations. A Worker Send/Continue must never be
+// replayed after a lost response because the first message may already have crossed the UI Send
+// boundary. Reacquiring the content script is safe for inspection, reconciliation, and reset.
+async function sendReadOnlyToTabWithReacquire(tabId, message, timeoutMs = 12000) {
+  try {
+    return await sendToTab(tabId, message, timeoutMs);
+  } catch (error) {
+    if (!transientTabMessageTransport(error)) throw error;
+    await waitForContent(tabId, Math.min(10000, timeoutMs));
+    return sendToTab(tabId, message, timeoutMs);
   }
 }
 
@@ -981,11 +1010,21 @@ async function waitForContent(tabId, timeoutMs = 20000) {
 async function markSendStarted(state, command) {
   const leaseId = command.lease?.leaseId;
   if (!leaseId) throw new Error('Managed chat command is missing lease');
-  const response = await api(state, SEND_STARTED_PATH, {
+  const request = () => api(state, SEND_STARTED_PATH, {
     method: 'POST',
     body: { commandId: command.id, leaseId }
   });
-  return response.command || command;
+  try {
+    const response = await request();
+    return response.command || command;
+  } catch (error) {
+    // The host transition is idempotent for the same command+lease. If loopback transport loses the
+    // response after the host committed SendStarted, retry once so the browser learns the durable
+    // state instead of abandoning a prepared Worker in Waking. HTTP conflicts are authoritative.
+    if (Number(error?.status || 0) !== 0) throw error;
+    const response = await request();
+    return response.command || command;
+  }
 }
 
 async function ack(state, command, outcome, details = null, conversationUrl = null) {
@@ -1234,14 +1273,28 @@ async function processCommand(state, offer, clearGeneration = workerClearGenerat
   }
 
   if (offer.reconcileRequired) {
-    await waitForContent(tab.id);
-    const response = await sendToTab(tab.id, {
-      type: 'MOONDESK_RECONCILE_WORKER',
-      commandId: command.id,
-      launchToken: record.launchToken,
-      placement,
-      launch: command.launch
-    }, 10000);
+    let response;
+    try {
+      await waitForContent(tab.id);
+      response = await sendReadOnlyToTabWithReacquire(tab.id, {
+        type: 'MOONDESK_RECONCILE_WORKER',
+        commandId: command.id,
+        launchToken: record.launchToken,
+        placement,
+        launch: command.launch
+      }, 10000);
+    } catch (error) {
+      if (!clearStillCurrent()) return;
+      await reconcileOrBlock(
+        state,
+        command,
+        record,
+        workspaceId,
+        `reconciliation_${tabMessageTransportReason(error)}`,
+        clearGeneration
+      );
+      return;
+    }
     if (!clearStillCurrent()) return;
     if (!response?.ok) {
       await reconcileOrBlock(state, command, record, workspaceId, 'reconciliation_tab_response_unconfirmed', clearGeneration);
@@ -1380,15 +1433,23 @@ async function processCommand(state, offer, clearGeneration = workerClearGenerat
   if (!clearStillCurrent()) return;
 
   let committed = null;
+  let commitTransportError = null;
   workerSendCommitInFlight += 1;
   try {
-    committed = await sendToTab(tab.id, {
-      type: 'MOONDESK_COMMIT_WORKER_SEND',
-      commandId: command.id,
-      launchToken: record.launchToken,
-      placement,
-      launch: command.launch
-    }, 12000);
+    try {
+      committed = await sendToTab(tab.id, {
+        type: 'MOONDESK_COMMIT_WORKER_SEND',
+        commandId: command.id,
+        launchToken: record.launchToken,
+        placement,
+        launch: command.launch
+      }, 12000);
+    } catch (error) {
+      // Do not resend an uncertain DOM Send. The first message may already have clicked Send even
+      // when Chromium destroyed the response channel during a ChatGPT remount. Move immediately
+      // into read-only reconciliation instead of leaving the durable command stuck SendStarted.
+      commitTransportError = error;
+    }
   } finally {
     workerSendCommitInFlight -= 1;
     if (workerSendCommitInFlight === 0) {
@@ -1396,6 +1457,17 @@ async function processCommand(state, offer, clearGeneration = workerClearGenerat
     }
   }
   if (!clearStillCurrent()) return;
+  if (commitTransportError) {
+    await reconcileOrBlock(
+      state,
+      command,
+      record,
+      workspaceId,
+      `worker_send_commit_${tabMessageTransportReason(commitTransportError)}`,
+      clearGeneration
+    );
+    return;
+  }
   if (!committed?.ok || committed.result?.state !== 'committed') {
     await pauseAfterSend(committed?.result?.reason || 'worker_send_commit_unconfirmed');
     return;
@@ -1490,27 +1562,45 @@ async function executeWorkerRecoveryCommand(command) {
   const action = command.action;
   const tab = await recoveryTabFor(command, action === 'inspect');
   if (action === 'inspect') {
-    const response = await sendToTab(tab.id, {
-      type: 'MOONDESK_RECOVER_WORKER_INSPECT',
-      taskMarker: command.taskMarker
-    }, 12000);
-    return response?.ok ? response.result : {
-      state: 'failed',
-      reason: response?.error || 'worker_recovery_inspect_unconfirmed'
-    };
+    try {
+      const response = await sendReadOnlyToTabWithReacquire(tab.id, {
+        type: 'MOONDESK_RECOVER_WORKER_INSPECT',
+        taskMarker: command.taskMarker
+      }, 12000);
+      return response?.ok ? response.result : {
+        state: 'failed',
+        reason: response?.error || 'worker_recovery_inspect_unconfirmed'
+      };
+    } catch (error) {
+      return {
+        state: 'failed',
+        reason: `worker_recovery_inspect_${tabMessageTransportReason(error)}`,
+        transportError: String(error?.message || error)
+      };
+    }
   }
   if (action === 'continue' || action === 'stop_continue') {
-    const response = await sendToTab(tab.id, {
-      type: 'MOONDESK_RECOVER_WORKER_CONTINUE',
-      taskMarker: command.taskMarker,
-      prompt: command.prompt,
-      stopIfBusy: action === 'stop_continue',
-      expected: command.expected || null
-    }, 25000);
-    return response?.ok ? response.result : {
-      state: 'failed',
-      reason: response?.error || 'worker_recovery_continue_unconfirmed'
-    };
+    try {
+      const response = await sendToTab(tab.id, {
+        type: 'MOONDESK_RECOVER_WORKER_CONTINUE',
+        taskMarker: command.taskMarker,
+        prompt: command.prompt,
+        stopIfBusy: action === 'stop_continue',
+        expected: command.expected || null
+      }, 25000);
+      return response?.ok ? response.result : {
+        state: 'failed',
+        reason: response?.error || 'worker_recovery_continue_unconfirmed'
+      };
+    } catch (error) {
+      // Continue/Stop+Continue may already have crossed the UI Send boundary. Never resend merely
+      // because Chromium lost the response channel; report uncertainty so Core can inspect first.
+      return {
+        state: 'unconfirmed',
+        reason: `worker_recovery_continue_${tabMessageTransportReason(error)}`,
+        transportError: String(error?.message || error)
+      };
+    }
   }
   return { state: 'failed', reason: 'worker_recovery_action_invalid' };
 }
@@ -1718,17 +1808,48 @@ async function setProfile({ profile: nextProfile }) {
   return response.profile || null;
 }
 
-async function clearRememberedWorkerLaunchesInTabs() {
+function workerAuthorityTabs(state, tabs) {
+  const tabIds = new Set();
+  const launchTokens = new Set();
+  const conversationUrls = new Set();
+  for (const record of Object.values(state?.launchRecords || {})) {
+    if (Number.isInteger(record?.tabId)) tabIds.add(record.tabId);
+    if (typeof record?.launchToken === 'string' && record.launchToken) launchTokens.add(record.launchToken);
+    const conversationUrl = canonicalConversationUrl(record?.conversationUrl);
+    if (conversationUrl) conversationUrls.add(conversationUrl);
+  }
+  for (const record of Object.values(state?.threadRecords || {})) {
+    if (Number.isInteger(record?.tabId)) tabIds.add(record.tabId);
+    const conversationUrl = canonicalConversationUrl(record?.conversationUrl);
+    if (conversationUrl) conversationUrls.add(conversationUrl);
+  }
+  return tabs.filter((tab) => {
+    if (!Number.isInteger(tab?.id)) return false;
+    if (tabIds.has(tab.id)) return true;
+    const conversationUrl = canonicalConversationUrl(tab.url);
+    if (conversationUrl && conversationUrls.has(conversationUrl)) return true;
+    return [...launchTokens].some((token) =>
+      typeof tab.url === 'string' && tab.url.includes(`moondesk-launch=${encodeURIComponent(token)}`)
+    );
+  });
+}
+
+async function clearRememberedWorkerLaunchesInTabs(state) {
   const tabs = await chrome.tabs.query({ url: 'https://chatgpt.com/*' });
-  await Promise.all(tabs.map(async (tab) => {
-    if (!Number.isInteger(tab?.id)) return;
+  const candidates = workerAuthorityTabs(state, tabs);
+  await Promise.all(candidates.map(async (tab) => {
     try {
       await ensureContent(tab.id);
-      const response = await sendToTab(tab.id, { type: 'MOONDESK_CLEAR_WORKER_LAUNCHES' }, 1500);
-      if (!response?.ok) throw new Error('ChatGPT tab did not confirm Worker Send cancellation');
+      const response = await sendReadOnlyToTabWithReacquire(
+        tab.id,
+        { type: 'MOONDESK_CLEAR_WORKER_LAUNCHES' },
+        3000
+      );
+      if (!response?.ok) throw new Error('ChatGPT Worker tab did not confirm Worker Send cancellation');
     } catch (error) {
       // A tab that closed during reset cannot click Send anymore and is therefore safe. Any still-
-      // open tab must explicitly confirm its content-side cancellation generation before reset ACK.
+      // open tab that held exact Worker launch authority must explicitly confirm its content-side
+      // cancellation generation before this browser can acknowledge the global reset.
       try { await chrome.tabs.get(tab.id); } catch { return; }
       throw error;
     }
@@ -1746,7 +1867,7 @@ async function clearWorkers() {
   sessionReconcileCommandIds.clear();
   try {
     const state = await ensureConnected();
-    await clearRememberedWorkerLaunchesInTabs();
+    await clearRememberedWorkerLaunchesInTabs(state);
     const response = await api(state, CLEAR_WORKERS_PATH, {
       method: 'POST',
       body: {},

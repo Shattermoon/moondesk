@@ -62,6 +62,10 @@ function loadBackground({ existingTabs = {}, contentByTab = {}, sendMessageImpl 
         existingTabs[id] = { ...existingTabs[id], ...changes };
         return existingTabs[id];
       },
+      async reload(id) {
+        if (!existingTabs[id]) throw new Error('missing tab');
+        return existingTabs[id];
+      },
       async remove(id) {
         if (!existingTabs[id]) throw new Error('missing tab');
         removedTabs.push(id);
@@ -736,11 +740,8 @@ test('a timed-out background Send cannot ACK reset until content-side cancellati
     globalThis.__lateSendCommand = ${JSON.stringify(command)};
   })()`);
 
-  await assert.rejects(
-    browserB.evaluate(
-      'processCommand(globalThis.__lateSendState, { command: globalThis.__lateSendCommand, reconcileRequired: false })'
-    ),
-    /timed out/
+  await browserB.evaluate(
+    'processCommand(globalThis.__lateSendState, { command: globalThis.__lateSendCommand, reconcileRequired: false })'
   );
   await flushMicrotasks();
 
@@ -787,7 +788,16 @@ test('an open ChatGPT tab that cannot confirm content cancellation keeps reset u
       ...freshState(),
       baseUrl: 'http://127.0.0.1:47650',
       clientId: 'browser-b',
-      credential: '${'e'.repeat(64)}'
+      credential: '${'e'.repeat(64)}',
+      launchRecords: {
+        'worker-reset-command': {
+          commandId: 'worker-reset-command',
+          workspaceId: 'workspace-reset-cancel',
+          launchToken: 'worker-reset-token',
+          tabId: 7,
+          conversationUrl: null
+        }
+      }
     };
   })()`);
 
@@ -802,6 +812,43 @@ test('an open ChatGPT tab that cannot confirm content cancellation keeps reset u
   );
   assert.equal(resetAckCalls, 0, 'host reset must remain pending without confirmed content cancellation');
   assert.equal(browser.evaluate('globalThis.__resetCancelState.workerResetEpoch'), 0);
+});
+
+test('an unrelated broken ChatGPT tab does not block a Worker reset', async () => {
+  let resetAckCalls = 0;
+  let tabMessages = 0;
+  const browser = loadBackground({
+    existingTabs: { 7: { id: 7, url: 'https://chatgpt.com/c/aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee' } },
+    fetchImpl: async (url) => {
+      if (new URL(url).pathname === '/__moondesk/companion/v1/workers/reset-ack') {
+        resetAckCalls += 1;
+        return { ok: true, status: 200, async text() { return JSON.stringify({ workerResetEpoch: 1, pendingClientCount: 0 }); } };
+      }
+      throw new Error(`unexpected unrelated-tab reset request: ${new URL(url).pathname}`);
+    },
+    sendMessageImpl: async () => {
+      tabMessages += 1;
+      throw new Error('unrelated ChatGPT content script is remounting');
+    }
+  });
+  await browser.evaluate(`(() => {
+    globalThis.__unrelatedResetState = {
+      ...freshState(),
+      baseUrl: 'http://127.0.0.1:47650',
+      clientId: 'browser-b',
+      credential: '${'f'.repeat(64)}'
+    };
+  })()`);
+
+  await browser.evaluate(
+    `applyHostWorkerResetEpoch(globalThis.__unrelatedResetState, {
+      workerResetEpoch: 1,
+      workerResetAckRequired: true
+    })`
+  );
+  assert.equal(tabMessages, 0, 'reset must not probe unrelated ChatGPT tabs');
+  assert.equal(resetAckCalls, 1);
+  assert.equal(browser.evaluate('globalThis.__unrelatedResetState.workerResetEpoch'), 1);
 });
 
 test('a retried global reset uses a fresh epoch to fence worker authority created after an earlier timed-out reset', async () => {
@@ -1026,7 +1073,7 @@ test('bridge discovery prefers an exact runtime match over another MoonDesk vers
             app: 'moondesk-worker-companion',
             appVersion: manifest.version,
             protocolVersion: 2,
-            companionRuntimeRevision: 22
+            companionRuntimeRevision: 23
           };
         }
       };
@@ -1054,7 +1101,7 @@ test('bridge discovery prefers an exact runtime match over another MoonDesk vers
 
   const { evaluate, runtimeReloads } = loadBackground({ fetchImpl });
   const hello = await evaluate('discoverBridge(freshState())');
-  assert.equal(hello.companionRuntimeRevision, 22);
+  assert.equal(hello.companionRuntimeRevision, 23);
   assert.equal(runtimeReloads.length, 0);
 });
 
@@ -1086,6 +1133,34 @@ test('companion API aborts a wedged loopback request at its configured deadline'
     /request timed out/
   );
   assert.equal(fetchCalls, 1);
+});
+
+test('markSendStarted retries one lost loopback response because the host transition is idempotent', async () => {
+  let calls = 0;
+  const command = {
+    id: 'mark-send-started-retry',
+    lease: { leaseId: 'lease-mark-send-started', clientId: 'browser-a' }
+  };
+  const { evaluate } = loadBackground({
+    fetchImpl: async (url) => {
+      if (new URL(url).pathname !== '/__moondesk/companion/v1/commands/send-started') {
+        throw new Error(`unexpected mark-send-started request: ${new URL(url).pathname}`);
+      }
+      calls += 1;
+      if (calls === 1) throw new Error('loopback response lost');
+      return {
+        ok: true,
+        status: 200,
+        async text() { return JSON.stringify({ command: { ...command, state: 'send_started' } }); }
+      };
+    }
+  });
+  const result = await evaluate('markSendStarted')(
+    { baseUrl: 'http://127.0.0.1:47650', credential: 'a'.repeat(64) },
+    command
+  );
+  assert.equal(calls, 2);
+  assert.equal(result.state, 'send_started');
 });
 
 test('bridge runtime revision mismatch reloads the unpacked companion once', async () => {
@@ -1139,7 +1214,7 @@ test('compatible bridge clears the one-shot runtime reload marker for a future m
             app: 'moondesk-worker-companion',
             appVersion: manifest.version,
             protocolVersion: 2,
-            companionRuntimeRevision: 22
+            companionRuntimeRevision: 23
           };
         }
       };
@@ -1152,7 +1227,7 @@ test('compatible bridge clears the one-shot runtime reload marker for a future m
   });
 
   const hello = await evaluate('discoverBridge(freshState())');
-  assert.equal(hello.companionRuntimeRevision, 22);
+  assert.equal(hello.companionRuntimeRevision, 23);
   const stored = await evaluate(`chrome.storage.local.get('${reloadKey}')`);
   assert.equal(stored[reloadKey], undefined);
 });
@@ -1170,7 +1245,7 @@ test('automatic pairing proves the extension was loaded from the MoonDesk-prepar
             app: 'moondesk-worker-companion',
             appVersion: manifest.version,
             protocolVersion: 2,
-            companionRuntimeRevision: 22
+            companionRuntimeRevision: 23
           };
         }
       };
@@ -1212,7 +1287,7 @@ test('source and release-ZIP installs without a bootstrap capability expose Manu
         app: 'moondesk-worker-companion',
         appVersion: manifest.version,
         protocolVersion: 2,
-        companionRuntimeRevision: 22
+        companionRuntimeRevision: 23
       };
       return {
         ok: true,
@@ -1281,7 +1356,7 @@ test('release version mismatch reloads the unpacked companion even when protocol
             app: 'moondesk-worker-companion',
             appVersion: '0.13.0',
             protocolVersion: 2,
-            companionRuntimeRevision: 22
+            companionRuntimeRevision: 23
           };
         }
       };
@@ -3603,6 +3678,84 @@ test('worker recovery stop/continue waits for fresh accepted send evidence', asy
   assert.equal(commitCalls, 1);
 });
 
+test('worker recovery inspect reacquires the content script after a remount closes the async response channel', async () => {
+  const conversationId = '6aaef8db-ecf0-83ee-bfcc-d6f94853c540';
+  const conversationUrl = `https://chatgpt.com/c/${conversationId}`;
+  const marker = 'moondesk-worker-task:recovery-remount';
+  let contextCalls = 0;
+  let inspectCalls = 0;
+  const { evaluate } = loadBackground({
+    existingTabs: { 7: { id: 7, url: conversationUrl, active: false } },
+    sendMessageImpl: async (_tabId, message) => {
+      if (message.type === 'MOONDESK_CONTEXT') {
+        contextCalls += 1;
+        return {
+          ok: true,
+          context: { conversationId, sourceUrl: conversationUrl, projectId: null, generating: false }
+        };
+      }
+      if (message.type === 'MOONDESK_RECOVER_WORKER_INSPECT') {
+        inspectCalls += 1;
+        if (inspectCalls === 1) {
+          throw new Error('A listener indicated an asynchronous response by returning true, but the message channel closed before a response was received');
+        }
+        return {
+          ok: true,
+          result: {
+            state: 'idle',
+            evidence: { conversationId, markerPresent: true, generating: false, userTurnCount: 2, assistantTurnCount: 1 }
+          }
+        };
+      }
+      throw new Error(`unexpected recovery-remount message: ${message.type}`);
+    }
+  });
+
+  const result = await evaluate(`executeWorkerRecoveryCommand(${JSON.stringify({
+    id: 'recovery-remount-command',
+    action: 'inspect',
+    conversationUrl,
+    taskMarker: marker
+  })})`);
+  assert.equal(result.state, 'idle');
+  assert.equal(inspectCalls, 2, 'read-only inspection may be retried after content-script reacquisition');
+  assert.ok(contextCalls >= 2, 'recovery must reacquire and re-prove the ChatGPT content script');
+});
+
+test('worker recovery continuation never replays an uncertain Send after its response channel closes', async () => {
+  const conversationId = '7bbef8db-ecf0-83ee-bfcc-d6f94853c541';
+  const conversationUrl = `https://chatgpt.com/c/${conversationId}`;
+  let continueCalls = 0;
+  const { evaluate } = loadBackground({
+    existingTabs: { 8: { id: 8, url: conversationUrl, active: false } },
+    sendMessageImpl: async (_tabId, message) => {
+      if (message.type === 'MOONDESK_CONTEXT') {
+        return {
+          ok: true,
+          context: { conversationId, sourceUrl: conversationUrl, projectId: null, generating: false }
+        };
+      }
+      if (message.type === 'MOONDESK_RECOVER_WORKER_CONTINUE') {
+        continueCalls += 1;
+        throw new Error('A listener indicated an asynchronous response by returning true, but the message channel closed before a response was received');
+      }
+      throw new Error(`unexpected recovery-continue message: ${message.type}`);
+    }
+  });
+
+  const result = await evaluate(`executeWorkerRecoveryCommand(${JSON.stringify({
+    id: 'recovery-continue-command',
+    action: 'continue',
+    conversationUrl,
+    taskMarker: 'moondesk-worker-task:recovery-continue',
+    prompt: 'Continue the same task.',
+    expected: { userTurnCount: 2, assistantTurnCount: 1 }
+  })})`);
+  assert.equal(result.state, 'unconfirmed');
+  assert.match(result.reason, /worker_recovery_continue_message_channel_closed/);
+  assert.equal(continueCalls, 1, 'uncertain continuation must never be sent twice');
+});
+
 test('existing-thread preparation waits for the recovered conversation composer before continuing', async () => {
   let messageHandler = null;
   let waitCalls = 0;
@@ -4503,6 +4656,99 @@ test('worker launch transaction survives ChatGPT navigation and ACKs the confirm
     state.threadRecords['worker:transaction-test'].conversationUrl,
     conversationUrl
   );
+});
+
+test('a lost commit response after SendStarted immediately enters reconciliation without replaying Send', async () => {
+  const commandId = '12111111-2222-4333-8444-555555555555';
+  const leaseId = '12666666-7777-4888-8999-aaaaaaaaaaaa';
+  const taskMarker = 'moondesk-worker-task:commit-channel-close';
+  const ackPayloads = [];
+  let launchIdentity = null;
+  let commitCalls = 0;
+  const command = {
+    id: commandId,
+    state: 'leased',
+    lease: { leaseId, clientId: 'browser-current' },
+    anchorContext: {
+      conversationId: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee',
+      conversationUrl: 'https://chatgpt.com/c/aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee',
+      projectId: null,
+      projectUrl: null
+    },
+    launch: {
+      workspaceId: 'workspace-channel-close',
+      purpose: 'worker',
+      taskMarker,
+      threadKey: 'worker:commit-channel-close',
+      openMode: 'new_thread',
+      openingMessage: `Do the task. Marker: ${taskMarker}`,
+      executionProfile: { modelId: 'gpt-5.6-sol', modelLabel: 'GPT-5.6 Sol', reasoningEffort: 'high' }
+    }
+  };
+  const response = (body) => ({ ok: true, status: 200, async text() { return JSON.stringify(body); } });
+  const fetchImpl = async (url, options = {}) => {
+    const parsed = new URL(url);
+    const body = options.body ? JSON.parse(options.body) : {};
+    if (parsed.pathname === '/__moondesk/companion/v1/commands/send-started') {
+      return response({ command: { ...command, state: 'send_started', reconcileHistory: true } });
+    }
+    if (parsed.pathname === '/__moondesk/companion/v1/status') {
+      return response({ workerResetEpoch: 0 });
+    }
+    if (parsed.pathname === '/__moondesk/companion/v1/commands/ack') {
+      ackPayloads.push(body);
+      return response({ command: { ...command, state: 'needs_reconcile', reconcileHistory: true } });
+    }
+    throw new Error(`unexpected commit-channel-close request: ${parsed.pathname}`);
+  };
+  const { evaluate } = loadBackground({
+    fetchImpl,
+    sendMessageImpl: async (_tabId, message) => {
+      if (message.type === 'MOONDESK_CONTEXT') {
+        return {
+          ok: true,
+          context: { projectId: null, projectUrl: null, conversationId: null, sourceUrl: 'https://chatgpt.com/', generating: false },
+          rememberedLaunch: launchIdentity
+        };
+      }
+      if (message.type === 'MOONDESK_PREPARE_WORKER') {
+        launchIdentity = {
+          commandId,
+          launchToken: message.launchToken,
+          taskMarker,
+          workspaceId: 'workspace-channel-close',
+          threadKey: 'worker:commit-channel-close'
+        };
+        return {
+          ok: true,
+          result: {
+            state: 'ready',
+            evidence: { conversationId: null, markerPresent: false, generating: false, userTurnCount: 0, composerEmpty: false }
+          }
+        };
+      }
+      if (message.type === 'MOONDESK_COMMIT_WORKER_SEND') {
+        commitCalls += 1;
+        throw new Error('A listener indicated an asynchronous response by returning true, but the message channel closed before a response was received');
+      }
+      throw new Error(`unexpected commit-channel-close tab message: ${message.type}`);
+    }
+  });
+  const state = {
+    baseUrl: 'http://127.0.0.1:47650',
+    credential: 'a'.repeat(64),
+    launchRecords: {},
+    threadRecords: {},
+    blockedCommands: {},
+    bindings: {}
+  };
+
+  await evaluate('processCommand')(state, { command, reconcileRequired: false });
+  assert.equal(commitCalls, 1, 'uncertain DOM Send must never be replayed');
+  assert.equal(ackPayloads.length, 1);
+  assert.equal(ackPayloads[0].outcome, 'needs_reconcile');
+  assert.equal(state.launchRecords[commandId].phase, 'uncertain');
+  assert.equal(state.launchRecords[commandId].reconcileAttempts, 1);
 });
 
 test('reconciliation commits a newly observed marker user turn without waiting for assistant activity', async () => {

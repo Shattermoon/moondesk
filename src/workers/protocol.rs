@@ -876,9 +876,27 @@ pub async fn handle(
                 .cloned()
                 .ok_or_else(|| "worker was not found".to_string())?;
             if worker.state == WorkerState::Provisioning
-                && worker.launch_state == crate::workers::types::WorkerLaunchState::WaitingClaim
+                && matches!(
+                    worker.launch_state,
+                    crate::workers::types::WorkerLaunchState::SendStarted
+                        | crate::workers::types::WorkerLaunchState::Reconciling
+                        | crate::workers::types::WorkerLaunchState::WaitingClaim
+                        | crate::workers::types::WorkerLaunchState::Paused
+                )
                 && worker.chat_identity.is_none()
             {
+                let task_id = worker
+                    .current_task_id
+                    .clone()
+                    .ok_or_else(|| "unclaimed Worker has no pending task to cancel".to_string())?;
+                let dedupe_key = format!("worker:{}:task:{}", worker_id, task_id);
+                launch_context
+                    .managed_chat_broker
+                    .fence_unclaimed_worker_after_send_by_dedupe(&dedupe_key)
+                    .await
+                    .map_err(|error| {
+                        format!("worker cannot fence sent assignment before retirement: {error}")
+                    })?;
                 let retired = broker
                     .cancel_unclaimed_after_send(workspace_id, caller_identity, &worker_id)
                     .await

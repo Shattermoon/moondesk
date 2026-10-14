@@ -732,11 +732,17 @@ impl WorkerBroker {
             .get(worker_id)
             .ok_or(WorkerBrokerError::NotFound)?;
         if worker.state != WorkerState::Provisioning
-            || worker.launch_state != WorkerLaunchState::WaitingClaim
+            || !matches!(
+                worker.launch_state,
+                WorkerLaunchState::SendStarted
+                    | WorkerLaunchState::Reconciling
+                    | WorkerLaunchState::WaitingClaim
+                    | WorkerLaunchState::Paused
+            )
             || worker.chat_identity.is_some()
         {
             return Err(WorkerBrokerError::Conflict(
-                "only an unclaimed Worker whose assignment was sent can be cancelled this way"
+                "only an unclaimed Worker whose assignment reached or may have reached Send can be cancelled this way"
                     .into(),
             ));
         }

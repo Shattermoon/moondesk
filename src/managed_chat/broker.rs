@@ -393,6 +393,63 @@ impl ManagedChatBroker {
         self.cancel_pre_send_by_dedupe(dedupe_key).await
     }
 
+    pub async fn fence_unclaimed_worker_after_send_by_dedupe(
+        &self,
+        dedupe_key: &str,
+    ) -> Result<bool, ManagedChatError> {
+        if dedupe_key.trim().is_empty() || dedupe_key.len() > 256 {
+            return Err(ManagedChatError::Invalid(
+                "managed chat dedupe key must contain 1..=256 bytes".into(),
+            ));
+        }
+        let mut guard = self.data.lock().await;
+        let Some(command_id) = guard.dedupe.get(dedupe_key).cloned() else {
+            return Ok(false);
+        };
+        let command = guard.commands.get(&command_id).ok_or_else(|| {
+            ManagedChatError::Storage("managed chat dedupe index is corrupt".into())
+        })?;
+        if matches!(
+            command.state,
+            ManagedChatCommandState::Paused | ManagedChatCommandState::Succeeded
+        ) || (command.state == ManagedChatCommandState::Failed && command.reconcile_history)
+        {
+            return Ok(true);
+        }
+        let post_send = matches!(
+            command.state,
+            ManagedChatCommandState::SendStarted | ManagedChatCommandState::NeedsReconcile
+        ) || (command.state == ManagedChatCommandState::Leased
+            && command.reconcile_history);
+        if !post_send {
+            return Err(ManagedChatError::Conflict(
+                "managed chat launch has not crossed the Send boundary for unclaimed Worker cancellation"
+                    .into(),
+            ));
+        }
+
+        let mut candidate = guard.clone();
+        let command = candidate.commands.get_mut(&command_id).ok_or_else(|| {
+            ManagedChatError::Storage("managed chat dedupe index is corrupt".into())
+        })?;
+        let conversation_url = command
+            .terminal
+            .as_ref()
+            .and_then(|terminal| terminal.conversation_url.clone());
+        command.state = ManagedChatCommandState::Paused;
+        command.reconcile_history = true;
+        command.lease = None;
+        command.target_client_id = None;
+        command.target_client_pinned_by_request = false;
+        command.terminal = Some(ManagedChatTerminalResult {
+            succeeded: false,
+            details: Some("worker_registration_cancelled_after_send".into()),
+            conversation_url,
+        });
+        self.commit_candidate(&mut guard, candidate).await?;
+        Ok(true)
+    }
+
     pub async fn cancel_pre_send_by_dedupe(
         &self,
         dedupe_key: &str,

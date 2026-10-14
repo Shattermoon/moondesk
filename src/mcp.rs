@@ -11805,7 +11805,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn workers_mcp_retire_cancels_only_pre_send_launch_and_reuses_slot() {
+    async fn workers_mcp_retire_handles_pre_send_and_unclaimed_post_send_launch() {
         let root = TestTempDir::new("moondesk-workers-mcp-retire");
         let workspace_root = root.path().join("workspace");
         std::fs::create_dir_all(&workspace_root).expect("create workspace");
@@ -11904,6 +11904,11 @@ mod tests {
             .get("workerId")
             .and_then(Value::as_str)
             .expect("replacement worker id");
+        let replacement_task_id = replacement
+            .get("taskId")
+            .and_then(Value::as_str)
+            .expect("replacement task id")
+            .to_string();
         assert_ne!(replacement_worker_id, worker_id);
 
         let offer = managed_chat_broker
@@ -11927,7 +11932,16 @@ mod tests {
             )
             .await
             .expect("cross replacement Send boundary");
-        let unsafe_retire = call_workers_for_test(
+        broker
+            .update_launch_by_command(
+                &offer.command.id.to_string(),
+                crate::workers::types::WorkerLaunchState::SendStarted,
+                None,
+                None,
+            )
+            .await
+            .expect("mirror live SendStarted worker state");
+        let sent_retire = call_workers_for_test(
             &tool_call_request_with_session(
                 "workers",
                 json!({ "action": "retire", "worker_id": replacement_worker_id }),
@@ -11940,32 +11954,65 @@ mod tests {
         )
         .await;
         assert_eq!(
-            unsafe_retire
+            sent_retire
                 .result
                 .as_ref()
-                .and_then(|result| result.get("isError"))
+                .and_then(|result| result.pointer("/structuredContent/state"))
+                .and_then(Value::as_str),
+            Some("retired")
+        );
+        assert_eq!(
+            sent_retire
+                .result
+                .as_ref()
+                .and_then(|result| result.pointer("/structuredContent/cancelledUnclaimedSend"))
                 .and_then(Value::as_bool),
             Some(true)
         );
-        assert!(result_text(&unsafe_retire).contains("Send boundary"));
-        let family = broker
-            .family_for_anchor(
-                &workspace_id,
-                &ChatIdentity::from_openai_meta(Some("worker-test-subject"), "anchor-retire"),
-            )
-            .await
-            .expect("read family")
-            .expect("family exists");
+        let managed = managed_chat_broker.snapshot().await;
+        let fenced = managed
+            .commands
+            .get(&offer.command.id)
+            .expect("post-Send launch remains as fenced terminal history");
+        assert_eq!(fenced.state, ManagedChatCommandState::Paused);
+        assert!(fenced.lease.is_none());
         assert_eq!(
-            family
-                .workers
-                .get(
-                    &crate::workers::types::WorkerId::parse(replacement_worker_id)
-                        .expect("parse replacement worker")
-                )
-                .expect("replacement worker")
-                .state,
-            crate::workers::types::WorkerState::Provisioning
+            fenced
+                .terminal
+                .as_ref()
+                .and_then(|terminal| terminal.details.as_deref()),
+            Some("worker_registration_cancelled_after_send")
+        );
+
+        let collected = call_workers_for_test(
+            &tool_call_request_with_session(
+                "workers",
+                json!({
+                    "action": "collect",
+                    "operation_id": Uuid::new_v4().to_string()
+                }),
+                "anchor-retire",
+            ),
+            &workspace_id,
+            &workspace_root.to_string_lossy(),
+            broker.clone(),
+            managed_chat_broker.clone(),
+        )
+        .await;
+        let failed = collected
+            .result
+            .as_ref()
+            .and_then(|result| result.pointer("/structuredContent/failed"))
+            .and_then(Value::as_array)
+            .expect("collect failed records");
+        assert_eq!(failed.len(), 1);
+        assert_eq!(
+            failed[0].get("taskId").and_then(Value::as_str),
+            Some(replacement_task_id.as_str())
+        );
+        assert_eq!(
+            failed[0].pointer("/failure/error").and_then(Value::as_str),
+            Some("worker_registration_cancelled_after_send")
         );
     }
 

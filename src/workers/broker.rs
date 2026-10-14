@@ -1,10 +1,11 @@
 use super::store;
 use super::types::{
-    BrowserAttachmentState, ChatIdentity, CollectReceipt, CollectedTaskReceipt, MessageReceipt,
-    OperationId, ReportReceipt, RetiredWorkerFence, ReuseReceipt, SpawnReceipt, TaskId, TaskState,
-    WorkerExecutionProfile, WorkerFamily, WorkerFamilyId, WorkerId, WorkerLaunchState,
-    WorkerMessage, WorkerMessageId, WorkerMessageState, WorkerRecord, WorkerRecoveryGuard,
-    WorkerReport, WorkerReportId, WorkerResult, WorkerState, WorkerStoreData, WorkerTask,
+    BrowserAttachmentState, ChatIdentity, CollectReceipt, CollectedTaskFailureReceipt,
+    CollectedTaskReceipt, MessageReceipt, OperationId, ReportReceipt, RetiredWorkerFence,
+    ReuseReceipt, SpawnReceipt, TaskId, TaskState, WorkerExecutionProfile, WorkerFamily,
+    WorkerFamilyId, WorkerId, WorkerLaunchState, WorkerMessage, WorkerMessageId,
+    WorkerMessageState, WorkerRecord, WorkerRecoveryGuard, WorkerReport, WorkerReportId,
+    WorkerResult, WorkerState, WorkerStoreData, WorkerTask, WorkerTaskFailure,
 };
 use super::{
     MAX_COLLECT_RECEIPTS_PER_FAMILY, MAX_COLLECTED_TASK_HISTORY_PER_WORKER,
@@ -12,6 +13,7 @@ use super::{
     MAX_TASK_RECORDS_PER_WORKER, MAX_UPDATES_PER_COLLECT, MAX_WORKER_ASSIGNMENT_BYTES,
     MAX_WORKER_CONTEXT_BYTES, MAX_WORKER_FAMILIES, MAX_WORKER_MESSAGE_BYTES,
     MAX_WORKER_RECORDS_PER_FAMILY, MAX_WORKERS_PER_FAMILY, RETIRED_WORKER_FENCE_TTL_MS,
+    WORKER_CLAIM_TIMEOUT_MS,
 };
 use crate::managed_chat::types::canonical_chatgpt_conversation_id;
 use crate::workspaces::WorkspaceId;
@@ -109,9 +111,18 @@ pub struct CollectedWorkerUpdate {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CollectedWorkerFailure {
+    pub worker_id: WorkerId,
+    pub display_id: String,
+    pub task_id: TaskId,
+    pub failure: WorkerTaskFailure,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CollectedUpdates {
     pub reports: Vec<WorkerReport>,
     pub completed: Vec<CollectedWorkerUpdate>,
+    pub failed: Vec<CollectedWorkerFailure>,
 }
 
 const MAX_RECENT_WORKER_TOOL_ACTIVITY: usize = 12;
@@ -159,6 +170,12 @@ pub(crate) struct InactiveWorkerCleanupPlan {
 pub(crate) struct WorkerClaimAttestationRequirement {
     pub operation_id: OperationId,
     pub conversation_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PendingWorkerClaimRegistration {
+    pub launch_command_id: String,
+    pub operation_id: OperationId,
 }
 
 pub struct WorkerBroker {
@@ -394,6 +411,7 @@ impl WorkerBroker {
             assignment: request.assignment,
             state: TaskState::Pending,
             result: None,
+            failure: None,
             collected: false,
         };
         let worker = WorkerRecord {
@@ -410,6 +428,7 @@ impl WorkerBroker {
             chat_identity: None,
             claim_token: Some(claim_token.clone()),
             claim_operation_id: Some(claim_operation_id.clone()),
+            waiting_claim_since_ms: None,
             current_task_id: Some(task_id.clone()),
             recovery_guard: None,
             tasks: [(task_id.clone(), task)].into_iter().collect(),
@@ -569,6 +588,17 @@ impl WorkerBroker {
         if conversation_url.is_some() {
             worker.conversation_url = conversation_url;
         }
+        match launch_state {
+            WorkerLaunchState::WaitingClaim if worker.chat_identity.is_none() => {
+                worker
+                    .waiting_claim_since_ms
+                    .get_or_insert_with(worker_unix_time_ms);
+            }
+            WorkerLaunchState::Claimed | WorkerLaunchState::Paused | WorkerLaunchState::Failed => {
+                worker.waiting_claim_since_ms = None;
+            }
+            _ => {}
+        }
         worker.attachment_state = match launch_state {
             WorkerLaunchState::Unknown | WorkerLaunchState::Queued => {
                 BrowserAttachmentState::Absent
@@ -594,15 +624,20 @@ impl WorkerBroker {
     ) -> Result<Vec<WorkerRecord>, WorkerBrokerError> {
         let mut guard = self.data.lock().await;
         let mut candidate = guard.clone();
-        let mut changed = Vec::new();
+        let now_ms = worker_unix_time_ms();
+        let mut changed = expire_waiting_claims_in_data(&mut candidate, now_ms, None);
 
         for family in candidate.families.values_mut() {
             for worker in family.workers.values_mut() {
+                let mut worker_changed = false;
                 let Some(conversation_id) = worker
                     .conversation_url
                     .as_deref()
                     .and_then(conversation_id_from_url)
                 else {
+                    if worker_changed {
+                        changed.push(worker.clone());
+                    }
                     continue;
                 };
                 let open = open_conversation_ids.contains(&conversation_id);
@@ -622,10 +657,18 @@ impl WorkerBroker {
                         }
                     }
                     WorkerState::Retired => BrowserAttachmentState::Absent,
-                    WorkerState::Provisioning | WorkerState::Waking => continue,
+                    WorkerState::Provisioning | WorkerState::Waking => {
+                        if worker_changed {
+                            changed.push(worker.clone());
+                        }
+                        continue;
+                    }
                 };
                 if worker.attachment_state != desired {
                     worker.attachment_state = desired;
+                    worker_changed = true;
+                }
+                if worker_changed {
                     changed.push(worker.clone());
                 }
             }
@@ -637,6 +680,109 @@ impl WorkerBroker {
         self.commit_candidate(&mut guard, candidate).await?;
         self.updates.notify_waiters();
         Ok(changed)
+    }
+
+    pub async fn expire_waiting_claim_timeouts_for_anchor(
+        &self,
+        workspace_id: &WorkspaceId,
+        anchor_identity: &ChatIdentity,
+    ) -> Result<Vec<WorkerRecord>, WorkerBrokerError> {
+        workspace_id
+            .validate()
+            .map_err(WorkerBrokerError::Invalid)?;
+        anchor_identity
+            .validate()
+            .map_err(WorkerBrokerError::Invalid)?;
+        let mut guard = self.data.lock().await;
+        let mut candidate = guard.clone();
+        let changed = expire_waiting_claims_in_data(
+            &mut candidate,
+            worker_unix_time_ms(),
+            Some((workspace_id, anchor_identity)),
+        );
+        if changed.is_empty() {
+            return Ok(changed);
+        }
+        self.commit_candidate(&mut guard, candidate).await?;
+        self.updates.notify_waiters();
+        Ok(changed)
+    }
+
+    pub async fn cancel_unclaimed_after_send(
+        &self,
+        workspace_id: &WorkspaceId,
+        anchor_identity: &ChatIdentity,
+        worker_id: &WorkerId,
+    ) -> Result<WorkerRecord, WorkerBrokerError> {
+        anchor_identity
+            .validate()
+            .map_err(WorkerBrokerError::Invalid)?;
+        let mut guard = self.data.lock().await;
+        let family_id = find_family_for_worker(&guard, workspace_id, worker_id)
+            .ok_or(WorkerBrokerError::NotFound)?;
+        let family = guard
+            .families
+            .get(&family_id)
+            .ok_or(WorkerBrokerError::NotFound)?;
+        if &family.anchor_identity != anchor_identity {
+            return Err(WorkerBrokerError::NotFound);
+        }
+        let worker = family
+            .workers
+            .get(worker_id)
+            .ok_or(WorkerBrokerError::NotFound)?;
+        if worker.state != WorkerState::Provisioning
+            || worker.launch_state != WorkerLaunchState::WaitingClaim
+            || worker.chat_identity.is_some()
+        {
+            return Err(WorkerBrokerError::Conflict(
+                "only an unclaimed Worker whose assignment was sent can be cancelled this way"
+                    .into(),
+            ));
+        }
+        let task_id = worker.current_task_id.clone().ok_or_else(|| {
+            WorkerBrokerError::Conflict("unclaimed Worker has no pending task to cancel".into())
+        })?;
+        if worker
+            .tasks
+            .get(&task_id)
+            .is_none_or(|task| task.state != TaskState::Pending)
+        {
+            return Err(WorkerBrokerError::Conflict(
+                "unclaimed Worker task is no longer pending".into(),
+            ));
+        }
+
+        let mut candidate = guard.clone();
+        let worker = candidate
+            .families
+            .get_mut(&family_id)
+            .and_then(|family| family.workers.get_mut(worker_id))
+            .ok_or(WorkerBrokerError::NotFound)?;
+        let task = worker
+            .tasks
+            .get_mut(&task_id)
+            .ok_or(WorkerBrokerError::NotFound)?;
+        task.state = TaskState::Failed;
+        task.result = None;
+        task.failure = Some(WorkerTaskFailure {
+            stage: "claim".into(),
+            error: "worker_registration_cancelled_after_send".into(),
+            launch_command_id: worker.launch_command_id.clone(),
+        });
+        task.collected = false;
+        worker.current_task_id = None;
+        worker.claim_token = None;
+        worker.claim_operation_id = None;
+        worker.waiting_claim_since_ms = None;
+        worker.state = WorkerState::Retired;
+        worker.launch_state = WorkerLaunchState::Failed;
+        worker.launch_error = Some("worker_registration_cancelled_after_send".into());
+        worker.attachment_state = BrowserAttachmentState::Absent;
+        let cancelled = worker.clone();
+        self.commit_candidate(&mut guard, candidate).await?;
+        self.updates.notify_waiters();
+        Ok(cancelled)
     }
 
     pub async fn settle_pre_send_failure_by_command(
@@ -703,6 +849,14 @@ impl WorkerBroker {
                     .into(),
             ));
         }
+        let launch_error = launch_error
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "worker launch failed before Send".into());
+        let task_failure = WorkerTaskFailure {
+            stage: worker_launch_failure_stage(&launch_error).into(),
+            error: launch_error.clone(),
+            launch_command_id: Some(command_id.to_string()),
+        };
 
         let mut candidate = guard.clone();
         let family = candidate
@@ -718,8 +872,12 @@ impl WorkerBroker {
             .get_mut(&task_id)
             .ok_or(WorkerBrokerError::NotFound)?;
         task.state = TaskState::Failed;
+        task.result = None;
+        task.failure = Some(task_failure);
+        task.collected = false;
         worker.current_task_id = None;
-        worker.launch_error = launch_error;
+        worker.launch_error = Some(launch_error);
+        worker.waiting_claim_since_ms = None;
         worker.attachment_state = BrowserAttachmentState::Absent;
         if was_fresh {
             worker.claim_token = None;
@@ -1061,6 +1219,7 @@ impl WorkerBroker {
                     assignment: request.assignment,
                     state: TaskState::Pending,
                     result: None,
+                    failure: None,
                     collected: false,
                 },
             );
@@ -1738,6 +1897,97 @@ impl WorkerBroker {
         Ok(workers)
     }
 
+    pub(crate) async fn pending_claim_registration(
+        &self,
+        workspace_id: &WorkspaceId,
+        worker_id: &WorkerId,
+        task_id: &TaskId,
+        claim_token: &str,
+        claim_operation_id: &OperationId,
+        worker_identity: &ChatIdentity,
+    ) -> Result<Option<PendingWorkerClaimRegistration>, WorkerBrokerError> {
+        worker_identity
+            .validate()
+            .map_err(WorkerBrokerError::Invalid)?;
+        let guard = self.data.lock().await;
+        let family_id = find_family_for_worker(&guard, workspace_id, worker_id)
+            .ok_or(WorkerBrokerError::NotFound)?;
+        let family = guard
+            .families
+            .get(&family_id)
+            .ok_or(WorkerBrokerError::NotFound)?;
+        if &family.anchor_identity == worker_identity {
+            return Err(WorkerBrokerError::Conflict(
+                "the Core conversation cannot claim one of its own workers".into(),
+            ));
+        }
+        ensure_worker_identity_unique_binding(&guard, &family_id, worker_id, worker_identity)?;
+        let worker = family
+            .workers
+            .get(worker_id)
+            .ok_or(WorkerBrokerError::NotFound)?;
+        if worker.current_task_id.as_ref() != Some(task_id) || !worker.tasks.contains_key(task_id) {
+            return Err(WorkerBrokerError::NotFound);
+        }
+        if let Some(existing) = &worker.chat_identity {
+            if existing == worker_identity {
+                return Ok(None);
+            }
+            return Err(WorkerBrokerError::Conflict(
+                "worker has already been claimed by another ChatGPT conversation".into(),
+            ));
+        }
+        ensure_worker_family_account_affinity(family, worker_id, worker_identity)?;
+        let Some(expected_operation_id) = worker.claim_operation_id.as_ref() else {
+            return Err(WorkerBrokerError::Conflict(
+                "worker claim predates browser-attested admission; leave this stale worker untouched and create a fresh worker"
+                    .into(),
+            ));
+        };
+        if expected_operation_id != claim_operation_id {
+            return Err(WorkerBrokerError::NotFound);
+        }
+        let Some(expected_claim_token) = worker.claim_token.as_deref() else {
+            return Err(WorkerBrokerError::Conflict(
+                "worker claim token has already been consumed".into(),
+            ));
+        };
+        if claim_token.len() != expected_claim_token.len()
+            || !bool::from(
+                claim_token
+                    .as_bytes()
+                    .ct_eq(expected_claim_token.as_bytes()),
+            )
+        {
+            return Err(WorkerBrokerError::NotFound);
+        }
+        match worker.launch_state {
+            WorkerLaunchState::WaitingClaim | WorkerLaunchState::Claimed => Ok(None),
+            WorkerLaunchState::Unknown
+            | WorkerLaunchState::Queued
+            | WorkerLaunchState::Preparing
+            | WorkerLaunchState::SendStarted
+            | WorkerLaunchState::Reconciling => {
+                let launch_command_id = worker.launch_command_id.clone().ok_or_else(|| {
+                    WorkerBrokerError::Conflict(
+                        "worker registration is pending but has no linked browser launch command"
+                            .into(),
+                    )
+                })?;
+                Ok(Some(PendingWorkerClaimRegistration {
+                    launch_command_id,
+                    operation_id: expected_operation_id.clone(),
+                }))
+            }
+            WorkerLaunchState::Paused | WorkerLaunchState::Failed => {
+                Err(WorkerBrokerError::Conflict(format!(
+                    "worker launch cannot be claimed because registration ended in {:?}",
+                    worker.launch_state
+                )))
+            }
+        }
+    }
+
     pub(crate) async fn claim_attestation_requirement(
         &self,
         workspace_id: &WorkspaceId,
@@ -1838,56 +2088,6 @@ impl WorkerBroker {
         }))
     }
 
-    pub(crate) async fn wait_for_claim_attestation_requirement(
-        &self,
-        workspace_id: &WorkspaceId,
-        worker_id: &WorkerId,
-        task_id: &TaskId,
-        claim_token: &str,
-        claim_operation_id: &OperationId,
-        worker_identity: &ChatIdentity,
-        timeout: std::time::Duration,
-    ) -> Result<Option<WorkerClaimAttestationRequirement>, WorkerBrokerError> {
-        let deadline = tokio::time::Instant::now() + timeout;
-        loop {
-            // Register the waiter before reading state so a registration ACK cannot race between the
-            // state check and sleeping. Notify::enable preserves a notification that arrives during
-            // the check below.
-            let mut notified = Box::pin(self.updates.notified());
-            notified.as_mut().enable();
-            match self
-                .claim_attestation_requirement(
-                    workspace_id,
-                    worker_id,
-                    task_id,
-                    claim_token,
-                    claim_operation_id,
-                    worker_identity,
-                )
-                .await
-            {
-                Ok(requirement) => return Ok(requirement),
-                Err(WorkerBrokerError::Conflict(message))
-                    if message == CLAIM_REGISTRATION_PENDING_MESSAGE => {}
-                Err(error) => return Err(error),
-            }
-
-            if tokio::time::Instant::now() >= deadline {
-                return Err(WorkerBrokerError::Conflict(format!(
-                    "{CLAIM_REGISTRATION_PENDING_MESSAGE}; retry the same claim with the same worker_id, task_id, claim_token, and operation_id after a short delay. The claim token was not consumed"
-                )));
-            }
-            tokio::select! {
-                _ = &mut notified => {},
-                _ = tokio::time::sleep_until(deadline) => {
-                    return Err(WorkerBrokerError::Conflict(format!(
-                        "{CLAIM_REGISTRATION_PENDING_MESSAGE}; retry the same claim with the same worker_id, task_id, claim_token, and operation_id after a short delay. The claim token was not consumed"
-                    )));
-                }
-            }
-        }
-    }
-
     pub async fn claim_worker_attested(
         &self,
         workspace_id: &WorkspaceId,
@@ -1973,7 +2173,11 @@ impl WorkerBroker {
         worker.chat_identity = Some(worker_identity);
         worker.claim_token = None;
         worker.claim_operation_id = None;
-        worker.state = WorkerState::Running;
+        worker.waiting_claim_since_ms = None;
+        // Claim binds this exact ChatGPT conversation to the Worker, but it does not mean the
+        // assignment has actually started. Keep the task pending until the Worker explicitly calls
+        // `workers start`; project tools remain blocked by the Worker gateway until that transition.
+        worker.state = WorkerState::Provisioning;
         worker.launch_state = WorkerLaunchState::Claimed;
         worker.launch_error = None;
         worker.attachment_state = BrowserAttachmentState::Attached;
@@ -1981,7 +2185,7 @@ impl WorkerBroker {
             .tasks
             .get_mut(task_id)
             .ok_or(WorkerBrokerError::NotFound)?;
-        task.state = TaskState::Running;
+        task.state = TaskState::Pending;
         let claimed = worker.clone();
         self.commit_candidate(&mut guard, candidate).await?;
         self.record_worker_activity(worker_id, Some(task_id.clone()), "workers:claim")
@@ -2009,15 +2213,21 @@ impl WorkerBroker {
                 .and_then(|worker| worker.claim_operation_id.clone())
                 .unwrap_or_else(OperationId::new)
         };
-        self.claim_worker_attested(
-            workspace_id,
-            worker_id,
-            task_id,
-            claim_token,
-            &claim_operation_id,
-            worker_identity,
-        )
-        .await
+        let claimed = self
+            .claim_worker_attested(
+                workspace_id,
+                worker_id,
+                task_id,
+                claim_token,
+                &claim_operation_id,
+                worker_identity.clone(),
+            )
+            .await?;
+        if claimed.state == WorkerState::Running {
+            return Ok(claimed);
+        }
+        self.start_task(workspace_id, &worker_identity, worker_id, task_id)
+            .await
     }
 
     pub async fn message_worker(
@@ -2174,9 +2384,18 @@ impl WorkerBroker {
             .get(&request.worker_id)
             .ok_or(WorkerBrokerError::NotFound)?;
         if worker.chat_identity.as_ref() != Some(&request.worker_identity)
-            || !worker.tasks.contains_key(&request.task_id)
+            || worker.current_task_id.as_ref() != Some(&request.task_id)
         {
             return Err(WorkerBrokerError::NotFound);
+        }
+        let task = worker
+            .tasks
+            .get(&request.task_id)
+            .ok_or(WorkerBrokerError::NotFound)?;
+        if worker.state != WorkerState::Running || task.state != TaskState::Running {
+            return Err(WorkerBrokerError::Conflict(
+                "worker task must complete workers start before reporting progress".into(),
+            ));
         }
         if let Some(receipt) = family.report_requests.get(&request.operation_id) {
             if receipt.request_fingerprint == fingerprint {
@@ -2274,6 +2493,7 @@ impl WorkerBroker {
             .cloned()
             .collect::<Vec<_>>();
         let mut completed = Vec::new();
+        let mut failed = Vec::new();
         'workers: for worker in family.workers.values() {
             for task in worker.tasks.values() {
                 if task.collected {
@@ -2289,13 +2509,24 @@ impl WorkerBroker {
                     if completed.len() >= MAX_UPDATES_PER_COLLECT {
                         break 'workers;
                     }
+                } else if let Some(failure) = &task.failure {
+                    failed.push(CollectedTaskFailureReceipt {
+                        worker_id: worker.id.clone(),
+                        display_id: worker.display_id.clone(),
+                        task_id: task.id.clone(),
+                        failure: failure.clone(),
+                    });
+                    if failed.len() >= MAX_UPDATES_PER_COLLECT {
+                        break 'workers;
+                    }
                 }
             }
         }
-        if reports.is_empty() && completed.is_empty() {
+        if reports.is_empty() && completed.is_empty() && failed.is_empty() {
             return Ok(CollectedUpdates {
                 reports,
                 completed: Vec::new(),
+                failed: Vec::new(),
             });
         }
 
@@ -2306,6 +2537,7 @@ impl WorkerBroker {
         let task_ids = completed
             .iter()
             .map(|task| task.task_id.clone())
+            .chain(failed.iter().map(|task| task.task_id.clone()))
             .collect::<BTreeSet<_>>();
         let mut candidate = guard.clone();
         let family = candidate
@@ -2328,6 +2560,7 @@ impl WorkerBroker {
             sequence,
             reports,
             completed,
+            failed,
         };
         family
             .collect_requests
@@ -2370,7 +2603,10 @@ impl WorkerBroker {
             let updates = self
                 .collect_updates_for_operation(workspace_id, anchor_identity, operation_id)
                 .await?;
-            if !updates.reports.is_empty() || !updates.completed.is_empty() {
+            if !updates.reports.is_empty()
+                || !updates.completed.is_empty()
+                || !updates.failed.is_empty()
+            {
                 return Ok(updates);
             }
 
@@ -2385,6 +2621,7 @@ impl WorkerBroker {
                 return Ok(CollectedUpdates {
                     reports: Vec::new(),
                     completed: Vec::new(),
+                    failed: Vec::new(),
                 });
             }
         }
@@ -2421,6 +2658,19 @@ impl WorkerBroker {
                 "completed worker task was finished again with a different result".into(),
             ));
         }
+        if task.state == TaskState::Failed || task.failure.is_some() {
+            return Err(WorkerBrokerError::Conflict(
+                "failed worker task cannot be finished by a late Worker turn".into(),
+            ));
+        }
+        if worker.current_task_id.as_ref() != Some(&request.task_id)
+            || worker.state != WorkerState::Running
+            || task.state != TaskState::Running
+        {
+            return Err(WorkerBrokerError::Conflict(
+                "worker task must complete workers start before it can finish".into(),
+            ));
+        }
 
         let mut candidate = guard.clone();
         let worker = candidate
@@ -2434,6 +2684,7 @@ impl WorkerBroker {
             .ok_or(WorkerBrokerError::NotFound)?;
         task.state = TaskState::Completed;
         task.result = Some(request.result.clone());
+        task.failure = None;
         if worker.current_task_id.as_ref() == Some(&request.task_id) {
             worker.current_task_id = None;
             if worker
@@ -2574,19 +2825,35 @@ fn collected_updates_from_receipt(receipt: &CollectReceipt) -> CollectedUpdates 
                 result: update.result.clone(),
             })
             .collect(),
+        failed: receipt
+            .failed
+            .iter()
+            .map(|update| CollectedWorkerFailure {
+                worker_id: update.worker_id.clone(),
+                display_id: update.display_id.clone(),
+                task_id: update.task_id.clone(),
+                failure: update.failure.clone(),
+            })
+            .collect(),
     }
 }
 
 fn task_is_settled_and_delivered(task: &WorkerTask) -> bool {
     match task.state {
         TaskState::Completed => task.result.is_some() && task.collected,
-        TaskState::Failed => task.result.as_ref().is_none_or(|_| task.collected),
+        TaskState::Failed => {
+            if task.result.is_some() || task.failure.is_some() {
+                task.collected
+            } else {
+                true
+            }
+        }
         TaskState::Pending | TaskState::Running | TaskState::Blocked => false,
     }
 }
 
 fn collect_receipt_has_payload(receipt: &CollectReceipt) -> bool {
-    !receipt.reports.is_empty() || !receipt.completed.is_empty()
+    !receipt.reports.is_empty() || !receipt.completed.is_empty() || !receipt.failed.is_empty()
 }
 
 fn family_is_safe_for_explicit_host_cleanup(family: &WorkerFamily) -> bool {
@@ -2804,6 +3071,80 @@ fn compact_family_history(family: &mut WorkerFamily) -> Result<(), WorkerBrokerE
     Ok(())
 }
 
+fn expire_waiting_claims_in_data(
+    data: &mut WorkerStoreData,
+    now_ms: u64,
+    scope: Option<(&WorkspaceId, &ChatIdentity)>,
+) -> Vec<WorkerRecord> {
+    let mut changed = Vec::new();
+    for family in data.families.values_mut() {
+        if scope.is_some_and(|(workspace_id, anchor_identity)| {
+            &family.workspace_id != workspace_id || &family.anchor_identity != anchor_identity
+        }) {
+            continue;
+        }
+        for worker in family.workers.values_mut() {
+            if worker.state != WorkerState::Provisioning
+                || worker.launch_state != WorkerLaunchState::WaitingClaim
+                || worker.chat_identity.is_some()
+            {
+                continue;
+            }
+            let started_at_ms = *worker.waiting_claim_since_ms.get_or_insert(now_ms);
+            if now_ms.saturating_sub(started_at_ms) < WORKER_CLAIM_TIMEOUT_MS {
+                // Persist the deadline anchor even for legacy records that predate this field.
+                if started_at_ms == now_ms {
+                    changed.push(worker.clone());
+                }
+                continue;
+            }
+            let task_id = worker.current_task_id.clone();
+            if let Some(task_id) = task_id
+                && let Some(task) = worker.tasks.get_mut(&task_id)
+                && task.state == TaskState::Pending
+            {
+                task.state = TaskState::Failed;
+                task.result = None;
+                task.failure = Some(WorkerTaskFailure {
+                    stage: "claim".into(),
+                    error: "worker_claim_timeout_after_send".into(),
+                    launch_command_id: worker.launch_command_id.clone(),
+                });
+                task.collected = false;
+            }
+            worker.current_task_id = None;
+            worker.claim_token = None;
+            worker.claim_operation_id = None;
+            worker.waiting_claim_since_ms = None;
+            worker.state = WorkerState::Retired;
+            worker.launch_state = WorkerLaunchState::Failed;
+            worker.launch_error = Some("worker_claim_timeout_after_send".into());
+            worker.attachment_state = BrowserAttachmentState::Absent;
+            changed.push(worker.clone());
+        }
+    }
+    changed
+}
+
+fn worker_launch_failure_stage(error: &str) -> &'static str {
+    if error.starts_with("model_or_effort_unconfirmed:")
+        || error.starts_with("worker_prepare")
+        || error.contains("composer_not_ready")
+    {
+        "prepare"
+    } else if error.starts_with("worker_browser_launch")
+        || error.starts_with("worker_account_")
+        || error.starts_with("worker_source_url_")
+        || error.starts_with("worker_thread_binding_")
+    {
+        "browser_launch"
+    } else if error.starts_with("reconciliation_") {
+        "reconcile"
+    } else {
+        "launch"
+    }
+}
+
 fn new_claim_token() -> String {
     format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple())
 }
@@ -2945,6 +3286,7 @@ mod tests {
             assignment: "completed history".into(),
             state: TaskState::Completed,
             result: Some(finished_result()),
+            failure: None,
             collected: result_collected,
         };
         let worker = WorkerRecord {
@@ -2961,6 +3303,7 @@ mod tests {
             chat_identity: Some(anchor(&format!("worker-{worker_id}"))),
             claim_token: None,
             claim_operation_id: None,
+            waiting_claim_since_ms: None,
             current_task_id: None,
             recovery_guard: None,
             tasks: [(task_id, task)].into_iter().collect(),
@@ -3007,101 +3350,6 @@ mod tests {
             )
             .await
             .expect("confirm canonical worker conversation before claim");
-    }
-
-    #[tokio::test]
-    async fn fresh_claim_waits_for_canonical_conversation_registration_without_consuming_capability()
-     {
-        let root = temp_root("moondesk-worker-claim-registration-race");
-        let path = root.join("worker-state-v1.json");
-        let broker = std::sync::Arc::new(WorkerBroker::open(&path).expect("open worker broker"));
-        let workspace = WorkspaceId::new();
-        let core = anchor("core-claim-registration-race");
-        let worker_identity = anchor("worker-claim-registration-race");
-        let spawned = broker
-            .spawn_worker(spawn_request(
-                OperationId::new(),
-                workspace.clone(),
-                core.clone(),
-                "claim immediately when bootstrap arrives",
-            ))
-            .await
-            .expect("spawn worker");
-        let command_id = Uuid::new_v4().to_string();
-        broker
-            .link_launch_command(
-                &workspace,
-                &core,
-                &spawned.worker_id,
-                &spawned.task_id,
-                &command_id,
-            )
-            .await
-            .expect("link launch before registration");
-
-        let claim_operation_id = spawned
-            .claim_operation_id
-            .clone()
-            .expect("fresh spawn claim operation");
-        let waiter = {
-            let broker = broker.clone();
-            let workspace = workspace.clone();
-            let worker_id = spawned.worker_id.clone();
-            let task_id = spawned.task_id.clone();
-            let claim_token = spawned.claim_token.clone();
-            let claim_operation_id = claim_operation_id.clone();
-            let worker_identity = worker_identity.clone();
-            tokio::spawn(async move {
-                broker
-                    .wait_for_claim_attestation_requirement(
-                        &workspace,
-                        &worker_id,
-                        &task_id,
-                        &claim_token,
-                        &claim_operation_id,
-                        &worker_identity,
-                        std::time::Duration::from_secs(1),
-                    )
-                    .await
-            })
-        };
-
-        tokio::task::yield_now().await;
-        let conversation_id = spawned.worker_id.to_string();
-        broker
-            .update_launch_by_command(
-                &command_id,
-                WorkerLaunchState::WaitingClaim,
-                None,
-                Some(format!("https://chatgpt.com/c/{conversation_id}")),
-            )
-            .await
-            .expect("publish canonical conversation registration");
-
-        let requirement = waiter
-            .await
-            .expect("claim waiter task")
-            .expect("registration should wake pending claim")
-            .expect("fresh claim needs browser attestation");
-        assert_eq!(requirement.operation_id, claim_operation_id);
-        assert_eq!(requirement.conversation_id, conversation_id);
-
-        let snapshot = broker.snapshot().await;
-        let worker = snapshot
-            .families
-            .values()
-            .flat_map(|family| family.workers.values())
-            .find(|worker| worker.id == spawned.worker_id)
-            .expect("worker retained");
-        assert_eq!(
-            worker.claim_token.as_deref(),
-            Some(spawned.claim_token.as_str())
-        );
-        assert_eq!(
-            worker.claim_operation_id.as_ref(),
-            Some(&claim_operation_id)
-        );
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]
@@ -3975,6 +4223,24 @@ mod tests {
                 .map(|task| task.state),
             Some(TaskState::Failed)
         );
+        assert_eq!(
+            fresh_settled
+                .tasks
+                .get(&fresh.task_id)
+                .and_then(|task| task.failure.as_ref())
+                .map(|failure| (failure.stage.as_str(), failure.error.as_str())),
+            Some(("launch", "model unavailable"))
+        );
+        let collected_failure = broker
+            .collect_updates_for_operation(&workspace, &core, &OperationId::new())
+            .await
+            .expect("collect failed launch");
+        assert_eq!(collected_failure.failed.len(), 1);
+        assert_eq!(collected_failure.failed[0].task_id, fresh.task_id);
+        assert_eq!(
+            collected_failure.failed[0].failure.error,
+            "model unavailable"
+        );
 
         let durable = broker
             .spawn_worker(spawn_request(
@@ -4043,6 +4309,151 @@ mod tests {
                 .get(&reused.task_id)
                 .map(|task| task.state),
             Some(TaskState::Failed)
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn unclaimed_sent_worker_can_be_cancelled_and_collected_as_failure() {
+        let root = temp_root("moondesk-worker-cancel-unclaimed");
+        let path = root.join("worker-state-v1.json");
+        let broker = WorkerBroker::open(&path).expect("open worker broker");
+        let workspace = WorkspaceId::new();
+        let core = anchor("core-cancel-unclaimed");
+        let spawned = broker
+            .spawn_worker(spawn_request(
+                OperationId::new(),
+                workspace.clone(),
+                core.clone(),
+                "cancel unclaimed",
+            ))
+            .await
+            .expect("spawn worker");
+        let command_id = Uuid::new_v4().to_string();
+        broker
+            .link_launch_command(
+                &workspace,
+                &core,
+                &spawned.worker_id,
+                &spawned.task_id,
+                &command_id,
+            )
+            .await
+            .expect("link command");
+        broker
+            .update_launch_by_command(
+                &command_id,
+                WorkerLaunchState::WaitingClaim,
+                None,
+                Some(format!("https://chatgpt.com/c/{}", spawned.worker_id)),
+            )
+            .await
+            .expect("mark waiting claim");
+
+        let cancelled = broker
+            .cancel_unclaimed_after_send(&workspace, &core, &spawned.worker_id)
+            .await
+            .expect("cancel unclaimed worker");
+        assert_eq!(cancelled.state, WorkerState::Retired);
+        assert_eq!(cancelled.launch_state, WorkerLaunchState::Failed);
+        assert!(cancelled.claim_token.is_none());
+        assert!(cancelled.claim_operation_id.is_none());
+        assert!(cancelled.current_task_id.is_none());
+        let failure = cancelled
+            .tasks
+            .get(&spawned.task_id)
+            .and_then(|task| task.failure.as_ref())
+            .expect("cancel failure payload");
+        assert_eq!(failure.stage, "claim");
+        assert_eq!(failure.error, "worker_registration_cancelled_after_send");
+
+        let updates = broker
+            .collect_updates_for_operation(&workspace, &core, &OperationId::new())
+            .await
+            .expect("collect cancellation");
+        assert_eq!(updates.failed.len(), 1);
+        assert_eq!(updates.failed[0].task_id, spawned.task_id);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn waiting_claim_timeout_terminalizes_abandoned_worker_and_reports_failure() {
+        let root = temp_root("moondesk-worker-claim-timeout");
+        let path = root.join("worker-state-v1.json");
+        let broker = WorkerBroker::open(&path).expect("open worker broker");
+        let workspace = WorkspaceId::new();
+        let core = anchor("core-claim-timeout");
+        let spawned = broker
+            .spawn_worker(spawn_request(
+                OperationId::new(),
+                workspace.clone(),
+                core.clone(),
+                "claim timeout",
+            ))
+            .await
+            .expect("spawn worker");
+        let command_id = Uuid::new_v4().to_string();
+        broker
+            .link_launch_command(
+                &workspace,
+                &core,
+                &spawned.worker_id,
+                &spawned.task_id,
+                &command_id,
+            )
+            .await
+            .expect("link command");
+        broker
+            .update_launch_by_command(
+                &command_id,
+                WorkerLaunchState::WaitingClaim,
+                None,
+                Some(format!("https://chatgpt.com/c/{}", spawned.worker_id)),
+            )
+            .await
+            .expect("mark waiting claim");
+        {
+            let mut guard = broker.data.lock().await;
+            let worker = guard
+                .families
+                .values_mut()
+                .flat_map(|family| family.workers.values_mut())
+                .find(|worker| worker.id == spawned.worker_id)
+                .expect("waiting worker");
+            worker.waiting_claim_since_ms =
+                Some(worker_unix_time_ms().saturating_sub(WORKER_CLAIM_TIMEOUT_MS + 1));
+        }
+
+        broker
+            .expire_waiting_claim_timeouts_for_anchor(&workspace, &core)
+            .await
+            .expect("expire waiting claim without browser presence");
+        let family = broker
+            .family_for_anchor(&workspace, &core)
+            .await
+            .expect("read family")
+            .expect("family remains");
+        let worker = family
+            .workers
+            .get(&spawned.worker_id)
+            .expect("worker remains");
+        assert_eq!(worker.state, WorkerState::Retired);
+        assert_eq!(worker.launch_state, WorkerLaunchState::Failed);
+        assert_eq!(
+            worker.launch_error.as_deref(),
+            Some("worker_claim_timeout_after_send")
+        );
+        assert!(worker.claim_token.is_none());
+
+        let updates = broker
+            .collect_updates_for_operation(&workspace, &core, &OperationId::new())
+            .await
+            .expect("collect claim timeout");
+        assert_eq!(updates.failed.len(), 1);
+        assert_eq!(updates.failed[0].failure.stage, "claim");
+        assert_eq!(
+            updates.failed[0].failure.error,
+            "worker_claim_timeout_after_send"
         );
         let _ = std::fs::remove_dir_all(root);
     }
@@ -4508,16 +4919,23 @@ mod tests {
         );
 
         make_claimable(&broker, &workspace_b, &core_b, &target).await;
-        broker
-            .claim_worker(
+        let claimed = broker
+            .claim_worker_attested(
                 &workspace_b,
                 &target.worker_id,
                 &target.task_id,
                 &target.claim_token,
+                &claim_operation_id,
                 worker_identity.clone(),
             )
             .await
             .expect("claim target Worker");
+        assert_eq!(claimed.state, WorkerState::Provisioning);
+        assert_eq!(
+            claimed.tasks.get(&target.task_id).map(|task| task.state),
+            Some(TaskState::Pending),
+            "claim must bind the Worker without pretending project work has started"
+        );
         assert_eq!(
             broker
                 .gateway_workspace_for_worker_identity(&worker_identity)
@@ -4525,11 +4943,56 @@ mod tests {
                 .expect("lookup after claim"),
             Some(workspace_b.clone())
         );
+        let before_start = broker
+            .gateway_workspace_for_active_worker_identity(&worker_identity)
+            .await
+            .expect_err(
+                "claimed Worker must not receive ordinary project-tool authority before start",
+            );
+        assert!(before_start.to_string().contains("no active running task"));
+        let early_report = broker
+            .report_worker(ReportWorkerRequest {
+                operation_id: OperationId::new(),
+                workspace_id: workspace_b.clone(),
+                worker_identity: worker_identity.clone(),
+                worker_id: target.worker_id.clone(),
+                task_id: target.task_id.clone(),
+                body: "must not report before start".into(),
+            })
+            .await
+            .expect_err("claimed Worker must start before reporting");
+        assert!(early_report.to_string().contains("workers start"));
+        let early_finish = broker
+            .finish_task(FinishTaskRequest {
+                workspace_id: workspace_b.clone(),
+                worker_identity: worker_identity.clone(),
+                worker_id: target.worker_id.clone(),
+                task_id: target.task_id.clone(),
+                result: finished_result(),
+            })
+            .await
+            .expect_err("claimed Worker must start before finishing");
+        assert!(early_finish.to_string().contains("workers start"));
+
+        let started = broker
+            .start_task(
+                &workspace_b,
+                &worker_identity,
+                &target.worker_id,
+                &target.task_id,
+            )
+            .await
+            .expect("start claimed target Worker");
+        assert_eq!(started.state, WorkerState::Running);
+        assert_eq!(
+            started.tasks.get(&target.task_id).map(|task| task.state),
+            Some(TaskState::Running)
+        );
         assert_eq!(
             broker
                 .gateway_workspace_for_active_worker_identity(&worker_identity)
                 .await
-                .expect("active lookup after claim"),
+                .expect("active lookup after start"),
             Some(workspace_b.clone())
         );
         broker
@@ -5530,6 +5993,7 @@ mod tests {
                     sequence,
                     reports: Vec::new(),
                     completed: Vec::new(),
+                    failed: Vec::new(),
                 },
             );
         }
@@ -5734,6 +6198,7 @@ mod tests {
                             task_id: task.id.clone(),
                             result: task.result.clone().expect("cleanup task result"),
                         }],
+                        failed: Vec::new(),
                     },
                 );
             }
@@ -6100,7 +6565,6 @@ mod tests {
         let family_id = family.id.clone();
         let worker = family.workers.values().next().expect("worker").clone();
         let worker_identity = worker.chat_identity.clone().expect("worker identity");
-        let task_id = worker.tasks.keys().next().expect("task").clone();
         let mut data = WorkerStoreData::default();
         data.families.insert(family.id.clone(), family);
         store::save(&path, &data).expect("seed cleanup family");
@@ -6114,13 +6578,27 @@ mod tests {
             .await
             .expect("precheck selected cleanup family");
 
+        let reused = broker
+            .reuse_worker(ReuseWorkerRequest {
+                operation_id: OperationId::new(),
+                workspace_id: workspace.clone(),
+                anchor_identity: core.clone(),
+                worker_id: worker.id.clone(),
+                assignment: "late work between cleanup precheck and commit".into(),
+            })
+            .await
+            .expect("reuse worker after cleanup precheck");
+        broker
+            .start_task(&workspace, &worker_identity, &worker.id, &reused.task_id)
+            .await
+            .expect("start late work before reporting");
         broker
             .report_worker(ReportWorkerRequest {
                 operation_id: OperationId::new(),
                 workspace_id: workspace.clone(),
                 worker_identity,
                 worker_id: worker.id.clone(),
-                task_id,
+                task_id: reused.task_id,
                 body: "late report between cleanup precheck and commit".into(),
             })
             .await

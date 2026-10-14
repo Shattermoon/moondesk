@@ -1323,6 +1323,19 @@ test('source and release-ZIP installs without a bootstrap capability expose Manu
   );
 });
 
+test('worker browser failure reasons preserve safe bounded diagnostics', () => {
+  const { evaluate } = loadBackground();
+  const reason = evaluate('workerFailureReason')(
+    'worker_browser_launch_exception',
+    new Error('chrome.tabs.create failed at https://chatgpt.com/c/aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee with abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789')
+  );
+  assert.match(reason, /^worker_browser_launch_exception:/);
+  assert.match(reason, /chrome\.tabs\.create failed/);
+  assert.doesNotMatch(reason, /https:\/\/chatgpt\.com/);
+  assert.doesNotMatch(reason, /abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789/);
+  assert.ok(reason.length < 400);
+});
+
 test('fresh worker creation does not probe unrelated ChatGPT tabs before opening its own tab', async () => {
   let contentProbeCalls = 0;
   const existingTabs = {
@@ -2768,6 +2781,60 @@ test('legacy GPT-5.6 Sol default resolves to ChatGPT live gpt-5-6-thinking execu
     JSON.parse(JSON.stringify(selection)),
     { model: 'gpt-5-6-thinking', reasoningEffort: 'high' }
   );
+});
+
+test('model selection reuses an already confirmed exact model and effort without opening the picker', async () => {
+  const picker = {
+    version: 'gpt-6',
+    currentBucket: 1,
+    versions: [{ id: 'gpt-6', label: 'GPT-6' }],
+    choices: [{
+      bucket: 1,
+      id: 'gpt-6-thinking',
+      label: 'GPT-6',
+      familyId: 'gpt-6-thinking',
+      familyLabel: 'GPT-6',
+      effort: 'high',
+      available: true
+    }]
+  };
+  const listeners = new Set();
+  const pageWindow = {
+    addEventListener(type, handler) {
+      if (type === 'message') listeners.add(handler);
+    },
+    removeEventListener(type, handler) {
+      if (type === 'message') listeners.delete(handler);
+    },
+    postMessage(message) {
+      if (message?.source !== 'moondesk-picker-ask') return;
+      for (const handler of [...listeners]) {
+        handler({
+          source: pageWindow,
+          origin: 'https://chatgpt.com',
+          data: { source: 'moondesk-picker-reply', nonce: message.nonce, v: 1, picker }
+        });
+      }
+    }
+  };
+  const context = vm.createContext({
+    window: pageWindow,
+    // No createElement: the test fails immediately if selection tries to open the native picker.
+    document: { querySelector() { return null; }, querySelectorAll() { return []; } },
+    location: { origin: 'https://chatgpt.com', pathname: '/' },
+    crypto: webcrypto,
+    URL,
+    setTimeout,
+    clearTimeout
+  });
+  vm.runInContext(chatgptDomSource, context, { filename: chatgptDomPath });
+
+  const selected = await pageWindow.MOONDESK_CHATGPT_DOM.selectModelSettings({
+    modelKey: 'gpt-6-thinking',
+    modelLabel: 'GPT-6',
+    reasoningEffort: 'high'
+  });
+  assert.equal(selected, true);
 });
 
 test('legacy GPT-5.6 Sol compatibility never admits the separate Pro execution id', async () => {

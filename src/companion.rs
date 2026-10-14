@@ -1716,10 +1716,12 @@ mod tests {
             .await
             .expect("fresh presence");
         assert_eq!(presence.tabs[0].project_id.as_deref(), Some(project_id));
-        assert!(
-            COMPANION_PRESENCE_MAX_AGE_MS >= 60_000,
-            "presence must survive at least two 30-second Manifest V3 alarm intervals"
-        );
+        const {
+            assert!(
+                COMPANION_PRESENCE_MAX_AGE_MS >= 60_000,
+                "presence must survive at least two 30-second Manifest V3 alarm intervals"
+            );
+        }
         assert!(
             auth.presence_for("extension-install-a", 100 + 60_000)
                 .await

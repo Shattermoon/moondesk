@@ -194,12 +194,42 @@ impl WorkerResult {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct WorkerTaskFailure {
+    pub stage: String,
+    pub error: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_command_id: Option<String>,
+}
+
+impl WorkerTaskFailure {
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        if self.stage.trim().is_empty() || self.stage.len() > 64 {
+            return Err("worker task failure stage is invalid".into());
+        }
+        if self.error.trim().is_empty() || self.error.len() > 1000 {
+            return Err("worker task failure error is invalid".into());
+        }
+        if self
+            .launch_command_id
+            .as_deref()
+            .is_some_and(|value| Uuid::parse_str(value).is_err())
+        {
+            return Err("worker task failure launch command id is invalid".into());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct WorkerTask {
     pub id: TaskId,
     pub assignment: String,
     pub state: TaskState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<WorkerResult>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<WorkerTaskFailure>,
     #[serde(default)]
     pub collected: bool,
 }
@@ -260,6 +290,8 @@ pub struct WorkerRecord {
     pub claim_token: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claim_operation_id: Option<OperationId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiting_claim_since_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_task_id: Option<TaskId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -330,6 +362,15 @@ pub struct CollectedTaskReceipt {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct CollectedTaskFailureReceipt {
+    pub worker_id: WorkerId,
+    pub display_id: String,
+    pub task_id: TaskId,
+    pub failure: WorkerTaskFailure,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CollectReceipt {
     pub request_fingerprint: String,
     #[serde(default)]
@@ -338,6 +379,8 @@ pub struct CollectReceipt {
     pub reports: Vec<WorkerReport>,
     #[serde(default)]
     pub completed: Vec<CollectedTaskReceipt>,
+    #[serde(default)]
+    pub failed: Vec<CollectedTaskFailureReceipt>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -490,6 +533,12 @@ impl WorkerStoreData {
                     }
                     if let Some(result) = task.result.as_ref() {
                         result.validate()?;
+                    }
+                    if let Some(failure) = task.failure.as_ref() {
+                        failure.validate()?;
+                    }
+                    if task.result.is_some() && task.failure.is_some() {
+                        return Err("worker task cannot contain both a result and a failure".into());
                     }
                 }
                 for message in &worker.messages {

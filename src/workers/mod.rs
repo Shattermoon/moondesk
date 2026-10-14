@@ -31,6 +31,10 @@ pub const MAX_COLLECTED_TASK_HISTORY_PER_WORKER: usize = 2;
 pub const MAX_TASK_RECORDS_PER_WORKER: usize = 8;
 pub const MAX_REPORTS_PER_FAMILY: usize = 64;
 pub const MAX_UPDATES_PER_COLLECT: usize = 32;
+// A fresh Worker must claim promptly after ChatGPT accepts its bootstrap. Past this grace,
+// invalidate the one-time claim capability so a stopped/abandoned chat cannot remain provisioning
+// forever or claim unexpectedly much later.
+pub const WORKER_CLAIM_TIMEOUT_MS: u64 = 120_000;
 // Match Chat on Steroids' post-clear worker fence: a recently cleared worker conversation stays
 // recognizable long enough for any already-running turn/tab to fail closed instead of becoming a
 // new Core immediately after its retained history is destroyed.

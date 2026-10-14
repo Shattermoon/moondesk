@@ -2100,9 +2100,9 @@ fn apply_local_ide_core_marker(body: &mut Value, local_ide_core: bool) {
         }
         *params = Value::Object(serde_json::Map::new());
     }
-    let params = params
-        .as_object_mut()
-        .expect("params was normalized to object");
+    let Some(params) = params.as_object_mut() else {
+        return;
+    };
     let meta = params
         .entry("_meta".to_string())
         .or_insert_with(|| Value::Object(serde_json::Map::new()));
@@ -2112,7 +2112,9 @@ fn apply_local_ide_core_marker(body: &mut Value, local_ide_core: bool) {
         }
         *meta = Value::Object(serde_json::Map::new());
     }
-    let meta = meta.as_object_mut().expect("meta was normalized to object");
+    let Some(meta) = meta.as_object_mut() else {
+        return;
+    };
     meta.remove(mcp::LOCAL_IDE_CORE_META_KEY);
     meta.remove(mcp::WORKER_GATEWAY_META_KEY);
     if local_ide_core {
@@ -2138,9 +2140,9 @@ fn apply_worker_gateway_marker(body: &mut Value, worker_gateway: bool) {
         }
         *params = Value::Object(serde_json::Map::new());
     }
-    let params = params
-        .as_object_mut()
-        .expect("params was normalized to object");
+    let Some(params) = params.as_object_mut() else {
+        return;
+    };
     let meta = params
         .entry("_meta".to_string())
         .or_insert_with(|| Value::Object(serde_json::Map::new()));
@@ -2150,7 +2152,9 @@ fn apply_worker_gateway_marker(body: &mut Value, worker_gateway: bool) {
         }
         *meta = Value::Object(serde_json::Map::new());
     }
-    let meta = meta.as_object_mut().expect("meta was normalized to object");
+    let Some(meta) = meta.as_object_mut() else {
+        return;
+    };
     meta.remove(mcp::WORKER_GATEWAY_META_KEY);
     if worker_gateway {
         meta.insert(mcp::WORKER_GATEWAY_META_KEY.to_string(), Value::Bool(true));

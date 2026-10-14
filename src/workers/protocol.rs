@@ -875,6 +875,22 @@ pub async fn handle(
                 .get(&worker_id)
                 .cloned()
                 .ok_or_else(|| "worker was not found".to_string())?;
+            if worker.state == WorkerState::Provisioning
+                && worker.launch_state == crate::workers::types::WorkerLaunchState::WaitingClaim
+                && worker.chat_identity.is_none()
+            {
+                let retired = broker
+                    .cancel_unclaimed_after_send(workspace_id, caller_identity, &worker_id)
+                    .await
+                    .map_err(broker_error)?;
+                return Ok(json!({
+                    "action": "retire",
+                    "workerId": retired.id,
+                    "displayId": retired.display_id,
+                    "state": retired.state,
+                    "cancelledUnclaimedSend": true
+                }));
+            }
             let pending_task = match worker.state {
                 WorkerState::Retired | WorkerState::Idle => None,
                 WorkerState::Provisioning | WorkerState::Waking => {
@@ -951,6 +967,12 @@ pub async fn handle(
                     "displayId": update.display_id,
                     "taskId": update.task_id,
                     "result": update.result
+                })).collect::<Vec<_>>(),
+                "failed": updates.failed.into_iter().map(|update| json!({
+                    "workerId": update.worker_id,
+                    "displayId": update.display_id,
+                    "taskId": update.task_id,
+                    "failure": update.failure
                 })).collect::<Vec<_>>()
             }))
         }
@@ -988,6 +1010,10 @@ pub async fn handle(
                 )
                 .await
                 .map_err(broker_error)?;
+            // Observability must never turn an already-committed task start into an apparent failure.
+            let _ = broker
+                .record_tool_activity(workspace_id, caller_identity, "workers:start")
+                .await;
             Ok(json!({
                 "action": "start",
                 "workerId": worker.id,
@@ -2007,7 +2033,7 @@ mod tests {
             .expect("worker remains");
         assert_eq!(waking.state, WorkerState::Waking);
         let reuse_task_id = waking.current_task_id.clone().expect("reuse task id");
-        worker
+        let report_error = worker
             .report_worker(ReportWorkerRequest {
                 operation_id: OperationId::new(),
                 workspace_id: workspace.clone(),
@@ -2017,7 +2043,8 @@ mod tests {
                 body: "concurrent worker report".into(),
             })
             .await
-            .expect("report cannot invoke crash recovery");
+            .expect_err("waking Worker must not report before workers start");
+        assert!(report_error.to_string().contains("workers start"));
         let status = handle(
             &json!({ "action": "status" }),
             &workspace,

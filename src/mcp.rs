@@ -625,7 +625,7 @@ fn workers_tool_descriptor() -> Value {
     json!({
         "name": "workers",
         "title": "Coordinate workers",
-        "description": "Coordinate MoonDesk workers. Core: status/spawn/reuse/recover/send/collect/retire; Worker: claim/start/inbox/ack/report/finish. ROLE-SCOPED RULE: browser ChatGPT Core may orchestrate Workers here; browserless Codex/IDE Core must use the machine-local `moondesk mcp` server instead of this account-bound connector. Workers launched by local IDE use the generalized MoonDesk Worker connector, which resolves their workspace from claim and exact Worker chat identity. Fresh spawn `context` may carry shared goals, constraints, settled decisions, validation, and sibling ownership while `task` stays worker-specific. Reuse keeps the same durable worker chat; send only new direction. Provisioning/Waking is queued, not started. health=suspect means the exact Worker is stale even if the browser says generating; recover before replacing it. collect may wait up to 60 seconds. Retry uncertain requests with the same `operation_id`.",
+        "description": "Coordinate MoonDesk workers. Core: status/spawn/reuse/recover/send/collect/retire; Worker: claim/start/inbox/ack/report/finish. ROLE-SCOPED RULE: browser ChatGPT Core may orchestrate Workers here; browserless Codex/IDE Core must use the machine-local `moondesk mcp` server instead of this account-bound connector. Workers launched by local IDE use the generalized MoonDesk Worker connector, which resolves their workspace from claim and exact Worker chat identity. Fresh spawn `context` may carry shared goals, constraints, settled decisions, validation, and sibling ownership while `task` stays worker-specific. Reuse keeps the same durable worker chat; send only new direction. `collect` returns completed results and durable `failed` launch/task records with stage/error. Provisioning/Waking is not proof of work. health=suspect means the exact Worker is stale even if the browser says generating; recover before replacing it. collect may wait up to 60 seconds. Retry uncertain requests with the same `operation_id`.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -681,6 +681,7 @@ fn workers_tool_descriptor() -> Value {
                 "messages": { "type": "array" },
                 "reports": { "type": "array" },
                 "completed": { "type": "array" },
+                "failed": { "type": "array" },
                 "result": {}
             }
         },
@@ -717,7 +718,7 @@ fn worker_gateway_workers_tool_descriptor() -> Value {
 fn local_ide_workers_tool_descriptor() -> Value {
     let mut descriptor = workers_tool_descriptor();
     descriptor["description"] = json!(
-        "Coordinate MoonDesk browser Workers from local Codex/IDE. Core actions: status, spawn, reuse, recover, send, collect, retire, clear. Worker chats run in the paired Companion browser and use the one generalized MoonDesk Worker connector; MoonDesk resolves each Worker's workspace from claim and exact Worker chat identity. Local IDE Core is account-independent: switching the ChatGPT account used by Codex does not change Worker ownership or the Worker browser account. Treat one workspace as one logical Codex Core at a time; separate concurrent Codex sessions share the same Worker family. `clear` is a destructive workspace-local recovery action for terminal browser launches: it removes only this local Core family's Worker ownership and managed launch history, preserves ChatGPT conversations and unrelated workspaces, and allows the next fresh spawn to choose an online Worker browser again. It fails closed while any matching browser launch is queued, leased, send-started, paused, or needs reconciliation; use the Companion's host-wide Clear Workers only when that stronger browser fence is actually required. Fresh spawn `context` may carry shared goals/constraints while `task` stays worker-specific. Provisioning/Waking is queued, not started; wait for Running/start activity. Do not repeatedly long-poll collect while a Worker is still waiting_claim. If status shows claimStartupBlockedLikely=true, report the Worker startup/connector blocker immediately instead of waiting: the browser chat is idle but the Worker never claimed. If status.migrationBlocked is true, do not spawn: an older Core still owns an active Worker and must finish or be cleared first. health=suspect means the exact Worker is stale even if ChatGPT still shows generating; recover before replacing it. Continue independent Core work while Workers run and collect results when needed."
+        "Delegate substantial, independent work to MoonDesk browser Workers. Local IDE Core is account-independent. Core actions: status, spawn, reuse, recover, send, collect, retire, clear. Prefer `collect` with `wait_ms` (up to 60000) after dispatch; use `status` for lifecycle/diagnosis, not rapid polling. Do not duplicate a Worker's assignment in Core unless takeover is necessary; continue only non-overlapping Core work when quota conservation matters. Lifecycle is queued -> sent -> claimed -> working; provisioning/waking alone is not work. `collect` returns reports, completed results, and durable failed records. Reuse keeps the same Worker conversation/account. Sent-but-unclaimed Workers expire to a collectible failure and may be retired safely. `clear` is workspace-local terminal recovery. If migrationBlocked is true, do not spawn; health=suspect means recover before replacing."
     );
     if let Some(action_enum) = descriptor.pointer_mut("/inputSchema/properties/action/enum") {
         *action_enum = json!([
@@ -739,6 +740,16 @@ fn local_ide_workers_tool_descriptor() -> Value {
             "blockers",
         ] {
             properties.remove(key);
+        }
+        if let Some(context) = properties.get_mut("context") {
+            context["description"] = json!(
+                "Optional concise shared context for a fresh Worker. Include only decisions, constraints, and state the Worker cannot cheaply rediscover; do not repeat repository content. Reuse relies on the existing Worker chat history."
+            );
+        }
+        if let Some(task) = properties.get_mut("task") {
+            task["description"] = json!(
+                "Concrete Worker-owned assignment. Keep it self-contained but do not duplicate shared context or work Core will also perform."
+            );
         }
         properties.insert(
             "worker_browser_id".into(),
@@ -1964,10 +1975,9 @@ async fn select_local_spawn_client(
                 .into(),
         );
     }
-    let preferred = remembered
-        .into_iter()
-        .next()
-        .expect("one remembered browser");
+    let preferred = remembered.into_iter().next().ok_or_else(|| {
+        "local Worker browser affinity disappeared while selecting the pinned Companion".to_string()
+    })?;
     if requested.is_some_and(|requested| requested != preferred) {
         return Err(format!(
             "this local Worker family is pinned to Companion browser '{preferred}'; call workers with action=clear before changing the Worker browser/account"
@@ -2044,6 +2054,10 @@ async fn worker_observability(
     broker: &WorkerBroker,
     companion_auth: Option<&CompanionAuth>,
 ) -> Result<Vec<Value>, String> {
+    broker
+        .expire_waiting_claim_timeouts_for_anchor(workspace_id, anchor_identity)
+        .await
+        .map_err(|error| error.to_string())?;
     let Some(family) = broker
         .family_for_anchor(workspace_id, anchor_identity)
         .await
@@ -2081,6 +2095,30 @@ async fn worker_observability(
             let snapshot = activity.get(&worker.id);
             let last_activity_at_ms = snapshot.and_then(|snapshot| snapshot.last_activity_at_ms);
             let last_activity_age_ms = last_activity_at_ms.map(|at| now_ms.saturating_sub(at));
+            let lifecycle_stage = match worker.state {
+                WorkerState::Provisioning | WorkerState::Waking => match worker.launch_state {
+                    crate::workers::types::WorkerLaunchState::Unknown
+                    | crate::workers::types::WorkerLaunchState::Queued
+                    | crate::workers::types::WorkerLaunchState::Preparing => "queued",
+                    crate::workers::types::WorkerLaunchState::SendStarted
+                    | crate::workers::types::WorkerLaunchState::Reconciling
+                    | crate::workers::types::WorkerLaunchState::WaitingClaim
+                    | crate::workers::types::WorkerLaunchState::Paused => "sent",
+                    crate::workers::types::WorkerLaunchState::Failed => "failed",
+                    crate::workers::types::WorkerLaunchState::Claimed => "claimed",
+                },
+                WorkerState::Running => "working",
+                WorkerState::Idle => "idle",
+                WorkerState::Retired
+                    if worker.launch_state == crate::workers::types::WorkerLaunchState::Failed =>
+                {
+                    "failed"
+                }
+                WorkerState::Retired => "retired",
+            };
+            let claim_deadline_at_ms = worker
+                .waiting_claim_since_ms
+                .map(|started| started.saturating_add(crate::workers::WORKER_CLAIM_TIMEOUT_MS));
             let browser_present = browser.is_some();
             let browser_generating = browser.is_some_and(|(_, tab)| tab.generating);
             let recovery_guard_started_at_ms = worker.recovery_guard.as_ref().and_then(|guard| {
@@ -2099,6 +2137,11 @@ async fn worker_observability(
                     if worker.launch_state == crate::workers::types::WorkerLaunchState::WaitingClaim =>
                 {
                     "waiting_claim"
+                }
+                WorkerState::Provisioning
+                    if worker.launch_state == crate::workers::types::WorkerLaunchState::Claimed =>
+                {
+                    "claimed"
                 }
                 WorkerState::Provisioning | WorkerState::Waking => "launching",
                 WorkerState::Idle => "idle",
@@ -2139,6 +2182,7 @@ async fn worker_observability(
                 "displayId": worker.display_id,
                 "taskId": worker.current_task_id,
                 "state": worker.state,
+                "lifecycleStage": lifecycle_stage,
                 "health": health,
                 "launchState": worker.launch_state,
                 "launchCommandId": worker.launch_command_id,
@@ -2150,8 +2194,9 @@ async fn worker_observability(
                 "recoveryGuardStartedAtMs": recovery_guard_started_at_ms,
                 "recoveryGuardAgeMs": recovery_guard_age_ms,
                 "claimStartupBlockedLikely": claim_startup_blocker_likely,
+                "claimDeadlineAtMs": claim_deadline_at_ms,
                 "startupDiagnostic": claim_startup_blocker_likely.then_some(
-                    "The Worker conversation is confirmed and the browser is idle, but the Worker never completed workers claim. The most likely causes are that the generalized MoonDesk Worker connector is unavailable in this Worker account/chat, or the claim failed before registration. Do not keep long-polling collect while the Worker remains waiting_claim; fix the generalized Worker connector/claim path and retry with a fresh Worker."
+                    "The Worker conversation is confirmed and the browser is idle, but workers claim has not completed. MoonDesk now gives sent-but-unclaimed Workers a bounded claim window and terminalizes them as a collectible failure when that deadline expires. Core may also retire this unclaimed Worker safely; that invalidates its one-time claim capability but cannot unsend a ChatGPT message that already reached the conversation."
                 ),
                 "recentToolCalls": snapshot
                     .map(|snapshot| snapshot.recent_tool_calls.clone())
@@ -2183,12 +2228,16 @@ async fn local_ide_foreign_active_workers(
             family.workspace_id == *workspace_id && family.anchor_identity != *caller_identity
         })
         .flat_map(|family| {
-            family.workers.values().filter_map(move |worker| {
-                matches!(
-                    worker.state,
-                    WorkerState::Provisioning | WorkerState::Waking | WorkerState::Running
-                )
-                .then(|| {
+            family
+                .workers
+                .values()
+                .filter(|worker| {
+                    matches!(
+                        worker.state,
+                        WorkerState::Provisioning | WorkerState::Waking | WorkerState::Running
+                    )
+                })
+                .map(move |worker| {
                     json!({
                         "familyId": family.id,
                         "workerId": worker.id,
@@ -2197,7 +2246,6 @@ async fn local_ide_foreign_active_workers(
                         "taskId": worker.current_task_id
                     })
                 })
-            })
         })
         .collect()
 }
@@ -2589,15 +2637,20 @@ async fn handle_tools_call_for_workspace(
                 .get("action")
                 .and_then(Value::as_str)
                 .unwrap_or("call");
-            format!("workers:{action}")
+            // `workers start` is the explicit transition from claimed to actually working. Record
+            // that marker only after the start call succeeds in the Worker protocol handler below;
+            // otherwise a rejected/failed start attempt could make Core observability lie.
+            (action != "start").then(|| format!("workers:{action}"))
         } else {
-            tool_name.clone()
+            Some(tool_name.clone())
         };
         // Best-effort observability only. Worker authority and tool execution must never depend
         // on this in-memory IDE/Work telemetry ledger.
-        let _ = worker_broker
-            .record_tool_activity(workspace_id, &identity, &activity_tool)
-            .await;
+        if let Some(activity_tool) = activity_tool {
+            let _ = worker_broker
+                .record_tool_activity(workspace_id, &identity, &activity_tool)
+                .await;
+        }
     }
 
     if user_browser_tool(&tool_name) {
@@ -2804,15 +2857,130 @@ async fn handle_tools_call_for_workspace(
                     );
                 }
             };
-            let requirement = match worker_broker
-                .wait_for_claim_attestation_requirement(
+            let Some(auth) = companion_auth.as_ref() else {
+                return tool_error_response_text_only(
+                    req,
+                    "fresh worker claim requires the MoonDesk Worker Companion browser attestation"
+                        .into(),
+                );
+            };
+            if auth.paired_client_count().await == 0 {
+                return tool_error_response_text_only(
+                    req,
+                    "fresh worker claim requires a paired MoonDesk Worker Companion browser".into(),
+                );
+            }
+
+            // The Worker can begin its first tool call immediately after ChatGPT accepts the
+            // assignment, before the Companion's slower terminal launch ACK has mirrored the
+            // canonical conversation URL into Worker state. The claim operation UUID is present
+            // only in that bootstrap and is passively correlated by the Companion to the exact
+            // ChatGPT conversation that issued this call. Use that proof to close the registration
+            // race instead of forcing the model to guess when the launch ACK has caught up.
+            let pending_registration = match worker_broker
+                .pending_claim_registration(
                     workspace_id,
                     &worker_id,
                     &task_id,
                     claim_token,
                     &claim_operation_id,
                     &caller_identity,
-                    std::time::Duration::from_secs(12),
+                )
+                .await
+            {
+                Ok(value) => value,
+                Err(error) => return tool_error_response_text_only(req, error.to_string()),
+            };
+            if let Some(pending) = pending_registration {
+                let operation_id = pending.operation_id.to_string();
+                let route = match auth
+                    .wait_for_any_correlation(
+                        &[operation_id.as_str()],
+                        std::time::Duration::from_secs(12),
+                    )
+                    .await
+                {
+                    Ok(route) => route,
+                    Err(error) => return tool_error_response_text_only(req, error),
+                };
+                let Some(route) = route else {
+                    return tool_error_response_text_only(
+                        req,
+                        "worker claim could not verify its browser-attested claim operation; the claim token was not consumed"
+                            .into(),
+                    );
+                };
+
+                let managed_snapshot = managed_chat_broker.snapshot().await;
+                let managed_command = managed_snapshot
+                    .commands
+                    .values()
+                    .find(|command| command.id.to_string() == pending.launch_command_id);
+                let Some(managed_command) = managed_command else {
+                    return tool_error_response_text_only(
+                        req,
+                        "worker registration is pending but its linked browser launch command is unavailable"
+                            .into(),
+                    );
+                };
+                let expected_thread_key = format!("worker:{worker_id}");
+                if managed_command.launch.purpose != ManagedChatPurpose::Worker
+                    || &managed_command.launch.workspace_id != workspace_id
+                    || managed_command.launch.thread_key.as_deref()
+                        != Some(expected_thread_key.as_str())
+                    || managed_command.target_client_id.as_deref() != Some(route.client_id.as_str())
+                    || !matches!(
+                        managed_command.state,
+                        ManagedChatCommandState::SendStarted
+                            | ManagedChatCommandState::NeedsReconcile
+                            | ManagedChatCommandState::Paused
+                            | ManagedChatCommandState::Succeeded
+                    )
+                {
+                    return tool_error_response_text_only(
+                        req,
+                        "worker claim browser attestation does not match the exact post-Send launch route; registration was not changed"
+                            .into(),
+                    );
+                }
+
+                let _lifecycle_guard = crate::workers::WORKER_LIFECYCLE_LOCK.lock().await;
+                let still_pending = match worker_broker
+                    .pending_claim_registration(
+                        workspace_id,
+                        &worker_id,
+                        &task_id,
+                        claim_token,
+                        &claim_operation_id,
+                        &caller_identity,
+                    )
+                    .await
+                {
+                    Ok(value) => value,
+                    Err(error) => return tool_error_response_text_only(req, error.to_string()),
+                };
+                if still_pending.is_some()
+                    && let Err(error) = worker_broker
+                        .update_launch_by_command(
+                            &pending.launch_command_id,
+                            crate::workers::types::WorkerLaunchState::WaitingClaim,
+                            None,
+                            Some(route.tab.conversation_url.clone()),
+                        )
+                        .await
+                {
+                    return tool_error_response_text_only(req, error.to_string());
+                }
+            }
+
+            let requirement = match worker_broker
+                .claim_attestation_requirement(
+                    workspace_id,
+                    &worker_id,
+                    &task_id,
+                    claim_token,
+                    &claim_operation_id,
+                    &caller_identity,
                 )
                 .await
             {
@@ -2820,19 +2988,6 @@ async fn handle_tools_call_for_workspace(
                 Err(error) => return tool_error_response_text_only(req, error.to_string()),
             };
             if let Some(requirement) = requirement {
-                let Some(auth) = companion_auth.as_ref() else {
-                    return tool_error_response_text_only(
-                        req,
-                        "fresh worker claim requires the MoonDesk Worker Companion browser attestation".into(),
-                    );
-                };
-                if auth.paired_client_count().await == 0 {
-                    return tool_error_response_text_only(
-                        req,
-                        "fresh worker claim requires a paired MoonDesk Worker Companion browser"
-                            .into(),
-                    );
-                }
                 let operation_id = requirement.operation_id.to_string();
                 let route = match auth
                     .wait_for_correlation_in_conversation(
@@ -3122,18 +3277,19 @@ async fn handle_tools_call_for_workspace(
         } else {
             Vec::new()
         };
-        let worker_observability = if matches!(action, Some("status") | Some("collect")) {
-            worker_observability(
-                workspace_id,
-                &caller_identity,
-                worker_broker.as_ref(),
-                companion_auth.as_deref(),
-            )
-            .await
-            .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
+        let worker_observability =
+            if action == Some("status") || (!local_ide_core && action == Some("collect")) {
+                worker_observability(
+                    workspace_id,
+                    &caller_identity,
+                    worker_broker.as_ref(),
+                    companion_auth.as_deref(),
+                )
+                .await
+                .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
         let foreign_active_workers = if local_ide_core && action == Some("status") {
             local_ide_foreign_active_workers(workspace_id, &caller_identity, worker_broker.as_ref())
                 .await
@@ -3176,7 +3332,54 @@ async fn handle_tools_call_for_workspace(
                             );
                         }
                     }
-                    if matches!(action, Some("status") | Some("collect")) {
+                    if action == Some("status")
+                        && let Some(workers) =
+                            object.get_mut("workers").and_then(Value::as_array_mut)
+                    {
+                        for worker in workers {
+                            let worker_id = worker
+                                .get("workerId")
+                                .and_then(Value::as_str)
+                                .map(str::to_owned);
+                            let Some(worker_id) = worker_id else {
+                                continue;
+                            };
+                            let Some(observed) = worker_observability.iter().find(|observed| {
+                                observed.get("workerId").and_then(Value::as_str)
+                                    == Some(worker_id.as_str())
+                            }) else {
+                                continue;
+                            };
+                            if let Some(worker_object) = worker.as_object_mut() {
+                                for key in ["lifecycleStage", "health", "claimDeadlineAtMs"] {
+                                    if let Some(value) = observed.get(key) {
+                                        worker_object.insert(key.into(), value.clone());
+                                    }
+                                }
+                                if local_ide_core {
+                                    // Local Codex needs compact lifecycle state, not duplicated browser
+                                    // diagnostics/history on every status turn. Recovery still consumes the
+                                    // richer observability internally when explicitly requested.
+                                    for key in
+                                        ["launchCommandId", "conversationUrl", "executionProfile"]
+                                    {
+                                        worker_object.remove(key);
+                                    }
+                                    if worker_object.get("launchError").is_some_and(Value::is_null)
+                                    {
+                                        worker_object.remove("launchError");
+                                    }
+                                    if worker_object
+                                        .get("claimDeadlineAtMs")
+                                        .is_some_and(Value::is_null)
+                                    {
+                                        worker_object.remove("claimDeadlineAtMs");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if !local_ide_core && matches!(action, Some("status") | Some("collect")) {
                         object.insert(
                             "workerObservability".into(),
                             Value::Array(worker_observability),
@@ -7853,11 +8056,23 @@ mod tests {
                 .is_some(),
             "local IDE MCP must advertise explicit Companion selection when more than one browser is online"
         );
+        let description = workers
+            .get("description")
+            .and_then(Value::as_str)
+            .expect("local IDE workers description");
+        assert!(description.contains("account-independent"));
+        assert!(description.contains("not rapid polling"));
+        assert!(description.contains("Do not duplicate a Worker's assignment"));
         assert!(
-            workers
-                .get("description")
-                .and_then(Value::as_str)
-                .is_some_and(|description| description.contains("account-independent"))
+            description.len() < 1_000,
+            "local IDE workers description should stay compact for Codex context"
+        );
+        let serialized =
+            serde_json::to_vec(workers).expect("serialize local IDE workers descriptor");
+        assert!(
+            serialized.len() < 4_000,
+            "local IDE workers descriptor should stay below 4 KB; got {} bytes",
+            serialized.len()
         );
     }
 
@@ -8008,6 +8223,13 @@ mod tests {
             .expect("read worker observability");
         assert_eq!(observed.len(), 1);
         assert_eq!(observed[0].get("health"), Some(&json!("waiting_claim")));
+        assert_eq!(observed[0].get("lifecycleStage"), Some(&json!("sent")));
+        assert!(
+            observed[0]
+                .get("claimDeadlineAtMs")
+                .and_then(Value::as_u64)
+                .is_some()
+        );
         assert_eq!(
             observed[0].get("claimStartupBlockedLikely"),
             Some(&json!(true))
@@ -8016,7 +8238,7 @@ mod tests {
             observed[0]
                 .get("startupDiagnostic")
                 .and_then(Value::as_str)
-                .is_some_and(|text| text.contains("Do not keep long-polling collect"))
+                .is_some_and(|text| text.contains("bounded claim window"))
         );
     }
 
@@ -8471,6 +8693,49 @@ mod tests {
                 .map(Vec::len),
             Some(1)
         );
+        assert!(
+            status.get("workerObservability").is_none(),
+            "local Codex status must not duplicate every Worker into a second observability array"
+        );
+        let local_status_worker = status
+            .get("workers")
+            .and_then(Value::as_array)
+            .and_then(|workers| workers.first())
+            .expect("local status worker");
+        assert!(local_status_worker.get("lifecycleStage").is_some());
+        assert!(local_status_worker.get("health").is_some());
+        for internal_field in ["launchCommandId", "conversationUrl", "executionProfile"] {
+            assert!(
+                local_status_worker.get(internal_field).is_none(),
+                "local Codex status should omit internal field {internal_field}"
+            );
+        }
+
+        let collected = call_workers_for_test_with_companion(
+            &tool_call_request_local_ide(
+                "workers",
+                json!({
+                    "action": "collect",
+                    "operation_id": Uuid::new_v4().to_string(),
+                    "wait_ms": 0
+                }),
+            ),
+            &workspace_id,
+            &workspace_root.to_string_lossy(),
+            broker.clone(),
+            managed_chat_broker.clone(),
+            Some(companion_auth.clone()),
+        )
+        .await;
+        let collected = collected
+            .result
+            .as_ref()
+            .and_then(|result| result.get("structuredContent"))
+            .expect("local collect structured output");
+        assert!(
+            collected.get("workerObservability").is_none(),
+            "local Codex collect must return only updates instead of a repeated full status dump"
+        );
 
         let spawn = call_workers_for_test_with_companion(
             &tool_call_request_local_ide(
@@ -8568,12 +8833,23 @@ mod tests {
             )
             .await
             .expect("pair worker browser");
+        let legacy_core_conversation = "8ccd9ad3-6d32-a500-b9df-f10d55aa8603";
         companion_auth
             .update_presence(
                 "reverse-migration-browser",
                 crate::companion::CompanionPresenceUpdate {
                     browser_label: Some("Edge".into()),
-                    tabs: Vec::new(),
+                    tabs: vec![crate::companion::CompanionTabPresence {
+                        conversation_id: legacy_core_conversation.into(),
+                        conversation_url: format!(
+                            "https://chatgpt.com/c/{legacy_core_conversation}"
+                        ),
+                        project_id: None,
+                        project_url: None,
+                        active: true,
+                        window_focused: true,
+                        generating: false,
+                    }],
                 },
                 crate::companion::unix_time_ms(),
             )
@@ -8627,15 +8903,30 @@ mod tests {
             .await
             .expect("claim local worker into running state");
 
+        let legacy_operation = OperationId::new();
+        companion_auth
+            .observe_correlations(
+                "reverse-migration-browser",
+                crate::companion::CompanionCorrelationUpdate {
+                    conversation_id: legacy_core_conversation.into(),
+                    conversation_url: format!("https://chatgpt.com/c/{legacy_core_conversation}"),
+                    project_id: None,
+                    project_url: None,
+                    request_ids: Vec::new(),
+                    operation_ids: vec![legacy_operation.to_string()],
+                },
+                crate::companion::unix_time_ms(),
+            )
+            .await
+            .expect("publish exact legacy Core operation correlation");
         let legacy_spawn = call_workers_for_test_with_companion(
             &tool_call_request_with_identity(
                 "workers",
                 json!({
                     "action": "spawn",
-                    "operation_id": Uuid::new_v4().to_string(),
+                    "operation_id": legacy_operation.to_string(),
                     "label": "legacy duplicate editor",
-                    "task": "Must be rejected while local Core is active.",
-                    "browserless_core": true
+                    "task": "Must be rejected while local Core is active."
                 }),
                 "legacy-codex-account",
                 "legacy-codex-session",
@@ -10273,20 +10564,24 @@ mod tests {
             .clone()
             .expect("fresh Worker claim operation id");
         let command = managed_chat_broker
-            .enqueue(crate::managed_chat::broker::EnqueueManagedChatRequest {
-                dedupe_key: format!("worker:{}:task:{}", spawned.worker_id, spawned.task_id),
-                launch: ManagedChatLaunch {
-                    workspace_id: workspace_id.clone(),
-                    purpose: ManagedChatPurpose::Worker,
-                    execution_profile: ChatExecutionProfile::default(),
-                    opening_message: "cross-account Worker launch".into(),
-                    task_marker: format!("moondesk-worker-task:{}", spawned.task_id),
-                    thread_key: None,
-                    open_mode: ManagedChatOpenMode::NewThread,
-                    existing_conversation_url: None,
-                    anchor_session_digest: Some(core_identity.session_digest.clone()),
+            .enqueue_with_route(
+                crate::managed_chat::broker::EnqueueManagedChatRequest {
+                    dedupe_key: format!("worker:{}:task:{}", spawned.worker_id, spawned.task_id),
+                    launch: ManagedChatLaunch {
+                        workspace_id: workspace_id.clone(),
+                        purpose: ManagedChatPurpose::Worker,
+                        execution_profile: ChatExecutionProfile::default(),
+                        opening_message: "cross-account Worker launch".into(),
+                        task_marker: format!("moondesk-worker-task:{}", spawned.task_id),
+                        thread_key: Some(format!("worker:{}", spawned.worker_id)),
+                        open_mode: ManagedChatOpenMode::NewThread,
+                        existing_conversation_url: None,
+                        anchor_session_digest: Some(core_identity.session_digest.clone()),
+                    },
                 },
-            })
+                Some("worker-account-browser".into()),
+                None,
+            )
             .await
             .expect("enqueue local-Core managed launch");
         broker
@@ -10299,16 +10594,23 @@ mod tests {
             )
             .await
             .expect("link local-Core managed launch");
-        let worker_conversation = "8ccd9ad3-6d32-a500-b9df-f10d55aa86f1";
-        broker
-            .update_launch_by_command(
-                &command.id.to_string(),
-                crate::workers::types::WorkerLaunchState::WaitingClaim,
-                None,
-                Some(format!("https://chatgpt.com/c/{worker_conversation}")),
-            )
+        let offer = managed_chat_broker
+            .redeem("worker-account-browser", crate::companion::unix_time_ms())
             .await
-            .expect("confirm Worker browser conversation");
+            .expect("redeem local-Core launch")
+            .expect("launch offer");
+        let lease_id = offer
+            .command
+            .lease
+            .as_ref()
+            .expect("launch lease")
+            .lease_id
+            .clone();
+        managed_chat_broker
+            .mark_send_started(&offer.command.id, &lease_id, "worker-account-browser")
+            .await
+            .expect("mark launch send started");
+        let worker_conversation = "8ccd9ad3-6d32-a500-b9df-f10d55aa86f1";
         companion_auth
             .observe_correlations(
                 "worker-account-browser",
@@ -10342,8 +10644,8 @@ mod tests {
             &workspace_id,
             &workspace_root.to_string_lossy(),
             broker.clone(),
-            managed_chat_broker,
-            Some(companion_auth),
+            managed_chat_broker.clone(),
+            Some(companion_auth.clone()),
         )
         .await;
         assert_eq!(
@@ -10352,9 +10654,38 @@ mod tests {
                 .as_ref()
                 .and_then(|result| result.pointer("/structuredContent/state"))
                 .and_then(Value::as_str),
-            Some("running"),
+            Some("provisioning"),
             "{}",
             result_text(&claimed)
+        );
+
+        let started = call_workers_for_test_with_companion(
+            &tool_call_request_with_identity(
+                "workers",
+                json!({
+                    "action": "start",
+                    "worker_id": spawned.worker_id,
+                    "task_id": spawned.task_id
+                }),
+                "different-worker-chatgpt-account",
+                "different-worker-chat-session",
+            ),
+            &workspace_id,
+            &workspace_root.to_string_lossy(),
+            broker.clone(),
+            managed_chat_broker,
+            Some(companion_auth),
+        )
+        .await;
+        assert_eq!(
+            started
+                .result
+                .as_ref()
+                .and_then(|result| result.pointer("/structuredContent/state"))
+                .and_then(Value::as_str),
+            Some("running"),
+            "{}",
+            result_text(&started)
         );
 
         let family = broker
@@ -10372,6 +10703,10 @@ mod tests {
                 Some("different-worker-chatgpt-account"),
                 "different-worker-chat-session"
             ))
+        );
+        assert_eq!(
+            worker.conversation_url.as_deref(),
+            Some(format!("https://chatgpt.com/c/{worker_conversation}").as_str())
         );
     }
 
@@ -10672,7 +11007,7 @@ mod tests {
                 .as_ref()
                 .and_then(|result| result.pointer("/structuredContent/state"))
                 .and_then(Value::as_str),
-            Some("running"),
+            Some("provisioning"),
             "{}",
             result_text(&claimed)
         );
@@ -10704,7 +11039,47 @@ mod tests {
                 .as_ref()
                 .and_then(|result| result.pointer("/structuredContent/state"))
                 .and_then(Value::as_str),
-            Some("running")
+            Some("provisioning")
+        );
+
+        let started = handle_tools_call_for_workspace(
+            &tool_call_request_with_session(
+                "workers",
+                json!({
+                    "action": "start",
+                    "worker_id": spawned.worker_id,
+                    "task_id": spawned.task_id
+                }),
+                "browser-bound-worker",
+            ),
+            McpRequestContext {
+                workspace_id: &workspace_id,
+                workspace_name: "Browser Bound Claim",
+                workspace_root: &workspace_root_text,
+                mode: Mode::Both,
+                tool_mode: ToolMode::MultiTools,
+                set_moondesk_as_co_author: false,
+                handoff_store_root: None,
+                command_jobs: &command_jobs,
+                browser_runtime: &browser_runtime,
+                worker_execution_profile: ChatExecutionProfile::default(),
+                worker_target_count: crate::workers::RECOMMENDED_WORKERS_PER_FAMILY,
+                worker_broker: broker.clone(),
+                managed_chat_broker: managed_chat_broker.clone(),
+                companion_auth: Some(companion_auth.clone()),
+                inbound_request_id: None,
+            },
+        )
+        .await;
+        assert_eq!(
+            started
+                .result
+                .as_ref()
+                .and_then(|result| result.pointer("/structuredContent/state"))
+                .and_then(Value::as_str),
+            Some("running"),
+            "{}",
+            result_text(&started)
         );
 
         let snapshot = broker.snapshot().await;
@@ -11008,6 +11383,31 @@ mod tests {
         .await;
         assert_eq!(
             claim
+                .result
+                .as_ref()
+                .and_then(|result| result.pointer("/structuredContent/state"))
+                .and_then(Value::as_str),
+            Some("provisioning")
+        );
+
+        let start = call_workers_for_test(
+            &tool_call_request_with_session(
+                "workers",
+                json!({
+                    "action": "start",
+                    "worker_id": worker_id,
+                    "task_id": task_id
+                }),
+                "worker-chat-a",
+            ),
+            &workspace_id,
+            &workspace_root.to_string_lossy(),
+            broker.clone(),
+            managed_chat_broker.clone(),
+        )
+        .await;
+        assert_eq!(
+            start
                 .result
                 .as_ref()
                 .and_then(|result| result.pointer("/structuredContent/state"))

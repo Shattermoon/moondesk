@@ -607,6 +607,17 @@ function browserLabel() {
   return 'Chromium';
 }
 
+function workerFailureReason(code, error) {
+  const raw = String(error?.message || error || '').trim();
+  if (!raw || raw === code) return code;
+  const safe = raw
+    .replace(/https?:\/\/\S+/gi, '<url>')
+    .replace(/[A-Za-z0-9_-]{48,}/g, '<redacted>')
+    .replace(/\s+/g, ' ')
+    .slice(0, 320);
+  return safe ? `${code}:${safe}` : code;
+}
+
 async function chatGptAccountFingerprintForTab(tabId) {
   if (!Number.isInteger(tabId)) return null;
   try {
@@ -1402,7 +1413,7 @@ async function processCommand(state, offer, clearGeneration = workerClearGenerat
     const launchRecord = state.launchRecords?.[command.id];
     if (launchRecord) launchRecord.phase = 'failed';
     console.warn('MoonDesk worker pre-send browser launch failed:', message);
-    await failBeforeSend('worker_browser_launch_exception');
+    await failBeforeSend(workerFailureReason('worker_browser_launch_exception', error));
     return;
   }
   if (!clearStillCurrent()) return;
@@ -1507,12 +1518,15 @@ async function processCommand(state, offer, clearGeneration = workerClearGenerat
     if (!(await writeWorkerCommandState(state, clearGeneration))) return;
     const message = String(error?.message || error);
     const timedOut = message === 'worker_prepare_timeout' || /timed out/i.test(message);
-    await failBeforeSend(timedOut ? 'worker_prepare_timeout' : 'worker_prepare_exception');
+    await failBeforeSend(workerFailureReason(
+      timedOut ? 'worker_prepare_timeout' : 'worker_prepare_exception',
+      error
+    ));
     return;
   }
   if (!clearStillCurrent()) return;
   if (!prepared?.ok) {
-    await failBeforeSend('worker_prepare_response_unconfirmed');
+    await failBeforeSend(workerFailureReason('worker_prepare_response_unconfirmed', prepared?.error));
     return;
   }
   const prepareResult = prepared.result || {};

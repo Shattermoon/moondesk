@@ -699,17 +699,13 @@
     return { model, reasoningEffort };
   }
 
-  async function selectedModelAndEffort(profile) {
-    const fromFullState = (state) => {
-      const choice = state?.choices?.find((entry) => entry.bucket === state.currentBucket);
-      return choiceMatchesResolvedProfile(state, choice, profile)
+  function selectionFromPickerSnapshot(snapshot, profile) {
+    if (snapshot && !snapshot.selected) {
+      const choice = snapshot.choices?.find((entry) => entry.bucket === snapshot.currentBucket);
+      return choiceMatchesResolvedProfile(snapshot, choice, profile)
         ? { model: choice.id, reasoningEffort: choice.effort }
         : null;
-    };
-
-    const snapshot = await readPickerState();
-    if (snapshot && !snapshot.selected) return fromFullState(snapshot);
-
+    }
     if (snapshot?.selected) {
       const expectedEfforts = providerEfforts(profile?.reasoningEffort);
       const requested = [profile?.modelKey, profile?.modelLabel].filter(Boolean);
@@ -717,10 +713,26 @@
       if (modelConfirmed && expectedEfforts.includes(snapshot.selected.effort)) {
         return { model: snapshot.selected.id, reasoningEffort: snapshot.selected.effort };
       }
-      // A closed picker exposes only the execution id. Older saved profiles can legitimately name
-      // the same provider family by a previous slug/display identity, so reopen the native picker
-      // and require full account-evaluated family proof before rejecting the readback.
     }
+    return null;
+  }
+
+  async function selectedModelAndEffortWithoutPicker(profile) {
+    return selectionFromPickerSnapshot(await readPickerState(), profile);
+  }
+
+  async function selectedModelAndEffort(profile) {
+    const snapshot = await readPickerState();
+    const confirmedWithoutPicker = selectionFromPickerSnapshot(snapshot, profile);
+    if (snapshot && !snapshot.selected) return confirmedWithoutPicker;
+    if (confirmedWithoutPicker) return confirmedWithoutPicker;
+
+    const fromFullState = (state) => {
+      const choice = state?.choices?.find((entry) => entry.bucket === state.currentBucket);
+      return choiceMatchesResolvedProfile(state, choice, profile)
+        ? { model: choice.id, reasoningEffort: choice.effort }
+        : null;
+    };
 
     const ui = modelPickerAccess();
     const full = await ui.open();
@@ -815,6 +827,12 @@
       fail('effort_invalid');
       return publishFailure();
     }
+    if (!stillCurrent()) {
+      fail('launch_target_changed');
+      return publishFailure();
+    }
+    const alreadySelected = await selectedModelAndEffortWithoutPicker(profile);
+    if (alreadySelected && stillCurrent()) return true;
     if (!stillCurrent()) {
       fail('launch_target_changed');
       return publishFailure();

@@ -1019,15 +1019,22 @@ pub async fn handle(
         }
         "start" => {
             let _lifecycle_guard = super::WORKER_LIFECYCLE_LOCK.lock().await;
+            let worker_id = parse_worker_id(arguments)?;
+            let task_id = parse_task_id(arguments)?;
             let worker = broker
-                .start_task(
-                    workspace_id,
-                    caller_identity,
-                    &parse_worker_id(arguments)?,
-                    &parse_task_id(arguments)?,
-                )
+                .start_task(workspace_id, caller_identity, &worker_id, &task_id)
                 .await
                 .map_err(broker_error)?;
+            // A successful start from the exact bound Worker is stronger eventual proof than a
+            // virtualized browser DOM. Settle only ambiguous post-Send launch history; never let a
+            // telemetry/storage repair turn an already-committed Worker start into an apparent failure.
+            if let Some(conversation_url) = worker.conversation_url.as_deref() {
+                let dedupe_key = format!("worker:{worker_id}:task:{task_id}");
+                let _ = launch_context
+                    .managed_chat_broker
+                    .confirm_worker_started_by_dedupe(&dedupe_key, conversation_url)
+                    .await;
+            }
             // Observability must never turn an already-committed task start into an apparent failure.
             let _ = broker
                 .record_tool_activity(workspace_id, caller_identity, "workers:start")

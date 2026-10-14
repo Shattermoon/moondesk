@@ -592,11 +592,18 @@
         if (!versionLabel) return null;
 
         if (!versionRows().length) {
-          const toggles = [...pickerRoot().querySelectorAll(
-            '[role="menuitem"][aria-expanded], [role="menuitem"][data-model-picker-view-toggle]'
-          )].filter(visible);
-          if (toggles.length !== 1) return null;
-          toggles[0].click();
+          // ChatGPT can remount the picker between awaited state reads. Reacquire the current
+          // picker root instead of dereferencing a stale or temporarily-missing panel.
+          const toggle = await wait(() => {
+            const panel = pickerRoot();
+            if (!panel) return null;
+            const toggles = [...panel.querySelectorAll(
+              '[role="menuitem"][aria-expanded], [role="menuitem"][data-model-picker-view-toggle]'
+            )].filter(visible);
+            return toggles.length === 1 ? toggles[0] : null;
+          }, 3500);
+          if (!toggle) return null;
+          toggle.click();
         }
         const option = await wait(() => {
           const rows = versionRows().filter((node) =>
@@ -615,10 +622,15 @@
           const to = current.choices.findIndex((choice) => choice.bucket === bucket);
           if (from < 0 || to < 0) return null;
           const expected = current.choices[from + (to > from ? 1 : -1)].bucket;
-          const controls = [...pickerRoot().querySelectorAll('[role="menuitem"][aria-keyshortcuts]')].filter(
-            (node) => visible(node) && (node.getAttribute('aria-keyshortcuts') || '').includes('ArrowRight')
-          );
-          if (controls.length !== 1 || !key(controls[0], to > from ? 'ArrowRight' : 'ArrowLeft')) {
+          const control = await wait(() => {
+            const panel = pickerRoot();
+            if (!panel) return null;
+            const controls = [...panel.querySelectorAll('[role="menuitem"][aria-keyshortcuts]')].filter(
+              (node) => visible(node) && (node.getAttribute('aria-keyshortcuts') || '').includes('ArrowRight')
+            );
+            return controls.length === 1 ? controls[0] : null;
+          }, 3500);
+          if (!control || !key(control, to > from ? 'ArrowRight' : 'ArrowLeft')) {
             return null;
           }
           const version = current.version;

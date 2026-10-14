@@ -1173,6 +1173,28 @@ async function ack(state, command, outcome, details = null, conversationUrl = nu
   return api(state, '/__moondesk/companion/v1/commands/ack', { method: 'POST', body: payload });
 }
 
+async function closeFreshPreSendFailureTab(state, command) {
+  const record = state.launchRecords?.[command?.id];
+  if (
+    !record ||
+    record.openMode !== 'new_thread' ||
+    record.conversationUrl ||
+    !Number.isInteger(record.tabId)
+  ) return false;
+  let tab;
+  try { tab = await chrome.tabs.get(record.tabId); } catch { return false; }
+  // Close only the exact MoonDesk-created fresh home tab. If it has become a real conversation or
+  // left ChatGPT, leave it alone because ownership is no longer provable from the pre-Send record.
+  if (!tab?.url?.startsWith('https://chatgpt.com/') || canonicalConversationUrl(tab.url)) return false;
+  try {
+    await chrome.tabs.remove(record.tabId);
+    record.tabId = null;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function acceptanceMatches(command, placement, baseline, evidence, conversationUrl, rememberedLaunch) {
   if (!conversationUrl || !evidence) return false;
   if (!rememberedLaunchMatchesRecord({
@@ -1194,15 +1216,11 @@ function acceptanceMatches(command, placement, baseline, evidence, conversationU
     evidence.conversationId !== baseline.conversationId
   ) return false;
   const marker = evidence.markerPresent === true && baseline?.markerPresent !== true;
-  const newUserTurn = (
-    Number.isInteger(evidence.userTurnCount) &&
-    Number.isInteger(baseline?.userTurnCount) &&
-    evidence.userTurnCount > baseline.userTurnCount
-  );
-  // The exact unique marker appearing in a new native user turn is the browser/provider Send
-  // receipt. Do not make conversation binding wait for assistant generation to begin; hidden tabs
-  // and deliberate models can remain quiet after ChatGPT has already accepted the user message.
-  return marker && newUserTurn;
+  // The task marker is unique per Worker task. Its appearance in the exact bound conversation is
+  // the provider-side Send receipt; mounted DOM turn counts are not monotonic because long ChatGPT
+  // threads virtualize old turns while new ones mount. Requiring userTurnCount to increase caused
+  // successfully-started reuses to remain permanently ambiguous.
+  return marker;
 }
 
 async function observeWorkerAcceptance(
@@ -1342,6 +1360,7 @@ async function processCommand(state, offer, clearGeneration = workerClearGenerat
     if (!clearStillCurrent()) return;
     await ack(state, command, 'failed', reason);
     if (!clearStillCurrent()) return;
+    await closeFreshPreSendFailureTab(state, command);
     blockCommand(state, {
       commandId: command.id,
       workspaceId,
@@ -1724,12 +1743,17 @@ async function executeWorkerRecoveryCommand(state, command) {
     return { state: 'failed', reason: 'worker_recovery_command_invalid' };
   }
   const action = command.action;
+  const expectedConversationId = chatContextFromUrl(command.conversationUrl)?.conversationId || null;
+  if (!expectedConversationId) {
+    return { state: 'failed', reason: 'worker_recovery_conversation_invalid' };
+  }
   const tab = await recoveryTabFor(state, command, action === 'inspect');
   if (action === 'inspect') {
     const inspectTab = async (targetTab) => {
       const response = await sendReadOnlyToTabWithReacquire(targetTab.id, {
         type: 'MOONDESK_RECOVER_WORKER_INSPECT',
-        taskMarker: command.taskMarker
+        taskMarker: command.taskMarker,
+        expectedConversationId
       }, 15000);
       return response?.ok ? response.result : {
         state: 'failed',
@@ -1758,6 +1782,7 @@ async function executeWorkerRecoveryCommand(state, command) {
       const response = await sendToTab(tab.id, {
         type: 'MOONDESK_RECOVER_WORKER_CONTINUE',
         taskMarker: command.taskMarker,
+        expectedConversationId,
         prompt: command.prompt,
         stopIfBusy: action === 'stop_continue',
         expected: command.expected || null

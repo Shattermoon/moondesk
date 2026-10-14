@@ -368,6 +368,95 @@ impl ManagedChatBroker {
         Ok((retargeted, paused, changed))
     }
 
+    pub async fn confirm_worker_started_by_dedupe(
+        &self,
+        dedupe_key: &str,
+        conversation_url: &str,
+    ) -> Result<bool, ManagedChatError> {
+        if dedupe_key.trim().is_empty() || dedupe_key.len() > 256 {
+            return Err(ManagedChatError::Invalid(
+                "managed chat dedupe key must contain 1..=256 bytes".into(),
+            ));
+        }
+        if conversation_url.len() > 2048
+            || canonical_chatgpt_conversation_id(conversation_url).is_none()
+        {
+            return Err(ManagedChatError::Invalid(
+                "worker start confirmation requires a canonical ChatGPT conversation URL".into(),
+            ));
+        }
+
+        let mut guard = self.data.lock().await;
+        let Some(command_id) = guard.dedupe.get(dedupe_key).cloned() else {
+            return Ok(false);
+        };
+        let command = guard.commands.get(&command_id).ok_or_else(|| {
+            ManagedChatError::Storage("managed chat dedupe index is corrupt".into())
+        })?;
+        if command.launch.purpose != ManagedChatPurpose::Worker {
+            return Err(ManagedChatError::Conflict(
+                "worker start confirmation cannot settle a non-Worker command".into(),
+            ));
+        }
+        if command.launch.open_mode == super::types::ManagedChatOpenMode::ExistingThread {
+            let expected = command
+                .launch
+                .existing_conversation_url
+                .as_deref()
+                .ok_or_else(|| {
+                    ManagedChatError::Conflict(
+                        "existing-thread command lost its durable conversation binding".into(),
+                    )
+                })?;
+            if expected != conversation_url {
+                return Err(ManagedChatError::Conflict(
+                    "Worker start conversation does not match the durable existing-thread binding"
+                        .into(),
+                ));
+            }
+        }
+        if command.state == ManagedChatCommandState::Succeeded {
+            if command
+                .terminal
+                .as_ref()
+                .and_then(|terminal| terminal.conversation_url.as_deref())
+                .is_none_or(|existing| existing == conversation_url)
+            {
+                return Ok(true);
+            }
+            return Err(ManagedChatError::Conflict(
+                "managed Worker command already succeeded for a different conversation".into(),
+            ));
+        }
+        let ambiguous_post_send = matches!(
+            command.state,
+            ManagedChatCommandState::SendStarted
+                | ManagedChatCommandState::NeedsReconcile
+                | ManagedChatCommandState::Paused
+        ) || (command.state == ManagedChatCommandState::Leased
+            && command.reconcile_history);
+        if !ambiguous_post_send {
+            return Err(ManagedChatError::Conflict(
+                "Worker start can settle only an ambiguous post-Send managed command".into(),
+            ));
+        }
+
+        let mut candidate = guard.clone();
+        let command = candidate.commands.get_mut(&command_id).ok_or_else(|| {
+            ManagedChatError::Storage("managed chat dedupe index is corrupt".into())
+        })?;
+        command.state = ManagedChatCommandState::Succeeded;
+        command.reconcile_history = true;
+        command.lease = None;
+        command.terminal = Some(ManagedChatTerminalResult {
+            succeeded: true,
+            details: Some("exact bound Worker start confirmed assignment delivery".into()),
+            conversation_url: Some(conversation_url.to_string()),
+        });
+        self.commit_candidate(&mut guard, candidate).await?;
+        Ok(true)
+    }
+
     pub async fn settle_for_worker_retire_by_dedupe(
         &self,
         dedupe_key: &str,
@@ -1112,12 +1201,13 @@ fn terminal_matches(command: &ManagedChatCommand, outcome: &ManagedChatAckOutcom
     };
     match outcome {
         ManagedChatAckOutcome::Succeeded {
-            details,
+            details: _,
             conversation_url,
         } => {
-            terminal.succeeded
-                && &terminal.details == details
-                && &terminal.conversation_url == conversation_url
+            // Success details are diagnostic text, not identity. Worker-side `start` may settle an
+            // ambiguous command milliseconds before the Companion's ordinary success ACK arrives;
+            // treat both as the same terminal outcome when the canonical conversation matches.
+            terminal.succeeded && &terminal.conversation_url == conversation_url
         }
         ManagedChatAckOutcome::Failed { details } => {
             command.state == ManagedChatCommandState::Failed
@@ -1534,6 +1624,83 @@ mod tests {
                 .map(|command| command.state),
             Some(ManagedChatCommandState::Paused)
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn exact_worker_start_settles_paused_post_send_command() {
+        let root = temp_root("moondesk-managed-chat-worker-start-proof");
+        let broker = ManagedChatBroker::open(root.join("state.json")).expect("open broker");
+        let dedupe_key = "worker:proof:task:started";
+        let command = broker
+            .enqueue(EnqueueManagedChatRequest {
+                dedupe_key: dedupe_key.into(),
+                launch: launch("task-start-proof"),
+            })
+            .await
+            .expect("enqueue command");
+        let offer = broker
+            .redeem("extension-a", 1_000)
+            .await
+            .expect("redeem command")
+            .expect("lease");
+        let lease_id = offer
+            .command
+            .lease
+            .as_ref()
+            .expect("lease")
+            .lease_id
+            .clone();
+        broker
+            .mark_send_started(&command.id, &lease_id, "extension-a")
+            .await
+            .expect("cross send boundary");
+        broker
+            .acknowledge(
+                &command.id,
+                &lease_id,
+                "extension-a",
+                ManagedChatAckOutcome::Paused {
+                    details: Some(
+                        "reconciliation_exhausted:task_marker_present_execution_unconfirmed".into(),
+                    ),
+                },
+            )
+            .await
+            .expect("pause ambiguous command");
+
+        let conversation_url = "https://chatgpt.com/c/aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+        assert!(
+            broker
+                .confirm_worker_started_by_dedupe(dedupe_key, conversation_url)
+                .await
+                .expect("settle from exact Worker start")
+        );
+        let snapshot = broker.snapshot().await;
+        let settled = snapshot.commands.get(&command.id).expect("settled command");
+        assert_eq!(settled.state, ManagedChatCommandState::Succeeded);
+        assert_eq!(
+            settled
+                .terminal
+                .as_ref()
+                .and_then(|terminal| terminal.conversation_url.as_deref()),
+            Some(conversation_url)
+        );
+        assert!(settled.lease.is_none());
+        let late_ack = broker
+            .acknowledge(
+                &command.id,
+                &lease_id,
+                "extension-a",
+                ManagedChatAckOutcome::Succeeded {
+                    details: Some("worker send acceptance confirmed".into()),
+                    conversation_url: Some(conversation_url.into()),
+                },
+            )
+            .await
+            .expect("late Companion success ACK is idempotent with exact Worker start proof");
+        assert_eq!(late_ack.state, ManagedChatCommandState::Succeeded);
+
         let _ = std::fs::remove_dir_all(root);
     }
 

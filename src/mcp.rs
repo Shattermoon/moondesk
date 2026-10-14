@@ -1205,9 +1205,10 @@ async fn handle_tools_list(
             } else {
                 workers_tool_descriptor()
             });
-            if !worker_gateway_request(req) {
-                push_user_browser_tools(&mut tools);
-            }
+            // User-browser control is exact-conversation scoped and remains gated by the
+            // generalized Worker's active task binding before dispatch. Workers need this surface
+            // for independent browser QA just like ordinary workspace tools.
+            push_user_browser_tools(&mut tools);
         }
         tools.push(json!({
             "name": "moondesk_instruction",
@@ -2655,14 +2656,6 @@ async fn handle_tools_call_for_workspace(
                 .into(),
         );
     }
-    if worker_gateway_request(req) && user_browser_tool(&tool_name) {
-        return tool_error_response_text_only(
-            req,
-            "The generalized MoonDesk Worker connector cannot control the user's personal browser; use workspace-scoped MoonDesk tools for the assigned Worker task."
-                .into(),
-        );
-    }
-
     // Clear Workers mirrors Chat on Steroids' retired-worker fence: a recently cleared worker tab
     // must not fall through and regain ordinary Core authority merely because its family history was
     // destroyed. Only exact ChatGPT session metadata participates, so non-ChatGPT clients are
@@ -8237,14 +8230,23 @@ mod tests {
                 .any(|tool| tool.get("name").and_then(Value::as_str) == Some("read")),
             "gateway must advertise normal workspace tools for use after claim"
         );
-        assert!(
-            !tools.iter().any(|tool| {
-                tool.get("name")
-                    .and_then(Value::as_str)
-                    .is_some_and(|name| name.starts_with("user_browser_"))
-            }),
-            "Worker gateway must not expose Core/user-browser control"
-        );
+        for name in [
+            "user_browser_tabs",
+            "user_browser_snapshot",
+            "user_browser_screenshot",
+            "user_browser_navigate",
+            "user_browser_action",
+            "user_browser_evaluate",
+            "user_browser_console",
+            "user_browser_network",
+        ] {
+            assert!(
+                tools
+                    .iter()
+                    .any(|tool| tool.get("name").and_then(Value::as_str) == Some(name)),
+                "active generalized Workers need the conversation-scoped {name} tool"
+            );
+        }
     }
 
     #[tokio::test]

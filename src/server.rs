@@ -6350,6 +6350,79 @@ document.getElementById('hidden-upload').addEventListener('change',event=>{docum
             .expect_err("ordinary workspace tools must fail before Worker claim");
         assert!(error.contains("has not claimed a MoonDesk task yet"));
 
+        let browser_request = mcp::JsonRpcRequest {
+            jsonrpc: "2.0".into(),
+            id: Some(json!("gateway-browser-route")),
+            method: "tools/call".into(),
+            params: json!({
+                "name": "user_browser_tabs",
+                "arguments": { "action": "list" },
+                "_meta": {
+                    "openai/subject": "fixed-worker-account",
+                    "openai/session": "gateway-worker-chat"
+                }
+            }),
+        };
+        let error = worker_gateway_workspace_slug(&server_state, &browser_request)
+            .await
+            .expect_err("unclaimed Worker must not receive browser authority");
+        assert!(error.contains("has not claimed a MoonDesk task yet"));
+
+        let command_id = Uuid::new_v4().to_string();
+        broker
+            .link_launch_command(
+                &target_workspace.id,
+                &crate::workers::types::ChatIdentity::local_core(&target_workspace.id),
+                &spawned.worker_id,
+                &spawned.task_id,
+                &command_id,
+            )
+            .await
+            .expect("link gateway Worker launch");
+        let conversation_url = format!("https://chatgpt.com/c/{}", Uuid::new_v4());
+        broker
+            .update_launch_by_command(
+                &command_id,
+                crate::workers::types::WorkerLaunchState::WaitingClaim,
+                None,
+                Some(conversation_url),
+            )
+            .await
+            .expect("make gateway Worker claimable");
+        let worker_identity = crate::workers::types::ChatIdentity::from_openai_meta(
+            Some("fixed-worker-account"),
+            "gateway-worker-chat",
+        );
+        broker
+            .claim_worker_attested(
+                &target_workspace.id,
+                &spawned.worker_id,
+                &spawned.task_id,
+                &spawned.claim_token,
+                &claim_operation_id,
+                worker_identity.clone(),
+            )
+            .await
+            .expect("claim gateway Worker");
+        let error = worker_gateway_workspace_slug(&server_state, &browser_request)
+            .await
+            .expect_err("claimed-but-not-started Worker must not receive browser authority");
+        assert!(error.contains("no active running task"));
+
+        broker
+            .start_task(
+                &target_workspace.id,
+                &worker_identity,
+                &spawned.worker_id,
+                &spawned.task_id,
+            )
+            .await
+            .expect("start gateway Worker");
+        let resolved = worker_gateway_workspace_slug(&server_state, &browser_request)
+            .await
+            .expect("active Worker browser tools must resolve to its claimed workspace");
+        assert_eq!(resolved, target_slug);
+
         let _ = std::fs::remove_dir_all(workspace_a);
         let _ = std::fs::remove_dir_all(workspace_b);
         let _ = std::fs::remove_dir_all(config_root);

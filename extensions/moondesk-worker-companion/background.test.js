@@ -2783,6 +2783,16 @@ test('legacy GPT-5.6 Sol default resolves to ChatGPT live gpt-5-6-thinking execu
   );
 });
 
+test('model picker remount paths reacquire the picker root instead of dereferencing a vanished panel', () => {
+  assert.doesNotMatch(
+    chatgptDomSource,
+    /pickerRoot\(\)\.querySelectorAll/,
+    'async picker transitions must never dereference a possibly-remounted picker root'
+  );
+  assert.match(chatgptDomSource, /const toggle = await wait\(\(\) => \{\s*const panel = pickerRoot\(\)/);
+  assert.match(chatgptDomSource, /const control = await wait\(\(\) => \{\s*const panel = pickerRoot\(\)/);
+});
+
 test('model selection reuses an already confirmed exact model and effort without opening the picker', async () => {
   const picker = {
     version: 'gpt-6',
@@ -3444,6 +3454,41 @@ test('record creation opens every fresh worker on normal ChatGPT home and never 
   assert.equal(normalUrl.hash, `#moondesk-launch=${encodeURIComponent(normal.record.launchToken)}`);
 });
 
+test('definitive pre-Send failure closes only its fresh MoonDesk home tab', async () => {
+  const existingTabs = {
+    55: { id: 55, url: 'https://chatgpt.com/?moondesk-launch=launch-failed&reasoning_effort=high', active: false },
+    56: { id: 56, url: 'https://chatgpt.com/c/aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee', active: false }
+  };
+  const { removedTabs, evaluate } = loadBackground({ existingTabs });
+  const closeFreshPreSendFailureTab = evaluate('closeFreshPreSendFailureTab');
+  const state = {
+    launchRecords: {
+      fresh: {
+        commandId: 'fresh',
+        openMode: 'new_thread',
+        tabId: 55,
+        conversationUrl: null
+      },
+      durable: {
+        commandId: 'durable',
+        openMode: 'new_thread',
+        tabId: 56,
+        conversationUrl: null
+      }
+    }
+  };
+
+  assert.equal(await closeFreshPreSendFailureTab(state, { id: 'fresh' }), true);
+  assert.deepEqual(Array.from(removedTabs), [55]);
+  assert.equal(state.launchRecords.fresh.tabId, null);
+  assert.equal(
+    await closeFreshPreSendFailureTab(state, { id: 'durable' }),
+    false,
+    'a tab that already became a canonical conversation must never be auto-closed'
+  );
+  assert.deepEqual(Array.from(removedTabs), [55]);
+});
+
 test('reconciliation without a durable launch record never creates a fresh worker tab', async () => {
   const { createdTabs, evaluate } = loadBackground();
   const recordForCommand = evaluate('recordForCommand');
@@ -3816,6 +3861,7 @@ test('worker recovery stop/continue waits for fresh accepted send evidence', asy
     const returned = messageHandler({
       type: 'MOONDESK_RECOVER_WORKER_CONTINUE',
       taskMarker: marker,
+      expectedConversationId: conversationId,
       prompt: `Continue the SAME assignment.\n\n[${marker}]`,
       stopIfBusy: true,
       expected: { userTurnCount: 2, assistantTurnCount: 1 }
@@ -3884,7 +3930,8 @@ test('worker recovery inspect classifies a zero-turn unhydrated shell as not-rea
   const response = await new Promise((resolve) => {
     const returned = messageHandler({
       type: 'MOONDESK_RECOVER_WORKER_INSPECT',
-      taskMarker: marker
+      taskMarker: marker,
+      expectedConversationId: conversationId
     }, null, resolve);
     assert.equal(returned, true);
   });
@@ -3893,6 +3940,92 @@ test('worker recovery inspect classifies a zero-turn unhydrated shell as not-rea
   assert.equal(response.result.reason, 'worker_recovery_page_not_ready');
   assert.equal(response.result.evidence.userTurnCount, 0);
   assert.equal(response.result.evidence.composerReady, false);
+});
+
+test('worker recovery trusts the exact conversation when an old task marker is virtualized out of the DOM', async () => {
+  let messageHandler = null;
+  const conversationId = '7aaef8db-ecf0-83ee-bfcc-d6f94853c541';
+  const marker = 'moondesk-worker-task:recovery-virtualized-marker';
+  let userTurnCount = 8;
+  let generating = false;
+  let draftPresent = false;
+  let commitCalls = 0;
+  const DOM = {
+    conversationIdFromPath() { return conversationId; },
+    taskMarkerPresent() { return false; },
+    workerEvidence() {
+      return {
+        conversationId,
+        conversationUrl: `https://chatgpt.com/c/${conversationId}`,
+        projectId: null,
+        markerPresent: false,
+        generating,
+        userTurnCount,
+        assistantTurnCount: 8,
+        composerEmpty: !draftPresent
+      };
+    },
+    composerReady() { return !generating; },
+    async waitForComposerReady(_timeoutMs, stillCurrent) { return stillCurrent(); },
+    insertPrompt() { draftPresent = true; return true; },
+    async commitSendOnce(_prompt, value, stillCurrent) {
+      assert.equal(value, marker);
+      assert.equal(stillCurrent(), true);
+      commitCalls += 1;
+      draftPresent = false;
+      userTurnCount += 1;
+      generating = true;
+      return { state: 'committed' };
+    }
+  };
+  const context = vm.createContext({
+    window: { MOONDESK_CHATGPT_DOM: DOM },
+    sessionStorage: { setItem() {}, getItem() { return null; }, removeItem() {} },
+    location: {
+      origin: 'https://chatgpt.com',
+      hash: '',
+      pathname: `/c/${conversationId}`,
+      search: '',
+      href: `https://chatgpt.com/c/${conversationId}`
+    },
+    history: { state: null, replaceState() {} },
+    chrome: { runtime: { onMessage: { addListener(handler) { messageHandler = handler; } } } },
+    crypto: webcrypto,
+    setTimeout,
+    clearTimeout,
+    setInterval,
+    clearInterval,
+    console
+  });
+  vm.runInContext(contentSource, context, { filename: contentPath });
+
+  const inspected = await new Promise((resolve) => {
+    const returned = messageHandler({
+      type: 'MOONDESK_RECOVER_WORKER_INSPECT',
+      taskMarker: marker,
+      expectedConversationId: conversationId
+    }, null, resolve);
+    assert.equal(returned, true);
+  });
+  assert.equal(inspected.ok, true);
+  assert.equal(inspected.result.state, 'idle');
+  assert.equal(inspected.result.reason, 'worker_recovery_exact_conversation_confirmed');
+  assert.equal(inspected.result.evidence.markerPresent, false);
+
+  const continued = await new Promise((resolve) => {
+    const returned = messageHandler({
+      type: 'MOONDESK_RECOVER_WORKER_CONTINUE',
+      taskMarker: marker,
+      expectedConversationId: conversationId,
+      prompt: `Continue the SAME assignment.\n\n[${marker}]`,
+      stopIfBusy: false,
+      expected: inspected.result.evidence
+    }, null, resolve);
+    assert.equal(returned, true);
+  });
+  assert.equal(continued.ok, true);
+  assert.equal(continued.result.state, 'continued');
+  assert.equal(commitCalls, 1);
 });
 
 test('worker recovery refuses a different ChatGPT account before navigating to the Worker conversation', async () => {
@@ -4764,8 +4897,8 @@ test('worker acceptance binds on the exact new marker user turn without waiting 
       conversationUrl,
       rememberedLaunch
     ),
-    false,
-    'a marker without a newly added user turn is not fresh Send acceptance'
+    true,
+    'the exact unique task marker remains Send proof even when DOM virtualization keeps the mounted user-turn count flat'
   );
 
   assert.equal(

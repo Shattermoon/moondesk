@@ -354,42 +354,56 @@
 
   function recoveryEvidence(marker) {
     const evidence = workerEvidence(marker);
+    const remembered = rememberedLaunch();
+    const conversationId = evidence?.conversationId || DOM.conversationIdFromPath() || null;
+    const rememberedTaskBinding = Boolean(
+      remembered &&
+      remembered.taskMarker === marker &&
+      (!remembered.targetConversationId || remembered.targetConversationId === conversationId)
+    );
     return {
       ...evidence,
+      rememberedTaskBinding,
       composerReady: DOM.composerReady?.() === true
     };
   }
 
   async function inspectWorkerRecovery(message) {
     const marker = message?.taskMarker;
+    const expectedConversationId = message?.expectedConversationId;
     if (typeof marker !== 'string' || !marker) {
       return { state: 'failed', reason: 'worker_recovery_task_marker_invalid' };
     }
+    if (typeof expectedConversationId !== 'string' || !expectedConversationId) {
+      return { state: 'failed', reason: 'worker_recovery_conversation_invalid' };
+    }
 
-    // A ChatGPT /c/<id> route can answer extension messages before its conversation history and
-    // composer have hydrated. Treating that transient blank shell as "task not present" made a
-    // recoverable stalled Worker look definitively corrupt. Wait for actual page evidence first.
+    // The trusted background already proved the exact canonical route and account. Long ChatGPT
+    // conversations virtualize/unmount old message nodes, so the task marker is supporting evidence
+    // rather than a requirement that an old DOM node remain mounted forever.
     const deadline = Date.now() + 12000;
     let evidence = recoveryEvidence(marker);
     while (Date.now() < deadline) {
       evidence = recoveryEvidence(marker);
-      if (evidence.conversationId && evidence.markerPresent === true) {
-        return {
-          state: evidence.generating ? 'busy' : 'idle',
-          evidence
-        };
+      if (evidence.conversationId && evidence.conversationId !== expectedConversationId) {
+        return { state: 'failed', reason: 'worker_recovery_target_changed', evidence };
       }
-      // Once real conversation turns are rendered, absence of the exact task marker is meaningful.
-      // Composer readiness alone is not enough: ChatGPT may paint the composer before history.
-      if (
-        evidence.conversationId &&
-        (Number(evidence.userTurnCount || 0) > 0 || Number(evidence.assistantTurnCount || 0) > 0)
-      ) {
-        return {
-          state: 'failed',
-          reason: 'worker_recovery_task_marker_absent_after_load',
-          evidence
-        };
+      if (evidence.conversationId === expectedConversationId) {
+        const hydrated =
+          evidence.markerPresent === true ||
+          evidence.rememberedTaskBinding === true ||
+          evidence.composerReady === true ||
+          Number(evidence.userTurnCount || 0) > 0 ||
+          Number(evidence.assistantTurnCount || 0) > 0;
+        if (hydrated) {
+          return {
+            state: evidence.generating ? 'busy' : 'idle',
+            reason: evidence.markerPresent === true
+              ? 'worker_recovery_task_marker_present'
+              : 'worker_recovery_exact_conversation_confirmed',
+            evidence
+          };
+        }
       }
       await new Promise((resolve) => setTimeout(resolve, 250));
     }
@@ -405,14 +419,23 @@
   async function continueWorkerRecovery(message) {
     const marker = message?.taskMarker;
     const prompt = message?.prompt;
-    if (typeof marker !== 'string' || !marker || typeof prompt !== 'string' || !prompt.trim()) {
+    const expectedConversationId = message?.expectedConversationId;
+    if (
+      typeof marker !== 'string' || !marker ||
+      typeof prompt !== 'string' || !prompt.trim() ||
+      typeof expectedConversationId !== 'string' || !expectedConversationId
+    ) {
       return { state: 'failed', reason: 'worker_recovery_continue_invalid' };
     }
-    const conversationId = DOM.conversationIdFromPath();
-    const stillCurrent = () =>
-      Boolean(conversationId) &&
-      DOM.conversationIdFromPath() === conversationId &&
-      DOM.taskMarkerPresent(marker);
+    const remembered = rememberedLaunch();
+    if (
+      remembered?.targetConversationId === expectedConversationId &&
+      remembered?.taskMarker &&
+      remembered.taskMarker !== marker
+    ) {
+      return { state: 'failed', reason: 'worker_recovery_task_changed' };
+    }
+    const stillCurrent = () => DOM.conversationIdFromPath() === expectedConversationId;
     if (!stillCurrent()) {
       return { state: 'failed', reason: 'worker_recovery_target_changed' };
     }

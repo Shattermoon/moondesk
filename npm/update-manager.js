@@ -364,12 +364,43 @@ function normalizeChangelogLine(line) {
   return value;
 }
 
+function structuredChangelogLines(body) {
+  const lines = body.split(/\r?\n/);
+  const headingIndex = lines.findIndex((line) => /^ {0,3}##[ \t]+Changelog[ \t]*$/.test(line));
+  if (headingIndex < 0) return null;
+
+  const changelog = [];
+  for (let index = headingIndex + 1; index < lines.length; index += 1) {
+    const line = lines[index];
+    if (/^ {0,3}#{1,2}(?:[ \t]+\S|[ \t]*$)/.test(line)) break;
+    changelog.push(line);
+  }
+  return changelog;
+}
+
 function normalizeReleaseNotes(body) {
   if (typeof body !== "string") return [];
+  const structured = structuredChangelogLines(body);
+  if (
+    structured &&
+    structured.some((line) => line.trim() === "No user-visible changelog.")
+  ) {
+    return [];
+  }
+
   const notes = [];
   const seen = new Set();
-  for (const line of body.split(/\r?\n/)) {
-    const note = normalizeChangelogLine(line);
+  const lines = structured ?? body.split(/\r?\n/);
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+    if (structured && !/^[-*+][ \t]+\S/.test(line)) continue;
+    let entry = line;
+    if (structured) {
+      while (index + 1 < lines.length && /^[ \t]{2,}(?![-*+][ \t])\S/.test(lines[index + 1])) {
+        entry += ` ${lines[++index].trim()}`;
+      }
+    }
+    const note = normalizeChangelogLine(entry);
     if (!note || seen.has(note)) continue;
     seen.add(note);
     notes.push(note);

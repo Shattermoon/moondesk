@@ -1,0 +1,31 @@
+name: PR metadata
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened, ready_for_review]
+
+concurrency:
+  group: pr-metadata-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  changelog:
+    if: github.event.pull_request.draft == false
+    name: Changelog
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          package-manager-cache: false
+
+      - name: Validate PR changelog
+        run: node .github/scripts/pr-changelog.mjs validate-event "$GITHUB_EVENT_PATH"

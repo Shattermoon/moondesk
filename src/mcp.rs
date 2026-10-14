@@ -11974,7 +11974,7 @@ mod tests {
             .commands
             .get(&offer.command.id)
             .expect("post-Send launch remains as fenced terminal history");
-        assert_eq!(fenced.state, ManagedChatCommandState::Paused);
+        assert_eq!(fenced.state, ManagedChatCommandState::Failed);
         assert!(fenced.lease.is_none());
         assert_eq!(
             fenced

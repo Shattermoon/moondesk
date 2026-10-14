@@ -436,7 +436,7 @@ impl ManagedChatBroker {
             .terminal
             .as_ref()
             .and_then(|terminal| terminal.conversation_url.clone());
-        command.state = ManagedChatCommandState::Paused;
+        command.state = ManagedChatCommandState::Failed;
         command.reconcile_history = true;
         command.lease = None;
         command.target_client_id = None;

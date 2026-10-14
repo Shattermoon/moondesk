@@ -70,6 +70,7 @@ mod tests {
             task_id: TaskId::new(),
             display_id: "worker-1".into(),
             claim_token: "claim-secret".into(),
+            browser_client_id: None,
             claim_operation_id: None,
         };
         let claim_operation_id = OperationId::new();

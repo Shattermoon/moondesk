@@ -1,7 +1,7 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
-use std::collections::hash_map::DefaultHasher;
+use std::collections::{BTreeMap, hash_map::DefaultHasher};
 use std::hash::{Hash, Hasher};
 use std::io::Write as IoWrite;
 use std::path::{Path, PathBuf};
@@ -24,7 +24,9 @@ use crate::companion::CompanionAuth;
 use crate::handoff;
 use crate::managed_chat::{
     broker::ManagedChatBroker,
-    types::{ChatExecutionProfile, ManagedChatCommandState, ManagedChatPurpose},
+    types::{
+        ChatExecutionProfile, ManagedChatCommandState, ManagedChatPurpose, ManagedChatStoreData,
+    },
 };
 use crate::state::{
     AgentsPathMode, BrowserPresentation, Mode, ToolMode, load_app_config, user_home_dir,
@@ -718,7 +720,7 @@ fn worker_gateway_workers_tool_descriptor() -> Value {
 fn local_ide_workers_tool_descriptor() -> Value {
     let mut descriptor = workers_tool_descriptor();
     descriptor["description"] = json!(
-        "Delegate substantial, independent work to MoonDesk browser Workers. Local IDE Core is account-independent. Core actions: status, spawn, reuse, recover, send, collect, retire, clear. Prefer `collect` with `wait_ms` (up to 60000) after dispatch; use `status` for lifecycle/diagnosis, not rapid polling. Do not duplicate a Worker's assignment in Core unless takeover is necessary; continue only non-overlapping Core work when quota conservation matters. Lifecycle is queued -> sent -> claimed -> working; provisioning/waking alone is not work. `collect` returns reports, completed results, and durable failed records. Reuse keeps the same Worker conversation/account. Sent-but-unclaimed Workers expire to a collectible failure and may be retired safely. `clear` is workspace-local terminal recovery. If migrationBlocked is true, do not spawn; health=suspect means recover before replacing."
+        "Delegate independent work to MoonDesk browser Workers. Local IDE Core is account-independent. Multiple online Companion browsers are load-balanced by least assigned slots; status target/max already reflect aggregate usable capacity. Each Worker stays pinned to its original browser/account for reuse and user_browser_* control. Core: status/spawn/reuse/recover/send/collect/retire/clear. Prefer collect(wait_ms<=60000); status is for lifecycle/diagnosis, not rapid polling. Do not duplicate a Worker's assignment in Core unless taking over. Lifecycle: queued->sent->claimed->working; provisioning/waking alone is not work. collect returns reports/completed/failed. Sent-but-unclaimed Workers expire and may be retired. clear is workspace-local terminal recovery. If migrationBlocked, do not spawn; health=suspect means recover before replacing."
     );
     if let Some(action_enum) = descriptor.pointer_mut("/inputSchema/properties/action/enum") {
         *action_enum = json!([
@@ -756,7 +758,7 @@ fn local_ide_workers_tool_descriptor() -> Value {
             json!({
                 "type": "string",
                 "maxLength": 128,
-                "description": "Optional paired Companion client id from status.workerBrowsers. Omit when exactly one Worker browser is online."
+                "description": "Optional paired Companion client id from status.workerBrowsers. Normally omit it: local IDE Core automatically chooses the least-loaded online browser. Specify it only for an explicit placement override; per-browser capacity still applies."
             }),
         );
     }
@@ -1703,11 +1705,35 @@ fn decorate_user_browser_tab_handles(value: &mut Value, browser_id: &str) {
     }
 }
 
+async fn active_worker_companion_client_id(
+    worker_identity: &ChatIdentity,
+    broker: &WorkerBroker,
+    managed_chat_broker: &ManagedChatBroker,
+) -> Result<Option<String>, String> {
+    let Some((_workspace_id, worker_id, persisted_client_id)) = broker
+        .active_worker_binding_for_identity(worker_identity)
+        .await
+        .map_err(|error| error.to_string())?
+    else {
+        return Ok(None);
+    };
+    if persisted_client_id.is_some() {
+        return Ok(persisted_client_id);
+    }
+    let snapshot = managed_chat_broker.snapshot().await;
+    let legacy_client_id = managed_worker_client_id(&snapshot, &worker_id)?;
+    legacy_client_id.map(Some).ok_or_else(|| {
+        "USER_BROWSER_WORKER_AFFINITY_UNKNOWN: this active Worker has no durable Companion browser affinity; finish it or Clear Workers before using multi-browser Worker control"
+            .to_string()
+    })
+}
+
 async fn handle_user_browser_tool(
     req: &JsonRpcRequest,
     tool_name: &str,
     identity: &ChatIdentity,
     companion_auth: &CompanionAuth,
+    pinned_companion_client_id: Option<&str>,
 ) -> JsonRpcResponse {
     let arguments = tool_arguments(req);
     let Some(input) = arguments.as_object() else {
@@ -1716,6 +1742,22 @@ async fn handle_user_browser_tool(
     let mut args = input.clone();
     let broker = companion_auth.user_browser_broker();
     let browsers = broker.browsers().await;
+    let pinned_browser_id = if let Some(companion_client_id) = pinned_companion_client_id {
+        match broker.browser_id_for_companion(companion_client_id).await {
+            Ok(Some(browser_id)) => Some(browser_id),
+            Ok(None) => {
+                return tool_error_response(
+                    req,
+                    format!(
+                        "USER_BROWSER_WORKER_AFFINITY_OFFLINE: this Worker is pinned to Companion browser '{companion_client_id}', but that browser is not currently exposing user-browser control"
+                    ),
+                );
+            }
+            Err(error) => return tool_error_response(req, error),
+        }
+    } else {
+        None
+    };
 
     let explicit_browser = match args.remove("browser_id") {
         None | Some(Value::Null) => Ok(None),
@@ -1750,8 +1792,23 @@ async fn handle_user_browser_tool(
             "USER_BROWSER_TAB_INVALID: browser_id does not match the tab handle".into(),
         );
     }
+    if let Some(pinned) = pinned_browser_id.as_deref()
+        && (explicit_browser
+            .as_deref()
+            .is_some_and(|explicit| explicit != pinned)
+            || handle_browser
+                .as_deref()
+                .is_some_and(|from_handle| from_handle != pinned))
+    {
+        return tool_error_response(
+            req,
+            "USER_BROWSER_WORKER_AFFINITY_MISMATCH: a Worker may control tabs only in the Companion browser/account that owns that Worker"
+                .into(),
+        );
+    }
 
-    let browser_id = explicit_browser
+    let browser_id = pinned_browser_id
+        .or(explicit_browser)
         .or(handle_browser)
         .or_else(|| (browsers.len() == 1).then(|| browsers[0].browser_id.clone()));
     let action = args.get("action").and_then(Value::as_str);
@@ -1851,9 +1908,160 @@ fn browserless_core_requested(arguments: &Value) -> Result<bool, String> {
     }
 }
 
-async fn worker_browser_choices(auth: &CompanionAuth) -> Vec<Value> {
+static LOCAL_IDE_SPAWN_PLACEMENT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+#[derive(Clone, Debug, Default)]
+struct LocalWorkerBrowserAssignments {
+    by_worker: BTreeMap<WorkerId, String>,
+    unresolved_workers: Vec<WorkerId>,
+    active_worker_count: usize,
+}
+
+#[derive(Clone, Debug, Default)]
+struct LocalWorkerCapacitySummary {
+    assigned_by_client: BTreeMap<String, usize>,
+    unresolved_workers: Vec<WorkerId>,
+    online_client_ids: Vec<String>,
+    assigned_worker_count: usize,
+    per_browser_capacity: usize,
+    available_worker_slots: usize,
+    effective_max_worker_count: usize,
+}
+
+fn managed_worker_client_id(
+    snapshot: &ManagedChatStoreData,
+    worker_id: &WorkerId,
+) -> Result<Option<String>, String> {
+    let thread_key = format!("worker:{worker_id}");
+    let client_ids = snapshot
+        .commands
+        .values()
+        .filter(|command| command.launch.thread_key.as_deref() == Some(thread_key.as_str()))
+        .filter_map(|command| command.target_client_id.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    match client_ids.len() {
+        0 => Ok(None),
+        1 => Ok(client_ids.into_iter().next()),
+        _ => Err(format!(
+            "worker {worker_id} has durable managed-chat history in multiple Companion browsers; Clear Workers before multi-browser placement/reuse"
+        )),
+    }
+}
+
+async fn local_worker_browser_assignments(
+    managed_chat_broker: &ManagedChatBroker,
+    broker: &WorkerBroker,
+    workspace_id: &WorkspaceId,
+    caller_identity: &ChatIdentity,
+) -> Result<LocalWorkerBrowserAssignments, String> {
+    let Some(family) = broker
+        .family_for_anchor(workspace_id, caller_identity)
+        .await
+        .map_err(|error| error.to_string())?
+    else {
+        return Ok(LocalWorkerBrowserAssignments::default());
+    };
+    let managed = managed_chat_broker.snapshot().await;
+    let mut assignments = LocalWorkerBrowserAssignments::default();
+    for worker in family
+        .workers
+        .values()
+        .filter(|worker| worker.state != WorkerState::Retired)
+    {
+        assignments.active_worker_count += 1;
+        let persisted = worker.browser_client_id.clone();
+        let client_id = match persisted.clone() {
+            Some(client_id) => Some(client_id),
+            None => managed_worker_client_id(&managed, &worker.id)?,
+        };
+        if let Some(client_id) = client_id {
+            if persisted.is_none() {
+                broker
+                    .bind_worker_browser_client_id_from_history(
+                        workspace_id,
+                        caller_identity,
+                        &worker.id,
+                        &client_id,
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
+            assignments.by_worker.insert(worker.id.clone(), client_id);
+        } else {
+            assignments.unresolved_workers.push(worker.id.clone());
+        }
+    }
+    Ok(assignments)
+}
+
+async fn local_worker_capacity_summary(
+    auth: &CompanionAuth,
+    managed_chat_broker: &ManagedChatBroker,
+    broker: &WorkerBroker,
+    workspace_id: &WorkspaceId,
+    caller_identity: &ChatIdentity,
+    per_browser_capacity: usize,
+) -> Result<LocalWorkerCapacitySummary, String> {
+    let assignments = local_worker_browser_assignments(
+        managed_chat_broker,
+        broker,
+        workspace_id,
+        caller_identity,
+    )
+    .await?;
+    let mut assigned_by_client = BTreeMap::<String, usize>::new();
+    for client_id in assignments.by_worker.values() {
+        *assigned_by_client.entry(client_id.clone()).or_default() += 1;
+    }
+    let mut online_client_ids = auth
+        .fresh_presence(crate::companion::unix_time_ms())
+        .await
+        .into_iter()
+        .map(|presence| presence.client_id)
+        .collect::<Vec<_>>();
+    online_client_ids.sort();
+    online_client_ids.dedup();
+    let family_headroom =
+        crate::workers::MAX_WORKERS_PER_FAMILY.saturating_sub(assignments.active_worker_count);
+    let online_headroom = online_client_ids
+        .iter()
+        .map(|client_id| {
+            per_browser_capacity.saturating_sub(
+                assigned_by_client
+                    .get(client_id)
+                    .copied()
+                    .unwrap_or_default(),
+            )
+        })
+        .sum::<usize>();
+    let available_worker_slots = if assignments.unresolved_workers.is_empty() {
+        family_headroom.min(online_headroom)
+    } else {
+        0
+    };
+    Ok(LocalWorkerCapacitySummary {
+        assigned_by_client,
+        unresolved_workers: assignments.unresolved_workers,
+        online_client_ids,
+        assigned_worker_count: assignments.active_worker_count,
+        per_browser_capacity,
+        available_worker_slots,
+        effective_max_worker_count: assignments
+            .active_worker_count
+            .saturating_add(available_worker_slots),
+    })
+}
+
+async fn worker_browser_choices(
+    auth: &CompanionAuth,
+    capacity: Option<&LocalWorkerCapacitySummary>,
+) -> Vec<Value> {
     let mut paired = auth.paired_client_ids().await;
+    if let Some(capacity) = capacity {
+        paired.extend(capacity.assigned_by_client.keys().cloned());
+    }
     paired.sort();
+    paired.dedup();
     let fresh = auth.fresh_presence(crate::companion::unix_time_ms()).await;
     paired
         .into_iter()
@@ -1861,12 +2069,38 @@ async fn worker_browser_choices(auth: &CompanionAuth) -> Vec<Value> {
             let presence = fresh
                 .iter()
                 .find(|presence| presence.client_id == client_id);
-            json!({
+            let assigned = capacity
+                .and_then(|capacity| capacity.assigned_by_client.get(&client_id).copied())
+                .unwrap_or_default();
+            let mut value = json!({
                 "clientId": client_id,
                 "browserLabel": presence.and_then(|presence| presence.browser_label.clone()),
                 "online": presence.is_some(),
                 "lastSeenMs": presence.map(|presence| presence.last_seen_ms)
-            })
+            });
+            if let Some(capacity) = capacity
+                && let Some(object) = value.as_object_mut()
+            {
+                object.insert(
+                    "workerCapacity".into(),
+                    json!(capacity.per_browser_capacity),
+                );
+                object.insert("assignedWorkerCount".into(), json!(assigned));
+                object.insert(
+                    "availableWorkerSlots".into(),
+                    json!(
+                        if presence.is_some() && capacity.unresolved_workers.is_empty() {
+                            capacity.per_browser_capacity.saturating_sub(assigned).min(
+                                crate::workers::MAX_WORKERS_PER_FAMILY
+                                    .saturating_sub(capacity.assigned_worker_count),
+                            )
+                        } else {
+                            0
+                        }
+                    ),
+                );
+            }
+            value
         })
         .collect()
 }
@@ -1919,6 +2153,7 @@ async fn select_local_spawn_client(
     broker: &WorkerBroker,
     workspace_id: &WorkspaceId,
     caller_identity: &ChatIdentity,
+    per_browser_capacity: usize,
 ) -> Result<String, String> {
     let requested = match arguments.get("worker_browser_id") {
         None | Some(Value::Null) => None,
@@ -1932,71 +2167,113 @@ async fn select_local_spawn_client(
             );
         }
     };
-    let worker_ids = broker
+    let family = broker
         .family_for_anchor(workspace_id, caller_identity)
         .await
-        .map_err(|error| error.to_string())?
-        .map(|family| {
-            family
-                .workers
-                .keys()
-                .cloned()
-                .collect::<std::collections::BTreeSet<_>>()
-        })
-        .unwrap_or_default();
-    if worker_ids.is_empty() {
-        return select_browserless_worker_client(arguments, auth).await;
+        .map_err(|error| error.to_string())?;
+    if let Some(operation_id) = arguments
+        .get("operation_id")
+        .and_then(Value::as_str)
+        .and_then(|value| OperationId::parse(value).ok())
+        && let Some(receipt) = family
+            .as_ref()
+            .and_then(|family| family.spawn_requests.get(&operation_id))
+        && let Some(client_id) = receipt.browser_client_id.as_deref()
+    {
+        if requested.is_some_and(|requested| requested != client_id) {
+            return Err(format!(
+                "this idempotent worker spawn is already pinned to Companion browser '{client_id}'"
+            ));
+        }
+        let online = auth
+            .fresh_presence(crate::companion::unix_time_ms())
+            .await
+            .into_iter()
+            .any(|presence| presence.client_id == client_id);
+        return online.then(|| client_id.to_string()).ok_or_else(|| {
+            format!(
+                "this idempotent worker spawn is pinned to Companion browser '{client_id}', which is currently offline"
+            )
+        });
     }
 
-    let snapshot = managed_chat_broker.snapshot().await;
-    let mut remembered = std::collections::BTreeSet::new();
-    for worker_id in worker_ids {
-        let thread_key = format!("worker:{worker_id}");
-        if let Some((_, client_id)) = snapshot
-            .commands
-            .values()
-            .filter(|command| command.launch.thread_key.as_deref() == Some(thread_key.as_str()))
-            .filter_map(|command| {
-                command
-                    .target_client_id
-                    .as_ref()
-                    .map(|client_id| (command.sequence, client_id.clone()))
-            })
-            .max_by_key(|(sequence, _)| *sequence)
-        {
-            remembered.insert(client_id);
-        }
+    let capacity = local_worker_capacity_summary(
+        auth,
+        managed_chat_broker,
+        broker,
+        workspace_id,
+        caller_identity,
+        per_browser_capacity,
+    )
+    .await?;
+    if !capacity.unresolved_workers.is_empty() {
+        return Err(format!(
+            "MoonDesk cannot safely place a new Worker because {} retained Worker(s) have no durable Companion browser affinity; finish/retire them or Clear Workers before multi-browser spawning",
+            capacity.unresolved_workers.len()
+        ));
     }
-    if remembered.is_empty() {
-        return select_browserless_worker_client(arguments, auth).await;
+    if capacity.assigned_worker_count >= crate::workers::MAX_WORKERS_PER_FAMILY {
+        return Err(format!(
+            "worker family is limited to {} active Worker slots across all browsers",
+            crate::workers::MAX_WORKERS_PER_FAMILY
+        ));
     }
-    if remembered.len() > 1 {
+    if capacity.online_client_ids.is_empty() {
         return Err(
-            "this local Worker family has durable conversations in multiple Companion browsers from earlier history; call workers with action=clear before creating new Workers so this workspace-local family can be pinned to one Worker account"
+            "workers local IDE Core requires an online paired MoonDesk Companion browser; open a paired Worker browser and retry"
                 .into(),
         );
     }
-    let preferred = remembered.into_iter().next().ok_or_else(|| {
-        "local Worker browser affinity disappeared while selecting the pinned Companion".to_string()
-    })?;
-    if requested.is_some_and(|requested| requested != preferred) {
-        return Err(format!(
-            "this local Worker family is pinned to Companion browser '{preferred}'; call workers with action=clear before changing the Worker browser/account"
-        ));
+    if let Some(requested) = requested {
+        if !capacity
+            .online_client_ids
+            .iter()
+            .any(|client_id| client_id == requested)
+        {
+            return Err(
+                "workers requested Companion browser is not currently online; call workers status and choose an online workerBrowsers clientId"
+                    .into(),
+            );
+        }
+        let assigned = capacity
+            .assigned_by_client
+            .get(requested)
+            .copied()
+            .unwrap_or_default();
+        if assigned >= per_browser_capacity {
+            return Err(format!(
+                "Companion browser '{requested}' already owns {assigned}/{per_browser_capacity} Worker slots; choose another browser or reuse/retire an existing Worker"
+            ));
+        }
+        return Ok(requested.to_string());
     }
-    let fresh = auth.fresh_presence(crate::companion::unix_time_ms()).await;
-    if fresh.iter().any(|presence| presence.client_id == preferred) {
-        return Ok(preferred);
-    }
-    Err(format!(
-        "this local Worker family is pinned to Companion browser '{preferred}', which is currently offline; MoonDesk will not create Workers in a different browser/account. Bring the pinned Worker browser online and retry, or call workers with action=clear to discard only this local workspace family and choose an online Worker browser again"
-    ))
+    capacity
+        .online_client_ids
+        .iter()
+        .filter_map(|client_id| {
+            let assigned = capacity
+                .assigned_by_client
+                .get(client_id)
+                .copied()
+                .unwrap_or_default();
+            (assigned < per_browser_capacity).then(|| (assigned, client_id.clone()))
+        })
+        .min_by(|left, right| left.cmp(right))
+        .map(|(_, client_id)| client_id)
+        .ok_or_else(|| {
+            format!(
+                "all online Companion browsers are at the configured per-browser Worker capacity ({per_browser_capacity}); reuse/retire a Worker or bring another paired browser online"
+            )
+        })
 }
 
 async fn select_browserless_reuse_client(
     arguments: &Value,
     auth: &CompanionAuth,
     managed_chat_broker: &ManagedChatBroker,
+    broker: &WorkerBroker,
+    workspace_id: &WorkspaceId,
+    caller_identity: &ChatIdentity,
     worker_id: &WorkerId,
 ) -> Result<String, String> {
     let requested = match arguments.get("worker_browser_id") {
@@ -2011,21 +2288,39 @@ async fn select_browserless_reuse_client(
             );
         }
     };
-    let thread_key = format!("worker:{worker_id}");
-    let remembered = managed_chat_broker
-        .snapshot()
+    let family = broker
+        .family_for_anchor(workspace_id, caller_identity)
         .await
-        .commands
-        .values()
-        .filter(|command| command.launch.thread_key.as_deref() == Some(thread_key.as_str()))
-        .filter_map(|command| {
-            command
-                .target_client_id
+        .map_err(|error| error.to_string())?;
+    let remembered = family.as_ref().and_then(|family| {
+        family
+            .workers
+            .get(worker_id)
+            .and_then(|worker| worker.browser_client_id.clone())
+    });
+    let remembered = match remembered {
+        Some(client_id) => Some(client_id),
+        None => {
+            let snapshot = managed_chat_broker.snapshot().await;
+            let client_id = managed_worker_client_id(&snapshot, worker_id)?;
+            if family
                 .as_ref()
-                .map(|client_id| (command.sequence, client_id.clone()))
-        })
-        .max_by_key(|(sequence, _)| *sequence)
-        .map(|(_, client_id)| client_id);
+                .is_some_and(|family| family.workers.contains_key(worker_id))
+                && let Some(client_id) = client_id.as_deref()
+            {
+                broker
+                    .bind_worker_browser_client_id_from_history(
+                        workspace_id,
+                        caller_identity,
+                        worker_id,
+                        client_id,
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
+            client_id
+        }
+    };
 
     let Some(remembered) = remembered else {
         return select_browserless_worker_client(arguments, auth).await;
@@ -2707,7 +3002,24 @@ async fn handle_tools_call_for_workspace(
                 "MoonDesk Companion is unavailable for user browser control".into(),
             );
         };
-        return handle_user_browser_tool(req, &tool_name, &identity, auth).await;
+        let pinned_companion_client_id = match active_worker_companion_client_id(
+            &identity,
+            worker_broker.as_ref(),
+            managed_chat_broker.as_ref(),
+        )
+        .await
+        {
+            Ok(value) => value,
+            Err(error) => return tool_error_response(req, error),
+        };
+        return handle_user_browser_tool(
+            req,
+            &tool_name,
+            &identity,
+            auth,
+            pinned_companion_client_id.as_deref(),
+        )
+        .await;
     }
 
     let connector_browser_tool = connector_expanded_browser_tool(&tool_name);
@@ -3183,6 +3495,24 @@ async fn handle_tools_call_for_workspace(
                 "workers worker_browser_id is only valid with browserless_core=true".into(),
             );
         }
+        if local_ide_core
+            && matches!(action, Some("spawn") | Some("reuse"))
+            && let Err(error) =
+                crate::workers::protocol::reject_parallel_editor_across_local_core_boundary(
+                    workspace_id,
+                    &caller_identity,
+                    worker_broker.as_ref(),
+                    true,
+                )
+                .await
+        {
+            return tool_error_response_text_only(req, error);
+        }
+        let _local_spawn_placement_guard = if local_ide_core && action == Some("spawn") {
+            Some(LOCAL_IDE_SPAWN_PLACEMENT_LOCK.lock().await)
+        } else {
+            None
+        };
         let browserless_client_id = if matches!(action, Some("spawn") | Some("reuse"))
             && browserless_core
         {
@@ -3212,6 +3542,9 @@ async fn handle_tools_call_for_workspace(
                     &arguments,
                     auth,
                     managed_chat_broker.as_ref(),
+                    worker_broker.as_ref(),
+                    workspace_id,
+                    &caller_identity,
                     &worker_id,
                 )
                 .await
@@ -3223,6 +3556,7 @@ async fn handle_tools_call_for_workspace(
                     worker_broker.as_ref(),
                     workspace_id,
                     &caller_identity,
+                    worker_target_count,
                 )
                 .await
             } else {
@@ -3309,9 +3643,29 @@ async fn handle_tools_call_for_workspace(
         } else {
             None
         };
+        let local_status_capacity = if local_ide_core && action == Some("status") {
+            match companion_auth.as_ref() {
+                Some(auth) => match local_worker_capacity_summary(
+                    auth,
+                    managed_chat_broker.as_ref(),
+                    worker_broker.as_ref(),
+                    workspace_id,
+                    &caller_identity,
+                    worker_target_count,
+                )
+                .await
+                {
+                    Ok(summary) => Some(summary),
+                    Err(error) => return tool_error_response_text_only(req, error),
+                },
+                None => None,
+            }
+        } else {
+            None
+        };
         let worker_browsers = if action == Some("status") {
             match companion_auth.as_ref() {
-                Some(auth) => worker_browser_choices(auth).await,
+                Some(auth) => worker_browser_choices(auth, local_status_capacity.as_ref()).await,
                 None => Vec::new(),
             }
         } else {
@@ -3371,6 +3725,55 @@ async fn handle_tools_call_for_workspace(
                                 Value::Array(foreign_active_workers),
                             );
                         }
+                    }
+                    if local_ide_core
+                        && matches!(action, Some("status") | Some("spawn") | Some("reuse"))
+                        && let Some(auth) = companion_auth.as_ref()
+                    {
+                        let capacity = match local_worker_capacity_summary(
+                            auth,
+                            managed_chat_broker.as_ref(),
+                            worker_broker.as_ref(),
+                            workspace_id,
+                            &caller_identity,
+                            worker_target_count,
+                        )
+                        .await
+                        {
+                            Ok(summary) => summary,
+                            Err(error) => return tool_error_response_text_only(req, error),
+                        };
+                        object.insert(
+                            "targetWorkerCount".into(),
+                            json!(capacity.effective_max_worker_count),
+                        );
+                        object.insert(
+                            "maxWorkerCount".into(),
+                            json!(capacity.effective_max_worker_count),
+                        );
+                        object.insert(
+                            "recommendedWorkerCount".into(),
+                            json!(
+                                crate::workers::RECOMMENDED_WORKERS_PER_FAMILY
+                                    .min(capacity.effective_max_worker_count)
+                            ),
+                        );
+                        object.insert(
+                            "workerCapacityPerBrowser".into(),
+                            json!(capacity.per_browser_capacity),
+                        );
+                        object.insert(
+                            "availableWorkerSlots".into(),
+                            json!(capacity.available_worker_slots),
+                        );
+                        object.insert(
+                            "absoluteMaxWorkerCount".into(),
+                            json!(crate::workers::MAX_WORKERS_PER_FAMILY),
+                        );
+                        object.insert(
+                            "unresolvedWorkerBrowserAffinities".into(),
+                            json!(capacity.unresolved_workers.len()),
+                        );
                     }
                     if action == Some("status")
                         && let Some(workers) =
@@ -7782,6 +8185,109 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn worker_user_browser_tools_default_to_own_companion_and_reject_cross_browser_control() {
+        let root = TestTempDir::new("moondesk-worker-user-browser-affinity");
+        let companion_auth = CompanionAuth::open(root.path().join("companion-auth.json"))
+            .expect("open test companion auth");
+        let broker = companion_auth.user_browser_broker();
+        let own_browser_id = Uuid::new_v4().to_string();
+        let other_browser_id = Uuid::new_v4().to_string();
+        broker
+            .poll(&own_browser_id, "worker-edge-client", "Edge", true)
+            .await
+            .expect("publish owned browser");
+        broker
+            .poll(&other_browser_id, "worker-chrome-client", "Chrome", true)
+            .await
+            .expect("publish other browser");
+        let identity =
+            ChatIdentity::from_openai_meta(Some("worker-account-a"), "worker-affinity-chat");
+
+        let mismatch = handle_user_browser_tool(
+            &tool_call_request_with_session(
+                "user_browser_tabs",
+                json!({ "action": "list", "browser_id": other_browser_id }),
+                "worker-affinity-chat",
+            ),
+            "user_browser_tabs",
+            &identity,
+            &companion_auth,
+            Some("worker-edge-client"),
+        )
+        .await;
+        assert_eq!(
+            mismatch
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(result_text(&mismatch).contains("USER_BROWSER_WORKER_AFFINITY_MISMATCH"));
+
+        let responder = {
+            let broker = broker.clone();
+            let own_browser_id = own_browser_id.clone();
+            tokio::spawn(async move {
+                loop {
+                    let poll = broker
+                        .poll(&own_browser_id, "worker-edge-client", "Edge", true)
+                        .await
+                        .expect("poll owned browser");
+                    let Some(request_id) = poll.requests.first().cloned() else {
+                        tokio::task::yield_now().await;
+                        continue;
+                    };
+                    let command = broker
+                        .claim(
+                            &own_browser_id,
+                            "worker-edge-client",
+                            &request_id,
+                            &poll.epoch,
+                        )
+                        .await
+                        .expect("claim owned-browser request");
+                    assert_eq!(command.tool, "user_browser_tabs");
+                    assert_eq!(command.args, json!({ "action": "list" }));
+                    assert!(
+                        broker
+                            .result(
+                                &own_browser_id,
+                                "worker-edge-client",
+                                &request_id,
+                                &poll.epoch,
+                                json!({ "value": { "tabs": [] } }),
+                            )
+                            .await
+                    );
+                    break;
+                }
+            })
+        };
+        let own_default = handle_user_browser_tool(
+            &tool_call_request_with_session(
+                "user_browser_tabs",
+                json!({ "action": "list" }),
+                "worker-affinity-chat",
+            ),
+            "user_browser_tabs",
+            &identity,
+            &companion_auth,
+            Some("worker-edge-client"),
+        )
+        .await;
+        assert_ne!(
+            own_default
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        responder.await.expect("join owned-browser responder");
+    }
+
+    #[tokio::test]
     async fn user_browser_tool_requires_exact_chatgpt_identity_before_dispatch() {
         let root = TestTempDir::new("moondesk-user-browser-identity");
         let workspace = WorkspaceId::new();
@@ -9408,20 +9914,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_ide_core_refuses_ambiguous_online_browsers() {
-        let root = TestTempDir::new("moondesk-workers-browserless-ambiguous");
+    async fn local_ide_core_load_balances_online_browsers() {
+        let root = TestTempDir::new("moondesk-workers-browserless-load-balance");
         let workspace_root = root.path().join("workspace");
         std::fs::create_dir_all(&workspace_root).expect("create workspace");
         let workspace_id = WorkspaceId::new();
+        let core = ChatIdentity::local_core(&workspace_id);
         let broker = Arc::new(
             WorkerBroker::open(root.path().join("worker-state-v1.json"))
                 .expect("open worker broker"),
         );
-        let managed_chat_broker = Arc::new(
+        let managed = Arc::new(
             ManagedChatBroker::open(root.path().join("managed-chat-state-v1.json"))
                 .expect("open managed chat broker"),
         );
-        let companion_auth = Arc::new(
+        let companion = Arc::new(
             CompanionAuth::open(root.path().join("companion-auth-v1.json"))
                 .expect("open companion auth"),
         );
@@ -9429,11 +9936,11 @@ mod tests {
             ("ide-chrome", "a".repeat(64), "Chrome"),
             ("ide-edge", "b".repeat(64), "Edge"),
         ] {
-            companion_auth
+            companion
                 .auto_pair(client_id, &credential, None)
                 .await
                 .expect("pair companion");
-            companion_auth
+            companion
                 .update_presence(
                     client_id,
                     crate::companion::CompanionPresenceUpdate {
@@ -9445,75 +9952,89 @@ mod tests {
                 .await
                 .expect("publish companion presence");
         }
-        let response = call_workers_for_test_with_companion(
-            &tool_call_request_local_ide(
-                "workers",
-                json!({
-                    "action": "spawn",
-                    "operation_id": Uuid::new_v4().to_string(),
-                    "label": "ambiguous browser",
-                    "task": "Do not launch until browser is selected."
-                }),
-            ),
-            &workspace_id,
-            &workspace_root.to_string_lossy(),
-            broker.clone(),
-            managed_chat_broker.clone(),
-            Some(companion_auth.clone()),
-        )
-        .await;
-        assert_eq!(
-            response
-                .result
-                .as_ref()
-                .and_then(|result| result.get("isError"))
-                .and_then(Value::as_bool),
-            Some(true)
-        );
-        assert!(result_text(&response).contains("multiple online Companion browsers"));
-        assert!(broker.snapshot().await.families.is_empty());
-        assert!(managed_chat_broker.snapshot().await.commands.is_empty());
 
-        let selected = call_workers_for_test_with_companion(
-            &tool_call_request_local_ide(
-                "workers",
-                json!({
-                    "action": "spawn",
-                    "operation_id": Uuid::new_v4().to_string(),
-                    "label": "selected worker browser",
-                    "task": "Launch only in the explicitly selected Worker browser.",
-                    "worker_browser_id": "ide-edge"
-                }),
-            ),
-            &workspace_id,
-            &workspace_root.to_string_lossy(),
-            broker,
-            managed_chat_broker.clone(),
-            Some(companion_auth),
-        )
-        .await;
-        assert_ne!(
-            selected
-                .result
-                .as_ref()
-                .and_then(|result| result.get("isError"))
-                .and_then(Value::as_bool),
-            Some(true)
+        for label in ["first balanced worker", "second balanced worker"] {
+            let response = call_workers_for_test_with_companion(
+                &tool_call_request_local_ide(
+                    "workers",
+                    json!({
+                        "action": "spawn",
+                        "operation_id": Uuid::new_v4().to_string(),
+                        "label": label,
+                        "task": "Read-only balanced placement test."
+                    }),
+                ),
+                &workspace_id,
+                &workspace_root.to_string_lossy(),
+                broker.clone(),
+                managed.clone(),
+                Some(companion.clone()),
+            )
+            .await;
+            assert_ne!(
+                response
+                    .result
+                    .as_ref()
+                    .and_then(|result| result.get("isError"))
+                    .and_then(Value::as_bool),
+                Some(true),
+                "multiple online browsers must be load-balanced automatically"
+            );
+        }
+
+        let family = broker
+            .family_for_anchor(&workspace_id, &core)
+            .await
+            .expect("read balanced family")
+            .expect("balanced family");
+        let by_display = family
+            .workers
+            .values()
+            .map(|worker| (worker.display_id.clone(), worker.browser_client_id.clone()))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(
+            by_display.get("worker-1").and_then(Option::as_deref),
+            Some("ide-chrome"),
+            "equal-load tie must be deterministic"
         );
-        let managed = managed_chat_broker.snapshot().await;
-        let command = managed
+        assert_eq!(
+            by_display.get("worker-2").and_then(Option::as_deref),
+            Some("ide-edge"),
+            "second fresh Worker should go to the less-loaded browser"
+        );
+        let commands = managed.snapshot().await;
+        let targets = commands
             .commands
             .values()
-            .next()
-            .expect("selected Worker browser launch command");
-        assert_eq!(command.target_client_id.as_deref(), Some("ide-edge"));
+            .filter_map(|command| command.target_client_id.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            targets,
+            ["ide-chrome".to_string(), "ide-edge".to_string()]
+                .into_iter()
+                .collect()
+        );
+
+        let capacity = local_worker_capacity_summary(
+            companion.as_ref(),
+            managed.as_ref(),
+            broker.as_ref(),
+            &workspace_id,
+            &core,
+            3,
+        )
+        .await
+        .expect("calculate per-browser capacity");
+        assert_eq!(capacity.assigned_worker_count, 2);
+        assert_eq!(capacity.available_worker_slots, 4);
+        assert_eq!(capacity.effective_max_worker_count, 6);
+        assert_eq!(capacity.assigned_by_client.get("ide-chrome"), Some(&1));
+        assert_eq!(capacity.assigned_by_client.get("ide-edge"), Some(&1));
     }
 
     #[tokio::test]
-    async fn local_ide_spawn_stays_on_existing_family_worker_browser_account() {
-        let root = TestTempDir::new("moondesk-local-ide-spawn-browser-affinity");
-        let workspace_root = root.path().join("workspace");
-        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+    async fn local_ide_spawn_enforces_per_browser_capacity_without_offline_spill() {
+        let root = TestTempDir::new("moondesk-local-ide-per-browser-capacity");
         let workspace_id = WorkspaceId::new();
         let core = ChatIdentity::local_core(&workspace_id);
         let broker = WorkerBroker::open(root.path().join("worker-state-v1.json"))
@@ -9523,8 +10044,8 @@ mod tests {
         let companion = CompanionAuth::open(root.path().join("companion-auth-v1.json"))
             .expect("open companion auth");
         for (client_id, credential) in [
-            ("fixed-edge", "a".repeat(64)),
-            ("other-chrome", "b".repeat(64)),
+            ("offline-edge", "a".repeat(64)),
+            ("online-chrome", "b".repeat(64)),
         ] {
             companion
                 .auto_pair(client_id, &credential, None)
@@ -9533,7 +10054,7 @@ mod tests {
         }
         companion
             .update_presence(
-                "other-chrome",
+                "online-chrome",
                 crate::companion::CompanionPresenceUpdate {
                     browser_label: Some("Chrome".into()),
                     tabs: Vec::new(),
@@ -9541,58 +10062,86 @@ mod tests {
                 crate::companion::unix_time_ms(),
             )
             .await
-            .expect("publish unrelated online browser");
+            .expect("publish Chrome presence");
 
-        let existing = broker
-            .spawn_worker(crate::workers::broker::SpawnWorkerRequest {
-                operation_id: OperationId::new(),
-                workspace_id: workspace_id.clone(),
-                anchor_identity: core.clone(),
-                label: "family affinity seed".into(),
-                assignment: "Seed the fixed Worker browser for this family.".into(),
-                context: String::new(),
-                execution_profile: ChatExecutionProfile::default(),
-            })
-            .await
-            .expect("spawn family affinity seed");
-        managed
-            .enqueue_with_route(
-                crate::managed_chat::broker::EnqueueManagedChatRequest {
-                    dedupe_key: format!("worker:{}:task:seed", existing.worker_id),
-                    launch: ManagedChatLaunch {
+        let mut edge_receipts = Vec::new();
+        for index in 0..3 {
+            edge_receipts.push(
+                broker
+                    .spawn_worker_on_browser(
+                        crate::workers::broker::SpawnWorkerRequest {
+                            operation_id: OperationId::new(),
+                            workspace_id: workspace_id.clone(),
+                            anchor_identity: core.clone(),
+                            label: format!("edge slot {index}"),
+                            assignment: "Reserve an Edge Worker slot.".into(),
+                            context: String::new(),
+                            execution_profile: ChatExecutionProfile::default(),
+                        },
+                        "offline-edge",
+                        3,
+                    )
+                    .await
+                    .expect("reserve Edge slot"),
+            );
+        }
+        for index in 0..3 {
+            broker
+                .spawn_worker_on_browser(
+                    crate::workers::broker::SpawnWorkerRequest {
+                        operation_id: OperationId::new(),
                         workspace_id: workspace_id.clone(),
-                        purpose: ManagedChatPurpose::Worker,
+                        anchor_identity: core.clone(),
+                        label: format!("chrome slot {index}"),
+                        assignment: "Reserve a Chrome Worker slot.".into(),
+                        context: String::new(),
                         execution_profile: ChatExecutionProfile::default(),
-                        opening_message: "seed fixed Worker browser".into(),
-                        task_marker: format!("moondesk-worker-task:{}", existing.task_id),
-                        thread_key: Some(format!("worker:{}", existing.worker_id)),
-                        open_mode: ManagedChatOpenMode::NewThread,
-                        existing_conversation_url: None,
-                        anchor_session_digest: Some(core.session_digest.clone()),
                     },
-                },
-                Some("fixed-edge".into()),
-                None,
-            )
-            .await
-            .expect("seed family browser affinity");
+                    "online-chrome",
+                    3,
+                )
+                .await
+                .expect("reserve Chrome slot");
+        }
 
-        let offline = select_local_spawn_client(
+        let full = select_local_spawn_client(
             &json!({}),
             &companion,
             &managed,
             &broker,
             &workspace_id,
             &core,
+            3,
         )
         .await
-        .expect_err("new local Worker must not fail over to another account");
-        assert!(offline.contains("fixed-edge"));
-        assert!(offline.contains("currently offline"));
+        .expect_err("offline Edge capacity must not spill into full Chrome");
+        assert!(full.contains("all online Companion browsers"));
+        let explicit_full = select_local_spawn_client(
+            &json!({ "worker_browser_id": "online-chrome" }),
+            &companion,
+            &managed,
+            &broker,
+            &workspace_id,
+            &core,
+            3,
+        )
+        .await
+        .expect_err("explicit browser selection must not bypass capacity");
+        assert!(explicit_full.contains("3/3 Worker slots"));
 
+        let first_edge = edge_receipts.first().expect("first Edge slot");
+        broker
+            .retire_worker(
+                &workspace_id,
+                &core,
+                &first_edge.worker_id,
+                Some(&first_edge.task_id),
+            )
+            .await
+            .expect("retire one Edge slot");
         companion
             .update_presence(
-                "fixed-edge",
+                "offline-edge",
                 crate::companion::CompanionPresenceUpdate {
                     browser_label: Some("Edge".into()),
                     tabs: Vec::new(),
@@ -9600,19 +10149,7 @@ mod tests {
                 crate::companion::unix_time_ms(),
             )
             .await
-            .expect("bring fixed Worker browser online");
-        let mismatch = select_local_spawn_client(
-            &json!({ "worker_browser_id": "other-chrome" }),
-            &companion,
-            &managed,
-            &broker,
-            &workspace_id,
-            &core,
-        )
-        .await
-        .expect_err("family cannot silently switch Worker account");
-        assert!(mismatch.contains("pinned to Companion browser 'fixed-edge'"));
-
+            .expect("bring Edge online");
         let selected = select_local_spawn_client(
             &json!({}),
             &companion,
@@ -9620,10 +10157,11 @@ mod tests {
             &broker,
             &workspace_id,
             &core,
+            3,
         )
         .await
-        .expect("select fixed family Worker browser");
-        assert_eq!(selected, "fixed-edge");
+        .expect("retired slot should become reusable capacity");
+        assert_eq!(selected, "offline-edge");
     }
 
     #[tokio::test]
@@ -9766,18 +10304,18 @@ mod tests {
             .await
             .expect("persist unrelated command");
 
-        let blocked = select_local_spawn_client(
+        let selected_before_clear = select_local_spawn_client(
             &json!({}),
             companion.as_ref(),
             managed.as_ref(),
             broker.as_ref(),
             &workspace_id,
             &core,
+            3,
         )
         .await
-        .expect_err("offline family affinity must block failover before clear");
-        assert!(blocked.contains("offline-chrome"));
-        assert!(blocked.contains("action=clear"));
+        .expect("offline Worker browser must not consume another browser's free slots");
+        assert_eq!(selected_before_clear, "online-edge");
 
         let response = call_workers_for_test_with_companion(
             &tool_call_request_local_ide("workers", json!({ "action": "clear" })),
@@ -9835,6 +10373,7 @@ mod tests {
             broker.as_ref(),
             &workspace_id,
             &core,
+            3,
         )
         .await
         .expect("fresh family may choose the only online browser after clear");
@@ -9846,6 +10385,10 @@ mod tests {
         let root = TestTempDir::new("moondesk-local-ide-reuse-browser-affinity");
         let managed = ManagedChatBroker::open(root.path().join("managed-chat-state-v1.json"))
             .expect("open managed chat broker");
+        let broker = WorkerBroker::open(root.path().join("worker-state-v1.json"))
+            .expect("open worker broker");
+        let workspace_id = WorkspaceId::new();
+        let core = ChatIdentity::local_core(&workspace_id);
         let companion = CompanionAuth::open(root.path().join("companion-auth-v1.json"))
             .expect("open companion auth");
         for (client_id, credential) in [
@@ -9892,9 +10435,17 @@ mod tests {
             .await
             .expect("seed Worker browser affinity");
 
-        let offline = select_browserless_reuse_client(&json!({}), &companion, &managed, &worker_id)
-            .await
-            .expect_err("reuse must not jump to another online browser");
+        let offline = select_browserless_reuse_client(
+            &json!({}),
+            &companion,
+            &managed,
+            &broker,
+            &workspace_id,
+            &core,
+            &worker_id,
+        )
+        .await
+        .expect_err("reuse must not jump to another online browser");
         assert!(offline.contains("worker-edge"));
         assert!(offline.contains("currently offline"));
 
@@ -9913,16 +10464,26 @@ mod tests {
             &json!({ "worker_browser_id": "other-chrome" }),
             &companion,
             &managed,
+            &broker,
+            &workspace_id,
+            &core,
             &worker_id,
         )
         .await
         .expect_err("existing Worker cannot move to another browser/account");
         assert!(mismatch.contains("pinned to Companion browser 'worker-edge'"));
 
-        let selected =
-            select_browserless_reuse_client(&json!({}), &companion, &managed, &worker_id)
-                .await
-                .expect("reuse original Worker browser");
+        let selected = select_browserless_reuse_client(
+            &json!({}),
+            &companion,
+            &managed,
+            &broker,
+            &workspace_id,
+            &core,
+            &worker_id,
+        )
+        .await
+        .expect("reuse original Worker browser");
         assert_eq!(selected, "worker-edge");
     }
 

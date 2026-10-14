@@ -287,6 +287,8 @@ pub struct WorkerRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chat_identity: Option<ChatIdentity>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browser_client_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claim_token: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claim_operation_id: Option<OperationId>,
@@ -313,6 +315,8 @@ pub struct SpawnReceipt {
     pub task_id: TaskId,
     pub display_id: String,
     pub claim_token: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browser_client_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claim_operation_id: Option<OperationId>,
 }
@@ -507,6 +511,13 @@ impl WorkerStoreData {
                 worker.execution_profile.validate()?;
                 if let Some(identity) = &worker.chat_identity {
                     identity.validate()?;
+                }
+                if worker
+                    .browser_client_id
+                    .as_deref()
+                    .is_some_and(|client_id| client_id.trim().is_empty() || client_id.len() > 128)
+                {
+                    return Err("worker Companion browser affinity is invalid".into());
                 }
                 if worker.messages.len() > super::MAX_PENDING_MESSAGES_PER_WORKER {
                     return Err("worker message queue exceeds configured limit".into());

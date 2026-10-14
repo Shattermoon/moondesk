@@ -4714,7 +4714,7 @@ async fn run_settings(
                             drop(app);
                             worker_connector_notice = Some(match worker_url {
                                 Some(url) if clipboard_copy(&url) => {
-                                    "Generalized Worker connector URL copied. Configure it once in the fixed Worker ChatGPT account with Authentication: None."
+                                    "Generalized Worker connector URL copied. Configure the same URL in each Worker ChatGPT account/browser you want MoonDesk to use, with Authentication: None."
                                         .into()
                                 }
                                 Some(_) => "Could not copy generalized Worker connector URL".into(),
@@ -5239,21 +5239,20 @@ fn draw_settings(f: &mut Frame, view: SettingsView<'_>) {
     }
     lines.push(Line::from(Span::styled(
         format!(
-            " {} [{}] Worker count: {} (recommended 1-{}, max {})",
+            " {} [{}] Worker target / IDE slots per browser: {} (family max {})",
             if worker_count_selected { ">" } else { " " },
             worker_count_row + 1,
             worker_target_count,
-            workers::RECOMMENDED_WORKERS_PER_FAMILY,
             workers::MAX_WORKERS_PER_FAMILY
         ),
         worker_count_style,
     )));
     lines.push(Line::from(Span::styled(
-        "     5-8 workers can hit ChatGPT/provider rate limits, especially with other active chats.",
+        "     Local IDE: this is a per-online-browser cap; fresh Workers are load-balanced and stay pinned to their original browser/account.",
         Style::default().fg(palette.muted_fg),
     )));
     lines.push(Line::from(Span::styled(
-        "     Worker Companion is optional. MoonDesk works normally without it; only Workers need it.",
+        "     Companion stays optional for normal MoonDesk. Aggregate local-IDE capacity grows with online paired browsers up to the family max; offline slots never spill.",
         Style::default().fg(palette.muted_fg),
     )));
     lines.push(Line::from(Span::styled(
@@ -5322,7 +5321,7 @@ fn draw_settings(f: &mut Frame, view: SettingsView<'_>) {
         worker_connector_style,
     )));
     lines.push(Line::from(Span::styled(
-        "     Configure this once in the fixed Worker ChatGPT account. It is account-level and resolves each Worker's workspace from its claim; the secret URL is copied, never displayed.",
+        "     Configure this same connector in each Worker ChatGPT account/browser you want to contribute capacity. It is account-level and resolves each Worker's workspace from its claim; the secret URL is copied, never displayed.",
         Style::default().fg(palette.muted_fg),
     )));
     if let Some(notice) = worker_connector_notice {
@@ -11351,10 +11350,10 @@ mod tests {
         assert!(rendered.contains("Workers (experimental)"));
         assert!(rendered.contains("Default model: GPT-5.6 Sol"));
         assert!(rendered.contains("Reasoning effort: High"));
-        assert!(rendered.contains("Worker count: 4 (recommended 1-4, max 8)"));
-        assert!(rendered.contains("5-8 workers can hit ChatGPT/provider rate limits"));
-        assert!(rendered.contains("Worker Companion is optional"));
-        assert!(rendered.contains("MoonDesk works normally without it"));
+        assert!(rendered.contains("Worker target / IDE slots per browser: 4 (family max 8)"));
+        assert!(rendered.contains("Local IDE: this is a per-online-browser cap"));
+        assert!(rendered.contains("Aggregate local-IDE capacity grows"));
+        assert!(rendered.contains("Companion stays optional for normal MoonDesk"));
         assert!(rendered.contains("chrome://extensions"));
         assert!(rendered.contains("synchronized automatically on startup"));
         assert!(rendered.contains("Open Worker Companion folder"));
@@ -11363,7 +11362,10 @@ mod tests {
         assert!(!rendered.contains("unavailable"));
         assert!(rendered.contains("Manual repair code: test-pairing-code"));
         assert!(rendered.contains("Copy generalized Worker connector URL"));
-        assert!(rendered.contains("Configure this once in the fixed Worker ChatGPT account"));
+        assert!(
+            rendered
+                .contains("Configure this same connector in each Worker ChatGPT account/browser")
+        );
         assert!(rendered.contains("Release inactive Worker capacity"));
         assert!(rendered.contains("Host-local cleanup for inaccessible old Cores"));
         assert!(rendered.contains("Released 2 inactive Core families"));

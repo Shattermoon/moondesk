@@ -92,6 +92,30 @@ impl UserBrowserBroker {
             .collect()
     }
 
+    pub async fn browser_id_for_companion(
+        &self,
+        companion_client_id: &str,
+    ) -> Result<Option<String>, String> {
+        let mut state = self.state.lock().await;
+        prune_clients(&mut state);
+        let matches = state
+            .clients
+            .iter()
+            .filter(|(_, client)| {
+                client.companion_client_id == companion_client_id && client.enabled
+            })
+            .map(|(browser_id, _)| browser_id.clone())
+            .collect::<Vec<_>>();
+        match matches.as_slice() {
+            [] => Ok(None),
+            [browser_id] => Ok(Some(browser_id.clone())),
+            _ => Err(
+                "USER_BROWSER_WORKER_AFFINITY_AMBIGUOUS: multiple user-browser identities belong to the Worker's Companion client"
+                    .into(),
+            ),
+        }
+    }
+
     pub async fn remove_companion(&self, companion_client_id: &str) {
         let mut state = self.state.lock().await;
         let browser_ids = state

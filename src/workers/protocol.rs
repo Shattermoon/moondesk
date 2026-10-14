@@ -398,7 +398,7 @@ pub(crate) async fn recover_registered_workspaces(
     }
 }
 
-async fn reject_parallel_editor_across_local_core_boundary(
+pub(crate) async fn reject_parallel_editor_across_local_core_boundary(
     workspace_id: &WorkspaceId,
     caller_identity: &ChatIdentity,
     broker: &WorkerBroker,
@@ -483,18 +483,26 @@ pub async fn handle(
             let context = worker_context(arguments)?;
             let execution_profile = execution_profile.clone();
             let operation_id = parse_operation_id(arguments)?;
-            let receipt = broker
-                .spawn_worker(SpawnWorkerRequest {
-                    operation_id: operation_id.clone(),
-                    workspace_id: workspace_id.clone(),
-                    anchor_identity: caller_identity.clone(),
-                    label: required_string(arguments, "label")?.to_string(),
-                    assignment: assignment.clone(),
-                    context: context.clone(),
-                    execution_profile: execution_profile.clone(),
-                })
-                .await
-                .map_err(broker_error)?;
+            let spawn_request = SpawnWorkerRequest {
+                operation_id: operation_id.clone(),
+                workspace_id: workspace_id.clone(),
+                anchor_identity: caller_identity.clone(),
+                label: required_string(arguments, "label")?.to_string(),
+                assignment: assignment.clone(),
+                context: context.clone(),
+                execution_profile: execution_profile.clone(),
+            };
+            let receipt = if launch_context.local_ide_core {
+                let browser_client_id = launch_context.browserless_client_id.ok_or_else(|| {
+                    "local IDE Worker spawn is missing its selected Companion browser".to_string()
+                })?;
+                broker
+                    .spawn_worker_on_browser(spawn_request, browser_client_id, worker_target_count)
+                    .await
+            } else {
+                broker.spawn_worker(spawn_request).await
+            }
+            .map_err(broker_error)?;
             maybe_pause_after_worker_persist(&operation_id).await;
 
             let claim_operation_id = receipt.claim_operation_id.as_ref().ok_or_else(|| {
@@ -521,7 +529,10 @@ pub async fn handle(
                     )
                 })
                 .unwrap_or((None, None));
-            let target_client_id = target_client_id
+            let target_client_id = receipt
+                .browser_client_id
+                .clone()
+                .or(target_client_id)
                 .or_else(|| launch_context.browserless_client_id.map(str::to_owned));
             let dedupe_key = format!("worker:{}:task:{}", receipt.worker_id, receipt.task_id);
             let launch = match launch_context
@@ -634,6 +645,7 @@ pub async fn handle(
                 "taskId": receipt.task_id,
                 "displayId": receipt.display_id,
                 "executionProfile": execution_profile,
+                "workerBrowserId": receipt.browser_client_id,
                 "launchCommandId": launch.id,
                 "state": "provisioning",
                 "targetWorkerCount": worker_target_count,
@@ -840,6 +852,7 @@ pub async fn handle(
                         "launchCommandId": worker.launch_command_id,
                         "launchError": worker.launch_error,
                         "conversationUrl": worker.conversation_url,
+                        "workerBrowserId": worker.browser_client_id,
                         "currentTaskId": worker.current_task_id,
                         "claimed": worker.chat_identity.is_some(),
                         "executionProfile": worker.execution_profile,

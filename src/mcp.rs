@@ -2214,6 +2214,53 @@ async fn worker_observability(
         .collect())
 }
 
+fn merge_local_ide_worker_observability(
+    worker: &mut serde_json::Map<String, Value>,
+    observed: &Value,
+) {
+    for key in ["lifecycleStage", "health", "claimDeadlineAtMs"] {
+        if let Some(value) = observed.get(key) {
+            worker.insert(key.into(), value.clone());
+        }
+    }
+
+    if observed.get("health").and_then(Value::as_str) == Some("suspect") {
+        if let Some(age) = observed
+            .get("lastActivityAgeMs")
+            .filter(|value| !value.is_null())
+        {
+            worker.insert("lastActivityAgeMs".into(), age.clone());
+        }
+        if let Some(last_tool) = observed
+            .get("recentToolCalls")
+            .and_then(Value::as_array)
+            .and_then(|calls| calls.last())
+            .and_then(|call| call.get("tool"))
+            .and_then(Value::as_str)
+        {
+            worker.insert("lastTool".into(), json!(last_tool));
+        }
+        if let Some(generating) = observed
+            .pointer("/browser/generating")
+            .and_then(Value::as_bool)
+        {
+            worker.insert("browserGenerating".into(), json!(generating));
+        }
+    }
+
+    // Local Codex needs compact lifecycle state, not duplicated browser diagnostics/history on
+    // every status turn. Rich observability remains internal to MoonDesk and explicit recovery.
+    for key in ["launchCommandId", "conversationUrl", "executionProfile"] {
+        worker.remove(key);
+    }
+    if worker.get("launchError").is_some_and(Value::is_null) {
+        worker.remove("launchError");
+    }
+    if worker.get("claimDeadlineAtMs").is_some_and(Value::is_null) {
+        worker.remove("claimDeadlineAtMs");
+    }
+}
+
 async fn local_ide_foreign_active_workers(
     workspace_id: &WorkspaceId,
     caller_identity: &ChatIdentity,
@@ -3351,29 +3398,13 @@ async fn handle_tools_call_for_workspace(
                                 continue;
                             };
                             if let Some(worker_object) = worker.as_object_mut() {
-                                for key in ["lifecycleStage", "health", "claimDeadlineAtMs"] {
-                                    if let Some(value) = observed.get(key) {
-                                        worker_object.insert(key.into(), value.clone());
-                                    }
-                                }
                                 if local_ide_core {
-                                    // Local Codex needs compact lifecycle state, not duplicated browser
-                                    // diagnostics/history on every status turn. Recovery still consumes the
-                                    // richer observability internally when explicitly requested.
-                                    for key in
-                                        ["launchCommandId", "conversationUrl", "executionProfile"]
-                                    {
-                                        worker_object.remove(key);
-                                    }
-                                    if worker_object.get("launchError").is_some_and(Value::is_null)
-                                    {
-                                        worker_object.remove("launchError");
-                                    }
-                                    if worker_object
-                                        .get("claimDeadlineAtMs")
-                                        .is_some_and(Value::is_null)
-                                    {
-                                        worker_object.remove("claimDeadlineAtMs");
+                                    merge_local_ide_worker_observability(worker_object, observed);
+                                } else {
+                                    for key in ["lifecycleStage", "health", "claimDeadlineAtMs"] {
+                                        if let Some(value) = observed.get(key) {
+                                            worker_object.insert(key.into(), value.clone());
+                                        }
                                     }
                                 }
                             }
@@ -8005,6 +8036,72 @@ mod tests {
                 "workers description should not narrate enforcement policy: {policy_like}"
             );
         }
+    }
+
+    #[test]
+    fn local_ide_suspect_worker_status_exposes_only_compact_activity_signal() {
+        let mut worker = json!({
+            "workerId": "worker-1",
+            "launchCommandId": "internal-command",
+            "conversationUrl": "https://chatgpt.com/c/internal",
+            "executionProfile": { "model": "internal" },
+            "launchError": null
+        })
+        .as_object()
+        .expect("worker fixture")
+        .clone();
+        let observed = json!({
+            "lifecycleStage": "working",
+            "health": "suspect",
+            "claimDeadlineAtMs": null,
+            "lastActivityAgeMs": 195000,
+            "recentToolCalls": [
+                { "atMs": 1, "tool": "read" },
+                { "atMs": 2, "tool": "run_command" }
+            ],
+            "browser": {
+                "present": true,
+                "generating": false,
+                "clientId": "internal-browser",
+                "lastSeenMs": 3
+            }
+        });
+
+        merge_local_ide_worker_observability(&mut worker, &observed);
+
+        assert_eq!(worker.get("lifecycleStage"), Some(&json!("working")));
+        assert_eq!(worker.get("health"), Some(&json!("suspect")));
+        assert_eq!(worker.get("lastActivityAgeMs"), Some(&json!(195000)));
+        assert_eq!(worker.get("lastTool"), Some(&json!("run_command")));
+        assert_eq!(worker.get("browserGenerating"), Some(&json!(false)));
+        assert!(worker.get("recentToolCalls").is_none());
+        assert!(worker.get("launchCommandId").is_none());
+        assert!(worker.get("conversationUrl").is_none());
+        assert!(worker.get("executionProfile").is_none());
+        assert!(worker.get("launchError").is_none());
+        assert!(worker.get("claimDeadlineAtMs").is_none());
+    }
+
+    #[test]
+    fn local_ide_healthy_worker_status_omits_activity_diagnostics() {
+        let mut worker = json!({ "workerId": "worker-1" })
+            .as_object()
+            .expect("worker fixture")
+            .clone();
+        let observed = json!({
+            "lifecycleStage": "working",
+            "health": "active",
+            "lastActivityAgeMs": 1200,
+            "recentToolCalls": [{ "atMs": 1, "tool": "run_command" }],
+            "browser": { "present": true, "generating": true }
+        });
+
+        merge_local_ide_worker_observability(&mut worker, &observed);
+
+        assert_eq!(worker.get("health"), Some(&json!("active")));
+        assert!(worker.get("lastActivityAgeMs").is_none());
+        assert!(worker.get("lastTool").is_none());
+        assert!(worker.get("browserGenerating").is_none());
     }
 
     #[tokio::test]

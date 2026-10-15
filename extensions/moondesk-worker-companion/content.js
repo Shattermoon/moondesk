@@ -12,6 +12,17 @@
   const pendingProviderCorrelations = new Map();
   let providerCorrelationTimer = null;
   let workerLaunchResetGeneration = 0;
+  const PRESENCE_WAKE_INTERVAL_MS = 20_000;
+
+  // Manifest V3 alarms are a fallback, not a strict realtime scheduler. A lightweight message from
+  // any loaded ChatGPT page wakes the extension service worker without carrying page/user data.
+  // Background-tab timers may be throttled, but combined with the 30s alarm this prevents healthy
+  // Worker browsers from aging out merely because Edge suspended the service worker.
+  if (chrome.runtime?.id) {
+    setInterval(() => {
+      void chrome.runtime.sendMessage({ type: 'MOONDESK_PRESENCE_WAKE' }).catch(() => {});
+    }, PRESENCE_WAKE_INTERVAL_MS);
+  }
 
   function validProviderCorrelation(value) {
     if (!value || typeof value !== 'object') return null;

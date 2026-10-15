@@ -308,6 +308,42 @@ impl WorkerBroker {
         browser_client_id: &str,
         browser_capacity: usize,
     ) -> Result<SpawnReceipt, WorkerBrokerError> {
+        self.spawn_worker_on_browser_inner(request, browser_client_id, None, browser_capacity)
+            .await
+    }
+
+    pub async fn spawn_worker_on_browser_account(
+        &self,
+        request: SpawnWorkerRequest,
+        browser_client_id: &str,
+        browser_account_fingerprint: &str,
+        browser_capacity: usize,
+    ) -> Result<SpawnReceipt, WorkerBrokerError> {
+        if browser_account_fingerprint.len() != 64
+            || !browser_account_fingerprint
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(WorkerBrokerError::Invalid(
+                "Worker Companion account fingerprint is invalid".into(),
+            ));
+        }
+        self.spawn_worker_on_browser_inner(
+            request,
+            browser_client_id,
+            Some(browser_account_fingerprint.to_ascii_lowercase()),
+            browser_capacity,
+        )
+        .await
+    }
+
+    async fn spawn_worker_on_browser_inner(
+        &self,
+        request: SpawnWorkerRequest,
+        browser_client_id: &str,
+        browser_account_fingerprint: Option<String>,
+        browser_capacity: usize,
+    ) -> Result<SpawnReceipt, WorkerBrokerError> {
         if browser_client_id.trim().is_empty() || browser_client_id.len() > 128 {
             return Err(WorkerBrokerError::Invalid(
                 "Worker Companion browser id must contain 1..=128 bytes".into(),
@@ -320,7 +356,11 @@ impl WorkerBroker {
         }
         self.spawn_worker_inner(
             request,
-            Some((browser_client_id.to_string(), browser_capacity)),
+            Some((
+                browser_client_id.to_string(),
+                browser_account_fingerprint,
+                browser_capacity,
+            )),
         )
         .await
     }
@@ -328,7 +368,7 @@ impl WorkerBroker {
     async fn spawn_worker_inner(
         &self,
         request: SpawnWorkerRequest,
-        browser_placement: Option<(String, usize)>,
+        browser_placement: Option<(String, Option<String>, usize)>,
     ) -> Result<SpawnReceipt, WorkerBrokerError> {
         validate_spawn_request(&request)?;
         let fingerprint = request_fingerprint(&request)?;
@@ -408,7 +448,7 @@ impl WorkerBroker {
             );
             id
         };
-        let family = candidate.families.get_mut(&family_id).ok_or_else(|| {
+        let family = candidate.families.get(&family_id).ok_or_else(|| {
             WorkerBrokerError::Storage("worker family disappeared during mutation".into())
         })?;
 
@@ -427,22 +467,84 @@ impl WorkerBroker {
                 "worker family is limited to {MAX_WORKERS_PER_FAMILY} active workers"
             )));
         }
-        if let Some((browser_client_id, browser_capacity)) = browser_placement.as_ref() {
-            let assigned = family
-                .workers
+        if let Some((browser_client_id, browser_account_fingerprint, browser_capacity)) =
+            browser_placement.as_ref()
+        {
+            let local_ide_workers = candidate
+                .families
                 .values()
-                .filter(|worker| {
-                    worker.state != WorkerState::Retired
-                        && worker.browser_client_id.as_deref() == Some(browser_client_id.as_str())
+                .filter(|family| {
+                    family.anchor_identity == ChatIdentity::local_core(&family.workspace_id)
                 })
-                .count();
-            if assigned >= *browser_capacity {
+                .flat_map(|family| family.workers.values())
+                .filter(|worker| worker.state != WorkerState::Retired)
+                .collect::<Vec<_>>();
+            let retained = local_ide_workers
+                .iter()
+                .copied()
+                .filter(|worker| {
+                    worker.browser_client_id.as_deref() == Some(browser_client_id.as_str())
+                })
+                .collect::<Vec<_>>();
+            let assigned = retained.len();
+            let retained_fingerprints = retained
+                .iter()
+                .filter_map(|worker| worker.browser_account_fingerprint.as_deref())
+                .collect::<BTreeSet<_>>();
+            if browser_account_fingerprint.is_some()
+                && retained
+                    .iter()
+                    .any(|worker| worker.browser_account_fingerprint.is_none())
+            {
+                return Err(WorkerBrokerError::Conflict(format!(
+                    "Companion browser '{browser_client_id}' still has retained legacy Workers without proven account affinity; reuse/retire them or Clear Workers before fresh multi-account spawning"
+                )));
+            }
+            if let Some(account_fingerprint) = browser_account_fingerprint.as_deref() {
+                let account_assigned = local_ide_workers
+                    .iter()
+                    .filter(|worker| {
+                        worker.browser_account_fingerprint.as_deref() == Some(account_fingerprint)
+                    })
+                    .count();
+                let unresolved_account_workers = local_ide_workers
+                    .iter()
+                    .filter(|worker| {
+                        worker.browser_client_id.is_some()
+                            && worker.browser_account_fingerprint.is_none()
+                    })
+                    .count();
+                let conservative_account_assigned =
+                    account_assigned.saturating_add(unresolved_account_workers);
+                if conservative_account_assigned >= *browser_capacity {
+                    return Err(WorkerBrokerError::Limit(format!(
+                        "this ChatGPT Worker account already owns or may own {conservative_account_assigned}/{browser_capacity} Worker slots across paired browsers and local IDE Core families"
+                    )));
+                }
+            } else if assigned >= *browser_capacity {
                 return Err(WorkerBrokerError::Limit(format!(
-                    "Companion browser '{browser_client_id}' already owns {assigned}/{browser_capacity} Worker slots"
+                    "Companion browser '{browser_client_id}' already owns {assigned}/{browser_capacity} Worker slots across local IDE Core families"
+                )));
+            }
+            if retained_fingerprints.len() > 1 {
+                return Err(WorkerBrokerError::Conflict(format!(
+                    "Companion browser '{browser_client_id}' has retained Workers from conflicting browser-account fingerprints; retire/Clear the conflicting Workers before spawning"
+                )));
+            }
+            if let (Some(expected), Some(actual)) = (
+                retained_fingerprints.into_iter().next(),
+                browser_account_fingerprint.as_deref(),
+            ) && expected != actual
+            {
+                return Err(WorkerBrokerError::Conflict(format!(
+                    "Companion browser '{browser_client_id}' is signed into a different ChatGPT account than its retained Workers; restore that account or retire/Clear those Workers before spawning"
                 )));
             }
         }
 
+        let family = candidate.families.get_mut(&family_id).ok_or_else(|| {
+            WorkerBrokerError::Storage("worker family disappeared during mutation".into())
+        })?;
         let display_id = next_display_id(family).ok_or_else(|| {
             WorkerBrokerError::Limit(format!(
                 "worker family is limited to {MAX_WORKERS_PER_FAMILY} workers"
@@ -474,7 +576,10 @@ impl WorkerBroker {
             chat_identity: None,
             browser_client_id: browser_placement
                 .as_ref()
-                .map(|(client_id, _)| client_id.clone()),
+                .map(|(client_id, _, _)| client_id.clone()),
+            browser_account_fingerprint: browser_placement
+                .as_ref()
+                .and_then(|(_, fingerprint, _)| fingerprint.clone()),
             claim_token: Some(claim_token.clone()),
             claim_operation_id: Some(claim_operation_id.clone()),
             waiting_claim_since_ms: None,
@@ -494,7 +599,11 @@ impl WorkerBroker {
             task_id,
             display_id,
             claim_token,
-            browser_client_id: browser_placement.map(|(client_id, _)| client_id),
+            browser_client_id: browser_placement
+                .as_ref()
+                .map(|(client_id, _, _)| client_id.clone()),
+            browser_account_fingerprint: browser_placement
+                .and_then(|(_, fingerprint, _)| fingerprint),
             claim_operation_id: Some(claim_operation_id),
         };
         family
@@ -1457,12 +1566,111 @@ impl WorkerBroker {
             None => {}
         }
         let mut candidate = guard.clone();
-        let worker = candidate
+        let claimed_identity = {
+            let worker = candidate
+                .families
+                .get_mut(&family_id)
+                .and_then(|family| family.workers.get_mut(worker_id))
+                .ok_or(WorkerBrokerError::NotFound)?;
+            worker.browser_client_id = Some(browser_client_id.to_string());
+            (worker.state != WorkerState::Retired)
+                .then(|| worker.chat_identity.clone())
+                .flatten()
+        };
+        if let Some(identity) = claimed_identity.as_ref() {
+            ensure_worker_browser_account_affinity(&candidate, &family_id, worker_id, identity)?;
+        }
+        self.commit_candidate(&mut guard, candidate).await?;
+        Ok(())
+    }
+
+    pub async fn bind_worker_browser_account_fingerprint_from_confirmed_launch(
+        &self,
+        workspace_id: &WorkspaceId,
+        worker_id: &WorkerId,
+        account_fingerprint: &str,
+    ) -> Result<(), WorkerBrokerError> {
+        if account_fingerprint.len() != 64
+            || !account_fingerprint
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(WorkerBrokerError::Invalid(
+                "Worker Companion account fingerprint is invalid".into(),
+            ));
+        }
+        let account_fingerprint = account_fingerprint.to_ascii_lowercase();
+        let mut guard = self.data.lock().await;
+        let family_id = find_family_for_worker(&guard, workspace_id, worker_id)
+            .ok_or(WorkerBrokerError::NotFound)?;
+        let family = guard
+            .families
+            .get(&family_id)
+            .ok_or(WorkerBrokerError::NotFound)?;
+        if family.anchor_identity != ChatIdentity::local_core(workspace_id) {
+            return Err(WorkerBrokerError::Invalid(
+                "browser account fingerprint backfill is only valid for local IDE Workers".into(),
+            ));
+        }
+        let worker = family
+            .workers
+            .get(worker_id)
+            .ok_or(WorkerBrokerError::NotFound)?;
+        if worker.state == WorkerState::Retired {
+            return Err(WorkerBrokerError::Conflict(
+                "retired Worker account affinity cannot be changed".into(),
+            ));
+        }
+        let browser_client_id = worker.browser_client_id.clone().ok_or_else(|| {
+            WorkerBrokerError::Conflict(
+                "Worker has no proven Companion browser affinity to bind an account".into(),
+            )
+        })?;
+        match worker.browser_account_fingerprint.as_deref() {
+            Some(existing) if existing == account_fingerprint => return Ok(()),
+            Some(_) => {
+                return Err(WorkerBrokerError::Conflict(
+                    "Worker already has a different Companion account fingerprint".into(),
+                ));
+            }
+            None => {}
+        }
+
+        let conflicting = guard.families.iter().any(|(_, family)| {
+            if family.anchor_identity != ChatIdentity::local_core(&family.workspace_id) {
+                return false;
+            }
+            family.workers.iter().any(|(candidate_id, candidate)| {
+                candidate_id != worker_id
+                    && candidate.state != WorkerState::Retired
+                    && candidate.browser_client_id.as_deref() == Some(browser_client_id.as_str())
+                    && candidate
+                        .browser_account_fingerprint
+                        .as_deref()
+                        .is_some_and(|fingerprint| fingerprint != account_fingerprint)
+            })
+        });
+        if conflicting {
+            return Err(WorkerBrokerError::Conflict(format!(
+                "Companion browser '{browser_client_id}' has retained Workers from a different account; refusing legacy account-affinity backfill"
+            )));
+        }
+
+        let mut candidate = guard.clone();
+        let family = candidate
             .families
             .get_mut(&family_id)
-            .and_then(|family| family.workers.get_mut(worker_id))
             .ok_or(WorkerBrokerError::NotFound)?;
-        worker.browser_client_id = Some(browser_client_id.to_string());
+        let worker = family
+            .workers
+            .get_mut(worker_id)
+            .ok_or(WorkerBrokerError::NotFound)?;
+        worker.browser_account_fingerprint = Some(account_fingerprint.clone());
+        for receipt in family.spawn_requests.values_mut() {
+            if &receipt.worker_id == worker_id {
+                receipt.browser_account_fingerprint = Some(account_fingerprint.clone());
+            }
+        }
         self.commit_candidate(&mut guard, candidate).await?;
         Ok(())
     }
@@ -2081,7 +2289,7 @@ impl WorkerBroker {
                 "worker has already been claimed by another ChatGPT conversation".into(),
             ));
         }
-        ensure_worker_family_account_affinity(family, worker_id, worker_identity)?;
+        ensure_worker_browser_account_affinity(&guard, &family_id, worker_id, worker_identity)?;
         let Some(expected_operation_id) = worker.claim_operation_id.as_ref() else {
             return Err(WorkerBrokerError::Conflict(
                 "worker claim predates browser-attested admission; leave this stale worker untouched and create a fresh worker"
@@ -2172,7 +2380,7 @@ impl WorkerBroker {
                 "worker has already been claimed by another ChatGPT conversation".into(),
             ));
         }
-        ensure_worker_family_account_affinity(family, worker_id, worker_identity)?;
+        ensure_worker_browser_account_affinity(&guard, &family_id, worker_id, worker_identity)?;
         match worker.launch_state {
             WorkerLaunchState::WaitingClaim => {}
             WorkerLaunchState::Unknown
@@ -2272,7 +2480,7 @@ impl WorkerBroker {
                 "worker has already been claimed by another ChatGPT conversation".into(),
             ));
         }
-        ensure_worker_family_account_affinity(family, worker_id, &worker_identity)?;
+        ensure_worker_browser_account_affinity(&guard, &family_id, worker_id, &worker_identity)?;
         if worker.launch_state != WorkerLaunchState::WaitingClaim
             || worker
                 .conversation_url
@@ -2901,36 +3109,64 @@ fn ensure_worker_identity_unique_binding(
     Ok(())
 }
 
-fn ensure_worker_family_account_affinity(
-    family: &WorkerFamily,
+fn ensure_worker_browser_account_affinity(
+    data: &WorkerStoreData,
+    current_family_id: &WorkerFamilyId,
     claiming_worker_id: &WorkerId,
     worker_identity: &ChatIdentity,
 ) -> Result<(), WorkerBrokerError> {
+    let family = data
+        .families
+        .get(current_family_id)
+        .ok_or(WorkerBrokerError::NotFound)?;
     let claiming_browser = family
         .workers
         .get(claiming_worker_id)
-        .and_then(|worker| worker.browser_client_id.as_deref());
-    let subjects = family
-        .workers
-        .iter()
-        .filter(|(worker_id, _)| *worker_id != claiming_worker_id)
-        .filter(|(_, worker)| worker.state != WorkerState::Retired)
-        .filter(|(_, worker)| match claiming_browser {
-            Some(browser_client_id) => {
-                worker.browser_client_id.as_deref() == Some(browser_client_id)
-            }
-            None => worker.browser_client_id.is_none(),
-        })
-        .filter_map(|(_, worker)| {
-            worker
-                .chat_identity
-                .as_ref()
-                .and_then(|identity| identity.subject_digest.as_deref())
-        })
-        .collect::<BTreeSet<_>>();
+        .ok_or(WorkerBrokerError::NotFound)?
+        .browser_client_id
+        .as_deref();
+
+    let subjects = match claiming_browser {
+        Some(browser_client_id) => data
+            .families
+            .iter()
+            .flat_map(|(family_id, family)| {
+                family
+                    .workers
+                    .iter()
+                    .filter_map(move |(worker_id, worker)| {
+                        if worker.state == WorkerState::Retired
+                            || (family_id == current_family_id && worker_id == claiming_worker_id)
+                            || worker.browser_client_id.as_deref() != Some(browser_client_id)
+                        {
+                            return None;
+                        }
+                        worker
+                            .chat_identity
+                            .as_ref()
+                            .and_then(|identity| identity.subject_digest.as_deref())
+                    })
+            })
+            .collect::<BTreeSet<_>>(),
+        None => family
+            .workers
+            .iter()
+            .filter(|(worker_id, worker)| {
+                *worker_id != claiming_worker_id
+                    && worker.state != WorkerState::Retired
+                    && worker.browser_client_id.is_none()
+            })
+            .filter_map(|(_, worker)| {
+                worker
+                    .chat_identity
+                    .as_ref()
+                    .and_then(|identity| identity.subject_digest.as_deref())
+            })
+            .collect::<BTreeSet<_>>(),
+    };
     if subjects.len() > 1 {
         return Err(WorkerBrokerError::Conflict(
-            "this Worker browser already contains claimed Workers from multiple ChatGPT accounts; Clear Workers before admitting another Worker on that browser"
+            "this Companion browser already contains retained Workers from multiple ChatGPT accounts; Clear or retire conflicting Workers before admitting another Worker on that browser"
                 .into(),
         ));
     }
@@ -2940,11 +3176,11 @@ fn ensure_worker_family_account_affinity(
     match worker_identity.subject_digest.as_deref() {
         Some(actual_subject) if actual_subject == expected_subject => Ok(()),
         Some(_) => Err(WorkerBrokerError::Conflict(
-            "worker claim came from a different ChatGPT account than this Worker's Companion browser. Restore that browser's fixed Worker account or Clear Workers before changing accounts"
+            "worker claim came from a different ChatGPT account than this Worker's Companion browser. Restore that browser's retained Worker account or retire/Clear those Workers before changing accounts"
                 .into(),
         )),
         None => Err(WorkerBrokerError::Conflict(
-            "worker claim could not verify the fixed Worker browser account because OpenAI subject metadata is missing; retry from the existing Worker account"
+            "worker claim could not verify the Companion browser account because OpenAI subject metadata is missing; retry from the existing Worker account"
                 .into(),
         )),
     }
@@ -3445,6 +3681,7 @@ mod tests {
             collected: result_collected,
         };
         let worker = WorkerRecord {
+            browser_account_fingerprint: None,
             id: worker_id.clone(),
             display_id: "worker-1".into(),
             label: "inactive".into(),
@@ -5058,6 +5295,332 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn confirmed_launch_backfills_legacy_worker_account_fingerprint() {
+        let root = temp_root("moondesk-legacy-worker-account-backfill");
+        let path = root.join("worker-state-v1.json");
+        let broker = WorkerBroker::open(&path).expect("open worker broker");
+        let workspace = WorkspaceId::new();
+        let core = ChatIdentity::local_core(&workspace);
+        let spawned = broker
+            .spawn_worker_on_browser(
+                spawn_request(
+                    OperationId::new(),
+                    workspace.clone(),
+                    core.clone(),
+                    "legacy account backfill",
+                ),
+                "edge-client",
+                3,
+            )
+            .await
+            .expect("spawn legacy browser-pinned worker");
+        assert_eq!(spawned.browser_account_fingerprint, None);
+
+        let fingerprint = "a".repeat(64);
+        broker
+            .bind_worker_browser_account_fingerprint_from_confirmed_launch(
+                &workspace,
+                &spawned.worker_id,
+                &fingerprint,
+            )
+            .await
+            .expect("backfill confirmed account fingerprint");
+        broker
+            .bind_worker_browser_account_fingerprint_from_confirmed_launch(
+                &workspace,
+                &spawned.worker_id,
+                &fingerprint,
+            )
+            .await
+            .expect("same backfill is idempotent");
+
+        let family = broker
+            .family_for_anchor(&workspace, &core)
+            .await
+            .expect("read family")
+            .expect("family exists");
+        assert_eq!(
+            family
+                .workers
+                .get(&spawned.worker_id)
+                .and_then(|worker| worker.browser_account_fingerprint.as_deref()),
+            Some(fingerprint.as_str())
+        );
+        assert!(family.spawn_requests.values().any(|receipt| {
+            receipt.worker_id == spawned.worker_id
+                && receipt.browser_account_fingerprint.as_deref() == Some(fingerprint.as_str())
+        }));
+
+        let conflict = broker
+            .bind_worker_browser_account_fingerprint_from_confirmed_launch(
+                &workspace,
+                &spawned.worker_id,
+                &"b".repeat(64),
+            )
+            .await
+            .expect_err("confirmed fingerprint cannot later change");
+        assert!(
+            conflict
+                .to_string()
+                .contains("different Companion account fingerprint")
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn companion_browser_capacity_is_global_across_local_core_families() {
+        let root = temp_root("moondesk-global-browser-capacity");
+        let path = root.join("worker-state-v1.json");
+        let broker = WorkerBroker::open(&path).expect("open worker broker");
+        let workspace_a = WorkspaceId::new();
+        let workspace_b = WorkspaceId::new();
+        let core_a = ChatIdentity::local_core(&workspace_a);
+        let core_b = ChatIdentity::local_core(&workspace_b);
+
+        let first = broker
+            .spawn_worker_on_browser(
+                spawn_request(
+                    OperationId::new(),
+                    workspace_a.clone(),
+                    core_a.clone(),
+                    "family A slot 1",
+                ),
+                "edge-client",
+                3,
+            )
+            .await
+            .expect("spawn first global Edge slot");
+        broker
+            .spawn_worker_on_browser(
+                spawn_request(
+                    OperationId::new(),
+                    workspace_a.clone(),
+                    core_a.clone(),
+                    "family A slot 2",
+                ),
+                "edge-client",
+                3,
+            )
+            .await
+            .expect("spawn second global Edge slot");
+        broker
+            .spawn_worker_on_browser(
+                spawn_request(
+                    OperationId::new(),
+                    workspace_b.clone(),
+                    core_b.clone(),
+                    "family B slot 1",
+                ),
+                "edge-client",
+                3,
+            )
+            .await
+            .expect("spawn third global Edge slot");
+
+        let full = broker
+            .spawn_worker_on_browser(
+                spawn_request(
+                    OperationId::new(),
+                    workspace_b.clone(),
+                    core_b.clone(),
+                    "family B overflow",
+                ),
+                "edge-client",
+                3,
+            )
+            .await
+            .expect_err("a second local Core must not bypass the browser/account capacity");
+        assert!(
+            full.to_string()
+                .contains("3/3 Worker slots across local IDE Core families")
+        );
+
+        broker
+            .retire_worker(
+                &workspace_a,
+                &core_a,
+                &first.worker_id,
+                Some(&first.task_id),
+            )
+            .await
+            .expect("retire one global browser slot");
+        broker
+            .spawn_worker_on_browser(
+                spawn_request(
+                    OperationId::new(),
+                    workspace_b,
+                    core_b,
+                    "family B replacement",
+                ),
+                "edge-client",
+                3,
+            )
+            .await
+            .expect("retirement should free the global browser slot");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn chatgpt_account_capacity_is_shared_across_companion_browsers() {
+        let root = temp_root("moondesk-worker-account-capacity-across-browsers");
+        let path = root.join("worker-state-v1.json");
+        let broker = WorkerBroker::open(&path).expect("open worker broker");
+        let workspace = WorkspaceId::new();
+        let core = ChatIdentity::local_core(&workspace);
+        let account = "a".repeat(64);
+
+        for (browser, label) in [
+            ("edge-client", "Edge slot 1"),
+            ("edge-client", "Edge slot 2"),
+            ("chrome-client", "Chrome same-account slot 3"),
+        ] {
+            broker
+                .spawn_worker_on_browser_account(
+                    spawn_request(OperationId::new(), workspace.clone(), core.clone(), label),
+                    browser,
+                    &account,
+                    3,
+                )
+                .await
+                .expect("shared account slot should fit");
+        }
+
+        let overflow = broker
+            .spawn_worker_on_browser_account(
+                spawn_request(
+                    OperationId::new(),
+                    workspace.clone(),
+                    core.clone(),
+                    "Chrome same-account overflow",
+                ),
+                "chrome-client",
+                &account,
+                3,
+            )
+            .await
+            .expect_err(
+                "a second browser on the same account must not create extra account capacity",
+            );
+        assert!(overflow.to_string().contains("3/3 Worker slots"));
+
+        broker
+            .spawn_worker_on_browser_account(
+                spawn_request(
+                    OperationId::new(),
+                    workspace,
+                    core,
+                    "Chrome different-account slot",
+                ),
+                "chrome-client",
+                &"b".repeat(64),
+                3,
+            )
+            .await
+            .expect_err(
+                "one Companion browser cannot switch account while retained Workers pin it",
+            );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn companion_browser_account_affinity_is_global_across_families() {
+        let root = temp_root("moondesk-global-browser-account-affinity");
+        let path = root.join("worker-state-v1.json");
+        let broker = WorkerBroker::open(&path).expect("open worker broker");
+        let workspace_a = WorkspaceId::new();
+        let workspace_b = WorkspaceId::new();
+        let core_a = ChatIdentity::local_core(&workspace_a);
+        let core_b = ChatIdentity::local_core(&workspace_b);
+
+        let edge_a = broker
+            .spawn_worker_on_browser(
+                spawn_request(
+                    OperationId::new(),
+                    workspace_a.clone(),
+                    core_a.clone(),
+                    "Edge account A in family A",
+                ),
+                "edge-client",
+                3,
+            )
+            .await
+            .expect("spawn family A Edge worker");
+        make_claimable(&broker, &workspace_a, &core_a, &edge_a).await;
+        broker
+            .claim_worker(
+                &workspace_a,
+                &edge_a.worker_id,
+                &edge_a.task_id,
+                &edge_a.claim_token,
+                ChatIdentity::from_openai_meta(Some("account-a"), "family-a-edge-worker"),
+            )
+            .await
+            .expect("establish Edge account A globally");
+
+        let edge_b = broker
+            .spawn_worker_on_browser(
+                spawn_request(
+                    OperationId::new(),
+                    workspace_b.clone(),
+                    core_b.clone(),
+                    "Edge account switch attempt in family B",
+                ),
+                "edge-client",
+                3,
+            )
+            .await
+            .expect("reserve family B Edge slot");
+        make_claimable(&broker, &workspace_b, &core_b, &edge_b).await;
+        let switched = broker
+            .claim_worker(
+                &workspace_b,
+                &edge_b.worker_id,
+                &edge_b.task_id,
+                &edge_b.claim_token,
+                ChatIdentity::from_openai_meta(Some("account-b"), "family-b-edge-worker"),
+            )
+            .await
+            .expect_err("same Companion browser cannot switch accounts in another family");
+        assert!(switched.to_string().contains("different ChatGPT account"));
+        broker
+            .claim_worker(
+                &workspace_b,
+                &edge_b.worker_id,
+                &edge_b.task_id,
+                &edge_b.claim_token,
+                ChatIdentity::from_openai_meta(Some("account-a"), "family-b-edge-worker-a"),
+            )
+            .await
+            .expect("same account is valid across families on the same browser");
+
+        let chrome_b = broker
+            .spawn_worker_on_browser(
+                spawn_request(
+                    OperationId::new(),
+                    workspace_b.clone(),
+                    core_b.clone(),
+                    "Chrome account B in family B",
+                ),
+                "chrome-client",
+                3,
+            )
+            .await
+            .expect("spawn family B Chrome worker");
+        make_claimable(&broker, &workspace_b, &core_b, &chrome_b).await;
+        broker
+            .claim_worker(
+                &workspace_b,
+                &chrome_b.worker_id,
+                &chrome_b.task_id,
+                &chrome_b.claim_token,
+                ChatIdentity::from_openai_meta(Some("account-b"), "family-b-chrome-worker"),
+            )
+            .await
+            .expect("different Companion browser may use account B");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn retired_worker_no_longer_pins_companion_browser_account() {
         let root = temp_root("moondesk-retired-worker-browser-account-release");
         let path = root.join("worker-state-v1.json");
@@ -6199,6 +6762,7 @@ mod tests {
             family.spawn_requests.insert(
                 OperationId::new(),
                 SpawnReceipt {
+                    browser_account_fingerprint: None,
                     request_fingerprint: "a".repeat(64),
                     sequence,
                     family_id: family.id.clone(),

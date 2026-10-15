@@ -4650,7 +4650,7 @@ async fn run_settings(
                                     app.worker_target_count + 1
                                 };
                             let count = app.worker_target_count;
-                            app.log("INFO", format!("Worker target count: {count}"));
+                            app.log("INFO", format!("Worker slots per ChatGPT account: {count}"));
                             app.mark_config_dirty();
                         } else if selected_row == settings_action_start + 3 {
                             let installation_token =
@@ -5239,7 +5239,7 @@ fn draw_settings(f: &mut Frame, view: SettingsView<'_>) {
     }
     lines.push(Line::from(Span::styled(
         format!(
-            " {} [{}] Worker target / IDE slots per browser: {} (family max {})",
+            " {} [{}] Worker slots per ChatGPT account: {} (family max {})",
             if worker_count_selected { ">" } else { " " },
             worker_count_row + 1,
             worker_target_count,
@@ -11350,7 +11350,7 @@ mod tests {
         assert!(rendered.contains("Workers (experimental)"));
         assert!(rendered.contains("Default model: GPT-5.6 Sol"));
         assert!(rendered.contains("Reasoning effort: High"));
-        assert!(rendered.contains("Worker target / IDE slots per browser: 4 (family max 8)"));
+        assert!(rendered.contains("Worker slots per ChatGPT account: 4 (family max 8)"));
         assert!(rendered.contains("Local IDE: this is a per-online-browser cap"));
         assert!(rendered.contains("Aggregate local-IDE capacity grows"));
         assert!(rendered.contains("Companion stays optional for normal MoonDesk"));

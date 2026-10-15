@@ -66,7 +66,7 @@ pub const COMPANION_USER_BROWSER_ROUTE: &str = "/__moondesk/companion/v1/browser
 pub const COMPANION_TOKEN_HEADER: &str = "x-moondesk-companion-token";
 // Bump with any shipped companion runtime change that requires Chromium to load new bytes. Keep
 // this aligned with COMPANION_RUNTIME_REVISION in background.js.
-pub const COMPANION_RUNTIME_REVISION: u32 = 24;
+pub const COMPANION_RUNTIME_REVISION: u32 = 25;
 const MAX_COMPANION_BODY_BYTES: usize = 16 * 1024;
 const MAX_COMPANION_USER_BROWSER_BODY_BYTES: usize = 2 * 1024 * 1024;
 
@@ -3360,6 +3360,7 @@ mod tests {
             host_control_token: Arc::from("unused-host-token"),
         };
         let legacy_command = ManagedChatCommand {
+            target_account_fingerprint: None,
             id: ManagedChatCommandId::parse(&command_id).expect("command id"),
             sequence: 0,
             dedupe_key: format!("worker:{}:task:{}", spawned.worker_id, spawned.task_id),
@@ -3511,6 +3512,7 @@ mod tests {
             State(server_state.clone()),
             headers.clone(),
             Json(CompanionPresenceUpdate {
+                account_fingerprint: None,
                 browser_label: Some("Chrome".into()),
                 tabs: vec![crate::companion::CompanionTabPresence {
                     conversation_id: worker_conversation.into(),
@@ -3530,6 +3532,7 @@ mod tests {
             State(server_state.clone()),
             headers.clone(),
             Json(CompanionPresenceUpdate {
+                account_fingerprint: None,
                 browser_label: Some("Chrome".into()),
                 tabs: Vec::new(),
             }),
@@ -3556,6 +3559,7 @@ mod tests {
             State(server_state),
             headers,
             Json(CompanionPresenceUpdate {
+                account_fingerprint: None,
                 browser_label: Some("Chrome".into()),
                 tabs: vec![crate::companion::CompanionTabPresence {
                     conversation_id: worker_conversation.into(),

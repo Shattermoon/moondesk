@@ -577,7 +577,7 @@ impl ManagedChatBroker {
         &self,
         request: EnqueueManagedChatRequest,
     ) -> Result<ManagedChatCommand, ManagedChatError> {
-        self.enqueue_with_route_dispatch(request, None, None, true)
+        self.enqueue_with_route_dispatch(request, None, None, None, true)
             .await
     }
 
@@ -591,12 +591,14 @@ impl ManagedChatBroker {
         self.enqueue_with_route_dispatch(
             request,
             requested_client_id,
+            None,
             requested_anchor_context,
             true,
         )
         .await
     }
 
+    #[cfg(test)]
     pub async fn enqueue_held_with_route(
         &self,
         request: EnqueueManagedChatRequest,
@@ -606,6 +608,24 @@ impl ManagedChatBroker {
         self.enqueue_with_route_dispatch(
             request,
             requested_client_id,
+            None,
+            requested_anchor_context,
+            false,
+        )
+        .await
+    }
+
+    pub async fn enqueue_held_with_route_and_account(
+        &self,
+        request: EnqueueManagedChatRequest,
+        requested_client_id: Option<String>,
+        requested_account_fingerprint: Option<String>,
+        requested_anchor_context: Option<ManagedChatAnchorContext>,
+    ) -> Result<ManagedChatCommand, ManagedChatError> {
+        self.enqueue_with_route_dispatch(
+            request,
+            requested_client_id,
+            requested_account_fingerprint,
             requested_anchor_context,
             false,
         )
@@ -616,6 +636,7 @@ impl ManagedChatBroker {
         &self,
         request: EnqueueManagedChatRequest,
         requested_client_id: Option<String>,
+        requested_account_fingerprint: Option<String>,
         requested_anchor_context: Option<ManagedChatAnchorContext>,
         dispatch_ready: bool,
     ) -> Result<ManagedChatCommand, ManagedChatError> {
@@ -626,6 +647,16 @@ impl ManagedChatBroker {
         {
             return Err(ManagedChatError::Invalid(
                 "managed chat requested client id is invalid".into(),
+            ));
+        }
+        if requested_account_fingerprint
+            .as_deref()
+            .is_some_and(|fingerprint| {
+                fingerprint.len() != 64 || !fingerprint.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+        {
+            return Err(ManagedChatError::Invalid(
+                "managed chat requested account fingerprint is invalid".into(),
             ));
         }
         if let Some(anchor_context) = requested_anchor_context.as_ref() {
@@ -675,9 +706,14 @@ impl ManagedChatBroker {
             };
         let prior_target_client_id =
             prior_thread_command.and_then(|command| command.target_client_id.clone());
+        let prior_target_account_fingerprint =
+            prior_thread_command.and_then(|command| command.target_account_fingerprint.clone());
         let target_client_pinned_by_request =
             prior_target_client_id.is_some() || requested_client_id.is_some();
         let target_client_id = prior_target_client_id.or(requested_client_id);
+        let target_account_fingerprint = prior_target_account_fingerprint
+            .or(requested_account_fingerprint)
+            .map(|fingerprint| fingerprint.to_ascii_lowercase());
         let anchor_context = prior_thread_command
             .and_then(|command| command.anchor_context.clone())
             .or(requested_anchor_context);
@@ -693,6 +729,7 @@ impl ManagedChatBroker {
             lease: None,
             terminal: None,
             target_client_id,
+            target_account_fingerprint,
             target_client_pinned_by_request,
             anchor_context,
         };
@@ -2447,6 +2484,7 @@ mod tests {
             let mut historical_launch = launch(&format!("terminal-{sequence}"));
             historical_launch.thread_key = None;
             let command = ManagedChatCommand {
+                target_account_fingerprint: None,
                 id: command_id.clone(),
                 sequence,
                 dedupe_key: dedupe_key.clone(),
@@ -2499,6 +2537,7 @@ mod tests {
             historical_launch.thread_key = Some(format!("worker:thread-{sequence}"));
             let conversation_url = format!("https://chatgpt.com/c/{command_id}");
             let command = ManagedChatCommand {
+                target_account_fingerprint: None,
                 id: command_id.clone(),
                 sequence,
                 dedupe_key: dedupe_key.clone(),
@@ -2555,6 +2594,7 @@ mod tests {
             large_launch.opening_message = large_opening.clone();
             large_launch.thread_key = Some(format!("worker:large-capacity-{sequence}"));
             let command = ManagedChatCommand {
+                target_account_fingerprint: None,
                 id: command_id.clone(),
                 sequence,
                 dedupe_key: dedupe_key.clone(),

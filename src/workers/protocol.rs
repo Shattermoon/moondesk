@@ -162,6 +162,9 @@ pub struct WorkerLaunchContext<'a> {
     /// Explicit Companion installation used when Core itself has no browser tab (Work/Codex/IDE).
     /// Browser-based Core calls leave this unset and keep using the exact anchor route above.
     pub browserless_client_id: Option<&'a str>,
+    /// One-way ChatGPT account fingerprint currently observed by that Companion browser. New local
+    /// IDE Worker spawns require it so account drift is rejected before any assignment is sent.
+    pub browserless_account_fingerprint: Option<&'a str>,
     /// Trusted host-injected local IDE Core. This mode must not silently create a second editor
     /// alongside a still-active legacy/browser Core family in the same workspace.
     pub local_ide_core: bool,
@@ -216,7 +219,7 @@ async fn maybe_pause_after_worker_persist(operation_id: &OperationId) {
 #[cfg(not(test))]
 async fn maybe_pause_after_worker_persist(_operation_id: &OperationId) {}
 
-async fn recover_incomplete_launch_transactions(
+pub(crate) async fn recover_incomplete_launch_transactions(
     workspace_id: &WorkspaceId,
     worker_broker: &WorkerBroker,
     managed_chat_broker: &ManagedChatBroker,
@@ -496,9 +499,27 @@ pub async fn handle(
                 let browser_client_id = launch_context.browserless_client_id.ok_or_else(|| {
                     "local IDE Worker spawn is missing its selected Companion browser".to_string()
                 })?;
-                broker
-                    .spawn_worker_on_browser(spawn_request, browser_client_id, worker_target_count)
-                    .await
+                match launch_context.browserless_account_fingerprint {
+                    Some(account_fingerprint) => {
+                        broker
+                            .spawn_worker_on_browser_account(
+                                spawn_request,
+                                browser_client_id,
+                                account_fingerprint,
+                                worker_target_count,
+                            )
+                            .await
+                    }
+                    None => {
+                        broker
+                            .spawn_worker_on_browser(
+                                spawn_request,
+                                browser_client_id,
+                                worker_target_count,
+                            )
+                            .await
+                    }
+                }
             } else {
                 broker.spawn_worker(spawn_request).await
             }
@@ -537,7 +558,7 @@ pub async fn handle(
             let dedupe_key = format!("worker:{}:task:{}", receipt.worker_id, receipt.task_id);
             let launch = match launch_context
                 .managed_chat_broker
-                .enqueue_held_with_route(
+                .enqueue_held_with_route_and_account(
                     EnqueueManagedChatRequest {
                         dedupe_key: dedupe_key.clone(),
                         launch: ManagedChatLaunch {
@@ -553,6 +574,7 @@ pub async fn handle(
                         },
                     },
                     target_client_id,
+                    receipt.browser_account_fingerprint.clone(),
                     anchor_context,
                 )
                 .await
@@ -713,7 +735,7 @@ pub async fn handle(
             let dedupe_key = format!("worker:{}:task:{}", receipt.worker_id, receipt.task_id);
             let launch = match launch_context
                 .managed_chat_broker
-                .enqueue_held_with_route(
+                .enqueue_held_with_route_and_account(
                     EnqueueManagedChatRequest {
                         dedupe_key: dedupe_key.clone(),
                         launch: ManagedChatLaunch {
@@ -729,6 +751,9 @@ pub async fn handle(
                         },
                     },
                     Some(target_client_id),
+                    launch_context
+                        .browserless_account_fingerprint
+                        .map(str::to_owned),
                     anchor_context,
                 )
                 .await
@@ -1047,6 +1072,27 @@ pub async fn handle(
                     .managed_chat_broker
                     .confirm_worker_started_by_dedupe(&dedupe_key, conversation_url)
                     .await;
+                if worker.browser_account_fingerprint.is_none() {
+                    let managed = launch_context.managed_chat_broker.snapshot().await;
+                    if let Some(command) = managed.commands.values().find(|command| {
+                        command.dedupe_key == dedupe_key
+                            && command.state == ManagedChatCommandState::Succeeded
+                    }) && let (Some(client_id), Some(account_fingerprint)) = (
+                        command.target_client_id.as_deref(),
+                        command.target_account_fingerprint.as_deref(),
+                    ) && worker.browser_client_id.as_deref() == Some(client_id)
+                    {
+                        // Successful exact-thread Send + workers start proves the legacy Worker's
+                        // current Companion account. Backfill best-effort; task start already committed.
+                        let _ = broker
+                            .bind_worker_browser_account_fingerprint_from_confirmed_launch(
+                                workspace_id,
+                                &worker_id,
+                                account_fingerprint,
+                            )
+                            .await;
+                    }
+                }
             }
             // Observability must never turn an already-committed task start into an apparent failure.
             let _ = broker
@@ -1866,6 +1912,7 @@ mod tests {
                     &ChatExecutionProfile::default(),
                     worker.as_ref(),
                     WorkerLaunchContext {
+                        browserless_account_fingerprint: None,
                         managed_chat_broker: managed.as_ref(),
                         anchor_route: None,
                         browserless_client_id: None,
@@ -1886,6 +1933,7 @@ mod tests {
             &ChatExecutionProfile::default(),
             worker.as_ref(),
             WorkerLaunchContext {
+                browserless_account_fingerprint: None,
                 managed_chat_broker: managed.as_ref(),
                 anchor_route: None,
                 browserless_client_id: None,
@@ -1916,6 +1964,7 @@ mod tests {
                     &ChatExecutionProfile::default(),
                     worker.as_ref(),
                     WorkerLaunchContext {
+                        browserless_account_fingerprint: None,
                         managed_chat_broker: managed.as_ref(),
                         anchor_route: None,
                         browserless_client_id: None,
@@ -1953,6 +2002,137 @@ mod tests {
                 .commands
                 .values()
                 .all(|command| command.dispatch_ready)
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn worker_start_backfills_legacy_account_from_confirmed_managed_launch() {
+        let root = temp_root("moondesk-worker-start-account-backfill");
+        let worker_path = root.join("worker-state-v1.json");
+        let managed_path = root.join("managed-chat-state-v1.json");
+        let workspace = WorkspaceId::new();
+        let anchor = ChatIdentity::local_core(&workspace);
+        let worker_identity = identity("legacy-account-backfill-worker");
+        let worker = WorkerBroker::open(&worker_path).expect("open worker broker");
+        let managed = ManagedChatBroker::open(&managed_path).expect("open managed broker");
+        let receipt = worker
+            .spawn_worker_on_browser(
+                spawn_request(OperationId::new(), workspace.clone(), anchor.clone()),
+                "edge-client",
+                3,
+            )
+            .await
+            .expect("spawn legacy browser-pinned Worker");
+        assert_eq!(receipt.browser_account_fingerprint, None);
+
+        let fingerprint = "a".repeat(64);
+        let command = managed
+            .enqueue_held_with_route_and_account(
+                launch_for(workspace.clone(), &receipt.worker_id, &receipt.task_id),
+                Some("edge-client".into()),
+                Some(fingerprint.clone()),
+                None,
+            )
+            .await
+            .expect("persist account-bound managed launch");
+        worker
+            .link_launch_command(
+                &workspace,
+                &anchor,
+                &receipt.worker_id,
+                &receipt.task_id,
+                &command.id.to_string(),
+            )
+            .await
+            .expect("link managed launch");
+        managed
+            .activate_dispatch(&command.id)
+            .await
+            .expect("activate managed launch");
+        let offer = managed
+            .redeem("edge-client", 1)
+            .await
+            .expect("redeem managed launch")
+            .expect("managed launch offer");
+        let lease_id = offer
+            .command
+            .lease
+            .as_ref()
+            .expect("managed launch lease")
+            .lease_id
+            .clone();
+        managed
+            .mark_send_started(&command.id, &lease_id, "edge-client")
+            .await
+            .expect("cross managed Send boundary");
+        let conversation_url = format!("https://chatgpt.com/c/{}", Uuid::new_v4());
+        managed
+            .acknowledge(
+                &command.id,
+                &lease_id,
+                "edge-client",
+                ManagedChatAckOutcome::Succeeded {
+                    details: Some("legacy Worker Send accepted".into()),
+                    conversation_url: Some(conversation_url.clone()),
+                },
+            )
+            .await
+            .expect("confirm exact managed launch");
+        worker
+            .update_launch_by_command(
+                &command.id.to_string(),
+                WorkerLaunchState::WaitingClaim,
+                None,
+                Some(conversation_url),
+            )
+            .await
+            .expect("make Worker claimable");
+        worker
+            .claim_worker(
+                &workspace,
+                &receipt.worker_id,
+                &receipt.task_id,
+                &receipt.claim_token,
+                worker_identity.clone(),
+            )
+            .await
+            .expect("claim legacy Worker");
+
+        handle(
+            &json!({
+                "action": "start",
+                "worker_id": receipt.worker_id.to_string(),
+                "task_id": receipt.task_id.to_string()
+            }),
+            &workspace,
+            "account-backfill",
+            &worker_identity,
+            &ChatExecutionProfile::default(),
+            &worker,
+            WorkerLaunchContext {
+                managed_chat_broker: &managed,
+                anchor_route: None,
+                browserless_client_id: None,
+                browserless_account_fingerprint: None,
+                local_ide_core: false,
+                worker_target_count: 3,
+            },
+        )
+        .await
+        .expect("start legacy Worker");
+
+        let family = worker
+            .family_for_anchor(&workspace, &anchor)
+            .await
+            .expect("read family")
+            .expect("family exists");
+        assert_eq!(
+            family
+                .workers
+                .get(&receipt.worker_id)
+                .and_then(|record| record.browser_account_fingerprint.as_deref()),
+            Some(fingerprint.as_str())
         );
         let _ = std::fs::remove_dir_all(root);
     }
@@ -2049,6 +2229,7 @@ mod tests {
                     &ChatExecutionProfile::default(),
                     worker.as_ref(),
                     WorkerLaunchContext {
+                        browserless_account_fingerprint: None,
                         managed_chat_broker: managed.as_ref(),
                         anchor_route: Some(&route),
                         browserless_client_id: None,
@@ -2091,6 +2272,7 @@ mod tests {
             &ChatExecutionProfile::default(),
             worker.as_ref(),
             WorkerLaunchContext {
+                browserless_account_fingerprint: None,
                 managed_chat_broker: managed.as_ref(),
                 anchor_route: None,
                 browserless_client_id: None,
@@ -2160,6 +2342,7 @@ mod tests {
             &ChatExecutionProfile::default(),
             &worker,
             WorkerLaunchContext {
+                browserless_account_fingerprint: None,
                 managed_chat_broker: &managed,
                 anchor_route: None,
                 browserless_client_id: None,

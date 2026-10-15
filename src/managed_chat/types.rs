@@ -364,6 +364,8 @@ pub struct ManagedChatCommand {
     pub terminal: Option<ManagedChatTerminalResult>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_client_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_account_fingerprint: Option<String>,
     #[serde(default)]
     pub target_client_pinned_by_request: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -446,6 +448,16 @@ impl ManagedChatStoreData {
                 .is_some_and(|client_id| client_id.trim().is_empty() || client_id.len() > 128)
             {
                 return Err("managed chat target client id is invalid".into());
+            }
+            if command
+                .target_account_fingerprint
+                .as_deref()
+                .is_some_and(|fingerprint| {
+                    fingerprint.len() != 64
+                        || !fingerprint.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
+            {
+                return Err("managed chat target account fingerprint is invalid".into());
             }
             if let Some(anchor_context) = command.anchor_context.as_ref() {
                 anchor_context.validate()?;

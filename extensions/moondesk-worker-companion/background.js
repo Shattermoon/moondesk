@@ -8,7 +8,7 @@ const BRIDGE_PORTS = [47650, 47651, 47652, 47653, 47654];
 const REQUIRED_PROTOCOL_VERSION = 2;
 // Bump with any shipped companion runtime change that requires Chromium to load new bytes. Keep
 // this aligned with COMPANION_RUNTIME_REVISION in src/server.rs.
-const COMPANION_RUNTIME_REVISION = 24;
+const COMPANION_RUNTIME_REVISION = 25;
 const SOURCE_DEV_MANIFEST_VERSION = '0.1.0';
 const RUNTIME_RELOAD_STORAGE_KEY = 'moondeskWorkerCompanionReloadRevisionV1';
 const INSTALLATION_BOOTSTRAP_FILE = 'moondesk-bootstrap.json';
@@ -28,6 +28,7 @@ const HELLO_TIMEOUT_MS = 1200;
 const API_TIMEOUT_MS = 3000;
 const CLEAR_WORKERS_TIMEOUT_MS = 8000;
 const FAST_POLL_MS = 1500;
+const PRESENCE_ACCOUNT_FINGERPRINT_MAX_AGE_MS = 30_000;
 const MAX_RECONCILE_ATTEMPTS = 3;
 const MAX_PARALLEL_COMMANDS = 4;
 const CHATGPT_MODEL_EFFORTS = new Set(['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra', 'pro']);
@@ -48,6 +49,8 @@ let workerSendCommitInFlight = 0;
 let userBrowserControl = null;
 let userBrowserTransportState = null;
 let userBrowserCommandFlight = null;
+let presenceAccountFingerprint = null;
+let presenceAccountFingerprintAt = 0;
 const sessionReconcileCommandIds = new Set();
 
 function freshState() {
@@ -764,7 +767,34 @@ function chatContextFromUrl(value) {
   }
 }
 
-async function collectPresence(state) {
+async function accountFingerprintForPresence(tabs, forceRefresh = false) {
+  const now = Date.now();
+  if (
+    !forceRefresh &&
+    validAccountFingerprint(presenceAccountFingerprint) &&
+    now - presenceAccountFingerprintAt <= PRESENCE_ACCOUNT_FINGERPRINT_MAX_AGE_MS
+  ) {
+    return presenceAccountFingerprint;
+  }
+  const fingerprintTab = tabs.find(
+    (tab) => Number.isInteger(tab?.id) && !tab.incognito && !tab.discarded && tab.status !== 'loading'
+  );
+  const fingerprint = Number.isInteger(fingerprintTab?.id)
+    ? await chatGptAccountFingerprintForTab(fingerprintTab.id)
+    : null;
+  if (fingerprint) {
+    presenceAccountFingerprint = fingerprint;
+    presenceAccountFingerprintAt = now;
+    return fingerprint;
+  }
+  if (forceRefresh) {
+    presenceAccountFingerprint = null;
+    presenceAccountFingerprintAt = now;
+  }
+  return null;
+}
+
+async function collectPresence(state, forceAccountRefresh = false) {
   const tabs = (await chrome.tabs.query({ url: 'https://chatgpt.com/*' })).slice(0, 32);
   let focusedWindowId = null;
   try {
@@ -798,9 +828,14 @@ async function collectPresence(state) {
     };
   }))).filter(Boolean);
 
+  const accountFingerprint = await accountFingerprintForPresence(tabs, forceAccountRefresh);
   const presence = await api(state, PRESENCE_PATH, {
     method: 'POST',
-    body: { browserLabel: browserLabel(), tabs: observed }
+    body: {
+      browserLabel: browserLabel(),
+      ...(accountFingerprint ? { accountFingerprint } : {}),
+      tabs: observed
+    }
   });
 
   const focusedTab = tabs.find(
@@ -1004,6 +1039,17 @@ async function recoverThreadRecord(state, threadKey, workspaceId) {
 async function recordForCommand(state, command, placement, reconcileRequired = false, clearGeneration = workerClearGeneration) {
   const threadKey = command.launch.threadKey || `command:${command.id}`;
   const openMode = command.launch.openMode || 'new_thread';
+  const expectedCommandFingerprint = validAccountFingerprint(command?.targetAccountFingerprint)
+    ? command.targetAccountFingerprint.toLowerCase()
+    : null;
+  if (command?.targetAccountFingerprint && !expectedCommandFingerprint) {
+    throw new Error('worker_account_binding_unconfirmed');
+  }
+  if (expectedCommandFingerprint) {
+    const currentFingerprint = await currentChatGptAccountFingerprint();
+    if (!currentFingerprint) throw new Error('worker_account_unconfirmed');
+    if (currentFingerprint !== expectedCommandFingerprint) throw new Error('worker_account_changed');
+  }
   let thread = state.threadRecords?.[threadKey] || null;
   const durableExistingConversation = openMode === 'existing_thread'
     ? canonicalConversationUrl(command.launch.existingConversationUrl)
@@ -1065,12 +1111,16 @@ async function recordForCommand(state, command, placement, reconcileRequired = f
     if (!sourceUrl) {
       throw new Error('Worker launch has no exact ChatGPT source URL for this placement');
     }
-    let accountFingerprint = null;
+    let accountFingerprint = expectedCommandFingerprint;
     if (openMode === 'existing_thread') {
-      accountFingerprint = validAccountFingerprint(thread?.accountFingerprint)
+      const rememberedFingerprint = validAccountFingerprint(thread?.accountFingerprint)
         ? thread.accountFingerprint.toLowerCase()
         : rememberedAccountFingerprintForConversation(state, existingConversation);
-      if (!accountFingerprint) throw new Error('worker_account_binding_unconfirmed');
+      if (!rememberedFingerprint) throw new Error('worker_account_binding_unconfirmed');
+      if (accountFingerprint && accountFingerprint !== rememberedFingerprint) {
+        throw new Error('worker_account_changed');
+      }
+      accountFingerprint = rememberedFingerprint;
       const currentFingerprint = await currentChatGptAccountFingerprint();
       if (!currentFingerprint) throw new Error('worker_account_unconfirmed');
       if (currentFingerprint !== accountFingerprint) throw new Error('worker_account_changed');
@@ -1936,6 +1986,9 @@ async function pair({ pairingToken }) {
 async function status() {
   try {
     const state = await ensureConnected();
+    // Do not report "connected" while the host still sees an expired browser-presence heartbeat.
+    // Opening the popup is itself proof that this extension is alive, so refresh presence first.
+    await collectPresence(state, true);
     const remote = await api(state, STATUS_PATH);
     await applyHostWorkerResetEpoch(state, remote);
     const hasLocalWorkerState =
@@ -2266,6 +2319,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       case 'MOONDESK_SET_PROFILE': return setProfile(message);
       case 'MOONDESK_DISCOVER_MODELS': return discoverModelCatalog({ force: true });
       case 'MOONDESK_CLEAR_WORKERS': return clearWorkers(message);
+      case 'MOONDESK_PRESENCE_WAKE': {
+        // Content scripts provide a redundant MV3 wake source when Edge/Chromium delays alarms.
+        schedulePump(25);
+        return { scheduled: true };
+      }
       case 'MOONDESK_PROVIDER_CORRELATION': return (async () => {
         const context = chatContextFromUrl(sender?.tab?.url || sender?.url || '');
         if (!context || !Number.isInteger(sender?.tab?.id)) {

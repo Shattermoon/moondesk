@@ -389,6 +389,7 @@ mod tests {
         let reuse_id = ManagedChatCommandId::new();
 
         let first = ManagedChatCommand {
+            target_account_fingerprint: None,
             id: first_id.clone(),
             sequence: 0,
             dedupe_key: "legacy-first".into(),
@@ -413,6 +414,7 @@ mod tests {
             anchor_context: None,
         };
         let reuse = ManagedChatCommand {
+            target_account_fingerprint: None,
             id: reuse_id.clone(),
             sequence: 1,
             dedupe_key: "legacy-reuse".into(),
@@ -515,6 +517,7 @@ mod tests {
 
         let command_id = ManagedChatCommandId::new();
         let command = ManagedChatCommand {
+            target_account_fingerprint: None,
             id: command_id.clone(),
             sequence: 0,
             dedupe_key: format!("worker:{}:task:legacy-reuse", receipt.worker_id),
@@ -568,6 +571,7 @@ mod tests {
         let worker_path = root.join(crate::workers::WORKER_STORE_FILE_NAME);
         let command_id = ManagedChatCommandId::new();
         let command = ManagedChatCommand {
+            target_account_fingerprint: None,
             id: command_id.clone(),
             sequence: 0,
             dedupe_key: "legacy-worker-store-error".into(),
@@ -617,6 +621,7 @@ mod tests {
         let command_id = ManagedChatCommandId::new();
         let lease_id = ManagedChatLeaseId::new();
         let command = ManagedChatCommand {
+            target_account_fingerprint: None,
             id: command_id.clone(),
             sequence: 0,
             dedupe_key: "legacy-ambiguous-reuse".into(),

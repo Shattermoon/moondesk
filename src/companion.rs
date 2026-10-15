@@ -16,10 +16,11 @@ pub const COMPANION_AUTH_SCHEMA_VERSION: u32 = 2;
 pub const COMPANION_AUTH_FILE_NAME: &str = "companion-auth-v1.json";
 pub const MAX_PAIRED_COMPANION_CLIENTS: usize = 8;
 // Manifest V3 may suspend the Companion service worker between its 30-second fallback alarm wakes.
-// Keep presence alive across at least two wake intervals so a healthy browser is not falsely marked
-// offline merely because Chromium paused background timers. Commands remain durably queued if a
-// browser really is gone, and status still exposes the exact last-seen age.
-pub const COMPANION_PRESENCE_MAX_AGE_MS: u64 = 75_000;
+// Keep presence alive across several 30-second alarm intervals. Edge/Chromium can delay Manifest V3
+// alarms while background work is throttled; content-script wake nudges and popup status refreshes are
+// the primary liveness signals, while this grace avoids a brief alarm delay looking like a disconnect.
+// Commands remain durably queued if a browser really is gone.
+pub const COMPANION_PRESENCE_MAX_AGE_MS: u64 = 120_000;
 const MAX_COMPANION_AUTH_BYTES: u64 = 32 * 1024;
 const MAX_COMPANION_CLIENT_ID_BYTES: usize = 128;
 const MAX_COMPANION_ORIGIN_BYTES: usize = 512;
@@ -184,6 +185,8 @@ impl CompanionTabPresence {
 pub struct CompanionPresenceUpdate {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub browser_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_fingerprint: Option<String>,
     #[serde(default)]
     pub tabs: Vec<CompanionTabPresence>,
 }
@@ -199,6 +202,15 @@ impl CompanionPresenceUpdate {
             label.trim().is_empty() || label.len() > MAX_COMPANION_BROWSER_LABEL_BYTES
         }) {
             return Err("companion browser label is invalid".into());
+        }
+        if self
+            .account_fingerprint
+            .as_deref()
+            .is_some_and(|fingerprint| {
+                fingerprint.len() != 64 || !fingerprint.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+        {
+            return Err("companion account fingerprint is invalid".into());
         }
         let mut conversations = BTreeSet::new();
         for tab in &self.tabs {
@@ -217,6 +229,8 @@ pub struct CompanionClientPresence {
     pub client_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub browser_label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account_fingerprint: Option<String>,
     pub last_seen_ms: u64,
     pub tabs: Vec<CompanionTabPresence>,
 }
@@ -727,6 +741,9 @@ impl CompanionAuth {
         let presence = CompanionClientPresence {
             client_id: client_id.to_string(),
             browser_label: update.browser_label,
+            account_fingerprint: update
+                .account_fingerprint
+                .map(|fingerprint| fingerprint.to_ascii_lowercase()),
             last_seen_ms: now_ms,
             tabs: update.tabs,
         };
@@ -1691,6 +1708,7 @@ mod tests {
         auth.update_presence(
             "extension-install-a",
             CompanionPresenceUpdate {
+                account_fingerprint: None,
                 browser_label: Some("Edge".into()),
                 tabs: vec![CompanionTabPresence {
                     conversation_id: conversation_id.into(),
@@ -2036,6 +2054,7 @@ mod tests {
         auth.update_presence(
             "chrome-install",
             CompanionPresenceUpdate {
+                account_fingerprint: None,
                 browser_label: Some("Chrome".into()),
                 tabs: vec![route.tab.clone()],
             },
@@ -2068,6 +2087,7 @@ mod tests {
         auth.update_presence(
             "chrome-install",
             CompanionPresenceUpdate {
+                account_fingerprint: None,
                 browser_label: Some("Chrome".into()),
                 tabs: vec![CompanionTabPresence {
                     conversation_id: chrome_conversation.into(),
@@ -2088,6 +2108,7 @@ mod tests {
         auth.update_presence(
             "edge-install",
             CompanionPresenceUpdate {
+                account_fingerprint: None,
                 browser_label: Some("Edge".into()),
                 tabs: vec![CompanionTabPresence {
                     conversation_id: edge_conversation.into(),
@@ -2133,6 +2154,7 @@ mod tests {
             auth.update_presence(
                 client_id,
                 CompanionPresenceUpdate {
+                    account_fingerprint: None,
                     browser_label: None,
                     tabs: vec![CompanionTabPresence {
                         conversation_id: conversation_id.into(),

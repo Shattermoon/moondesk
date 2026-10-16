@@ -249,8 +249,11 @@ test('popup stale browser summary counts offline clients, not every non-current 
 
 test('Companion liveness has redundant MV3 wake and popup presence refresh paths', async () => {
   assert.match(contentSource, /MOONDESK_PRESENCE_WAKE/);
+  assert.match(contentSource, /clearInterval\(presenceWakeTimer\)/, 'stale content scripts must stop waking after extension reload');
   assert.match(source, /case 'MOONDESK_PRESENCE_WAKE'/);
   assert.match(source, /async function status\(\)[\s\S]*await collectPresence\(state, true\);[\s\S]*STATUS_PATH/);
+  assert.match(source, /void \(async \(\) => \{[\s\S]*MOONDESK_CORRELATION_EVIDENCE/, 'optional correlation telemetry must not block presence/status');
+  assert.match(popupSource, /const POPUP_STATUS_TIMEOUT_MS = 20_000;/);
   assert.match(popupSource, /bg\(\{ type: 'MOONDESK_STATUS' \}, POPUP_STATUS_TIMEOUT_MS\)/);
   assert.match(popupSource, /pill\.textContent = 'Unavailable'/);
 
@@ -1241,7 +1244,7 @@ test('bridge discovery prefers an exact runtime match over another MoonDesk vers
             app: 'moondesk-worker-companion',
             appVersion: manifest.version,
             protocolVersion: 2,
-            companionRuntimeRevision: 29
+            companionRuntimeRevision: 30
           };
         }
       };
@@ -1269,7 +1272,7 @@ test('bridge discovery prefers an exact runtime match over another MoonDesk vers
 
   const { evaluate, runtimeReloads } = loadBackground({ fetchImpl });
   const hello = await evaluate('discoverBridge(freshState())');
-  assert.equal(hello.companionRuntimeRevision, 29);
+  assert.equal(hello.companionRuntimeRevision, 30);
   assert.equal(runtimeReloads.length, 0);
 });
 
@@ -1382,7 +1385,7 @@ test('compatible bridge clears the one-shot runtime reload marker for a future m
             app: 'moondesk-worker-companion',
             appVersion: manifest.version,
             protocolVersion: 2,
-            companionRuntimeRevision: 29
+            companionRuntimeRevision: 30
           };
         }
       };
@@ -1395,7 +1398,7 @@ test('compatible bridge clears the one-shot runtime reload marker for a future m
   });
 
   const hello = await evaluate('discoverBridge(freshState())');
-  assert.equal(hello.companionRuntimeRevision, 29);
+  assert.equal(hello.companionRuntimeRevision, 30);
   const stored = await evaluate(`chrome.storage.local.get('${reloadKey}')`);
   assert.equal(stored[reloadKey], undefined);
 });
@@ -1413,7 +1416,7 @@ test('automatic pairing proves the extension was loaded from the MoonDesk-prepar
             app: 'moondesk-worker-companion',
             appVersion: manifest.version,
             protocolVersion: 2,
-            companionRuntimeRevision: 29
+            companionRuntimeRevision: 30
           };
         }
       };
@@ -1455,7 +1458,7 @@ test('source and release-ZIP installs without a bootstrap capability expose Manu
         app: 'moondesk-worker-companion',
         appVersion: manifest.version,
         protocolVersion: 2,
-        companionRuntimeRevision: 29
+        companionRuntimeRevision: 30
       };
       return {
         ok: true,
@@ -1576,7 +1579,7 @@ test('release version mismatch reloads the unpacked companion even when protocol
             app: 'moondesk-worker-companion',
             appVersion: '0.13.0',
             protocolVersion: 2,
-            companionRuntimeRevision: 29
+            companionRuntimeRevision: 30
           };
         }
       };
@@ -2018,6 +2021,98 @@ test('provider correlation fails closed when one stream event claims conflicting
     0,
     'ambiguous provider evidence must never be promoted into Core authority'
   );
+});
+
+test('content reinjection replaces legacy or invalidated guards but skips a live current context', () => {
+  let runtimeListeners = 0;
+  let oldRuntimeInvalidated = false;
+  const oldRuntime = {
+    id: 'test-extension',
+    getManifest() {
+      if (oldRuntimeInvalidated) throw new Error('Extension context invalidated.');
+      return manifest;
+    },
+    sendMessage() { return Promise.resolve({ ok: true }); },
+    onMessage: { addListener() { runtimeListeners += 1; } }
+  };
+  const newRuntime = {
+    id: 'test-extension',
+    getManifest() { return manifest; },
+    sendMessage() { return Promise.resolve({ ok: true }); },
+    onMessage: { addListener() { runtimeListeners += 1; } }
+  };
+  const pageWindow = {
+    __MOONDESK_WORKER_COMPANION_CONTENT__: true,
+    MOONDESK_CHATGPT_DOM: { conversationIdFromPath() { return null; } },
+    addEventListener() {},
+    postMessage() {}
+  };
+  const chrome = { runtime: oldRuntime };
+  const context = vm.createContext({
+    window: pageWindow,
+    location: { origin: 'https://chatgpt.com', pathname: '/', search: '', hash: '' },
+    chrome,
+    crypto: webcrypto,
+    Date,
+    setTimeout,
+    clearTimeout,
+    setInterval() { return 1; },
+    clearInterval() {},
+    console
+  });
+
+  vm.runInContext(contentSource, context, { filename: contentPath });
+  assert.equal(runtimeListeners, 1, 'runtime 30 must replace the legacy boolean guard');
+  vm.runInContext(contentSource, context, { filename: contentPath });
+  assert.equal(runtimeListeners, 1, 'a live current content context must remain idempotent');
+
+  oldRuntimeInvalidated = true;
+  chrome.runtime = newRuntime;
+  vm.runInContext(contentSource, context, { filename: contentPath });
+  assert.equal(runtimeListeners, 2, 'an invalidated old content context must not block reinjection');
+});
+
+test('stale content presence timer stops after extension context invalidation', () => {
+  let presenceWake = null;
+  const clearedTimers = [];
+  let invalidated = false;
+  const pageWindow = {
+    MOONDESK_CHATGPT_DOM: {
+      conversationIdFromPath() { return null; }
+    },
+    addEventListener() {},
+    postMessage() {}
+  };
+  const context = vm.createContext({
+    window: pageWindow,
+    location: { origin: 'https://chatgpt.com', pathname: '/', search: '', hash: '' },
+    chrome: {
+      runtime: {
+        id: 'test-extension',
+        sendMessage() {
+          if (invalidated) throw new Error('Extension context invalidated.');
+          return Promise.resolve({ ok: true });
+        },
+        onMessage: { addListener() {} }
+      }
+    },
+    crypto: webcrypto,
+    Date,
+    setTimeout,
+    clearTimeout,
+    setInterval(callback) {
+      presenceWake = callback;
+      return 77;
+    },
+    clearInterval(id) { clearedTimers.push(id); },
+    console
+  });
+
+  vm.runInContext(contentSource, context, { filename: contentPath });
+  assert.equal(typeof presenceWake, 'function');
+  invalidated = true;
+  assert.doesNotThrow(() => presenceWake());
+  assert.deepEqual(clearedTimers, [77]);
 });
 
 test('isolated content forwards provider correlation immediately for the exact current conversation', async () => {

@@ -35,7 +35,7 @@ const CONFIG_EFFORT_LABEL = {
 };
 
 // ── Background messaging ─────────────────────────────────────────
-const POPUP_STATUS_TIMEOUT_MS = 10_000;
+const POPUP_STATUS_TIMEOUT_MS = 20_000;
 
 async function bg(message, timeoutMs = null) {
   const work = chrome.runtime.sendMessage(message);

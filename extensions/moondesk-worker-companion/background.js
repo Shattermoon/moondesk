@@ -8,7 +8,7 @@ const BRIDGE_PORTS = [47650, 47651, 47652, 47653, 47654];
 const REQUIRED_PROTOCOL_VERSION = 2;
 // Bump with any shipped companion runtime change that requires Chromium to load new bytes. Keep
 // this aligned with COMPANION_RUNTIME_REVISION in src/server.rs.
-const COMPANION_RUNTIME_REVISION = 29;
+const COMPANION_RUNTIME_REVISION = 30;
 const SOURCE_DEV_MANIFEST_VERSION = '0.1.0';
 const RUNTIME_RELOAD_STORAGE_KEY = 'moondeskWorkerCompanionReloadRevisionV1';
 const INSTALLATION_BOOTSTRAP_FILE = 'moondesk-bootstrap.json';
@@ -899,34 +899,36 @@ async function collectPresence(state, forceAccountRefresh = false) {
     (tab) => tab.id && tab.active && focusedWindowId !== null && tab.windowId === focusedWindowId
   );
   if (Number.isInteger(focusedTab?.id)) {
-    try {
-      // Correlation evidence is best-effort telemetry. Never repair/reinject the focused ChatGPT
-      // tab inline with presence publication; a slow remount must not hold the browser heartbeat.
-      const response = await sendToTab(
-        focusedTab.id,
-        { type: 'MOONDESK_CORRELATION_EVIDENCE' },
-        2500
-      );
-      const evidence = response?.ok ? response.evidence : null;
-      const context = chatContextFromUrl(focusedTab.url);
-      if (
-        evidence?.conversationId &&
-        context?.conversationId === evidence.conversationId &&
-        Array.isArray(evidence.requestIds) &&
-        evidence.requestIds.length
-      ) {
-        await api(state, CORRELATIONS_PATH, {
-          method: 'POST',
-          body: {
-            conversationId: context.conversationId,
-            conversationUrl: context.conversationUrl,
-            projectId: context.projectId,
-            projectUrl: context.projectUrl,
-            requestIds: evidence.requestIds
-          }
-        });
-      }
-    } catch {}
+    // Correlation evidence is optional telemetry. Publish the heartbeat/status result first and run
+    // this work independently so a slow/remounting ChatGPT tab cannot delay popup status or liveness.
+    void (async () => {
+      try {
+        const response = await sendToTab(
+          focusedTab.id,
+          { type: 'MOONDESK_CORRELATION_EVIDENCE' },
+          2500
+        );
+        const evidence = response?.ok ? response.evidence : null;
+        const context = chatContextFromUrl(focusedTab.url);
+        if (
+          evidence?.conversationId &&
+          context?.conversationId === evidence.conversationId &&
+          Array.isArray(evidence.requestIds) &&
+          evidence.requestIds.length
+        ) {
+          await api(state, CORRELATIONS_PATH, {
+            method: 'POST',
+            body: {
+              conversationId: context.conversationId,
+              conversationUrl: context.conversationUrl,
+              projectId: context.projectId,
+              projectUrl: context.projectUrl,
+              requestIds: evidence.requestIds
+            }
+          });
+        }
+      } catch {}
+    })();
   }
 
   return presence;

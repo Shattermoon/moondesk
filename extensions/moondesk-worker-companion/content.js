@@ -1,6 +1,20 @@
 (() => {
-  if (window.__MOONDESK_WORKER_COMPANION_CONTENT__) return;
-  window.__MOONDESK_WORKER_COMPANION_CONTENT__ = true;
+  const previousContent = window.__MOONDESK_WORKER_COMPANION_CONTENT__;
+  if (previousContent && typeof previousContent.contextAlive === 'function') {
+    try {
+      if (previousContent.contextAlive()) return;
+    } catch {}
+  }
+  const runtime = chrome.runtime;
+  window.__MOONDESK_WORKER_COMPANION_CONTENT__ = {
+    contextAlive() {
+      try {
+        return Boolean(runtime?.id && runtime.getManifest?.());
+      } catch {
+        return false;
+      }
+    }
+  };
   const DOM = window.MOONDESK_CHATGPT_DOM;
   if (!DOM) return;
 
@@ -18,10 +32,24 @@
   // any loaded ChatGPT page wakes the extension service worker without carrying page/user data.
   // Background-tab timers may be throttled, but combined with the 30s alarm this prevents healthy
   // Worker browsers from aging out merely because Edge suspended the service worker.
-  if (chrome.runtime?.id) {
-    setInterval(() => {
-      void chrome.runtime.sendMessage({ type: 'MOONDESK_PRESENCE_WAKE' }).catch(() => {});
-    }, PRESENCE_WAKE_INTERVAL_MS);
+  try {
+    if (chrome.runtime?.id) {
+      const presenceWakeTimer = setInterval(() => {
+        try {
+          if (!chrome.runtime?.id) {
+            clearInterval(presenceWakeTimer);
+            return;
+          }
+          void chrome.runtime.sendMessage({ type: 'MOONDESK_PRESENCE_WAKE' }).catch(() => {});
+        } catch {
+          // Extension reloads invalidate old content-script chrome.runtime objects while the page
+          // itself stays alive. Stop this stale timer instead of logging the same exception forever.
+          clearInterval(presenceWakeTimer);
+        }
+      }, PRESENCE_WAKE_INTERVAL_MS);
+    }
+  } catch {
+    // The extension may already have been reloaded between script evaluation and runtime access.
   }
 
   function validProviderCorrelation(value) {

@@ -310,6 +310,33 @@ pub(crate) async fn recover_incomplete_launch_transactions(
                             format!("worker launch recovery could not activate command: {error}")
                         })?;
                 }
+                // Older builds could persist a reused Worker as Waking/WaitingClaim even though the
+                // durable Worker conversation was already claimed and this exact managed wake had
+                // succeeded. Normalize that cross-store partial state so status/retire no longer
+                // treats a reused Worker as if it needed a second one-time claim.
+                if claimed
+                    && command.state == ManagedChatCommandState::Succeeded
+                    && launch_state == WorkerLaunchState::WaitingClaim
+                {
+                    let confirmed_conversation = command
+                        .terminal
+                        .as_ref()
+                        .and_then(|terminal| terminal.conversation_url.clone())
+                        .or_else(|| conversation_url.clone());
+                    worker_broker
+                        .update_launch_by_command(
+                            &command_id,
+                            WorkerLaunchState::Claimed,
+                            None,
+                            confirmed_conversation,
+                        )
+                        .await
+                        .map_err(|error| {
+                            format!(
+                                "worker launch recovery could not normalize claimed wake: {error}"
+                            )
+                        })?;
+                }
             }
             None => match (worker_state, claimed, linked_command_id.as_deref()) {
                 (WorkerState::Provisioning, false, None) => worker_broker
@@ -2362,6 +2389,132 @@ mod tests {
                 .workers
                 .contains_key(&receipt.worker_id),
             "read-only worker actions must not run crash recovery against a live transaction"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn recovery_normalizes_legacy_claimed_reuse_left_in_waiting_claim() {
+        let root = temp_root("moondesk-worker-recovery-claimed-reuse-waiting-claim");
+        let worker_path = root.join("worker-state-v1.json");
+        let managed_path = root.join("managed-chat-state-v1.json");
+        let workspace = WorkspaceId::new();
+        let anchor = identity("anchor-claimed-reuse-recovery");
+        let worker = WorkerBroker::open(&worker_path).expect("open worker broker");
+        let managed = ManagedChatBroker::open(&managed_path).expect("open managed broker");
+        let (worker_id, _) = make_idle_collected_worker(&worker, &workspace, &anchor).await;
+        let reuse = worker
+            .reuse_worker(ReuseWorkerRequest {
+                operation_id: OperationId::new(),
+                workspace_id: workspace.clone(),
+                anchor_identity: anchor.clone(),
+                worker_id: worker_id.clone(),
+                assignment: "follow-up after browser wake".into(),
+            })
+            .await
+            .expect("reuse claimed worker");
+        let mut launch = launch_for(workspace.clone(), &worker_id, &reuse.task_id);
+        launch.launch.thread_key = Some(format!("worker:{worker_id}"));
+        launch.launch.open_mode = ManagedChatOpenMode::ExistingThread;
+        launch.launch.existing_conversation_url = Some(reuse.conversation_url.clone());
+        let command = managed.enqueue(launch).await.expect("enqueue reuse wake");
+        worker
+            .link_launch_command(
+                &workspace,
+                &anchor,
+                &worker_id,
+                &reuse.task_id,
+                &command.id.to_string(),
+            )
+            .await
+            .expect("link reuse wake");
+        let offer = managed
+            .redeem("extension-a", 1_000)
+            .await
+            .expect("redeem reuse wake")
+            .expect("reuse wake lease");
+        let lease_id = offer
+            .command
+            .lease
+            .as_ref()
+            .expect("reuse wake lease id")
+            .lease_id
+            .clone();
+        managed
+            .mark_send_started(&command.id, &lease_id, "extension-a")
+            .await
+            .expect("cross reuse Send boundary");
+        managed
+            .acknowledge(
+                &command.id,
+                &lease_id,
+                "extension-a",
+                ManagedChatAckOutcome::Succeeded {
+                    details: Some("worker send acceptance confirmed".into()),
+                    conversation_url: Some(reuse.conversation_url.clone()),
+                },
+            )
+            .await
+            .expect("persist succeeded reuse wake");
+        worker
+            .update_launch_by_command(
+                &command.id.to_string(),
+                WorkerLaunchState::WaitingClaim,
+                None,
+                Some(reuse.conversation_url.clone()),
+            )
+            .await
+            .expect("mirror reuse wake before simulating old persisted state");
+        drop(worker);
+
+        // Simulate the exact state emitted by older builds: the durable Worker identity already
+        // exists, but the current reuse mirror was persisted as WaitingClaim after Send success.
+        let mut raw: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(&worker_path).expect("read worker store for legacy-state fixture"),
+        )
+        .expect("parse worker store fixture");
+        let families = raw
+            .get_mut("families")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("worker families object");
+        let mut found = false;
+        for family in families.values_mut() {
+            let Some(workers) = family
+                .get_mut("workers")
+                .and_then(serde_json::Value::as_object_mut)
+            else {
+                continue;
+            };
+            if let Some(record) = workers.get_mut(&worker_id.to_string()) {
+                record["launchState"] = json!("waiting_claim");
+                found = true;
+                break;
+            }
+        }
+        assert!(found, "legacy fixture worker must exist");
+        std::fs::write(
+            &worker_path,
+            serde_json::to_vec_pretty(&raw).expect("serialize legacy worker fixture"),
+        )
+        .expect("write legacy worker fixture");
+
+        let worker = WorkerBroker::open(&worker_path).expect("reopen legacy worker broker");
+        recover_incomplete_launch_transactions(&workspace, &worker, &managed)
+            .await
+            .expect("normalize claimed reuse after old partial persistence");
+        let family = worker
+            .family_for_anchor(&workspace, &anchor)
+            .await
+            .expect("read normalized family")
+            .expect("family remains");
+        let normalized = family.workers.get(&worker_id).expect("worker remains");
+        assert_eq!(normalized.state, WorkerState::Waking);
+        assert_eq!(normalized.launch_state, WorkerLaunchState::Claimed);
+        assert!(normalized.chat_identity.is_some());
+        assert_eq!(normalized.current_task_id.as_ref(), Some(&reuse.task_id));
+        assert_eq!(
+            normalized.conversation_url.as_deref(),
+            Some(reuse.conversation_url.as_str())
         );
         let _ = std::fs::remove_dir_all(root);
     }

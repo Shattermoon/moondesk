@@ -9192,6 +9192,7 @@ mod tests {
             flow_id: flow_id.into(),
             short_id: flow_id.into(),
             events: vec![event.into()],
+            last_activity_ms: 0,
             bootstrap_status_active: false,
             bootstrap_completed_steps: 0,
             bootstrap_pending_steps: Default::default(),

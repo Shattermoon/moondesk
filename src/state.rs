@@ -63,6 +63,7 @@ pub struct FlowLane {
     pub flow_id: String,
     pub short_id: String,
     pub events: Vec<String>,
+    pub last_activity_ms: u128,
     pub bootstrap_status_active: bool,
     pub bootstrap_completed_steps: usize,
     pub bootstrap_pending_steps: VecDeque<usize>,
@@ -1047,6 +1048,7 @@ const FLOW_STEP_FIXED_MS: u64 = FLOW_FORWARD_ANIMATION_DURATION_MS.div_ceil(FLOW
 const FLOW_TURN_TRANSITION_MS: u64 = 24;
 const FLOW_CLOSE_PRUNE_MULTIPLIER: u64 = 3;
 const FLOW_BOOTSTRAP_STATUS_CLOSE_DELAY_MS: u128 = 3_000;
+const FLOW_BOOTSTRAP_STALE_AFTER_MS: u128 = 30_000;
 
 fn short_flow_id(flow_id: &str) -> String {
     flow_id[..flow_id.len().min(8)].to_string()
@@ -1492,6 +1494,17 @@ fn flow_bootstrap_step(index: usize) -> Option<&'static FlowBootstrapStep> {
     None
 }
 
+fn flow_bootstrap_event_index(event: &str) -> Option<usize> {
+    let mut offset = 0;
+    for phase in FLOW_BOOTSTRAP_PHASES {
+        if let Some(index) = phase.steps.iter().position(|step| step.event == event) {
+            return Some(offset + index);
+        }
+        offset += phase.steps.len();
+    }
+    None
+}
+
 pub fn flow_bootstrap_steps_total() -> usize {
     FLOW_BOOTSTRAP_PHASES
         .iter()
@@ -1523,18 +1536,31 @@ fn advance_bootstrap_progress(
     match direction {
         FlowDirection::Forward => {
             for event in events {
+                // Later bootstrap stages prove that earlier initialize traffic has been superseded.
+                // After a host/client crash Codex may retry initialize while an older response is
+                // already lost; carrying that stale pending initialize forever would otherwise keep
+                // the dashboard stuck even though the new MCP session is usable.
+                if matches!(event.as_str(), "notifications/initialized" | "tools/list")
+                    && let Some(event_index) = flow_bootstrap_event_index(event)
+                {
+                    pending_steps.retain(|index| *index >= event_index);
+                    *completed_steps = (*completed_steps).max(event_index);
+                    if event == "notifications/initialized" {
+                        *completed_steps = (*completed_steps).max(event_index + 1);
+                        pending_steps.retain(|index| *index > event_index);
+                    } else if !pending_steps.contains(&event_index) {
+                        pending_steps.push_back(event_index);
+                    }
+                    continue;
+                }
+
                 let next_index = completed_steps.saturating_add(pending_steps.len());
                 let Some(step) = flow_bootstrap_step(next_index) else {
                     break;
                 };
-                if step.event != event {
-                    continue;
+                if step.event == event {
+                    pending_steps.push_back(next_index);
                 }
-                if step.event == "notifications/initialized" {
-                    *completed_steps = next_index + 1;
-                    continue;
-                }
-                pending_steps.push_back(next_index);
             }
         }
         FlowDirection::Backward => {
@@ -1548,7 +1574,7 @@ fn advance_bootstrap_progress(
                 };
                 if step.event == event {
                     pending_steps.pop_front();
-                    *completed_steps = pending_index + 1;
+                    *completed_steps = (*completed_steps).max(pending_index + 1);
                 }
             }
         }
@@ -2137,6 +2163,7 @@ impl AppState {
                 flow.bootstrap_status_close_deadline_ms = None;
             }
             flow.events.extend(events.iter().cloned());
+            flow.last_activity_ms = now_ms;
             if flow.events.len() > 12 {
                 let drop_n = flow.events.len() - 12;
                 flow.events.drain(0..drop_n);
@@ -2173,6 +2200,7 @@ impl AppState {
                 flow_id: flow_id.to_string(),
                 short_id: short_flow_id(flow_id),
                 events: trimmed,
+                last_activity_ms: now_ms,
                 bootstrap_status_active: starts_bootstrap_status,
                 bootstrap_completed_steps: bootstrap.completed_steps,
                 bootstrap_pending_steps: bootstrap.pending_steps.clone(),
@@ -2219,6 +2247,7 @@ impl AppState {
     pub fn prune_closed_flows(&mut self) {
         let now_ms = now_unix_millis();
         let bootstrap_steps_total = flow_bootstrap_steps_total();
+        let mut stale_bootstrap_flow_ids = Vec::new();
 
         for flow in &mut self.flows {
             prune_finished_segments(&mut flow.anim_queue, now_ms);
@@ -2228,6 +2257,17 @@ impl AppState {
             }
             let bootstrap_complete = flow.bootstrap_completed_steps >= bootstrap_steps_total
                 && flow.bootstrap_pending_steps.is_empty();
+            if flow.closing_started_ms.is_none()
+                && !bootstrap_complete
+                && now_ms.saturating_sub(flow.last_activity_ms) >= FLOW_BOOTSTRAP_STALE_AFTER_MS
+            {
+                flow.bootstrap_status_active = false;
+                flow.bootstrap_completed_steps = 0;
+                flow.bootstrap_pending_steps.clear();
+                flow.bootstrap_status_close_deadline_ms = None;
+                stale_bootstrap_flow_ids.push(flow.flow_id.clone());
+                continue;
+            }
             if flow.closing_started_ms.is_none() && bootstrap_complete {
                 if flow.anim_queue.is_empty() {
                     match flow.bootstrap_status_close_deadline_ms {
@@ -2247,6 +2287,9 @@ impl AppState {
             } else {
                 flow.bootstrap_status_close_deadline_ms = None;
             }
+        }
+        for flow_id in stale_bootstrap_flow_ids {
+            self.flow_bootstrap_progress.remove(&flow_id);
         }
         self.flows.retain(|flow| {
             let Some(closing_started_ms) = flow.closing_started_ms else {
@@ -3962,6 +4005,67 @@ toolMode = "multiTools"
         assert_eq!(flow_bootstrap_steps_total(), 4);
         assert_eq!(flow.bootstrap_completed_steps, flow_bootstrap_steps_total());
         assert!(flow.bootstrap_pending_steps.is_empty());
+
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn record_flow_bootstrap_recovers_when_initialize_retry_loses_one_response() {
+        let (mut app, workspace, config_path) = test_app("moondesk-flow-bootstrap-retry");
+
+        let sequence = [
+            ("initialize", FlowDirection::Forward),
+            ("initialize", FlowDirection::Forward),
+            ("initialize", FlowDirection::Backward),
+            ("notifications/initialized", FlowDirection::Forward),
+            ("tools/list", FlowDirection::Forward),
+            ("tools/list", FlowDirection::Backward),
+        ];
+        for (event, direction) in sequence {
+            app.record_flow("stateless", &[event.to_string()], direction);
+        }
+
+        let flow = app.flows.first().expect("missing flow");
+        assert_eq!(flow.bootstrap_completed_steps, flow_bootstrap_steps_total());
+        assert!(flow.bootstrap_pending_steps.is_empty());
+
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn stale_incomplete_bootstrap_self_clears_and_can_start_fresh() {
+        let (mut app, workspace, config_path) = test_app("moondesk-flow-bootstrap-stale");
+        app.record_flow(
+            "stateless",
+            &["initialize".to_string()],
+            FlowDirection::Forward,
+        );
+        let stale_at = now_unix_millis().saturating_sub(FLOW_BOOTSTRAP_STALE_AFTER_MS + 1);
+        app.flows
+            .first_mut()
+            .expect("missing flow")
+            .last_activity_ms = stale_at;
+
+        app.prune_closed_flows();
+        let flow = app
+            .flows
+            .first()
+            .expect("flow remains available for observability");
+        assert!(!flow.bootstrap_status_active);
+        assert_eq!(flow.bootstrap_completed_steps, 0);
+        assert!(flow.bootstrap_pending_steps.is_empty());
+        assert!(!app.flow_bootstrap_progress.contains_key("stateless"));
+
+        app.record_flow(
+            "stateless",
+            &["initialize".to_string()],
+            FlowDirection::Forward,
+        );
+        let flow = app.flows.first().expect("fresh bootstrap flow");
+        assert!(flow.bootstrap_status_active);
+        assert_eq!(flow.bootstrap_pending_steps.front(), Some(&0));
 
         let _ = std::fs::remove_file(config_path);
         let _ = std::fs::remove_dir_all(workspace);

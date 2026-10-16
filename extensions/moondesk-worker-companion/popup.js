@@ -35,8 +35,19 @@ const CONFIG_EFFORT_LABEL = {
 };
 
 // ── Background messaging ─────────────────────────────────────────
-async function bg(message) {
-  const response = await chrome.runtime.sendMessage(message);
+const POPUP_STATUS_TIMEOUT_MS = 10_000;
+
+async function bg(message, timeoutMs = null) {
+  const work = chrome.runtime.sendMessage(message);
+  let timer;
+  const response = Number.isFinite(Number(timeoutMs))
+    ? await Promise.race([
+        work,
+        new Promise((_, reject) => {
+          timer = setTimeout(() => reject(new Error('MoonDesk Companion status timed out')), Number(timeoutMs));
+        })
+      ]).finally(() => { if (timer) clearTimeout(timer); })
+    : await work;
   if (!response?.ok) throw new Error(response?.error || 'MoonDesk companion request failed');
   return response.result;
 }
@@ -198,7 +209,7 @@ function renderBrowserClients(clients) {
   const list = $('browserList');
   list.textContent = '';
   const all = clients || [];
-  const stale = all.filter((client) => !client.current);
+  const stale = all.filter((client) => !client.online);
   $('browsersBlock').hidden = all.length === 0;
   if (!all.length) return;
 
@@ -244,11 +255,18 @@ function renderClearWorkers(status) {
 // ── Main render ──────────────────────────────────────────────────
 async function render() {
   showError('');
-  const status = await bg({ type: 'MOONDESK_STATUS' });
+  const pill = $('connPill');
+  let status;
+  try {
+    status = await bg({ type: 'MOONDESK_STATUS' }, POPUP_STATUS_TIMEOUT_MS);
+  } catch (error) {
+    pill.className = 'conn-pill pill-error';
+    pill.textContent = 'Unavailable';
+    throw error;
+  }
   const connected = status.connected === true;
 
   // Connection pill
-  const pill = $('connPill');
   pill.className = 'conn-pill';
   if (connected) {
     pill.textContent = 'Connected';

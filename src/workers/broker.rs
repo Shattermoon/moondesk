@@ -742,6 +742,16 @@ impl WorkerBroker {
                 "worker WaitingClaim state requires a canonical ChatGPT conversation URL".into(),
             ));
         }
+        // A durable reused Worker is already claimed by its exact ChatGPT conversation. When the
+        // browser confirms delivery of a new reuse assignment, that task is waiting for `workers
+        // start`, not another one-time claim. Keep WaitingClaim exclusively for fresh Workers whose
+        // conversation identity has not been bound yet.
+        let launch_state =
+            if launch_state == WorkerLaunchState::WaitingClaim && worker.chat_identity.is_some() {
+                WorkerLaunchState::Claimed
+            } else {
+                launch_state
+            };
         worker.launch_state = launch_state;
         worker.launch_error = launch_error;
         if conversation_url.is_some() {
@@ -4437,6 +4447,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reused_worker_delivery_waits_for_start_without_reentering_waiting_claim() {
+        let root = temp_root("moondesk-worker-reuse-delivery-claimed");
+        let path = root.join("worker-state-v1.json");
+        let workspace = WorkspaceId::new();
+        let core = anchor("core-reuse-delivery");
+        let worker_identity = anchor("worker-reuse-delivery");
+        let broker = WorkerBroker::open(&path).expect("open worker broker");
+        let spawned = broker
+            .spawn_worker(spawn_request(
+                OperationId::new(),
+                workspace.clone(),
+                core.clone(),
+                "initial task",
+            ))
+            .await
+            .expect("spawn worker");
+        make_claimable(&broker, &workspace, &core, &spawned).await;
+        broker
+            .claim_worker(
+                &workspace,
+                &spawned.worker_id,
+                &spawned.task_id,
+                &spawned.claim_token,
+                worker_identity.clone(),
+            )
+            .await
+            .expect("claim worker");
+        broker
+            .finish_task(FinishTaskRequest {
+                workspace_id: workspace.clone(),
+                worker_identity,
+                worker_id: spawned.worker_id.clone(),
+                task_id: spawned.task_id.clone(),
+                result: finished_result(),
+            })
+            .await
+            .expect("finish initial task");
+
+        let reused = broker
+            .reuse_worker(ReuseWorkerRequest {
+                operation_id: OperationId::new(),
+                workspace_id: workspace.clone(),
+                anchor_identity: core.clone(),
+                worker_id: spawned.worker_id.clone(),
+                assignment: "follow-up task".into(),
+            })
+            .await
+            .expect("reuse worker");
+        let command_id = Uuid::new_v4().to_string();
+        broker
+            .link_launch_command(
+                &workspace,
+                &core,
+                &spawned.worker_id,
+                &reused.task_id,
+                &command_id,
+            )
+            .await
+            .expect("link reuse launch");
+        let delivered = broker
+            .update_launch_by_command(
+                &command_id,
+                WorkerLaunchState::WaitingClaim,
+                None,
+                Some(reused.conversation_url.clone()),
+            )
+            .await
+            .expect("mirror accepted reuse delivery")
+            .expect("worker remains linked");
+        assert_eq!(delivered.state, WorkerState::Waking);
+        assert_eq!(delivered.launch_state, WorkerLaunchState::Claimed);
+        assert!(delivered.chat_identity.is_some());
+        assert!(delivered.waiting_claim_since_ms.is_none());
+        assert_eq!(delivered.current_task_id.as_ref(), Some(&reused.task_id));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn purge_workspace_removes_only_owned_worker_families_and_is_idempotent() {
         let root = temp_root("moondesk-worker-purge-workspace");
         let path = root.join("worker-state-v1.json");
@@ -4766,6 +4854,73 @@ mod tests {
             .expect("collect cancellation");
         assert_eq!(updates.failed.len(), 1);
         assert_eq!(updates.failed[0].task_id, spawned.task_id);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn waiting_claim_does_not_expire_a_legitimate_slow_first_turn() {
+        let root = temp_root("moondesk-worker-slow-claim");
+        let path = root.join("worker-state-v1.json");
+        let broker = WorkerBroker::open(&path).expect("open worker broker");
+        let workspace = WorkspaceId::new();
+        let core = anchor("core-slow-claim");
+        let spawned = broker
+            .spawn_worker(spawn_request(
+                OperationId::new(),
+                workspace.clone(),
+                core.clone(),
+                "slow claim",
+            ))
+            .await
+            .expect("spawn worker");
+        let command_id = Uuid::new_v4().to_string();
+        broker
+            .link_launch_command(
+                &workspace,
+                &core,
+                &spawned.worker_id,
+                &spawned.task_id,
+                &command_id,
+            )
+            .await
+            .expect("link command");
+        broker
+            .update_launch_by_command(
+                &command_id,
+                WorkerLaunchState::WaitingClaim,
+                None,
+                Some(format!("https://chatgpt.com/c/{}", spawned.worker_id)),
+            )
+            .await
+            .expect("mark waiting claim");
+        {
+            let mut guard = broker.data.lock().await;
+            let worker = guard
+                .families
+                .values_mut()
+                .flat_map(|family| family.workers.values_mut())
+                .find(|worker| worker.id == spawned.worker_id)
+                .expect("waiting worker");
+            worker.waiting_claim_since_ms = Some(worker_unix_time_ms().saturating_sub(3 * 60_000));
+        }
+
+        let expired = broker
+            .expire_waiting_claim_timeouts_for_anchor(&workspace, &core)
+            .await
+            .expect("keep legitimate slow first turn alive");
+        assert!(expired.is_empty());
+        let family = broker
+            .family_for_anchor(&workspace, &core)
+            .await
+            .expect("read family")
+            .expect("family remains");
+        let worker = family
+            .workers
+            .get(&spawned.worker_id)
+            .expect("worker remains");
+        assert_eq!(worker.state, WorkerState::Provisioning);
+        assert_eq!(worker.launch_state, WorkerLaunchState::WaitingClaim);
+        assert!(worker.claim_token.is_some());
         let _ = std::fs::remove_dir_all(root);
     }
 

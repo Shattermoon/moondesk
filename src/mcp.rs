@@ -741,7 +741,7 @@ fn worker_gateway_workers_tool_descriptor() -> Value {
 fn local_ide_workers_tool_descriptor() -> Value {
     let mut descriptor = workers_tool_descriptor();
     descriptor["description"] = json!(
-        "Delegate work to MoonDesk browser Workers. Local IDE Core is account-independent. Fresh Workers load-balance across eligible browser/accounts; browsers on one account share its slot budget. Each Worker stays pinned to its original browser/account for reuse and browser control. Core: status/spawn/reuse/recover/send/collect/retire/clear. Prefer collect(wait_ms<=60000); status is diagnostic, not rapid polling. Do not duplicate a Worker's assignment in Core unless taking over. Lifecycle: queued->sent->claimed->working; provisioning/waking is not work. collect returns reports/completed/failed. clear is workspace-local recovery. If migrationBlocked, do not spawn; health=suspect means recover first."
+        "Delegate work to MoonDesk Workers. Local IDE Core is account-independent. Fresh Workers load-balance across browser/accounts; same-account browsers share capacity. Workers stay pinned to their browser/account. Core: status/spawn/reuse/recover/send/collect/retire/clear. Prefer collect(wait_ms<=60000); status is diagnostic, not rapid polling. Do not duplicate a Worker's assignment in Core unless taking over. Lifecycle: queued->sent->claimed->working. If migrationBlocked, do not spawn. For health=suspect or browser_missing, call recover before user intervention: it uses the pinned browser/account and auto-reopens the durable chat. Never ask the user to reopen it or send a wake message."
     );
     if let Some(action_enum) = descriptor.pointer_mut("/inputSchema/properties/action/enum") {
         *action_enum = json!([
@@ -2793,7 +2793,15 @@ fn merge_local_ide_worker_observability(
         }
     }
 
-    if observed.get("health").and_then(Value::as_str) == Some("suspect") {
+    let health = observed.get("health").and_then(Value::as_str);
+    if matches!(health, Some("suspect" | "browser_missing")) {
+        worker.insert("recoveryRecommended".into(), json!(true));
+        worker.insert(
+            "recoveryInstruction".into(),
+            json!("Call workers action=recover for this Worker. MoonDesk will use its persisted Companion browser/account and reopen the exact durable ChatGPT conversation automatically if its tab is closed; do not ask the user to reopen the chat or send a custom wake message."),
+        );
+    }
+    if health == Some("suspect") {
         if let Some(age) = observed
             .get("lastActivityAgeMs")
             .filter(|value| !value.is_null())
@@ -2894,6 +2902,10 @@ async fn recover_worker_for_core(
         .conversation_url
         .clone()
         .ok_or_else(|| "worker recovery requires a durable ChatGPT conversation URL".to_string())?;
+    // Multi-account Workers persist their exact Companion browser affinity independently of whether
+    // the Worker tab is currently open. Recovery must use that durable route first; inferring from
+    // visible tabs or compactable managed-chat history is only a legacy fallback.
+    let persisted_browser_client_id = worker.browser_client_id.clone();
     let conversation_id =
         crate::managed_chat::types::canonical_chatgpt_conversation_id(&conversation_url)
             .ok_or_else(|| "worker recovery conversation URL is invalid".to_string())?;
@@ -2948,18 +2960,27 @@ async fn recover_worker_for_core(
         .iter()
         .map(|client| client.client_id.clone())
         .collect::<std::collections::BTreeSet<_>>();
-    let client_id = visible_client
-        .map(|(client_id, _)| client_id)
-        .or_else(|| remembered_client.filter(|client_id| online.contains(client_id)))
-        .or_else(|| {
-            (online.len() == 1)
-                .then(|| online.iter().next().cloned())
-                .flatten()
-        })
-        .ok_or_else(|| {
-            "worker recovery cannot identify an online Companion browser for this worker"
-                .to_string()
-        })?;
+    let client_id = if let Some(persisted) = persisted_browser_client_id {
+        if !online.contains(&persisted) {
+            return Err(format!(
+                "worker {worker_id}'s pinned Companion browser '{persisted}' is currently offline; MoonDesk will not recover this Worker in another browser/account"
+            ));
+        }
+        persisted
+    } else {
+        visible_client
+            .map(|(client_id, _)| client_id)
+            .or_else(|| remembered_client.filter(|client_id| online.contains(client_id)))
+            .or_else(|| {
+                (online.len() == 1)
+                    .then(|| online.iter().next().cloned())
+                    .flatten()
+            })
+            .ok_or_else(|| {
+                "worker recovery cannot identify an online Companion browser for this legacy worker"
+                    .to_string()
+            })?
+    };
 
     let recovery_guard = match broker
         .begin_recovery_guard(
@@ -9967,6 +9988,164 @@ mod tests {
                 .filter(|family| family.workspace_id == workspace_id)
                 .count(),
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn workers_recovery_uses_persisted_browser_when_tab_is_closed_with_two_browsers_online() {
+        let root = TestTempDir::new("moondesk-workers-recovery-closed-tab-pinned-browser");
+        let workspace_id = WorkspaceId::new();
+        let broker = Arc::new(
+            WorkerBroker::open(root.path().join("worker-state-v1.json"))
+                .expect("open worker broker"),
+        );
+        let managed = Arc::new(
+            ManagedChatBroker::open(root.path().join("managed-chat-state-v1.json"))
+                .expect("open managed broker"),
+        );
+        let companion = Arc::new(
+            CompanionAuth::open(root.path().join("companion-auth-v1.json"))
+                .expect("open companion auth"),
+        );
+        for (client_id, credential, label, fingerprint) in [
+            ("pinned-chrome", "c".repeat(64), "Chrome", "a".repeat(64)),
+            ("other-edge", "d".repeat(64), "Edge", "b".repeat(64)),
+        ] {
+            companion
+                .auto_pair(client_id, &credential, None)
+                .await
+                .expect("pair recovery browser");
+            companion
+                .update_presence(
+                    client_id,
+                    crate::companion::CompanionPresenceUpdate {
+                        account_fingerprint: Some(fingerprint),
+                        browser_label: Some(label.into()),
+                        tabs: Vec::new(),
+                    },
+                    crate::companion::unix_time_ms(),
+                )
+                .await
+                .expect("publish online browser without Worker tab");
+        }
+
+        let core = ChatIdentity::local_core(&workspace_id);
+        let worker_identity =
+            ChatIdentity::from_openai_meta(Some("pinned-worker-account"), "closed-tab-worker");
+        let spawned = broker
+            .spawn_worker_on_browser_account(
+                crate::workers::broker::SpawnWorkerRequest {
+                    operation_id: OperationId::new(),
+                    workspace_id: workspace_id.clone(),
+                    anchor_identity: core.clone(),
+                    label: "closed tab recovery worker".into(),
+                    assignment: "continue after its browser tab is closed".into(),
+                    context: String::new(),
+                    execution_profile: ChatExecutionProfile::default(),
+                },
+                "pinned-chrome",
+                &"a".repeat(64),
+                3,
+            )
+            .await
+            .expect("spawn browser-pinned worker");
+        let launch_id = Uuid::new_v4().to_string();
+        let conversation_id = "6aaef8db-ecf0-83ee-bfcc-d6f94853c599";
+        let conversation_url = format!("https://chatgpt.com/c/{conversation_id}");
+        broker
+            .link_launch_command(
+                &workspace_id,
+                &core,
+                &spawned.worker_id,
+                &spawned.task_id,
+                &launch_id,
+            )
+            .await
+            .expect("link recovery worker");
+        broker
+            .update_launch_by_command(
+                &launch_id,
+                crate::workers::types::WorkerLaunchState::WaitingClaim,
+                None,
+                Some(conversation_url.clone()),
+            )
+            .await
+            .expect("bind durable Worker conversation");
+        broker
+            .claim_worker(
+                &workspace_id,
+                &spawned.worker_id,
+                &spawned.task_id,
+                &spawned.claim_token,
+                worker_identity,
+            )
+            .await
+            .expect("claim/start browser-pinned worker");
+
+        // Deliberately keep managed-chat history empty and both browsers online. The only safe route
+        // is the Worker's independently persisted browser_client_id.
+        assert!(managed.snapshot().await.commands.is_empty());
+        let recovery_broker = companion.worker_recovery_broker();
+        let responder_broker = recovery_broker.clone();
+        let responder = tokio::spawn(async move {
+            for expected_action in ["inspect", "continue"] {
+                let (poll, request_id) = loop {
+                    let other = responder_broker.poll("other-edge").await.unwrap();
+                    assert!(
+                        other.requests.is_empty(),
+                        "closed-tab Worker recovery must never migrate to another online browser"
+                    );
+                    let poll = responder_broker.poll("pinned-chrome").await.unwrap();
+                    if let Some(id) = poll.requests.first().cloned() {
+                        break (poll, id);
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                };
+                let command = responder_broker
+                    .claim("pinned-chrome", &request_id, &poll.epoch)
+                    .await
+                    .expect("claim recovery command on pinned browser");
+                assert_eq!(command.action, expected_action);
+                assert_eq!(command.conversation_url, conversation_url);
+                let result = if expected_action == "inspect" {
+                    json!({
+                        "state": "idle",
+                        "evidence": {
+                            "userTurnCount": 1,
+                            "assistantTurnCount": 1,
+                            "generating": false,
+                            "markerPresent": true
+                        }
+                    })
+                } else {
+                    json!({ "state": "continued", "stopped": false })
+                };
+                assert!(
+                    responder_broker
+                        .result("pinned-chrome", &request_id, &poll.epoch, result)
+                        .await
+                );
+            }
+        });
+
+        let result = recover_worker_for_core(
+            &workspace_id,
+            &core,
+            &spawned.worker_id,
+            broker.as_ref(),
+            managed.as_ref(),
+            companion.as_ref(),
+        )
+        .await
+        .expect("recover closed-tab worker using persisted browser");
+        responder.await.expect("recovery responder");
+        assert_eq!(
+            result.get("browserClientId").and_then(Value::as_str),
+            Some("pinned-chrome")
+        );
+        assert_eq!(
+            result.get("state").and_then(Value::as_str),
+            Some("recovery_sent")
         );
     }
 

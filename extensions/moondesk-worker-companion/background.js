@@ -8,7 +8,7 @@ const BRIDGE_PORTS = [47650, 47651, 47652, 47653, 47654];
 const REQUIRED_PROTOCOL_VERSION = 2;
 // Bump with any shipped companion runtime change that requires Chromium to load new bytes. Keep
 // this aligned with COMPANION_RUNTIME_REVISION in src/server.rs.
-const COMPANION_RUNTIME_REVISION = 25;
+const COMPANION_RUNTIME_REVISION = 29;
 const SOURCE_DEV_MANIFEST_VERSION = '0.1.0';
 const RUNTIME_RELOAD_STORAGE_KEY = 'moondeskWorkerCompanionReloadRevisionV1';
 const INSTALLATION_BOOTSTRAP_FILE = 'moondesk-bootstrap.json';
@@ -28,7 +28,10 @@ const HELLO_TIMEOUT_MS = 1200;
 const API_TIMEOUT_MS = 3000;
 const CLEAR_WORKERS_TIMEOUT_MS = 8000;
 const FAST_POLL_MS = 1500;
+const ACCOUNT_FINGERPRINT_PROBE_TIMEOUT_MS = 2000;
 const PRESENCE_ACCOUNT_FINGERPRINT_MAX_AGE_MS = 30_000;
+const PRESENCE_ACCOUNT_FINGERPRINT_STALE_GRACE_MS = 2 * 60_000;
+const ACCOUNT_FINGERPRINT_MAX_TABS = 4;
 const MAX_RECONCILE_ATTEMPTS = 3;
 const MAX_PARALLEL_COMMANDS = 4;
 const CHATGPT_MODEL_EFFORTS = new Set(['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra', 'pro']);
@@ -211,6 +214,20 @@ function requestError(message, status = 0, code = null) {
   error.status = status;
   error.code = code;
   return error;
+}
+
+async function withTimeout(promise, timeoutMs, message) {
+  let timer;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+      })
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 async function api(
@@ -624,11 +641,17 @@ function workerFailureReason(code, error) {
 async function chatGptAccountFingerprintForTab(tabId) {
   if (!Number.isInteger(tabId)) return null;
   try {
-    const [frame] = await chrome.scripting.executeScript({
+    const execution = chrome.scripting.executeScript({
       target: { tabId },
-      func: async () => {
+      func: async (timeoutMs) => {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), timeoutMs);
         try {
-          const response = await fetch('/api/auth/session', { credentials: 'include', cache: 'no-store' });
+          const response = await fetch('/api/auth/session', {
+            credentials: 'include',
+            cache: 'no-store',
+            signal: controller.signal
+          });
           if (!response.ok) return null;
           const session = await response.json();
           const raw = session?.user?.id || session?.user?.account_id || session?.user?.accountId || session?.account?.id || null;
@@ -638,9 +661,17 @@ async function chatGptAccountFingerprintForTab(tabId) {
           return [...new Uint8Array(digest)].map((value) => value.toString(16).padStart(2, '0')).join('');
         } catch {
           return null;
+        } finally {
+          clearTimeout(timer);
         }
-      }
+      },
+      args: [ACCOUNT_FINGERPRINT_PROBE_TIMEOUT_MS]
     });
+    const [frame] = await withTimeout(
+      execution,
+      ACCOUNT_FINGERPRINT_PROBE_TIMEOUT_MS + 500,
+      'ChatGPT account verification timed out'
+    );
     const fingerprint = frame?.result;
     return typeof fingerprint === 'string' && /^[0-9a-f]{64}$/i.test(fingerprint)
       ? fingerprint.toLowerCase()
@@ -657,10 +688,13 @@ async function currentChatGptAccountFingerprint() {
   } catch {
     return null;
   }
-  const fingerprints = await Promise.all(tabs.slice(0, 32).map(async (tab) => {
-    if (!Number.isInteger(tab?.id) || tab.incognito || tab.discarded || tab.status === 'loading') return null;
-    return chatGptAccountFingerprintForTab(tab.id);
-  }));
+  const candidates = tabs
+    .filter((tab) => Number.isInteger(tab?.id) && !tab.incognito && !tab.discarded && tab.status !== 'loading')
+    .sort((left, right) => Number(Boolean(right.active)) - Number(Boolean(left.active)))
+    .slice(0, ACCOUNT_FINGERPRINT_MAX_TABS);
+  const fingerprints = await Promise.all(
+    candidates.map((tab) => chatGptAccountFingerprintForTab(tab.id))
+  );
   const unique = [...new Set(fingerprints.filter(Boolean))];
   return unique.length === 1 ? unique[0] : null;
 }
@@ -769,28 +803,52 @@ function chatContextFromUrl(value) {
 
 async function accountFingerprintForPresence(tabs, forceRefresh = false) {
   const now = Date.now();
+  const cachedAge = now - presenceAccountFingerprintAt;
   if (
     !forceRefresh &&
     validAccountFingerprint(presenceAccountFingerprint) &&
-    now - presenceAccountFingerprintAt <= PRESENCE_ACCOUNT_FINGERPRINT_MAX_AGE_MS
+    cachedAge <= PRESENCE_ACCOUNT_FINGERPRINT_MAX_AGE_MS
   ) {
     return presenceAccountFingerprint;
   }
-  const fingerprintTab = tabs.find(
-    (tab) => Number.isInteger(tab?.id) && !tab.incognito && !tab.discarded && tab.status !== 'loading'
-  );
-  const fingerprint = Number.isInteger(fingerprintTab?.id)
-    ? await chatGptAccountFingerprintForTab(fingerprintTab.id)
-    : null;
-  if (fingerprint) {
-    presenceAccountFingerprint = fingerprint;
-    presenceAccountFingerprintAt = now;
-    return fingerprint;
-  }
-  if (forceRefresh) {
+
+  const candidates = tabs
+    .filter((tab) => Number.isInteger(tab?.id) && !tab.incognito && !tab.discarded && tab.status !== 'loading')
+    .sort((left, right) => Number(Boolean(right.active)) - Number(Boolean(left.active)))
+    .slice(0, ACCOUNT_FINGERPRINT_MAX_TABS);
+  if (!candidates.length) {
     presenceAccountFingerprint = null;
     presenceAccountFingerprintAt = now;
+    return null;
   }
+
+  const fingerprints = await Promise.all(
+    candidates.map((tab) => chatGptAccountFingerprintForTab(tab.id))
+  );
+  const unique = [...new Set(fingerprints.filter(Boolean))];
+  if (unique.length === 1) {
+    presenceAccountFingerprint = unique[0];
+    presenceAccountFingerprintAt = now;
+    return unique[0];
+  }
+  if (unique.length > 1) {
+    // Fail closed if one browser profile somehow reports conflicting account identities.
+    presenceAccountFingerprint = null;
+    presenceAccountFingerprintAt = now;
+    return null;
+  }
+
+  // A transient ChatGPT session-endpoint stall must not make a healthy Companion flap offline or
+  // immediately lose its previously proven Worker account. Keep a short bounded grace; every Worker
+  // launch/reuse still performs a fresh exact account check before any tab is created or Send occurs.
+  if (
+    validAccountFingerprint(presenceAccountFingerprint) &&
+    cachedAge <= PRESENCE_ACCOUNT_FINGERPRINT_STALE_GRACE_MS
+  ) {
+    return presenceAccountFingerprint;
+  }
+  presenceAccountFingerprint = null;
+  presenceAccountFingerprintAt = now;
   return null;
 }
 
@@ -811,9 +869,8 @@ async function collectPresence(state, forceAccountRefresh = false) {
       try {
         response = await sendToTab(tab.id, { type: 'MOONDESK_CONTEXT' }, 600);
       } catch {
-        if (tab.active) {
-          try { response = await ensureContent(tab.id); } catch {}
-        }
+        // Presence is a liveness heartbeat, not a content-script repair path. A remounting or
+        // unresponsive ChatGPT tab must not delay the browser heartbeat while telemetry recovers.
       }
       const reported = response?.ok ? response.context : null;
       generating = Boolean(
@@ -843,7 +900,8 @@ async function collectPresence(state, forceAccountRefresh = false) {
   );
   if (Number.isInteger(focusedTab?.id)) {
     try {
-      await ensureContent(focusedTab.id);
+      // Correlation evidence is best-effort telemetry. Never repair/reinject the focused ChatGPT
+      // tab inline with presence publication; a slow remount must not hold the browser heartbeat.
       const response = await sendToTab(
         focusedTab.id,
         { type: 'MOONDESK_CORRELATION_EVIDENCE' },
@@ -1045,10 +1103,20 @@ async function recordForCommand(state, command, placement, reconcileRequired = f
   if (command?.targetAccountFingerprint && !expectedCommandFingerprint) {
     throw new Error('worker_account_binding_unconfirmed');
   }
+  // If ChatGPT is already open, fail closed on an account mismatch before creating another tab. If
+  // every ChatGPT tab is closed, defer account proof to the exact target tab we open below; that tab
+  // is still verified before any Worker Send.
   if (expectedCommandFingerprint) {
-    const currentFingerprint = await currentChatGptAccountFingerprint();
-    if (!currentFingerprint) throw new Error('worker_account_unconfirmed');
-    if (currentFingerprint !== expectedCommandFingerprint) throw new Error('worker_account_changed');
+    let accountProbeTabs = [];
+    try { accountProbeTabs = await chrome.tabs.query({ url: 'https://chatgpt.com/*' }); } catch {}
+    const hasReadyAccountProbe = accountProbeTabs.some((tab) =>
+      Number.isInteger(tab?.id) && !tab.incognito && !tab.discarded && tab.status !== 'loading'
+    );
+    if (hasReadyAccountProbe) {
+      const currentFingerprint = await currentChatGptAccountFingerprint();
+      if (!currentFingerprint) throw new Error('worker_account_unconfirmed');
+      if (currentFingerprint !== expectedCommandFingerprint) throw new Error('worker_account_changed');
+    }
   }
   let thread = state.threadRecords?.[threadKey] || null;
   const durableExistingConversation = openMode === 'existing_thread'
@@ -1062,7 +1130,11 @@ async function recordForCommand(state, command, placement, reconcileRequired = f
     threadRecordOwnedByWorkspace(thread, command.launch.workspaceId) &&
     canonicalConversationUrl(thread.conversationUrl) !== durableExistingConversation
   ) {
-    throw new Error('Existing worker thread durable binding conflicts with companion-local history');
+    // Host Worker state is the durable authority. A browser crash/reinstall can leave an older
+    // same-workspace thread cache behind even though MoonDesk still owns the exact Worker URL.
+    // Drop only that stale cache entry; account affinity is rechecked below before any tab opens.
+    delete state.threadRecords[threadKey];
+    thread = null;
   }
   if (
     openMode === 'existing_thread' &&
@@ -1086,11 +1158,8 @@ async function recordForCommand(state, command, placement, reconcileRequired = f
       ? record.accountFingerprint.toLowerCase()
       : null;
     if (!expectedFingerprint) throw new Error('worker_account_binding_unconfirmed');
-    const actualFingerprint = Number.isInteger(record.tabId)
-      ? await chatGptAccountFingerprintForTab(record.tabId)
-      : await currentChatGptAccountFingerprint();
-    if (!actualFingerprint) throw new Error('worker_account_unconfirmed');
-    if (actualFingerprint !== expectedFingerprint) throw new Error('worker_account_changed');
+    // The exact recovered/created tab is verified below. Do not require another ChatGPT tab to be
+    // open here: after a browser restart the durable Worker tab may be the first ChatGPT page we open.
   }
   if (!record && reconcileRequired) {
     throw new Error('Reconciliation has no durable browser launch record and cannot create a fresh worker thread');
@@ -1115,15 +1184,26 @@ async function recordForCommand(state, command, placement, reconcileRequired = f
     if (openMode === 'existing_thread') {
       const rememberedFingerprint = validAccountFingerprint(thread?.accountFingerprint)
         ? thread.accountFingerprint.toLowerCase()
-        : rememberedAccountFingerprintForConversation(state, existingConversation);
+        : rememberedAccountFingerprintForConversation(state, existingConversation)
+          || expectedCommandFingerprint;
       if (!rememberedFingerprint) throw new Error('worker_account_binding_unconfirmed');
       if (accountFingerprint && accountFingerprint !== rememberedFingerprint) {
         throw new Error('worker_account_changed');
       }
       accountFingerprint = rememberedFingerprint;
-      const currentFingerprint = await currentChatGptAccountFingerprint();
-      if (!currentFingerprint) throw new Error('worker_account_unconfirmed');
-      if (currentFingerprint !== accountFingerprint) throw new Error('worker_account_changed');
+      // Reuse may come from legacy managed history without a host target fingerprint. If any ready
+      // ChatGPT page already exists, prove the remembered account before opening the durable Worker
+      // URL. With no usable ChatGPT page, defer proof to the exact Worker tab opened below.
+      let accountProbeTabs = [];
+      try { accountProbeTabs = await chrome.tabs.query({ url: 'https://chatgpt.com/*' }); } catch {}
+      const hasReadyAccountProbe = accountProbeTabs.some((tab) =>
+        Number.isInteger(tab?.id) && !tab.incognito && !tab.discarded && tab.status !== 'loading'
+      );
+      if (hasReadyAccountProbe) {
+        const currentFingerprint = await currentChatGptAccountFingerprint();
+        if (!currentFingerprint) throw new Error('worker_account_unconfirmed');
+        if (currentFingerprint !== accountFingerprint) throw new Error('worker_account_changed');
+      }
     }
     record = {
       commandId: command.id,
@@ -1764,15 +1844,23 @@ async function recoveryTabFor(state, command, reload = false) {
   if (!expectedUrl) throw new Error('worker_recovery_conversation_invalid');
   const expectedFingerprint = rememberedAccountFingerprintForConversation(state, expectedUrl);
   if (!expectedFingerprint) throw new Error('worker_account_binding_unconfirmed');
-  const currentFingerprint = await currentChatGptAccountFingerprint();
-  if (!currentFingerprint) throw new Error('worker_account_unconfirmed');
-  if (currentFingerprint !== expectedFingerprint) throw new Error('worker_account_changed');
 
+  // Recovery may be the first ChatGPT page opened after a browser restart. Opening the exact durable
+  // Worker URL is reversible and does not send anything; verify that target tab's account immediately
+  // afterwards and fail closed before inspection/continuation if the browser account changed.
   const tabs = await chrome.tabs.query({ url: 'https://chatgpt.com/*' });
   let tab = tabs.find((candidate) =>
     Number.isInteger(candidate?.id) && canonicalConversationUrl(candidate.url) === expectedUrl
   ) || null;
   if (!tab) {
+    const hasReadyAccountProbe = tabs.some((candidate) =>
+      Number.isInteger(candidate?.id) && !candidate.incognito && !candidate.discarded && candidate.status !== 'loading'
+    );
+    if (hasReadyAccountProbe) {
+      const currentFingerprint = await currentChatGptAccountFingerprint();
+      if (!currentFingerprint) throw new Error('worker_account_unconfirmed');
+      if (currentFingerprint !== expectedFingerprint) throw new Error('worker_account_changed');
+    }
     tab = await chrome.tabs.create({ url: expectedUrl, active: false });
   }
   if (!Number.isInteger(tab?.id)) throw new Error('worker_recovery_tab_unavailable');

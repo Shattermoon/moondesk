@@ -242,10 +242,17 @@ test('Clear Workers mirrors Clear Swarm instead of requiring the current Core ta
   assert.doesNotMatch(popupSource, /Retry safe launch|MOONDESK_RETRY_BLOCKED/);
 });
 
+test('popup stale browser summary counts offline clients, not every non-current browser', () => {
+  assert.match(popupSource, /const stale = all\.filter\(\(client\) => !client\.online\);/);
+  assert.doesNotMatch(popupSource, /const stale = all\.filter\(\(client\) => !client\.current\);/);
+});
+
 test('Companion liveness has redundant MV3 wake and popup presence refresh paths', async () => {
   assert.match(contentSource, /MOONDESK_PRESENCE_WAKE/);
   assert.match(source, /case 'MOONDESK_PRESENCE_WAKE'/);
   assert.match(source, /async function status\(\)[\s\S]*await collectPresence\(state, true\);[\s\S]*STATUS_PATH/);
+  assert.match(popupSource, /bg\(\{ type: 'MOONDESK_STATUS' \}, POPUP_STATUS_TIMEOUT_MS\)/);
+  assert.match(popupSource, /pill\.textContent = 'Unavailable'/);
 
   const scheduled = [];
   const { dispatchRuntimeMessage } = loadBackground({
@@ -296,6 +303,88 @@ test('presence account fingerprint is cached between fast pumps but forced popup
   await evaluate(`collectPresence(${stateExpr}, true)`);
   assert.equal(accountReads, 2, 'popup/explicit refresh must bypass the presence fingerprint cache');
   assert.equal(presencePosts, 3);
+});
+
+test('stalled ChatGPT account verification cannot block the presence heartbeat', async () => {
+  let presencePosts = 0;
+  let presenceBody = null;
+  const existingTabs = {
+    5: { id: 5, url: 'https://chatgpt.com/', active: true, windowId: 1, status: 'complete' }
+  };
+  const fetchImpl = async (url, options = {}) => {
+    const parsed = new URL(url);
+    if (parsed.pathname !== '/__moondesk/companion/v1/presence') {
+      throw new Error(`unexpected request: ${parsed.pathname}`);
+    }
+    presencePosts += 1;
+    presenceBody = JSON.parse(options.body || '{}');
+    return {
+      ok: true,
+      status: 200,
+      async text() { return JSON.stringify({ presence: presenceBody }); }
+    };
+  };
+  const { evaluate } = loadBackground({
+    existingTabs,
+    fetchImpl,
+    scriptingExecuteImpl: async (options) => {
+      if (typeof options?.func === 'function' && String(options.func).includes('moondesk-chatgpt-account-v1')) {
+        return new Promise(() => {});
+      }
+      return [];
+    },
+    setTimeoutImpl(callback, delayMs) {
+      if (delayMs === 2500) queueMicrotask(callback);
+      return 1;
+    }
+  });
+
+  await evaluate("collectPresence({ baseUrl: 'http://127.0.0.1:47650', credential: 'token' }, true)");
+  assert.equal(presencePosts, 1, 'heartbeat must still reach MoonDesk after a bounded account-probe timeout');
+  assert.equal(presenceBody.accountFingerprint, undefined);
+});
+
+test('transient account probe timeout keeps a recently verified fingerprint for bounded liveness grace', async () => {
+  let hangProbe = false;
+  const fingerprint = 'a'.repeat(64);
+  const { evaluate } = loadBackground({
+    scriptingExecuteImpl: async (options) => {
+      if (typeof options?.func === 'function' && String(options.func).includes('moondesk-chatgpt-account-v1')) {
+        if (hangProbe) return new Promise(() => {});
+        return [{ result: fingerprint }];
+      }
+      return [];
+    },
+    setTimeoutImpl(callback, delayMs) {
+      if (hangProbe && delayMs === 2500) queueMicrotask(callback);
+      return 1;
+    }
+  });
+  const tabsExpr = "[{ id: 5, url: 'https://chatgpt.com/', active: true, windowId: 1, status: 'complete' }]";
+  assert.equal(await evaluate(`accountFingerprintForPresence(${tabsExpr}, false)`), fingerprint);
+  hangProbe = true;
+  assert.equal(
+    await evaluate(`accountFingerprintForPresence(${tabsExpr}, true)`),
+    fingerprint,
+    'one transient forced refresh must not immediately discard a recently proven account'
+  );
+});
+
+test('presence heartbeat never repairs ChatGPT content inline', () => {
+  const start = source.indexOf('async function collectPresence');
+  const end = source.indexOf('function placementForOffer', start);
+  assert.ok(start >= 0 && end > start, 'collectPresence source range must be found');
+  const collectPresenceSource = source.slice(start, end);
+  assert.match(
+    collectPresenceSource,
+    /sendToTab\(tab\.id, \{ type: 'MOONDESK_CONTEXT' \}, 600\)/,
+    'presence may use only the bounded read-only context probe'
+  );
+  assert.doesNotMatch(
+    collectPresenceSource,
+    /ensureContent\(/,
+    'presence must skip unavailable telemetry instead of repairing content inline'
+  );
 });
 
 test('clearWorkers destroys all companion-side worker history with an empty host request', async () => {
@@ -1152,7 +1241,7 @@ test('bridge discovery prefers an exact runtime match over another MoonDesk vers
             app: 'moondesk-worker-companion',
             appVersion: manifest.version,
             protocolVersion: 2,
-            companionRuntimeRevision: 25
+            companionRuntimeRevision: 29
           };
         }
       };
@@ -1180,7 +1269,7 @@ test('bridge discovery prefers an exact runtime match over another MoonDesk vers
 
   const { evaluate, runtimeReloads } = loadBackground({ fetchImpl });
   const hello = await evaluate('discoverBridge(freshState())');
-  assert.equal(hello.companionRuntimeRevision, 25);
+  assert.equal(hello.companionRuntimeRevision, 29);
   assert.equal(runtimeReloads.length, 0);
 });
 
@@ -1293,7 +1382,7 @@ test('compatible bridge clears the one-shot runtime reload marker for a future m
             app: 'moondesk-worker-companion',
             appVersion: manifest.version,
             protocolVersion: 2,
-            companionRuntimeRevision: 25
+            companionRuntimeRevision: 29
           };
         }
       };
@@ -1306,7 +1395,7 @@ test('compatible bridge clears the one-shot runtime reload marker for a future m
   });
 
   const hello = await evaluate('discoverBridge(freshState())');
-  assert.equal(hello.companionRuntimeRevision, 25);
+  assert.equal(hello.companionRuntimeRevision, 29);
   const stored = await evaluate(`chrome.storage.local.get('${reloadKey}')`);
   assert.equal(stored[reloadKey], undefined);
 });
@@ -1324,7 +1413,7 @@ test('automatic pairing proves the extension was loaded from the MoonDesk-prepar
             app: 'moondesk-worker-companion',
             appVersion: manifest.version,
             protocolVersion: 2,
-            companionRuntimeRevision: 25
+            companionRuntimeRevision: 29
           };
         }
       };
@@ -1366,7 +1455,7 @@ test('source and release-ZIP installs without a bootstrap capability expose Manu
         app: 'moondesk-worker-companion',
         appVersion: manifest.version,
         protocolVersion: 2,
-        companionRuntimeRevision: 25
+        companionRuntimeRevision: 29
       };
       return {
         ok: true,
@@ -1487,7 +1576,7 @@ test('release version mismatch reloads the unpacked companion even when protocol
             app: 'moondesk-worker-companion',
             appVersion: '0.13.0',
             protocolVersion: 2,
-            companionRuntimeRevision: 25
+            companionRuntimeRevision: 29
           };
         }
       };
@@ -3700,6 +3789,85 @@ test('existing-thread reuse treats the host durable URL as authority instead of 
   assert.equal(new URL(createdTabs[0].url).pathname, '/c/aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeee1');
 });
 
+test('existing-thread reuse reopens its durable Worker when every ChatGPT tab is closed', async () => {
+  const durableWorkerUrl = 'https://chatgpt.com/c/aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeee3';
+  const fingerprint = 'a'.repeat(64);
+  const { createdTabs, evaluate } = loadBackground({ accountFingerprint: fingerprint });
+  const recordForCommand = evaluate('recordForCommand');
+  const command = {
+    id: 'command-closed-tab-reuse',
+    targetAccountFingerprint: fingerprint,
+    launch: {
+      workspaceId: 'workspace-current',
+      taskMarker: 'marker-closed-tab-reuse',
+      threadKey: 'worker:closed-tab-reuse',
+      openMode: 'existing_thread',
+      existingConversationUrl: durableWorkerUrl
+    }
+  };
+  const state = {
+    launchRecords: {
+      prior: {
+        commandId: 'prior',
+        workspaceId: 'workspace-current',
+        threadKey: 'worker:closed-tab-reuse',
+        openMode: 'new_thread',
+        phase: 'succeeded',
+        conversationUrl: durableWorkerUrl,
+        accountFingerprint: fingerprint
+      }
+    },
+    threadRecords: {}
+  };
+
+  const reused = await recordForCommand(state, command, null);
+  assert.equal(createdTabs.length, 1, 'reuse must open the exact durable Worker itself');
+  assert.equal(createdTabs[0].active, false);
+  assert.equal(new URL(createdTabs[0].url).pathname, '/c/aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeee3');
+  assert.equal(reused.record.accountFingerprint, fingerprint);
+  assert.equal(reused.tab.id, createdTabs[0].id);
+});
+
+test('existing-thread reuse repairs stale same-workspace companion history after a browser crash', async () => {
+  const durableWorkerUrl = 'https://chatgpt.com/c/aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeee4';
+  const staleWorkerUrl = 'https://chatgpt.com/c/aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeee9';
+  const { createdTabs, evaluate } = loadBackground({
+    accountFingerprint: 'a'.repeat(64),
+    existingTabs: { 77: { id: 77, url: staleWorkerUrl } }
+  });
+  const recordForCommand = evaluate('recordForCommand');
+  const command = {
+    id: 'command-crash-reuse',
+    targetAccountFingerprint: 'a'.repeat(64),
+    launch: {
+      workspaceId: 'workspace-current',
+      taskMarker: 'marker-crash-reuse',
+      threadKey: 'worker:crash-reuse',
+      openMode: 'existing_thread',
+      existingConversationUrl: durableWorkerUrl
+    }
+  };
+  const state = {
+    launchRecords: {},
+    threadRecords: {
+      'worker:crash-reuse': {
+        workspaceId: 'workspace-current',
+        projectId: null,
+        conversationUrl: staleWorkerUrl,
+        tabId: 77,
+        accountFingerprint: 'a'.repeat(64)
+      }
+    }
+  };
+
+  const reused = await recordForCommand(state, command, null);
+  assert.equal(reused.record.conversationUrl, durableWorkerUrl);
+  assert.notEqual(reused.tab.id, 77, 'stale cached tab must not override MoonDesk durable Worker binding');
+  assert.equal(createdTabs.length, 1);
+  assert.equal(new URL(createdTabs[0].url).pathname, '/c/aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeee4');
+  assert.equal(state.threadRecords['worker:crash-reuse'], undefined);
+});
+
 test('existing-thread reuse never adopts a remembered local-chatgpt placeholder instead of its durable conversation', async () => {
   const durableUrl = 'https://chatgpt.com/c/aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeee5';
   const localUrl = 'https://chatgpt.com/c/local-chatgpt%3A422be40f-2871-4c05-9110-62ac6e7854cd';
@@ -4132,6 +4300,56 @@ test('worker recovery trusts the exact conversation when an old task marker is v
   assert.equal(continued.ok, true);
   assert.equal(continued.result.state, 'continued');
   assert.equal(commitCalls, 1);
+});
+
+test('worker recovery reopens the exact durable conversation when every ChatGPT tab is closed', async () => {
+  const conversationId = '6aaef8db-ecf0-83ee-bfcc-d6f94853c577';
+  const conversationUrl = `https://chatgpt.com/c/${conversationId}`;
+  const fingerprint = 'a'.repeat(64);
+  const marker = 'moondesk-worker-task:closed-tab-recovery';
+  const { createdTabs, evaluate } = loadBackground({
+    accountFingerprint: fingerprint,
+    sendMessageImpl: async (_tabId, message) => {
+      if (message.type === 'MOONDESK_CONTEXT') {
+        return {
+          ok: true,
+          context: { conversationId, sourceUrl: conversationUrl, projectId: null, generating: false }
+        };
+      }
+      if (message.type === 'MOONDESK_RECOVER_WORKER_INSPECT') {
+        return {
+          ok: true,
+          result: {
+            state: 'idle',
+            evidence: {
+              conversationId,
+              markerPresent: true,
+              generating: false,
+              userTurnCount: 1,
+              assistantTurnCount: 1
+            }
+          }
+        };
+      }
+      throw new Error(`unexpected closed-tab recovery message: ${message.type}`);
+    }
+  });
+  const state = {
+    launchRecords: { prior: { conversationUrl, accountFingerprint: fingerprint } },
+    threadRecords: {}
+  };
+  const command = {
+    id: 'closed-tab-recovery-command',
+    action: 'inspect',
+    conversationUrl,
+    taskMarker: marker
+  };
+
+  const result = await evaluate(`executeWorkerRecoveryCommand(${JSON.stringify(state)}, ${JSON.stringify(command)})`);
+  assert.equal(result.state, 'idle');
+  assert.equal(createdTabs.length, 1, 'recovery must reopen the durable Worker without user help');
+  assert.equal(createdTabs[0].active, false);
+  assert.equal(createdTabs[0].url, conversationUrl);
 });
 
 test('worker recovery refuses a different ChatGPT account before navigating to the Worker conversation', async () => {

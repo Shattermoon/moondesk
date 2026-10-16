@@ -473,13 +473,29 @@ impl ManagedChatBroker {
         let command = guard.commands.get(&command_id).ok_or_else(|| {
             ManagedChatError::Storage("managed chat dedupe index is corrupt".into())
         })?;
-        if command.state == ManagedChatCommandState::Paused
-            || (command.state == ManagedChatCommandState::Failed && command.reconcile_history)
+        if matches!(
+            command.state,
+            ManagedChatCommandState::Paused | ManagedChatCommandState::Succeeded
+        ) || (command.state == ManagedChatCommandState::Failed && command.reconcile_history)
         {
             return Ok(true);
         }
+        let post_send = matches!(
+            command.state,
+            ManagedChatCommandState::SendStarted | ManagedChatCommandState::NeedsReconcile
+        ) || (command.state == ManagedChatCommandState::Leased
+            && command.reconcile_history);
         drop(guard);
-        self.cancel_pre_send_by_dedupe(dedupe_key).await
+        if post_send {
+            // Retirement never replays a browser Send. If the current task may already have crossed
+            // that boundary, terminalize the managed command first so a late Companion cannot wake
+            // or reconcile it after the Worker has been retired. A message that already reached
+            // ChatGPT cannot be unsent, but the retired Worker identity will reject start/project use.
+            self.fence_unclaimed_worker_after_send_by_dedupe(dedupe_key)
+                .await
+        } else {
+            self.cancel_pre_send_by_dedupe(dedupe_key).await
+        }
     }
 
     pub async fn fence_unclaimed_worker_after_send_by_dedupe(
@@ -1660,6 +1676,113 @@ mod tests {
                 .get(&ambiguous.id)
                 .map(|command| command.state),
             Some(ManagedChatCommandState::Paused)
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn worker_retire_accepts_succeeded_launch_and_fences_ambiguous_post_send_launch() {
+        let root = temp_root("moondesk-managed-chat-worker-retire-settlement");
+        let broker = ManagedChatBroker::open(root.join("state.json")).expect("open broker");
+
+        let succeeded_key = "worker:durable:task:succeeded";
+        let succeeded = broker
+            .enqueue(EnqueueManagedChatRequest {
+                dedupe_key: succeeded_key.into(),
+                launch: launch("retire-succeeded"),
+            })
+            .await
+            .expect("enqueue succeeded command");
+        let succeeded_offer = broker
+            .redeem("extension-a", 1_000)
+            .await
+            .expect("redeem succeeded command")
+            .expect("succeeded lease");
+        let succeeded_lease = succeeded_offer
+            .command
+            .lease
+            .as_ref()
+            .expect("succeeded lease")
+            .lease_id
+            .clone();
+        broker
+            .mark_send_started(&succeeded.id, &succeeded_lease, "extension-a")
+            .await
+            .expect("cross succeeded send boundary");
+        broker
+            .acknowledge(
+                &succeeded.id,
+                &succeeded_lease,
+                "extension-a",
+                ManagedChatAckOutcome::Succeeded {
+                    details: Some("worker send acceptance confirmed".into()),
+                    conversation_url: Some(
+                        "https://chatgpt.com/c/aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeee1".into(),
+                    ),
+                },
+            )
+            .await
+            .expect("ack succeeded Worker wake");
+        assert!(
+            broker
+                .settle_for_worker_retire_by_dedupe(succeeded_key)
+                .await
+                .expect("already-succeeded Worker wake is safe to retire around")
+        );
+        assert_eq!(
+            broker
+                .snapshot()
+                .await
+                .commands
+                .get(&succeeded.id)
+                .map(|command| command.state),
+            Some(ManagedChatCommandState::Succeeded)
+        );
+
+        let ambiguous_key = "worker:durable:task:ambiguous";
+        let ambiguous = broker
+            .enqueue(EnqueueManagedChatRequest {
+                dedupe_key: ambiguous_key.into(),
+                launch: launch("retire-ambiguous"),
+            })
+            .await
+            .expect("enqueue ambiguous command");
+        let ambiguous_offer = broker
+            .redeem("extension-a", 2_000)
+            .await
+            .expect("redeem ambiguous command")
+            .expect("ambiguous lease");
+        let ambiguous_lease = ambiguous_offer
+            .command
+            .lease
+            .as_ref()
+            .expect("ambiguous lease")
+            .lease_id
+            .clone();
+        broker
+            .mark_send_started(&ambiguous.id, &ambiguous_lease, "extension-a")
+            .await
+            .expect("cross ambiguous send boundary");
+        assert!(
+            broker
+                .settle_for_worker_retire_by_dedupe(ambiguous_key)
+                .await
+                .expect("ambiguous post-Send Worker wake is fenced before retire")
+        );
+        let snapshot = broker.snapshot().await;
+        let fenced = snapshot
+            .commands
+            .get(&ambiguous.id)
+            .expect("fenced command remains as terminal history");
+        assert_eq!(fenced.state, ManagedChatCommandState::Failed);
+        assert!(fenced.reconcile_history);
+        assert!(fenced.lease.is_none());
+        assert_eq!(
+            fenced
+                .terminal
+                .as_ref()
+                .and_then(|terminal| terminal.details.as_deref()),
+            Some("worker_registration_cancelled_after_send")
         );
         let _ = std::fs::remove_dir_all(root);
     }

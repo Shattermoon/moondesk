@@ -66,7 +66,7 @@ pub const COMPANION_USER_BROWSER_ROUTE: &str = "/__moondesk/companion/v1/browser
 pub const COMPANION_TOKEN_HEADER: &str = "x-moondesk-companion-token";
 // Bump with any shipped companion runtime change that requires Chromium to load new bytes. Keep
 // this aligned with COMPANION_RUNTIME_REVISION in background.js.
-pub const COMPANION_RUNTIME_REVISION: u32 = 33;
+pub const COMPANION_RUNTIME_REVISION: u32 = 34;
 const MAX_COMPANION_BODY_BYTES: usize = 16 * 1024;
 const MAX_COMPANION_USER_BROWSER_BODY_BYTES: usize = 2 * 1024 * 1024;
 
@@ -806,7 +806,9 @@ async fn companion_clients(State(state): State<ServerState>, headers: HeaderMap)
                 "current": client_id == current_client_id,
                 "online": presence.is_some(),
                 "browserLabel": presence.and_then(|value| value.browser_label.clone()),
-                "lastSeenMs": presence.map(|value| value.last_seen_ms)
+                "lastSeenMs": presence.map(|value| value.last_seen_ms),
+                "tabsFresh": presence.is_some_and(|value| value.tabs_fresh),
+                "workerAccountFresh": presence.is_some_and(|value| value.account_fingerprint_fresh)
             })
         })
         .collect::<Vec<_>>();
@@ -903,14 +905,36 @@ async fn update_companion_presence(
     let now_ms = unix_time_ms();
     match auth.update_presence(&client_id, update, now_ms).await {
         Ok(presence) => {
-            let open_conversation_ids = auth
-                .fresh_presence(now_ms)
-                .await
-                .into_iter()
-                .flat_map(|client| client.tabs.into_iter().map(|tab| tab.conversation_id))
+            let fresh = auth.fresh_presence(now_ms).await;
+            let current_open_conversation_ids = if presence.tabs_fresh {
+                presence
+                    .tabs
+                    .iter()
+                    .map(|tab| tab.conversation_id.clone())
+                    .collect::<BTreeSet<_>>()
+            } else {
+                BTreeSet::new()
+            };
+            let fresh_open_conversation_ids = fresh
+                .iter()
+                .filter(|client| client.tabs_fresh)
+                .flat_map(|client| client.tabs.iter().map(|tab| tab.conversation_id.clone()))
                 .collect::<BTreeSet<_>>();
+            let paired = auth.paired_client_ids().await;
+            let legacy_absence_authoritative = !paired.is_empty()
+                && paired.iter().all(|paired_client_id| {
+                    fresh
+                        .iter()
+                        .any(|client| client.client_id == *paired_client_id && client.tabs_fresh)
+                });
             if let Err(error) = worker_broker
-                .sync_browser_presence(&open_conversation_ids)
+                .sync_browser_presence_for_client(
+                    &client_id,
+                    presence.tabs_fresh,
+                    &current_open_conversation_ids,
+                    &fresh_open_conversation_ids,
+                    legacy_absence_authoritative,
+                )
                 .await
             {
                 return json_response(
@@ -1023,6 +1047,9 @@ async fn eligible_anchor_conversations_for_client(
         std::collections::BTreeMap::new();
 
     for client in presence {
+        if !client.tabs_fresh {
+            continue;
+        }
         for tab in client.tabs {
             let score = if tab.active && tab.window_focused {
                 2
@@ -3514,6 +3541,8 @@ mod tests {
             Json(CompanionPresenceUpdate {
                 account_fingerprint: None,
                 browser_label: Some("Chrome".into()),
+                account_fingerprint_fresh: false,
+                tabs_fresh: true,
                 tabs: vec![crate::companion::CompanionTabPresence {
                     conversation_id: worker_conversation.into(),
                     conversation_url: format!("https://chatgpt.com/c/{worker_conversation}"),
@@ -3528,12 +3557,42 @@ mod tests {
         .await;
         assert_eq!(attached.status(), StatusCode::OK);
 
+        let stale = update_companion_presence(
+            State(server_state.clone()),
+            headers.clone(),
+            Json(CompanionPresenceUpdate {
+                account_fingerprint: None,
+                browser_label: Some("Chrome".into()),
+                account_fingerprint_fresh: false,
+                tabs_fresh: false,
+                tabs: Vec::new(),
+            }),
+        )
+        .await;
+        assert_eq!(stale.status(), StatusCode::OK);
+        let family = broker
+            .family_for_anchor(&workspace_id, &core)
+            .await
+            .expect("read family after stale telemetry")
+            .expect("worker family exists");
+        assert_eq!(
+            family
+                .workers
+                .get(&spawned.worker_id)
+                .expect("worker exists after stale telemetry")
+                .attachment_state,
+            crate::workers::types::BrowserAttachmentState::Attached,
+            "a live browser heartbeat with stale ChatGPT tab telemetry must not manufacture a detach"
+        );
+
         let closed = update_companion_presence(
             State(server_state.clone()),
             headers.clone(),
             Json(CompanionPresenceUpdate {
                 account_fingerprint: None,
                 browser_label: Some("Chrome".into()),
+                account_fingerprint_fresh: false,
+                tabs_fresh: true,
                 tabs: Vec::new(),
             }),
         )
@@ -3561,6 +3620,8 @@ mod tests {
             Json(CompanionPresenceUpdate {
                 account_fingerprint: None,
                 browser_label: Some("Chrome".into()),
+                account_fingerprint_fresh: false,
+                tabs_fresh: true,
                 tabs: vec![crate::companion::CompanionTabPresence {
                     conversation_id: worker_conversation.into(),
                     conversation_url: format!("https://chatgpt.com/c/{worker_conversation}"),

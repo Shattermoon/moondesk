@@ -5,7 +5,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, oneshot};
 use uuid::Uuid;
 
-pub const USER_BROWSER_REQUEST_TIMEOUT_MS: u64 = 25_000;
+pub const USER_BROWSER_REQUEST_TIMEOUT_MS: u64 = 60_000;
 pub const USER_BROWSER_PRESENCE_MS: u64 = 75_000;
 pub const USER_BROWSER_MAX_CLIENTS: usize = 8;
 pub const USER_BROWSER_MAX_PENDING: usize = 32;
@@ -414,6 +414,17 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn request_timeout_outlives_mv3_alarm_fallback() {
+        // The unpacked MV3 Companion alarm falls back to a 30-second wake cadence. A browser command
+        // must survive at least one delayed alarm wake plus startup/claim work after service-worker
+        // suspension; otherwise Codex can time out before the browser ever sees the request.
+        const {
+            assert!(USER_BROWSER_REQUEST_TIMEOUT_MS >= 60_000);
+            assert!(USER_BROWSER_REQUEST_TIMEOUT_MS < USER_BROWSER_PRESENCE_MS);
+        }
+    }
 
     #[tokio::test]
     async fn claimed_request_is_never_offered_twice() {

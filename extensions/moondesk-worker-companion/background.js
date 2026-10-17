@@ -16,7 +16,7 @@ const BRIDGE_PORTS = [47650, 47651, 47652, 47653, 47654];
 const REQUIRED_PROTOCOL_VERSION = 2;
 // Bump with any shipped companion runtime change that requires Chromium to load new bytes. Keep
 // this aligned with COMPANION_RUNTIME_REVISION in src/server.rs.
-const COMPANION_RUNTIME_REVISION = 33;
+const COMPANION_RUNTIME_REVISION = 34;
 const SOURCE_DEV_MANIFEST_VERSION = '0.1.0';
 const RUNTIME_RELOAD_STORAGE_KEY = 'moondeskWorkerCompanionReloadRevisionV1';
 const INSTALLATION_BOOTSTRAP_FILE = 'moondesk-bootstrap.json';
@@ -39,6 +39,7 @@ const CHROME_TAB_MUTATION_TIMEOUT_MS = 5000;
 const CONNECTION_TIMEOUT_MS = 15000;
 const CLEAR_WORKERS_TIMEOUT_MS = 8000;
 const FAST_POLL_MS = 1500;
+const PRESENCE_POLL_MS = 5000;
 const ACCOUNT_FINGERPRINT_PROBE_TIMEOUT_MS = 2000;
 const PRESENCE_ACCOUNT_FINGERPRINT_MAX_AGE_MS = 30_000;
 const PRESENCE_ACCOUNT_FINGERPRINT_STALE_GRACE_MS = 2 * 60_000;
@@ -85,38 +86,117 @@ function freshState() {
   };
 }
 
-async function readState() {
+function normalizeStoredState(persisted = {}) {
+  const state = { ...freshState(), ...(persisted || {}) };
+  if (!state.blockedCommands || typeof state.blockedCommands !== 'object' || Array.isArray(state.blockedCommands)) {
+    state.blockedCommands = {};
+  }
+  if (persisted?.blockedCommand?.commandId && !state.blockedCommands[persisted.blockedCommand.commandId]) {
+    state.blockedCommands[persisted.blockedCommand.commandId] = persisted.blockedCommand;
+  }
+  delete state.blockedCommand;
+  return state;
+}
+
+async function readStoredState() {
   const stored = await chromeApi(
     chrome.storage.local.get(STORAGE_KEY),
     CHROME_API_TIMEOUT_MS,
     'MoonDesk Companion state read timed out'
   );
-  const persisted = stored[STORAGE_KEY] || {};
-  const state = { ...freshState(), ...persisted };
-  if (!state.blockedCommands || typeof state.blockedCommands !== 'object' || Array.isArray(state.blockedCommands)) {
-    state.blockedCommands = {};
-  }
-  if (persisted.blockedCommand?.commandId && !state.blockedCommands[persisted.blockedCommand.commandId]) {
-    state.blockedCommands[persisted.blockedCommand.commandId] = persisted.blockedCommand;
-  }
-  delete state.blockedCommand;
-  if (!state.clientId) {
-    state.clientId = crypto.randomUUID();
-    await writeState(state);
-  }
-  return state;
+  return normalizeStoredState(stored[STORAGE_KEY] || {});
+}
+
+function replaceLocalState(target, source) {
+  if (!target) return;
+  for (const key of Object.keys(target)) delete target[key];
+  Object.assign(target, JSON.parse(JSON.stringify(source)));
+}
+
+async function mutateStoredState(target, mutate, replaceTarget = true) {
+  let committed = null;
+  stateWriteQueue = stateWriteQueue
+    .catch(() => {})
+    .then(async () => {
+      const current = await readStoredState();
+      const next = normalizeStoredState(await mutate(current) || current);
+      const snapshot = JSON.parse(JSON.stringify(next));
+      await chromeApi(
+        chrome.storage.local.set({ [STORAGE_KEY]: snapshot }),
+        CHROME_API_TIMEOUT_MS,
+        'MoonDesk Companion state write timed out'
+      );
+      committed = snapshot;
+    });
+  await stateWriteQueue;
+  const result = normalizeStoredState(committed || {});
+  if (replaceTarget) replaceLocalState(target, result);
+  return result;
+}
+
+async function readState() {
+  const state = await readStoredState();
+  if (state.clientId) return state;
+  // Worker, presence, popup and browser-control lanes can cold-start concurrently. Serialize the
+  // first installation identity so they cannot each pair a different UUID and leave stale clients.
+  return mutateStoredState(null, (current) => {
+    if (!current.clientId) current.clientId = crypto.randomUUID();
+    return current;
+  });
 }
 
 async function writeState(state) {
-  const snapshot = JSON.parse(JSON.stringify(state));
-  stateWriteQueue = stateWriteQueue
-    .catch(() => {})
-    .then(() => chromeApi(
-      chrome.storage.local.set({ [STORAGE_KEY]: snapshot }),
-      CHROME_API_TIMEOUT_MS,
-      'MoonDesk Companion state write timed out'
-    ));
-  await stateWriteQueue;
+  const committed = await mutateStoredState(null, (current) => ({
+    ...current,
+    baseUrl: current.baseUrl || state.baseUrl,
+    clientId: current.clientId || state.clientId,
+    credential: current.credential || state.credential,
+    launchRecords: state.launchRecords || {},
+    threadRecords: state.threadRecords || {},
+    blockedCommands: state.blockedCommands || {},
+    workerResetEpoch: normalizedWorkerResetEpoch(state.workerResetEpoch)
+  }), false);
+  // Keep live Worker record object references intact while adopting connection metadata that another
+  // independent lane may have updated while this Worker mutation was in flight.
+  state.baseUrl = committed.baseUrl;
+  state.clientId = committed.clientId;
+  state.credential = committed.credential;
+  return committed;
+}
+
+async function writeConnectionState(state) {
+  return mutateStoredState(state, (current) => ({
+    ...current,
+    baseUrl: current.baseUrl || state.baseUrl,
+    clientId: current.clientId || state.clientId,
+    credential: current.credential || state.credential
+  }));
+}
+
+async function writeConfirmedBridgeState(state) {
+  return mutateStoredState(state, (current) => ({
+    ...current,
+    baseUrl: state.baseUrl,
+    clientId: current.clientId || state.clientId,
+    credential: current.credential || state.credential
+  }));
+}
+
+async function writeAuthenticatedClientId(state, clientId) {
+  return mutateStoredState(state, (current) => {
+    if (!current.credential || current.credential !== state.credential) return current;
+    return { ...current, clientId };
+  });
+}
+
+async function writePairState(state) {
+  return mutateStoredState(state, (current) => ({
+    ...current,
+    baseUrl: state.baseUrl,
+    clientId: state.clientId || current.clientId,
+    credential: state.credential,
+    blockedCommands: {}
+  }));
 }
 
 async function writeWorkerCommandState(state, clearGeneration) {
@@ -414,17 +494,21 @@ async function pumpUserBrowserControl(state) {
   const control = activeUserBrowserControl();
   if (!control) return false;
   userBrowserTransportState = state;
-  await control.heartbeat();
   if (!userBrowserCommandFlight) {
+    // The command pump performs its own heartbeat before looking for work. Avoid a duplicate idle
+    // heartbeat; while a long command is running, later cycles use the branch below to renew liveness.
     const flight = control.pump()
-      .catch(async (error) => {
-        await control.revoke().catch(() => {});
+      .catch((error) => {
+        // Transient loopback/Chromium failures must not destroy debugger custody. The control layer
+        // itself revokes only on authoritative permission, epoch or authentication failures.
         console.warn('MoonDesk user browser command pump failed:', String(error?.message || error));
       })
       .finally(() => {
         if (userBrowserCommandFlight === flight) userBrowserCommandFlight = null;
       });
     userBrowserCommandFlight = flight;
+  } else {
+    await control.heartbeat();
   }
   return true;
 }
@@ -542,7 +626,7 @@ async function discoverBridge(state) {
     );
     if (state.baseUrl !== match.baseUrl) {
       state.baseUrl = match.baseUrl;
-      await writeState(state);
+      await writeConfirmedBridgeState(state);
     }
     return match.hello;
   }
@@ -577,8 +661,7 @@ async function ensureConnectedOnce() {
     try {
       const remote = await api(state, STATUS_PATH);
       if (remote?.clientId && remote.clientId !== state.clientId) {
-        state.clientId = remote.clientId;
-        await writeState(state);
+        await writeAuthenticatedClientId(state, remote.clientId);
       }
       // Worker-reset reconciliation is performed by the Worker pump, not by shared connectivity.
       return state;
@@ -591,7 +674,7 @@ async function ensureConnectedOnce() {
     state.credential = randomCredential();
     // Persist before the network side effect. If the response is lost, retrying with
     // the same installation credential is idempotent on the MoonDesk side.
-    await writeState(state);
+    await writeConnectionState(state);
   }
 
   const bootstrapToken = await installationBootstrapToken();
@@ -633,6 +716,10 @@ async function operationalState() {
   // Only an unpaired/incomplete installation performs its own bounded recovery transaction.
   const state = await readState();
   if (bridgeBaseUrl(state.baseUrl) && state.credential) return state;
+  // Cold pairing is a mutating transaction. Share exactly one pairing flight so independent MV3
+  // lanes cannot rotate credentials against each other. Once paired, all operational lanes remain
+  // independent from the Worker connection flight.
+  if (!state.credential) return ensureConnected();
   return ensureConnectedIndependent();
 }
 
@@ -789,7 +876,9 @@ async function chatGptAccountFingerprintForTab(tabId) {
           });
           if (!response.ok) return null;
           const session = await response.json();
-          const raw = session?.user?.id || session?.user?.account_id || session?.user?.accountId || session?.account?.id || null;
+          // Use one canonical opaque ChatGPT user identity. Falling through to account/team fields
+          // can make the same login hash differently when the session payload shape changes.
+          const raw = session?.user?.id;
           if (typeof raw !== 'string' || !raw.trim()) return null;
           const bytes = new TextEncoder().encode(`moondesk-chatgpt-account-v1:${raw.trim()}`);
           const digest = await crypto.subtle.digest('SHA-256', bytes);
@@ -835,18 +924,36 @@ async function currentChatGptAccountFingerprint() {
     candidates.map((tab) => chatGptAccountFingerprintForTab(tab.id))
   );
   const unique = [...new Set(fingerprints.filter(Boolean))];
-  return unique.length === 1 ? unique[0] : null;
+  if (unique.length === 1) {
+    rememberPresenceAccountFingerprint(unique[0]);
+    return unique[0];
+  }
+  return null;
 }
 
 function validAccountFingerprint(value) {
   return typeof value === 'string' && /^[0-9a-f]{64}$/i.test(value);
 }
 
-async function waitForChatGptAccountFingerprint(tabId, timeoutMs = 15000) {
+function invalidatePresenceAccountFingerprint() {
+  presenceAccountFingerprintAt = 0;
+}
+
+function rememberPresenceAccountFingerprint(fingerprint) {
+  if (!validAccountFingerprint(fingerprint)) return;
+  presenceAccountFingerprint = fingerprint.toLowerCase();
+  presenceAccountFingerprintAt = Date.now();
+  schedulePresencePump(25);
+}
+
+async function waitForChatGptAccountFingerprint(tabId, timeoutMs = 30000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const fingerprint = await chatGptAccountFingerprintForTab(tabId);
-    if (fingerprint) return fingerprint;
+    if (fingerprint) {
+      rememberPresenceAccountFingerprint(fingerprint);
+      return fingerprint;
+    }
     await new Promise((resolve) => setTimeout(resolve, 250));
   }
   return null;
@@ -948,7 +1055,7 @@ async function accountFingerprintForPresence(tabs, forceRefresh = false) {
     validAccountFingerprint(presenceAccountFingerprint) &&
     cachedAge <= PRESENCE_ACCOUNT_FINGERPRINT_MAX_AGE_MS
   ) {
-    return presenceAccountFingerprint;
+    return { fingerprint: presenceAccountFingerprint, fresh: true };
   }
 
   const candidates = tabs
@@ -958,7 +1065,7 @@ async function accountFingerprintForPresence(tabs, forceRefresh = false) {
   if (!candidates.length) {
     presenceAccountFingerprint = null;
     presenceAccountFingerprintAt = now;
-    return null;
+    return { fingerprint: null, fresh: false };
   }
 
   const fingerprints = await Promise.all(
@@ -968,27 +1075,26 @@ async function accountFingerprintForPresence(tabs, forceRefresh = false) {
   if (unique.length === 1) {
     presenceAccountFingerprint = unique[0];
     presenceAccountFingerprintAt = now;
-    return unique[0];
+    return { fingerprint: unique[0], fresh: true };
   }
   if (unique.length > 1) {
     // Fail closed if one browser profile somehow reports conflicting account identities.
     presenceAccountFingerprint = null;
     presenceAccountFingerprintAt = now;
-    return null;
+    return { fingerprint: null, fresh: false };
   }
 
-  // A transient ChatGPT session-endpoint stall must not make a healthy Companion flap offline or
-  // immediately lose its previously proven Worker account. Keep a short bounded grace; every Worker
-  // launch/reuse still performs a fresh exact account check before any tab is created or Send occurs.
+  // Preserve a recently proven fingerprint as stale diagnostic context only. The host receives an
+  // explicit freshness bit and must not use stale proof for new Worker placement or account gates.
   if (
     validAccountFingerprint(presenceAccountFingerprint) &&
     cachedAge <= PRESENCE_ACCOUNT_FINGERPRINT_STALE_GRACE_MS
   ) {
-    return presenceAccountFingerprint;
+    return { fingerprint: presenceAccountFingerprint, fresh: false };
   }
   presenceAccountFingerprint = null;
   presenceAccountFingerprintAt = now;
-  return null;
+  return { fingerprint: null, fresh: false };
 }
 
 async function collectPresence(state, forceAccountRefresh = false) {
@@ -1039,26 +1145,35 @@ async function collectPresence(state, forceAccountRefresh = false) {
   }))).filter(Boolean);
 
   const presenceNow = Date.now();
-  if (!tabsQueryFailed) {
+  const tabsFresh = !tabsQueryFailed;
+  if (tabsFresh) {
     presenceObservedTabs = observed.map((tab) => ({ ...tab }));
     presenceObservedTabsAt = presenceNow;
   } else if (presenceNow - presenceObservedTabsAt <= PRESENCE_TAB_SNAPSHOT_STALE_GRACE_MS) {
     observed = presenceObservedTabs.map((tab) => ({ ...tab }));
   } else {
-    throw new Error('ChatGPT tab enumeration is unavailable beyond the bounded presence grace period');
+    // Browser liveness is independent from ChatGPT tab telemetry. Once the bounded stale snapshot
+    // expires, publish no tab claims and mark them non-fresh rather than dropping the heartbeat.
+    observed = [];
   }
 
   const cachedFingerprintAge = presenceNow - presenceAccountFingerprintAt;
-  const accountFingerprint = tabsQueryFailed
-    && validAccountFingerprint(presenceAccountFingerprint)
-    && cachedFingerprintAge <= PRESENCE_ACCOUNT_FINGERPRINT_STALE_GRACE_MS
-      ? presenceAccountFingerprint
-      : await accountFingerprintForPresence(tabs, forceAccountRefresh);
+  const accountObservation = tabsQueryFailed
+    ? {
+        fingerprint: validAccountFingerprint(presenceAccountFingerprint)
+          && cachedFingerprintAge <= PRESENCE_ACCOUNT_FINGERPRINT_STALE_GRACE_MS
+            ? presenceAccountFingerprint
+            : null,
+        fresh: false
+      }
+    : await accountFingerprintForPresence(tabs, forceAccountRefresh);
   const presence = await api(state, PRESENCE_PATH, {
     method: 'POST',
     body: {
       browserLabel: browserLabel(),
-      ...(accountFingerprint ? { accountFingerprint } : {}),
+      tabsFresh,
+      accountFingerprintFresh: accountObservation.fresh === true,
+      ...(accountObservation.fingerprint ? { accountFingerprint: accountObservation.fingerprint } : {}),
       tabs: observed
     }
   });
@@ -1284,8 +1399,9 @@ async function recordForCommand(state, command, placement, reconcileRequired = f
     );
     if (hasReadyAccountProbe) {
       const currentFingerprint = await currentChatGptAccountFingerprint();
-      if (!currentFingerprint) throw new Error('worker_account_unconfirmed');
-      if (currentFingerprint !== expectedCommandFingerprint) throw new Error('worker_account_changed');
+      if (currentFingerprint && currentFingerprint !== expectedCommandFingerprint) {
+        throw new Error('worker_account_changed');
+      }
     }
   }
   let thread = state.threadRecords?.[threadKey] || null;
@@ -1371,8 +1487,9 @@ async function recordForCommand(state, command, placement, reconcileRequired = f
       );
       if (hasReadyAccountProbe) {
         const currentFingerprint = await currentChatGptAccountFingerprint();
-        if (!currentFingerprint) throw new Error('worker_account_unconfirmed');
-        if (currentFingerprint !== accountFingerprint) throw new Error('worker_account_changed');
+        if (currentFingerprint && currentFingerprint !== accountFingerprint) {
+          throw new Error('worker_account_changed');
+        }
       }
     }
     record = {
@@ -1988,7 +2105,7 @@ function schedulePump(delayMs = FAST_POLL_MS) {
   pumpTimer = setTimeout(() => { void pump(); }, delayMs);
 }
 
-function schedulePresencePump(delayMs = FAST_POLL_MS) {
+function schedulePresencePump(delayMs = PRESENCE_POLL_MS) {
   if (presencePumpTimer) clearTimeout(presencePumpTimer);
   presencePumpTimer = setTimeout(() => { void presencePump(); }, delayMs);
 }
@@ -2019,8 +2136,8 @@ async function userBrowserPump() {
     const state = await operationalState();
     await pumpUserBrowserControl(state);
   } catch (error) {
-    const control = activeUserBrowserControl();
-    if (control) await control.revoke().catch(() => {});
+    // A transient host/Chrome API failure is not revocation. Preserve exact-tab debugger custody;
+    // authoritative permission/auth/epoch changes are handled inside the control heartbeat itself.
     console.warn('MoonDesk user browser pump failed:', String(error?.message || error));
   } finally {
     userBrowserPumpActive = false;
@@ -2047,8 +2164,9 @@ async function recoveryTabFor(state, command, reload = false) {
     );
     if (hasReadyAccountProbe) {
       const currentFingerprint = await currentChatGptAccountFingerprint();
-      if (!currentFingerprint) throw new Error('worker_account_unconfirmed');
-      if (currentFingerprint !== expectedFingerprint) throw new Error('worker_account_changed');
+      if (currentFingerprint && currentFingerprint !== expectedFingerprint) {
+        throw new Error('worker_account_changed');
+      }
     }
     tab = await createTab({ url: expectedUrl, active: false });
   }
@@ -2254,7 +2372,7 @@ async function pair({ pairingToken }) {
   state.clientId = response.clientId;
   state.credential = response.credential;
   state.blockedCommands = {};
-  await writeState(state);
+  await writePairState(state);
   schedulePump(50);
   schedulePresencePump(50);
   scheduleUserBrowserPump(50);
@@ -2657,7 +2775,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         if (!context || !Number.isInteger(sender?.tab?.id)) {
           throw new Error('provider correlation sender was not an exact ChatGPT conversation tab');
         }
-        const state = await ensureConnected();
+        const state = await operationalState();
         return publishProviderCorrelation(state, context, message.correlation);
       })();
       default: return null;
@@ -2694,6 +2812,9 @@ chrome.tabs.onActivated.addListener(() => {
 });
 chrome.tabs.onUpdated.addListener((_tabId, changeInfo, tab) => {
   if ((changeInfo.url || changeInfo.status === 'complete') && tab.url?.startsWith('https://chatgpt.com/')) {
+    // Navigation/reload can reflect a sign-in/account switch. Force the next presence publication
+    // to prove the current account instead of advertising a cached account for another 30 seconds.
+    invalidatePresenceAccountFingerprint();
     void discoverModelCatalog({ requireExistingPage: true }).catch(() => {});
     schedulePresencePump(25);
   }

@@ -288,6 +288,10 @@ function createBrowserControl(chrome, transport, protectedTab = () => false) {
     await ready(); policy = { read:false,write:false };
     await Promise.all([...tabs.values()].map(release));
   }
+  function authoritativeTransportFailure(response) {
+    const status = Number(response?.status) || 0;
+    return status >= 400 && status < 500 && status !== 408 && status !== 429;
+  }
   async function refreshIndicators() {
     if (!tabs.size || Date.now() - lastIndicatorRefreshAt < 2000) return;
     lastIndicatorRefreshAt = Date.now();
@@ -299,8 +303,26 @@ function createBrowserControl(chrome, transport, protectedTab = () => false) {
         if (tab.pendingUrl && tab.pendingUrl !== tab.url) pageURL(tab.pendingUrl);
       } catch { await release(state,false); return; }
       if (protectedTab(state.tabId, tab.url) || protectedTab(state.tabId, tab.pendingUrl)) { await release(state,false); return; }
-      try { await page(state,'overlay'); }
-      catch { await release(state); }
+      try {
+        await page(state,'overlay');
+      } catch {
+        // ChatGPT/Chromium can briefly remount or invalidate an execution context while the tab is
+        // otherwise still safe. Revalidate the destination and retry the visible-control overlay
+        // once before failing closed and releasing debugger custody.
+        try {
+          await new Promise(resolve => setTimeout(resolve, 100));
+          const retryTab = await getTab(state.tabId);
+          pageURL(retryTab.url);
+          if (retryTab.pendingUrl && retryTab.pendingUrl !== retryTab.url) pageURL(retryTab.pendingUrl);
+          if (protectedTab(state.tabId,retryTab.url) || protectedTab(state.tabId,retryTab.pendingUrl)) {
+            await release(state,false);
+            return;
+          }
+          await page(state,'overlay');
+        } catch {
+          await release(state);
+        }
+      }
     }));
   }
   async function attach(tabId, command) {
@@ -719,7 +741,10 @@ function createBrowserControl(chrome, transport, protectedTab = () => false) {
     await ready();
     const enabled = await bounded(chrome.permissions.contains({permissions:['debugger','tabs']}), 2500, 'BROWSER_PERMISSION_STATE_TIMEOUT');
     const poll = await transport('/browser-control',{method:'POST',body:JSON.stringify({action:'poll',browserId,name:/Edg\//.test(navigator.userAgent) ? 'Edge' : 'Chrome / Chromium',enabled})});
-    if (!poll.ok) { await revoke(); return null; }
+    if (!poll.ok) {
+      if (authoritativeTransportFailure(poll)) await revoke();
+      return null;
+    }
     policy = poll.data.policy;
     if (epoch !== poll.data.epoch) { await Promise.all([...tabs.values()].map(release)); epoch = poll.data.epoch; await save(); }
     if (!enabled || !policy?.read) { await revoke(); return null; }
@@ -730,7 +755,10 @@ function createBrowserControl(chrome, transport, protectedTab = () => false) {
     await ready();
     if (receipt) {
       const ack = await transport('/browser-control',{method:'POST',body:JSON.stringify({action:'result',browserId,...receipt})});
-      if (!ack.ok && ack.status !== 409) { await revoke(); return; }
+      if (!ack.ok && ack.status !== 409) {
+        if (authoritativeTransportFailure(ack)) await revoke();
+        return;
+      }
       receipt = null; await save();
     }
     const poll = await heartbeat();

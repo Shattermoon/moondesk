@@ -22,6 +22,7 @@ const contentSource = fs.readFileSync(contentPath, 'utf8');
 const popupSource = fs.readFileSync(popupPath, 'utf8');
 const serverSource = fs.readFileSync(serverPath, 'utf8');
 const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+const companionRuntimeRevision = Number(source.match(/const COMPANION_RUNTIME_REVISION = (\d+);/)?.[1]);
 
 function loadBackground({ existingTabs = {}, contentByTab = {}, sendMessageImpl = null, scriptingExecuteImpl = null, storageLocalGetImpl = null, tabsQueryImpl = null, importScriptsImpl = null, accountFingerprint = 'a'.repeat(64), fetchImpl = async () => { throw new Error('network not used'); }, setTimeoutImpl = null, runtimeManifest = manifest, initialStored = {}, createdTabIdStart = 101, bootstrapAvailable = true, bootstrapToken = 'b'.repeat(64) } = {}) {
   const createdTabs = [];
@@ -277,6 +278,15 @@ test('popup bg helper does not coerce an omitted timeout to zero milliseconds', 
   assert.equal(result.profile, 'ready');
 });
 
+test('popup Chrome extension API awaits are bounded', () => {
+  assert.match(popupSource, /async function popupChromeApi\(/);
+  assert.doesNotMatch(
+    popupSource,
+    /await\s+chrome\.(?:tabs|scripting|storage)\./,
+    'popup must not directly await an unbounded Chromium API promise'
+  );
+});
+
 test('Companion liveness has redundant MV3 wake and popup presence refresh paths', async () => {
   assert.match(contentSource, /MOONDESK_PRESENCE_WAKE/);
   assert.match(contentSource, /clearInterval\(presenceWakeTimer\)/, 'stale content scripts must stop waking after extension reload');
@@ -364,7 +374,7 @@ test('popup status ignores a permanently hung Worker connection flight', async (
     const body = {
       appVersion: manifest.version,
       protocolVersion: 2,
-      companionRuntimeRevision: 33,
+      companionRuntimeRevision,
       paired: true,
       clientId: 'status-independent',
       hasWorkerState: false,
@@ -399,7 +409,7 @@ test('optional browser-control import failure cannot kill core Companion status'
     const body = {
       appVersion: manifest.version,
       protocolVersion: 2,
-      companionRuntimeRevision: 33,
+      companionRuntimeRevision,
       paired: true,
       clientId: 'core-survives-import',
       hasWorkerState: false,
@@ -435,7 +445,7 @@ test('popup status stays responsive when ChatGPT scripting is permanently hung',
         app: 'moondesk-worker-companion',
         appVersion: manifest.version,
         protocolVersion: 2,
-        companionRuntimeRevision: 33
+        companionRuntimeRevision
       } : {};
       return { ok, status: ok ? 200 : 404, async json() { return body; }, async text() { return JSON.stringify(body); } };
     }
@@ -521,6 +531,16 @@ test('presence account fingerprint is cached between fast pumps but forced popup
   assert.equal(presencePosts, 3);
 });
 
+test('ChatGPT account fingerprint uses one canonical user identity without shape-dependent fallbacks', () => {
+  const start = source.indexOf('async function chatGptAccountFingerprintForTab');
+  const end = source.indexOf('async function currentChatGptAccountFingerprint', start);
+  assert.ok(start >= 0 && end > start, 'account fingerprint helper must be extractable');
+  const helper = source.slice(start, end);
+  assert.match(helper, /const raw = session\?\.user\?\.id;/);
+  assert.doesNotMatch(helper, /account_id|accountId|session\?\.account\?\.id/,
+    'the same login must not hash a different fallback field when ChatGPT session shape changes');
+});
+
 test('stalled ChatGPT account verification cannot block the presence heartbeat', async () => {
   let presencePosts = 0;
   let presenceBody = null;
@@ -591,6 +611,88 @@ test('failed tab enumeration reuses the last successful presence snapshot instea
   assert.equal(presenceBodies.length, 2);
   assert.equal(presenceBodies[0].tabs.length, 1);
   assert.deepEqual(presenceBodies[1].tabs, presenceBodies[0].tabs, 'transient tab-query failure must not fabricate an empty browser');
+  assert.equal(presenceBodies[1].tabsFresh, false, 'reused tab telemetry must be explicitly stale');
+});
+
+test('expired tab telemetry still publishes browser liveness without claiming fresh tabs', async () => {
+  const presenceBodies = [];
+  const fetchImpl = async (url, options = {}) => {
+    const parsed = new URL(url);
+    if (parsed.pathname !== '/__moondesk/companion/v1/presence') throw new Error(`unexpected request: ${parsed.pathname}`);
+    presenceBodies.push(JSON.parse(options.body || '{}'));
+    return { ok: true, status: 200, async text() { return JSON.stringify({ presence: presenceBodies.at(-1) }); } };
+  };
+  const { evaluate } = loadBackground({
+    tabsQueryImpl: () => Promise.reject(new Error('tabs subsystem unavailable')),
+    fetchImpl
+  });
+  await evaluate(`(() => {
+    presenceObservedTabs = [{ conversationId: '6aad7eb1-4b10-83ee-97bd-d98b338864de', conversationUrl: 'https://chatgpt.com/c/6aad7eb1-4b10-83ee-97bd-d98b338864de', projectId: null, projectUrl: null, active: true, windowFocused: true, generating: false }];
+    presenceObservedTabsAt = Date.now() - PRESENCE_TAB_SNAPSHOT_STALE_GRACE_MS - 1000;
+  })()`);
+  const stateExpr = "({ baseUrl: 'http://127.0.0.1:47650', credential: 'token' })";
+  await evaluate(`collectPresence(${stateExpr})`);
+  assert.equal(presenceBodies.length, 1, 'telemetry failure must not suppress the browser heartbeat');
+  assert.equal(presenceBodies[0].tabsFresh, false);
+  assert.deepEqual(presenceBodies[0].tabs, [], 'expired stale tabs must not be asserted as open');
+  assert.equal(presenceBodies[0].accountFingerprintFresh, false);
+});
+
+test('ChatGPT navigation invalidates cached account proof before the next placement heartbeat', async () => {
+  const scheduled = [];
+  const browser = loadBackground({
+    setTimeoutImpl(_callback, delay) { scheduled.push(delay); return scheduled.length; }
+  });
+  await browser.evaluate(`(() => {
+    presenceAccountFingerprint = '${'a'.repeat(64)}';
+    presenceAccountFingerprintAt = Date.now();
+  })()`);
+  browser.dispatchTabUpdated(7, { status: 'complete' }, { id: 7, url: 'https://chatgpt.com/c/6aad7eb1-4b10-83ee-97bd-d98b338864de' });
+  assert.equal(browser.evaluate('presenceAccountFingerprintAt'), 0);
+  assert.ok(scheduled.includes(25), 'account invalidation must trigger an immediate presence refresh');
+});
+
+test('concurrent cold-start state reads converge on one persistent Companion client id', async () => {
+  const browser = loadBackground();
+  const ids = await browser.evaluate(`Promise.all(Array.from({ length: 12 }, () => readState())).then(states => states.map(state => state.clientId))`);
+  assert.equal(new Set(ids).size, 1, 'all startup lanes must share one serialized installation id');
+  const storedId = await browser.evaluate(`chrome.storage.local.get(STORAGE_KEY).then(value => value[STORAGE_KEY].clientId)`);
+  assert.equal(storedId, ids[0]);
+});
+
+test('concurrent cold-start operational lanes perform one pairing transaction and share one credential', async () => {
+  const revision = Number(source.match(/const COMPANION_RUNTIME_REVISION = (\d+);/)?.[1]);
+  let pairCalls = 0;
+  let pairedClientId = null;
+  let pairedCredential = null;
+  const fetchImpl = async (url, options = {}) => {
+    const parsed = new URL(url);
+    if (parsed.pathname === '/__moondesk/companion/v1/hello') {
+      const ok = parsed.port === '47650';
+      const body = ok ? { app: 'moondesk-worker-companion', appVersion: manifest.version, protocolVersion: 2, companionRuntimeRevision: revision } : {};
+      return { ok, status: ok ? 200 : 404, async json() { return body; }, async text() { return JSON.stringify(body); } };
+    }
+    if (parsed.pathname === '/__moondesk/companion/v1/pair') {
+      pairCalls += 1;
+      const body = JSON.parse(options.body || '{}');
+      pairedClientId = body.clientId;
+      pairedCredential = body.credential;
+      return { ok: true, status: 200, async text() { return '{}'; } };
+    }
+    if (parsed.pathname === '/__moondesk/companion/v1/status') {
+      const body = { clientId: pairedClientId, paired: true, protocolVersion: 2, companionRuntimeRevision: revision, workerResetEpoch: 0 };
+      return { ok: true, status: 200, async text() { return JSON.stringify(body); } };
+    }
+    throw new Error(`unexpected request: ${parsed.pathname}`);
+  };
+  const browser = loadBackground({ fetchImpl });
+  const states = await browser.evaluate(`Promise.all(Array.from({ length: 8 }, () => operationalState()))`);
+  assert.equal(pairCalls, 1, 'cold-start lanes must share one mutating pair flight');
+  assert.ok(pairedClientId);
+  assert.match(pairedCredential, /^[0-9a-f]{64}$/);
+  assert.equal(new Set(states.map(state => state.clientId)).size, 1);
+  assert.equal(new Set(states.map(state => state.credential)).size, 1);
+  assert.equal(states[0].credential, pairedCredential);
 });
 
 test('transient account probe timeout keeps a recently verified fingerprint for bounded liveness grace', async () => {
@@ -610,12 +712,15 @@ test('transient account probe timeout keeps a recently verified fingerprint for 
     }
   });
   const tabsExpr = "[{ id: 5, url: 'https://chatgpt.com/', active: true, windowId: 1, status: 'complete' }]";
-  assert.equal(await evaluate(`accountFingerprintForPresence(${tabsExpr}, false)`), fingerprint);
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(await evaluate(`accountFingerprintForPresence(${tabsExpr}, false)`))),
+    { fingerprint, fresh: true }
+  );
   hangProbe = true;
-  assert.equal(
-    await evaluate(`accountFingerprintForPresence(${tabsExpr}, true)`),
-    fingerprint,
-    'one transient forced refresh must not immediately discard a recently proven account'
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(await evaluate(`accountFingerprintForPresence(${tabsExpr}, true)`))),
+    { fingerprint, fresh: false },
+    'one transient forced refresh may retain diagnostic account context but must mark it stale'
   );
 });
 
@@ -1438,7 +1543,7 @@ test('user browser heartbeat stays independent of both Worker and long browser c
     await pumpUserBrowserControl({});
     await pumpUserBrowserControl({});
   })()`);
-  assert.equal(browser.evaluate('globalThis.__userBrowserHeartbeatCalls'), 2, 'lease heartbeat must keep running while a browser command is busy');
+  assert.equal(browser.evaluate('globalThis.__userBrowserHeartbeatCalls'), 1, 'idle startup must not duplicate the pump heartbeat, while an in-flight browser command still gets an independent lease heartbeat');
   assert.equal(browser.evaluate('globalThis.__userBrowserCommandCalls'), 1, 'only one browser command pump may be in flight');
   assert.equal(browser.evaluate('pumpActive'), true, 'browser heartbeat must not wait for the Worker pump');
   await browser.evaluate(`(async () => {
@@ -1490,7 +1595,7 @@ test('bridge discovery prefers an exact runtime match over another MoonDesk vers
             app: 'moondesk-worker-companion',
             appVersion: manifest.version,
             protocolVersion: 2,
-            companionRuntimeRevision: 33
+            companionRuntimeRevision
           };
         }
       };
@@ -1518,7 +1623,7 @@ test('bridge discovery prefers an exact runtime match over another MoonDesk vers
 
   const { evaluate, runtimeReloads } = loadBackground({ fetchImpl });
   const hello = await evaluate('discoverBridge(freshState())');
-  assert.equal(hello.companionRuntimeRevision, 33);
+  assert.equal(hello.companionRuntimeRevision, companionRuntimeRevision);
   assert.equal(runtimeReloads.length, 0);
 });
 
@@ -1631,7 +1736,7 @@ test('compatible bridge clears the one-shot runtime reload marker for a future m
             app: 'moondesk-worker-companion',
             appVersion: manifest.version,
             protocolVersion: 2,
-            companionRuntimeRevision: 33
+            companionRuntimeRevision
           };
         }
       };
@@ -1644,7 +1749,7 @@ test('compatible bridge clears the one-shot runtime reload marker for a future m
   });
 
   const hello = await evaluate('discoverBridge(freshState())');
-  assert.equal(hello.companionRuntimeRevision, 33);
+  assert.equal(hello.companionRuntimeRevision, companionRuntimeRevision);
   const stored = await evaluate(`chrome.storage.local.get('${reloadKey}')`);
   assert.equal(stored[reloadKey], undefined);
 });
@@ -1662,7 +1767,7 @@ test('automatic pairing proves the extension was loaded from the MoonDesk-prepar
             app: 'moondesk-worker-companion',
             appVersion: manifest.version,
             protocolVersion: 2,
-            companionRuntimeRevision: 33
+            companionRuntimeRevision
           };
         }
       };
@@ -1704,7 +1809,7 @@ test('source and release-ZIP installs without a bootstrap capability expose Manu
         app: 'moondesk-worker-companion',
         appVersion: manifest.version,
         protocolVersion: 2,
-        companionRuntimeRevision: 33
+        companionRuntimeRevision
       };
       return {
         ok: true,
@@ -1825,7 +1930,7 @@ test('release version mismatch reloads the unpacked companion even when protocol
             app: 'moondesk-worker-companion',
             appVersion: '0.13.0',
             protocolVersion: 2,
-            companionRuntimeRevision: 33
+            companionRuntimeRevision
           };
         }
       };
@@ -2599,7 +2704,7 @@ test('background accepts provider correlation only from the exact sending ChatGP
     baseUrl: 'http://127.0.0.1:47650',
     clientId: 'client-provider',
     credential: '${'a'.repeat(64)}'
-  })`);
+  }).then(() => { connecting = new Promise(() => {}); })`);
 
   const response = await dispatchRuntimeMessage({
     type: 'MOONDESK_PROVIDER_CORRELATION',
@@ -4291,6 +4396,35 @@ test('fresh worker command refuses a changed ChatGPT account before creating any
     /worker_account_changed/
   );
   assert.equal(createdTabs.length, 0, 'account mismatch must fail before a Worker tab is created or assignment can be sent');
+});
+
+test('transient preflight account uncertainty defers to the exact Worker tab account fence', async () => {
+  const expected = 'a'.repeat(64);
+  const { createdTabs, evaluate } = loadBackground({
+    existingTabs: {
+      7: { id: 7, url: 'https://chatgpt.com/', active: true, windowId: 1, status: 'complete' }
+    },
+    scriptingExecuteImpl: async (options) => {
+      if (typeof options?.func !== 'function' || !String(options.func).includes('moondesk-chatgpt-account-v1')) return [];
+      return [{ result: options.target?.tabId === 7 ? null : expected }];
+    }
+  });
+  const recordForCommand = evaluate('recordForCommand');
+  const command = {
+    id: 'command-fresh-account-deferred-proof',
+    targetAccountFingerprint: expected,
+    launch: {
+      workspaceId: 'workspace-current',
+      taskMarker: 'marker-fresh-account-deferred-proof',
+      threadKey: 'worker:fresh-account-deferred-proof',
+      openMode: 'new_thread',
+      executionProfile: { modelKey: 'gpt-5.6-sol', modelLabel: 'GPT-5.6 Sol', reasoningEffort: 'high' }
+    }
+  };
+  const state = { launchRecords: {}, threadRecords: {}, blockedCommands: {} };
+  const { record } = await recordForCommand(state, command, null);
+  assert.equal(createdTabs.length, 1, 'read-only Worker tab creation may proceed when preflight account proof is temporarily unavailable');
+  assert.equal(record.accountFingerprint, expected, 'the exact created tab must still prove the expected account before Send');
 });
 
 test('existing-thread reuse refuses a different ChatGPT account before opening the durable conversation', async () => {

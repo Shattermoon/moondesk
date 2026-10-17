@@ -188,6 +188,10 @@ pub struct CompanionPresenceUpdate {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_fingerprint: Option<String>,
     #[serde(default)]
+    pub account_fingerprint_fresh: bool,
+    #[serde(default)]
+    pub tabs_fresh: bool,
+    #[serde(default)]
     pub tabs: Vec<CompanionTabPresence>,
 }
 
@@ -212,6 +216,9 @@ impl CompanionPresenceUpdate {
         {
             return Err("companion account fingerprint is invalid".into());
         }
+        if self.account_fingerprint_fresh && self.account_fingerprint.is_none() {
+            return Err("fresh companion account proof requires an account fingerprint".into());
+        }
         let mut conversations = BTreeSet::new();
         for tab in &self.tabs {
             tab.validate()?;
@@ -231,6 +238,8 @@ pub struct CompanionClientPresence {
     pub browser_label: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub account_fingerprint: Option<String>,
+    pub account_fingerprint_fresh: bool,
+    pub tabs_fresh: bool,
     pub last_seen_ms: u64,
     pub tabs: Vec<CompanionTabPresence>,
 }
@@ -744,6 +753,8 @@ impl CompanionAuth {
             account_fingerprint: update
                 .account_fingerprint
                 .map(|fingerprint| fingerprint.to_ascii_lowercase()),
+            account_fingerprint_fresh: update.account_fingerprint_fresh,
+            tabs_fresh: update.tabs_fresh,
             last_seen_ms: now_ms,
             tabs: update.tabs,
         };
@@ -820,7 +831,7 @@ impl CompanionAuth {
             .map(|(route, _)| route.clone())?;
         let fresh = self.fresh_presence(unix_time_ms()).await;
         for client in fresh {
-            if client.client_id != cached.client_id {
+            if client.client_id != cached.client_id || !client.tabs_fresh {
                 continue;
             }
             if let Some(tab) = client
@@ -854,10 +865,11 @@ impl CompanionAuth {
             .into_iter()
             .find(|presence| presence.client_id == client_id)
             .is_some_and(|presence| {
-                presence
-                    .tabs
-                    .iter()
-                    .any(|tab| tab.conversation_id == conversation_id)
+                presence.tabs_fresh
+                    && presence
+                        .tabs
+                        .iter()
+                        .any(|tab| tab.conversation_id == conversation_id)
             });
         if !present {
             return Err("Core conversation is not open in this paired browser".into());
@@ -887,6 +899,7 @@ impl CompanionAuth {
         let presence = self.fresh_presence(unix_time_ms()).await;
         let mut candidates = presence
             .into_iter()
+            .filter(|client| client.tabs_fresh)
             .flat_map(|client| {
                 client.tabs.into_iter().filter_map(move |tab| {
                     (tab.active && tab.window_focused).then_some(CompanionAnchorRoute {
@@ -1710,6 +1723,8 @@ mod tests {
             CompanionPresenceUpdate {
                 account_fingerprint: None,
                 browser_label: Some("Edge".into()),
+                account_fingerprint_fresh: false,
+                tabs_fresh: true,
                 tabs: vec![CompanionTabPresence {
                     conversation_id: conversation_id.into(),
                     conversation_url: format!(
@@ -2056,6 +2071,8 @@ mod tests {
             CompanionPresenceUpdate {
                 account_fingerprint: None,
                 browser_label: Some("Chrome".into()),
+                account_fingerprint_fresh: false,
+                tabs_fresh: true,
                 tabs: vec![route.tab.clone()],
             },
             unix_time_ms(),
@@ -2089,6 +2106,8 @@ mod tests {
             CompanionPresenceUpdate {
                 account_fingerprint: None,
                 browser_label: Some("Chrome".into()),
+                account_fingerprint_fresh: false,
+                tabs_fresh: true,
                 tabs: vec![CompanionTabPresence {
                     conversation_id: chrome_conversation.into(),
                     conversation_url: format!("https://chatgpt.com/c/{chrome_conversation}"),
@@ -2110,6 +2129,8 @@ mod tests {
             CompanionPresenceUpdate {
                 account_fingerprint: None,
                 browser_label: Some("Edge".into()),
+                account_fingerprint_fresh: false,
+                tabs_fresh: true,
                 tabs: vec![CompanionTabPresence {
                     conversation_id: edge_conversation.into(),
                     conversation_url: format!("https://chatgpt.com/c/{edge_conversation}"),
@@ -2156,6 +2177,8 @@ mod tests {
                 CompanionPresenceUpdate {
                     account_fingerprint: None,
                     browser_label: None,
+                    account_fingerprint_fresh: false,
+                    tabs_fresh: true,
                     tabs: vec![CompanionTabPresence {
                         conversation_id: conversation_id.into(),
                         conversation_url: format!("https://chatgpt.com/c/{conversation_id}"),

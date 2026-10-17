@@ -37,6 +37,21 @@ const CONFIG_EFFORT_LABEL = {
 // ── Background messaging ─────────────────────────────────────────
 const POPUP_BOOT_TIMEOUT_MS = 5_000;
 const POPUP_STATUS_TIMEOUT_MS = 25_000;
+const POPUP_CHROME_API_TIMEOUT_MS = 5_000;
+
+async function popupChromeApi(work, label, timeoutMs = POPUP_CHROME_API_TIMEOUT_MS) {
+  let timer;
+  try {
+    return await Promise.race([
+      Promise.resolve(work),
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`MoonDesk Companion ${label} timed out`)), timeoutMs);
+      })
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
 
 async function bg(message, timeoutMs = null) {
   const work = chrome.runtime.sendMessage(message);
@@ -61,22 +76,25 @@ async function bg(message, timeoutMs = null) {
 
 // ── ChatGPT context detection ────────────────────────────────────
 async function activeChatTab() {
-  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  const [tab] = await popupChromeApi(
+    chrome.tabs.query({ active: true, currentWindow: true }),
+    'active-tab query'
+  );
   return Number.isInteger(tab?.id) && tab.url?.startsWith('https://chatgpt.com/') ? tab : null;
 }
 
 async function ensureChatScripts(tabId) {
   try {
-    await chrome.scripting.executeScript({
+    await popupChromeApi(chrome.scripting.executeScript({
       target: { tabId },
       world: 'MAIN',
       files: ['model-state-main.js']
-    });
+    }), 'MAIN-world injection');
   } catch {}
-  await chrome.scripting.executeScript({
+  await popupChromeApi(chrome.scripting.executeScript({
     target: { tabId },
     files: ['chatgpt-dom.js', 'content.js']
-  });
+  }), 'content-script injection');
 }
 
 async function currentChatContext() {
@@ -84,7 +102,10 @@ async function currentChatContext() {
   if (!tab) return null;
   try {
     await ensureChatScripts(tab.id);
-    const response = await chrome.tabs.sendMessage(tab.id, { type: 'MOONDESK_CONTEXT' });
+    const response = await popupChromeApi(
+      chrome.tabs.sendMessage(tab.id, { type: 'MOONDESK_CONTEXT' }),
+      'ChatGPT context read'
+    );
     return response?.ok ? response.context : null;
   } catch {
     return null;
@@ -102,7 +123,10 @@ async function currentModelCatalog() {
 
 async function loadCachedModelCatalog() {
   try {
-    const stored = await chrome.storage.local.get(MODEL_CATALOG_STORAGE_KEY);
+    const stored = await popupChromeApi(
+      chrome.storage.local.get(MODEL_CATALOG_STORAGE_KEY),
+      'model-cache read'
+    );
     const cached = stored[MODEL_CATALOG_STORAGE_KEY];
     return Array.isArray(cached?.catalog) ? cached.catalog : [];
   } catch {
@@ -111,12 +135,12 @@ async function loadCachedModelCatalog() {
 }
 
 async function saveCachedModelCatalog(catalog) {
-  await chrome.storage.local.set({
+  await popupChromeApi(chrome.storage.local.set({
     [MODEL_CATALOG_STORAGE_KEY]: {
       catalog,
       updatedAt: Date.now()
     }
-  });
+  }), 'model-cache write');
 }
 
 // ── UI helpers ───────────────────────────────────────────────────

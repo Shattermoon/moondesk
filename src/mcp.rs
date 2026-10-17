@@ -2143,6 +2143,8 @@ async fn local_worker_capacity_summary(
             Some("legacy_account_unconfirmed")
         } else if retained.is_some_and(|fingerprints| fingerprints.len() > 1) {
             Some("retained_account_conflict")
+        } else if !presence.account_fingerprint_fresh {
+            Some("account_unconfirmed")
         } else {
             match presence.account_fingerprint.as_deref() {
                 None => Some("account_unconfirmed"),
@@ -2236,7 +2238,9 @@ async fn worker_browser_choices(
                 "clientId": client_id,
                 "browserLabel": presence.and_then(|presence| presence.browser_label.clone()),
                 "online": presence.is_some(),
-                "lastSeenMs": presence.map(|presence| presence.last_seen_ms)
+                "lastSeenMs": presence.map(|presence| presence.last_seen_ms),
+                "tabsFresh": presence.is_some_and(|presence| presence.tabs_fresh),
+                "workerAccountFresh": presence.is_some_and(|presence| presence.account_fingerprint_fresh)
             });
             if let Some(capacity) = capacity
                 && let Some(object) = value.as_object_mut()
@@ -2601,7 +2605,11 @@ async fn select_browserless_reuse_client(
         ));
     };
     if let Some(expected) = expected_account_fingerprint.as_deref() {
-        let Some(actual) = presence.account_fingerprint.as_deref() else {
+        let Some(actual) = presence
+            .account_fingerprint_fresh
+            .then_some(presence.account_fingerprint.as_deref())
+            .flatten()
+        else {
             return Err(format!(
                 "worker {worker_id}'s Companion browser '{remembered}' is online but its signed-in ChatGPT account could not be verified; open ChatGPT in that browser and retry"
             ));
@@ -2654,6 +2662,14 @@ async fn worker_observability(
                 .and_then(crate::managed_chat::types::canonical_chatgpt_conversation_id);
             let browser = conversation_id.as_deref().and_then(|conversation_id| {
                 presence.iter().find_map(|client| {
+                    if !client.tabs_fresh
+                        || worker
+                            .browser_client_id
+                            .as_ref()
+                            .is_some_and(|bound| bound != &client.client_id)
+                    {
+                        return None;
+                    }
                     client
                         .tabs
                         .iter()
@@ -2924,6 +2940,13 @@ async fn recover_worker_for_core(
         .map(|at| recovery_now_ms.saturating_sub(at));
     let fresh = companion_auth.fresh_presence(recovery_now_ms).await;
     let visible_client = fresh.iter().find_map(|client| {
+        if !client.tabs_fresh
+            || persisted_browser_client_id
+                .as_ref()
+                .is_some_and(|bound| bound != &client.client_id)
+        {
+            return None;
+        }
         client
             .tabs
             .iter()
@@ -3906,7 +3929,9 @@ async fn handle_tools_call_for_workspace(
                         .fresh_presence(crate::companion::unix_time_ms())
                         .await
                         .into_iter()
-                        .find(|presence| presence.client_id == client_id)
+                        .find(|presence| {
+                            presence.client_id == client_id && presence.account_fingerprint_fresh
+                        })
                         .and_then(|presence| presence.account_fingerprint),
                     None => None,
                 };
@@ -3968,7 +3993,10 @@ async fn handle_tools_call_for_workspace(
                             .fresh_presence(crate::companion::unix_time_ms())
                             .await
                             .into_iter()
-                            .find(|presence| presence.client_id == client_id)
+                            .find(|presence| {
+                                presence.client_id == client_id
+                                    && presence.account_fingerprint_fresh
+                            })
                             .and_then(|presence| presence.account_fingerprint),
                         None => None,
                     };
@@ -9227,6 +9255,8 @@ mod tests {
                 crate::companion::CompanionPresenceUpdate {
                     account_fingerprint: None,
                     browser_label: Some("Chrome".into()),
+                    account_fingerprint_fresh: false,
+                    tabs_fresh: true,
                     tabs: vec![crate::companion::CompanionTabPresence {
                         conversation_id: conversation_id.into(),
                         conversation_url,
@@ -9386,6 +9416,8 @@ mod tests {
                 crate::companion::CompanionPresenceUpdate {
                     account_fingerprint: None,
                     browser_label: Some("Chrome".into()),
+                    account_fingerprint_fresh: false,
+                    tabs_fresh: true,
                     tabs: Vec::new(),
                 },
                 crate::companion::unix_time_ms(),
@@ -9492,6 +9524,8 @@ mod tests {
                 crate::companion::CompanionPresenceUpdate {
                     account_fingerprint: Some("c".repeat(64)),
                     browser_label: Some("Edge".into()),
+                    account_fingerprint_fresh: true,
+                    tabs_fresh: true,
                     tabs: Vec::new(),
                 },
                 crate::companion::unix_time_ms(),
@@ -9580,6 +9614,8 @@ mod tests {
                 crate::companion::CompanionPresenceUpdate {
                     account_fingerprint: None,
                     browser_label: Some("Edge".into()),
+                    account_fingerprint_fresh: false,
+                    tabs_fresh: true,
                     tabs: Vec::new(),
                 },
                 crate::companion::unix_time_ms(),
@@ -9867,6 +9903,8 @@ mod tests {
                 crate::companion::CompanionPresenceUpdate {
                     account_fingerprint: None,
                     browser_label: Some("Edge".into()),
+                    account_fingerprint_fresh: false,
+                    tabs_fresh: true,
                     tabs: vec![crate::companion::CompanionTabPresence {
                         conversation_id: legacy_core_conversation.into(),
                         conversation_url: format!(
@@ -10021,6 +10059,8 @@ mod tests {
                     crate::companion::CompanionPresenceUpdate {
                         account_fingerprint: Some(fingerprint),
                         browser_label: Some(label.into()),
+                        account_fingerprint_fresh: true,
+                        tabs_fresh: true,
                         tabs: Vec::new(),
                     },
                     crate::companion::unix_time_ms(),
@@ -10222,6 +10262,8 @@ mod tests {
                 crate::companion::CompanionPresenceUpdate {
                     account_fingerprint: None,
                     browser_label: Some("Chrome".into()),
+                    account_fingerprint_fresh: false,
+                    tabs_fresh: true,
                     tabs: vec![crate::companion::CompanionTabPresence {
                         conversation_id: conversation_id.into(),
                         conversation_url: conversation_url.clone(),
@@ -10402,6 +10444,8 @@ mod tests {
                 crate::companion::CompanionPresenceUpdate {
                     account_fingerprint: None,
                     browser_label: Some("Chrome".into()),
+                    account_fingerprint_fresh: false,
+                    tabs_fresh: true,
                     tabs: vec![crate::companion::CompanionTabPresence {
                         conversation_id: conversation_id.into(),
                         conversation_url: conversation_url.clone(),
@@ -10529,6 +10573,8 @@ mod tests {
                     crate::companion::CompanionPresenceUpdate {
                         account_fingerprint: Some(credential.clone()),
                         browser_label: Some(label.into()),
+                        account_fingerprint_fresh: true,
+                        tabs_fresh: true,
                         tabs: Vec::new(),
                     },
                     crate::companion::unix_time_ms(),
@@ -10646,6 +10692,8 @@ mod tests {
                     crate::companion::CompanionPresenceUpdate {
                         account_fingerprint: Some("a".repeat(64)),
                         browser_label: Some(label.into()),
+                        account_fingerprint_fresh: true,
+                        tabs_fresh: true,
                         tabs: Vec::new(),
                     },
                     crate::companion::unix_time_ms(),
@@ -10774,6 +10822,8 @@ mod tests {
                 crate::companion::CompanionPresenceUpdate {
                     account_fingerprint: Some("b".repeat(64)),
                     browser_label: Some("Edge".into()),
+                    account_fingerprint_fresh: true,
+                    tabs_fresh: true,
                     tabs: Vec::new(),
                 },
                 crate::companion::unix_time_ms(),
@@ -10831,6 +10881,8 @@ mod tests {
                 crate::companion::CompanionPresenceUpdate {
                     account_fingerprint: Some("a".repeat(64)),
                     browser_label: Some("Edge".into()),
+                    account_fingerprint_fresh: true,
+                    tabs_fresh: true,
                     tabs: Vec::new(),
                 },
                 crate::companion::unix_time_ms(),
@@ -10967,6 +11019,8 @@ mod tests {
                 crate::companion::CompanionPresenceUpdate {
                     account_fingerprint: Some("a".repeat(64)),
                     browser_label: Some("Edge".into()),
+                    account_fingerprint_fresh: true,
+                    tabs_fresh: true,
                     tabs: Vec::new(),
                 },
                 crate::companion::unix_time_ms(),
@@ -11062,6 +11116,8 @@ mod tests {
                 crate::companion::CompanionPresenceUpdate {
                     account_fingerprint: Some("b".repeat(64)),
                     browser_label: Some("Chrome".into()),
+                    account_fingerprint_fresh: true,
+                    tabs_fresh: true,
                     tabs: Vec::new(),
                 },
                 crate::companion::unix_time_ms(),
@@ -11152,6 +11208,8 @@ mod tests {
                 crate::companion::CompanionPresenceUpdate {
                     account_fingerprint: Some("a".repeat(64)),
                     browser_label: Some("Edge".into()),
+                    account_fingerprint_fresh: true,
+                    tabs_fresh: true,
                     tabs: Vec::new(),
                 },
                 crate::companion::unix_time_ms(),
@@ -11208,6 +11266,8 @@ mod tests {
                 crate::companion::CompanionPresenceUpdate {
                     account_fingerprint: Some("b".repeat(64)),
                     browser_label: Some("Edge".into()),
+                    account_fingerprint_fresh: true,
+                    tabs_fresh: true,
                     tabs: Vec::new(),
                 },
                 crate::companion::unix_time_ms(),
@@ -11415,6 +11475,8 @@ mod tests {
                 crate::companion::CompanionPresenceUpdate {
                     account_fingerprint: None,
                     browser_label: Some("Chrome".into()),
+                    account_fingerprint_fresh: false,
+                    tabs_fresh: true,
                     tabs: Vec::new(),
                 },
                 crate::companion::unix_time_ms(),
@@ -11465,6 +11527,8 @@ mod tests {
                 crate::companion::CompanionPresenceUpdate {
                     account_fingerprint: None,
                     browser_label: Some("Edge".into()),
+                    account_fingerprint_fresh: false,
+                    tabs_fresh: true,
                     tabs: Vec::new(),
                 },
                 crate::companion::unix_time_ms(),
@@ -11662,6 +11726,8 @@ mod tests {
                 crate::companion::CompanionPresenceUpdate {
                     account_fingerprint: None,
                     browser_label: Some("Chrome".into()),
+                    account_fingerprint_fresh: false,
+                    tabs_fresh: true,
                     tabs: vec![crate::companion::CompanionTabPresence {
                         conversation_id: wrong_correlation_conversation.into(),
                         conversation_url: format!(
@@ -11686,6 +11752,8 @@ mod tests {
                 crate::companion::CompanionPresenceUpdate {
                     account_fingerprint: None,
                     browser_label: Some("Edge".into()),
+                    account_fingerprint_fresh: false,
+                    tabs_fresh: true,
                     tabs: vec![crate::companion::CompanionTabPresence {
                         conversation_id: anchor_conversation.into(),
                         conversation_url: format!("https://chatgpt.com/c/{anchor_conversation}"),
@@ -11943,6 +12011,8 @@ mod tests {
                 crate::companion::CompanionPresenceUpdate {
                     account_fingerprint: None,
                     browser_label: Some("Chrome".into()),
+                    account_fingerprint_fresh: false,
+                    tabs_fresh: true,
                     tabs: vec![crate::companion::CompanionTabPresence {
                         conversation_id: chrome_conversation.into(),
                         conversation_url: format!("https://chatgpt.com/c/{chrome_conversation}"),
@@ -11965,6 +12035,8 @@ mod tests {
                 crate::companion::CompanionPresenceUpdate {
                     account_fingerprint: None,
                     browser_label: Some("Edge".into()),
+                    account_fingerprint_fresh: false,
+                    tabs_fresh: true,
                     tabs: vec![crate::companion::CompanionTabPresence {
                         conversation_id: edge_conversation.into(),
                         conversation_url: format!("https://chatgpt.com/c/{edge_conversation}"),
@@ -11985,6 +12057,8 @@ mod tests {
                 crate::companion::CompanionPresenceUpdate {
                     account_fingerprint: None,
                     browser_label: Some("Edge".into()),
+                    account_fingerprint_fresh: false,
+                    tabs_fresh: true,
                     tabs: vec![crate::companion::CompanionTabPresence {
                         conversation_id: edge_conversation.into(),
                         conversation_url: format!("https://chatgpt.com/c/{edge_conversation}"),
@@ -12101,6 +12175,8 @@ mod tests {
                 crate::companion::CompanionPresenceUpdate {
                     account_fingerprint: None,
                     browser_label: Some("Edge".into()),
+                    account_fingerprint_fresh: false,
+                    tabs_fresh: true,
                     tabs: vec![anchor_tab.clone()],
                 },
                 crate::companion::unix_time_ms(),
@@ -12113,6 +12189,8 @@ mod tests {
                 crate::companion::CompanionPresenceUpdate {
                     account_fingerprint: None,
                     browser_label: Some("Chrome".into()),
+                    account_fingerprint_fresh: false,
+                    tabs_fresh: true,
                     tabs: vec![crate::companion::CompanionTabPresence {
                         conversation_id: worker_conversation.into(),
                         conversation_url: format!("https://chatgpt.com/c/{worker_conversation}"),
@@ -13269,6 +13347,8 @@ mod tests {
                 crate::companion::CompanionPresenceUpdate {
                     account_fingerprint: None,
                     browser_label: Some("Chrome".into()),
+                    account_fingerprint_fresh: false,
+                    tabs_fresh: true,
                     tabs: vec![core_route.tab.clone()],
                 },
                 crate::companion::unix_time_ms(),

@@ -29,7 +29,8 @@ function loadControl({ initialTabs = {}, protectedTab = () => false, pendingComm
   const results = [];
   const transportCalls = [];
   let pending = pendingCommand ? { ...pendingCommand } : null;
-  let failPoll = false;
+  let failPollStatus = null;
+  let failResultStatus = null;
   const onUpdated = eventHook();
   const onRemoved = eventHook();
   const onDebuggerEvent = eventHook();
@@ -120,7 +121,7 @@ function loadControl({ initialTabs = {}, protectedTab = () => false, pendingComm
     const body = typeof options.body === 'string' ? JSON.parse(options.body) : (options.body || {});
     transportCalls.push({ body, options: { ...options } });
     if (body.action === 'poll') {
-      if (failPoll) return { ok: false, status: 0, data: { error: 'bridge offline' } };
+      if (failPollStatus !== null) return { ok: false, status: failPollStatus, data: { error: 'bridge unavailable' } };
       return { ok: true, status: 200, data: { epoch: 'epoch-1', requests: pending ? [pending.id] : [], policy: { read: true, write: true } } };
     }
     if (body.action === 'claim') {
@@ -131,6 +132,7 @@ function loadControl({ initialTabs = {}, protectedTab = () => false, pendingComm
     }
     if (body.action === 'check') return { ok: true, status: 200, data: { allowed: true } };
     if (body.action === 'result') {
+      if (failResultStatus !== null) return { ok: false, status: failResultStatus, data: { error: 'result ack unavailable' } };
       results.push(body.result);
       return { ok: true, status: 200, data: { ok: true } };
     }
@@ -156,8 +158,12 @@ function loadControl({ initialTabs = {}, protectedTab = () => false, pendingComm
     results,
     transportCalls,
     localStore,
+    getSessionStore() { return { ...sessionStore }; },
     onDebuggerEvent,
-    setPollFailure(value = true) { failPoll = value; }
+    setPollFailure(status = 0) { failPollStatus = status; },
+    clearPollFailure() { failPollStatus = null; },
+    setResultFailure(status = 0) { failResultStatus = status; },
+    clearResultFailure() { failResultStatus = null; }
   };
 }
 
@@ -568,16 +574,87 @@ test('failed browser screenshot still restores the human-only control glow', asy
   assert.deepEqual(env.detachCalls, []);
 });
 
-test('lost browser-control bridge revokes debugger custody instead of leaving invisible control', async () => {
+test('one transient overlay refresh failure is retried before releasing debugger custody', async () => {
+  let failOverlayCount = 0;
+  const env = loadControl({
+    initialTabs: { 4: { url: 'https://example.org/', title: 'Example Org', active: false, pinned: false, status: 'complete' } },
+    onDebuggerCommand: async ({ method, params }) => {
+      if (method === 'Runtime.evaluate' && String(params.expression || '').includes('"overlay"') && failOverlayCount > 0) {
+        failOverlayCount -= 1;
+        throw new Error('transient renderer context loss');
+      }
+    }
+  });
+  await env.control.pump();
+  await env.control.execute(env.command('browser_tabs', { action: 'attach', tabId: 4 }));
+  failOverlayCount = 1;
+  await env.control.heartbeat();
+  assert.deepEqual(env.detachCalls, [], 'one transient overlay error must be repaired without invalidating the tab handle');
+});
+
+test('persistent overlay refresh failure still releases debugger custody fail-closed', async () => {
+  let failOverlayCount = 0;
+  const env = loadControl({
+    initialTabs: { 4: { url: 'https://example.org/', title: 'Example Org', active: false, pinned: false, status: 'complete' } },
+    onDebuggerCommand: async ({ method, params }) => {
+      if (method === 'Runtime.evaluate' && String(params.expression || '').includes('"overlay"') && failOverlayCount > 0) {
+        failOverlayCount -= 1;
+        throw new Error('persistent renderer context loss');
+      }
+    }
+  });
+  await env.control.pump();
+  await env.control.execute(env.command('browser_tabs', { action: 'attach', tabId: 4 }));
+  failOverlayCount = 2;
+  await env.control.heartbeat();
+  assert.deepEqual(env.detachCalls, [4], 'MoonDesk must not retain invisible debugger custody when the overlay cannot be restored');
+});
+
+test('transient browser-control bridge failure preserves exact debugger custody', async () => {
   const env = loadControl({
     initialTabs: { 3: { url: 'https://example.net/', title: 'Example Net', active: false, pinned: false, status: 'complete' } }
   });
   await env.control.pump();
   await env.control.execute(env.command('browser_tabs', { action: 'attach', tabId: 3 }));
   assert.deepEqual(env.attachCalls, [3]);
-  env.setPollFailure();
+  env.setPollFailure(0);
   await env.control.pump();
-  assert.deepEqual(env.detachCalls, [3]);
+  assert.deepEqual(env.detachCalls, [], 'a loopback timeout must not invalidate Codex tab handles');
+});
+
+test('authoritative browser-control rejection revokes debugger custody', async () => {
+  const env = loadControl({
+    initialTabs: { 3: { url: 'https://example.net/', title: 'Example Net', active: false, pinned: false, status: 'complete' } }
+  });
+  await env.control.pump();
+  await env.control.execute(env.command('browser_tabs', { action: 'attach', tabId: 3 }));
+  env.setPollFailure(401);
+  await env.control.pump();
+  assert.deepEqual(env.detachCalls, [3], 'credential/auth revocation must fail closed');
+});
+
+test('transient result acknowledgement failure preserves attachment and durable receipt', async () => {
+  const pendingCommand = {
+    id: 'request-attach-transient-ack',
+    epoch: 'epoch-1',
+    owner: 'owner-a',
+    tool: 'user_browser_tabs',
+    args: { action: 'attach', tabId: 9 },
+    expiresAt: Date.now() + 10_000
+  };
+  const env = loadControl({
+    initialTabs: { 9: { url: 'https://example.com/', title: 'Example', active: false, pinned: false, status: 'complete' } },
+    pendingCommand
+  });
+  env.setResultFailure(0);
+  await env.control.pump();
+  assert.deepEqual(env.attachCalls, [9]);
+  assert.deepEqual(env.detachCalls, [], 'lost result ACK must not invalidate the exact attached tab');
+  assert.ok(env.getSessionStore().moondeskUserBrowserControlV1?.receipt, 'unacknowledged result must survive MV3 service-worker suspension for retry');
+  env.clearResultFailure();
+  await env.control.pump();
+  assert.equal(env.getSessionStore().moondeskUserBrowserControlV1?.receipt ?? null, null, 'later successful ACK clears the session receipt');
+  assert.deepEqual(env.detachCalls, []);
 });
 
 test('poll loop maps user_browser tool names into the tab executor and returns the result once', async () => {

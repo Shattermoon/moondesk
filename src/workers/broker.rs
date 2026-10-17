@@ -787,9 +787,28 @@ impl WorkerBroker {
         Ok(Some(updated))
     }
 
+    #[cfg(test)]
     pub async fn sync_browser_presence(
         &self,
         open_conversation_ids: &BTreeSet<String>,
+    ) -> Result<Vec<WorkerRecord>, WorkerBrokerError> {
+        self.sync_browser_presence_for_client(
+            "",
+            false,
+            &BTreeSet::new(),
+            open_conversation_ids,
+            true,
+        )
+        .await
+    }
+
+    pub async fn sync_browser_presence_for_client(
+        &self,
+        current_client_id: &str,
+        current_tabs_fresh: bool,
+        current_open_conversation_ids: &BTreeSet<String>,
+        fresh_open_conversation_ids: &BTreeSet<String>,
+        legacy_absence_authoritative: bool,
     ) -> Result<Vec<WorkerRecord>, WorkerBrokerError> {
         let mut guard = self.data.lock().await;
         let mut candidate = guard.clone();
@@ -809,7 +828,21 @@ impl WorkerBroker {
                     }
                     continue;
                 };
-                let open = open_conversation_ids.contains(&conversation_id);
+                let open = if let Some(bound_client_id) = worker.browser_client_id.as_deref() {
+                    if bound_client_id != current_client_id || !current_tabs_fresh {
+                        continue;
+                    }
+                    current_open_conversation_ids.contains(&conversation_id)
+                } else if fresh_open_conversation_ids.contains(&conversation_id) {
+                    true
+                } else if legacy_absence_authoritative {
+                    false
+                } else {
+                    // Legacy Workers without a durable browser affinity may attach on positive fresh
+                    // evidence, but absence is not authoritative while any paired browser lacks
+                    // fresh tab telemetry. Preserve the prior state rather than inventing a detach.
+                    continue;
+                };
                 let desired = match worker.state {
                     WorkerState::Running => {
                         if open {
@@ -4054,6 +4087,131 @@ mod tests {
         assert_eq!(finished.attachment_state, BrowserAttachmentState::Absent);
         assert!(finished.current_task_id.is_none());
 
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn browser_scoped_presence_cannot_detach_another_browsers_pinned_worker() {
+        let root = temp_root("moondesk-worker-browser-scoped-presence");
+        let path = root.join("worker-state-v1.json");
+        let broker = WorkerBroker::open(&path).expect("open worker broker");
+        let workspace = WorkspaceId::new();
+        let core = anchor("core-browser-scoped-presence");
+
+        let edge = broker
+            .spawn_worker_on_browser(
+                spawn_request(
+                    OperationId::new(),
+                    workspace.clone(),
+                    core.clone(),
+                    "edge worker",
+                ),
+                "edge-client",
+                2,
+            )
+            .await
+            .expect("spawn edge worker");
+        make_claimable(&broker, &workspace, &core, &edge).await;
+        broker
+            .claim_worker(
+                &workspace,
+                &edge.worker_id,
+                &edge.task_id,
+                &edge.claim_token,
+                anchor("edge-worker-scoped-presence"),
+            )
+            .await
+            .expect("claim edge worker");
+
+        let chrome = broker
+            .spawn_worker_on_browser(
+                spawn_request(
+                    OperationId::new(),
+                    workspace.clone(),
+                    core.clone(),
+                    "chrome worker",
+                ),
+                "chrome-client",
+                2,
+            )
+            .await
+            .expect("spawn chrome worker");
+        make_claimable(&broker, &workspace, &core, &chrome).await;
+        broker
+            .claim_worker(
+                &workspace,
+                &chrome.worker_id,
+                &chrome.task_id,
+                &chrome.claim_token,
+                anchor("chrome-worker-scoped-presence"),
+            )
+            .await
+            .expect("claim chrome worker");
+
+        let edge_open = BTreeSet::from([edge.worker_id.to_string()]);
+        let chrome_open = BTreeSet::from([chrome.worker_id.to_string()]);
+        let both_open = BTreeSet::from([edge.worker_id.to_string(), chrome.worker_id.to_string()]);
+        broker
+            .sync_browser_presence_for_client("edge-client", true, &edge_open, &both_open, false)
+            .await
+            .expect("attach edge worker from edge telemetry");
+        broker
+            .sync_browser_presence_for_client(
+                "chrome-client",
+                true,
+                &chrome_open,
+                &both_open,
+                false,
+            )
+            .await
+            .expect("attach chrome worker from chrome telemetry");
+
+        broker
+            .sync_browser_presence_for_client(
+                "edge-client",
+                true,
+                &BTreeSet::new(),
+                &chrome_open,
+                false,
+            )
+            .await
+            .expect("edge closed-tab telemetry");
+        let family = broker
+            .family_for_anchor(&workspace, &core)
+            .await
+            .expect("read family")
+            .expect("family exists");
+        assert_eq!(
+            family.workers[&edge.worker_id].attachment_state,
+            BrowserAttachmentState::Detached,
+            "fresh edge telemetry may update only the edge-pinned worker"
+        );
+        assert_eq!(
+            family.workers[&chrome.worker_id].attachment_state,
+            BrowserAttachmentState::Attached,
+            "edge telemetry must not detach the chrome-pinned worker"
+        );
+
+        broker
+            .sync_browser_presence_for_client(
+                "chrome-client",
+                false,
+                &BTreeSet::new(),
+                &BTreeSet::new(),
+                false,
+            )
+            .await
+            .expect("stale chrome telemetry");
+        let family = broker
+            .family_for_anchor(&workspace, &core)
+            .await
+            .expect("read family after stale telemetry")
+            .expect("family exists");
+        assert_eq!(
+            family.workers[&chrome.worker_id].attachment_state,
+            BrowserAttachmentState::Attached,
+            "stale telemetry cannot manufacture a detach"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 

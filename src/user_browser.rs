@@ -161,6 +161,44 @@ impl UserBrowserBroker {
         validate_browser_id(browser_id)?;
         let mut state = self.state.lock().await;
         prune_clients(&mut state);
+        // A physical Companion installation owns at most one live user-browser identity. Older
+        // runtimes stored browser_id in chrome.storage.session, so an extension/browser restart
+        // could rotate it and leave the prior identity fresh for the presence TTL. Supersede that
+        // incarnation immediately instead of advertising two browsers for one Companion.
+        let superseded_browser_ids = state
+            .clients
+            .iter()
+            .filter(|(existing_browser_id, client)| {
+                existing_browser_id.as_str() != browser_id
+                    && client.companion_client_id == companion_client_id
+            })
+            .map(|(existing_browser_id, _)| existing_browser_id.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        if !superseded_browser_ids.is_empty() {
+            state.clients.retain(|existing_browser_id, _| {
+                !superseded_browser_ids.contains(existing_browser_id)
+            });
+            let superseded_request_ids = state
+                .pending
+                .iter()
+                .filter(|(_, pending)| superseded_browser_ids.contains(&pending.browser_id))
+                .map(|(request_id, _)| request_id.clone())
+                .collect::<Vec<_>>();
+            for request_id in superseded_request_ids {
+                let Some(mut pending) = state.pending.remove(&request_id) else {
+                    continue;
+                };
+                let error = if pending.claimed {
+                    "USER_BROWSER_RESULT_UNCONFIRMED: the browser identity changed after this operation was dispatched. Inspect the same tab before repeating input."
+                } else {
+                    "USER_BROWSER_OFFLINE: the browser identity changed before this operation was dispatched; list connected user browsers again"
+                };
+                if let Some(sender) = pending.sender.take() {
+                    let _ = sender.send(serde_json::json!({ "error": error }));
+                }
+            }
+        }
+
         if let Some(existing) = state.clients.get(browser_id)
             && existing.companion_client_id != companion_client_id
         {
@@ -524,6 +562,61 @@ mod tests {
                     serde_json::json!({"value":{"accepted":true}}),
                 )
                 .await
+        );
+    }
+
+    #[tokio::test]
+    async fn same_companion_new_browser_identity_supersedes_old_incarnation_immediately() {
+        let broker = std::sync::Arc::new(UserBrowserBroker::new());
+        let old_browser_id = Uuid::new_v4().to_string();
+        let new_browser_id = Uuid::new_v4().to_string();
+        broker
+            .poll(&old_browser_id, "companion-a", "Chrome", true)
+            .await
+            .unwrap();
+        let runner = {
+            let broker = broker.clone();
+            let browser_id = old_browser_id.clone();
+            tokio::spawn(async move {
+                broker
+                    .execute(
+                        &browser_id,
+                        &"d".repeat(64),
+                        "user_browser_tabs",
+                        serde_json::json!({"action":"list"}),
+                    )
+                    .await
+            })
+        };
+        tokio::task::yield_now().await;
+        let old_poll = broker
+            .poll(&old_browser_id, "companion-a", "Chrome", true)
+            .await
+            .unwrap();
+        assert_eq!(old_poll.requests.len(), 1);
+
+        broker
+            .poll(&new_browser_id, "companion-a", "Chrome", true)
+            .await
+            .unwrap();
+
+        let browsers = broker.browsers().await;
+        assert_eq!(browsers.len(), 1);
+        assert_eq!(browsers[0].browser_id, new_browser_id);
+        assert_eq!(
+            broker
+                .browser_id_for_companion("companion-a")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(new_browser_id.as_str())
+        );
+        let result = runner.await.unwrap().unwrap();
+        assert!(
+            result
+                .get("error")
+                .and_then(Value::as_str)
+                .is_some_and(|error| error.contains("USER_BROWSER_OFFLINE"))
         );
     }
 

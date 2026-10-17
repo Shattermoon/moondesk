@@ -17,10 +17,11 @@ function eventHook() {
   };
 }
 
-function loadControl({ initialTabs = {}, protectedTab = () => false, pendingCommand = null, failCapture = false, delayFrameTreeMs = 0, onDebuggerCommand = null, navigationHistory = null } = {}) {
+function loadControl({ initialTabs = {}, protectedTab = () => false, pendingCommand = null, failCapture = false, delayFrameTreeMs = 0, onDebuggerCommand = null, navigationHistory = null, initialSessionStore = {}, sharedLocalStore = null } = {}) {
   const tabs = new Map(Object.entries(initialTabs).map(([id, tab]) => [Number(id), { id: Number(id), ...tab }]));
   let nextTabId = Math.max(100, ...tabs.keys()) + 1;
-  let sessionStore = {};
+  let sessionStore = { ...initialSessionStore };
+  const localStore = sharedLocalStore || {};
   const attached = new Set();
   const attachCalls = [];
   const detachCalls = [];
@@ -39,6 +40,10 @@ function loadControl({ initialTabs = {}, protectedTab = () => false, pendingComm
       session: {
         async get(key) { return { [key]: sessionStore[key] }; },
         async set(value) { sessionStore = { ...sessionStore, ...value }; }
+      },
+      local: {
+        async get(key) { return { [key]: localStore[key] }; },
+        async set(value) { Object.assign(localStore, value); }
       }
     },
     permissions: { async contains() { return true; } },
@@ -150,10 +155,52 @@ function loadControl({ initialTabs = {}, protectedTab = () => false, pendingComm
     debuggerCommands,
     results,
     transportCalls,
+    localStore,
     onDebuggerEvent,
     setPollFailure(value = true) { failPoll = value; }
   };
 }
+
+test('user-browser identity survives extension reload when session storage is cleared', async () => {
+  const localStore = {};
+  const first = loadControl({ sharedLocalStore: localStore });
+  await first.control.heartbeat();
+  const firstPoll = first.transportCalls.find(call => call.body.action === 'poll');
+  assert.ok(firstPoll?.body?.browserId);
+  assert.equal(localStore.moondeskUserBrowserIdentityV1, firstPoll.body.browserId);
+
+  const second = loadControl({ sharedLocalStore: localStore });
+  await second.control.heartbeat();
+  const secondPoll = second.transportCalls.find(call => call.body.action === 'poll');
+  assert.equal(secondPoll?.body?.browserId, firstPoll.body.browserId, 'extension reload must not rotate browser-control identity');
+});
+
+test('legacy session browser id migrates into persistent browser identity', async () => {
+  const legacyId = nodeCrypto.randomUUID();
+  const localStore = {};
+  const env = loadControl({
+    sharedLocalStore: localStore,
+    initialSessionStore: {
+      moondeskUserBrowserControlV1: { browserId: legacyId, epoch: null, receipt: null, tabs: [] }
+    }
+  });
+  await env.control.heartbeat();
+  const poll = env.transportCalls.find(call => call.body.action === 'poll');
+  assert.equal(poll?.body?.browserId, legacyId);
+  assert.equal(localStore.moondeskUserBrowserIdentityV1, legacyId);
+});
+
+test('first persistent browser identity can reuse the existing Companion installation id', async () => {
+  const companionId = nodeCrypto.randomUUID();
+  const localStore = {
+    moondeskWorkerCompanionV1: { clientId: companionId }
+  };
+  const env = loadControl({ sharedLocalStore: localStore });
+  await env.control.heartbeat();
+  const poll = env.transportCalls.find(call => call.body.action === 'poll');
+  assert.equal(poll?.body?.browserId, companionId);
+  assert.equal(localStore.moondeskUserBrowserIdentityV1, companionId);
+});
 
 test('protected ChatGPT tabs refuse interactive attachment before debugger ownership', async () => {
   const env = loadControl({

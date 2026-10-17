@@ -5,6 +5,9 @@ const { browserPage, boundedBrowserValue, browserFramePoint } = globalThis.MoonD
 /** One browser-lifetime tab custodian. No selected-tab fallback and no action replay. */
 function createBrowserControl(chrome, transport, protectedTab = () => false) {
   const KEY = 'moondeskUserBrowserControlV1';
+  const IDENTITY_KEY = 'moondeskUserBrowserIdentityV1';
+  const COMPANION_STATE_KEY = 'moondeskWorkerCompanionV1';
+  const STORAGE_TIMEOUT_MS = 2500;
   const tabs = new Map();
   let browserId, epoch = null, receipt = null, loading, pumping, again = false, saving = Promise.resolve();
   let policy = { read: false, write: false };
@@ -12,6 +15,17 @@ function createBrowserControl(chrome, transport, protectedTab = () => false) {
   const id = () => crypto.randomUUID();
   const cut = (s, n = 1000) => String(s ?? '').slice(0,n);
   const error = message => { throw new Error(message); };
+  async function bounded(work, timeoutMs = STORAGE_TIMEOUT_MS, message = 'BROWSER_EXTENSION_API_TIMEOUT') {
+    let timer;
+    try {
+      return await Promise.race([
+        Promise.resolve(work),
+        new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(message)), timeoutMs); })
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
   const handle = tabId => tabId;
   const owns = (state, command) => !!state && (state.owner === command.owner ||
     state.owner.startsWith('request:') && command.owner.startsWith('session:') && command.ownerAliases?.includes(state.owner));
@@ -35,10 +49,10 @@ function createBrowserControl(chrome, transport, protectedTab = () => false) {
     return url.href;
   };
   function save() {
-    const work = saving.catch(() => {}).then(() => chrome.storage.session.set({ [KEY]: {
+    const work = saving.catch(() => {}).then(() => bounded(chrome.storage.session.set({ [KEY]: {
       browserId, epoch, receipt,
       tabs: [...tabs.values()].map(s => ({ tabId: s.tabId, owner: s.owner, lease: s.lease }))
-    } }));
+    } }), STORAGE_TIMEOUT_MS, 'BROWSER_SESSION_STORAGE_TIMEOUT'));
     saving = work; return work;
   }
   function newState(tabId, owner, lease = id()) {
@@ -51,8 +65,39 @@ function createBrowserControl(chrome, transport, protectedTab = () => false) {
   }
   async function ready() {
     if (!loading) loading = (async () => {
-      const data = (await chrome.storage.session.get(KEY))[KEY];
-      browserId = typeof data?.browserId === 'string' && /^[a-f\d-]{36}$/i.test(data.browserId) ? data.browserId : id();
+      let data = {};
+      try {
+        data = (await bounded(chrome.storage.session.get(KEY), STORAGE_TIMEOUT_MS, 'BROWSER_SESSION_STORAGE_TIMEOUT'))[KEY] || {};
+      } catch {}
+      const localIdentity = await bounded(
+        chrome.storage.local.get(IDENTITY_KEY),
+        STORAGE_TIMEOUT_MS,
+        'BROWSER_LOCAL_STORAGE_TIMEOUT'
+      );
+      const companionState = await bounded(
+        chrome.storage.local.get(COMPANION_STATE_KEY),
+        STORAGE_TIMEOUT_MS,
+        'BROWSER_LOCAL_STORAGE_TIMEOUT'
+      );
+      const persistedBrowserId = localIdentity?.[IDENTITY_KEY];
+      const sessionBrowserId = typeof data?.browserId === 'string' && /^[a-f\d-]{36}$/i.test(data.browserId)
+        ? data.browserId
+        : null;
+      const companionClientId = companionState?.[COMPANION_STATE_KEY]?.clientId;
+      browserId = typeof persistedBrowserId === 'string' && /^[a-f\d-]{36}$/i.test(persistedBrowserId)
+        ? persistedBrowserId
+        : (sessionBrowserId || (
+          typeof companionClientId === 'string' && /^[a-f\d-]{36}$/i.test(companionClientId)
+            ? companionClientId
+            : id()
+        ));
+      if (persistedBrowserId !== browserId) {
+        await bounded(
+          chrome.storage.local.set({ [IDENTITY_KEY]: browserId }),
+          STORAGE_TIMEOUT_MS,
+          'BROWSER_LOCAL_STORAGE_TIMEOUT'
+        );
+      }
       epoch = data?.epoch || null; receipt = data?.receipt || null;
       for (const entry of (Array.isArray(data?.tabs) ? data.tabs : []).slice(0,32)) {
         if (Number.isSafeInteger(entry.tabId) && typeof entry.owner === 'string' && typeof entry.lease === 'string') {
@@ -98,7 +143,7 @@ function createBrowserControl(chrome, transport, protectedTab = () => false) {
       // A debugger loss can race its MV3 notification. Confirm Chrome's current target
       // state before retiring custody; an ordinary protocol/JavaScript error is not detach.
       if (tabs.get(state.tabId) === state) {
-        const targets = await chrome.debugger.getTargets().catch(() => null);
+        const targets = await bounded(chrome.debugger.getTargets(), 2500, 'BROWSER_DEBUGGER_STATE_TIMEOUT').catch(() => null);
         if (targets && !targets.some(target => target.tabId === state.tabId && target.attached)) {
           await release(state);
           error('BROWSER_DETACHED: Chrome ended this attachment. Earlier input may have completed; inspect before repeating.');
@@ -117,7 +162,7 @@ function createBrowserControl(chrome, transport, protectedTab = () => false) {
     return tab;
   }
   async function getTab(tabId) {
-    try { return await chrome.tabs.get(tabId); }
+    try { return await bounded(chrome.tabs.get(tabId), 2500, 'BROWSER_TAB_LOOKUP_TIMEOUT'); }
     catch (cause) {
       if (/No tab with id|Invalid tab ID/i.test(cause?.message || '')) error('BROWSER_TAB_CLOSED: this exact tab no longer exists, possibly closed by the user. List tabs to inspect current state; do not recreate it automatically.');
       throw cause;
@@ -269,7 +314,7 @@ function createBrowserControl(chrome, transport, protectedTab = () => false) {
       await currentTab(state,command);
       if (!previous) {
         await save(); // Crash before/after attach never grants an automatic reattach.
-        await chrome.debugger.attach({ tabId },'1.3');
+        await bounded(chrome.debugger.attach({ tabId },'1.3'), Math.min(5000, Math.max(1, command.expiresAt - Date.now())), 'BROWSER_ATTACH_TIMEOUT');
         acquired = true;
         alive(state,command);
       }
@@ -513,7 +558,7 @@ function createBrowserControl(chrome, transport, protectedTab = () => false) {
     if (tool === 'browser_navigate' && !['url','back','forward','reload'].includes(args.action)) error('BROWSER_NAVIGATION_ACTION_UNKNOWN');
     if (tool === 'browser_tabs') {
       if (args.action === 'list') {
-        const list = await chrome.tabs.query({});
+        const list = await bounded(chrome.tabs.query({}), 3000, 'BROWSER_TAB_LIST_TIMEOUT');
         const matched=list.filter(t=>(/^https?:/.test(t.url || t.pendingUrl || '') || t.url === 'about:blank')&&(!args.filter || `${t.title} ${t.url} ${t.pendingUrl || ''}`.toLowerCase().includes(args.filter.toLowerCase())));
         const values=[];let size=0;
         for(const tab of matched.slice(args.offset || 0,(args.offset || 0)+(args.limit || 100))) {
@@ -537,7 +582,7 @@ function createBrowserControl(chrome, transport, protectedTab = () => false) {
         if (protectedTab(null,url,command.conversationId)) error('BROWSER_EXECUTOR_TAB: ChatGPT pages cannot be opened through user-browser control. Open them yourself outside this control surface.');
         if (tabs.size >= 32) error('BROWSER_TAB_LIMIT: release an unused attachment before opening another tab.');
         await authorize(command);
-        const tab = await chrome.tabs.create({url,active:false});
+        const tab = await bounded(chrome.tabs.create({url,active:false}), Math.min(5000, Math.max(1, command.expiresAt - Date.now())), 'BROWSER_TAB_CREATE_TIMEOUT');
         // Creation is already accepted. Preserve that receipt even when attachment fails.
         // In particular, an unavailable debugger must not strand the requested URL on blank.
         try {
@@ -552,7 +597,7 @@ function createBrowserControl(chrome, transport, protectedTab = () => false) {
       }
       const state = await owned(command);
       if (args.action === 'release') { await release(state); return {value:{tabId:handle(state.tabId),released:true}}; }
-      if (args.action === 'close') { await authorize(command); await currentTab(state,command); await chrome.tabs.remove(state.tabId); await release(state); return {value:{tabId:handle(state.tabId),closed:true}}; }
+      if (args.action === 'close') { await authorize(command); await currentTab(state,command); await bounded(chrome.tabs.remove(state.tabId), Math.min(5000, Math.max(1, command.expiresAt - Date.now())), 'BROWSER_TAB_CLOSE_TIMEOUT'); await release(state); return {value:{tabId:handle(state.tabId),closed:true}}; }
       error('BROWSER_TABS_ACTION_UNKNOWN');
     }
     const existing = tabs.get(args.tabId);
@@ -672,7 +717,7 @@ function createBrowserControl(chrome, transport, protectedTab = () => false) {
   }
   async function heartbeat() {
     await ready();
-    const enabled = await chrome.permissions.contains({permissions:['debugger','tabs']});
+    const enabled = await bounded(chrome.permissions.contains({permissions:['debugger','tabs']}), 2500, 'BROWSER_PERMISSION_STATE_TIMEOUT');
     const poll = await transport('/browser-control',{method:'POST',body:JSON.stringify({action:'poll',browserId,name:/Edg\//.test(navigator.userAgent) ? 'Edge' : 'Chrome / Chromium',enabled})});
     if (!poll.ok) { await revoke(); return null; }
     policy = poll.data.policy;

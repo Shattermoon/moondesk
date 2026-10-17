@@ -23,7 +23,7 @@ const popupSource = fs.readFileSync(popupPath, 'utf8');
 const serverSource = fs.readFileSync(serverPath, 'utf8');
 const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
 
-function loadBackground({ existingTabs = {}, contentByTab = {}, sendMessageImpl = null, scriptingExecuteImpl = null, accountFingerprint = 'a'.repeat(64), fetchImpl = async () => { throw new Error('network not used'); }, setTimeoutImpl = null, runtimeManifest = manifest, initialStored = {}, createdTabIdStart = 101, bootstrapAvailable = true, bootstrapToken = 'b'.repeat(64) } = {}) {
+function loadBackground({ existingTabs = {}, contentByTab = {}, sendMessageImpl = null, scriptingExecuteImpl = null, storageLocalGetImpl = null, tabsQueryImpl = null, accountFingerprint = 'a'.repeat(64), fetchImpl = async () => { throw new Error('network not used'); }, setTimeoutImpl = null, runtimeManifest = manifest, initialStored = {}, createdTabIdStart = 101, bootstrapAvailable = true, bootstrapToken = 'b'.repeat(64) } = {}) {
   const createdTabs = [];
   const removedTabs = [];
   const runtimeReloads = [];
@@ -36,7 +36,10 @@ function loadBackground({ existingTabs = {}, contentByTab = {}, sendMessageImpl 
   const chrome = {
     storage: {
       local: {
-        async get() { return stored; },
+        async get(...args) {
+          if (storageLocalGetImpl) return storageLocalGetImpl(...args);
+          return stored;
+        },
         async set(value) { stored = { ...stored, ...value }; },
         async remove(key) {
           for (const entry of Array.isArray(key) ? key : [key]) delete stored[entry];
@@ -48,7 +51,8 @@ function loadBackground({ existingTabs = {}, contentByTab = {}, sendMessageImpl 
         if (existingTabs[id]) return existingTabs[id];
         throw new Error('missing tab');
       },
-      async query() {
+      async query(...args) {
+        if (tabsQueryImpl) return tabsQueryImpl(...args);
         return Object.values(existingTabs);
       },
       async create(options) {
@@ -251,9 +255,16 @@ test('Companion liveness has redundant MV3 wake and popup presence refresh paths
   assert.match(contentSource, /MOONDESK_PRESENCE_WAKE/);
   assert.match(contentSource, /clearInterval\(presenceWakeTimer\)/, 'stale content scripts must stop waking after extension reload');
   assert.match(source, /case 'MOONDESK_PRESENCE_WAKE'/);
-  assert.match(source, /async function status\(\)[\s\S]*await collectPresence\(state, true\);[\s\S]*STATUS_PATH/);
+  assert.match(source, /async function status\(\)[\s\S]*schedulePresencePump\(25\);[\s\S]*STATUS_PATH/);
+  const statusStart = source.indexOf('async function status()');
+  const statusEnd = source.indexOf('async function clients()', statusStart);
+  assert.doesNotMatch(source.slice(statusStart, statusEnd), /await collectPresence|applyHostWorkerResetEpoch/, 'popup health must not await ChatGPT telemetry or Worker reset recovery');
+  const workerPumpStart = source.indexOf('async function pump()');
+  const workerPumpEnd = source.indexOf('async function pair(', workerPumpStart);
+  assert.doesNotMatch(source.slice(workerPumpStart, workerPumpEnd), /collectPresence\(/, 'Worker execution must not own browser presence liveness');
+  assert.match(source, /async function presencePump\(\)[\s\S]*await collectPresence\(state\)/, 'presence must have an independent pump');
   assert.match(source, /void \(async \(\) => \{[\s\S]*MOONDESK_CORRELATION_EVIDENCE/, 'optional correlation telemetry must not block presence/status');
-  assert.match(popupSource, /const POPUP_STATUS_TIMEOUT_MS = 20_000;/);
+  assert.match(popupSource, /const POPUP_STATUS_TIMEOUT_MS = 25_000;/);
   assert.match(popupSource, /bg\(\{ type: 'MOONDESK_STATUS' \}, POPUP_STATUS_TIMEOUT_MS\)/);
   assert.match(popupSource, /pill\.textContent = 'Unavailable'/);
 
@@ -268,6 +279,100 @@ test('Companion liveness has redundant MV3 wake and popup presence refresh paths
   assert.equal(result?.ok, true);
   assert.equal(result?.result?.scheduled, true);
   assert.ok(scheduled.includes(25), 'a content-script wake must schedule an immediate presence pump');
+  assert.ok(scheduled.filter((delay) => delay === 25).length >= 2, 'the same wake must independently nudge Worker execution too');
+});
+
+test('presence heartbeat remains live while the Worker pump is already busy', async () => {
+  let presencePosts = 0;
+  const fetchImpl = async (url, options = {}) => {
+    const parsed = new URL(url);
+    if (parsed.pathname !== '/__moondesk/companion/v1/presence') {
+      throw new Error(`unexpected request: ${parsed.pathname}`);
+    }
+    presencePosts += 1;
+    return {
+      ok: true,
+      status: 200,
+      async text() { return JSON.stringify({ presence: JSON.parse(options.body || '{}') }); }
+    };
+  };
+  const { evaluate } = loadBackground({ fetchImpl });
+  await evaluate(`(() => {
+    pumpActive = true;
+    connecting = Promise.resolve({
+      ...freshState(),
+      baseUrl: 'http://127.0.0.1:47650',
+      clientId: 'presence-independent',
+      credential: '${'d'.repeat(64)}'
+    });
+  })()`);
+  await evaluate('presencePump()');
+  assert.equal(presencePosts, 1, 'a hung Worker pump must not suppress Companion presence');
+});
+
+test('popup status stays responsive when ChatGPT scripting is permanently hung', async () => {
+  const credential = 'c'.repeat(64);
+  const initialStored = {
+    moondeskWorkerCompanionV1: {
+      baseUrl: 'http://127.0.0.1:47650',
+      clientId: 'popup-responsive',
+      credential
+    }
+  };
+  const fetchImpl = async (url) => {
+    const parsed = new URL(url);
+    if (parsed.pathname === '/__moondesk/companion/v1/hello') {
+      const ok = parsed.port === '47650';
+      const body = ok ? {
+        app: 'moondesk-worker-companion',
+        appVersion: manifest.version,
+        protocolVersion: 2,
+        companionRuntimeRevision: 31
+      } : {};
+      return { ok, status: ok ? 200 : 404, async json() { return body; }, async text() { return JSON.stringify(body); } };
+    }
+    if (parsed.pathname === '/__moondesk/companion/v1/status') {
+      const body = { paired: true, clientId: 'popup-responsive', hasWorkerState: false, workerResetEpoch: 0 };
+      return { ok: true, status: 200, async text() { return JSON.stringify(body); } };
+    }
+    throw new Error(`unexpected request: ${parsed.pathname}`);
+  };
+  const { evaluate } = loadBackground({
+    existingTabs: { 5: { id: 5, url: 'https://chatgpt.com/', active: true, windowId: 1, status: 'complete' } },
+    initialStored,
+    fetchImpl,
+    scriptingExecuteImpl: () => new Promise(() => {})
+  });
+  const result = await Promise.race([
+    evaluate('status()'),
+    new Promise((_, reject) => setTimeout(() => reject(new Error('popup status inherited a hung ChatGPT script')), 250))
+  ]);
+  assert.equal(result.connected, true);
+});
+
+test('shared connection state fails boundedly when Chromium persistent storage never resolves', async () => {
+  const { evaluate } = loadBackground({
+    storageLocalGetImpl: () => new Promise(() => {}),
+    setTimeoutImpl(callback, delayMs) {
+      if (delayMs === 3000) queueMicrotask(callback);
+      return 1;
+    }
+  });
+  const result = await evaluate('status()');
+  assert.equal(result.connected, false);
+  assert.match(result.error, /state read timed out/i);
+});
+
+test('model-discovery sign-in probe is bounded when Chromium scripting never resolves', async () => {
+  const { evaluate } = loadBackground({
+    existingTabs: { 5: { id: 5, url: 'https://chatgpt.com/', active: true, windowId: 1, status: 'complete' } },
+    scriptingExecuteImpl: () => new Promise(() => {}),
+    setTimeoutImpl(callback, delayMs) {
+      if (delayMs === 2500) queueMicrotask(callback);
+      return 1;
+    }
+  });
+  assert.equal(await evaluate('signedInChatGptPageAvailable()'), false);
 });
 
 test('presence account fingerprint is cached between fast pumps but forced popup refresh bypasses the cache', async () => {
@@ -345,6 +450,39 @@ test('stalled ChatGPT account verification cannot block the presence heartbeat',
   await evaluate("collectPresence({ baseUrl: 'http://127.0.0.1:47650', credential: 'token' }, true)");
   assert.equal(presencePosts, 1, 'heartbeat must still reach MoonDesk after a bounded account-probe timeout');
   assert.equal(presenceBody.accountFingerprint, undefined);
+});
+
+test('failed tab enumeration reuses the last successful presence snapshot instead of publishing zero tabs', async () => {
+  let failQuery = false;
+  const presenceBodies = [];
+  const existingTabs = {
+    5: { id: 5, url: 'https://chatgpt.com/c/aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee', active: true, windowId: 1, status: 'complete' }
+  };
+  const fetchImpl = async (url, options = {}) => {
+    const parsed = new URL(url);
+    if (parsed.pathname !== '/__moondesk/companion/v1/presence') throw new Error(`unexpected request: ${parsed.pathname}`);
+    const body = JSON.parse(options.body || '{}');
+    presenceBodies.push(body);
+    return { ok: true, status: 200, async text() { return JSON.stringify({ presence: body }); } };
+  };
+  const { evaluate } = loadBackground({
+    existingTabs,
+    fetchImpl,
+    tabsQueryImpl: async () => {
+      if (failQuery) throw new Error('Chromium tab enumeration unavailable');
+      return Object.values(existingTabs);
+    },
+    sendMessageImpl: async (_id, message) => message?.type === 'MOONDESK_CONTEXT'
+      ? { ok: true, context: { conversationId: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee', generating: false } }
+      : null
+  });
+  const stateExpr = "({ baseUrl: 'http://127.0.0.1:47650', credential: 'token' })";
+  await evaluate(`collectPresence(${stateExpr})`);
+  failQuery = true;
+  await evaluate(`collectPresence(${stateExpr})`);
+  assert.equal(presenceBodies.length, 2);
+  assert.equal(presenceBodies[0].tabs.length, 1);
+  assert.deepEqual(presenceBodies[1].tabs, presenceBodies[0].tabs, 'transient tab-query failure must not fabricate an empty browser');
 });
 
 test('transient account probe timeout keeps a recently verified fingerprint for bounded liveness grace', async () => {
@@ -471,7 +609,7 @@ test('popup status keeps Clear Workers available for stale companion-only histor
   })()`);
   const result = await evaluate('status()');
   assert.equal(result.hasWorkerState, true);
-  assert.equal(presenceRefreshes, 1, 'popup status must refresh host browser presence before reporting connected');
+  assert.equal(presenceRefreshes, 0, 'popup status must not block on ChatGPT presence telemetry');
 });
 
 test('Clear Workers fences in-flight browser work before awaiting the host reset', async () => {
@@ -1244,7 +1382,7 @@ test('bridge discovery prefers an exact runtime match over another MoonDesk vers
             app: 'moondesk-worker-companion',
             appVersion: manifest.version,
             protocolVersion: 2,
-            companionRuntimeRevision: 30
+            companionRuntimeRevision: 31
           };
         }
       };
@@ -1272,7 +1410,7 @@ test('bridge discovery prefers an exact runtime match over another MoonDesk vers
 
   const { evaluate, runtimeReloads } = loadBackground({ fetchImpl });
   const hello = await evaluate('discoverBridge(freshState())');
-  assert.equal(hello.companionRuntimeRevision, 30);
+  assert.equal(hello.companionRuntimeRevision, 31);
   assert.equal(runtimeReloads.length, 0);
 });
 
@@ -1385,7 +1523,7 @@ test('compatible bridge clears the one-shot runtime reload marker for a future m
             app: 'moondesk-worker-companion',
             appVersion: manifest.version,
             protocolVersion: 2,
-            companionRuntimeRevision: 30
+            companionRuntimeRevision: 31
           };
         }
       };
@@ -1398,7 +1536,7 @@ test('compatible bridge clears the one-shot runtime reload marker for a future m
   });
 
   const hello = await evaluate('discoverBridge(freshState())');
-  assert.equal(hello.companionRuntimeRevision, 30);
+  assert.equal(hello.companionRuntimeRevision, 31);
   const stored = await evaluate(`chrome.storage.local.get('${reloadKey}')`);
   assert.equal(stored[reloadKey], undefined);
 });
@@ -1416,7 +1554,7 @@ test('automatic pairing proves the extension was loaded from the MoonDesk-prepar
             app: 'moondesk-worker-companion',
             appVersion: manifest.version,
             protocolVersion: 2,
-            companionRuntimeRevision: 30
+            companionRuntimeRevision: 31
           };
         }
       };
@@ -1458,7 +1596,7 @@ test('source and release-ZIP installs without a bootstrap capability expose Manu
         app: 'moondesk-worker-companion',
         appVersion: manifest.version,
         protocolVersion: 2,
-        companionRuntimeRevision: 30
+        companionRuntimeRevision: 31
       };
       return {
         ok: true,
@@ -1579,7 +1717,7 @@ test('release version mismatch reloads the unpacked companion even when protocol
             app: 'moondesk-worker-companion',
             appVersion: '0.13.0',
             protocolVersion: 2,
-            companionRuntimeRevision: 30
+            companionRuntimeRevision: 31
           };
         }
       };
@@ -2062,7 +2200,7 @@ test('content reinjection replaces legacy or invalidated guards but skips a live
   });
 
   vm.runInContext(contentSource, context, { filename: contentPath });
-  assert.equal(runtimeListeners, 1, 'runtime 30 must replace the legacy boolean guard');
+  assert.equal(runtimeListeners, 1, 'the current runtime must replace the legacy boolean guard');
   vm.runInContext(contentSource, context, { filename: contentPath });
   assert.equal(runtimeListeners, 1, 'a live current content context must remain idempotent');
 

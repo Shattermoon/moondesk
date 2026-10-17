@@ -8,7 +8,7 @@ const BRIDGE_PORTS = [47650, 47651, 47652, 47653, 47654];
 const REQUIRED_PROTOCOL_VERSION = 2;
 // Bump with any shipped companion runtime change that requires Chromium to load new bytes. Keep
 // this aligned with COMPANION_RUNTIME_REVISION in src/server.rs.
-const COMPANION_RUNTIME_REVISION = 30;
+const COMPANION_RUNTIME_REVISION = 31;
 const SOURCE_DEV_MANIFEST_VERSION = '0.1.0';
 const RUNTIME_RELOAD_STORAGE_KEY = 'moondeskWorkerCompanionReloadRevisionV1';
 const INSTALLATION_BOOTSTRAP_FILE = 'moondesk-bootstrap.json';
@@ -26,11 +26,15 @@ const WORKER_RECOVERY_PATH = '/__moondesk/companion/v1/workers/recovery';
 const USER_BROWSER_PATH = '/__moondesk/companion/v1/browser-control';
 const HELLO_TIMEOUT_MS = 1200;
 const API_TIMEOUT_MS = 3000;
+const CHROME_API_TIMEOUT_MS = 3000;
+const CHROME_TAB_MUTATION_TIMEOUT_MS = 5000;
+const CONNECTION_TIMEOUT_MS = 15000;
 const CLEAR_WORKERS_TIMEOUT_MS = 8000;
 const FAST_POLL_MS = 1500;
 const ACCOUNT_FINGERPRINT_PROBE_TIMEOUT_MS = 2000;
 const PRESENCE_ACCOUNT_FINGERPRINT_MAX_AGE_MS = 30_000;
 const PRESENCE_ACCOUNT_FINGERPRINT_STALE_GRACE_MS = 2 * 60_000;
+const PRESENCE_TAB_SNAPSHOT_STALE_GRACE_MS = 2 * 60_000;
 const ACCOUNT_FINGERPRINT_MAX_TABS = 4;
 const MAX_RECONCILE_ATTEMPTS = 3;
 const MAX_PARALLEL_COMMANDS = 4;
@@ -41,6 +45,8 @@ const MODEL_CATALOG_RETRY_MS = 5 * 60 * 1000;
 
 let pumpTimer = null;
 let pumpActive = false;
+let presencePumpTimer = null;
+let presencePumpActive = false;
 let userBrowserPumpTimer = null;
 let userBrowserPumpActive = false;
 let connecting = null;
@@ -54,6 +60,8 @@ let userBrowserTransportState = null;
 let userBrowserCommandFlight = null;
 let presenceAccountFingerprint = null;
 let presenceAccountFingerprintAt = 0;
+let presenceObservedTabs = [];
+let presenceObservedTabsAt = 0;
 const sessionReconcileCommandIds = new Set();
 
 function freshState() {
@@ -70,7 +78,11 @@ function freshState() {
 }
 
 async function readState() {
-  const stored = await chrome.storage.local.get(STORAGE_KEY);
+  const stored = await chromeApi(
+    chrome.storage.local.get(STORAGE_KEY),
+    CHROME_API_TIMEOUT_MS,
+    'MoonDesk Companion state read timed out'
+  );
   const persisted = stored[STORAGE_KEY] || {};
   const state = { ...freshState(), ...persisted };
   if (!state.blockedCommands || typeof state.blockedCommands !== 'object' || Array.isArray(state.blockedCommands)) {
@@ -91,7 +103,11 @@ async function writeState(state) {
   const snapshot = JSON.parse(JSON.stringify(state));
   stateWriteQueue = stateWriteQueue
     .catch(() => {})
-    .then(() => chrome.storage.local.set({ [STORAGE_KEY]: snapshot }));
+    .then(() => chromeApi(
+      chrome.storage.local.set({ [STORAGE_KEY]: snapshot }),
+      CHROME_API_TIMEOUT_MS,
+      'MoonDesk Companion state write timed out'
+    ));
   await stateWriteQueue;
 }
 
@@ -186,7 +202,11 @@ function randomCredential() {
 async function installationBootstrapToken() {
   let response;
   try {
-    response = await fetch(chrome.runtime.getURL(INSTALLATION_BOOTSTRAP_FILE), { cache: 'no-store' });
+    response = await withTimeout(
+      fetch(chrome.runtime.getURL(INSTALLATION_BOOTSTRAP_FILE), { cache: 'no-store' }),
+      CHROME_API_TIMEOUT_MS,
+      'MoonDesk Companion installation capability read timed out'
+    );
   } catch {
     response = null;
   }
@@ -197,7 +217,11 @@ async function installationBootstrapToken() {
       'companion_installation_capability_missing'
     );
   }
-  const body = await response.json().catch(() => null);
+  const body = await withTimeout(
+    response.json().catch(() => null),
+    CHROME_API_TIMEOUT_MS,
+    'MoonDesk Companion installation capability parse timed out'
+  );
   const token = typeof body?.pairingToken === 'string' ? body.pairingToken.trim() : '';
   if (!/^[0-9a-f]{64}$/i.test(token)) {
     throw requestError(
@@ -230,6 +254,58 @@ async function withTimeout(promise, timeoutMs, message) {
   }
 }
 
+async function chromeApi(work, timeoutMs = CHROME_API_TIMEOUT_MS, message = 'Chromium extension API timed out') {
+  return withTimeout(Promise.resolve(work), timeoutMs, message);
+}
+
+async function queryChatGptTabs() {
+  return chromeApi(
+    chrome.tabs.query({ url: 'https://chatgpt.com/*' }),
+    CHROME_API_TIMEOUT_MS,
+    'ChatGPT tab query timed out'
+  );
+}
+
+async function getTab(tabId) {
+  return chromeApi(
+    chrome.tabs.get(tabId),
+    CHROME_API_TIMEOUT_MS,
+    'Chromium tab lookup timed out'
+  );
+}
+
+async function createTab(options) {
+  return chromeApi(
+    chrome.tabs.create(options),
+    CHROME_TAB_MUTATION_TIMEOUT_MS,
+    'Chromium tab creation timed out'
+  );
+}
+
+async function updateTab(tabId, changes) {
+  return chromeApi(
+    chrome.tabs.update(tabId, changes),
+    CHROME_TAB_MUTATION_TIMEOUT_MS,
+    'Chromium tab update timed out'
+  );
+}
+
+async function reloadTab(tabId) {
+  return chromeApi(
+    chrome.tabs.reload(tabId),
+    CHROME_TAB_MUTATION_TIMEOUT_MS,
+    'Chromium tab reload timed out'
+  );
+}
+
+async function removeTab(tabId) {
+  return chromeApi(
+    chrome.tabs.remove(tabId),
+    CHROME_TAB_MUTATION_TIMEOUT_MS,
+    'Chromium tab removal timed out'
+  );
+}
+
 async function api(
   state,
   path,
@@ -255,7 +331,11 @@ async function api(
       body: body === null ? undefined : JSON.stringify(body),
       signal: controller.signal
     });
-    const text = await response.text();
+    const text = await withTimeout(
+      response.text(),
+      boundedTimeout,
+      'MoonDesk companion response body timed out'
+    );
     let parsed = {};
     if (text) {
       try { parsed = JSON.parse(text); }
@@ -349,7 +429,11 @@ async function hello(baseUrl) {
       signal: controller.signal
     });
     if (!response.ok) return null;
-    const body = await response.json().catch(() => null);
+    const body = await withTimeout(
+      response.json().catch(() => null),
+      HELLO_TIMEOUT_MS,
+      'MoonDesk Companion bridge hello parse timed out'
+    );
     return body?.app === 'moondesk-worker-companion'
       && Number.isInteger(body?.protocolVersion)
       && body.protocolVersion > 0
@@ -398,7 +482,11 @@ async function maybeReloadForRuntimeMismatch(helloBody) {
   if (!mismatch.revisionMismatch && !mismatch.versionMismatch) return false;
 
   const target = `${mismatch.remoteVersion || 'unknown'}:${Number.isInteger(mismatch.remoteRevision) ? mismatch.remoteRevision : 'legacy'}`;
-  const stored = await chrome.storage.local.get(RUNTIME_RELOAD_STORAGE_KEY);
+  const stored = await chromeApi(
+    chrome.storage.local.get(RUNTIME_RELOAD_STORAGE_KEY),
+    CHROME_API_TIMEOUT_MS,
+    'MoonDesk Companion runtime-state read timed out'
+  );
   if (stored[RUNTIME_RELOAD_STORAGE_KEY] === target) {
     throw requestError(
       `MoonDesk refreshed the Worker Companion files, but Chromium is still running the previous extension generation. Reload MoonDesk Worker Companion once on the browser extensions page.`,
@@ -407,7 +495,11 @@ async function maybeReloadForRuntimeMismatch(helloBody) {
     );
   }
 
-  await chrome.storage.local.set({ [RUNTIME_RELOAD_STORAGE_KEY]: target });
+  await chromeApi(
+    chrome.storage.local.set({ [RUNTIME_RELOAD_STORAGE_KEY]: target }),
+    CHROME_API_TIMEOUT_MS,
+    'MoonDesk Companion runtime-state write timed out'
+  );
   chrome.runtime.reload();
   return true;
 }
@@ -434,7 +526,11 @@ async function discoverBridge(state) {
     || legacyCompatible.find((probe) => probe.baseUrl === preferred)
     || legacyCompatible[0];
   if (match) {
-    await chrome.storage.local.remove(RUNTIME_RELOAD_STORAGE_KEY);
+    await chromeApi(
+      chrome.storage.local.remove(RUNTIME_RELOAD_STORAGE_KEY),
+      CHROME_API_TIMEOUT_MS,
+      'MoonDesk Companion runtime-state cleanup timed out'
+    );
     if (state.baseUrl !== match.baseUrl) {
       state.baseUrl = match.baseUrl;
       await writeState(state);
@@ -475,7 +571,7 @@ async function ensureConnectedOnce() {
         state.clientId = remote.clientId;
         await writeState(state);
       }
-      await applyHostWorkerResetEpoch(state, remote);
+      // Worker-reset reconciliation is performed by the Worker pump, not by shared connectivity.
       return state;
     } catch (error) {
       if (error?.status !== 401) throw error;
@@ -502,7 +598,11 @@ async function ensureConnectedOnce() {
 
 function ensureConnected() {
   if (connecting) return connecting;
-  const work = ensureConnectedOnce();
+  const work = withTimeout(
+    ensureConnectedOnce(),
+    CONNECTION_TIMEOUT_MS,
+    'MoonDesk Companion connection attempt timed out'
+  );
   const tracked = work.finally(() => {
     if (connecting === tracked) connecting = null;
   });
@@ -550,20 +650,29 @@ async function sendReadOnlyToTabWithReacquire(tabId, message, timeoutMs = 12000)
 
 async function ensureContent(tabId) {
   // Picker verification must run in ChatGPT's MAIN world so it can read the native
-  // React-owned model state. The helper exposes only a bounded allowlist snapshot.
+  // React-owned model state. Every Chromium extension API call is bounded: one remounting tab must
+  // never hold the shared Companion connection/pumps forever.
   try {
-    await chrome.scripting.executeScript({
-      target: { tabId },
-      world: 'MAIN',
-      files: ['provider-correlation-main.js', 'model-state-main.js']
-    });
+    await chromeApi(
+      chrome.scripting.executeScript({
+        target: { tabId },
+        world: 'MAIN',
+        files: ['provider-correlation-main.js', 'model-state-main.js']
+      }),
+      CHROME_API_TIMEOUT_MS,
+      'ChatGPT MAIN-world helper injection timed out'
+    );
   } catch {}
 
   try {
     const response = await sendToTab(tabId, { type: 'MOONDESK_CONTEXT' }, 3000);
     if (response?.ok) return response;
   } catch {}
-  await chrome.scripting.executeScript({ target: { tabId }, files: ['chatgpt-dom.js', 'content.js'] });
+  await chromeApi(
+    chrome.scripting.executeScript({ target: { tabId }, files: ['chatgpt-dom.js', 'content.js'] }),
+    CHROME_API_TIMEOUT_MS,
+    'ChatGPT content-script injection timed out'
+  );
   return sendToTab(tabId, { type: 'MOONDESK_CONTEXT' }, 5000);
 }
 
@@ -684,7 +793,11 @@ async function chatGptAccountFingerprintForTab(tabId) {
 async function currentChatGptAccountFingerprint() {
   let tabs = [];
   try {
-    tabs = await chrome.tabs.query({ url: 'https://chatgpt.com/*' });
+    tabs = await chromeApi(
+      chrome.tabs.query({ url: 'https://chatgpt.com/*' }),
+      CHROME_API_TIMEOUT_MS,
+      'ChatGPT tab query timed out'
+    );
   } catch {
     return null;
   }
@@ -853,14 +966,28 @@ async function accountFingerprintForPresence(tabs, forceRefresh = false) {
 }
 
 async function collectPresence(state, forceAccountRefresh = false) {
-  const tabs = (await chrome.tabs.query({ url: 'https://chatgpt.com/*' })).slice(0, 32);
+  let tabs = [];
+  let tabsQueryFailed = false;
+  try {
+    tabs = (await chromeApi(
+      chrome.tabs.query({ url: 'https://chatgpt.com/*' }),
+      CHROME_API_TIMEOUT_MS,
+      'ChatGPT tab query timed out'
+    )).slice(0, 32);
+  } catch {
+    tabsQueryFailed = true;
+  }
   let focusedWindowId = null;
   try {
-    const focused = await chrome.windows.getLastFocused();
+    const focused = await chromeApi(
+      chrome.windows.getLastFocused(),
+      CHROME_API_TIMEOUT_MS,
+      'Focused-window query timed out'
+    );
     focusedWindowId = focused?.focused ? (focused.id ?? null) : null;
   } catch {}
 
-  const observed = (await Promise.all(tabs.map(async (tab) => {
+  let observed = (await Promise.all(tabs.map(async (tab) => {
     const context = chatContextFromUrl(tab.url);
     if (!context) return null;
     let generating = false;
@@ -885,7 +1012,22 @@ async function collectPresence(state, forceAccountRefresh = false) {
     };
   }))).filter(Boolean);
 
-  const accountFingerprint = await accountFingerprintForPresence(tabs, forceAccountRefresh);
+  const presenceNow = Date.now();
+  if (!tabsQueryFailed) {
+    presenceObservedTabs = observed.map((tab) => ({ ...tab }));
+    presenceObservedTabsAt = presenceNow;
+  } else if (presenceNow - presenceObservedTabsAt <= PRESENCE_TAB_SNAPSHOT_STALE_GRACE_MS) {
+    observed = presenceObservedTabs.map((tab) => ({ ...tab }));
+  } else {
+    throw new Error('ChatGPT tab enumeration is unavailable beyond the bounded presence grace period');
+  }
+
+  const cachedFingerprintAge = presenceNow - presenceAccountFingerprintAt;
+  const accountFingerprint = tabsQueryFailed
+    && validAccountFingerprint(presenceAccountFingerprint)
+    && cachedFingerprintAge <= PRESENCE_ACCOUNT_FINGERPRINT_STALE_GRACE_MS
+      ? presenceAccountFingerprint
+      : await accountFingerprintForPresence(tabs, forceAccountRefresh);
   const presence = await api(state, PRESENCE_PATH, {
     method: 'POST',
     body: {
@@ -1052,12 +1194,12 @@ async function tabMatchesRecord(tab, record, allowRememberedLaunch = true) {
 async function recoverTab(record) {
   if (Number.isInteger(record.tabId)) {
     try {
-      const tab = await chrome.tabs.get(record.tabId);
+      const tab = await getTab(record.tabId);
       if (await tabMatchesRecord(tab, record)) return tab;
     } catch {}
   }
   const allowRememberedLaunchScan = Boolean(record.conversationUrl) || record.phase !== 'creating';
-  const tabs = await chrome.tabs.query({ url: 'https://chatgpt.com/*' });
+  const tabs = await queryChatGptTabs();
   for (const tab of tabs) {
     if (await tabMatchesRecord(tab, record, allowRememberedLaunchScan)) return tab;
   }
@@ -1110,7 +1252,7 @@ async function recordForCommand(state, command, placement, reconcileRequired = f
   // is still verified before any Worker Send.
   if (expectedCommandFingerprint) {
     let accountProbeTabs = [];
-    try { accountProbeTabs = await chrome.tabs.query({ url: 'https://chatgpt.com/*' }); } catch {}
+    try { accountProbeTabs = await queryChatGptTabs(); } catch {}
     const hasReadyAccountProbe = accountProbeTabs.some((tab) =>
       Number.isInteger(tab?.id) && !tab.incognito && !tab.discarded && tab.status !== 'loading'
     );
@@ -1197,7 +1339,7 @@ async function recordForCommand(state, command, placement, reconcileRequired = f
       // ChatGPT page already exists, prove the remembered account before opening the durable Worker
       // URL. With no usable ChatGPT page, defer proof to the exact Worker tab opened below.
       let accountProbeTabs = [];
-      try { accountProbeTabs = await chrome.tabs.query({ url: 'https://chatgpt.com/*' }); } catch {}
+      try { accountProbeTabs = await queryChatGptTabs(); } catch {}
       const hasReadyAccountProbe = accountProbeTabs.some((tab) =>
         Number.isInteger(tab?.id) && !tab.incognito && !tab.discarded && tab.status !== 'loading'
       );
@@ -1232,7 +1374,7 @@ async function recordForCommand(state, command, placement, reconcileRequired = f
       throw new Error('Reconciliation has no confirmed worker conversation URL and cannot create a fresh worker thread');
     }
     const targetUrl = record.conversationUrl || record.sourceUrl;
-    tab = await chrome.tabs.create({
+    tab = await createTab({
       url: sourceWithLaunchToken(targetUrl, record.launchToken, command.launch.executionProfile),
       active: false
     });
@@ -1314,12 +1456,12 @@ async function closeFreshPreSendFailureTab(state, command) {
     !Number.isInteger(record.tabId)
   ) return false;
   let tab;
-  try { tab = await chrome.tabs.get(record.tabId); } catch { return false; }
+  try { tab = await getTab(record.tabId); } catch { return false; }
   // Close only the exact MoonDesk-created fresh home tab. If it has become a real conversation or
   // left ChatGPT, leave it alone because ownership is no longer provable from the pre-Send record.
   if (!tab?.url?.startsWith('https://chatgpt.com/') || canonicalConversationUrl(tab.url)) return false;
   try {
-    await chrome.tabs.remove(record.tabId);
+    await removeTab(record.tabId);
     record.tabId = null;
     return true;
   } catch {
@@ -1369,7 +1511,7 @@ async function observeWorkerAcceptance(
     if (clearGeneration !== workerClearGeneration) return null;
     let tab = null;
     if (Number.isInteger(record.tabId)) {
-      try { tab = await chrome.tabs.get(record.tabId); } catch {}
+      try { tab = await getTab(record.tabId); } catch {}
     }
     if (!tab) {
       try { tab = await recoverTab(record); } catch {}
@@ -1820,6 +1962,25 @@ function schedulePump(delayMs = FAST_POLL_MS) {
   pumpTimer = setTimeout(() => { void pump(); }, delayMs);
 }
 
+function schedulePresencePump(delayMs = FAST_POLL_MS) {
+  if (presencePumpTimer) clearTimeout(presencePumpTimer);
+  presencePumpTimer = setTimeout(() => { void presencePump(); }, delayMs);
+}
+
+async function presencePump() {
+  if (presencePumpActive) return;
+  presencePumpActive = true;
+  try {
+    const state = await ensureConnected();
+    await collectPresence(state);
+  } catch (error) {
+    console.warn('MoonDesk Companion presence pump failed:', String(error?.message || error));
+  } finally {
+    presencePumpActive = false;
+    schedulePresencePump();
+  }
+}
+
 function scheduleUserBrowserPump(delayMs = FAST_POLL_MS) {
   if (userBrowserPumpTimer) clearTimeout(userBrowserPumpTimer);
   userBrowserPumpTimer = setTimeout(() => { void userBrowserPump(); }, delayMs);
@@ -1850,7 +2011,7 @@ async function recoveryTabFor(state, command, reload = false) {
   // Recovery may be the first ChatGPT page opened after a browser restart. Opening the exact durable
   // Worker URL is reversible and does not send anything; verify that target tab's account immediately
   // afterwards and fail closed before inspection/continuation if the browser account changed.
-  const tabs = await chrome.tabs.query({ url: 'https://chatgpt.com/*' });
+  const tabs = await queryChatGptTabs();
   let tab = tabs.find((candidate) =>
     Number.isInteger(candidate?.id) && canonicalConversationUrl(candidate.url) === expectedUrl
   ) || null;
@@ -1863,15 +2024,15 @@ async function recoveryTabFor(state, command, reload = false) {
       if (!currentFingerprint) throw new Error('worker_account_unconfirmed');
       if (currentFingerprint !== expectedFingerprint) throw new Error('worker_account_changed');
     }
-    tab = await chrome.tabs.create({ url: expectedUrl, active: false });
+    tab = await createTab({ url: expectedUrl, active: false });
   }
   if (!Number.isInteger(tab?.id)) throw new Error('worker_recovery_tab_unavailable');
   const targetFingerprint = await waitForChatGptAccountFingerprint(tab.id);
   if (!targetFingerprint) throw new Error('worker_account_unconfirmed');
   if (targetFingerprint !== expectedFingerprint) throw new Error('worker_account_changed');
-  if (reload) await chrome.tabs.reload(tab.id);
+  if (reload) await reloadTab(tab.id);
   await waitForContent(tab.id, 20000);
-  tab = await chrome.tabs.get(tab.id);
+  tab = await getTab(tab.id);
   if (canonicalConversationUrl(tab?.url) !== expectedUrl) {
     throw new Error('worker_recovery_tab_changed');
   }
@@ -2032,7 +2193,7 @@ async function pump() {
   try {
     const state = await ensureConnected();
     if (workerClearInProgress || clearGeneration !== workerClearGeneration) return;
-    await collectPresence(state);
+    await syncHostWorkerResetEpoch(state);
     if (workerClearInProgress || clearGeneration !== workerClearGeneration) return;
     const recovered = await pumpWorkerRecovery(state);
     if (recovered) redeemed += 1;
@@ -2069,6 +2230,7 @@ async function pair({ pairingToken }) {
   state.blockedCommands = {};
   await writeState(state);
   schedulePump(50);
+  schedulePresencePump(50);
   scheduleUserBrowserPump(50);
   return { paired: true, connected: true, clientId: state.clientId, baseUrl: state.baseUrl };
 }
@@ -2076,11 +2238,12 @@ async function pair({ pairingToken }) {
 async function status() {
   try {
     const state = await ensureConnected();
-    // Do not report "connected" while the host still sees an expired browser-presence heartbeat.
-    // Opening the popup is itself proof that this extension is alive, so refresh presence first.
-    await collectPresence(state, true);
+    // Popup health must never wait on ChatGPT tab telemetry. Nudge the normal bounded pumps and
+    // return host connectivity immediately; presence/account refresh continues independently.
+    schedulePresencePump(25);
+    scheduleUserBrowserPump(25);
     const remote = await api(state, STATUS_PATH);
-    await applyHostWorkerResetEpoch(state, remote);
+    // Worker-reset reconciliation belongs to the Worker pump; it must not block popup health.
     const hasLocalWorkerState =
       Object.keys(state.launchRecords || {}).length > 0 ||
       Object.keys(state.threadRecords || {}).length > 0 ||
@@ -2095,7 +2258,8 @@ async function status() {
       requiredProtocolVersion: REQUIRED_PROTOCOL_VERSION
     };
   } catch (error) {
-    const state = await readState();
+    let state = freshState();
+    try { state = await readState(); } catch {}
     return {
       paired: Boolean(state.credential),
       connected: false,
@@ -2177,7 +2341,7 @@ function workerAuthorityTabs(state, tabs) {
 }
 
 async function clearRememberedWorkerLaunchesInTabs(state) {
-  const tabs = await chrome.tabs.query({ url: 'https://chatgpt.com/*' });
+  const tabs = await queryChatGptTabs();
   const candidates = workerAuthorityTabs(state, tabs);
   await Promise.all(candidates.map(async (tab) => {
     try {
@@ -2192,7 +2356,7 @@ async function clearRememberedWorkerLaunchesInTabs(state) {
       // A tab that closed during reset cannot click Send anymore and is therefore safe. Any still-
       // open tab that held exact Worker launch authority must explicitly confirm its content-side
       // cancellation generation before this browser can acknowledge the global reset.
-      try { await chrome.tabs.get(tab.id); } catch { return; }
+      try { await getTab(tab.id); } catch { return; }
       throw error;
     }
   }));
@@ -2243,7 +2407,7 @@ async function closeModelCatalogHelper(tabId) {
     // This tab id is created exclusively for the current discovery flight. ChatGPT is allowed to
     // rewrite its URL while the picker opens, so URL-based ownership checks can leak the helper tab.
     // Closing by the exact created tab id keeps discovery disposable without touching user tabs.
-    await chrome.tabs.remove(tabId);
+    await removeTab(tabId);
   } catch {}
 }
 
@@ -2297,7 +2461,11 @@ function normalizeModelCatalog(catalog) {
 
 async function readModelCatalogCache() {
   try {
-    const stored = await chrome.storage.local.get(MODEL_CATALOG_STORAGE_KEY);
+    const stored = await chromeApi(
+      chrome.storage.local.get(MODEL_CATALOG_STORAGE_KEY),
+      CHROME_API_TIMEOUT_MS,
+      'Model-catalog cache read timed out'
+    );
     const record = stored[MODEL_CATALOG_STORAGE_KEY];
     return record && typeof record === 'object' && !Array.isArray(record) ? record : {};
   } catch {
@@ -2306,32 +2474,48 @@ async function readModelCatalogCache() {
 }
 
 async function writeModelCatalogCache(record) {
-  await chrome.storage.local.set({ [MODEL_CATALOG_STORAGE_KEY]: record });
+  await chromeApi(
+    chrome.storage.local.set({ [MODEL_CATALOG_STORAGE_KEY]: record }),
+    CHROME_API_TIMEOUT_MS,
+    'Model-catalog cache write timed out'
+  );
 }
 
 async function signedInChatGptPageAvailable() {
   let tabs = [];
-  try {
-    tabs = await chrome.tabs.query({ url: 'https://chatgpt.com/*' });
-  } catch {
-    return false;
-  }
-  for (const tab of tabs) {
-    if (!Number.isInteger(tab?.id) || tab.incognito || tab.discarded || tab.status !== 'complete') continue;
+  try { tabs = await queryChatGptTabs(); } catch { return false; }
+  const candidates = tabs.filter((tab) =>
+    Number.isInteger(tab?.id) && !tab.incognito && !tab.discarded && tab.status === 'complete'
+  );
+  for (const tab of candidates) {
     try {
-      const [frame] = await chrome.scripting.executeScript({
+      const execution = chrome.scripting.executeScript({
         target: { tabId: tab.id },
-        func: async () => {
+        func: async (timeoutMs) => {
+          const controller = new AbortController();
+          const timer = setTimeout(() => controller.abort(), timeoutMs);
           try {
-            const response = await fetch('/api/auth/session', { credentials: 'include', cache: 'no-store' });
+            const response = await fetch('/api/auth/session', {
+              credentials: 'include',
+              cache: 'no-store',
+              signal: controller.signal
+            });
             if (!response.ok) return false;
             const session = await response.json();
             return Boolean(session && typeof session === 'object' && (session.accessToken || session.user));
           } catch {
             return false;
+          } finally {
+            clearTimeout(timer);
           }
-        }
+        },
+        args: [ACCOUNT_FINGERPRINT_PROBE_TIMEOUT_MS]
       });
+      const [frame] = await chromeApi(
+        execution,
+        ACCOUNT_FINGERPRINT_PROBE_TIMEOUT_MS + 500,
+        'ChatGPT sign-in probe timed out'
+      );
       if (frame?.result === true) return true;
     } catch {}
   }
@@ -2354,9 +2538,9 @@ async function discoverModelCatalog({ force = false, requireExistingPage = false
     const expiresAt = now + 60000;
     let tab = null;
     try {
-      tab = await chrome.tabs.create({ url: modelCatalogHelperUrl(nonce), active: false });
+      tab = await createTab({ url: modelCatalogHelperUrl(nonce), active: false });
       if (!Number.isInteger(tab?.id)) throw new Error('Could not create ChatGPT model-discovery helper');
-      try { await chrome.tabs.update(tab.id, { autoDiscardable: false }); } catch {}
+      try { await updateTab(tab.id, { autoDiscardable: false }); } catch {}
       await waitForContent(tab.id, Math.min(20000, Math.max(1, expiresAt - Date.now())));
       const remaining = expiresAt - Date.now();
       if (remaining <= 0) throw new Error('ChatGPT model discovery timed out before inspection');
@@ -2411,6 +2595,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       case 'MOONDESK_CLEAR_WORKERS': return clearWorkers(message);
       case 'MOONDESK_PRESENCE_WAKE': {
         // Content scripts provide a redundant MV3 wake source when Edge/Chromium delays alarms.
+        schedulePresencePump(25);
         schedulePump(25);
         return { scheduled: true };
       }
@@ -2435,41 +2620,45 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 chrome.runtime.onInstalled.addListener(() => {
   void chrome.alarms.create(POLL_ALARM, { periodInMinutes: 0.5 });
   schedulePump(200);
+  schedulePresencePump(200);
   scheduleUserBrowserPump(200);
   void discoverModelCatalog({ requireExistingPage: true }).catch(() => {});
 });
 chrome.runtime.onStartup.addListener(() => {
   void chrome.alarms.create(POLL_ALARM, { periodInMinutes: 0.5 });
   schedulePump(200);
+  schedulePresencePump(200);
   scheduleUserBrowserPump(200);
   void discoverModelCatalog({ requireExistingPage: true }).catch(() => {});
 });
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === POLL_ALARM) {
     void pump();
+    void presencePump();
     void userBrowserPump();
     void discoverModelCatalog({ requireExistingPage: true }).catch(() => {});
   }
 });
 chrome.tabs.onActivated.addListener(() => {
-  schedulePump(25);
+  schedulePresencePump(25);
 });
 chrome.tabs.onUpdated.addListener((_tabId, changeInfo, tab) => {
   if ((changeInfo.url || changeInfo.status === 'complete') && tab.url?.startsWith('https://chatgpt.com/')) {
     void discoverModelCatalog({ requireExistingPage: true }).catch(() => {});
-    schedulePump(25);
+    schedulePresencePump(25);
   }
 });
 chrome.tabs.onRemoved.addListener(() => {
   // A closed worker tab is not a finished worker. Publish fresh presence quickly so MoonDesk can
   // mark the durable worker as detached/no-tab without guessing that its server-side turn stopped.
-  schedulePump(25);
+  schedulePresencePump(25);
 });
 chrome.windows.onFocusChanged.addListener(() => {
-  schedulePump(25);
+  schedulePresencePump(25);
 });
 
 void chrome.alarms.create(POLL_ALARM, { periodInMinutes: 0.5 });
 schedulePump(500);
+schedulePresencePump(500);
 scheduleUserBrowserPump(500);
 void discoverModelCatalog({ requireExistingPage: true }).catch(() => {});

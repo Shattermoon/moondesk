@@ -66,7 +66,7 @@ pub const COMPANION_USER_BROWSER_ROUTE: &str = "/__moondesk/companion/v1/browser
 pub const COMPANION_TOKEN_HEADER: &str = "x-moondesk-companion-token";
 // Bump with any shipped companion runtime change that requires Chromium to load new bytes. Keep
 // this aligned with COMPANION_RUNTIME_REVISION in background.js.
-pub const COMPANION_RUNTIME_REVISION: u32 = 31;
+pub const COMPANION_RUNTIME_REVISION: u32 = 32;
 const MAX_COMPANION_BODY_BYTES: usize = 16 * 1024;
 const MAX_COMPANION_USER_BROWSER_BODY_BYTES: usize = 2 * 1024 * 1024;
 

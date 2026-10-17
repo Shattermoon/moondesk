@@ -23,7 +23,7 @@ const popupSource = fs.readFileSync(popupPath, 'utf8');
 const serverSource = fs.readFileSync(serverPath, 'utf8');
 const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
 
-function loadBackground({ existingTabs = {}, contentByTab = {}, sendMessageImpl = null, scriptingExecuteImpl = null, storageLocalGetImpl = null, tabsQueryImpl = null, accountFingerprint = 'a'.repeat(64), fetchImpl = async () => { throw new Error('network not used'); }, setTimeoutImpl = null, runtimeManifest = manifest, initialStored = {}, createdTabIdStart = 101, bootstrapAvailable = true, bootstrapToken = 'b'.repeat(64) } = {}) {
+function loadBackground({ existingTabs = {}, contentByTab = {}, sendMessageImpl = null, scriptingExecuteImpl = null, storageLocalGetImpl = null, tabsQueryImpl = null, importScriptsImpl = null, accountFingerprint = 'a'.repeat(64), fetchImpl = async () => { throw new Error('network not used'); }, setTimeoutImpl = null, runtimeManifest = manifest, initialStored = {}, createdTabIdStart = 101, bootstrapAvailable = true, bootstrapToken = 'b'.repeat(64) } = {}) {
   const createdTabs = [];
   const removedTabs = [];
   const runtimeReloads = [];
@@ -113,6 +113,7 @@ function loadBackground({ existingTabs = {}, contentByTab = {}, sendMessageImpl 
 
   const context = vm.createContext({
     chrome,
+    ...(importScriptsImpl ? { importScripts: importScriptsImpl } : {}),
     console: { warn() {} },
     crypto: webcrypto,
     URL,
@@ -255,16 +256,21 @@ test('Companion liveness has redundant MV3 wake and popup presence refresh paths
   assert.match(contentSource, /MOONDESK_PRESENCE_WAKE/);
   assert.match(contentSource, /clearInterval\(presenceWakeTimer\)/, 'stale content scripts must stop waking after extension reload');
   assert.match(source, /case 'MOONDESK_PRESENCE_WAKE'/);
-  assert.match(source, /async function status\(\)[\s\S]*schedulePresencePump\(25\);[\s\S]*STATUS_PATH/);
+  assert.match(source, /case 'MOONDESK_PING'/);
   const statusStart = source.indexOf('async function status()');
   const statusEnd = source.indexOf('async function clients()', statusStart);
-  assert.doesNotMatch(source.slice(statusStart, statusEnd), /await collectPresence|applyHostWorkerResetEpoch/, 'popup health must not await ChatGPT telemetry or Worker reset recovery');
+  const statusSource = source.slice(statusStart, statusEnd);
+  assert.match(statusSource, /operationalState\(\)/, 'popup status must use the independent operational lane');
+  assert.match(statusSource, /schedulePresencePump\(25\)/);
+  assert.doesNotMatch(statusSource, /await collectPresence|applyHostWorkerResetEpoch|await ensureConnected\(\)/, 'popup health must not await ChatGPT telemetry, Worker reset recovery, or the shared Worker connection flight');
   const workerPumpStart = source.indexOf('async function pump()');
   const workerPumpEnd = source.indexOf('async function pair(', workerPumpStart);
   assert.doesNotMatch(source.slice(workerPumpStart, workerPumpEnd), /collectPresence\(/, 'Worker execution must not own browser presence liveness');
   assert.match(source, /async function presencePump\(\)[\s\S]*await collectPresence\(state\)/, 'presence must have an independent pump');
   assert.match(source, /void \(async \(\) => \{[\s\S]*MOONDESK_CORRELATION_EVIDENCE/, 'optional correlation telemetry must not block presence/status');
+  assert.match(popupSource, /const POPUP_BOOT_TIMEOUT_MS = 5_000;/);
   assert.match(popupSource, /const POPUP_STATUS_TIMEOUT_MS = 25_000;/);
+  assert.match(popupSource, /bg\(\{ type: 'MOONDESK_PING' \}, POPUP_BOOT_TIMEOUT_MS\)/);
   assert.match(popupSource, /bg\(\{ type: 'MOONDESK_STATUS' \}, POPUP_STATUS_TIMEOUT_MS\)/);
   assert.match(popupSource, /pill\.textContent = 'Unavailable'/);
 
@@ -282,8 +288,16 @@ test('Companion liveness has redundant MV3 wake and popup presence refresh paths
   assert.ok(scheduled.filter((delay) => delay === 25).length >= 2, 'the same wake must independently nudge Worker execution too');
 });
 
-test('presence heartbeat remains live while the Worker pump is already busy', async () => {
+test('presence heartbeat remains live while the Worker connection flight never resolves', async () => {
   let presencePosts = 0;
+  const credential = 'd'.repeat(64);
+  const initialStored = {
+    moondeskWorkerCompanionV1: {
+      baseUrl: 'http://127.0.0.1:47650',
+      clientId: 'presence-independent',
+      credential
+    }
+  };
   const fetchImpl = async (url, options = {}) => {
     const parsed = new URL(url);
     if (parsed.pathname !== '/__moondesk/companion/v1/presence') {
@@ -296,18 +310,87 @@ test('presence heartbeat remains live while the Worker pump is already busy', as
       async text() { return JSON.stringify({ presence: JSON.parse(options.body || '{}') }); }
     };
   };
-  const { evaluate } = loadBackground({ fetchImpl });
+  const { evaluate } = loadBackground({ initialStored, fetchImpl });
   await evaluate(`(() => {
     pumpActive = true;
-    connecting = Promise.resolve({
-      ...freshState(),
-      baseUrl: 'http://127.0.0.1:47650',
-      clientId: 'presence-independent',
-      credential: '${'d'.repeat(64)}'
-    });
+    connecting = new Promise(() => {});
   })()`);
-  await evaluate('presencePump()');
-  assert.equal(presencePosts, 1, 'a hung Worker pump must not suppress Companion presence');
+  await Promise.race([
+    evaluate('presencePump()'),
+    new Promise((_, reject) => setTimeout(() => reject(new Error('presence inherited the Worker connection flight')), 250))
+  ]);
+  assert.equal(presencePosts, 1, 'a permanently hung Worker connection must not suppress Companion presence');
+});
+
+test('popup status ignores a permanently hung Worker connection flight', async () => {
+  const credential = 'e'.repeat(64);
+  const initialStored = {
+    moondeskWorkerCompanionV1: {
+      baseUrl: 'http://127.0.0.1:47650',
+      clientId: 'status-independent',
+      credential
+    }
+  };
+  const fetchImpl = async (url) => {
+    const parsed = new URL(url);
+    if (parsed.pathname !== '/__moondesk/companion/v1/status') {
+      throw new Error(`unexpected request: ${parsed.pathname}`);
+    }
+    const body = {
+      appVersion: manifest.version,
+      protocolVersion: 2,
+      companionRuntimeRevision: 32,
+      paired: true,
+      clientId: 'status-independent',
+      hasWorkerState: false,
+      workerResetEpoch: 0
+    };
+    return { ok: true, status: 200, async text() { return JSON.stringify(body); } };
+  };
+  const { evaluate } = loadBackground({ initialStored, fetchImpl });
+  evaluate('connecting = new Promise(() => {})');
+  const result = await Promise.race([
+    evaluate('status()'),
+    new Promise((_, reject) => setTimeout(() => reject(new Error('status inherited the Worker connection flight')), 250))
+  ]);
+  assert.equal(result.connected, true);
+  assert.equal(result.clientId, 'status-independent');
+});
+
+test('optional browser-control import failure cannot kill core Companion status', async () => {
+  const credential = 'f'.repeat(64);
+  const initialStored = {
+    moondeskWorkerCompanionV1: {
+      baseUrl: 'http://127.0.0.1:47650',
+      clientId: 'core-survives-import',
+      credential
+    }
+  };
+  const fetchImpl = async (url) => {
+    const parsed = new URL(url);
+    if (parsed.pathname !== '/__moondesk/companion/v1/status') {
+      throw new Error(`unexpected request: ${parsed.pathname}`);
+    }
+    const body = {
+      appVersion: manifest.version,
+      protocolVersion: 2,
+      companionRuntimeRevision: 32,
+      paired: true,
+      clientId: 'core-survives-import',
+      hasWorkerState: false,
+      workerResetEpoch: 0
+    };
+    return { ok: true, status: 200, async text() { return JSON.stringify(body); } };
+  };
+  const { dispatchRuntimeMessage } = loadBackground({
+    initialStored,
+    fetchImpl,
+    importScriptsImpl() { throw new Error('simulated optional module parse failure'); }
+  });
+  const response = await dispatchRuntimeMessage({ type: 'MOONDESK_STATUS' });
+  assert.equal(response?.ok, true);
+  assert.equal(response?.result?.connected, true);
+  assert.match(response?.result?.browserControlError || '', /simulated optional module parse failure/);
 });
 
 test('popup status stays responsive when ChatGPT scripting is permanently hung', async () => {
@@ -327,7 +410,7 @@ test('popup status stays responsive when ChatGPT scripting is permanently hung',
         app: 'moondesk-worker-companion',
         appVersion: manifest.version,
         protocolVersion: 2,
-        companionRuntimeRevision: 31
+        companionRuntimeRevision: 32
       } : {};
       return { ok, status: ok ? 200 : 404, async json() { return body; }, async text() { return JSON.stringify(body); } };
     }
@@ -605,8 +688,8 @@ test('popup status keeps Clear Workers available for stale companion-only histor
       credential: '${'c'.repeat(64)}',
       launchRecords: { stale: { commandId: 'stale' } }
     };
-    connecting = Promise.resolve(globalThis.__localHistoryState);
   })()`);
+  await evaluate('writeState(globalThis.__localHistoryState)');
   const result = await evaluate('status()');
   assert.equal(result.hasWorkerState, true);
   assert.equal(presenceRefreshes, 0, 'popup status must not block on ChatGPT presence telemetry');
@@ -1382,7 +1465,7 @@ test('bridge discovery prefers an exact runtime match over another MoonDesk vers
             app: 'moondesk-worker-companion',
             appVersion: manifest.version,
             protocolVersion: 2,
-            companionRuntimeRevision: 31
+            companionRuntimeRevision: 32
           };
         }
       };
@@ -1410,7 +1493,7 @@ test('bridge discovery prefers an exact runtime match over another MoonDesk vers
 
   const { evaluate, runtimeReloads } = loadBackground({ fetchImpl });
   const hello = await evaluate('discoverBridge(freshState())');
-  assert.equal(hello.companionRuntimeRevision, 31);
+  assert.equal(hello.companionRuntimeRevision, 32);
   assert.equal(runtimeReloads.length, 0);
 });
 
@@ -1523,7 +1606,7 @@ test('compatible bridge clears the one-shot runtime reload marker for a future m
             app: 'moondesk-worker-companion',
             appVersion: manifest.version,
             protocolVersion: 2,
-            companionRuntimeRevision: 31
+            companionRuntimeRevision: 32
           };
         }
       };
@@ -1536,7 +1619,7 @@ test('compatible bridge clears the one-shot runtime reload marker for a future m
   });
 
   const hello = await evaluate('discoverBridge(freshState())');
-  assert.equal(hello.companionRuntimeRevision, 31);
+  assert.equal(hello.companionRuntimeRevision, 32);
   const stored = await evaluate(`chrome.storage.local.get('${reloadKey}')`);
   assert.equal(stored[reloadKey], undefined);
 });
@@ -1554,7 +1637,7 @@ test('automatic pairing proves the extension was loaded from the MoonDesk-prepar
             app: 'moondesk-worker-companion',
             appVersion: manifest.version,
             protocolVersion: 2,
-            companionRuntimeRevision: 31
+            companionRuntimeRevision: 32
           };
         }
       };
@@ -1596,7 +1679,7 @@ test('source and release-ZIP installs without a bootstrap capability expose Manu
         app: 'moondesk-worker-companion',
         appVersion: manifest.version,
         protocolVersion: 2,
-        companionRuntimeRevision: 31
+        companionRuntimeRevision: 32
       };
       return {
         ok: true,
@@ -1717,7 +1800,7 @@ test('release version mismatch reloads the unpacked companion even when protocol
             app: 'moondesk-worker-companion',
             appVersion: '0.13.0',
             protocolVersion: 2,
-            companionRuntimeRevision: 31
+            companionRuntimeRevision: 32
           };
         }
       };

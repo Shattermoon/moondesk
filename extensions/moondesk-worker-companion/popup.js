@@ -35,16 +35,18 @@ const CONFIG_EFFORT_LABEL = {
 };
 
 // ── Background messaging ─────────────────────────────────────────
+const POPUP_BOOT_TIMEOUT_MS = 5_000;
 const POPUP_STATUS_TIMEOUT_MS = 25_000;
 
 async function bg(message, timeoutMs = null) {
   const work = chrome.runtime.sendMessage(message);
   let timer;
+  const operation = message?.type === 'MOONDESK_PING' ? 'background startup' : 'status';
   const response = Number.isFinite(Number(timeoutMs))
     ? await Promise.race([
         work,
         new Promise((_, reject) => {
-          timer = setTimeout(() => reject(new Error('MoonDesk Companion status timed out')), Number(timeoutMs));
+          timer = setTimeout(() => reject(new Error(`MoonDesk Companion ${operation} timed out`)), Number(timeoutMs));
         })
       ]).finally(() => { if (timer) clearTimeout(timer); })
     : await work;
@@ -258,6 +260,7 @@ async function render() {
   const pill = $('connPill');
   let status;
   try {
+    await bg({ type: 'MOONDESK_PING' }, POPUP_BOOT_TIMEOUT_MS);
     status = await bg({ type: 'MOONDESK_STATUS' }, POPUP_STATUS_TIMEOUT_MS);
   } catch (error) {
     pill.className = 'conn-pill pill-error';

@@ -1,5 +1,13 @@
+let userBrowserModuleLoadError = null;
 if (typeof importScripts === 'function') {
-  importScripts('user-browser-page.js', 'user-browser-control.js');
+  try {
+    importScripts('user-browser-page.js', 'user-browser-control.js');
+  } catch (error) {
+    // Browser control is optional to the core Companion. A bad/stale optional module must never
+    // prevent the MV3 service worker from registering status, Worker, and presence listeners.
+    userBrowserModuleLoadError = String(error?.message || error || 'user-browser module load failed');
+    console.warn('MoonDesk optional browser-control module failed to load:', userBrowserModuleLoadError);
+  }
 }
 
 const STORAGE_KEY = 'moondeskWorkerCompanionV1';
@@ -8,7 +16,7 @@ const BRIDGE_PORTS = [47650, 47651, 47652, 47653, 47654];
 const REQUIRED_PROTOCOL_VERSION = 2;
 // Bump with any shipped companion runtime change that requires Chromium to load new bytes. Keep
 // this aligned with COMPANION_RUNTIME_REVISION in src/server.rs.
-const COMPANION_RUNTIME_REVISION = 31;
+const COMPANION_RUNTIME_REVISION = 32;
 const SOURCE_DEV_MANIFEST_VERSION = '0.1.0';
 const RUNTIME_RELOAD_STORAGE_KEY = 'moondeskWorkerCompanionReloadRevisionV1';
 const INSTALLATION_BOOTSTRAP_FILE = 'moondesk-bootstrap.json';
@@ -390,6 +398,7 @@ async function userBrowserTransport(_path, options = {}) {
 
 function activeUserBrowserControl() {
   if (userBrowserControl) return userBrowserControl;
+  if (userBrowserModuleLoadError) return null;
   const factory = globalThis.MoonDeskUserBrowserControl?.create;
   if (
     typeof factory !== 'function' ||
@@ -596,6 +605,14 @@ async function ensureConnectedOnce() {
   return state;
 }
 
+function ensureConnectedIndependent() {
+  return withTimeout(
+    ensureConnectedOnce(),
+    CONNECTION_TIMEOUT_MS,
+    'MoonDesk Companion independent connection attempt timed out'
+  );
+}
+
 function ensureConnected() {
   if (connecting) return connecting;
   const work = withTimeout(
@@ -608,6 +625,15 @@ function ensureConnected() {
   });
   connecting = tracked;
   return tracked;
+}
+
+async function operationalState() {
+  // Status/presence/browser-control must not queue behind the Worker lane's shared connection flight.
+  // A normally paired Companion already has everything those read-only/control lanes need locally.
+  // Only an unpaired/incomplete installation performs its own bounded recovery transaction.
+  const state = await readState();
+  if (bridgeBaseUrl(state.baseUrl) && state.credential) return state;
+  return ensureConnectedIndependent();
 }
 
 async function sendToTab(tabId, message, timeoutMs = 35000) {
@@ -1971,7 +1997,7 @@ async function presencePump() {
   if (presencePumpActive) return;
   presencePumpActive = true;
   try {
-    const state = await ensureConnected();
+    const state = await operationalState();
     await collectPresence(state);
   } catch (error) {
     console.warn('MoonDesk Companion presence pump failed:', String(error?.message || error));
@@ -1990,7 +2016,7 @@ async function userBrowserPump() {
   if (userBrowserPumpActive) return;
   userBrowserPumpActive = true;
   try {
-    const state = await ensureConnected();
+    const state = await operationalState();
     await pumpUserBrowserControl(state);
   } catch (error) {
     const control = activeUserBrowserControl();
@@ -2236,14 +2262,33 @@ async function pair({ pairingToken }) {
 }
 
 async function status() {
+  let state = freshState();
   try {
-    const state = await ensureConnected();
+    // Popup health owns an independent connection lane. Never queue behind an in-flight Worker
+    // recovery/redeem transaction: a wedged Worker must not make the whole Companion look dead.
+    state = await operationalState();
+    let remote;
+    try {
+      remote = await api(state, STATUS_PATH);
+    } catch {
+      // Stored loopback state can become stale after a host restart/port move. Repair independently
+      // rather than joining the Worker lane's shared `connecting` promise.
+      state = await ensureConnectedIndependent();
+      remote = await api(state, STATUS_PATH);
+    }
+    if (hasCompanionRuntimeMismatch(remote)) {
+      if (await maybeReloadForRuntimeMismatch(remote)) {
+        throw requestError(
+          'MoonDesk refreshed the Worker Companion runtime; Chromium is reloading the extension.',
+          0,
+          'companion_runtime_reloading'
+        );
+      }
+    }
     // Popup health must never wait on ChatGPT tab telemetry. Nudge the normal bounded pumps and
     // return host connectivity immediately; presence/account refresh continues independently.
     schedulePresencePump(25);
     scheduleUserBrowserPump(25);
-    const remote = await api(state, STATUS_PATH);
-    // Worker-reset reconciliation belongs to the Worker pump; it must not block popup health.
     const hasLocalWorkerState =
       Object.keys(state.launchRecords || {}).length > 0 ||
       Object.keys(state.threadRecords || {}).length > 0 ||
@@ -2255,11 +2300,13 @@ async function status() {
       connected: true,
       baseUrl: state.baseUrl,
       companionVersion: chrome.runtime.getManifest().version,
-      requiredProtocolVersion: REQUIRED_PROTOCOL_VERSION
+      requiredProtocolVersion: REQUIRED_PROTOCOL_VERSION,
+      ...(userBrowserModuleLoadError ? { browserControlError: userBrowserModuleLoadError } : {})
     };
   } catch (error) {
-    let state = freshState();
-    try { state = await readState(); } catch {}
+    if (!state.baseUrl && !state.credential) {
+      try { state = await readState(); } catch {}
+    }
     return {
       paired: Boolean(state.credential),
       connected: false,
@@ -2268,6 +2315,7 @@ async function status() {
       requiredProtocolVersion: REQUIRED_PROTOCOL_VERSION,
       error: String(error?.message || error),
       errorCode: error?.code || null,
+      ...(userBrowserModuleLoadError ? { browserControlError: userBrowserModuleLoadError } : {}),
       repairRequired: error?.status === 409
         || error?.code === 'companion_installation_capability_missing'
         || error?.code === 'companion_installation_capability_invalid'
@@ -2276,14 +2324,14 @@ async function status() {
 }
 
 async function clients() {
-  const state = await ensureConnected();
+  const state = await operationalState();
   const response = await api(state, CLIENTS_PATH);
   return response.clients || [];
 }
 
 async function revokeClient({ clientId }) {
   if (!clientId) throw new Error('Paired browser client id is required');
-  const state = await ensureConnected();
+  const state = await operationalState();
   return api(state, CLIENTS_PATH, {
     method: 'POST',
     body: { clientId }
@@ -2291,13 +2339,13 @@ async function revokeClient({ clientId }) {
 }
 
 async function workspaces() {
-  const state = await ensureConnected();
+  const state = await operationalState();
   const response = await api(state, '/__moondesk/companion/v1/workspaces');
   return response.workspaces || [];
 }
 
 async function profile() {
-  const state = await ensureConnected();
+  const state = await operationalState();
   const response = await api(state, '/__moondesk/companion/v1/profile');
   return response.profile || null;
 }
@@ -2306,7 +2354,7 @@ async function setProfile({ profile: nextProfile }) {
   if (!nextProfile?.modelKey || !nextProfile?.modelLabel || !nextProfile?.reasoningEffort) {
     throw new Error('Worker execution profile is incomplete');
   }
-  const state = await ensureConnected();
+  const state = await operationalState();
   const response = await api(state, '/__moondesk/companion/v1/profile', {
     method: 'POST',
     body: nextProfile
@@ -2585,6 +2633,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (!message || typeof message.type !== 'string') return false;
   const task = (() => {
     switch (message.type) {
+      case 'MOONDESK_PING': return {
+        runtimeRevision: COMPANION_RUNTIME_REVISION,
+        browserControlModuleLoaded: !userBrowserModuleLoadError,
+        ...(userBrowserModuleLoadError ? { browserControlError: userBrowserModuleLoadError } : {})
+      };
       case 'MOONDESK_PAIR': return pair(message);
       case 'MOONDESK_STATUS': return status();
       case 'MOONDESK_CLIENTS': return clients();
@@ -2618,25 +2671,22 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 });
 
 chrome.runtime.onInstalled.addListener(() => {
-  void chrome.alarms.create(POLL_ALARM, { periodInMinutes: 0.5 });
+  void chrome.alarms.create(POLL_ALARM, { periodInMinutes: 0.5 }).catch(() => {});
   schedulePump(200);
   schedulePresencePump(200);
   scheduleUserBrowserPump(200);
-  void discoverModelCatalog({ requireExistingPage: true }).catch(() => {});
 });
 chrome.runtime.onStartup.addListener(() => {
-  void chrome.alarms.create(POLL_ALARM, { periodInMinutes: 0.5 });
+  void chrome.alarms.create(POLL_ALARM, { periodInMinutes: 0.5 }).catch(() => {});
   schedulePump(200);
   schedulePresencePump(200);
   scheduleUserBrowserPump(200);
-  void discoverModelCatalog({ requireExistingPage: true }).catch(() => {});
 });
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === POLL_ALARM) {
     void pump();
     void presencePump();
     void userBrowserPump();
-    void discoverModelCatalog({ requireExistingPage: true }).catch(() => {});
   }
 });
 chrome.tabs.onActivated.addListener(() => {
@@ -2657,8 +2707,7 @@ chrome.windows.onFocusChanged.addListener(() => {
   schedulePresencePump(25);
 });
 
-void chrome.alarms.create(POLL_ALARM, { periodInMinutes: 0.5 });
-schedulePump(500);
-schedulePresencePump(500);
-scheduleUserBrowserPump(500);
-void discoverModelCatalog({ requireExistingPage: true }).catch(() => {});
+void chrome.alarms.create(POLL_ALARM, { periodInMinutes: 0.5 }).catch(() => {});
+schedulePump(750);
+schedulePresencePump(750);
+scheduleUserBrowserPump(750);

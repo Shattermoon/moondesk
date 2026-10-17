@@ -40,16 +40,21 @@ const POPUP_STATUS_TIMEOUT_MS = 25_000;
 
 async function bg(message, timeoutMs = null) {
   const work = chrome.runtime.sendMessage(message);
+  const hasTimeout = timeoutMs !== null && timeoutMs !== undefined && Number.isFinite(Number(timeoutMs));
+  if (!hasTimeout) {
+    const response = await work;
+    if (!response?.ok) throw new Error(response?.error || 'MoonDesk companion request failed');
+    return response.result;
+  }
+
   let timer;
   const operation = message?.type === 'MOONDESK_PING' ? 'background startup' : 'status';
-  const response = Number.isFinite(Number(timeoutMs))
-    ? await Promise.race([
-        work,
-        new Promise((_, reject) => {
-          timer = setTimeout(() => reject(new Error(`MoonDesk Companion ${operation} timed out`)), Number(timeoutMs));
-        })
-      ]).finally(() => { if (timer) clearTimeout(timer); })
-    : await work;
+  const response = await Promise.race([
+    work,
+    new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`MoonDesk Companion ${operation} timed out`)), Number(timeoutMs));
+    })
+  ]).finally(() => { if (timer) clearTimeout(timer); });
   if (!response?.ok) throw new Error(response?.error || 'MoonDesk companion request failed');
   return response.result;
 }

@@ -252,6 +252,31 @@ test('popup stale browser summary counts offline clients, not every non-current 
   assert.doesNotMatch(popupSource, /const stale = all\.filter\(\(client\) => !client\.current\);/);
 });
 
+test('popup bg helper does not coerce an omitted timeout to zero milliseconds', async () => {
+  const start = popupSource.indexOf('async function bg(');
+  const end = popupSource.indexOf('// ── ChatGPT context detection', start);
+  assert.ok(start >= 0 && end > start, 'popup bg helper must be extractable');
+  const bgSource = popupSource.slice(start, end);
+
+  let timeoutCalls = 0;
+  let resolveMessage;
+  const messageResponse = new Promise((resolve) => { resolveMessage = resolve; });
+  const context = vm.createContext({
+    chrome: { runtime: { sendMessage() { return messageResponse; } } },
+    setTimeout() { timeoutCalls += 1; return timeoutCalls; },
+    clearTimeout() {}
+  });
+  vm.runInContext(bgSource, context, { filename: popupPath });
+
+  const pending = vm.runInContext("bg({ type: 'MOONDESK_PROFILE' })", context);
+  await Promise.resolve();
+  assert.equal(timeoutCalls, 0, 'default null timeout must mean no timeout, not a 0 ms timeout');
+
+  resolveMessage({ ok: true, result: { profile: 'ready' } });
+  const result = await pending;
+  assert.equal(result.profile, 'ready');
+});
+
 test('Companion liveness has redundant MV3 wake and popup presence refresh paths', async () => {
   assert.match(contentSource, /MOONDESK_PRESENCE_WAKE/);
   assert.match(contentSource, /clearInterval\(presenceWakeTimer\)/, 'stale content scripts must stop waking after extension reload');
@@ -339,7 +364,7 @@ test('popup status ignores a permanently hung Worker connection flight', async (
     const body = {
       appVersion: manifest.version,
       protocolVersion: 2,
-      companionRuntimeRevision: 32,
+      companionRuntimeRevision: 33,
       paired: true,
       clientId: 'status-independent',
       hasWorkerState: false,
@@ -374,7 +399,7 @@ test('optional browser-control import failure cannot kill core Companion status'
     const body = {
       appVersion: manifest.version,
       protocolVersion: 2,
-      companionRuntimeRevision: 32,
+      companionRuntimeRevision: 33,
       paired: true,
       clientId: 'core-survives-import',
       hasWorkerState: false,
@@ -410,7 +435,7 @@ test('popup status stays responsive when ChatGPT scripting is permanently hung',
         app: 'moondesk-worker-companion',
         appVersion: manifest.version,
         protocolVersion: 2,
-        companionRuntimeRevision: 32
+        companionRuntimeRevision: 33
       } : {};
       return { ok, status: ok ? 200 : 404, async json() { return body; }, async text() { return JSON.stringify(body); } };
     }
@@ -1465,7 +1490,7 @@ test('bridge discovery prefers an exact runtime match over another MoonDesk vers
             app: 'moondesk-worker-companion',
             appVersion: manifest.version,
             protocolVersion: 2,
-            companionRuntimeRevision: 32
+            companionRuntimeRevision: 33
           };
         }
       };
@@ -1493,7 +1518,7 @@ test('bridge discovery prefers an exact runtime match over another MoonDesk vers
 
   const { evaluate, runtimeReloads } = loadBackground({ fetchImpl });
   const hello = await evaluate('discoverBridge(freshState())');
-  assert.equal(hello.companionRuntimeRevision, 32);
+  assert.equal(hello.companionRuntimeRevision, 33);
   assert.equal(runtimeReloads.length, 0);
 });
 
@@ -1606,7 +1631,7 @@ test('compatible bridge clears the one-shot runtime reload marker for a future m
             app: 'moondesk-worker-companion',
             appVersion: manifest.version,
             protocolVersion: 2,
-            companionRuntimeRevision: 32
+            companionRuntimeRevision: 33
           };
         }
       };
@@ -1619,7 +1644,7 @@ test('compatible bridge clears the one-shot runtime reload marker for a future m
   });
 
   const hello = await evaluate('discoverBridge(freshState())');
-  assert.equal(hello.companionRuntimeRevision, 32);
+  assert.equal(hello.companionRuntimeRevision, 33);
   const stored = await evaluate(`chrome.storage.local.get('${reloadKey}')`);
   assert.equal(stored[reloadKey], undefined);
 });
@@ -1637,7 +1662,7 @@ test('automatic pairing proves the extension was loaded from the MoonDesk-prepar
             app: 'moondesk-worker-companion',
             appVersion: manifest.version,
             protocolVersion: 2,
-            companionRuntimeRevision: 32
+            companionRuntimeRevision: 33
           };
         }
       };
@@ -1679,7 +1704,7 @@ test('source and release-ZIP installs without a bootstrap capability expose Manu
         app: 'moondesk-worker-companion',
         appVersion: manifest.version,
         protocolVersion: 2,
-        companionRuntimeRevision: 32
+        companionRuntimeRevision: 33
       };
       return {
         ok: true,
@@ -1800,7 +1825,7 @@ test('release version mismatch reloads the unpacked companion even when protocol
             app: 'moondesk-worker-companion',
             appVersion: '0.13.0',
             protocolVersion: 2,
-            companionRuntimeRevision: 32
+            companionRuntimeRevision: 33
           };
         }
       };

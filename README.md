@@ -2,9 +2,9 @@
 
 # MoonDesk
 
-**Turn ChatGPT Chat into a local coding agent.**
+**Turn ChatGPT into a local coding agent.**
 
-Files, shell commands, browser automation, multiple workspaces, and session handoffs — through one local MCP host.
+Files, shell commands, browser automation, multiple workspaces, durable workers, and session handoffs — through one local MCP host.
 
 **No reverse engineering. No OpenAI API key. No separate agent service.**
 
@@ -35,10 +35,11 @@ MoonDesk
    ├─ Shell jobs
    ├─ Browser / DevTools
    ├─ Workspaces
+   ├─ Experimental Workers
    └─ Session handoffs
 ```
 
-Your code stays on your machine unless a tool you run sends it somewhere else.
+MoonDesk does not upload your repository by itself. Only content returned by invoked tools—or sent by programs and browser activity you run—leaves your machine.
 
 ## What you get
 
@@ -46,7 +47,7 @@ Your code stays on your machine unless a tool you run sends it somewhere else.
 | --- | --- |
 | **Files** | Read, search, edit, write, and delete inside a project workspace. |
 | **Shell** | Run tests, builds, package installs, dev servers, Git, and other developer commands. |
-| **Browser** | Control a dedicated Chromium session, inspect the DOM/console, emulate viewports, and visually inspect pages. |
+| **Browser** | Control MoonDesk's isolated managed Chromium, inspect the DOM/console, emulate viewports, and visually inspect pages. |
 | **Workspaces** | Serve multiple projects from one host, each with its own secret MCP URL. |
 | **Handoffs** | Save continuation state when moving a long task to a fresh conversation. |
 | **Workers (experimental)** | Delegate parallel tasks to durable ChatGPT Worker conversations through the optional Companion extension. |
@@ -130,7 +131,9 @@ Select the connector and start working.
 ## Experimental ChatGPT workers
 
 > [!WARNING]
-> Workers are **experimental**. The optional Worker Companion extension is required for Workers/sub-agents and for the separate `user_browser_*` tools that control exact tabs in your existing Chromium browser. Normal files, shell, workspaces, handoffs, MCP use, and MoonDesk's isolated `browser_*` runtime do **not** require the extension.
+> Workers are **experimental**. The optional Worker Companion extension is required for Workers/sub-agents and for the separate `user_browser_*` tools that control exact tabs in your existing Chromium browser.
+>
+> Normal files, shell, workspaces, handoffs, MCP use, and MoonDesk's isolated `browser_*` runtime do **not** require the extension.
 >
 > The Companion drives ChatGPT's web UI for Worker launches. MoonDesk fails closed if it cannot verify the requested model, reasoning effort, conversation placement, account binding, or previous Send state.
 
@@ -173,9 +176,15 @@ You only need the Companion for Workers or `user_browser_*` control.
 6. Open the ChatGPT conversation you want to use as Core.
 7. In the Companion popup, choose a confirmed ChatGPT model and reasoning effort, then save the Worker profile.
 
-**Supported targets:** Google Chrome, Microsoft Edge, and Brave. Current signed-in acceptance has been run in Chrome; Edge and Brave use the same Chromium Manifest V3 APIs but have not been separately live-tested in this cycle. Firefox and Safari are not supported.
+**Supported targets:**
 
-MoonDesk keeps the prepared extension in `~/.moondesk/worker-companion` and refreshes those files on MoonDesk upgrades. The Companion requests Chromium's `debugger` permission because exact-tab control uses CDP; an older unpacked installation may require a one-time permission approval or re-enable after upgrading.
+- Google Chrome — signed-in acceptance tested.
+- Microsoft Edge and Brave — supported through the same Chromium Manifest V3 APIs, but not separately live-tested in this cycle.
+- Firefox and Safari — not supported.
+
+MoonDesk keeps the prepared extension in `~/.moondesk/worker-companion` and refreshes those files on MoonDesk upgrades.
+
+The Companion requests Chromium's `debugger` permission because exact-tab control uses CDP. An older unpacked installation may require a one-time permission approval or re-enable after upgrading.
 
 <details>
 <summary><strong>Source builds, manual repair, and fallback ZIP</strong></summary>
@@ -205,6 +214,7 @@ The `workers` MCP tool has two sides:
 | `send` | Send follow-up instructions to a Worker |
 | `collect` | Receive reports, completed results, and durable failures |
 | `reuse` | Wake an idle Worker in its existing conversation |
+| `recover` | Guardedly recover a stalled running Worker through the Companion |
 | `retire` | Permanently stop reusing a Worker |
 
 | Worker operations | Purpose |
@@ -242,9 +252,13 @@ Local IDE status exposes a derived `lifecycleStage` for the launch/start path:
 | `claimed` | Conversation registration succeeded, but `workers start` has not completed |
 | `working` | The durable start transition succeeded and project work may proceed |
 
-A newly opened Worker claims its one-time capability and then calls `start`. While it is only claimed, MoonDesk blocks normal project tools, progress reports, and `finish`. If claim races the Companion's final launch acknowledgement, MoonDesk uses the browser-attested claim operation to complete the same registration atomically instead of creating a second Worker.
+A newly opened Worker claims its one-time capability and then calls `start`. While it is only claimed, MoonDesk blocks normal project tools, progress reports, and `finish`.
 
-`collect` is durable and idempotent when retried with the same `operation_id`. It returns progress reports, completed results, and `failed` task records with the failing stage plus a bounded underlying error. MoonDesk retains the most recent **16 collection batches per Core family**, so replay is intentionally bounded rather than an indefinite delivery-ACK log.
+If claim races the Companion's final launch acknowledgement, MoonDesk uses the browser-attested claim operation to complete the same registration atomically instead of creating a second Worker.
+
+`collect` is durable and idempotent when retried with the same `operation_id`. It returns progress reports, completed results, and `failed` task records with the failing stage plus a bounded underlying error.
+
+MoonDesk retains the most recent **16 collection batches per Core family**, so replay is intentionally bounded rather than an indefinite delivery-ACK log.
 
 ### Durability and failure handling
 
@@ -268,7 +282,8 @@ MoonDesk does **not** infer completion from tab closure or silence after a Worke
 - The Companion stores a one-way fingerprint of the ChatGPT account that created the Worker. Reuse/recovery fails closed if the proof is missing or the signed-in account differs.
 - MoonDesk verifies the actual model and reasoning effort before every Worker assignment. The cached model catalog only avoids unnecessary rediscovery.
 - If a Worker conversation still exposes an old cached connector schema after a MoonDesk upgrade, refresh/reconnect that Worker connector and start a fresh Worker conversation.
-- Once a Worker has claimed **and** started, the generalized Worker connector can expose that conversation's `user_browser_*` tools for independent browser QA. Unclaimed, claimed-but-not-started, finished, and unrelated chats do not receive that authority; ChatGPT/OpenAI tabs remain protected.
+- Once a Worker has claimed **and** started, the generalized Worker connector can expose that conversation's `user_browser_*` tools for independent browser QA.
+- Unclaimed, claimed-but-not-started, finished, and unrelated chats do not receive that authority. ChatGPT/OpenAI tabs remain protected.
 
 ### Local Codex / IDE Core
 
@@ -280,16 +295,28 @@ For a local IDE or Codex Core:
 
 The generalized Worker connector is intentionally not tied to one project. Switching the ChatGPT account used by Codex does not require changing the Worker account or either connector configuration.
 
-If a local Worker family is pinned to an offline Companion browser and its browser launch is already terminal, local IDE Core can use `workers` with `action=clear` to discard only that workspace-local family and choose an online Worker browser again. MoonDesk refuses that scoped clear while any matching launch is still queued, leased, send-started, paused, or awaiting reconciliation.
+If a local Worker family is pinned to an offline Companion browser and its browser launch is already terminal, local IDE Core can use `workers` with `action=clear` to discard only that workspace-local family and choose an online Worker browser again.
+
+MoonDesk refuses that scoped clear while any matching launch is still queued, leased, send-started, paused, or awaiting reconciliation.
 
 <details>
 <summary><strong>Capacity cleanup and host-wide reset</strong></summary>
 
 MoonDesk retains up to **64 Core families**. Automatic compaction will not discard an idle reusable Worker, an uncollected result, or a still-replayable non-empty `collect` receipt merely to make room.
 
-If an old Core conversation is gone and its idle family cannot be retired from that chat, open **MoonDesk Settings → Workers → Release inactive Worker capacity**, choose the workspace, and type `CLEANUP`. MoonDesk only removes idle/retired families when Worker state and browser-launch history prove there is no active or ambiguous Send, pending Worker message/report, or uncollected result. The ChatGPT conversations themselves are preserved.
+If an old Core conversation is gone and its idle family cannot be retired from that chat:
 
-The Companion popup's **Clear workers** action is a stronger, host-wide reset. It clears retained Worker ownership and managed launch history while leaving ChatGPT conversations untouched. MoonDesk publishes a durable reset epoch so paired browsers discard stale Worker history before another Send. If a browser already crossed `send_started`, Clear workers waits for that browser to acknowledge the new epoch; a missing or stuck browser leaves the reset retryable instead of allowing a later stale Send.
+1. Open **MoonDesk Settings → Workers → Release inactive Worker capacity**.
+2. Choose the workspace.
+3. Type `CLEANUP` to confirm.
+
+MoonDesk only removes idle/retired families when Worker state and browser-launch history prove there is no active or ambiguous Send, pending Worker message/report, or uncollected result. The ChatGPT conversations themselves are preserved.
+
+The Companion popup's **Clear workers** action is a stronger, host-wide reset. It clears retained Worker ownership and managed launch history while leaving ChatGPT conversations untouched.
+
+MoonDesk publishes a durable reset epoch so paired browsers discard stale Worker history before another Send.
+
+If a browser already crossed `send_started`, Clear workers waits for that browser to acknowledge the new epoch. A missing or stuck browser leaves the reset retryable instead of allowing a later stale Send.
 
 A Send that already reached ChatGPT cannot be unsent. Clear workers reports commands that had already crossed MoonDesk's Send boundary so the UI can warn about that possibility.
 
@@ -297,13 +324,103 @@ A Send that already reached ChatGPT cannot be unsent. Clear workers reports comm
 
 ## Browser control
 
-MoonDesk owns one lazy managed Chromium process instead of attaching to your personal browser profile or launching a separate browser for every project. On first browser use it provisions a pinned Chrome for Testing build for the current platform, verifies the exact archive size and SHA-256, records a verified inventory of the installed browser files including Unix permission bits where applicable, installs it atomically into MoonDesk's browser cache, and controls it directly from Rust over the Chrome DevTools Protocol (CDP)—no Playwright, `chrome-devtools-mcp`, or separate browser-control service is required. Later starts revalidate that inventory so a missing or damaged support file triggers reprovisioning instead of a persistent broken-browser loop. Inside that shared Chromium, each registered workspace gets its own isolated BrowserContext for cookies and site storage, while each ChatGPT conversation gets its own MoonDesk-routed logical tab set. Different workspaces therefore do not share cookies, localStorage, IndexedDB, or service-worker state, and separate conversations cannot accidentally act on each other's selected tabs.
+MoonDesk provides two deliberately separate browser surfaces:
 
-The browser runs headless by default and can be switched to visible mode for human-assisted steps such as logins or permission prompts. Headless and visible are two presentations of the same agent browser and expose the same page-local tabs, navigation, DOM controls, visual computer-use controls, viewport management, screenshots, console/network inspection, and heap-snapshot capabilities. Browser-global performance tracing has stricter isolation preconditions and is rejected whenever another managed BrowserContext is active, another logical browser session has used the workspace BrowserContext in the current runtime generation, a managed page is not owned by the requester, or an unowned/default-context page could contribute unrelated trace data. Presentation belongs to the shared Chromium process, so changing it while the browser is live requires explicit confirmation because every workspace BrowserContext and logical tab is recreated. MoonDesk never attaches to or reuses your personal browser profile, cookies, or logged-in sessions.
+| Surface | What it controls | Profile / storage | Requires Companion? |
+| --- | --- | --- | --- |
+| `browser_*` | MoonDesk's managed Chrome for Testing runtime | MoonDesk-owned; isolated per workspace | No |
+| `user_browser_*` | Exact tabs in your existing Chrome / Edge / Brave browser | Your existing browser profile | Yes |
 
-For normal agent work MoonDesk exposes a Codex-style capability facade: `browser_state` for ambient state, `browser_tabs` for conversation-owned tabs, `browser_navigate` for goto/back/forward/reload, `browser_dom` for accessibility/DOM interactions, `browser_cua` for rendered screenshots plus physical coordinate/keyboard/wheel input, and `browser_viewport` for responsive/device sizing. `browser_command` remains available as an advanced native-CDP escape hatch for console/network inspection, emulation, performance traces, V8 heap snapshots, screenshots, and lower-level page operations that are not represented by the facade.
+### Managed browser (`browser_*`)
 
-When the optional Companion extension is installed, MoonDesk also exposes a deliberately separate `user_browser_*` surface for exact tabs in the user's existing Chromium browser: `user_browser_tabs` lists, attaches, opens, releases, and explicitly closes tabs; `user_browser_snapshot` reads the controlled page, `user_browser_screenshot` captures rendered pixels, `user_browser_navigate` navigates it, `user_browser_action` performs bounded page input, `user_browser_evaluate` runs bounded page JavaScript, and `user_browser_console` / `user_browser_network` expose bounded diagnostics. This is **not PC control** and does not merge the personal profile into MoonDesk's managed `browser_*` BrowserContexts. Each attachment is leased to the exact ChatGPT conversation, old page references are invalidated on navigation, uncertain input is never blindly replayed, every HTTPS `chatgpt.com` / `chat.openai.com` tab is protected from all user-browser observation and interaction (a controlled tab that reaches one is detached), and an animated multicolor edge/corner glow shows while MoonDesk holds control. MoonDesk temporarily hides only that indicator while taking model-facing screenshots so the captured page pixels stay clean. Releasing a tab removes the glow and detaches CDP without closing the user's tab; closing is a separate explicit `user_browser_tabs` action.
+MoonDesk owns **one lazy Chromium process per host** and controls it directly from Rust over Chrome DevTools Protocol (CDP). It does not use Playwright, `chrome-devtools-mcp`, or your personal browser profile.
+
+```text
+MoonDesk-managed Chromium
+├─ Workspace A BrowserContext
+│  ├─ Conversation 1 tabs
+│  └─ Conversation 2 tabs
+└─ Workspace B BrowserContext
+   └─ Conversation 3 tabs
+```
+
+| Boundary | Behavior |
+| --- | --- |
+| Browser process | Shared by the MoonDesk host |
+| Cookies / localStorage / IndexedDB / service workers | Isolated per workspace BrowserContext |
+| Selected tabs / page authority | Isolated per ChatGPT conversation |
+| Personal browser profile | Never attached or reused |
+| Startup | Lazy; Chromium starts on first browser operation |
+| Default presentation | Headless |
+
+On first use, MoonDesk downloads the pinned Chrome for Testing build for the current platform, verifies its exact archive size and SHA-256, records a verified inventory of installed files, and publishes the browser atomically into its cache.
+
+Later launches revalidate that inventory so missing or damaged files trigger reprovisioning instead of a persistent broken-browser state.
+
+#### Agent-facing browser tools
+
+| Tool | Typical use |
+| --- | --- |
+| `browser_state` | Inspect browser/runtime state |
+| `browser_tabs` | List, open, select, or close conversation-owned tabs |
+| `browser_navigate` | Go to a URL, back, forward, or reload |
+| `browser_dom` | Accessibility snapshots, forms, clicks, text input, DOM interaction |
+| `browser_cua` | Rendered screenshots and coordinate/keyboard/wheel input |
+| `browser_viewport` | Desktop/mobile viewport and device emulation |
+| `view_page` | Inspect actual rendered pixels |
+| `browser_command` | Advanced native-CDP operations not covered by the normal facade |
+
+Use `browser_dom` for ordinary web controls. Use `browser_cua` or `view_page` when the task depends on what the page actually looks like.
+
+#### Headless and visible mode
+
+Headless and visible are two presentations of the **same managed browser** and expose the same page-local capabilities. Visible mode is useful for logins, permission prompts, CAPTCHAs, or other human-assisted steps.
+
+> [!IMPORTANT]
+> Presentation is process-global. Switching presentation while Chromium is live requires explicit confirmation because every MoonDesk workspace BrowserContext and logical tab is recreated.
+
+<details>
+<summary><strong>Advanced tracing isolation</strong></summary>
+
+Browser-global performance tracing is allowed only when MoonDesk can prove that unrelated work cannot contribute data.
+
+Tracing is rejected when any of these isolation conditions fail:
+
+- another managed BrowserContext is active;
+- another logical session used the workspace BrowserContext in the current runtime generation;
+- the page is not owned by the requester; or
+- an unowned/default-context page could contribute unrelated trace data.
+
+</details>
+
+### Existing-browser control (`user_browser_*`)
+
+When the optional Companion extension is installed, MoonDesk can deliberately attach to **specific tabs** in your existing Chromium browser.
+
+| Tool | Purpose |
+| --- | --- |
+| `user_browser_tabs` | List, attach, open, release, or explicitly close tabs |
+| `user_browser_snapshot` | Read the controlled page structure |
+| `user_browser_screenshot` | Capture rendered pixels |
+| `user_browser_navigate` | Navigate the controlled tab |
+| `user_browser_action` | Perform bounded page input |
+| `user_browser_evaluate` | Run bounded page JavaScript |
+| `user_browser_console` / `user_browser_network` | Read bounded diagnostics |
+
+This surface is **not PC control** and does not merge your personal browser profile into the managed `browser_*` runtime.
+
+Safety rules for attached user tabs:
+
+- Attachments are leased to the exact ChatGPT conversation.
+- Navigation invalidates old page references.
+- Uncertain input is not blindly replayed.
+- HTTPS tabs on `chatgpt.com` and `chat.openai.com` are protected from observation and interaction; reaching one detaches the controlled tab.
+- A multicolor edge/corner glow shows while MoonDesk holds control.
+- Releasing removes control without closing the tab; closing is a separate explicit action.
+
+### Browser CLI
+
+The `moondesk browser` CLI is the deterministic scripting path for the managed browser:
 
 ```bash
 moondesk browser navigate_page --url=http://localhost:3000
@@ -312,17 +429,41 @@ moondesk browser take_snapshot
 moondesk browser list_console_messages
 ```
 
-The `moondesk browser` CLI is the deterministic low-level scripting path. It shares the resolved workspace's BrowserContext/login state but uses its own logical tab session, so scripted browser commands cannot steal a ChatGPT conversation's active page. For interactive agent work prefer the capability facade; use `browser_cua action=screenshot` or `view_page` when the task depends on actual rendered pixels rather than only a text/accessibility snapshot.
+It shares the resolved workspace's BrowserContext/login state but uses its own logical tab session, so scripts cannot steal a ChatGPT conversation's selected page.
 
-For browser-runtime invariants and implementation details, see [`docs/BROWSER_RUNTIME_ARCHITECTURE_HARDENING.md`](docs/BROWSER_RUNTIME_ARCHITECTURE_HARDENING.md).
+For deeper runtime invariants, see [`docs/BROWSER_RUNTIME_ARCHITECTURE_HARDENING.md`](docs/BROWSER_RUNTIME_ARCHITECTURE_HARDENING.md).
 
 ## Workspaces and handoffs
 
-Each workspace keeps its own root, secret connector URL, command jobs, retained output, history, and handoff state. Use `[w] Workspaces` to add, rename, inspect, copy, rotate, or remove projects.
+### Workspaces
 
-MoonDesk refuses filesystem roots and protected operating-system directories as workspace roots. If an older config already contains one, MoonDesk keeps it visible as **BLOCKED** while disabling its connector and workspace tools; add or select a valid project workspace, then remove the blocked entry. Launching `moondesk` from a protected directory never auto-attaches it to a running host, and a fresh interactive launch asks you to choose a project folder instead.
+One MoonDesk host can serve multiple projects while keeping their local authority separate.
 
-Handoffs are explicit checkpoints. `create_handoff` saves the task goal, completed work, decisions, validation, blockers, next steps, Git state, and current MoonDesk jobs. `resume_handoff` reloads the checkpoint and checks for drift; `complete_handoff` marks the continuation finished.
+| Workspace-owned state | Isolation |
+| --- | --- |
+| Root directory | Per workspace |
+| Secret MCP URL | Per workspace |
+| Command jobs and retained output | Per workspace |
+| History / quotas | Per workspace |
+| Handoff state | Per workspace |
+| Managed browser site storage | Per workspace BrowserContext |
+
+Use `[w] Workspaces` to add, rename, inspect, copy, rotate, or remove projects.
+
+> [!IMPORTANT]
+> MoonDesk refuses filesystem roots and protected operating-system directories as workspace roots. Older invalid entries remain visible as **BLOCKED**, but their connector and workspace tools are disabled until you move to a valid project workspace.
+
+Launching `moondesk` from a protected directory never silently attaches that directory to a running host. On a fresh interactive launch, MoonDesk asks you to choose a valid project folder instead.
+
+### Handoffs
+
+Handoffs are explicit checkpoints for moving unfinished work to another ChatGPT conversation.
+
+| Tool | Purpose |
+| --- | --- |
+| `create_handoff` | Save the goal, completed work, decisions, validation, blockers, next steps, Git state, and current MoonDesk jobs |
+| `resume_handoff` | Reload the checkpoint and compare saved state with the current workspace |
+| `complete_handoff` | Mark the continuation finished |
 
 > [!CAUTION]
 > Never put credentials, tokens, passwords, private keys, or other secrets in handoff text.
@@ -331,33 +472,34 @@ Stopping the MoonDesk host disconnects every active workspace connector, so shut
 
 ## Safety
 
-Dedicated file tools stay inside the selected workspace and reject path traversal plus symlink/junction escapes.
+| Tool surface | Boundary |
+| --- | --- |
+| Dedicated file tools | Stay inside the selected workspace and reject path traversal plus symlink/junction escapes |
+| Shell tools | Run your normal developer shell with the workspace only as the working directory |
+| Managed browser | Uses MoonDesk-owned browser storage; never inherits your personal browser profile |
+| User-browser control | Requires the Companion and explicit tab attachment |
 
-Shell tools are different:
+> [!WARNING]
+> `run_command` and `start_command` inherit your normal environment, credentials, `PATH`, and OS permissions. **The workspace directory is not an OS sandbox.**
 
-> `run_command` and `start_command` execute your normal developer shell with the workspace as its working directory. They inherit your normal environment, credentials, `PATH`, and OS permissions.
-
-**The workspace directory is not an OS sandbox.**
-
-Use read-only mode when mutation is unnecessary, and use a VM or container for untrusted code.
+Use read-only mode when mutation is unnecessary. For untrusted code, use a VM or container.
 
 > [!CAUTION]
-> Never share a workspace MCP URL. Anyone who can use it may be able to invoke the tools you exposed.
+> Never share a workspace MCP URL. Treat it as a credential: anyone who can use it may be able to invoke the tools you exposed.
 
 ## Reference
 
 <details>
 <summary><strong>Tools</strong></summary>
 
-**Guidance / handoffs:** `moondesk_instruction`, `create_handoff`, `resume_handoff`, `complete_handoff`
-
-**Experimental workers:** `workers`
-
-**Files:** `read`, `view_image`, `view_images`, `search`, `write`, `edit`, `delete`
-
-**Commands:** `run_command`, `start_command`, `list_commands`, `poll_command`, `read_command_output`, `cancel_command`
-
-**Browser:** isolated `browser_state`, `browser_tabs`, `browser_navigate`, `browser_dom`, `browser_cua`, `browser_viewport`, `set_browser_presentation`, `view_page`, plus advanced `browser_command`; with the optional Companion, exact user-browser tab control is exposed separately as `user_browser_tabs`, `user_browser_snapshot`, `user_browser_screenshot`, `user_browser_navigate`, `user_browser_action`, `user_browser_evaluate`, `user_browser_console`, and `user_browser_network`
+| Category | Tools |
+| --- | --- |
+| Guidance / handoffs | `moondesk_instruction`, `create_handoff`, `resume_handoff`, `complete_handoff` |
+| Experimental Workers | `workers` |
+| Files | `read`, `view_image`, `view_images`, `search`, `write`, `edit`, `delete` |
+| Commands | `run_command`, `start_command`, `list_commands`, `poll_command`, `read_command_output`, `cancel_command` |
+| Managed browser | `browser_state`, `browser_tabs`, `browser_navigate`, `browser_dom`, `browser_cua`, `browser_viewport`, `set_browser_presentation`, `view_page`, advanced `browser_command` |
+| Existing-browser Companion | `user_browser_tabs`, `user_browser_snapshot`, `user_browser_screenshot`, `user_browser_navigate`, `user_browser_action`, `user_browser_evaluate`, `user_browser_console`, `user_browser_network` |
 
 Use `run_command` for short work. Use `start_command` + `poll_command` for builds, tests, installs, dev servers, and other long-running jobs.
 
@@ -379,7 +521,13 @@ Use `run_command` for short work. Use `start_command` + `poll_command` for build
 
 Workspace `AGENTS.md` instructions take priority.
 
-On macOS, MoonDesk keeps your existing terminal profile instead of installing or forcing its own. Older Apple Terminal versions without reliable truecolor support use a stable 256-color compatibility palette for theme and ClippyMoon rendering; Terminal.app 2.15+ and other truecolor-capable terminals keep full RGB output. When upgrading from older MoonDesk versions, a tab still using the legacy `MoonDesk` Terminal.app profile is restored to your Terminal default settings. Set `MOONDESK_SKIP_MACOS_TERMINAL_PROFILE=1` only if you want to skip that legacy-profile migration.
+**macOS terminal behavior**
+
+- MoonDesk keeps your existing terminal profile instead of installing or forcing its own.
+- Older Apple Terminal versions without reliable truecolor support use a stable 256-color compatibility palette for theme and ClippyMoon rendering.
+- Terminal.app 2.15+ and other truecolor-capable terminals keep full RGB output.
+- When upgrading from older MoonDesk versions, a tab still using the legacy `MoonDesk` Terminal.app profile is restored to your Terminal default settings.
+- Set `MOONDESK_SKIP_MACOS_TERMINAL_PROFILE=1` only if you want to skip that legacy-profile migration.
 
 </details>
 
@@ -388,7 +536,9 @@ On macOS, MoonDesk keeps your existing terminal profile instead of installing or
 
 MoonDesk verifies the downloaded native executable against the SHA-256 published with the matching GitHub Release before launching it.
 
-If Windows Security or another antivirus quarantines the verified executable, update security definitions and check **Protection history**, then run `moondesk` again. Do not disable antivirus protection or exclude the entire MoonDesk directory just to bypass a detection.
+If Windows Security or another antivirus quarantines the verified executable, update security definitions and check **Protection history**, then run `moondesk` again.
+
+Do not disable antivirus protection or exclude the entire MoonDesk directory just to bypass a detection.
 
 </details>
 

@@ -1,20 +1,26 @@
 use axum::{
     Router,
     body::{Body, Bytes},
-    extract::{DefaultBodyLimit, Path as AxumPath, Request, State},
+    extract::{
+        DefaultBodyLimit, Path as AxumPath, Request, State,
+        ws::{Message as WsMessage, WebSocket, WebSocketUpgrade},
+    },
     http::{HeaderMap, HeaderValue, Response, StatusCode, header},
     middleware::{self, Next},
-    response::Json,
+    response::{IntoResponse, Json},
     routing::{delete, get, post},
 };
+use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use subtle::ConstantTimeEq;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::browser_runtime::{
     BrowserRuntime, BrowserSessionKey, DEFAULT_BROWSER_COMMAND_TIMEOUT,
@@ -53,6 +59,8 @@ pub const COMPANION_BRIDGE_PORTS: [u16; 5] = [47650, 47651, 47652, 47653, 47654]
 pub const COMPANION_STATUS_ROUTE: &str = "/__moondesk/companion/v1/status";
 pub const COMPANION_CLIENTS_ROUTE: &str = "/__moondesk/companion/v1/clients";
 pub const COMPANION_PRESENCE_ROUTE: &str = "/__moondesk/companion/v1/presence";
+pub const COMPANION_WAKE_ROUTE: &str = "/__moondesk/companion/v1/wake";
+static COMPANION_WAKE_SLOTS: OnceLock<Arc<Semaphore>> = OnceLock::new();
 pub const COMPANION_CORRELATIONS_ROUTE: &str = "/__moondesk/companion/v1/correlations";
 pub const COMPANION_WORKSPACES_ROUTE: &str = "/__moondesk/companion/v1/workspaces";
 pub const COMPANION_PROFILE_ROUTE: &str = "/__moondesk/companion/v1/profile";
@@ -66,7 +74,7 @@ pub const COMPANION_USER_BROWSER_ROUTE: &str = "/__moondesk/companion/v1/browser
 pub const COMPANION_TOKEN_HEADER: &str = "x-moondesk-companion-token";
 // Bump with any shipped companion runtime change that requires Chromium to load new bytes. Keep
 // this aligned with COMPANION_RUNTIME_REVISION in background.js.
-pub const COMPANION_RUNTIME_REVISION: u32 = 34;
+pub const COMPANION_RUNTIME_REVISION: u32 = 35;
 const MAX_COMPANION_BODY_BYTES: usize = 16 * 1024;
 const MAX_COMPANION_USER_BROWSER_BODY_BYTES: usize = 2 * 1024 * 1024;
 
@@ -184,6 +192,7 @@ pub fn companion_bridge_router(
             post(pair_companion).layer(DefaultBodyLimit::max(MAX_COMPANION_BODY_BYTES)),
         )
         .route(COMPANION_STATUS_ROUTE, get(companion_status))
+        .route(COMPANION_WAKE_ROUTE, get(companion_wake))
         .route(
             COMPANION_CLIENTS_ROUTE,
             get(companion_clients)
@@ -411,6 +420,91 @@ struct CompanionWorkerResetAckRequest {
 #[serde(rename_all = "camelCase")]
 struct CompanionRevokeClientRequest {
     client_id: String,
+}
+
+async fn companion_wake(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+) -> Response<Body> {
+    if !companion_origin_allowed(&headers) {
+        return companion_origin_error();
+    }
+    // Bound unauthenticated upgrades. Authentication happens in the FIRST websocket message,
+    // never in a URL or a browser-observable query parameter.
+    let slots = COMPANION_WAKE_SLOTS.get_or_init(|| Arc::new(Semaphore::new(8)));
+    let Ok(slot) = slots.clone().try_acquire_owned() else {
+        return json_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({"error": "wake channel capacity reached"}),
+        );
+    };
+    let origin = companion_request_origin(&headers).map(str::to_owned);
+    let auth = { state.app.lock().await.companion_auth.clone() };
+    ws.on_upgrade(move |socket| companion_wake_socket(socket, auth, origin, slot))
+        .into_response()
+}
+
+async fn companion_wake_socket(
+    socket: WebSocket,
+    auth: Arc<crate::companion::CompanionAuth>,
+    origin: Option<String>,
+    _slot: OwnedSemaphorePermit,
+) {
+    let (mut write, mut read) = socket.split();
+    let Ok(Some(Ok(WsMessage::Text(secret)))) =
+        tokio::time::timeout(Duration::from_secs(5), read.next()).await
+    else {
+        return;
+    };
+    if secret.len() > 256 || secret.is_empty() {
+        return;
+    }
+    let Some(client_id) = auth.authorize(secret.as_str(), origin.as_deref()).await else {
+        return;
+    };
+    auth.wake_heartbeat(&client_id, unix_time_ms()).await;
+    // Wake immediately after reconnect; Worker commands remain durable HTTP work.
+    if !matches!(
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            write.send(WsMessage::Text("wake".into())),
+        )
+        .await,
+        Ok(Ok(()))
+    ) {
+        return;
+    }
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(20));
+    heartbeat.tick().await;
+    let mut awaiting_pong = false;
+    loop {
+        tokio::select! {
+            _ = heartbeat.tick() => {
+                // The socket is NOT an alternative account/tab proof. It only keeps the
+                // MV3 service worker awake so its separately validated presence can flow.
+                if awaiting_pong || auth.authorize(secret.as_str(), origin.as_deref()).await.as_deref() != Some(client_id.as_str()) {
+                    break;
+                }
+                if !matches!(
+                    tokio::time::timeout(Duration::from_secs(3), write.send(WsMessage::Text("ping".into()))).await,
+                    Ok(Ok(()))
+                ) {
+                    break;
+                }
+                awaiting_pong = true;
+            }
+            incoming = read.next() => {
+                match incoming {
+                    Some(Ok(WsMessage::Text(text))) if text == "pong" && awaiting_pong => {
+                        awaiting_pong = false;
+                        auth.wake_heartbeat(&client_id, unix_time_ms()).await;
+                    }
+                    _ => break,
+                }
+            }
+        }
+    }
 }
 
 async fn companion_hello(State(state): State<ServerState>, headers: HeaderMap) -> Response<Body> {
@@ -791,6 +885,7 @@ async fn companion_clients(State(state): State<ServerState>, headers: HeaderMap)
     };
     let auth = { state.app.lock().await.companion_auth.clone() };
     let paired = auth.paired_client_ids().await;
+    let wake_recent = auth.recent_wake_clients(unix_time_ms()).await;
     let fresh = auth
         .fresh_presence(unix_time_ms())
         .await
@@ -805,6 +900,7 @@ async fn companion_clients(State(state): State<ServerState>, headers: HeaderMap)
                 "clientId": client_id,
                 "current": client_id == current_client_id,
                 "online": presence.is_some(),
+                "wakeRecent": wake_recent.contains(&client_id),
                 "browserLabel": presence.and_then(|value| value.browser_label.clone()),
                 "lastSeenMs": presence.map(|value| value.last_seen_ms),
                 "tabsFresh": presence.is_some_and(|value| value.tabs_fresh),
@@ -3648,6 +3744,113 @@ mod tests {
             Some(crate::workers::types::BrowserAttachmentState::Attached)
         );
 
+        let _ = std::fs::remove_dir_all(config_root);
+        let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn companion_wake_channel_requires_exact_pairing_and_keeps_secrets_out_of_url() {
+        use tokio_tungstenite::tungstenite::{
+            Message as ClientWsMessage, client::IntoClientRequest,
+        };
+        let workspace_root = unique_temp_path("moondesk-wake-workspace");
+        let config_root = unique_temp_path("moondesk-wake-config");
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        std::fs::create_dir_all(&config_root).expect("create config");
+        let app = AppState::new_for_test(
+            8787,
+            workspace_root.to_string_lossy().into_owned(),
+            config_root.join("config.toml"),
+        )
+        .expect("create app state");
+        let credential = "e".repeat(64);
+        app.companion_auth
+            .auto_pair(
+                "wake-browser",
+                &credential,
+                Some("chrome-extension://moondesk-wake-test"),
+            )
+            .await
+            .expect("pair wake browser");
+        let (ui_tx, _ui_rx) = ui_event_channel();
+        let app_router = companion_bridge_router(
+            Arc::new(Mutex::new(app)),
+            None,
+            CommandJobManager::new(),
+            ui_tx,
+            Arc::from("unused-host-token"),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind wake bridge");
+        let address = listener.local_addr().expect("wake bridge address");
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app_router).await;
+        });
+        let url = format!("ws://{address}{COMPANION_WAKE_ROUTE}");
+        let request_for = |origin: &'static str| {
+            let mut request = url
+                .clone()
+                .into_client_request()
+                .expect("prepare websocket request");
+            request
+                .headers_mut()
+                .insert(header::ORIGIN, HeaderValue::from_static(origin));
+            request
+        };
+        let (mut authenticated, _) =
+            tokio_tungstenite::connect_async(request_for("chrome-extension://moondesk-wake-test"))
+                .await
+                .expect("upgrade valid browser");
+        authenticated
+            .send(ClientWsMessage::Text(credential.clone().into()))
+            .await
+            .expect("send credential as first message");
+        let wake = tokio::time::timeout(Duration::from_secs(3), authenticated.next())
+            .await
+            .expect("host must wake a reconnect immediately")
+            .expect("websocket must answer")
+            .expect("websocket frame");
+        assert_eq!(wake, ClientWsMessage::Text("wake".into()));
+        assert!(
+            !url.contains(&credential),
+            "credential must never enter websocket URL"
+        );
+        let _ = authenticated.close(None).await;
+
+        let (mut wrong, _) =
+            tokio_tungstenite::connect_async(request_for("chrome-extension://moondesk-wake-test"))
+                .await
+                .expect("unauthenticated upgrade may open briefly");
+        wrong
+            .send(ClientWsMessage::Text("bad-credential".into()))
+            .await
+            .expect("send invalid credential");
+        let reply = tokio::time::timeout(Duration::from_secs(3), wrong.next())
+            .await
+            .expect("invalid wake connection must close promptly");
+        assert!(
+            !matches!(reply, Some(Ok(ClientWsMessage::Text(text))) if text == "wake"),
+            "unpaired browser must never receive wake instructions"
+        );
+
+        let rejected =
+            tokio_tungstenite::connect_async(request_for("chrome-extension://wrong-browser"))
+                .await
+                .expect("HTTP websocket upgrade succeeds before credential, not origin");
+        let (mut wrong_origin, _) = rejected;
+        wrong_origin
+            .send(ClientWsMessage::Text(credential.into()))
+            .await
+            .expect("send valid secret from wrong extension");
+        let reply = tokio::time::timeout(Duration::from_secs(3), wrong_origin.next())
+            .await
+            .expect("mismatched extension origin must close");
+        assert!(
+            !matches!(reply, Some(Ok(ClientWsMessage::Text(text))) if text == "wake"),
+            "correct credential from a different extension must not authenticate"
+        );
+        server.abort();
         let _ = std::fs::remove_dir_all(config_root);
         let _ = std::fs::remove_dir_all(workspace_root);
     }

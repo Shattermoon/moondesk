@@ -352,6 +352,7 @@ pub struct CompanionAuth {
     path: PathBuf,
     state: Mutex<CompanionAuthState>,
     presence: Mutex<BTreeMap<String, CompanionClientPresence>>,
+    wake_heartbeats: Mutex<BTreeMap<String, u64>>,
     correlations: Mutex<BTreeMap<String, (CompanionAnchorRoute, u64)>>,
     anchor_affinities: Mutex<BTreeMap<String, (CompanionAnchorRoute, u64)>>,
     worker_reset_notify: Notify,
@@ -376,6 +377,7 @@ impl CompanionAuth {
             path,
             state: Mutex::new(state),
             presence: Mutex::new(BTreeMap::new()),
+            wake_heartbeats: Mutex::new(BTreeMap::new()),
             correlations: Mutex::new(BTreeMap::new()),
             anchor_affinities: Mutex::new(BTreeMap::new()),
             worker_reset_notify: Notify::new(),
@@ -721,6 +723,7 @@ impl CompanionAuth {
             self.worker_reset_notify.notify_waiters();
         }
         self.presence.lock().await.remove(client_id);
+        self.wake_heartbeats.lock().await.remove(client_id);
         self.correlations
             .lock()
             .await
@@ -777,16 +780,66 @@ impl CompanionAuth {
             .then(|| presence.clone())
     }
 
-    pub async fn fresh_presence(&self, now_ms: u64) -> Vec<CompanionClientPresence> {
-        self.presence
+    /// A WebSocket pong proves browser/extension liveness, but never proves a ChatGPT account
+    /// or tab. Its timestamp is kept separately from validated HTTP presence observations.
+    pub async fn wake_heartbeat(&self, client_id: &str, now_ms: u64) {
+        if !self.state.lock().await.clients.contains_key(client_id) {
+            return;
+        }
+        self.wake_heartbeats
             .lock()
             .await
-            .values()
-            .filter(|presence| {
-                now_ms.saturating_sub(presence.last_seen_ms) <= COMPANION_PRESENCE_MAX_AGE_MS
-            })
-            .cloned()
+            .insert(client_id.to_string(), now_ms);
+    }
+
+    pub async fn recent_wake_clients(&self, now_ms: u64) -> BTreeSet<String> {
+        self.wake_heartbeats
+            .lock()
+            .await
+            .iter()
+            .filter(|(_, at)| now_ms.saturating_sub(**at) <= 45_000)
+            .map(|(client_id, _)| client_id.clone())
             .collect()
+    }
+
+    pub async fn fresh_presence(&self, now_ms: u64) -> Vec<CompanionClientPresence> {
+        let wakes = self.wake_heartbeats.lock().await.clone();
+        let observations = self.presence.lock().await;
+        let mut result = Vec::new();
+        for stored in observations.values() {
+            let wake_at = wakes.get(&stored.client_id).copied().unwrap_or(0);
+            let last_seen = stored.last_seen_ms.max(wake_at);
+            if now_ms.saturating_sub(last_seen) > COMPANION_PRESENCE_MAX_AGE_MS {
+                continue;
+            }
+            let mut entry = stored.clone();
+            entry.last_seen_ms = last_seen;
+            // Socket liveness must NEVER extend an old signed-in account or tab claim.
+            if now_ms.saturating_sub(stored.last_seen_ms) > 30_000 {
+                entry.account_fingerprint_fresh = false;
+                entry.tabs_fresh = false;
+            }
+            result.push(entry);
+        }
+        for (client_id, wake_at) in wakes {
+            if now_ms.saturating_sub(wake_at) > COMPANION_PRESENCE_MAX_AGE_MS
+                || observations.contains_key(&client_id)
+            {
+                continue;
+            }
+            // A connected extension may have no readable ChatGPT tab yet. Show it online,
+            // but require independent verified account evidence before any Worker placement.
+            result.push(CompanionClientPresence {
+                client_id,
+                browser_label: None,
+                account_fingerprint: None,
+                account_fingerprint_fresh: false,
+                tabs_fresh: false,
+                last_seen_ms: wake_at,
+                tabs: Vec::new(),
+            });
+        }
+        result
     }
 
     pub async fn remember_anchor_affinity(
@@ -1398,6 +1451,55 @@ mod tests {
 
     const ORIGIN_A: &str = "chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const ORIGIN_B: &str = "chrome-extension://bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    #[tokio::test]
+    async fn websocket_liveness_keeps_browser_online_without_extending_stale_account_proof() {
+        let root = temp_root("moondesk-companion-wake-presence");
+        let path = root.join(COMPANION_AUTH_FILE_NAME);
+        let auth = CompanionAuth::open(&path).expect("open companion auth");
+        auth.auto_pair("wake-chrome", &"c".repeat(64), Some(ORIGIN_A))
+            .await
+            .expect("pair companion");
+        auth.update_presence(
+            "wake-chrome",
+            CompanionPresenceUpdate {
+                account_fingerprint: Some("a".repeat(64)),
+                browser_label: Some("Chrome".into()),
+                account_fingerprint_fresh: true,
+                tabs_fresh: true,
+                tabs: Vec::new(),
+            },
+            100_000,
+        )
+        .await
+        .expect("publish verified account");
+        auth.wake_heartbeat("wake-chrome", 160_000).await;
+        let online = auth.fresh_presence(160_000).await;
+        assert_eq!(online.len(), 1);
+        assert_eq!(online[0].last_seen_ms, 160_000);
+        assert_eq!(online[0].browser_label.as_deref(), Some("Chrome"));
+        assert!(
+            !online[0].account_fingerprint_fresh,
+            "WebSocket pong is not ChatGPT account proof"
+        );
+        assert!(!online[0].tabs_fresh, "WebSocket pong is not tab telemetry");
+        assert!(
+            auth.recent_wake_clients(160_000)
+                .await
+                .contains("wake-chrome")
+        );
+
+        auth.revoke_client("wake-chrome")
+            .await
+            .expect("revoke browser");
+        assert!(auth.fresh_presence(160_001).await.is_empty());
+        auth.wake_heartbeat("wake-chrome", 160_002).await;
+        assert!(
+            auth.fresh_presence(160_002).await.is_empty(),
+            "revoked sockets must never resurrect an unpaired browser"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
 
     #[tokio::test]
     async fn pairing_persists_only_hash_and_survives_restart() {

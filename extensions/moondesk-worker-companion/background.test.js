@@ -24,7 +24,7 @@ const serverSource = fs.readFileSync(serverPath, 'utf8');
 const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
 const companionRuntimeRevision = Number(source.match(/const COMPANION_RUNTIME_REVISION = (\d+);/)?.[1]);
 
-function loadBackground({ existingTabs = {}, contentByTab = {}, sendMessageImpl = null, scriptingExecuteImpl = null, storageLocalGetImpl = null, tabsQueryImpl = null, importScriptsImpl = null, accountFingerprint = 'a'.repeat(64), fetchImpl = async () => { throw new Error('network not used'); }, setTimeoutImpl = null, runtimeManifest = manifest, initialStored = {}, createdTabIdStart = 101, bootstrapAvailable = true, bootstrapToken = 'b'.repeat(64) } = {}) {
+function loadBackground({ existingTabs = {}, contentByTab = {}, sendMessageImpl = null, scriptingExecuteImpl = null, storageLocalGetImpl = null, tabsQueryImpl = null, importScriptsImpl = null, webSocketImpl = null, accountFingerprint = 'a'.repeat(64), fetchImpl = async () => { throw new Error('network not used'); }, setTimeoutImpl = null, runtimeManifest = manifest, initialStored = {}, createdTabIdStart = 101, bootstrapAvailable = true, bootstrapToken = 'b'.repeat(64) } = {}) {
   const createdTabs = [];
   const removedTabs = [];
   const runtimeReloads = [];
@@ -120,6 +120,7 @@ function loadBackground({ existingTabs = {}, contentByTab = {}, sendMessageImpl 
     URL,
     AbortController,
     navigator: { userAgent: 'Mozilla/5.0 Chrome/153.0.0.0 Safari/537.36' },
+    ...(webSocketImpl ? { WebSocket: webSocketImpl } : {}),
     fetch: async (url, options = {}) => {
       if (String(url) === 'chrome-extension://test/moondesk-bootstrap.json') {
         if (!bootstrapAvailable) {
@@ -204,6 +205,103 @@ async function flushMicrotasks() {
   await new Promise((resolve) => setImmediate(resolve));
   await new Promise((resolve) => setImmediate(resolve));
 }
+
+test('reconciles invalidated ChatGPT content scripts after extension reload without reloading tabs', async () => {
+  const tabs = {
+    31: { id: 31, url: 'https://chatgpt.com/c/old-worker-chat', status: 'complete' },
+    32: { id: 32, url: 'https://chatgpt.com/c/healthy-chat', status: 'complete' }
+  };
+  let recovered = false;
+  const injections = [];
+  const browser = loadBackground({
+    existingTabs: tabs,
+    sendMessageImpl: async (tabId, message) => {
+      assert.equal(message.type, 'MOONDESK_CONTEXT');
+      if (tabId === 32 || recovered) return { ok: true, context: {} };
+      throw new Error('Could not establish connection. Receiving end does not exist.');
+    },
+    scriptingExecuteImpl: async (options) => {
+      injections.push({ tabId: options.target.tabId, files: options.files });
+      if (options.files?.includes('content.js')) recovered = true;
+      return [];
+    }
+  });
+  await browser.evaluate('restoreOpenChatGptContent()');
+  assert.equal(recovered, true, 'existing invalidated document must recover without a page reload');
+  assert.deepEqual(injections.map((x) => x.tabId), [31, 31]);
+  assert.equal(browser.createdTabs.length, 0);
+  assert.equal(browser.removedTabs.length, 0);
+  assert.equal(tabs[31].url, 'https://chatgpt.com/c/old-worker-chat');
+  await browser.evaluate('restoreOpenChatGptContent()');
+  assert.equal(injections.length, 2, 'recovery remains rate-limited on subsequent alarms');
+});
+
+test('recovery refuses to reinject when the ChatGPT document navigates during inspection', async () => {
+  const tabs = { 31: { id: 31, url: 'https://chatgpt.com/c/old-chat', status: 'complete' } };
+  let injected = 0;
+  const browser = loadBackground({
+    existingTabs: tabs,
+    sendMessageImpl: async () => {
+      tabs[31] = { ...tabs[31], url: 'https://example.com/' };
+      throw new Error('Receiving end does not exist.');
+    },
+    scriptingExecuteImpl: async () => { injected++; return []; }
+  });
+  await browser.evaluate('restoreOpenChatGptContent()');
+  assert.equal(injected, 0, 'page navigation must revoke repair authority for the original document');
+});
+
+test('wake channel authenticates without credentials in URL, answers ping, and reconnects after close', () => {
+  const sockets = [];
+  class FakeWebSocket {
+    constructor(url) { this.url = url; this.readyState = 0; this.sent = []; sockets.push(this); }
+    send(text) { this.sent.push(text); }
+    close() { this.readyState = 3; this.onclose?.(); }
+    open() { this.readyState = 1; this.onopen?.(); }
+    receive(data) { this.onmessage?.({ data }); }
+  }
+  const browser = loadBackground({ webSocketImpl: FakeWebSocket });
+  const state = "{ baseUrl: 'http://127.0.0.1:47650', credential: 'secret' }";
+  browser.evaluate(`connectWakeSocket(${state})`);
+  assert.equal(sockets.length, 1);
+  assert.equal(sockets[0].url, 'ws://127.0.0.1:47650/__moondesk/companion/v1/wake');
+  assert.doesNotMatch(sockets[0].url, /secret/);
+  sockets[0].open();
+  assert.deepEqual(sockets[0].sent, ['secret']);
+  sockets[0].receive('ping');
+  assert.deepEqual(sockets[0].sent, ['secret', 'pong']);
+  sockets[0].receive('wake');
+  sockets[0].close();
+  browser.evaluate('wakeReconnectAt = 0');
+  browser.evaluate(`connectWakeSocket(${state})`);
+  assert.equal(sockets.length, 2, 'alarm/presence must reconnect a closed wake socket');
+  browser.evaluate(`connectWakeSocket(${state})`);
+  assert.equal(sockets.length, 2, 'concurrent lanes must share the same wake socket');
+});
+
+test('an indefinitely blocked presence lane cannot prevent a later wake from publishing presence', async () => {
+  let reads = 0;
+  let posts = 0;
+  const initialState = { clientId: 'test', baseUrl: 'http://127.0.0.1:47650', credential: 'paired' };
+  const browser = loadBackground({
+    storageLocalGetImpl: () => {
+      reads++;
+      if (reads === 1) return new Promise(() => {});
+      return { moondeskWorkerCompanionV1: initialState };
+    },
+    fetchImpl: async (url, options) => {
+      if (!String(url).endsWith('/presence')) throw new Error('unexpected URL');
+      posts++;
+      return { ok: true, status: 200, async text() { return JSON.stringify({ presence: JSON.parse(options.body) }); } };
+    }
+  });
+  void browser.evaluate('presencePump()');
+  await flushMicrotasks();
+  browser.evaluate('presencePumpStartedAt = Date.now() - PRESENCE_FLIGHT_DEADLINE_MS - 1');
+  await browser.evaluate('presencePump()');
+  assert.equal(posts, 1, 'later wake must recover despite the first Chromium promise never settling');
+  assert.equal(browser.evaluate('presencePumpActive'), false);
+});
 
 test('companion HTTP paths used by the extension match server route constants', () => {
   const routes = [...serverSource.matchAll(/pub const (COMPANION_[A-Z_]+_ROUTE): &str = "([^"]+)";/g)]
@@ -301,7 +399,7 @@ test('Companion liveness has redundant MV3 wake and popup presence refresh paths
   const workerPumpStart = source.indexOf('async function pump()');
   const workerPumpEnd = source.indexOf('async function pair(', workerPumpStart);
   assert.doesNotMatch(source.slice(workerPumpStart, workerPumpEnd), /collectPresence\(/, 'Worker execution must not own browser presence liveness');
-  assert.match(source, /async function presencePump\(\)[\s\S]*await collectPresence\(state\)/, 'presence must have an independent pump');
+  assert.match(source, /async function presencePump\(\)[\s\S]*await withTimeout\(collectPresence\(state/, 'presence must have an independent pump');
   assert.match(source, /void \(async \(\) => \{[\s\S]*MOONDESK_CORRELATION_EVIDENCE/, 'optional correlation telemetry must not block presence/status');
   assert.match(popupSource, /const POPUP_BOOT_TIMEOUT_MS = 5_000;/);
   assert.match(popupSource, /const POPUP_STATUS_TIMEOUT_MS = 25_000;/);

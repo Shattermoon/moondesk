@@ -16,7 +16,7 @@ const BRIDGE_PORTS = [47650, 47651, 47652, 47653, 47654];
 const REQUIRED_PROTOCOL_VERSION = 2;
 // Bump with any shipped companion runtime change that requires Chromium to load new bytes. Keep
 // this aligned with COMPANION_RUNTIME_REVISION in src/server.rs.
-const COMPANION_RUNTIME_REVISION = 34;
+const COMPANION_RUNTIME_REVISION = 35;
 const SOURCE_DEV_MANIFEST_VERSION = '0.1.0';
 const RUNTIME_RELOAD_STORAGE_KEY = 'moondeskWorkerCompanionReloadRevisionV1';
 const INSTALLATION_BOOTSTRAP_FILE = 'moondesk-bootstrap.json';
@@ -26,6 +26,7 @@ const REPAIR_PATH = '/__moondesk/companion/v1/repair';
 const STATUS_PATH = '/__moondesk/companion/v1/status';
 const CLIENTS_PATH = '/__moondesk/companion/v1/clients';
 const PRESENCE_PATH = '/__moondesk/companion/v1/presence';
+const WAKE_PATH = '/__moondesk/companion/v1/wake';
 const CORRELATIONS_PATH = '/__moondesk/companion/v1/correlations';
 const SEND_STARTED_PATH = '/__moondesk/companion/v1/commands/send-started';
 const CLEAR_WORKERS_PATH = '/__moondesk/companion/v1/workers/clear';
@@ -40,6 +41,10 @@ const CONNECTION_TIMEOUT_MS = 15000;
 const CLEAR_WORKERS_TIMEOUT_MS = 8000;
 const FAST_POLL_MS = 1500;
 const PRESENCE_POLL_MS = 5000;
+const PRESENCE_FLIGHT_DEADLINE_MS = 15000;
+const WAKE_RECONNECT_DELAY_MS = 5000;
+const CONTENT_RECOVERY_INTERVAL_MS = 60_000;
+const CONTENT_RECOVERY_BATCH_SIZE = 8;
 const ACCOUNT_FINGERPRINT_PROBE_TIMEOUT_MS = 2000;
 const PRESENCE_ACCOUNT_FINGERPRINT_MAX_AGE_MS = 30_000;
 const PRESENCE_ACCOUNT_FINGERPRINT_STALE_GRACE_MS = 2 * 60_000;
@@ -56,6 +61,15 @@ let pumpTimer = null;
 let pumpActive = false;
 let presencePumpTimer = null;
 let presencePumpActive = false;
+let presencePumpStartedAt = 0;
+let presencePumpGeneration = 0;
+let wakeSocket = null;
+let wakeSocketTarget = null;
+let wakeSocketCredential = null;
+let wakeReconnectAt = 0;
+let contentRecoveryActive = false;
+let contentRecoveryLastAt = 0;
+let contentRecoveryCursor = 0;
 let userBrowserPumpTimer = null;
 let userBrowserPumpActive = false;
 let connecting = null;
@@ -710,17 +724,76 @@ function ensureConnected() {
   return tracked;
 }
 
+function connectWakeSocket(state) {
+  if (typeof WebSocket !== 'function' || !bridgeBaseUrl(state?.baseUrl) || !state?.credential) return;
+  const target = `${bridgeBaseUrl(state.baseUrl).replace(/^http:/, 'ws:')}${WAKE_PATH}`;
+  if (wakeSocket && wakeSocketTarget === target && wakeSocketCredential === state.credential && wakeSocket.readyState <= 1) return;
+  if (Date.now() < wakeReconnectAt) return;
+  if (wakeSocket) {
+    const old = wakeSocket;
+    wakeSocket = null;
+    try { old.close(); } catch {}
+  }
+  let socket;
+  try {
+    socket = new WebSocket(target);
+  } catch (error) {
+    wakeReconnectAt = Date.now() + WAKE_RECONNECT_DELAY_MS;
+    console.warn('MoonDesk wake channel could not start:', String(error?.message || error));
+    return;
+  }
+  wakeSocket = socket;
+  wakeSocketTarget = target;
+  wakeSocketCredential = state.credential;
+  socket.onopen = () => {
+    if (wakeSocket !== socket) { socket.close(); return; }
+    try { socket.send(state.credential); }
+    catch { socket.close(); }
+  };
+  socket.onmessage = (event) => {
+    if (wakeSocket !== socket) return;
+    if (event.data === 'ping') {
+      try { socket.send('pong'); } catch { socket.close(); return; }
+    } else if (event.data !== 'wake') {
+      socket.close();
+      return;
+    }
+    // A host wake must not depend on an already wedged Worker or browser-control pump.
+    schedulePresencePump(25);
+    schedulePump(25);
+    scheduleUserBrowserPump(25);
+  };
+  socket.onerror = () => { try { socket.close(); } catch {} };
+  socket.onclose = () => {
+    if (wakeSocket !== socket) return;
+    wakeSocket = null;
+    wakeSocketTarget = null;
+    wakeSocketCredential = null;
+    wakeReconnectAt = Date.now() + WAKE_RECONNECT_DELAY_MS;
+    // Existing Chrome alarms and page messages remain the fallback when the host is absent.
+  };
+}
+
 async function operationalState() {
   // Status/presence/browser-control must not queue behind the Worker lane's shared connection flight.
   // A normally paired Companion already has everything those read-only/control lanes need locally.
   // Only an unpaired/incomplete installation performs its own bounded recovery transaction.
   const state = await readState();
-  if (bridgeBaseUrl(state.baseUrl) && state.credential) return state;
+  if (bridgeBaseUrl(state.baseUrl) && state.credential) {
+    connectWakeSocket(state);
+    return state;
+  }
   // Cold pairing is a mutating transaction. Share exactly one pairing flight so independent MV3
   // lanes cannot rotate credentials against each other. Once paired, all operational lanes remain
   // independent from the Worker connection flight.
-  if (!state.credential) return ensureConnected();
-  return ensureConnectedIndependent();
+  if (!state.credential) {
+    const connected = await ensureConnected();
+    connectWakeSocket(connected);
+    return connected;
+  }
+  const connected = await ensureConnectedIndependent();
+  connectWakeSocket(connected);
+  return connected;
 }
 
 async function sendToTab(tabId, message, timeoutMs = 35000) {
@@ -787,6 +860,39 @@ async function ensureContent(tabId) {
     'ChatGPT content-script injection timed out'
   );
   return sendToTab(tabId, { type: 'MOONDESK_CONTEXT' }, 5000);
+}
+
+// Extension reload invalidates existing isolated-world receivers without reloading ChatGPT tabs.
+// Presence must remain fast and never repair inline; the existing 30s alarm independently
+// reconciles a bounded batch of existing pages, without navigation or Worker Send replay.
+async function restoreOpenChatGptContent() {
+  if (contentRecoveryActive || Date.now() - contentRecoveryLastAt < CONTENT_RECOVERY_INTERVAL_MS) return;
+  contentRecoveryActive = true;
+  contentRecoveryLastAt = Date.now();
+  try {
+    const tabs = (await queryChatGptTabs()).filter((tab) => Number.isInteger(tab?.id));
+    if (!tabs.length) { contentRecoveryCursor = 0; return; }
+    const count = Math.min(CONTENT_RECOVERY_BATCH_SIZE, tabs.length);
+    const first = contentRecoveryCursor % tabs.length;
+    contentRecoveryCursor = (first + count) % tabs.length;
+    for (let offset = 0; offset < count; offset++) {
+      const tab = tabs[(first + offset) % tabs.length];
+      if (!tab.url?.startsWith('https://chatgpt.com/') || tab.discarded || tab.frozen || tab.status === 'loading') continue;
+      try {
+        if ((await sendToTab(tab.id, { type: 'MOONDESK_CONTEXT' }, 750))?.ok) continue;
+      } catch { /* A missing receiver is normal after an extension reload. */ }
+      // A tab can navigate between the initial enumeration and injection. Never target a
+      // changed, frozen, or discarded document, and never navigate/reload a user's page.
+      const current = await getTab(tab.id).catch(() => null);
+      if (!current || current.url !== tab.url || current.discarded || current.frozen || current.status === 'loading') continue;
+      try { await ensureContent(tab.id); }
+      catch (error) { console.warn('MoonDesk existing ChatGPT receiver recovery failed:', String(error?.message || error)); }
+    }
+  } catch (error) {
+    console.warn('MoonDesk existing ChatGPT tab scan failed:', String(error?.message || error));
+  } finally {
+    contentRecoveryActive = false;
+  }
 }
 
 function launchHash(token) {
@@ -1097,7 +1203,7 @@ async function accountFingerprintForPresence(tabs, forceRefresh = false) {
   return { fingerprint: null, fresh: false };
 }
 
-async function collectPresence(state, forceAccountRefresh = false) {
+async function collectPresence(state, forceAccountRefresh = false, canPublish = () => true) {
   let tabs = [];
   let tabsQueryFailed = false;
   try {
@@ -1167,6 +1273,7 @@ async function collectPresence(state, forceAccountRefresh = false) {
         fresh: false
       }
     : await accountFingerprintForPresence(tabs, forceAccountRefresh);
+  if (!canPublish()) return null;
   const presence = await api(state, PRESENCE_PATH, {
     method: 'POST',
     body: {
@@ -2111,16 +2218,19 @@ function schedulePresencePump(delayMs = PRESENCE_POLL_MS) {
 }
 
 async function presencePump() {
-  if (presencePumpActive) return;
+  if (presencePumpActive && Date.now() - presencePumpStartedAt < PRESENCE_FLIGHT_DEADLINE_MS) return;
+  if (presencePumpActive) console.warn('MoonDesk abandoned stalled presence flight');
+  const generation = ++presencePumpGeneration;
+  presencePumpStartedAt = Date.now();
   presencePumpActive = true;
   try {
     const state = await operationalState();
-    await collectPresence(state);
+    await withTimeout(collectPresence(state, false, () => presencePumpGeneration === generation), PRESENCE_FLIGHT_DEADLINE_MS, 'MoonDesk presence flight timed out');
   } catch (error) {
     console.warn('MoonDesk Companion presence pump failed:', String(error?.message || error));
   } finally {
-    presencePumpActive = false;
-    schedulePresencePump();
+    if (presencePumpGeneration === generation) presencePumpActive = false;
+    if (presencePumpGeneration === generation) schedulePresencePump();
   }
 }
 
@@ -2793,18 +2903,21 @@ chrome.runtime.onInstalled.addListener(() => {
   schedulePump(200);
   schedulePresencePump(200);
   scheduleUserBrowserPump(200);
+  void restoreOpenChatGptContent();
 });
 chrome.runtime.onStartup.addListener(() => {
   void chrome.alarms.create(POLL_ALARM, { periodInMinutes: 0.5 }).catch(() => {});
   schedulePump(200);
   schedulePresencePump(200);
   scheduleUserBrowserPump(200);
+  void restoreOpenChatGptContent();
 });
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === POLL_ALARM) {
     void pump();
     void presencePump();
     void userBrowserPump();
+    void restoreOpenChatGptContent();
   }
 });
 chrome.tabs.onActivated.addListener(() => {
@@ -2832,3 +2945,5 @@ void chrome.alarms.create(POLL_ALARM, { periodInMinutes: 0.5 }).catch(() => {});
 schedulePump(750);
 schedulePresencePump(750);
 scheduleUserBrowserPump(750);
+// Also recover after a manual extension reload, which fires neither onInstalled nor onStartup.
+setTimeout(() => { void restoreOpenChatGptContent(); }, 750);

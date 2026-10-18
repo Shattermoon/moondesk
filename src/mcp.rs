@@ -2221,7 +2221,9 @@ async fn worker_browser_choices(
     }
     paired.sort();
     paired.dedup();
-    let fresh = auth.fresh_presence(crate::companion::unix_time_ms()).await;
+    let now_ms = crate::companion::unix_time_ms();
+    let wake_recent = auth.recent_wake_clients(now_ms).await;
+    let fresh = auth.fresh_presence(now_ms).await;
     paired
         .into_iter()
         .map(|client_id| {
@@ -2238,6 +2240,7 @@ async fn worker_browser_choices(
                 "clientId": client_id,
                 "browserLabel": presence.and_then(|presence| presence.browser_label.clone()),
                 "online": presence.is_some(),
+                "wakeRecent": wake_recent.contains(&client_id),
                 "lastSeenMs": presence.map(|presence| presence.last_seen_ms),
                 "tabsFresh": presence.is_some_and(|presence| presence.tabs_fresh),
                 "workerAccountFresh": presence.is_some_and(|presence| presence.account_fingerprint_fresh)
